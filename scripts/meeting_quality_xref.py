@@ -41,6 +41,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+import zlib
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
@@ -79,7 +80,6 @@ TH = {
     "oscillation_shed_count": 5,       # R3: > this many sheds in the meeting => oscillation
     "send_queue_bytes": 500_000,       # R4: WS buffered_amount over this => uplink saturation
     "concealment_pct": 15.0,           # R5: audio_concealment_pct over this => audible breakup
-    "protective_cycles": 10,           # R6: > this many ENTERED/EMERGENCY => thrash
     "freshness_head_age_ms": 5000,     # R7: held-last-good head_age over this => bad freeze
     "freshness_skip_count": 20,        # R7: > this many freshness_skips for a sender => starvation
     "high_rtt_ms": 200.0,              # R14: baseline/active RTT over this => high-RTT env
@@ -168,6 +168,16 @@ RE = {
     "congestion_ceiling": re.compile(r"congestion ceiling (?:cut to|->) (\d+)"),
     # Updated audio health (buffer: 660ms) for peer: 12175... (from current_user)
     "audio_health": re.compile(r"audio health \(buffer:\s*(\d+)ms\) for peer:\s*(\d+)"),
+    # issue 1853 (instrumentation-only): per-receiver audio-scale posture, emitted
+    # ~5s from the health loop. ADDITIVE parse contract ONLY — no rule consumes it
+    # yet (R1-R14 unchanged); a future cycle correlates concealment vs concurrent
+    # source count / receiver downlink / per-source buffer depth.
+    # [AUDIO_SCALE] sources=7 concealed=4 worst_pct=98.0 mean_pct=54.0 downlink_mbps=12.5 min_buf_ms=40.0 mean_buf_ms=120.0 cores=22
+    "audio_scale": re.compile(
+        r"\[AUDIO_SCALE\] sources=(\d+) concealed=(\d+) worst_pct=([\d.]+) "
+        r"mean_pct=([\d.]+) downlink_mbps=(-?[\d.]+) min_buf_ms=([\d.]+) "
+        r"mean_buf_ms=([\d.]+) cores=(-?\d+)"
+    ),
     # WebSocket backpressure: dropping 667 byte packet (buffered: 1048955 bytes, threshold: 1048576 bytes)
     "ws_backpressure": re.compile(
         r"WebSocket backpressure: dropping (\d+) byte packet \(buffered:\s*(\d+) bytes"
@@ -177,6 +187,13 @@ RE = {
     "baseline_rtt": re.compile(r"Baseline RTT for re-election monitoring:\s*([\d.]+)ms"),
     "reelection": re.compile(r"RTT degradation threshold reached|Re-election triggered"),
     "connection_lost": re.compile(r"Connection lost|No valid connections"),
+    # This Failed state is the event that VideoCallClient handles by clearing all
+    # peer decoders and emitting the connection-lost callback. Match its explicit
+    # reason instead of correlating teardown with nearby ProtectiveMode events.
+    "suppression_teardown": re.compile(
+        r'Connection state changed:\s*Failed\s*\{\s*error:\s*'
+        r'"cpu-stall suppression budget exhausted"'
+    ),
     "capability_ceiling": re.compile(r"simulcast capability ceiling:\s*(\d+) layer"),
     # SIMULCAST: publishing 3 video layers (default ON) ...
     "publish_layers": re.compile(r"publishing (\d+) video layers"),
@@ -287,10 +304,10 @@ def load_participant(meeting, email, files, log_dir):
             # A truncated/partial .log.gz (tab-closed mid-flush, or a disk-full write on the
             # log-writer — see the 2026-07-15 ENOSPC event) ends before its DEFLATE
             # end-of-stream marker. `errors="replace"` only covers text decode, NOT a
-            # truncated compressed stream, so iterating raises EOFError/BadGzipFile from the C
-            # layer. Accumulate line-by-line so the lines decompressed before the bad tail are
-            # kept, then WARN and move on — one bad chunk must not abort the whole analysis
-            # (guard-rail #7: truncation is expected, not fatal).
+            # truncated/corrupt compressed stream, so iterating raises EOFError,
+            # BadGzipFile, or zlib.error from the C layer. Accumulate line-by-line so the lines
+            # decompressed before the bad tail are kept, then WARN and move on — one bad chunk
+            # must not abort the whole analysis (guard-rail #7: truncation is expected, not fatal).
             lines = []
             fh_iter = iter(fh)
             while True:
@@ -298,7 +315,7 @@ def load_participant(meeting, email, files, log_dir):
                     lines.append(next(fh_iter))
                 except StopIteration:
                     break
-                except (EOFError, OSError, gzip.BadGzipFile) as e:
+                except (EOFError, OSError, gzip.BadGzipFile, zlib.error) as e:
                     sys.stderr.write(
                         f"WARN: truncated/corrupt gzip {fn} ({e}); using {len(lines)} lines read before the bad tail\n"
                     )
@@ -363,11 +380,18 @@ def _classify(meeting, p, epoch, msg):
     m = RE["aq_status"].search(msg)
     if m:
         union = m.group(7)
+        try:
+            union_cap = None if union == "none" else int(union)
+        except ValueError:
+            sys.stderr.write(
+                f"WARN: invalid AQ_STATUS union_cap={union!r}; treating it as unknown\n"
+            )
+            union_cap = None
         _ev(p, epoch, "aq",
             video_tier=m.group(1), video_tier_n=int(m.group(2)),
             audio_tier=m.group(3), target_bitrate=int(m.group(5)),
             active_layers=int(m.group(6)),
-            union_cap=(None if union == "none" else int(union)))
+            union_cap=union_cap)
         return
     m = RE["layer_switch"].search(msg)
     if m:
@@ -450,6 +474,9 @@ def _classify(meeting, p, epoch, msg):
         return
     if RE["connection_lost"].search(msg):
         _ev(p, epoch, "connection_lost")
+        return
+    if RE["suppression_teardown"].search(msg):
+        _ev(p, epoch, "suppression_teardown")
         return
     m = RE["capability_ceiling"].search(msg)
     if m:
@@ -600,7 +627,7 @@ RULE_NAMES = {
     "R3": "layer oscillation (shed/restore flap)",
     "R4": "WS send-side HOL / uplink saturation",
     "R5": "audio concealment (breakup)",
-    "R6": "ProtectiveMode thrash",
+    "R6": "CPU-stall suppression teardown",
     "R7": "keyframe-starvation freeze",
     "R9": "navigator.connection guard (UNRELIABLE)",
     "R10": "re-election / connection instability",
@@ -798,15 +825,18 @@ def rule_R3_layer_oscillation(meeting, prom):
         cause = "; ".join(signals) if signals else "unknown"
         # Prom corroboration: cpu_throttled gauge + stddev_over_time(encoder_active_layers[camera])
         prom_note = ""
-        if prom and prom.enabled and p.display_name:
-            dn = promql_label(p.display_name)
+        if prom and prom.enabled and p.own_session:
+            # #1580: display_name is no longer a label on these metrics; filter
+            # on the stable session_id instead (also avoids the same-name
+            # cross-meeting contamination the old display_name filter risked).
+            sid = promql_label(p.own_session)
             # Scope by meeting_id (both metrics carry it; verified metrics.rs:1008/1061) so a
             # same-display_name participant in another concurrent meeting can't contaminate the
             # CPU-hunting corroboration for this one.
             mid = promql_label(meeting.room)
             res = prom.query(
                 f'stddev_over_time(videocall_encoder_active_layers'
-                f'{{meeting_id="{mid}",media_kind="camera",display_name="{dn}"}}[{prom.lb()}] @ {prom.end_epoch})'
+                f'{{meeting_id="{mid}",media_kind="camera",session_id="{sid}"}}[{prom.lb()}] @ {prom.end_epoch})'
             )
             if res:
                 try:
@@ -816,7 +846,7 @@ def rule_R3_layer_oscillation(meeting, prom):
                     pass
             thr = prom.query(
                 f'max_over_time(videocall_client_cpu_throttled'
-                f'{{meeting_id="{mid}",display_name="{dn}"}}[{prom.lb()}] @ {prom.end_epoch})'
+                f'{{meeting_id="{mid}",session_id="{sid}"}}[{prom.lb()}] @ {prom.end_epoch})'
             )
             if thr:
                 try:
@@ -898,15 +928,17 @@ def rule_R5_concealment_by_source(meeting, prom):
     """audio_concealment_pct > 15% names the bad uplink. Needs Prom.
 
     Label semantics VERIFIED on the cluster (do NOT trust intuition here):
-      - `to_peer`       = the SOURCE peer's session_id (whose audio is being concealed)
-      - `reporter_name` = the RECEIVER reporting the concealment
-      - `from_peer`     = the receiver's OWN email (NOT the source) — counter-intuitive
+      - `to_peer`   = the SOURCE peer's session_id (whose audio is being concealed)
+      - `from_peer` = the RECEIVER reporting the concealment — the receiver's OWN
+                      id (email OR session_id), NOT the source. Resolve it locally
+                      via _resolve_peer; do NOT join videocall_peer_info (#1954
+                      dropped the per-pair display-name PII labels).
     Use avg_over_time (sustained concealment), not max_over_time (transient 100% spikes).
     Aggregate by `to_peer` to attribute the bad UPLINK to its owner."""
     findings = []
     if not (prom and prom.enabled):
         return findings
-    # Per (to_peer, reporter) sustained average — names each receiver that heard the source badly.
+    # Per (to_peer, from_peer) sustained average — names each receiver that heard the source badly.
     # MUST scope to this meeting: `videocall_audio_concealment_pct` carries a `meeting_id` label
     # (== room name; verified metrics.rs:1071) and persists ~5min, so an UNSCOPED query pulls in
     # any other live meeting on the same Prometheus in the lookback window and would fabricate
@@ -914,7 +946,7 @@ def rule_R5_concealment_by_source(meeting, prom):
     # section already does for its room-labeled series.
     _mid = promql_label(meeting.room)
     res = prom.query(
-        f'avg by (to_peer, reporter_name)'
+        f'avg by (to_peer, from_peer)'
         f'(avg_over_time(videocall_audio_concealment_pct{{meeting_id="{_mid}"}}[{prom.lb()}] @ {prom.end_epoch}))'
     )
     if not res:
@@ -931,7 +963,9 @@ def rule_R5_concealment_by_source(meeting, prom):
             continue
         m = series.get("metric", {})
         src_sid = m.get("to_peer")
-        rx = m.get("reporter_name") or "?"
+        # `from_peer` is the receiver's own id (email or session_id). Resolve it to a
+        # friendly display name locally (#1954 dropped the PII labels); NO Prometheus join.
+        rx, _ = _resolve_peer(meeting, m.get("from_peer"))
         if not src_sid or src_sid == "none":
             continue
         src_name, src_email = _resolve_peer(meeting, src_sid)
@@ -973,30 +1007,28 @@ def rule_R5_concealment_by_source(meeting, prom):
     return findings
 
 
-def rule_R6_protective_thrash(meeting, prom):
+def rule_R6_suppression_teardown(meeting, prom):
     findings = []
     for email, p in meeting.participants.items():
-        pm = events_of(p, "protective")
-        if not pm:
+        # Adjacent gzip chunks can overlap at their boundary. A teardown state
+        # transition has one timestamp, so deduplicate exact repeats before
+        # reporting how many reconnects occurred.
+        teardowns = sorted(
+            {e["ts"]: e for e in events_of(p, "suppression_teardown")}.values(),
+            key=lambda e: e["ts"],
+        )
+        if not teardowns:
             continue
-        entered = [e for e in pm if e["state"] == "ENTERED"]
-        emergency = [e for e in pm if e["state"] == "EMERGENCY"]
-        cycles = len(entered) + len(emergency)
-        if cycles <= TH["protective_cycles"]:
-            continue
-        triggers = Counter(e["trigger"] for e in entered if e["trigger"])
-        top_trigger = triggers.most_common(1)[0][0] if triggers else "?"
-        meaning = ("receiver audio-jitter starvation" if top_trigger == "audio_buffer"
-                   else "decode/main-thread pressure" if top_trigger == "fps" else "?")
+        count = len(teardowns)
+        plural = "s" if count != 1 else ""
         findings.append(Finding(
-            "R6", "MEDIUM",
-            f"ProtectiveMode thrash on {label(meeting,p)}: {len(entered)} ENTERED / "
-            f"{len(emergency)} EMERGENCY (top trigger={top_trigger} → {meaning}).",
+            "R6", "HIGH",
+            f"CPU-stall suppression forced {count} full reconnect{plural} for "
+            f"{label(meeting,p)}.",
             subject=email,
             evidence=[
-                f"ENTERED={len(entered)} EMERGENCY={len(emergency)} EXITED="
-                f"{len([e for e in pm if e['state']=='EXITED'])}",
-                f"trigger histogram: {dict(triggers)}",
+                'ConnectionState::Failed reason="cpu-stall suppression budget exhausted"',
+                "timestamps: " + ", ".join(fmt_clock(e["ts"]) for e in teardowns),
             ],
         ))
     return findings
@@ -1177,7 +1209,7 @@ ALL_RULES = [
     rule_R3_layer_oscillation,
     rule_R4_send_side_hol,
     rule_R5_concealment_by_source,
-    rule_R6_protective_thrash,
+    rule_R6_suppression_teardown,
     rule_R7_keyframe_starvation,
     rule_R9_navigator_connection_guard,
     rule_R10_reelection,
@@ -1421,8 +1453,11 @@ def render_relay_section(meeting, prom, out):
             f'sum(increase(videocall_outbound_channel_drops_total[{lb}] @ {ep}))',
         # Client-side, carries meeting_id (metrics.rs:773) — MUST scope, else another concurrent
         # meeting's WS drops get attributed here (same contamination class as R5).
+        # #1580: display_name is no longer a label on the metric; group by
+        # peer_id (stable) and join videocall_peer_info to recover the name.
         "videocall_websocket_drops (client-side WS drops, by reporter)":
-            f'sum by (display_name)(videocall_websocket_drops{{meeting_id="{room}"}} @ {ep})',
+            f'sum by (meeting_id, session_id, peer_id)(videocall_websocket_drops{{meeting_id="{room}"}} @ {ep})'
+            f' * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info',
         "videocall_relay_scheduler_lag_ms (avg, histogram)":
             f'sum(rate(videocall_relay_scheduler_lag_ms_sum[{lb}] @ {ep}))'
             f'/sum(rate(videocall_relay_scheduler_lag_ms_count[{lb}] @ {ep}))',

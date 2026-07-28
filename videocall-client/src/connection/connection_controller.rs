@@ -28,6 +28,7 @@ use log::{debug, info, warn};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use videocall_transport::webtransport::FrameDropMeta;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 #[derive(Debug)]
@@ -240,6 +241,19 @@ impl ConnectionController {
             .try_borrow()
             .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
         mgr.send_packet(packet, stream_key)
+    }
+
+    pub fn send_packet_with_drop_meta(
+        &self,
+        packet: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) -> Result<()> {
+        let mgr = self
+            .manager
+            .try_borrow()
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.send_packet_with_drop_meta(packet, stream_key, meta)
     }
 
     /// Send packet through active connection via datagram (unreliable, low-latency).

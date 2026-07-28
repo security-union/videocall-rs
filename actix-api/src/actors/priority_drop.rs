@@ -23,16 +23,23 @@
 //! the *next* packet to arrive regardless of media type. A single 1-2 Mbps
 //! video frame buffer is equivalent to ~200 50-byte audio frames, so a
 //! uniform drop wastes audio frames disproportionately. This module
-//! implements the priority-aware variant requested in discussion #699:
+//! implements the priority-aware variant requested in discussion #699, refined
+//! by the screen-share ordering of issue 1977:
 //!
-//! 1. **VIDEO / SCREEN** frames are dropped first, starting at
-//!    [`PRIORITY_DROP_VIDEO_FILL_RATIO`] (80% full). Brief video freezes
+//! 1. **Camera VIDEO** frames are dropped first, starting at
+//!    [`PRIORITY_DROP_VIDEO_FILL_RATIO`] (80% full). Brief camera freezes
 //!    are tolerable; audio loss is catastrophic.
-//! 2. **AUDIO** frames are preserved until
+//! 2. **SCREEN** frames are held longer than camera VIDEO — dropped only at
+//!    [`PRIORITY_DROP_SCREEN_FILL_RATIO`] (90% full). Issue 1977: when someone
+//!    is presenting, the shared content is the meeting, so it outranks every
+//!    camera (priority 2 vs 4). Before 1977 SCREEN shared VIDEO's 80% threshold,
+//!    so the presented content froze at the same fill camera tiles did — the
+//!    exact field regression discussion 1960 reported.
+//! 3. **AUDIO** frames are preserved until
 //!    [`PRIORITY_DROP_AUDIO_FILL_RATIO`] (95% full). Audio is ~50 kbps
 //!    and far cheaper than video, so a few extra audio frames in the
 //!    queue buy more UX than a few extra video frames.
-//! 3. **CONTROL** packets are never preemptively dropped. They are
+//! 4. **CONTROL** packets are never preemptively dropped. They are
 //!    admitted up to the point the channel is 100% full, at which the
 //!    transport-level `try_send` returns `Full` and the existing drop
 //!    counter still fires (with the new `overflow_critical` label so the
@@ -74,13 +81,24 @@
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 
-/// Channel-fill ratio at which VIDEO and SCREEN media packets begin
-/// being dropped to make room for higher-priority audio and control.
+/// Channel-fill ratio at which camera VIDEO media packets begin being
+/// dropped to make room for higher-priority screen, audio, and control.
 ///
-/// 80% of the bounded outbound channel. Below this, video/audio/control
-/// are all admitted. Tuned together with [`PRIORITY_DROP_AUDIO_FILL_RATIO`]
-/// to give audio a 15-percentage-point cushion over video.
+/// 80% of the bounded outbound channel. Below this, video/screen/audio/control
+/// are all admitted. Tuned together with [`PRIORITY_DROP_SCREEN_FILL_RATIO`]
+/// (90%) and [`PRIORITY_DROP_AUDIO_FILL_RATIO`] (95%) to shed camera VIDEO
+/// first, then SCREEN, then AUDIO.
 pub const PRIORITY_DROP_VIDEO_FILL_RATIO: f32 = 0.80;
+
+/// Channel-fill ratio at which SCREEN-share media packets begin being dropped.
+///
+/// 90% of the bounded outbound channel — DELIBERATELY higher than
+/// [`PRIORITY_DROP_VIDEO_FILL_RATIO`] (80%) so camera VIDEO is shed a full 10
+/// percentage points before the shared content (issue 1977: audio > screen >
+/// cameras). It sits below [`PRIORITY_DROP_AUDIO_FILL_RATIO`] (95%) so audio
+/// still outranks screen. The camera↔screen threshold divergence here is
+/// intentional and is the whole point of the issue — do NOT re-unify them.
+pub const PRIORITY_DROP_SCREEN_FILL_RATIO: f32 = 0.90;
 
 /// Channel-fill ratio at which AUDIO media packets begin being dropped.
 ///
@@ -106,10 +124,13 @@ pub enum OutboundPriority {
     /// Audio media frame. Dropped when fill ratio reaches
     /// [`PRIORITY_DROP_AUDIO_FILL_RATIO`].
     Audio,
-    /// Video media frame. Dropped when fill ratio reaches
-    /// [`PRIORITY_DROP_VIDEO_FILL_RATIO`].
+    /// Camera video media frame. Dropped when fill ratio reaches
+    /// [`PRIORITY_DROP_VIDEO_FILL_RATIO`] (80%) — the first media kind shed.
     Video,
-    /// Screen-share media frame. Same drop threshold as `Video`.
+    /// Screen-share media frame. Held longer than camera `Video`: dropped only
+    /// when fill ratio reaches [`PRIORITY_DROP_SCREEN_FILL_RATIO`] (90%), so the
+    /// presented content outranks every camera under channel pressure (issue
+    /// 1977).
     Screen,
 }
 
@@ -326,8 +347,21 @@ pub fn evaluate(
                 PriorityDropDecision::Admit
             }
         }
-        OutboundPriority::Video | OutboundPriority::Screen => {
+        OutboundPriority::Video => {
             if fill_ratio >= PRIORITY_DROP_VIDEO_FILL_RATIO {
+                PriorityDropDecision::Drop {
+                    reason: "priority_drop_video",
+                }
+            } else {
+                PriorityDropDecision::Admit
+            }
+        }
+        OutboundPriority::Screen => {
+            // Issue 1977: SCREEN is held to a HIGHER fill threshold than camera
+            // VIDEO so cameras are shed first and the presented content is
+            // preserved. Keeps the "priority_drop_video" reason label (the
+            // video-band drop counter) so existing dashboards are unaffected.
+            if fill_ratio >= PRIORITY_DROP_SCREEN_FILL_RATIO {
                 PriorityDropDecision::Drop {
                     reason: "priority_drop_video",
                 }
@@ -655,17 +689,56 @@ mod tests {
     }
 
     #[test]
-    fn screen_dropped_at_exactly_80_percent_full() {
-        // SCREEN must share the same threshold as VIDEO.
+    fn screen_admitted_at_80_percent_while_video_dropped() {
+        // Issue 1977: SCREEN now outranks camera VIDEO. At 80% fill camera VIDEO
+        // drops but SCREEN is ADMITTED (it is only shed at 90%). This FAILS on
+        // the pre-1977 code, where SCREEN shared VIDEO's 80% threshold.
         let total = 100usize;
         let used = 80;
+        let free = total - used;
+        assert_eq!(
+            evaluate(OutboundPriority::Screen, free, total),
+            PriorityDropDecision::Admit,
+            "SCREEN must survive at 80% fill (shed only at 90%) — issue 1977",
+        );
+        // ...and camera VIDEO is dropped at the same fill.
+        assert!(matches!(
+            evaluate(OutboundPriority::Video, free, total),
+            PriorityDropDecision::Drop { .. }
+        ));
+    }
+
+    #[test]
+    fn screen_admitted_just_below_90_percent_full() {
+        // Last sub-threshold slot: SCREEN still admitted at 89% (issue 1977).
+        let total = 100usize;
+        let used = 89;
+        let free = total - used;
+        assert_eq!(
+            evaluate(OutboundPriority::Screen, free, total),
+            PriorityDropDecision::Admit,
+        );
+    }
+
+    #[test]
+    fn screen_dropped_at_exactly_90_percent_full() {
+        // SCREEN is shed at its own 90% threshold (issue 1977), between camera
+        // VIDEO (80%) and AUDIO (95%). Still labelled in the video-band counter.
+        let total = 100usize;
+        let used = 90;
         let free = total - used;
         match evaluate(OutboundPriority::Screen, free, total) {
             PriorityDropDecision::Drop { reason } => {
                 assert_eq!(reason, "priority_drop_video");
             }
-            other => panic!("expected Drop at 80% for SCREEN, got {other:?}"),
+            other => panic!("expected Drop at 90% for SCREEN, got {other:?}"),
         }
+        // AUDIO still survives at 90% (protected until 95%).
+        assert_eq!(
+            evaluate(OutboundPriority::Audio, free, total),
+            PriorityDropDecision::Admit,
+            "AUDIO must outrank SCREEN — survives while SCREEN drops at 90%",
+        );
     }
 
     #[test]
@@ -908,16 +981,16 @@ mod tests {
     // message tying it back to the spec.
 
     #[test]
-    fn spec_video_dropped_first_at_80_percent() {
-        // "VIDEO / SCREEN frames first — start dropping when channel
-        //  is ≥80% full."
-        // Uses the real 512-slot default (issue #979); video drops at
-        // ~410 used.
+    fn spec_camera_video_dropped_first_at_80_percent() {
+        // "Camera VIDEO first — start dropping when channel is ≥80% full."
+        // Issue 1977 refined discussion #699: SCREEN is NO LONGER shed at 80%
+        // (it now outranks camera VIDEO and is held until 90%).
+        // Uses the real 512-slot default (issue #979); video drops at ~410 used.
         let total = 512usize;
         let used = (total as f32 * 0.81) as usize;
         let free = total - used;
 
-        // Video and screen drop at 81% fill...
+        // Camera VIDEO drops at 81% fill...
         assert!(
             matches!(
                 evaluate(OutboundPriority::Video, free, total),
@@ -925,22 +998,60 @@ mod tests {
                     reason: "priority_drop_video"
                 }
             ),
-            "spec: VIDEO must drop at >=80% fill"
+            "spec: camera VIDEO must drop at >=80% fill"
         );
-        assert!(
-            matches!(
-                evaluate(OutboundPriority::Screen, free, total),
-                PriorityDropDecision::Drop {
-                    reason: "priority_drop_video"
-                }
-            ),
-            "spec: SCREEN must drop at >=80% fill (same threshold as VIDEO)"
+        // ...while SCREEN is preserved (issue 1977: screen outranks cameras)...
+        assert_eq!(
+            evaluate(OutboundPriority::Screen, free, total),
+            PriorityDropDecision::Admit,
+            "spec 1977: SCREEN must be preserved at 81% fill (shed only at 90%)"
         );
-        // ...while audio still passes through.
+        // ...and audio still passes through.
         assert_eq!(
             evaluate(OutboundPriority::Audio, free, total),
             PriorityDropDecision::Admit,
             "spec: AUDIO must be preserved at 81% fill"
+        );
+    }
+
+    #[test]
+    fn spec_1977_shed_order_camera_then_screen_then_audio() {
+        // The full issue-1977 ordering across the fill range on the real
+        // 512-slot channel: camera VIDEO sheds first (80%), then SCREEN (90%),
+        // then AUDIO (95%). Each probe pins one rung of the ordering; the whole
+        // test FAILS on pre-1977 code (where SCREEN dropped with VIDEO at 80%).
+        let total = 512usize;
+
+        // 82% fill: only camera VIDEO is shed.
+        let free_82 = total - (total as f32 * 0.82) as usize;
+        assert!(matches!(
+            evaluate(OutboundPriority::Video, free_82, total),
+            PriorityDropDecision::Drop { .. }
+        ));
+        assert_eq!(
+            evaluate(OutboundPriority::Screen, free_82, total),
+            PriorityDropDecision::Admit,
+            "1977: SCREEN survives while cameras are shed",
+        );
+        assert_eq!(
+            evaluate(OutboundPriority::Audio, free_82, total),
+            PriorityDropDecision::Admit,
+        );
+
+        // 92% fill: camera VIDEO and SCREEN both shed; AUDIO still protected.
+        let free_92 = total - (total as f32 * 0.92) as usize;
+        assert!(matches!(
+            evaluate(OutboundPriority::Video, free_92, total),
+            PriorityDropDecision::Drop { .. }
+        ));
+        assert!(matches!(
+            evaluate(OutboundPriority::Screen, free_92, total),
+            PriorityDropDecision::Drop { .. }
+        ));
+        assert_eq!(
+            evaluate(OutboundPriority::Audio, free_92, total),
+            PriorityDropDecision::Admit,
+            "1977: AUDIO outranks SCREEN — survives at 92% while SCREEN sheds",
         );
     }
 
@@ -1061,6 +1172,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn camera_video_always_shed_before_screen_and_audio() {
+        // Issue-1977 monotonic ordering: at ANY fill, if SCREEN is dropped then
+        // camera VIDEO is also dropped, and if AUDIO is dropped then SCREEN is
+        // also dropped. i.e. the sacrifice order is strictly camera → screen →
+        // audio. On pre-1977 code (SCREEN == VIDEO threshold) the screen-vs-video
+        // implication still held, but the RANK GAP this test also checks — that
+        // there EXISTS a fill where VIDEO drops while SCREEN admits — did not.
+        let total = 1024usize;
+        let mut saw_video_dropped_while_screen_admitted = false;
+        let mut saw_screen_dropped_while_audio_admitted = false;
+        for fill_pct_x10 in 700u32..1000 {
+            let used = total * (fill_pct_x10 as usize) / 1000;
+            let free = total - used;
+            let video = evaluate(OutboundPriority::Video, free, total);
+            let screen = evaluate(OutboundPriority::Screen, free, total);
+            let audio = evaluate(OutboundPriority::Audio, free, total);
+
+            if matches!(screen, PriorityDropDecision::Drop { .. }) {
+                assert!(
+                    matches!(video, PriorityDropDecision::Drop { .. }),
+                    "ordering violation at fill {}%: SCREEN dropped while camera VIDEO admitted",
+                    fill_pct_x10 as f32 / 10.0,
+                );
+            }
+            if matches!(audio, PriorityDropDecision::Drop { .. }) {
+                assert!(
+                    matches!(screen, PriorityDropDecision::Drop { .. }),
+                    "ordering violation at fill {}%: AUDIO dropped while SCREEN admitted",
+                    fill_pct_x10 as f32 / 10.0,
+                );
+            }
+            if matches!(video, PriorityDropDecision::Drop { .. })
+                && matches!(screen, PriorityDropDecision::Admit)
+            {
+                saw_video_dropped_while_screen_admitted = true;
+            }
+            if matches!(screen, PriorityDropDecision::Drop { .. })
+                && matches!(audio, PriorityDropDecision::Admit)
+            {
+                saw_screen_dropped_while_audio_admitted = true;
+            }
+        }
+        assert!(
+            saw_video_dropped_while_screen_admitted,
+            "issue 1977: there must exist a fill where camera VIDEO is shed but SCREEN survives",
+        );
+        assert!(
+            saw_screen_dropped_while_audio_admitted,
+            "there must exist a fill where SCREEN is shed but AUDIO survives",
+        );
     }
 
     // ----- Real-channel integration -----------------------------------

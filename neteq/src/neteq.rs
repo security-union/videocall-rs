@@ -258,6 +258,11 @@ pub struct NetEq {
     leftover_samples: Vec<f32>,
     /// Map RTP payload-type → audio decoder instance.
     decoders: HashMap<u8, Box<dyn crate::codec::AudioDecoder + Send>>,
+    /// RTP payload type of the most recently decoded packet (issue 620). Used by
+    /// `decode_expand` to pick the decoder whose codec-level PLC extrapolates the
+    /// lost frame. `None` until a packet has been decoded (cold start) and after
+    /// `reset`; a concealment in that state falls back to the quiet-noise path.
+    last_decode_payload_type: Option<u8>,
     /// Audio queue for bypass mode (direct decoding without jitter buffer)
     bypass_audio_queue: VecDeque<f32>,
     /// Rolling counters for packets-per-second measurement
@@ -336,6 +341,7 @@ impl NetEq {
             frame_timestamp: 0,
             leftover_samples: Vec::new(),
             decoders: HashMap::new(),
+            last_decode_payload_type: None,
             bypass_audio_queue: VecDeque::new(),
             packets_received_this_second: 0,
             last_packets_second_instant: Instant::now(),
@@ -572,6 +578,10 @@ impl NetEq {
         self.buffer_level_filter
             .set_filtered_buffer_level(self.current_buffer_size_samples());
         self.last_decode_timestamp = None;
+        // Mirror last_decode_timestamp: after a flush / 6s expand safety-valve
+        // recalibration, drop the codec-PLC decoder selection so concealment
+        // falls back to noise until a fresh packet is decoded (issue 620).
+        self.last_decode_payload_type = None;
         self.consecutive_expands = 0;
         self.packets_received_this_second = 0;
         self.packets_per_sec_snapshot = 0;
@@ -877,6 +887,10 @@ impl NetEq {
                     }
 
                     self.last_decode_timestamp = Some(packet.header.timestamp);
+                    // Remember which decoder produced this audio so a following
+                    // concealment (decode_expand) can drive its codec-level PLC
+                    // (issue 620).
+                    self.last_decode_payload_type = Some(packet.header.payload_type);
                     frame.speech_type = SpeechType::Normal;
                     frame.vad_activity = true;
                 }
@@ -1067,8 +1081,43 @@ impl NetEq {
 
         self.decode_normal(&mut input)?;
 
-        self.expand
-            .process(&input.samples, &mut frame.samples, phase);
+        // Codec-level PLC (issue 620): ask the decoder that produced the stream
+        // (the payload type of the last decoded packet) to extrapolate the lost
+        // frame. `decode_normal` above runs first, so for ExpandStart/ExpandEnd
+        // any overlap packet it pulls updates `last_decode_payload_type` before we
+        // read it here; either way the field holds the most recent real packet's
+        // payload type (the same stream/decoder). Any of {no packet ever decoded,
+        // no decoder registered for that payload type, a web decoder with no PLC
+        // primitive, a libopus failure} yields `None`, and `Expand::process` then
+        // uses the quiet-noise fallback. The length filter keeps this decision in
+        // lockstep with the counter below.
+        //
+        // FEC-recovery seam (issue 620, point 3): when the NEXT packet is already
+        // buffered, libopus could instead reconstruct THIS lost frame from its
+        // in-band FEC via `decode_float(next_packet, out, true)`. That needs a
+        // peek of `PacketBuffer::peek_next_packet_from_timestamp` for the missing
+        // timestamp plus reordered normal consumption, so it is left as future
+        // work; codec PLC is used here unconditionally.
+        let concealment: Option<Vec<f32>> = self
+            .last_decode_payload_type
+            .and_then(|pt| self.decoders.get_mut(&pt))
+            .and_then(|dec| dec.decode_plc(frame.samples_per_channel))
+            .filter(|pcm| pcm.len() == frame.samples.len());
+        let used_codec_plc = concealment.is_some();
+
+        self.expand.process(
+            &input.samples,
+            &mut frame.samples,
+            phase,
+            concealment.as_deref(),
+        );
+
+        // Observability (issue 620): count codec-PLC vs noise-fallback concealment.
+        if used_codec_plc {
+            self.statistics.plc_invocation_opus_native();
+        } else {
+            self.statistics.plc_invocation_fallback_noise();
+        }
 
         // Put back unused samples
         let used_input_samples = self.expand.get_used_input_samples();
@@ -1077,9 +1126,10 @@ impl NetEq {
                 .splice(0..0, input.samples[used_input_samples..].iter().cloned());
         }
 
-        // Update statistics
+        // Update statistics. Codec PLC produces real (non-silent) audio; the
+        // noise fallback is effectively silent (issue 620).
         self.statistics
-            .concealment_event(frame.samples_per_channel as u64, true);
+            .concealment_event(frame.samples_per_channel as u64, !used_codec_plc);
         self.statistics.time_stretch_operation(
             TimeStretchOperation::Expand,
             frame.samples_per_channel as u64,
@@ -1149,6 +1199,16 @@ impl NetEq {
     ) {
         self.decoders.insert(payload_type, decoder);
     }
+
+    /// The operation chosen for the most recent `get_audio` call (issue 620).
+    /// Test-only: lets concealment tests isolate a plain `Expand` frame (no
+    /// overlap crossfade) from `ExpandStart`/`ExpandEnd`. Gated identically to
+    /// its sole consumer (`opus_plc_tests`) so it is not dead code in the
+    /// web-feature test build, which excludes that native module.
+    #[cfg(all(test, not(target_arch = "wasm32"), feature = "native"))]
+    pub(crate) fn last_operation(&self) -> Operation {
+        self.last_operation
+    }
 }
 
 // Simple random number generator for testing
@@ -1163,6 +1223,152 @@ fn simple_random() -> f32 {
     x ^= x << 17;
     RNG_STATE.store(x, Ordering::Relaxed);
     ((x as u32) >> 16) as f32 / 65536.0
+}
+
+/// Native-only integration tests for libopus packet-loss concealment (issue 620).
+///
+/// Gated on `feature = "native"` (and non-wasm) so they never compile under the
+/// CI `neteq --no-default-features --features web --tests` clippy job, which has
+/// neither the `opus` crate nor `NativeOpusDecoder`.
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "native"))]
+mod opus_plc_tests {
+    use super::*;
+    use crate::codec::{AudioDecoder, NativeOpusDecoder};
+    use crate::packet::{AudioPacket, RtpHeader};
+    use opus::{Application, Channels, Encoder};
+
+    const SR: u32 = 48_000;
+    const FRAME: usize = 960; // 20 ms @ 48 kHz, mono
+    const OPUS_PT: u8 = 111;
+
+    /// Encode `frame_count` frames of a loud 440 Hz sine into real Opus packets.
+    fn encode_sine_packets(frame_count: usize) -> Vec<AudioPacket> {
+        let mut enc = Encoder::new(SR, Channels::Mono, Application::Voip).unwrap();
+        let mut packets = Vec::with_capacity(frame_count);
+        let mut phase = 0u64;
+        for i in 0..frame_count {
+            let mut pcm = vec![0.0f32; FRAME];
+            for s in pcm.iter_mut() {
+                let t = phase as f32 / SR as f32;
+                *s = 0.5 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+                phase += 1;
+            }
+            let mut out = vec![0u8; 4000];
+            let n = enc.encode_float(&pcm, &mut out).unwrap();
+            out.truncate(n);
+            let header = RtpHeader::new(i as u16, (i as u32) * FRAME as u32, 12345, OPUS_PT, false);
+            packets.push(AudioPacket::new(header, out, SR, 1, 20));
+        }
+        packets
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    /// Trait-contract: `decode_plc` returns exactly the requested per-channel
+    /// sample count, and requires prior decoder state (a real packet decoded
+    /// first).
+    #[test]
+    fn test_decode_plc_returns_requested_sample_count_after_real_decode() {
+        let mut dec = NativeOpusDecoder::new(SR, 1).unwrap();
+        let packets = encode_sine_packets(1);
+        let decoded = dec.decode(&packets[0].payload).unwrap();
+        assert!(!decoded.is_empty(), "real decode should yield samples");
+
+        let plc = dec
+            .decode_plc(480)
+            .expect("native opus must provide PLC after a real decode");
+        assert_eq!(
+            plc.len(),
+            480,
+            "PLC frame must match requested sample count"
+        );
+
+        // A different frame size must be honoured exactly too.
+        let plc2 = dec.decode_plc(240).expect("PLC for a 5 ms frame");
+        assert_eq!(plc2.len(), 240);
+    }
+
+    /// issue 620 REGRESSION: with a native libopus decoder, a concealed frame
+    /// must carry codec-PLC energy, NOT the old quiet-noise floor, and the
+    /// codec-PLC counter (not the fallback counter) must increment.
+    ///
+    /// It keys specifically on a plain `Operation::Expand` frame, which has NO
+    /// overlap crossfade — so the measured energy comes entirely from the
+    /// concealment source. (An `ExpandStart` frame would crossfade its overlap
+    /// with the loud real sine and could pass the energy check even on noise,
+    /// which would make the test fake.)
+    ///
+    /// WHY THIS FAILS PRE-FIX: the old `decode_expand` always filled
+    /// `Expand::process` with quiet random noise of amplitude ≤ `0.0001 * 0.5 =
+    /// 5e-5`, so `|sample| ≤ 5e-5` and RMS ≤ `5e-5 / sqrt(3) ≈ 2.9e-5` — far
+    /// below the `0.001` floor asserted here. Routing the plain Expand to
+    /// always-noise drops the concealed RMS back to ~2.9e-5 and the energy
+    /// asserts fail; removing the `plc_invocation_opus_native()` call fails the
+    /// counter assert. (Verified by mutation.)
+    #[test]
+    fn test_expand_uses_opus_plc_not_noise() {
+        // Max RMS the old quiet-noise fallback can produce (uniform in ±5e-5).
+        const NOISE_RMS_BOUND: f32 = 0.0001 * 0.5 / 1.732_051; // ≈ 2.9e-5
+
+        let config = NetEqConfig {
+            sample_rate: SR,
+            channels: 1,
+            for_test_no_time_stretching: true,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+        neteq.register_decoder(OPUS_PT, Box::new(NativeOpusDecoder::new(SR, 1).unwrap()));
+
+        // Prime: buffer real Opus packets so the decoder builds internal state
+        // and `last_decode_payload_type` is set as they are drained.
+        for p in encode_sine_packets(4) {
+            neteq.insert_packet(p).unwrap();
+        }
+
+        // Drain, capturing the first *plain-Expand* codec-PLC concealment (no
+        // crossfade) once the buffer has emptied. Track the codec-PLC counter
+        // per-frame so we know THIS frame's concealment came from libopus.
+        let mut concealed = None;
+        let mut prev_opus = neteq.get_statistics().lifetime.plc_invocations_opus_native;
+        for _ in 0..40 {
+            let frame = neteq.get_audio().unwrap();
+            let op = neteq.last_operation();
+            let now_opus = neteq.get_statistics().lifetime.plc_invocations_opus_native;
+            let this_frame_used_plc = now_opus > prev_opus;
+            prev_opus = now_opus;
+            if op == Operation::Expand && this_frame_used_plc {
+                concealed = Some(frame);
+                break;
+            }
+        }
+        let frame = concealed
+            .expect("expected a plain-Expand codec-PLC concealment frame as the buffer drained");
+
+        // No noise fallback should have occurred: every concealment so far used
+        // codec PLC.
+        let life = neteq.get_statistics().lifetime;
+        assert_eq!(
+            life.plc_invocations_fallback_noise, 0,
+            "native decoder must never hit the noise fallback here"
+        );
+        assert!(
+            life.plc_invocations_opus_native >= 1,
+            "codec-PLC counter must have incremented"
+        );
+
+        let concealed_rms = rms(&frame.samples);
+        assert!(
+            concealed_rms > 0.001,
+            "codec-PLC concealed RMS {concealed_rms} must exceed 0.001 (noise floor ≈ {NOISE_RMS_BOUND})"
+        );
+        assert!(
+            concealed_rms > 100.0 * NOISE_RMS_BOUND,
+            "codec-PLC concealed RMS {concealed_rms} must exceed 100x the noise bound {}",
+            100.0 * NOISE_RMS_BOUND
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1217,6 +1423,64 @@ mod tests {
             payload.extend_from_slice(&sample.to_le_bytes());
         }
         AudioPacket::new(header, payload, 48000, 1, 20)
+    }
+
+    /// issue 620: a decoder that does not implement `decode_plc` (uses the trait
+    /// default `None`) must keep the quiet-noise concealment and increment the
+    /// fallback counter — never the codec-PLC counter. `TestPcmDecoder` inherits
+    /// the default, so this exercises the web-decoder / no-PLC path on the host.
+    #[test]
+    fn test_expand_fallback_noise_when_decoder_has_no_plc() {
+        let config = NetEqConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            for_test_no_time_stretching: true,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+        neteq.register_decoder(
+            96,
+            Box::new(TestPcmDecoder {
+                sample_rate: 48_000,
+                channels: 1,
+                samples: 960,
+            }),
+        );
+
+        // Prime with a few packets (payload content is ignored by TestPcmDecoder).
+        for i in 0..3u32 {
+            neteq
+                .insert_packet(create_48k_20ms_packet(i as u16, i * 960))
+                .unwrap();
+        }
+
+        // Drain well past buffer-empty: 3 packets = 6 output frames, so by the
+        // final pulls we are deep in continuous plain-`Expand` concealment (empty
+        // buffer => no overlap crossfade with real audio), i.e. pure quiet noise.
+        let mut last_frame = None;
+        for _ in 0..40 {
+            last_frame = Some(neteq.get_audio().unwrap());
+        }
+
+        let life = neteq.get_statistics().lifetime;
+        assert!(
+            life.plc_invocations_fallback_noise > 0,
+            "expected noise-fallback concealments as the buffer drained"
+        );
+        assert_eq!(
+            life.plc_invocations_opus_native, 0,
+            "TestPcmDecoder has no codec PLC; opus-native counter must stay 0"
+        );
+
+        // The final frame is a plain-Expand quiet-noise concealment (near-silent),
+        // NOT codec PLC of the 0.25-amplitude test audio.
+        let frame = last_frame.unwrap();
+        let energy: f32 =
+            frame.samples.iter().map(|s| s * s).sum::<f32>() / frame.samples.len() as f32;
+        assert!(
+            energy < 0.00001,
+            "noise-fallback concealment energy {energy} should be near-silent"
+        );
     }
 
     /// Regression guard: `NetEq::flush` must keep draining the packet buffer.

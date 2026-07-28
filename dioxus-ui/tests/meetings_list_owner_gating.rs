@@ -46,9 +46,6 @@ fn inject_minimal_config() {
     set("firefoxEnabled", &"false".into());
     set("usersAllowedToStream", &"".into());
     set("serverElectionPeriodMs", &wasm_bindgen::JsValue::from(2000));
-    set("audioBitrateKbps", &wasm_bindgen::JsValue::from(65));
-    set("videoBitrateKbps", &wasm_bindgen::JsValue::from(100));
-    set("screenBitrateKbps", &wasm_bindgen::JsValue::from(100));
     set("vadThreshold", &wasm_bindgen::JsValue::from(0.02));
     let frozen = js_sys::Object::freeze(&config);
     js_sys::Reflect::set(&gloo_utils::window(), &"__APP_CONFIG".into(), &frozen).unwrap();

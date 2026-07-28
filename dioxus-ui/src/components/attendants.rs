@@ -40,6 +40,7 @@ use crate::components::{
     },
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
+    emoji_picker::EmojiPicker,
     host::Host,
     host_controls::HostControls,
     media_metrics_overlay::{MediaMetricsOverlayCtx, MEDIA_METRICS_OVERLAY_KEY},
@@ -69,24 +70,24 @@ use crate::context::{
     html_media_set_sink_id_supported, load_appearance_settings_from_storage,
     load_decode_budget_override, load_density_mode, load_dock_autohide, load_dock_position,
     load_preferred_camera_on, load_preferred_device_ids, load_preferred_mic_on,
-    resolve_initial_enabled, resolve_transport_config, restore_device_id,
-    save_appearance_settings_to_storage, save_density_mode, save_display_name_to_storage,
-    save_dock_autohide, save_dock_position, save_preferred_camera_id, save_preferred_camera_on,
-    save_preferred_mic_id, save_preferred_mic_on, save_preferred_speaker_id, validate_display_name,
-    AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride,
-    DensityModeCtx, DetachedShareCtx, DisplayNameCtx, DockPosition, DockPositionCtx,
-    HostRefreshNonceCtx, HostSetCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx,
-    ScreenZoomState, SignalPopupStateMap, TransportPreference, TransportPreferenceCtx,
-    UserRequestedDecodeCtx,
+    load_transport_preference_with_source, resolve_initial_enabled, resolve_transport_config,
+    restore_device_id, save_appearance_settings_to_storage, save_density_mode,
+    save_display_name_to_storage, save_dock_autohide, save_dock_position, save_preferred_camera_id,
+    save_preferred_camera_on, save_preferred_mic_id, save_preferred_mic_on,
+    save_preferred_speaker_id, validate_display_name, AppearanceSettingsCtx, AutohideCtx,
+    CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx, DetachedShareCtx,
+    DisplayNameCtx, DockPosition, DockPositionCtx, HostRefreshNonceCtx, HostSetCtx,
+    LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap,
+    RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState, SignalPopupStateMap,
+    TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
 };
-use crate::local_storage::{load_bool, load_f64, save_f64};
+use crate::local_storage::{load_bool, load_f64, load_json, save_f64, save_json};
 use crate::types::DeviceInfo;
-// Issue #1884: reaction enum, the closed wire vocabulary the palette + overlay use.
+// Issue 1884: reaction enum, the closed wire vocabulary the palette + overlay use.
 use crate::components::reactions::{
-    compose_reaction_announcement, integrate_reaction, reaction_glyph, reaction_glyph_from_i32,
-    step_reaction, would_integrate_mutate, FloatingReaction, IntegrateOutcome, REACTIONS,
-    REACTION_FLOAT_LIFETIME_MS, REACTION_PALETTE_AUTOHIDE_MS, REACTION_SR_THROTTLE_MS,
+    compose_reaction_announcement, integrate_reaction, push_recent_custom_emoji, reaction_glyph,
+    reaction_glyph_from_i32, sanitize_recent_custom_emojis, step_reaction, FloatingReaction,
+    REACTIONS, REACTION_FLOAT_LIFETIME_MS, REACTION_PALETTE_AUTOHIDE_MS, REACTION_SR_THROTTLE_MS,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -101,9 +102,9 @@ use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::MediaDeviceList;
 use videocall_client::{
-    ConnectionLostReason, MediaAccessKind, MediaDeviceAccess, MediaPermission,
-    MediaPermissionsErrorState, PermissionState, ReactionSelfThrottle, ScreenShareEvent,
-    VideoCallClient, VideoCallClientOptions,
+    validate_custom_emoji, ConnectionLostReason, MediaAccessKind, MediaDeviceAccess,
+    MediaPermission, MediaPermissionsErrorState, PermissionState, ReactionSelfThrottle,
+    ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
 #[cfg(feature = "media-server-jwt-auth")]
 use videocall_client::{RefreshRoomTokenCallback, RefreshedTokens};
@@ -114,28 +115,38 @@ use wasm_bindgen_futures::JsFuture;
 
 /// Call `window.__vcRecording.start(peerIds, onStateChange, localUserName, isLocalUserHost)` via
 /// `js_sys::Reflect` so we can pass a dynamic array and a Rust closure.
+///
+/// Returns `true` iff execution reached the final `start_fn.apply(...)` — i.e.
+/// we successfully handed off to the JS side. Returns `false` on every early-out
+/// (no `window`, `__vcRecording` / `start` missing or not a function — recording.js
+/// stale/404/unloaded). The apply itself throwing STILL returns `true`: whether
+/// recording ACTUALLY began is reported asynchronously by the JS `onStateChange`
+/// callback (the source of truth for success); this function only answers "did we
+/// hand off to JS?". The caller uses the answer to avoid announcing / retaining a
+/// callback for a recording that never even started (see `recording_start_outcome`).
+#[must_use]
 fn js_recording_start(
     peer_ids: &[String],
     on_state_change: &js_sys::Function,
     local_display_name: &str,
     is_local_user_host: bool,
-) {
+) -> bool {
     let window = match web_sys::window() {
         Some(w) => w,
-        None => return,
+        None => return false,
     };
     let rec = match js_sys::Reflect::get(&window, &JsValue::from_str("__vcRecording")) {
         Ok(v) => v,
         Err(_) => {
             log::error!("[recording] window.__vcRecording not found — is recording.js loaded?");
-            return;
+            return false;
         }
     };
     let start_fn = match js_sys::Reflect::get(&rec, &JsValue::from_str("start")) {
         Ok(f) => f,
         Err(_) => {
             log::error!("[recording] window.__vcRecording.start not found");
-            return;
+            return false;
         }
     };
     let ids_array = js_sys::Array::new();
@@ -146,7 +157,7 @@ fn js_recording_start(
         Ok(f) => f,
         Err(_) => {
             log::error!("[recording] window.__vcRecording.start is not a function");
-            return;
+            return false;
         }
     };
     let args = js_sys::Array::new();
@@ -157,6 +168,8 @@ fn js_recording_start(
     if let Err(e) = start_fn.apply(&rec, &args) {
         log::error!("[recording] window.__vcRecording.start() threw: {e:?}");
     }
+    // Reached the hand-off — the JS side now owns success/failure reporting.
+    true
 }
 
 /// Call `window.__vcRecording.stop()`.
@@ -691,24 +704,44 @@ fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
     Some((base as f64 + jitter).max(500.0) as u32)
 }
 
-/// Push (or coalesce) one reaction float into `active` and schedule its
-/// lifetime-bounded removal (issue 1884). Shared by the local-echo send path
-/// and the `on_reaction` receive path so the coalesce/cap math and the timer
-/// bookkeeping live in exactly one place.
+/// `localStorage` key for the recent-CUSTOM-emoji quick-picks (issue 1884).
+/// Stored as a JSON array of at most [`crate::components::reactions::MAX_RECENT_CUSTOM_EMOJIS`]
+/// emoji strings, most-recent-first, e.g. `["😭","🎉","🚀"]`. Loaded values are
+/// re-validated against the exact standard-emoji allowlist (a tampered entry is
+/// silently dropped), so this key is safe for e2e to seed before navigation.
+const RECENT_CUSTOM_EMOJIS_KEY: &str = "reactions.recent_custom";
+
+/// Load + sanitize the persisted recent CUSTOM emojis (issue 1884). Reads the
+/// JSON array, then drops any entry that is not an exact standard emoji, plus
+/// duplicates and overflow — so a hand-edited/tampered `localStorage` value can
+/// never inject arbitrary text into the palette.
+fn load_recent_custom_emojis() -> Vec<String> {
+    sanitize_recent_custom_emojis(load_json::<Vec<String>>(
+        RECENT_CUSTOM_EMOJIS_KEY,
+        Vec::new(),
+    ))
+}
+
+/// Persist the recent CUSTOM emojis as a JSON array (issue 1884). Silently
+/// no-ops if `localStorage` is unavailable (private mode, quota).
+fn save_recent_custom_emojis(recents: &[String]) {
+    save_json(RECENT_CUSTOM_EMOJIS_KEY, &recents.to_vec());
+}
+
+/// Push one reaction float into `active` and schedule its lifetime-bounded
+/// removal (issue 1884). Shared by the local-echo send path and the
+/// `on_reaction` receive path so the cap math and the timer bookkeeping live in
+/// exactly one place.
+///
+/// EVERY reaction becomes its own float — repeats are NOT coalesced (issue 1884
+/// tweak: each repeat animates separately). `integrate_reaction` bounds the
+/// overlay by evicting the OLDEST float at the cap, so this ALWAYS mutates the
+/// list; there is no drop-at-cap early-out to predict, so we take the `write()`
+/// directly.
 ///
 /// `id_counter` mints the stable per-float id (Timeout removal key + Dioxus list
-/// key). The removal Timeout captures the float's `born_ms`; because a coalesce
-/// resets `born_ms` and schedules a fresh timer, a stale timer whose captured
-/// `born_ms` no longer matches the float is a no-op — last-write-wins on the
-/// lifetime, so a repeatedly-coalesced float lives a full lifetime from its most
-/// recent repeat rather than vanishing at the first float's deadline.
-///
-/// PERF (#1884 perf review): a reaction that would be DROPPED at the cap must
-/// not `write()` the signal — a write dirties `active_reactions` and re-renders
-/// the overlay for no change. So we predict the outcome read-only via
-/// [`would_integrate_mutate`] and only take `write()` when it will actually
-/// mutate. (No TOCTOU: this runs synchronously on the single wasm thread with no
-/// await between the read and the write.)
+/// key). The removal Timeout matches on `(id, born_ms)`; a float evicted early by
+/// the drop-oldest cap leaves a stale timer that finds nothing and no-ops.
 ///
 /// LIFECYCLE (#1884 perf review): the removal Timeout is `.forget()`-ed and can
 /// fire up to `REACTION_FLOAT_LIFETIME_MS` AFTER this component unmounts (user
@@ -724,6 +757,7 @@ fn push_reaction_float(
 ) {
     let now = js_sys::Date::now();
     let id = id_counter.get();
+    id_counter.set(id.wrapping_add(1));
     // Horizontal launch jitter in [-35, 35]% so simultaneous floats fan out
     // across the overlay instead of stacking in one column.
     let offset_pct = js_sys::Math::random() as f32 * 70.0 - 35.0;
@@ -732,49 +766,33 @@ fn push_reaction_float(
         sender_session,
         emoji,
         name,
-        count: 1,
         offset_pct,
         born_ms: now,
     };
-    // Read-only pre-check: if this reaction would be dropped at the cap, bail
-    // BEFORE any write() so the overlay is not re-rendered for a no-op. `read()`
-    // in this (non-render) context does not subscribe anything.
-    if !would_integrate_mutate(&active.read(), &incoming, now) {
-        return;
-    }
-    // A float is actually being created/coalesced, so consume the id and mutate.
-    id_counter.set(id.wrapping_add(1));
     // Scope the write guard so it is dropped before the removal Timeout closure
     // (which also writes the same signal) can run.
-    let outcome = {
+    {
         let mut list = active.write();
-        integrate_reaction(&mut list, incoming, now)
-    };
-    // Pushed and Coalesced both (re)arm a removal timer keyed on (id, born_ms).
-    // Dropped is unreachable here (would_integrate_mutate gated it out above),
-    // but handle it defensively rather than unwrap.
-    let removal_id = match outcome {
-        IntegrateOutcome::Pushed(id) | IntegrateOutcome::Coalesced(id) => id,
-        IntegrateOutcome::Dropped => return,
-    };
+        integrate_reaction(&mut list, incoming);
+    }
     Timeout::new(REACTION_FLOAT_LIFETIME_MS, move || {
         // Peek read-only first: only take write() (which re-renders the overlay)
         // when this timer's float is STILL present with the born_ms it was armed
-        // for. A stale timer — the float was coalesced and re-timed, or already
-        // removed — must NOT dirty the signal (perf review). try_read also
-        // guards unmount: it returns Err on a dropped scope, so we never touch a
-        // gone signal. (Neither try_read nor try_write here subscribes anything —
-        // this runs in a Timeout, not a render.)
+        // for. A stale timer — the float was evicted early by the drop-oldest cap
+        // or already removed — must NOT dirty the signal (perf review). try_read
+        // also guards unmount: it returns Err on a dropped scope, so we never
+        // touch a gone signal. (Neither try_read nor try_write here subscribes
+        // anything — this runs in a Timeout, not a render.)
         let still_present = active
             .try_read()
-            .map(|list| list.iter().any(|r| r.id == removal_id && r.born_ms == now))
+            .map(|list| list.iter().any(|r| r.id == id && r.born_ms == now))
             .unwrap_or(false);
         if still_present {
             // try_write (not write): the owning component may unmount between the
             // peek and here; a plain write() would panic on the dropped signal
             // (dioxus-signals 0.7 write() = try_write().unwrap()).
             if let Ok(mut list) = active.try_write() {
-                list.retain(|r| !(r.id == removal_id && r.born_ms == now));
+                list.retain(|r| !(r.id == id && r.born_ms == now));
             }
         }
     })
@@ -983,6 +1001,20 @@ fn schedule_reconnect(
                         server_wt_enabled,
                     );
 
+                    // Issue #1745 PR2 (observability only): same structured line
+                    // as the primary-join site, emitted on the token-refresh
+                    // reconnect path so a triager can see whether the user's
+                    // preference (and its source) changed the candidate lists on
+                    // reconnect vs. the initial join.
+                    let (_, pref_source) = load_transport_preference_with_source();
+                    log::info!(
+                        "Transport preference applied: pref={} source={} wt_urls={} ws_urls={}",
+                        pref,
+                        pref_source,
+                        wt.len(),
+                        ws.len()
+                    );
+
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
                         if let Err(e) = client.connect() {
@@ -1062,7 +1094,8 @@ fn schedule_reconnect_no_jwt(
 }
 
 use super::attendants_layout::{
-    compute_effective_density, compute_layout, promote_speakers, TILE_AR,
+    compute_effective_density, compute_layout, promote_speakers, screen_share_pinned_tile_size,
+    TILE_AR,
 };
 use super::density::{next_density_mode, DensityMode, DENSITY_MODES};
 
@@ -1133,6 +1166,149 @@ fn recording_event_key<'a>(source_user_id: &'a str, source_session_id: &'a str) 
         None
     } else {
         Some(source_session_id)
+    }
+}
+
+/// Which mutation a recording-set write intends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingWriteOp {
+    /// Add a session to the live recording set (a `RECORDING_STARTED` / local
+    /// `Recording` transition).
+    Insert,
+    /// Drop a session from the live recording set (a `RECORDING_STOPPED`, a
+    /// local `Idle` transition, or a departure).
+    Remove,
+}
+
+/// Whether applying `op` to `recording_peer_ids` would actually change the set,
+/// given whether the key is already present.
+///
+/// `Signal::write()` marks the signal dirty — re-rendering every reactive
+/// dependent (the roster `PeerList`, and via `any_recording_active` the meeting
+/// status bar) — REGARDLESS of whether the underlying `HashSet` changed. So a
+/// redundant `insert` of a key already present, or a `remove` of a key already
+/// absent, fans out a wasted re-render. `recording.js` fires `STOPPED` twice per
+/// recording (a clean save, then an idle transition ~3s later) and a reconnect
+/// re-announces `STARTED`, so these redundant writes are real, not theoretical.
+/// Callers gate `.write()` behind this predicate — reading membership via
+/// `.peek()` (which does NOT subscribe/dirty). An `insert` changes the set only
+/// when the key is absent; a `remove` only when the key is present. Kept pure so
+/// the guard is unit-testable and mutation-pinnable (see `mod tests`).
+fn recording_set_write_needed(op: RecordingWriteOp, key_present: bool) -> bool {
+    match op {
+        RecordingWriteOp::Insert => !key_present,
+        RecordingWriteOp::Remove => key_present,
+    }
+}
+
+/// Whether `on_peer_left` must drop the departing session from the live
+/// recording set — deliberately INDEPENDENT of the local client's reconnect
+/// state.
+///
+/// A departing recorder can no longer send `RECORDING_STOPPED`, so its icon must
+/// be cleared on departure or it sticks until page reload (the set is purely
+/// live, with no roster reconciliation). Crucially this removal must run even
+/// while the LOCAL client is mid-reconnect: the leave toast/sound IS suppressed
+/// during reconnect (issue #244, to avoid a spurious-leave storm), but the relay
+/// only ever broadcasts `PARTICIPANT_LEFT` for a GENUINE departure — a
+/// transport-only reconnect is cancelled within the grace period and never emits
+/// LEFT (see `chat_server` `pending_departures`). So every left event that
+/// reaches the UI means that exact session is truly gone and its recording icon
+/// must clear, whether or not the local client happens to be reconnecting.
+///
+/// `is_reconnecting` is accepted so this contract is explicit and mutation-
+/// pinnable: a future change that (wrongly) gated the removal on reconnect would
+/// have to alter this function, and the test would fail. The only actual guard
+/// is the shared redundant-write guard (`recording_set_write_needed`). Kept pure
+/// (see `mod tests`).
+fn should_clear_departed_recorder(is_reconnecting: bool, departing_session_in_set: bool) -> bool {
+    // Intentionally unused: the recording-set removal is NOT gated on reconnect
+    // (unlike the leave toast/sound below it) — see the doc comment.
+    let _ = is_reconnecting;
+    recording_set_write_needed(RecordingWriteOp::Remove, departing_session_in_set)
+}
+
+/// One side effect `on_peer_left` performs, listed in the ORDER it must run.
+///
+/// Extracted so the *ordering* itself is unit-testable. The headline fix for the
+/// stuck-"Recording"-status-bar bug (Item A) is NOT the
+/// [`should_clear_departed_recorder`] predicate alone — it is that the
+/// recording-set cleanup runs BEFORE the reconnect toast-suppression
+/// early-return. A test on the predicate in isolation still passes if someone
+/// moves the cleanup back below the early-return (the pre-fix ordering); a test
+/// on this ordered action list does not. `on_peer_left` is a Dioxus `VcCallback`
+/// closure (not directly unit-testable), so it is driven by [`on_peer_left_actions`]
+/// and executes the returned actions in list order — making the order a property
+/// of this pure, pinnable function rather than of closure control flow no test
+/// can observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnPeerLeftAction {
+    /// Drop the departing session from the live recording set (clears its icon
+    /// and decrements the meeting-wide `any_session_recording` aggregate).
+    /// Emitted iff the departing session is in the set (the redundant-write
+    /// guard) and, crucially, INDEPENDENT of `is_reconnecting` — so it is always
+    /// ordered ahead of `SuppressLeaveAndReturn`.
+    ClearRecordingIcon,
+    /// Suppress the leave toast + sound and stop processing (the reconnect
+    /// early-return, issue #244). Terminal: no action follows it.
+    SuppressLeaveAndReturn,
+    /// Enter the normal (non-reconnect) leave path, where the toast and/or sound
+    /// are shown subject to appearance settings. Terminal.
+    ProcessLeaveNotification,
+}
+
+/// The ORDERED list of [`OnPeerLeftAction`]s `on_peer_left` must execute for one
+/// `PARTICIPANT_LEFT` event, given the local client's reconnect state and whether
+/// the departing session is currently in the recording set. See
+/// [`OnPeerLeftAction`] for why the ORDER (not just the membership predicate) is
+/// the thing under test. Kept pure so it is mutation-pinnable (see `mod tests`).
+fn on_peer_left_actions(
+    is_reconnecting: bool,
+    departing_session_in_set: bool,
+) -> Vec<OnPeerLeftAction> {
+    let mut actions = Vec::new();
+    // (1) Recording-set cleanup FIRST — NOT gated on reconnect. This ordering IS
+    // the Item A fix: a recorder that departs while the LOCAL client is
+    // reconnecting must still lose its icon, so the clear is emitted ahead of any
+    // early-return. Membership-guarded to avoid a redundant re-render.
+    if should_clear_departed_recorder(is_reconnecting, departing_session_in_set) {
+        actions.push(OnPeerLeftAction::ClearRecordingIcon);
+    }
+    // (2) THEN the reconnect early-return suppresses the toast/sound and stops.
+    if is_reconnecting {
+        actions.push(OnPeerLeftAction::SuppressLeaveAndReturn);
+        return actions;
+    }
+    // (3) Otherwise fall through to the normal leave-notification path.
+    actions.push(OnPeerLeftAction::ProcessLeaveNotification);
+    actions
+}
+
+/// What the Record button's `Idle` onclick handler must do after attempting the
+/// JS hand-off to `window.__vcRecording.start(...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingStartOutcome {
+    /// The hand-off reached `start_fn.apply(...)` — retain the state callback and
+    /// broadcast `RECORDING_STARTED` to peers. (Whether recording ACTUALLY began
+    /// is reported separately by the JS `onStateChange` callback.)
+    Announce,
+    /// The hand-off failed before calling into JS (recording.js missing /
+    /// malformed — stale cache, 404, load failure). The JS `onStateChange`
+    /// callback will never fire, so `record_state` would stay `Idle` forever and
+    /// `RECORDING_STOPPED` would never be sent — leaving every peer with a
+    /// permanent phantom "Recording" banner. So do NOT retain the callback or
+    /// announce; surface an error to the local user instead.
+    ShowError,
+}
+
+/// Map the result of [`js_recording_start`] (did we successfully hand off to the
+/// JS side?) to the action the onclick handler must take. Kept pure so the
+/// gate is unit-testable and mutation-pinnable (see `mod tests`).
+fn recording_start_outcome(js_handoff_ok: bool) -> RecordingStartOutcome {
+    if js_handoff_ok {
+        RecordingStartOutcome::Announce
+    } else {
+        RecordingStartOutcome::ShowError
     }
 }
 
@@ -2093,6 +2269,11 @@ pub fn AttendantsComponent(
     let any_recording_active = use_memo(move || any_session_recording(&recording_peer_ids.read()));
     // Brief "Recording saved" toast shown to the recorder when recording completes.
     let recording_saved_toast: Signal<bool> = use_signal(|| false);
+    // Brief error toast shown to the local user when a Record click could not
+    // hand off to the JS recorder (recording.js missing / stale / 404). Without
+    // it the click would fail silently — no state change, and no way for the
+    // user to learn recording never started. See `recording_start_outcome`.
+    let recording_error_toast: Signal<bool> = use_signal(|| false);
     // Stable JS closure passed to `window.__vcRecording.start()` so the JS
     // callback updates `record_state` when the recorder transitions.
     #[allow(clippy::type_complexity)]
@@ -2151,6 +2332,16 @@ pub fn AttendantsComponent(
     let reaction_announcement: Signal<String> = use_signal(String::new);
     let reaction_sr_buffer = use_hook(|| Rc::new(RefCell::new(Vec::<(String, String)>::new())));
     let reaction_sr_flush_scheduled = use_hook(|| Rc::new(Cell::new(false)));
+    // Issue 1884: standard-emoji picker for the CUSTOM reaction. `emoji_picker_open`
+    // toggles the browser panel appended below the quick row; `emoji_group` is the
+    // selected category tab. Only the SELECTED category's grid is mounted at a time
+    // (see the palette RSX), so we never render the full ~3600-emoji table at once.
+    let mut emoji_picker_open = use_signal(|| false);
+    let emoji_group: Signal<emojis::Group> = use_signal(|| emojis::Group::SmileysAndEmotion);
+    // Issue 1884: the last <=3 CUSTOM (picker) emojis, shown as palette quick-picks.
+    // Seeded from localStorage (sanitized against the allowlist on load), updated
+    // most-recent-first with dedupe + cap on every custom send, and re-persisted.
+    let mut recent_custom_emojis: Signal<Vec<String>> = use_signal(load_recent_custom_emojis);
 
     // When the popover opens, seed the highlight from the current mode
     // and auto-focus that option after the DOM settles.
@@ -2202,6 +2393,14 @@ pub fn AttendantsComponent(
         use_effect(move || {
             if !reactions_open() {
                 reaction_autohide_gen.set(reaction_autohide_gen.get().wrapping_add(1));
+                // Issue 1884: also collapse the emoji picker so a later reopen of
+                // the palette starts on the quick row, never mid-picker. `peek()`
+                // avoids subscribing this effect to `emoji_picker_open` (it
+                // depends only on `reactions_open`); the write is a cheap no-op
+                // when the picker is already closed.
+                if *emoji_picker_open.peek() {
+                    emoji_picker_open.set(false);
+                }
             }
         });
     }
@@ -2769,6 +2968,29 @@ pub fn AttendantsComponent(
             server_wt_enabled,
         );
 
+        // Issue #1745 PR2 (observability only): record the user's transport
+        // preference and how it filtered the candidate lists at this call site
+        // (primary in-call join). We log `transport_pref` — the value from the
+        // context signal that ACTUALLY filtered the two lists above, so the
+        // logged pref and URL counts can never contradict each other — and pair
+        // it with the provenance tag, which the signal doesn't carry. The signal
+        // is seeded from this same storage at boot and only changes via a
+        // page-reload path, so within one wasm lifetime the tag describes the
+        // applied value. (The only divergence is a cross-tab localStorage change
+        // without a reload, where the fresh-read tag could label a signal value
+        // this tab hasn't picked up — a log-only cosmetic mismatch; selection
+        // still uses `transport_pref`.) Lets a triager tell "WT list empty
+        // because the server disabled it" from "empty because the user pinned
+        // WebSocket".
+        let (_, pref_source) = load_transport_preference_with_source();
+        log::info!(
+            "Transport preference applied: pref={} source={} wt_urls={} ws_urls={}",
+            transport_pref,
+            pref_source,
+            webtransport_urls.len(),
+            websocket_urls.len()
+        );
+
         log::info!(
             "DIOXUS-UI: Creating VideoCallClient for {} in meeting {}",
             initial_display_name,
@@ -2814,14 +3036,36 @@ pub fn AttendantsComponent(
                 let reaction_sr_flush_scheduled = reaction_sr_flush_scheduled.clone();
                 let reaction_id_counter = reaction_id_counter.clone();
                 Some(VcCallback::from(
-                    move |(sender_session, reaction_value, name): (u64, i32, String)| {
-                        if let Some((emoji, label, _slug)) = reaction_glyph_from_i32(reaction_value)
+                    move |(sender_session, reaction_value, name, custom): (
+                        u64,
+                        i32,
+                        String,
+                        Option<String>,
+                    )| {
+                        // Resolve the (emoji, SR label) to render. CUSTOM (12)
+                        // renders the validated custom emoji string; 1..=11 use
+                        // the static glyph table. The client already validated a
+                        // received CUSTOM emoji, but we re-validate here as
+                        // defense in depth before render (proto threat model);
+                        // an invalid one is dropped with a debug log. For CUSTOM
+                        // the emoji doubles as its SR label (assistive tech reads
+                        // the emoji's Unicode name).
+                        let resolved: Option<(String, String)> = if reaction_value
+                            == ReactionType::CUSTOM as i32
                         {
+                            custom
+                                .filter(|s| validate_custom_emoji(s))
+                                .map(|s| (s.clone(), s))
+                        } else {
+                            reaction_glyph_from_i32(reaction_value)
+                                .map(|(emoji, label, _slug)| (emoji.to_string(), label.to_string()))
+                        };
+                        if let Some((emoji, label)) = resolved {
                             push_reaction_float(
                                 active_reactions,
                                 &reaction_id_counter,
                                 sender_session,
-                                emoji.to_string(),
+                                emoji,
                                 name.clone(),
                             );
                             schedule_reaction_announcement(
@@ -2829,8 +3073,10 @@ pub fn AttendantsComponent(
                                 &reaction_sr_buffer,
                                 &reaction_sr_flush_scheduled,
                                 name,
-                                label.to_string(),
+                                label,
                             );
+                        } else if reaction_value == ReactionType::CUSTOM as i32 {
+                            log::debug!("Dropping CUSTOM reaction with invalid emoji at render");
                         }
                     },
                 ))
@@ -3302,10 +3548,21 @@ pub fn AttendantsComponent(
                         // tab of the same account is not falsely marked recording.
                         // Covers late joiners too — the local recorder re-announces
                         // STARTED to each new peer in `on_peer_joined`.
+                        // Guard the write behind a `peek` membership check — an
+                        // unconditional `write()` marks the signal dirty and
+                        // re-renders the roster + `any_recording_active` even when
+                        // the key is already present (a reconnect re-announce of a
+                        // still-recording peer). Mirrors the `on_peer_left` and
+                        // STOPPED sites via the shared `recording_set_write_needed`.
                         if let Some(key) = recording_event_key(&source_user_id, &source_session_id)
                         {
                             let mut rec_ids = recording_peer_ids;
-                            rec_ids.write().insert(key.to_string());
+                            if recording_set_write_needed(
+                                RecordingWriteOp::Insert,
+                                rec_ids.peek().contains(key),
+                            ) {
+                                rec_ids.write().insert(key.to_string());
+                            }
                         }
                     } else if event_type == videocall_client::PEER_EVENT_RECORDING_STOPPED {
                         log::info!(
@@ -3313,10 +3570,22 @@ pub fn AttendantsComponent(
                         );
                         // Removal by SESSION id is naturally correct with several
                         // concurrent recorders — it only affects THIS session's icon.
+                        // Guard the write behind a `peek` membership check — an
+                        // unconditional `write()` marks the signal dirty even when
+                        // the key is already absent. `recording.js` fires STOPPED
+                        // TWICE per recording (a clean save, then an idle transition
+                        // ~3s later), so the second one would otherwise re-render the
+                        // roster + `any_recording_active` for no reason. Mirrors the
+                        // `on_peer_left` and STARTED sites via `recording_set_write_needed`.
                         if let Some(key) = recording_event_key(&source_user_id, &source_session_id)
                         {
                             let mut rec_ids = recording_peer_ids;
-                            rec_ids.write().remove(key);
+                            if recording_set_write_needed(
+                                RecordingWriteOp::Remove,
+                                rec_ids.peek().contains(key),
+                            ) {
+                                rec_ids.write().remove(key);
+                            }
                         }
                     } else {
                         log::debug!("Ignoring PEER_EVENT with unknown event_type: {event_type}");
@@ -3329,18 +3598,74 @@ pub fn AttendantsComponent(
                     move |(display_name, user_id, session_id): (String, String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
 
-                        // Suppress replayed "left" events during a transport reconnect.
-                        // The server replays the member list on reconnect (see issue 244),
-                        // which would otherwise fire a spurious leave toast + sound that
-                        // a following replayed "joined" cancels - ~30 toasts in a 15-person
-                        // meeting after a network blip. Mirrors the on_peer_joined guard.
-                        if let Some(ref client) = *client_cell.borrow() {
-                            if client.is_reconnecting() {
-                                log::debug!(
-                                    "Suppressing leave toast for {} (reconnecting)",
-                                    display_name
-                                );
-                                return;
+                        let is_reconnecting = client_cell
+                            .borrow()
+                            .as_ref()
+                            .map(|client| client.is_reconnecting())
+                            .unwrap_or(false);
+
+                        // A departing recorder can no longer send RECORDING_STOPPED,
+                        // so drop its recording icon (and decrement the meeting-wide
+                        // `any_session_recording` aggregate that drives the persistent
+                        // indicator). The set is keyed by SESSION id (per-recorder), so
+                        // remove the departing session — a sibling session of the
+                        // same user_id that is still recording keeps its own icon.
+                        //
+                        // This MUST run BEFORE the reconnect toast-suppression
+                        // early-return below: unlike the toast/sound (which IS
+                        // suppressed during reconnect — issue #244), the relay only
+                        // ever broadcasts PARTICIPANT_LEFT for a GENUINE departure (a
+                        // transport-only reconnect is cancelled within the grace
+                        // period and never emits LEFT — see chat_server
+                        // `pending_departures`), so every left event means that exact
+                        // session is truly gone and its icon must clear even mid-
+                        // reconnect. If gated by the early-return, a recorder that
+                        // departs while the LOCAL client is reconnecting would leave
+                        // a stuck "Recording" status bar until page reload (the set
+                        // has no other reconciliation). `should_clear_departed_recorder`
+                        // encodes the "not gated on reconnect" contract; the write is
+                        // still `peek`-guarded (via the shared `recording_set_write_needed`)
+                        // to avoid a redundant re-render when the departing peer
+                        // wasn't recording — the common case during reconnection waves.
+                        // Drive the ordered side effects from the pure, unit-tested
+                        // `on_peer_left_actions` so the ORDERING (clear-before-return)
+                        // is a property of a mutation-pinnable function, not of closure
+                        // control flow no test can observe. Iterating the list in order
+                        // means the recording-icon clear physically runs BEFORE the
+                        // reconnect early-return; if the list ever ordered `Suppress`
+                        // first, this loop would `return` before clearing — exactly the
+                        // regression `on_peer_left_clears_recording_before_reconnect_return`
+                        // guards against.
+                        let mut rec_ids = recording_peer_ids;
+                        let actions = on_peer_left_actions(
+                            is_reconnecting,
+                            rec_ids.peek().contains(&session_id),
+                        );
+                        for action in &actions {
+                            match action {
+                                OnPeerLeftAction::ClearRecordingIcon => {
+                                    // Emitted only when the session is in the set
+                                    // (redundant-write guarded by `on_peer_left_actions`
+                                    // → `recording_set_write_needed`), so this write
+                                    // always changes the set.
+                                    rec_ids.write().remove(&session_id);
+                                }
+                                OnPeerLeftAction::SuppressLeaveAndReturn => {
+                                    // Reconnect early-return (issue 244): the server
+                                    // replays the member list on reconnect, which would
+                                    // otherwise fire a spurious leave toast + sound that a
+                                    // following replayed "joined" cancels — ~30 toasts in a
+                                    // 15-person meeting after a network blip. The clear
+                                    // above has already run regardless of this suppression.
+                                    log::debug!(
+                                        "Suppressing leave toast for {} (reconnecting)",
+                                        display_name
+                                    );
+                                    return;
+                                }
+                                // Non-reconnect path: fall through to the normal
+                                // leave-notification block below.
+                                OnPeerLeftAction::ProcessLeaveNotification => {}
                             }
                         }
 
@@ -3350,25 +3675,6 @@ pub fn AttendantsComponent(
                             || !matches!(*record_state.peek(), RecordButtonState::Idle);
                         let play_sound = settings.play_exit_sound;
                         drop(settings);
-
-                        // A departing recorder can no longer send RECORDING_STOPPED,
-                        // so drop its recording icon (and decrement the meeting-wide
-                        // `any_session_recording` aggregate that drives the persistent
-                        // indicator). The set is keyed by SESSION id (per-recorder), so
-                        // remove the departing session — a sibling session of the
-                        // same user_id that is still recording keeps its own icon.
-                        // Guard the write behind a `peek` membership check — an
-                        // unconditional `write()` marks the signal dirty and
-                        // re-renders every PeerTile + the peer list even when the
-                        // departing peer wasn't recording (the common case), which
-                        // fans out O(n) wasted re-renders during reconnection waves.
-                        // Mirrors the other `peek`-guarded set writes in this file.
-                        {
-                            let mut rec_ids = recording_peer_ids;
-                            if rec_ids.peek().contains(&session_id) {
-                                rec_ids.write().remove(&session_id);
-                            }
-                        }
 
                         if show_toast {
                             let mut toast_counter = toast_counter;
@@ -3713,6 +4019,18 @@ pub fn AttendantsComponent(
                                     crate::constants::webtransport_enabled().unwrap_or(false);
                                 let (_enable_wt, ws, wt) =
                                     resolve_transport_config(pref, server_wt_enabled, ws, wt);
+                                // Issue #1745 PR2 (observability only): same
+                                // structured line as the other call sites,
+                                // emitted from the re-election token-refresh
+                                // callback (JWT-auth build only).
+                                let (_, pref_source) = load_transport_preference_with_source();
+                                log::info!(
+                                    "Transport preference applied: pref={} source={} wt_urls={} ws_urls={}",
+                                    pref,
+                                    pref_source,
+                                    wt.len(),
+                                    ws.len()
+                                );
                                 log::info!(
                                     "DIOXUS-UI: refresh_room_token_callback succeeded — providing {} ws / {} wt URLs to ConnectionManager",
                                     ws.len(),
@@ -7139,16 +7457,48 @@ pub fn AttendantsComponent(
     let container_style = if has_screen_share {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85).
         // The container is full-bleed; the overlay drawers float over it without reflowing it.
+        //
+        // `--tile-w`/`--tile-h` MUST be set explicitly here (PR #1946). The
+        // pinned split-tile chrome — `.split-peer-tile.grid-item-pinned` name
+        // badge, top-icon cluster and camera-off placeholder in style.css —
+        // scales off these custom properties. A pinned side-panel tile is
+        // `position: fixed; width/height: 100%` (it MAXIMIZES over the shared
+        // screen), so the vars must describe that maximized tile, which is the
+        // single full meeting-area 3:2 tile (`screen_share_pinned_tile_size`),
+        // NOT the small side-panel thumbnail and NOT a participant-count-
+        // dependent grid cell.
+        //
+        // CROSS-RENDER DEPENDENCY — DO NOT REMOVE THESE TWO DECLARATIONS.
+        // Before PR #1946 this branch omitted `--tile-w`/`--tile-h` and relied
+        // on an UNDOCUMENTED Dioxus behavior: `dioxus-interpreter-js`'s
+        // `set_attribute.ts` saves the element's existing inline style
+        // properties, applies the new `style` string, then RESTORES any old
+        // property the new string does not mention (it treats "absent" as
+        // "unchanged", not "cleared"). So the `--tile-w`/`--tile-h` written by a
+        // PRIOR grid-branch render (the `else` arm below) silently persisted
+        // into screen-share mode. `has_screen_share_sig` defaults to `false` on
+        // mount, so the grid arm always runs at least once first — the frozen
+        // value was therefore whatever `tile_count` the last pre-share grid
+        // render happened to have, which SHRINKS as tiles grow. Two clients in
+        // the same meeting could freeze DIFFERENT pinned-chrome sizes for the
+        // same objective state (nondeterministic by join/render order). Setting
+        // the vars here severs that reliance. Note this merge-preserve behavior
+        // is specific to the single `style: "{…}"` string form used at this call
+        // site (see `set_attribute.ts`'s `case "style"` branch) — so removing
+        // these declarations would break silently, with no compile error.
+        //
         // The status bar reserve is folded into the top padding on the SAME
         // condition as the grid path, so the share/participant panels never sit
         // under the bar while recording is active. 16px is the base top padding.
+        let (ss_tw, ss_th) = screen_share_pinned_tile_size(avail_w, avail_h);
         let ss_pad_top = 16.0 + status_bar_reserve;
         format!(
             "position: absolute; left: 0; right: 0; top: 0; bottom: 0; height: 100%; \
              display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
              padding: {ss_pad_top:.0}px 16px 80px 16px; \
              align-items: stretch; box-sizing: border-box; \
-             grid-template-columns: none; grid-template-rows: none;"
+             grid-template-columns: none; grid-template-rows: none; \
+             --tile-w: {ss_tw:.0}px; --tile-h: {ss_th:.0}px;"
         )
     } else {
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
@@ -7701,6 +8051,54 @@ pub fn AttendantsComponent(
         })
     };
 
+    // Issue 1884: send a CUSTOM reaction carrying a picker-selected standard
+    // emoji. Mirrors `send_reaction`'s press-gate + self-throttle + local-echo +
+    // auto-hide, but keyed on the emoji STRING. The picker only offers emoji that
+    // pass `validate_custom_emoji`, and the client re-validates at the wire
+    // boundary; we validate here too (defense in depth) so an invalid string is
+    // never sent OR echoed. The picker (and palette) stay OPEN after a click so
+    // the user can fire several — matching the quick-row semantics.
+    let send_custom_reaction: EventHandler<String> = {
+        let client = client.clone();
+        let reaction_throttle = reaction_throttle.clone();
+        let reaction_id_counter = reaction_id_counter.clone();
+        let reaction_autohide_gen = reaction_autohide_gen.clone();
+        let reaction_last_press = reaction_last_press.clone();
+        EventHandler::new(move |emoji: String| {
+            // Reject anything not on the exact standard-emoji allowlist before any
+            // work (also blocks a stale/garbled grid value).
+            if !validate_custom_emoji(&emoji) {
+                return;
+            }
+            let now = js_sys::Date::now();
+            // Same held-key/rapid press gate as the quick row (shares the clock).
+            if now - reaction_last_press.get() < 150.0 {
+                return;
+            }
+            reaction_last_press.set(now);
+            let allowed = reaction_throttle.borrow_mut().try_acquire(now);
+            if allowed && client.send_custom_reaction(&emoji) {
+                // Record it as the most-recent CUSTOM quick-pick (dedupe + cap)
+                // and persist, BEFORE the echo consumes `emoji`. peek() keeps
+                // this event handler from subscribing to its own write.
+                let mut updated = recent_custom_emojis.peek().clone();
+                push_recent_custom_emoji(&mut updated, &emoji);
+                save_recent_custom_emojis(&updated);
+                recent_custom_emojis.set(updated);
+                // Relay self-skips the sender: render our own echo locally.
+                push_reaction_float(
+                    active_reactions,
+                    &reaction_id_counter,
+                    u64::MAX,
+                    emoji,
+                    "You".to_string(),
+                );
+            }
+            // Keep the palette/picker open on every click (throttled or not).
+            arm_reaction_autohide(reactions_open, &reaction_autohide_gen);
+        })
+    };
+
     rsx! {
         div {
             // Provide MeetingTime context
@@ -7838,6 +8236,7 @@ pub fn AttendantsComponent(
                     || screen_share_toast_state().is_some()
                     || !matches!(record_state(), RecordButtonState::Idle)
                     || recording_saved_toast()
+                    || recording_error_toast()
                 {
                     div { class: "peer-toasts",
                         // Local recording status banner — visible only to the participant who started recording.
@@ -7876,6 +8275,20 @@ pub fn AttendantsComponent(
                                 span { class: "rec-dot" }
                                 span { class: "toast-text",
                                     span { class: "toast-name", "Recording saved" }
+                                }
+                            }
+                        }
+                        // Recording-failed notification — shown briefly to the local user when a
+                        // Record click could not hand off to the JS recorder (recording.js
+                        // missing / stale / 404). `role="alert"` so it is announced assertively.
+                        if recording_error_toast() {
+                            div {
+                                class: "peer-toast recording-error-banner",
+                                role: "alert",
+                                aria_live: "assertive",
+                                aria_label: "Couldn't start recording",
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Couldn't start recording. Please refresh and try again." }
                                 }
                             }
                         }
@@ -9019,44 +9432,14 @@ pub fn AttendantsComponent(
                                                                                     }
                                                                                 };
 
-                                                                                let width_constraint = js_sys::Object::new();
-                                                                                let _ = js_sys::Reflect::set(
-                                                                                    &width_constraint,
-                                                                                    &JsValue::from_str("ideal"),
-                                                                                    &JsValue::from_f64(1920.0),
-                                                                                );
-                                                                                let height_constraint = js_sys::Object::new();
-                                                                                let _ = js_sys::Reflect::set(
-                                                                                    &height_constraint,
-                                                                                    &JsValue::from_str("ideal"),
-                                                                                    &JsValue::from_f64(1080.0),
-                                                                                );
-                                                                                let framerate_constraint = js_sys::Object::new();
-                                                                                let _ = js_sys::Reflect::set(
-                                                                                    &framerate_constraint,
-                                                                                    &JsValue::from_str("ideal"),
-                                                                                    &JsValue::from_f64(10.0),
-                                                                                );
-                                                                                let video_constraints = js_sys::Object::new();
-                                                                                let _ = js_sys::Reflect::set(
-                                                                                    &video_constraints,
-                                                                                    &JsValue::from_str("width"),
-                                                                                    &width_constraint.into(),
-                                                                                );
-                                                                                let _ = js_sys::Reflect::set(
-                                                                                    &video_constraints,
-                                                                                    &JsValue::from_str("height"),
-                                                                                    &height_constraint.into(),
-                                                                                );
-                                                                                let _ = js_sys::Reflect::set(
-                                                                                    &video_constraints,
-                                                                                    &JsValue::from_str("frameRate"),
-                                                                                    &framerate_constraint.into(),
-                                                                                );
-
-                                                                                let constraints = web_sys::DisplayMediaStreamConstraints::new();
-                                                                                constraints.set_video(&video_constraints.into());
-                                                                                constraints.set_audio(&JsValue::FALSE);
+                                                                                // issue 1973: request the shared capture resolution ceiling
+                                                                                // (max 1920x1080) so a native 4K / ultra-wide source is bounded at
+                                                                                // capture time. This is the PRIMARY capture path (Safari needs
+                                                                                // getDisplayMedia in the sync gesture handler; Chrome/Firefox reuse
+                                                                                // the pre-acquired stream too), so the ceiling MUST be applied here,
+                                                                                // not only in ScreenEncoder::start().
+                                                                                let constraints =
+                                                                                    videocall_client::screen_capture_display_constraints(true);
 
                                                                                 let promise = match media_devices
                                                                                     .get_display_media_with_constraints(&constraints)
@@ -9069,19 +9452,44 @@ pub fn AttendantsComponent(
                                                                                 };
                                                                                 screen_share_state.set(ScreenShareState::Requesting);
                                                                                 let cell = stream_cell.clone();
+                                                                                // issue 1973: clone the handle so the async block can retry once
+                                                                                // without the ceiling if the browser rejects it (OverconstrainedError).
+                                                                                let media_devices_retry = media_devices.clone();
                                                                                 wasm_bindgen_futures::spawn_local(async move {
-                                                                                    match JsFuture::from(promise).await {
+                                                                                    // issue 1973: on OverconstrainedError retry ONCE without the
+                                                                                    // ceiling so it can never itself kill screen share.
+                                                                                    let acquired = match JsFuture::from(promise).await {
+                                                                                        Ok(stream) => Ok(stream),
+                                                                                        Err(e) => {
+                                                                                            let name = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+                                                                                                .ok()
+                                                                                                .and_then(|v| v.as_string())
+                                                                                                .unwrap_or_default();
+                                                                                            if videocall_client::should_retry_screen_capture_without_ceiling(
+                                                                                                &name, false,
+                                                                                            ) {
+                                                                                                log::warn!("issue 1973: getDisplayMedia rejected the capture resolution ceiling (OverconstrainedError); retrying without max");
+                                                                                                let fallback =
+                                                                                                    videocall_client::screen_capture_display_constraints(false);
+                                                                                                match media_devices_retry
+                                                                                                    .get_display_media_with_constraints(&fallback)
+                                                                                                {
+                                                                                                    Ok(p) => JsFuture::from(p).await,
+                                                                                                    Err(e2) => Err(e2),
+                                                                                                }
+                                                                                            } else {
+                                                                                                Err(e)
+                                                                                            }
+                                                                                        }
+                                                                                    };
+                                                                                    match acquired {
                                                                                         Ok(stream) => {
-                                                                                            let media_stream: web_sys::MediaStream = stream
-                                                                                                .unchecked_into();
+                                                                                            let media_stream: web_sys::MediaStream = stream.unchecked_into();
                                                                                             cell.borrow_mut().replace(media_stream);
                                                                                             screen_share_state.set(ScreenShareState::StreamReady);
                                                                                         }
                                                                                         Err(e) => {
-                                                                                            let is_cancel = js_sys::Reflect::get(
-                                                                                                    &e,
-                                                                                                    &JsValue::from_str("name"),
-                                                                                                )
+                                                                                            let is_cancel = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
                                                                                                 .ok()
                                                                                                 .and_then(|v| v.as_string())
                                                                                                 .map(|n| n == "NotAllowedError")
@@ -9286,20 +9694,49 @@ pub fn AttendantsComponent(
                                                                                                 if js_state == "saved" {
                                                                                                     let mut saved = recording_saved_toast;
                                                                                                     saved.set(true);
-                                                                                                    Timeout::new(6_000, move || saved.set(false)).forget();
+                                                                                                    // The removal Timeout is `.forget()`-ed and can fire up
+                                                                                                    // to 6s AFTER this component unmounts (user leaves the
+                                                                                                    // meeting right after a save completes). In dioxus-signals
+                                                                                                    // 0.7 `set()` == `try_write().unwrap()` and PANICS on a
+                                                                                                    // dropped scope (in wasm this can wedge the SPA), so use
+                                                                                                    // `try_write()` and no-op if the signal is already gone —
+                                                                                                    // matching the reaction-float timer precedent above.
+                                                                                                    Timeout::new(6_000, move || {
+                                                                                                        if let Ok(mut t) = saved.try_write() {
+                                                                                                            *t = false;
+                                                                                                        }
+                                                                                                    })
+                                                                                                    .forget();
                                                                                                 }
                                                                                             }
                                                                                             // Add/remove OUR OWN recording icon based on the
                                                                                             // transition: insert on Recording, remove on Idle
                                                                                             // (save or abort), untouched during busy states.
+                                                                                            // Peek-guard both writes via the shared
+                                                                                            // `recording_set_write_needed` predicate, exactly like the
+                                                                                            // remote STARTED/STOPPED and `on_peer_left` sites.
+                                                                                            // `recording.js` fires `saved` then `idle` ~3s apart, so the
+                                                                                            // local Remove would otherwise fire twice and the second
+                                                                                            // (key already absent) would dirty the signal and re-render
+                                                                                            // the roster + `any_recording_active` for no change.
                                                                                             match local_recording_set_op(&new_state) {
                                                                                                 LocalRecordingSetOp::Insert => {
-                                                                                                    if !self_session.is_empty() {
+                                                                                                    if !self_session.is_empty()
+                                                                                                        && recording_set_write_needed(
+                                                                                                            RecordingWriteOp::Insert,
+                                                                                                            rec_ids.peek().contains(&self_session),
+                                                                                                        )
+                                                                                                    {
                                                                                                         rec_ids.write().insert(self_session.clone());
                                                                                                     }
                                                                                                 }
                                                                                                 LocalRecordingSetOp::Remove => {
-                                                                                                    rec_ids.write().remove(&self_session);
+                                                                                                    if recording_set_write_needed(
+                                                                                                        RecordingWriteOp::Remove,
+                                                                                                        rec_ids.peek().contains(&self_session),
+                                                                                                    ) {
+                                                                                                        rec_ids.write().remove(&self_session);
+                                                                                                    }
                                                                                                 }
                                                                                                 LocalRecordingSetOp::Noop => {}
                                                                                             }
@@ -9308,21 +9745,54 @@ pub fn AttendantsComponent(
                                                                                     );
                                                                                     let js_fn: &js_sys::Function =
                                                                                         cb.as_ref().unchecked_ref();
-                                                                                    js_recording_start(
+                                                                                    let handoff_ok = js_recording_start(
                                                                                         &peer_ids,
                                                                                         js_fn,
                                                                                         &current_display_name(),
                                                                                         is_owner,
                                                                                     );
-                                                                                    *state_cb_clone.borrow_mut() = Some(cb);
-                                                                                    for session_id in &peer_ids {
-                                                                                        if let Some(uid) =
-                                                                                            rec_client.get_peer_user_id(session_id)
-                                                                                        {
-                                                                                            rec_client.send_peer_event(
-                                                                                                &uid,
-                                                                                                videocall_client::PEER_EVENT_RECORDING_STARTED,
+                                                                                    // Only retain the state callback and announce
+                                                                                    // RECORDING_STARTED to peers if the JS hand-off
+                                                                                    // succeeded. If it failed, the JS `onStateChange`
+                                                                                    // callback will never fire, so `record_state` stays
+                                                                                    // Idle and RECORDING_STOPPED is never sent — announcing
+                                                                                    // here would leave every peer with a permanent phantom
+                                                                                    // "Recording" banner. Surface an error to the local
+                                                                                    // user instead. See `recording_start_outcome`.
+                                                                                    match recording_start_outcome(handoff_ok) {
+                                                                                        RecordingStartOutcome::Announce => {
+                                                                                            *state_cb_clone.borrow_mut() = Some(cb);
+                                                                                            for session_id in &peer_ids {
+                                                                                                if let Some(uid) =
+                                                                                                    rec_client.get_peer_user_id(session_id)
+                                                                                                {
+                                                                                                    rec_client.send_peer_event(
+                                                                                                        &uid,
+                                                                                                        videocall_client::PEER_EVENT_RECORDING_STARTED,
+                                                                                                    );
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                        RecordingStartOutcome::ShowError => {
+                                                                                            // Drop `cb` (do not store it) — nothing owns it,
+                                                                                            // so the closure is freed. `record_state` was
+                                                                                            // never forced to Recording, so it stays Idle and
+                                                                                            // the button remains clickable for a retry.
+                                                                                            log::error!(
+                                                                                                "[recording] start hand-off failed — recording.js unavailable; not announcing to peers"
                                                                                             );
+                                                                                            let mut err_toast = recording_error_toast;
+                                                                                            err_toast.set(true);
+                                                                                            // `.forget()`-ed: can fire up to 6s after the component
+                                                                                            // unmounts (user leaves the meeting within 6s of a failed
+                                                                                            // hand-off). `set()` == `try_write().unwrap()` PANICS on a
+                                                                                            // dropped scope, so use `try_write()` and no-op if gone.
+                                                                                            Timeout::new(6_000, move || {
+                                                                                                if let Ok(mut t) = err_toast.try_write() {
+                                                                                                    *t = false;
+                                                                                                }
+                                                                                            })
+                                                                                            .forget();
                                                                                         }
                                                                                     }
                                                                                 }
@@ -10873,16 +11343,17 @@ pub fn AttendantsComponent(
 
                 // Issue 1884: reactions palette — a fixed, screen-centered
                 // TOOLBAR (UX B2). role=toolbar (not menu): the palette persists
-                // after activation and holds a non-menuitem close (X), which SR
-                // menu mode would hide — toolbar semantics fit a persistent strip
-                // of controls. Arrow/Home/End move the roving highlight across the
-                // 7 option buttons; Enter/Space is native <button> activation;
-                // Tab is NOT intercepted, so it flows highlighted-option -> X ->
-                // out of the toolbar (the X's keyboard reachability — the roving
-                // is keyed on ReactionType, so threading the X into it is
-                // invasive; the accepted fallback is to let Tab reach it). Escape
-                // bubbles to #main-container's popover-tier chain. NOT gated on
-                // `has_screen_share`: reacting must work while someone presents.
+                // after activation and holds non-menuitem controls (recents, More
+                // emoji, close X) which SR menu mode would hide — toolbar semantics
+                // fit a persistent strip of controls. Arrow/Home/End move the
+                // roving highlight across the 11 fixed reaction buttons ONLY;
+                // Enter/Space is native <button> activation; Tab is NOT
+                // intercepted, so it flows highlighted-option -> recents -> More
+                // emoji -> X -> (picker grid, when open) -> out of the toolbar (the
+                // roving is keyed on ReactionType, so the recents/More/X sit
+                // outside it; the accepted fallback is to let Tab reach them).
+                // Escape bubbles to #main-container's popover-tier chain. NOT gated
+                // on `has_screen_share`: reacting must work while someone presents.
                 if reactions_open() {
                     div { class: "reactions-palette",
                         id: "reactions-palette",
@@ -10928,8 +11399,9 @@ pub fn AttendantsComponent(
                             }
                             // No Tab branch (UX B2): a toolbar does not trap Tab.
                             // Letting it through moves focus highlighted-option ->
-                            // X -> out, which is how the X becomes keyboard
-                            // reachable. Escape still closes (via #main-container).
+                            // recents -> More emoji -> X -> out, which is how those
+                            // non-roving controls become keyboard reachable. Escape
+                            // still closes (via #main-container).
                         },
                         for reaction in REACTIONS {
                             {
@@ -10972,15 +11444,75 @@ pub fn AttendantsComponent(
                                 }
                             }
                         }
-                        // Issue 1884: manual close (X), last control in the
-                        // toolbar (UX B2). Closes immediately and restores focus
-                        // to the trigger, exactly like the Escape path. Reuses
-                        // the shared `.close-button` tokens (scoped to 44px + a
-                        // focus ring in style.css). Keyboard-reachable via Tab now
-                        // that the toolbar does not trap Tab: default tabindex 0,
-                        // so from the highlighted (roving) option Tab lands here.
+                        // Issue 1884: recent CUSTOM emojis as quick-picks — the last
+                        // <=3 picker emojis, most-recent-first, grouped AFTER the
+                        // fixed reactions and adjacent to "More emoji". A thin
+                        // divider (aria-hidden) sets them apart only when non-empty;
+                        // an empty recents list renders nothing (no placeholders).
+                        // Clicking one sends it as a CUSTOM reaction, identical to
+                        // picking it from the picker (palette stays open).
+                        if !recent_custom_emojis().is_empty() {
+                            span {
+                                class: "reactions-recent-sep",
+                                "aria-hidden": "true",
+                            }
+                        }
+                        for (i, recent) in recent_custom_emojis().iter().enumerate() {
+                            {
+                                let glyph = recent.clone();
+                                let name = emojis::get(&glyph)
+                                    .map(|e| e.name().to_string())
+                                    .unwrap_or_else(|| "reaction".to_string());
+                                rsx! {
+                                    button {
+                                        key: "recent-{glyph}",
+                                        class: "reaction-option reaction-recent",
+                                        r#type: "button",
+                                        "data-testid": "reaction-recent-{i}",
+                                        "aria-label": "React with {name}",
+                                        title: "{name}",
+                                        onclick: move |e: MouseEvent| {
+                                            e.stop_propagation();
+                                            send_custom_reaction.call(glyph.clone());
+                                        },
+                                        span {
+                                            class: "reaction-option__emoji",
+                                            "aria-hidden": "true",
+                                            "{glyph}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Issue 1884: "More emoji" affordance — opens the standard
+                        // emoji picker panel (CUSTOM reaction). A plain toolbar
+                        // button after the quick row; Tab-reachable (default
+                        // tabindex 0). `aria-expanded` reflects the picker state.
                         button {
-                            class: "close-button",
+                            class: if emoji_picker_open() { "reaction-option reaction-option--more active" } else { "reaction-option reaction-option--more" },
+                            r#type: "button",
+                            "data-testid": "emoji-picker-open",
+                            "aria-label": "More emoji",
+                            "aria-expanded": if emoji_picker_open() { "true" } else { "false" },
+                            onclick: move |e: MouseEvent| {
+                                e.stop_propagation();
+                                let opening = !emoji_picker_open();
+                                emoji_picker_open.set(opening);
+                            },
+                            span {
+                                class: "reaction-option__emoji",
+                                "aria-hidden": "true",
+                                "\u{2795}"
+                            }
+                        }
+                        // Issue 1884: manual close (X), corner control (UX B2).
+                        // Closes immediately and restores focus to the trigger,
+                        // exactly like the Escape path. Restyled to a small badge
+                        // hanging off the palette's top-right corner (style.css);
+                        // keyboard-reachable via Tab (default tabindex 0) now that
+                        // the toolbar does not trap Tab.
+                        button {
+                            class: "close-button reactions-close-badge",
                             r#type: "button",
                             "data-testid": "reactions-close",
                             "aria-label": "Close reactions",
@@ -10990,6 +11522,16 @@ pub fn AttendantsComponent(
                                 focus_element_by_id("reactions-trigger");
                             },
                             "\u{00d7}"
+                        }
+                        // Issue 1884: the standard-emoji picker panel (CUSTOM
+                        // reaction), extracted into its own child so an unrelated
+                        // attendants re-render while it sits open does NOT rebuild
+                        // its ~388-button category grid — the child is memoized on
+                        // `emoji_group` (perf review). It reads/writes `emoji_group`
+                        // and calls `send_custom_reaction`; the recents row above
+                        // stays in the palette (parent). Mounted only while open.
+                        if emoji_picker_open() {
+                            EmojiPicker { emoji_group, send_custom_reaction }
                         }
                     }
                 }
@@ -11705,6 +12247,251 @@ mod tests {
         );
     }
 
+    // ── Item B: redundant-write guard on recording-set mutations ──
+    // `recording_set_write_needed` is the shared predicate that gates every
+    // `recording_peer_ids.write()` (STARTED insert, STOPPED remove, on_peer_left
+    // remove) so a no-op mutation does not mark the signal dirty and re-render
+    // the roster + `any_recording_active`.
+
+    /// An `Insert` is only needed when the key is ABSENT; inserting a key already
+    /// present is a redundant `write()` (same set contents, but a re-render).
+    /// This is the reconnect re-announce of a still-recording peer.
+    ///
+    /// Mutation sensitivity: swap the `Insert` arm to `key_present` (or `true`)
+    /// and the "already present" case wrongly returns `true` → this test fails.
+    #[test]
+    fn recording_set_insert_needed_only_when_absent() {
+        assert!(
+            recording_set_write_needed(RecordingWriteOp::Insert, false),
+            "inserting an absent key changes the set — the write is needed"
+        );
+        assert!(
+            !recording_set_write_needed(RecordingWriteOp::Insert, true),
+            "inserting a key already present is a no-op — the redundant write must be skipped"
+        );
+    }
+
+    /// A `Remove` is only needed when the key is PRESENT; removing an absent key
+    /// is a redundant `write()`. This is the SECOND `RECORDING_STOPPED`
+    /// `recording.js` fires ~3s after the first (save then idle).
+    ///
+    /// Mutation sensitivity: swap the `Remove` arm to `!key_present` (or `true`)
+    /// and the "already absent" case wrongly returns `true` → this test fails.
+    #[test]
+    fn recording_set_remove_needed_only_when_present() {
+        assert!(
+            recording_set_write_needed(RecordingWriteOp::Remove, true),
+            "removing a present key changes the set — the write is needed"
+        );
+        assert!(
+            !recording_set_write_needed(RecordingWriteOp::Remove, false),
+            "removing an absent key is a no-op — the redundant write must be skipped"
+        );
+    }
+
+    /// End-to-end over the guard the way the production call sites use it: apply
+    /// the guarded op to a real `HashSet` and assert the set only mutates when the
+    /// guard says so — proving the guard never suppresses a REAL change (which
+    /// would drop a recording icon) and always suppresses a no-op.
+    #[test]
+    fn recording_set_write_guard_matches_real_set_mutation() {
+        let mut set: HashSet<String> = HashSet::new();
+
+        // First STARTED for sessX → guard true, set gains the key.
+        let need = recording_set_write_needed(RecordingWriteOp::Insert, set.contains("sessX"));
+        assert!(need, "first insert must be applied");
+        if need {
+            set.insert("sessX".to_string());
+        }
+        assert!(set.contains("sessX"));
+
+        // Reconnect re-announce STARTED for sessX → guard false, set unchanged.
+        let need = recording_set_write_needed(RecordingWriteOp::Insert, set.contains("sessX"));
+        assert!(!need, "redundant re-insert must be skipped");
+        assert!(
+            set.contains("sessX"),
+            "skipping the redundant insert must NOT lose the existing icon"
+        );
+
+        // First STOPPED for sessX → guard true, set loses the key.
+        let need = recording_set_write_needed(RecordingWriteOp::Remove, set.contains("sessX"));
+        assert!(need, "first remove must be applied");
+        if need {
+            set.remove("sessX");
+        }
+        assert!(!set.contains("sessX"));
+
+        // Second STOPPED (~3s later) for sessX → guard false, set unchanged.
+        let need = recording_set_write_needed(RecordingWriteOp::Remove, set.contains("sessX"));
+        assert!(
+            !need,
+            "the duplicate STOPPED must be skipped (no redundant re-render)"
+        );
+    }
+
+    // ── Item A: departed recorder cleared even during a local reconnect ──
+
+    /// A recorder that genuinely departs while the LOCAL client is mid-reconnect
+    /// must STILL be dropped from the recording set, or its "Recording" status bar
+    /// sticks until page reload. The relay only broadcasts PARTICIPANT_LEFT for a
+    /// genuine departure (transport-only reconnects are cancelled within the grace
+    /// period), so the removal is deliberately NOT gated on `is_reconnecting` —
+    /// only on set membership (the redundant-write guard).
+    ///
+    /// Mutation sensitivity: reintroduce the reconnect gate — e.g. change
+    /// `should_clear_departed_recorder` to `!is_reconnecting && recording_set_write_needed(...)`
+    /// (the pre-fix behavior, where the whole `on_peer_left` body returned early
+    /// while reconnecting) — and the `(true, present)` case flips to `false`,
+    /// failing the first assertion below.
+    #[test]
+    fn departed_recorder_cleared_even_while_reconnecting() {
+        // Genuine departure of a recorder while the local client reconnects:
+        // the departing session IS in the set → must clear.
+        assert!(
+            should_clear_departed_recorder(true, true),
+            "a genuine departure must clear the recorder's icon even mid-reconnect"
+        );
+        // Same when NOT reconnecting — the normal peer-left path stays correct.
+        assert!(
+            should_clear_departed_recorder(false, true),
+            "a departing recorder must be cleared on the normal (non-reconnect) path"
+        );
+        // A non-recording peer leaving (session not in the set) → nothing to do,
+        // regardless of reconnect state. This is the redundant-write guard,
+        // preventing an O(n) re-render storm during reconnection waves.
+        assert!(
+            !should_clear_departed_recorder(true, false),
+            "a non-recording peer leaving must not trigger a set write (mid-reconnect)"
+        );
+        assert!(
+            !should_clear_departed_recorder(false, false),
+            "a non-recording peer leaving must not trigger a set write"
+        );
+    }
+
+    /// Walks the exact stuck-status-bar scenario through the production decision:
+    /// a lone recorder (sessRec) departs while the local client is reconnecting.
+    /// The aggregate MUST fall to OFF afterwards — the bug left it ON forever.
+    #[test]
+    fn lone_recorder_departing_mid_reconnect_clears_status_bar() {
+        let mut set: HashSet<String> = HashSet::new();
+        set.insert("sessRec".to_string());
+        assert!(
+            any_session_recording(&set),
+            "precondition: the recording status bar is shown"
+        );
+
+        // on_peer_left fires for sessRec while is_reconnecting() == true.
+        let is_reconnecting = true;
+        if should_clear_departed_recorder(is_reconnecting, set.contains("sessRec")) {
+            set.remove("sessRec");
+        }
+
+        assert!(
+            !any_session_recording(&set),
+            "the recording status bar must clear when the lone recorder departs, even mid-reconnect"
+        );
+    }
+
+    /// ORDERING guard for Item A. The predicate tests above pin
+    /// `should_clear_departed_recorder`, but the headline fix is that
+    /// `on_peer_left` clears the recording icon BEFORE the reconnect early-return
+    /// — moving the cleanup back below the return leaves the predicate unchanged,
+    /// so every predicate test still passes on the buggy (reverted) ordering. The
+    /// closure is driven by `on_peer_left_actions`, so this asserts the ORDERED
+    /// list puts `ClearRecordingIcon` ahead of `SuppressLeaveAndReturn`.
+    ///
+    /// Mutation sensitivity (the reversion this catches that the predicate tests
+    /// do NOT): in `on_peer_left_actions`, move the `ClearRecordingIcon` push to
+    /// AFTER the `if is_reconnecting { push(Suppress); return }` block — the
+    /// pre-fix ordering where the whole body returned early while reconnecting.
+    /// Then for `(is_reconnecting=true, in_set=true)` the list becomes just
+    /// `[SuppressLeaveAndReturn]`: the clear is dropped, `clear_pos` is `None`,
+    /// and both the "must clear" and "clear precedes suppress" assertions fail.
+    #[test]
+    fn on_peer_left_clears_recording_before_reconnect_return() {
+        // A recorder genuinely departs while the LOCAL client is mid-reconnect.
+        let actions = on_peer_left_actions(true, true);
+        let clear_pos = actions
+            .iter()
+            .position(|a| *a == OnPeerLeftAction::ClearRecordingIcon);
+        let suppress_pos = actions
+            .iter()
+            .position(|a| *a == OnPeerLeftAction::SuppressLeaveAndReturn);
+        assert!(
+            clear_pos.is_some(),
+            "the recording-icon clear must be emitted even mid-reconnect; got {actions:?}"
+        );
+        assert!(
+            suppress_pos.is_some(),
+            "the reconnect path must still suppress the leave toast; got {actions:?}"
+        );
+        assert!(
+            clear_pos < suppress_pos,
+            "the recording-icon clear must run BEFORE the reconnect early-return, \
+             or the loop returns before ever clearing; got {actions:?}"
+        );
+        assert!(
+            !actions.contains(&OnPeerLeftAction::ProcessLeaveNotification),
+            "no leave notification is processed during reconnect; got {actions:?}"
+        );
+    }
+
+    /// Pins the EXACT ordered action list for every (is_reconnecting, in_set)
+    /// combination the closure iterates. The `(true, true)` row is the Item A
+    /// fix: `[ClearRecordingIcon, SuppressLeaveAndReturn]` in that order. Any
+    /// reordering, dropped action, or spurious action flips one row.
+    #[test]
+    fn on_peer_left_action_order_matrix() {
+        use OnPeerLeftAction::*;
+        assert_eq!(
+            on_peer_left_actions(true, true),
+            vec![ClearRecordingIcon, SuppressLeaveAndReturn],
+            "recorder departing mid-reconnect: clear THEN suppress"
+        );
+        assert_eq!(
+            on_peer_left_actions(true, false),
+            vec![SuppressLeaveAndReturn],
+            "non-recording peer leaving mid-reconnect: suppress only, no set write"
+        );
+        assert_eq!(
+            on_peer_left_actions(false, true),
+            vec![ClearRecordingIcon, ProcessLeaveNotification],
+            "recorder departing normally: clear THEN show the leave notification"
+        );
+        assert_eq!(
+            on_peer_left_actions(false, false),
+            vec![ProcessLeaveNotification],
+            "non-recording peer leaving normally: just the leave notification"
+        );
+    }
+
+    // ── Item C: failed JS hand-off must not announce a phantom recording ──
+
+    /// When `js_recording_start` reports a successful hand-off, the click handler
+    /// retains the state callback and announces RECORDING_STARTED. When it reports
+    /// failure (recording.js missing/stale/404), it must NOT announce — the JS
+    /// `onStateChange` callback will never fire, so peers would be left with a
+    /// permanent phantom "Recording" banner — and must surface an error instead.
+    ///
+    /// Mutation sensitivity: collapse `recording_start_outcome` to always return
+    /// `Announce` (dropping the failure branch — the pre-fix behavior, where the
+    /// call site ignored the return value and always announced) and the second
+    /// assertion fails.
+    #[test]
+    fn failed_recording_handoff_shows_error_not_announce() {
+        assert_eq!(
+            recording_start_outcome(true),
+            RecordingStartOutcome::Announce,
+            "a successful JS hand-off must announce RECORDING_STARTED to peers"
+        );
+        assert_eq!(
+            recording_start_outcome(false),
+            RecordingStartOutcome::ShowError,
+            "a failed JS hand-off must surface an error, NOT announce a phantom recording"
+        );
+    }
+
     // ── roster-seed seq-recheck clobber guard ──
 
     /// Build a minimal admitted `ParticipantStatusResponse` for the guard tests.
@@ -11728,6 +12515,7 @@ mod tests {
             host_user_id: None,
             allow_guests: false,
             recording_allowed_for_all: false,
+            chat_allowed_for_all: true,
         }
     }
 

@@ -29,6 +29,13 @@
 //! 4. **Cached JS keys**: JsValue property names cached to avoid repeated string allocations
 //! 5. **Unchecked array access**: Direct array indexing where bounds are known
 //! 6. **Zero-copy returns**: std::mem::take to return buffers without cloning
+//!
+//! ## Packet-loss concealment (issue 620)
+//! The opus-decoder JS library exposes no libopus-style PLC primitive, so this
+//! decoder does NOT override `AudioDecoder::decode_plc`; it keeps the trait
+//! default (`None`). When a packet is lost, NetEQ's concealment therefore falls
+//! back to the quiet-noise `Expand` path rather than codec PLC. Codec-level PLC
+//! is available only on native targets (see `NativeOpusDecoder`).
 
 use crate::codec::AudioDecoder;
 use js_sys::{Function, Promise, Reflect, Uint8Array};

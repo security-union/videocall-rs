@@ -2688,12 +2688,21 @@ impl Peer {
                     // Flush screen decoder when screen sharing is turned off
                     if screen_turned_off {
                         self.screen.flush();
+                        // HCL #893 re-share: the screen decoder is reused across
+                        // stop→restart (only flushed, never recreated), so its
+                        // once-per-lifetime first-render ack latch survives. Re-arm
+                        // it here so the NEXT share re-fires
+                        // PEER_EVENT(screen_decode_started); otherwise every share
+                        // after the first in this page session never acks and the
+                        // publisher falsely toasts "No peers received the shared
+                        // content within 10 seconds".
+                        self.screen.rearm_first_render_ack();
                         // A stopped share is a source-state transition, not a
                         // visibility shed. Wipe the decoder canvas so the
                         // recording compositor cannot retain a frozen frame.
                         self.screen.force_clear_canvas();
                         debug!(
-                            "Flushed screen decoder for peer {} (screen turned off)",
+                            "Flushed + re-armed screen decoder ack + cleared canvas for peer {} (screen turned off)",
                             self.session_id
                         );
                     }
@@ -4252,6 +4261,36 @@ impl PeerDecodeManager {
                     );
                 }
                 peer.context_initialized = true;
+            } else if send_packet_for_route.is_some() && !peer.video.has_keyframe_request_route() {
+                // Issue 1899 / discussion 1960 — self-healing route re-install. The proactive
+                // keyframe-request route is installed exactly once above (the one-time
+                // `context_initialized` latch), but it is DESTROYED later in the peer lifecycle:
+                // `Peer::reset` (decode-error path) rebuilds the video+screen decoders with empty
+                // route slots, and `clear_send_packet_callback` nulls them on teardown. Because the
+                // latch never re-runs, a reset leaves the route `None` FOREVER — the worker's
+                // keyframe-less eviction PLIs (issue #1025) then post to a no-op main-thread route,
+                // so a keyframe-starved tile can never recover (field: minutes-long screen freeze
+                // after a reset while PLIs fired into the void). Here media is flowing again AND the
+                // transport is wired (`send_packet` set — so this cannot fire during a disconnect
+                // teardown, where it is intentionally `None`), so re-install the route on the fresh
+                // decoders. Transport-agnostic: the same route serves WebTransport and WebSocket.
+                // The `has_keyframe_request_route` probe is a RefCell-borrow `Option` check that runs
+                // on EVERY packet while the transport is wired (the probe itself never stops); only the
+                // install BODY below is skipped once the route is present, so on the common healthy path
+                // this costs just that one borrow-and-check per packet. Probing VIDEO alone is valid
+                // because routes are only ever dropped in PAIRS — both `Peer::reset` and
+                // `clear_send_packet_callback` drop the VIDEO and SCREEN routes together — so a missing
+                // screen route always implies a missing video route. (A future change that dropped the
+                // SCREEN route alone would evade this VIDEO-keyed probe; keep the pair-drop invariant
+                // or probe both.)
+                if let Some(send_packet) = &send_packet_for_route {
+                    install_keyframe_request_routes(
+                        peer,
+                        send_packet,
+                        &local_user_id_for_route,
+                        &pli_budget_for_route,
+                    );
+                }
             }
             // Issue #1878: stamp the live active transport onto the peer so the
             // AUDIO arm's datagram-loss tracker runs only when this receiver is
@@ -5483,6 +5522,71 @@ mod tests {
         assert!(
             !peer.screen.has_keyframe_request_route(),
             "screen keyframe-request route must be cleared on teardown (#1025 leak guard)"
+        );
+    }
+
+    /// Issue 1899 / discussion 1960 — self-healing keyframe-request route. The route is installed
+    /// once (the `context_initialized` latch), but `Peer::reset` (decode-error path) rebuilds the
+    /// video+screen decoders with EMPTY route slots and the latch never re-runs — so without
+    /// self-healing the route stays `None` forever after a reset and the worker's keyframe-less
+    /// eviction PLIs (issue #1025) become permanent no-ops, freezing a keyframe-starved tile for
+    /// minutes (the field symptom). `decode()` must re-install a dropped route on the next media
+    /// packet whenever the transport is wired.
+    ///
+    /// Noop decoders stand in for the fresh (route-less) decoders `Peer::reset` mints — their route
+    /// slot supports `set`/`has`/`clear` exactly like the real `VideoPeerDecoder` — so the invariant
+    /// is exercised through the REAL `decode()` path without a browser worker (which the harness
+    /// cannot construct).
+    ///
+    /// Mutation coverage: deleting the `else if send_packet.is_some() && !has_keyframe_request_route`
+    /// re-install branch leaves BOTH routes `None` after decode → both asserts fail. The outer
+    /// `send_packet.is_some()` in the condition is only a cheap short-circuit; the LOAD-BEARING
+    /// teardown guard is the inner `if let Some(send_packet)` inside the branch body — during a
+    /// disconnect teardown `send_packet` is `None`, so even if the branch is entered the install body
+    /// is skipped and no route is (re)installed against a dead transport.
+    #[wasm_bindgen_test]
+    fn decode_reinstalls_dropped_keyframe_request_route() {
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(
+            Callback::from(|_p: PacketWrapper| {}),
+            "me@test.com".to_string(),
+        );
+
+        let (mut peer, _muted) = make_test_peer(42);
+        // Past the one-time install latch, with the route dropped exactly as Peer::reset() leaves it.
+        peer.context_initialized = true;
+        peer.has_received_heartbeat = true;
+        peer.video.clear_keyframe_request_route();
+        peer.screen.clear_keyframe_request_route();
+        assert!(!peer.video.has_keyframe_request_route());
+        assert!(!peer.screen.has_keyframe_request_route());
+        manager.connected_peers.insert(42, peer);
+
+        // Any media packet on the already-initialized peer must trigger the self-healing re-install.
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: b"test@test.com".to_vec(),
+            heartbeat_metadata: Some(HeartbeatMetadata {
+                video_enabled: true,
+                audio_enabled: true,
+                screen_enabled: false,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        manager
+            .decode(packet_wrapper(&media, 42), "test@test.com")
+            .expect("heartbeat should decode");
+
+        let peer = manager.connected_peers.get(&42).expect("peer present");
+        assert!(
+            peer.video.has_keyframe_request_route(),
+            "decode must re-install a dropped VIDEO keyframe-request route (issue 1899 / discussion 1960)"
+        );
+        assert!(
+            peer.screen.has_keyframe_request_route(),
+            "decode must re-install a dropped SCREEN keyframe-request route (issue 1899 / discussion 1960)"
         );
     }
 

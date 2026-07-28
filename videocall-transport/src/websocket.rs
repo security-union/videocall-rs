@@ -20,21 +20,66 @@ const MAX_BUFFERED_AMOUNT: u32 = 1_048_576;
 /// Cumulative count of packets dropped because the WebSocket send buffer exceeded the threshold.
 static WEBSOCKET_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// Indexed by `MediaStreamKey::as_u8()` (0..=4; slot 0 unused, keys 1..=4).
+// Keep this hand-maintained size above the declared max in videocall-client;
+// unknown larger keys remain aggregate-only.
+const STREAM_COUNTER_SLOTS: usize = 5;
+
+static WEBSOCKET_DROP_COUNT_BY_STREAM: [AtomicU64; STREAM_COUNTER_SLOTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn record_websocket_drop(stream_key: u8) {
+    WEBSOCKET_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+    if let Some(counter) = websocket_stream_counter(stream_key) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn websocket_stream_counter(stream_key: u8) -> Option<&'static AtomicU64> {
+    match stream_key {
+        1..=4 => WEBSOCKET_DROP_COUNT_BY_STREAM.get(usize::from(stream_key)),
+        _ => None,
+    }
+}
+
 /// Returns the total number of WebSocket packets dropped due to backpressure since process start.
 pub fn websocket_drop_count() -> u64 {
     WEBSOCKET_DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// Returns WebSocket backpressure drops attributed to one media stream key.
+/// WebSocket still uses one TCP socket; attribution records which attempted
+/// send encountered the full shared buffer.
+pub fn websocket_drop_count_for_stream(stream_key: u8) -> u64 {
+    websocket_stream_counter(stream_key)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// NETSIM-ONLY: synthetically bump the WS send-buffer drop counter by `n` (issue
 /// #1398). The real increment fires when `bufferedAmount > MAX_BUFFERED_AMOUNT`,
 /// which an e2e test cannot reliably induce on a localhost loopback. This
-/// feature-gated bumper lets the netsim e2e harness drive the SAME counter the
-/// encoders consult, exercising the mic-side single-layer audio uplink-distress
-/// detector's WS axis deterministically. Zero production cost: compiled out
-/// unless the `netsim` feature is on.
+/// feature-gated bumper records audio-attributed drops for the microphone
+/// detector while preserving the aggregate counter used by camera/screen AQ.
+/// Zero production cost: compiled out unless the `netsim` feature is on.
 #[cfg(feature = "netsim")]
 pub fn force_websocket_drop(n: u64) {
+    force_websocket_drop_for_stream(1, n);
+}
+
+/// NETSIM-ONLY: synthetically record buffered-send drops for one media stream.
+/// Used by regression tests that verify cross-stream isolation.
+#[cfg(feature = "netsim")]
+pub fn force_websocket_drop_for_stream(stream_key: u8, n: u64) {
     WEBSOCKET_DROP_COUNT.fetch_add(n, Ordering::Relaxed);
+    if let Some(counter) = websocket_stream_counter(stream_key) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 use gloo::events::EventListener;
@@ -319,12 +364,18 @@ impl WebSocketTask {
     /// slow networks. This mirrors the congestion-drop behavior used on the
     /// WebTransport datagram path.
     pub fn send_binary(&self, data: Vec<u8>) {
+        self.send_binary_for_stream(data, 0);
+    }
+
+    /// Sends binary data while retaining the caller's media key for
+    /// backpressure-counter attribution. The key does not affect WS routing.
+    pub fn send_binary_for_stream(&self, data: Vec<u8>, stream_key: u8) {
         if !self.is_active() {
             return;
         }
         let buffered = self.ws.buffered_amount();
         if buffered > MAX_BUFFERED_AMOUNT {
-            WEBSOCKET_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            record_websocket_drop(stream_key);
             warn!(
                 "WebSocket backpressure: dropping {} byte packet (buffered: {} bytes, threshold: {} bytes)",
                 data.len(),
@@ -366,5 +417,27 @@ impl Drop for WebSocketTask {
         if self.is_active() {
             self.ws.close().ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_backpressure_drops_do_not_increment_audio_counter() {
+        let aggregate_before = websocket_drop_count();
+        let audio_before = websocket_drop_count_for_stream(1);
+        let screen_before = websocket_drop_count_for_stream(3);
+
+        record_websocket_drop(3);
+
+        assert_eq!(websocket_drop_count() - aggregate_before, 1);
+        assert_eq!(websocket_drop_count_for_stream(3) - screen_before, 1);
+        assert_eq!(
+            websocket_drop_count_for_stream(1),
+            audio_before,
+            "screen backpressure must not enter the microphone's audio counter",
+        );
     }
 }

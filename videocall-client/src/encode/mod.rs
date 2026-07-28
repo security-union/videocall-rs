@@ -41,11 +41,13 @@ pub use camera_encoder::{
 };
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{
-    screen_encoder_errors_closed_codec, screen_encoder_errors_configure_fatal,
-    screen_encoder_errors_generic, screen_encoder_errors_vpx_mem_alloc,
-    screen_encoder_frames_submitted_ok, screen_encoder_layers_torn_down,
+    screen_capture_display_constraints, screen_encoder_errors_closed_codec,
+    screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
+    screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
+    screen_encoder_layers_torn_down, screen_encoder_max_stall_gap_ms,
     screen_encoder_restarts_closed_codec, screen_encoder_restarts_configure,
-    screen_encoder_restarts_memory, screen_encoder_restarts_other, ScreenEncoder,
+    screen_encoder_restarts_memory, screen_encoder_restarts_other, screen_encoder_stall_episodes,
+    screen_ws_stale_delta_drops, should_retry_screen_capture_without_ceiling, ScreenEncoder,
     ScreenQualitySnapshot, ScreenQualityTierBounds, ScreenShareEvent,
 };
 

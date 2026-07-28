@@ -95,10 +95,17 @@ services:
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - JWT_SECRET=dev-jwt-secret-change-me
       - TOKEN_TTL_SECS=3600
-      - SESSION_TTL_SECS=315360000
+      - SESSION_TTL_SECS=604800
+      - SESSION_REFRESH_THRESHOLD_SECS=7200
+      - SESSION_ABSOLUTE_MAX_SECS=2592000
       - COOKIE_SECURE=false
       - COOKIE_DOMAIN=
-      - CORS_ALLOWED_ORIGIN=
+      # The browser origin for the e2e stack is the Dioxus UI at :3001
+      # (Playwright baseURL). meeting-api now fails closed on an empty
+      # CORS_ALLOWED_ORIGIN unless DEV_USER is set (issue #1751), so set the
+      # exact frontend origin here rather than relying on the mirror_request
+      # fallback.
+      - CORS_ALLOWED_ORIGIN=http://localhost:3001
       - OAUTH_CLIENT_ID=
       - OAUTH_SECRET=
       - OAUTH_REDIRECT_URL=

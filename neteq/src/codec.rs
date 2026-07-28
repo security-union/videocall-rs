@@ -30,6 +30,27 @@ pub trait AudioDecoder {
 
     /// Decodes a single audio packet.
     fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>>;
+
+    /// Produce a packet-loss-concealment (PLC) frame from the decoder's internal
+    /// state, for use when a packet is missing (issue 620).
+    ///
+    /// # Contract
+    /// - `num_samples_per_channel` is the number of samples **per channel** the
+    ///   caller needs (e.g. 480 for a 10 ms frame at 48 kHz).
+    /// - On success the returned vector is **interleaved** `f32` PCM containing
+    ///   exactly `num_samples_per_channel * channels()` samples.
+    /// - Returning `None` means "this decoder has no codec-level PLC primitive,
+    ///   or concealment failed": the caller then falls back to the quiet-noise
+    ///   `Expand` path. The default implementation returns `None`, so a decoder
+    ///   opts in explicitly by overriding this method.
+    ///
+    /// Codec PLC is stateful: it extrapolates the missing frame from the audio
+    /// of previously decoded packets, so it is only meaningful after at least
+    /// one real packet has been decoded on this decoder instance.
+    fn decode_plc(&mut self, num_samples_per_channel: usize) -> Option<Vec<f32>> {
+        let _ = num_samples_per_channel;
+        None
+    }
 }
 
 // Platform-specific codec implementations
@@ -186,6 +207,12 @@ impl AudioDecoder for UnifiedOpusDecoder {
             DecoderBackend::JsLibrary(d) => Ok(d.decode_sync(encoded)),
         }
     }
+
+    // NOTE (issue 620): neither web backend (WebCodecs nor the opus-decoder JS
+    // library) exposes a libopus-style PLC primitive, so `decode_plc` is left as
+    // the trait default (`None`). On the browser production path, packet-loss
+    // concealment therefore falls back to NetEQ's quiet-noise `Expand` path.
+    // Native targets override `decode_plc` (see `NativeOpusDecoder`).
 }
 
 // Convenience type alias for the recommended decoder

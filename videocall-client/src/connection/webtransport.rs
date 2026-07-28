@@ -34,7 +34,7 @@ use log::info;
 use log::warn;
 use protobuf::Message;
 use videocall_transport::webtransport::{
-    WebTransportService, WebTransportStatus, WebTransportTask,
+    FrameDropMeta, WebTransportService, WebTransportStatus, WebTransportTask,
 };
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -138,6 +138,15 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
     /// frames from each stream in a loop until EOF and routes by the MediaType
     /// inside the encrypted protobuf payload.
     fn send_bytes(&self, bytes: Vec<u8>, stream_key: MediaStreamKey) {
+        self.send_bytes_with_drop_meta(bytes, stream_key, None);
+    }
+
+    fn send_bytes_with_drop_meta(
+        &self,
+        bytes: Vec<u8>,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) {
         // Phase 3b: consult the per-tab netsim shim. When the
         // `netsim` feature is off the entire block compiles out and
         // the send path is byte-for-byte identical to pre-3b.
@@ -152,6 +161,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             self.persistent_streams.clone(),
             stream_key.as_u8(),
             bytes,
+            meta,
         );
     }
 
@@ -188,6 +198,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
                 self.persistent_streams.clone(),
                 MediaStreamKey::Control.as_u8(),
                 bytes,
+                None,
             );
         }
     }

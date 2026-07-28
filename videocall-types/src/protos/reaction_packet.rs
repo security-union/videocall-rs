@@ -50,6 +50,13 @@ pub struct ReactionPacket {
     ///  client renders as ESCAPED text and caps length (<=64). Optional.
     // @@protoc_insertion_point(field:ReactionPacket.display_name)
     pub display_name: ::std::vec::Vec<u8>,
+    ///  Standard Unicode emoji for a CUSTOM (12) reaction; empty/ignored otherwise.
+    ///  Attacker-controlled, SAME threat model as `display_name`: the relay MUST
+    ///  validate at ingress (exact standard-emoji allowlist + byte cap <=32,
+    ///  unknown -> drop) and the client ALSO validates before send AND before
+    ///  render (defense in depth). Rendered as ESCAPED text only (never markup).
+    // @@protoc_insertion_point(field:ReactionPacket.custom_emoji)
+    pub custom_emoji: ::std::vec::Vec<u8>,
     // special fields
     // @@protoc_insertion_point(special_field:ReactionPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -67,7 +74,7 @@ impl ReactionPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut fields = ::std::vec::Vec::with_capacity(3);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "reaction",
@@ -78,6 +85,11 @@ impl ReactionPacket {
             "display_name",
             |m: &ReactionPacket| { &m.display_name },
             |m: &mut ReactionPacket| { &mut m.display_name },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "custom_emoji",
+            |m: &ReactionPacket| { &m.custom_emoji },
+            |m: &mut ReactionPacket| { &mut m.custom_emoji },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ReactionPacket>(
             "ReactionPacket",
@@ -103,6 +115,9 @@ impl ::protobuf::Message for ReactionPacket {
                 18 => {
                     self.display_name = is.read_bytes()?;
                 },
+                26 => {
+                    self.custom_emoji = is.read_bytes()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -121,6 +136,9 @@ impl ::protobuf::Message for ReactionPacket {
         if !self.display_name.is_empty() {
             my_size += ::protobuf::rt::bytes_size(2, &self.display_name);
         }
+        if !self.custom_emoji.is_empty() {
+            my_size += ::protobuf::rt::bytes_size(3, &self.custom_emoji);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -132,6 +150,9 @@ impl ::protobuf::Message for ReactionPacket {
         }
         if !self.display_name.is_empty() {
             os.write_bytes(2, &self.display_name)?;
+        }
+        if !self.custom_emoji.is_empty() {
+            os.write_bytes(3, &self.custom_emoji)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -152,6 +173,7 @@ impl ::protobuf::Message for ReactionPacket {
     fn clear(&mut self) {
         self.reaction = ::protobuf::EnumOrUnknown::new(reaction_packet::ReactionType::REACTION_TYPE_UNSPECIFIED);
         self.display_name.clear();
+        self.custom_emoji.clear();
         self.special_fields.clear();
     }
 
@@ -159,6 +181,7 @@ impl ::protobuf::Message for ReactionPacket {
         static instance: ReactionPacket = ReactionPacket {
             reaction: ::protobuf::EnumOrUnknown::from_i32(0),
             display_name: ::std::vec::Vec::new(),
+            custom_emoji: ::std::vec::Vec::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -203,6 +226,16 @@ pub mod reaction_packet {
         THINKING = 6,
         // @@protoc_insertion_point(enum_value:ReactionPacket.ReactionType.PARTY)
         PARTY = 7,
+        // @@protoc_insertion_point(enum_value:ReactionPacket.ReactionType.CRY)
+        CRY = 8,
+        // @@protoc_insertion_point(enum_value:ReactionPacket.ReactionType.DISAGREE)
+        DISAGREE = 9,
+        // @@protoc_insertion_point(enum_value:ReactionPacket.ReactionType.SAD)
+        SAD = 10,
+        // @@protoc_insertion_point(enum_value:ReactionPacket.ReactionType.HEART_BROKEN)
+        HEART_BROKEN = 11,
+        // @@protoc_insertion_point(enum_value:ReactionPacket.ReactionType.CUSTOM)
+        CUSTOM = 12,
     }
 
     impl ::protobuf::Enum for ReactionType {
@@ -222,6 +255,11 @@ pub mod reaction_packet {
                 5 => ::std::option::Option::Some(ReactionType::HEART),
                 6 => ::std::option::Option::Some(ReactionType::THINKING),
                 7 => ::std::option::Option::Some(ReactionType::PARTY),
+                8 => ::std::option::Option::Some(ReactionType::CRY),
+                9 => ::std::option::Option::Some(ReactionType::DISAGREE),
+                10 => ::std::option::Option::Some(ReactionType::SAD),
+                11 => ::std::option::Option::Some(ReactionType::HEART_BROKEN),
+                12 => ::std::option::Option::Some(ReactionType::CUSTOM),
                 _ => ::std::option::Option::None
             }
         }
@@ -236,6 +274,11 @@ pub mod reaction_packet {
                 "HEART" => ::std::option::Option::Some(ReactionType::HEART),
                 "THINKING" => ::std::option::Option::Some(ReactionType::THINKING),
                 "PARTY" => ::std::option::Option::Some(ReactionType::PARTY),
+                "CRY" => ::std::option::Option::Some(ReactionType::CRY),
+                "DISAGREE" => ::std::option::Option::Some(ReactionType::DISAGREE),
+                "SAD" => ::std::option::Option::Some(ReactionType::SAD),
+                "HEART_BROKEN" => ::std::option::Option::Some(ReactionType::HEART_BROKEN),
+                "CUSTOM" => ::std::option::Option::Some(ReactionType::CUSTOM),
                 _ => ::std::option::Option::None
             }
         }
@@ -249,6 +292,11 @@ pub mod reaction_packet {
             ReactionType::HEART,
             ReactionType::THINKING,
             ReactionType::PARTY,
+            ReactionType::CRY,
+            ReactionType::DISAGREE,
+            ReactionType::SAD,
+            ReactionType::HEART_BROKEN,
+            ReactionType::CUSTOM,
         ];
     }
 
@@ -278,66 +326,94 @@ pub mod reaction_packet {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1btypes/reaction_packet.proto\"\x80\x02\n\x0eReactionPacket\x128\n\
+    \n\x1btypes/reaction_packet.proto\"\xe1\x02\n\x0eReactionPacket\x128\n\
     \x08reaction\x18\x01\x20\x01(\x0e2\x1c.ReactionPacket.ReactionTypeR\x08r\
-    eaction\x12!\n\x0cdisplay_name\x18\x02\x20\x01(\x0cR\x0bdisplayName\"\
-    \x90\x01\n\x0cReactionType\x12\x1d\n\x19REACTION_TYPE_UNSPECIFIED\x10\0\
-    \x12\r\n\tTHUMBS_UP\x10\x01\x12\x0f\n\x0bTHUMBS_DOWN\x10\x02\x12\t\n\x05\
-    LAUGH\x10\x03\x12\x0c\n\x08APPLAUSE\x10\x04\x12\t\n\x05HEART\x10\x05\x12\
-    \x0c\n\x08THINKING\x10\x06\x12\t\n\x05PARTY\x10\x07\"\x04\x08\x08\x10\
-    \x1fJ\xe3\r\n\x06\x12\x04\0\0#\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\xbd\
-    \x07\n\x02\x04\0\x12\x04\x12\0#\x01\x1a\xb0\x07\x20Client\x20->\x20relay\
-    \x20->\x20all-peers\x20ephemeral\x20reaction\x20broadcast\x20(issue\x20#\
-    1884).\n\x20Carried\x20inside\x20a\x20PacketWrapper\x20whose\x20packet_t\
-    ype\x20is\x20REACTION\x20(17).\n\x20Unlike\x20VIEWPORT/LAYER_PREFERENCE\
-    \x20(relay-consumed,\x20never\x20re-broadcast),\x20a\n\x20REACTION\x20is\
-    \x20RE-BROADCAST\x20on\x20the\x20standard\x20media\x20fan-out\n\x20(room\
-    .{room}.{sender_sid}\x20->\x20wildcard).\x20The\x20relay\x20self-skips\
-    \x20the\x20sender,\n\x20so\x20the\x20sender\x20never\x20receives\x20its\
-    \x20own\x20reaction\x20(it\x20renders\x20a\x20local\x20echo).\n\n\x20NOT\
-    \x20E2EE-sealed:\x20CLEARTEXT\x20even\x20when\x20E2EE_ENABLED=true,\x20b\
-    ecause\x20the\x20relay\n\x20must\x20read\x20`reaction`\x20to\x20enforce\
-    \x20the\x20closed-enum\x20allowlist\x20on\x20ingress\n\x20(unknown\x20va\
-    lue\x20->\x20drop)\x20and\x20a\x20reaction\x20is\x20broadcast-public\x20\
-    by\x20definition.\n\x20Put\x20NO\x20private\x20data\x20in\x20this\x20mes\
-    sage.\n\n\x20Attribution:\x20WHO\x20is\x20anchored\x20on\x20the\x20relay\
-    -stamped\x20envelope\x20session_id,\n\x20resolved\x20via\x20the\x20clien\
-    t's\x20display_name_cache.\x20`display_name`\x20is\x20a\x20COSMETIC\n\
-    \x20fallback\x20only\x20(pre-join\x20cache\x20race);\x20never\x20identit\
-    y/authorization.\x20Mirrors\n\x20MeetingPacket.display_name\x20(field\
-    \x2010).\n\n\n\n\x03\x04\0\x01\x12\x03\x12\x08\x16\n\x0c\n\x04\x04\0\x04\
-    \0\x12\x04\x13\x02\x1d\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x13\x07\
-    \x13\n\r\n\x06\x04\0\x04\0\x02\0\x12\x03\x14\x04\"\n\x0e\n\x07\x04\0\x04\
-    \0\x02\0\x01\x12\x03\x14\x04\x1d\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\
-    \x03\x14\x20!\n\r\n\x06\x04\0\x04\0\x02\x01\x12\x03\x15\x04\x14\n\x0e\n\
-    \x07\x04\0\x04\0\x02\x01\x01\x12\x03\x15\x04\r\n\x0e\n\x07\x04\0\x04\0\
-    \x02\x01\x02\x12\x03\x15\x12\x13\n\r\n\x06\x04\0\x04\0\x02\x02\x12\x03\
-    \x16\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x02\x01\x12\x03\x16\x04\x0f\n\
-    \x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\x03\x16\x12\x13\n\r\n\x06\x04\0\
-    \x04\0\x02\x03\x12\x03\x17\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\
-    \x12\x03\x17\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\x03\x17\x12\
-    \x13\n\r\n\x06\x04\0\x04\0\x02\x04\x12\x03\x18\x04\x14\n\x0e\n\x07\x04\0\
-    \x04\0\x02\x04\x01\x12\x03\x18\x04\x0c\n\x0e\n\x07\x04\0\x04\0\x02\x04\
-    \x02\x12\x03\x18\x12\x13\n\r\n\x06\x04\0\x04\0\x02\x05\x12\x03\x19\x04\
-    \x14\n\x0e\n\x07\x04\0\x04\0\x02\x05\x01\x12\x03\x19\x04\t\n\x0e\n\x07\
-    \x04\0\x04\0\x02\x05\x02\x12\x03\x19\x12\x13\n\r\n\x06\x04\0\x04\0\x02\
-    \x06\x12\x03\x1a\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x06\x01\x12\x03\x1a\
-    \x04\x0c\n\x0e\n\x07\x04\0\x04\0\x02\x06\x02\x12\x03\x1a\x12\x13\n\r\n\
-    \x06\x04\0\x04\0\x02\x07\x12\x03\x1b\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\
-    \x07\x01\x12\x03\x1b\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x07\x02\x12\x03\
-    \x1b\x12\x13\nD\n\x05\x04\0\x04\0\x04\x12\x03\x1c\x04\x15\"6\x20future\
-    \x20reactions;\x20relay+client\x20treat\x20unknown\x20->\x20drop\n\n\r\n\
-    \x06\x04\0\x04\0\x04\0\x12\x03\x1c\r\x14\n\x0e\n\x07\x04\0\x04\0\x04\0\
-    \x01\x12\x03\x1c\r\x0e\n\x0e\n\x07\x04\0\x04\0\x04\0\x02\x12\x03\x1c\x12\
-    \x14\n\x0b\n\x04\x04\0\x02\0\x12\x03\x1f\x02\x1c\n\x0c\n\x05\x04\0\x02\0\
-    \x06\x12\x03\x1f\x02\x0e\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x1f\x0f\x17\
-    \n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x1f\x1a\x1b\n\x98\x01\n\x04\x04\0\
-    \x02\x01\x12\x03\"\x02\x19\x1a\x8a\x01\x20Cosmetic\x20display-name\x20fa\
-    llback\x20(see\x20message\x20doc).\x20Attacker-controlled:\n\x20client\
-    \x20renders\x20as\x20ESCAPED\x20text\x20and\x20caps\x20length\x20(<=64).\
-    \x20Optional.\n\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\"\x02\x07\n\x0c\n\
-    \x05\x04\0\x02\x01\x01\x12\x03\"\x08\x14\n\x0c\n\x05\x04\0\x02\x01\x03\
-    \x12\x03\"\x17\x18b\x06proto3\
+    eaction\x12!\n\x0cdisplay_name\x18\x02\x20\x01(\x0cR\x0bdisplayName\x12!\
+    \n\x0ccustom_emoji\x18\x03\x20\x01(\x0cR\x0bcustomEmoji\"\xce\x01\n\x0cR\
+    eactionType\x12\x1d\n\x19REACTION_TYPE_UNSPECIFIED\x10\0\x12\r\n\tTHUMBS\
+    _UP\x10\x01\x12\x0f\n\x0bTHUMBS_DOWN\x10\x02\x12\t\n\x05LAUGH\x10\x03\
+    \x12\x0c\n\x08APPLAUSE\x10\x04\x12\t\n\x05HEART\x10\x05\x12\x0c\n\x08THI\
+    NKING\x10\x06\x12\t\n\x05PARTY\x10\x07\x12\x07\n\x03CRY\x10\x08\x12\x0c\
+    \n\x08DISAGREE\x10\t\x12\x07\n\x03SAD\x10\n\x12\x10\n\x0cHEART_BROKEN\
+    \x10\x0b\x12\n\n\x06CUSTOM\x10\x0c\"\x04\x08\r\x10\x1fJ\xdc\x14\n\x06\
+    \x12\x04\0\01\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\xbd\x07\n\x02\x04\0\
+    \x12\x04\x12\01\x01\x1a\xb0\x07\x20Client\x20->\x20relay\x20->\x20all-pe\
+    ers\x20ephemeral\x20reaction\x20broadcast\x20(issue\x20#1884).\n\x20Carr\
+    ied\x20inside\x20a\x20PacketWrapper\x20whose\x20packet_type\x20is\x20REA\
+    CTION\x20(17).\n\x20Unlike\x20VIEWPORT/LAYER_PREFERENCE\x20(relay-consum\
+    ed,\x20never\x20re-broadcast),\x20a\n\x20REACTION\x20is\x20RE-BROADCAST\
+    \x20on\x20the\x20standard\x20media\x20fan-out\n\x20(room.{room}.{sender_\
+    sid}\x20->\x20wildcard).\x20The\x20relay\x20self-skips\x20the\x20sender,\
+    \n\x20so\x20the\x20sender\x20never\x20receives\x20its\x20own\x20reaction\
+    \x20(it\x20renders\x20a\x20local\x20echo).\n\n\x20NOT\x20E2EE-sealed:\
+    \x20CLEARTEXT\x20even\x20when\x20E2EE_ENABLED=true,\x20because\x20the\
+    \x20relay\n\x20must\x20read\x20`reaction`\x20to\x20enforce\x20the\x20clo\
+    sed-enum\x20allowlist\x20on\x20ingress\n\x20(unknown\x20value\x20->\x20d\
+    rop)\x20and\x20a\x20reaction\x20is\x20broadcast-public\x20by\x20definiti\
+    on.\n\x20Put\x20NO\x20private\x20data\x20in\x20this\x20message.\n\n\x20A\
+    ttribution:\x20WHO\x20is\x20anchored\x20on\x20the\x20relay-stamped\x20en\
+    velope\x20session_id,\n\x20resolved\x20via\x20the\x20client's\x20display\
+    _name_cache.\x20`display_name`\x20is\x20a\x20COSMETIC\n\x20fallback\x20o\
+    nly\x20(pre-join\x20cache\x20race);\x20never\x20identity/authorization.\
+    \x20Mirrors\n\x20MeetingPacket.display_name\x20(field\x2010).\n\n\n\n\
+    \x03\x04\0\x01\x12\x03\x12\x08\x16\n\x0c\n\x04\x04\0\x04\0\x12\x04\x13\
+    \x02%\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x13\x07\x13\n\r\n\x06\x04\
+    \0\x04\0\x02\0\x12\x03\x14\x04\"\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\
+    \x03\x14\x04\x1d\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x14\x20!\n\r\
+    \n\x06\x04\0\x04\0\x02\x01\x12\x03\x15\x04\x15\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x01\x01\x12\x03\x15\x04\r\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\
+    \x03\x15\x13\x14\n\r\n\x06\x04\0\x04\0\x02\x02\x12\x03\x16\x04\x15\n\x0e\
+    \n\x07\x04\0\x04\0\x02\x02\x01\x12\x03\x16\x04\x0f\n\x0e\n\x07\x04\0\x04\
+    \0\x02\x02\x02\x12\x03\x16\x13\x14\n\r\n\x06\x04\0\x04\0\x02\x03\x12\x03\
+    \x17\x04\x15\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\x12\x03\x17\x04\t\n\x0e\
+    \n\x07\x04\0\x04\0\x02\x03\x02\x12\x03\x17\x13\x14\n\r\n\x06\x04\0\x04\0\
+    \x02\x04\x12\x03\x18\x04\x15\n\x0e\n\x07\x04\0\x04\0\x02\x04\x01\x12\x03\
+    \x18\x04\x0c\n\x0e\n\x07\x04\0\x04\0\x02\x04\x02\x12\x03\x18\x13\x14\n\r\
+    \n\x06\x04\0\x04\0\x02\x05\x12\x03\x19\x04\x15\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x05\x01\x12\x03\x19\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x05\x02\x12\
+    \x03\x19\x13\x14\n\r\n\x06\x04\0\x04\0\x02\x06\x12\x03\x1a\x04\x15\n\x0e\
+    \n\x07\x04\0\x04\0\x02\x06\x01\x12\x03\x1a\x04\x0c\n\x0e\n\x07\x04\0\x04\
+    \0\x02\x06\x02\x12\x03\x1a\x13\x14\n\r\n\x06\x04\0\x04\0\x02\x07\x12\x03\
+    \x1b\x04\x15\n\x0e\n\x07\x04\0\x04\0\x02\x07\x01\x12\x03\x1b\x04\t\n\x0e\
+    \n\x07\x04\0\x04\0\x02\x07\x02\x12\x03\x1b\x13\x14\n\r\n\x06\x04\0\x04\0\
+    \x02\x08\x12\x03\x1c\x04\x15\n\x0e\n\x07\x04\0\x04\0\x02\x08\x01\x12\x03\
+    \x1c\x04\x07\n\x0e\n\x07\x04\0\x04\0\x02\x08\x02\x12\x03\x1c\x13\x14\n\r\
+    \n\x06\x04\0\x04\0\x02\t\x12\x03\x1d\x04\x15\n\x0e\n\x07\x04\0\x04\0\x02\
+    \t\x01\x12\x03\x1d\x04\x0c\n\x0e\n\x07\x04\0\x04\0\x02\t\x02\x12\x03\x1d\
+    \x13\x14\n\r\n\x06\x04\0\x04\0\x02\n\x12\x03\x1e\x04\x16\n\x0e\n\x07\x04\
+    \0\x04\0\x02\n\x01\x12\x03\x1e\x04\x07\n\x0e\n\x07\x04\0\x04\0\x02\n\x02\
+    \x12\x03\x1e\x13\x15\n\r\n\x06\x04\0\x04\0\x02\x0b\x12\x03\x1f\x04\x16\n\
+    \x0e\n\x07\x04\0\x04\0\x02\x0b\x01\x12\x03\x1f\x04\x10\n\x0e\n\x07\x04\0\
+    \x04\0\x02\x0b\x02\x12\x03\x1f\x13\x15\n\xf1\x01\n\x06\x04\0\x04\0\x02\
+    \x0c\x12\x03#\x04\x16\x1a\xe1\x01\x20CUSTOM\x20carries\x20a\x20picker-se\
+    lected\x20standard\x20Unicode\x20emoji\x20in\x20`custom_emoji`\n\x20inst\
+    ead\x20of\x20mapping\x20to\x20a\x20fixed\x20glyph.\x20Still\x20a\x20clos\
+    ed-enum\x20value\x20the\x20relay\n\x20allowlists;\x20the\x20emoji\x20STR\
+    ING\x20is\x20validated\x20separately\x20(see\x20`custom_emoji`).\n\n\x0e\
+    \n\x07\x04\0\x04\0\x02\x0c\x01\x12\x03#\x04\n\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x0c\x02\x12\x03#\x13\x15\nD\n\x05\x04\0\x04\0\x04\x12\x03$\x04\x16\
+    \"6\x20future\x20reactions;\x20relay+client\x20treat\x20unknown\x20->\
+    \x20drop\n\n\r\n\x06\x04\0\x04\0\x04\0\x12\x03$\r\x15\n\x0e\n\x07\x04\0\
+    \x04\0\x04\0\x01\x12\x03$\r\x0f\n\x0e\n\x07\x04\0\x04\0\x04\0\x02\x12\
+    \x03$\x13\x15\n\x0b\n\x04\x04\0\x02\0\x12\x03'\x02\x1c\n\x0c\n\x05\x04\0\
+    \x02\0\x06\x12\x03'\x02\x0e\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03'\x0f\x17\
+    \n\x0c\n\x05\x04\0\x02\0\x03\x12\x03'\x1a\x1b\n\x98\x01\n\x04\x04\0\x02\
+    \x01\x12\x03*\x02\x19\x1a\x8a\x01\x20Cosmetic\x20display-name\x20fallbac\
+    k\x20(see\x20message\x20doc).\x20Attacker-controlled:\n\x20client\x20ren\
+    ders\x20as\x20ESCAPED\x20text\x20and\x20caps\x20length\x20(<=64).\x20Opt\
+    ional.\n\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03*\x02\x07\n\x0c\n\x05\x04\
+    \0\x02\x01\x01\x12\x03*\x08\x14\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03*\
+    \x17\x18\n\xfc\x02\n\x04\x04\0\x02\x02\x12\x030\x02\x19\x1a\xee\x02\x20S\
+    tandard\x20Unicode\x20emoji\x20for\x20a\x20CUSTOM\x20(12)\x20reaction;\
+    \x20empty/ignored\x20otherwise.\n\x20Attacker-controlled,\x20SAME\x20thr\
+    eat\x20model\x20as\x20`display_name`:\x20the\x20relay\x20MUST\n\x20valid\
+    ate\x20at\x20ingress\x20(exact\x20standard-emoji\x20allowlist\x20+\x20by\
+    te\x20cap\x20<=32,\n\x20unknown\x20->\x20drop)\x20and\x20the\x20client\
+    \x20ALSO\x20validates\x20before\x20send\x20AND\x20before\n\x20render\x20\
+    (defense\x20in\x20depth).\x20Rendered\x20as\x20ESCAPED\x20text\x20only\
+    \x20(never\x20markup).\n\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x030\x02\x07\
+    \n\x0c\n\x05\x04\0\x02\x02\x01\x12\x030\x08\x14\n\x0c\n\x05\x04\0\x02\
+    \x02\x03\x12\x030\x17\x18b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

@@ -50,6 +50,36 @@ pub(crate) fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usiz
     (best_cols, best_rows, best_tw)
 }
 
+/// Nominal camera-tile geometry (`--tile-w`, `--tile-h`) for the screen-share
+/// split layout's *maximized* (pinned) tile.
+///
+/// During screen share the participant panel renders small side-panel
+/// thumbnails, but a PINNED side-panel tile is `position: fixed;
+/// width/height: 100%` (style.css `.split-peer-tile.grid-item-pinned`) — it
+/// maximizes over the shared screen, exactly like `.grid-item-pinned` in the
+/// normal grid. That pinned tile's chrome (name badge, top-icon cluster,
+/// camera-off placeholder) is sized from the `--tile-w`/`--tile-h` custom
+/// properties on `#grid-container`, so those vars must describe the MAXIMIZED
+/// tile — NOT the compact side-panel thumbnail and NOT an N-tile grid cell
+/// (whose height shrinks as the participant count grows).
+///
+/// Returns the largest 3:2 tile that fits the available meeting area
+/// (`avail_w` × `avail_h`). This is intentionally the single-full-area tile —
+/// numerically identical to `compute_layout(1, avail_w, avail_h, _)` — and is
+/// a distinct, self-documenting function so the call site cannot be mistaken
+/// for the participant-count-dependent grid packing math that this value must
+/// NEVER reuse (PR #1946: reusing the grid cell size froze the pinned chrome
+/// at a stale, count-dependent size). Depends only on the viewport-derived
+/// available area, so it is deterministic across clients for a given viewport.
+pub(crate) fn screen_share_pinned_tile_size(avail_w: f64, avail_h: f64) -> (f64, f64) {
+    // Width of a 3:2 tile whose height fills `avail_h`, capped so it never
+    // exceeds `avail_w` (mirrors the height-vs-width constraint in
+    // `compute_layout`'s single-tile case for tall/narrow viewports).
+    let tw = (avail_h * TILE_AR).min(avail_w).max(0.0);
+    let th = tw / TILE_AR;
+    (tw, th)
+}
+
 /// Promote overflow speakers into the visible portion of a tile list.
 ///
 /// When there are more tiles than fit on screen, tiles beyond `visible_count`
@@ -207,6 +237,68 @@ mod tests {
         assert_eq!(c, 2);
         let th = tw / TILE_AR;
         assert!(th > 0.0);
+    }
+
+    // -- screen_share_pinned_tile_size --------------------------------
+
+    #[test]
+    fn ss_pinned_tile_matches_single_maximized_tile() {
+        // Landscape meeting area (1280x720 viewport minus grid padding:
+        // avail_w = 1280-40 = 1240, avail_h = 720-140 = 580 — the exact
+        // dimensions the screen-share E2E harness runs at).
+        let (tw, th) = screen_share_pinned_tile_size(1240.0, 580.0);
+        // A 3:2 tile filling the 580px height is 870px wide, which fits in
+        // 1240px, so height is the binding constraint.
+        assert!((th - 580.0).abs() < 0.5, "th was {th}");
+        assert!((tw - 870.0).abs() < 0.5, "tw was {tw}");
+        // Must equal the single full-area grid tile (the `tile_count == 1`
+        // pin), the value the normal-grid pin uses — this is the parity the
+        // pinned split-tile chrome depends on.
+        let (_c, _r, grid_tw) = compute_layout(1, 1240.0, 580.0, 16.0);
+        let grid_th = grid_tw / TILE_AR;
+        assert!((tw - grid_tw).abs() < 0.5, "tw {tw} != grid_tw {grid_tw}");
+        assert!((th - grid_th).abs() < 0.5, "th {th} != grid_th {grid_th}");
+    }
+
+    #[test]
+    fn ss_pinned_tile_is_independent_of_participant_count() {
+        // The whole point of the fix: the pinned split-tile size must NOT
+        // track the grid cell size, which shrinks as tiles are added. At 9
+        // tiles the grid cell height collapses well below the maximized
+        // height, so if this value ever tracked the grid it would regress.
+        let (_tw, th_pin) = screen_share_pinned_tile_size(1240.0, 580.0);
+        let (_c, _r, grid_tw_9) = compute_layout(9, 1240.0, 580.0, 16.0);
+        let grid_th_9 = grid_tw_9 / TILE_AR;
+        // Sanity: 9-tile grid cell is far smaller than the maximized pin, and
+        // below the 293px chrome-saturation threshold the pin must stay above.
+        assert!(
+            grid_th_9 < 250.0,
+            "9-tile grid th unexpectedly large: {grid_th_9}"
+        );
+        assert!(
+            th_pin > grid_th_9 + 100.0,
+            "pinned th {th_pin} not clearly larger than 9-tile grid th {grid_th_9}"
+        );
+        assert!(
+            th_pin >= 293.0,
+            "pinned th {th_pin} below chrome-saturation threshold"
+        );
+    }
+
+    #[test]
+    fn ss_pinned_tile_caps_width_in_tall_narrow_viewport() {
+        // Portrait/narrow area: a 3:2 tile of full height would overflow the
+        // width, so width binds and height derives from it.
+        let (tw, th) = screen_share_pinned_tile_size(300.0, 1000.0);
+        assert!((tw - 300.0).abs() < 0.5, "tw was {tw}");
+        assert!((th - 200.0).abs() < 0.5, "th was {th}");
+    }
+
+    #[test]
+    fn ss_pinned_tile_never_negative() {
+        // Degenerate collapsed viewport must not produce negative sizes.
+        let (tw, th) = screen_share_pinned_tile_size(0.0, 0.0);
+        assert!(tw >= 0.0 && th >= 0.0, "got ({tw}, {th})");
     }
 
     // -- promote_speakers ---------------------------------------------

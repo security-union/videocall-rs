@@ -329,6 +329,18 @@ pub struct VideoPeerDecoder {
     /// this signal the screen-share visibility toast on the publisher
     /// would time out at 10s on every share, even on the happy path.
     first_render_pending_ack: Rc<RefCell<bool>>,
+    /// HCL #893 companion latch: the "have we ever fired the first-render ack
+    /// for THIS decoder" guard that `mark_first_render` checks so the
+    /// `PEER_EVENT(screen_decode_started)` ack is emitted at most once per real
+    /// render burst. The screen `VideoPeerDecoder` is created once per peer and
+    /// only `flush()`ed (not recreated) when a share stops, so this latch
+    /// survives a stop→restart of screen sharing. `rearm_first_render_ack()`
+    /// clears it on the screen-turned-off edge so the NEXT share re-arms and
+    /// re-acks — without that reset every share after the first (within a
+    /// receiver's page session) never acks, and the publisher falsely reports
+    /// "No peers received the shared content within 10 seconds" even though the
+    /// receiver is decoding and painting the share.
+    first_render_fired: Rc<RefCell<bool>>,
     /// Issue #1183 (late-frame race): gate for the async paint callback.
     ///
     /// `clear_canvas()` (called synchronously on the decode-stop edge) sets
@@ -704,6 +716,7 @@ impl VideoPeerDecoder {
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context,
             first_render_pending_ack,
+            first_render_fired,
             paint_enabled,
             keyframe_request_route,
             latest_frame,
@@ -1020,6 +1033,30 @@ impl VideoPeerDecoder {
         self.decoder.flush()
     }
 
+    /// HCL #893 re-share fix: re-arm the once-per-lifetime first-render ack so
+    /// the NEXT screen share from this peer re-fires
+    /// `PEER_EVENT(screen_decode_started)`.
+    ///
+    /// The screen `VideoPeerDecoder` is created once per peer and only
+    /// `flush()`ed (jitter buffer cleared) — never recreated — when a share
+    /// stops. `first_render_fired` therefore stays `true` across a stop→restart,
+    /// so `mark_first_render` no-ops on the second share's first render and the
+    /// synchronous `decode()` never returns `first_frame: true` again. Without
+    /// this reset, `peer_decode_manager` never publishes the decode-started ack
+    /// for the second (and every subsequent) share of a receiver's page
+    /// session, and the publisher's visibility timer falsely fires
+    /// "No peers received the shared content within 10 seconds" even though the
+    /// receiver is decoding and painting the share.
+    ///
+    /// Called on the screen-turned-off edge (paired with `flush()`), so the
+    /// latch is clean before the next share's first keyframe renders. Resetting
+    /// the pending-ack flag too prevents a stale un-consumed ack from a prior
+    /// share from acking the new share before its content has actually
+    /// rendered.
+    pub fn rearm_first_render_ack(&self) {
+        rearm_first_render(&self.first_render_fired, &self.first_render_pending_ack);
+    }
+
     /// Install the proactive keyframe-request route (issue #1025).
     ///
     /// `route` is invoked on the main thread when the worker signals that it evicted a stale
@@ -1076,6 +1113,7 @@ impl VideoPeerDecoder {
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: Rc::new(RefCell::new(None)),
             first_render_pending_ack: Rc::new(RefCell::new(false)),
+            first_render_fired: Rc::new(RefCell::new(false)),
             paint_enabled: Rc::new(Cell::new(true)),
             keyframe_request_route: Rc::new(RefCell::new(None)),
             latest_frame: Rc::new(RefCell::new(LatestFrameMailbox::new())),
@@ -1371,6 +1409,19 @@ fn mark_first_render(fired: &Rc<RefCell<bool>>, ack: &Rc<RefCell<bool>>) {
         *fired.borrow_mut() = true;
         *ack.borrow_mut() = true;
     }
+}
+
+/// HCL #893 re-share fix: reset the `first_render_fired` guard (and any pending
+/// ack) so the next `mark_first_render` re-arms the once-per-share
+/// `PEER_EVENT(screen_decode_started)` ack. See
+/// [`VideoPeerDecoder::rearm_first_render_ack`] for the lifecycle rationale.
+///
+/// Extracted as a free function (mirroring `mark_first_render` /
+/// `consume_first_render_flag`) so the re-arm semantics can be unit-tested
+/// without a real `WasmDecoder`.
+fn rearm_first_render(fired: &Rc<RefCell<bool>>, ack: &Rc<RefCell<bool>>) {
+    *fired.borrow_mut() = false;
+    *ack.borrow_mut() = false;
 }
 
 ///
@@ -1696,6 +1747,51 @@ mod tests {
             !*ack.borrow(),
             "subsequent renders must not re-arm `ack` — would cause \
              a duplicate PEER_EVENT(screen_decode_started) per share"
+        );
+    }
+
+    /// HCL #893 re-share regression: the screen `VideoPeerDecoder` is reused
+    /// (only `flush()`ed, never recreated) across a share stop→restart, so the
+    /// `first_render_fired` latch survives. `rearm_first_render` (invoked by
+    /// `rearm_first_render_ack` on the screen-turned-off edge) must reset that
+    /// latch so the SECOND share's first render re-acks the publisher.
+    ///
+    /// Mutation sensitivity: reverting `rearm_first_render` to a no-op (or
+    /// dropping the screen-off `rearm_first_render_ack()` call it backs) leaves
+    /// `fired == true`, so the second `mark_first_render` no-ops, the final
+    /// `consume` returns `false`, and this test fails — which is exactly the
+    /// production symptom: no ack, and the publisher falsely toasts
+    /// "No peers received the shared content within 10 seconds".
+    #[test]
+    fn rearm_allows_second_share_to_reack() {
+        let fired = Rc::new(RefCell::new(false));
+        let ack = Rc::new(RefCell::new(false));
+
+        // --- First share: render, then the ack is consumed exactly once. ---
+        mark_first_render(&fired, &ack);
+        assert!(
+            consume_first_render_flag(&ack),
+            "first share: the first render must ack once"
+        );
+        assert!(
+            !consume_first_render_flag(&ack),
+            "first share: no second ack within the same share"
+        );
+
+        // --- Share stops: the screen-turned-off edge re-arms the latch. ---
+        rearm_first_render(&fired, &ack);
+        assert!(
+            !*fired.borrow(),
+            "re-arm must clear the fired guard so the next render can re-arm"
+        );
+
+        // --- Second share (same decoder lifetime): render must re-ack. ---
+        mark_first_render(&fired, &ack);
+        assert!(
+            consume_first_render_flag(&ack),
+            "after re-arm, the second share's first render must re-ack — \
+             otherwise the publisher falsely reports no receivers on every \
+             share after the first in a page session"
         );
     }
 

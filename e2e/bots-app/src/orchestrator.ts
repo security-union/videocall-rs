@@ -543,6 +543,7 @@ async function runSingleBotTask(
     // eligible, we skip straight to `launching` to match the
     // pre-auto-prime behaviour.
     const willAutoPrime =
+      entry.task.videoMode !== "clock" &&
       entry.task.manifest != null &&
       entry.task.manifestDir != null &&
       entry.task.manifestDir !== "" &&

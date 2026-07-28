@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { chromium, Browser, BrowserContext, Page } from "@playwright/test";
 
@@ -23,6 +24,8 @@ const CHROME_ARGS = [
   "--disable-dev-shm-usage",
 ];
 
+export type VideoMode = "costume" | "file" | "clock";
+
 export interface BotRunOptions {
   meetingURL: string;
   participant: string;
@@ -36,6 +39,13 @@ export interface BotRunOptions {
   botIdShort?: string | null;
   displayName: string;
   headless: boolean;
+  /**
+   * Camera source mode. `"costume"` and `"file"` retain the existing
+   * manifest/override-backed fake-device behavior. `"clock"` injects a
+   * page-lifetime canvas source and skips all asset preparation and
+   * Chrome fake-file capture flags.
+   */
+  videoMode?: VideoMode;
   /**
    * Auth backend selection. `"jwt"` injects a session cookie signed with
    * the server-known JWT_SECRET (local + HCL daily + previews).
@@ -190,6 +200,7 @@ function logLabel(opts: Pick<BotRunOptions, "participant" | "botIdShort">): stri
 
 export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   const label = logLabel(opts);
+  const videoMode = opts.videoMode ?? "costume";
   // `baseURL` is derived from the *original* URL (no query) so the
   // JWT session cookie's scope doesn't drift if a `?netsim=` param is
   // injected below. `target` is the URL we actually navigate to —
@@ -229,6 +240,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // (`spawnRemoteBot` bypasses `launchBot` entirely), so the
   // auto-prime is local-only by construction.
   if (
+    videoMode !== "clock" &&
     opts.manifest != null &&
     opts.manifestDir != null &&
     opts.manifestDir !== "" &&
@@ -257,7 +269,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       },
     });
   }
-  if (opts.runDir != null && opts.runDir !== "") {
+  if (videoMode !== "clock" && opts.runDir != null && opts.runDir !== "") {
     const assets =
       opts.manifest != null
         ? resolveAssetsForParticipant({
@@ -353,6 +365,15 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   }
 
   const page = await context.newPage();
+  if (videoMode === "clock") {
+    await page.addInitScript(
+      `globalThis.__CLOCK_PARTICIPANT = ${JSON.stringify(opts.displayName)};`,
+    );
+    await page.addInitScript({
+      path: fileURLToPath(new URL("./clock-source.js", import.meta.url)),
+    });
+    console.log(`[${label}] fake camera: synchronized wall clock`);
+  }
 
   // Dioxus 0.7's `trunk serve` workflow injects noisy diagnostics on
   // every page load (HMR websocket failure + the SPA HTML being served

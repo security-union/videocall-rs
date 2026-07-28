@@ -178,6 +178,19 @@ async function clickReaction(page: Page, slug: string): Promise<void> {
   await page.locator(`[data-testid="reaction-option-${slug}"]`).click();
 }
 
+/**
+ * Open the palette (if needed) and reveal the standard-emoji picker (CUSTOM
+ * reaction, issue 1884). Idempotent: the "More emoji" toggle reflects its state
+ * in aria-expanded, so we only click it when the picker is not already shown.
+ */
+async function openEmojiPicker(page: Page): Promise<void> {
+  await ensureReactionsPaletteOpen(page);
+  const picker = page.locator('[data-testid="emoji-picker"]');
+  if (await picker.isVisible().catch(() => false)) return;
+  await page.locator('[data-testid="emoji-picker-open"]').click();
+  await expect(picker).toBeVisible({ timeout: 5000 });
+}
+
 /** Join a meeting as the sole host (grid visible) — enough for palette-only
  * specs that need no peer. Returns the host page; the caller closes `browser`. */
 async function hostInMeeting(
@@ -481,11 +494,11 @@ test.describe("Two users in a meeting", () => {
     }
   });
 
-  test("rapid same-emoji reactions coalesce into a count badge within the concurrency cap", async ({
+  test("repeated same-emoji reactions each render as their own float (no count badge)", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:80";
-    const meetingId = `e2e_reaction_burst_${Date.now()}`;
+    const meetingId = `e2e_reaction_repeat_${Date.now()}`;
     const browser1 = await chromium.launch({ args: BROWSER_ARGS });
     const browser2 = await chromium.launch({ args: BROWSER_ARGS });
     try {
@@ -505,44 +518,169 @@ test.describe("Two users in a meeting", () => {
       const guestPage = await guestCtx.newPage();
       await enterTwoUserMeeting(hostPage, guestPage, meetingId);
 
-      // Case 6 + 7: a burst of the SAME emoji from one sender. The client
-      // self-throttle keeps sends within the relay budget, and the receiver
-      // coalesces repeats of the same (sender, emoji) into ONE float with a
-      // "×N" count badge instead of spawning a float per click. The palette
-      // stays open (persistence), so we open it once and click the same option
-      // repeatedly — re-opening would toggle it closed.
+      // Issue 1884 tweak: repeats of the SAME emoji are NO LONGER coalesced —
+      // each round-tripped reaction is its own float with its own animation, and
+      // there is NO "×N" count badge. The palette stays open (persistence), so we
+      // open it once and click the same option repeatedly.
       await ensureReactionsPaletteOpen(hostPage);
       const burstOption = hostPage.locator('[data-testid="reaction-option-thumbs_up"]');
-      const BURST = 8;
-      for (let i = 0; i < BURST; i++) {
+      const REPEATS = 3;
+      for (let i = 0; i < REPEATS; i++) {
         await burstOption.click();
-        // ~200ms between clicks. Back-to-back clicks can complete under the
-        // client's 350ms send min-interval on a fast runner, so the throttle
-        // would admit only ONE send and no ×N badge would appear. 200ms also
-        // clears the ~150ms local press gate (so each click is not coalesced
-        // away) while several still get through (coalescing within the 2s
-        // window).
-        await hostPage.waitForTimeout(200);
+        // ~400ms between clicks: clears the client's 350ms send min-interval so
+        // EVERY click sends (a tighter spacing would let the self-throttle drop
+        // some, weakening the "3 separate floats" assertion). Also clears the
+        // ~150ms local press gate.
+        await hostPage.waitForTimeout(400);
       }
 
-      // The count badge appears (coalescing happened) — assert DOM, never pixels.
-      const guestCount = guestPage.locator('[data-testid="reaction-float-count"]');
-      await expect(guestCount.first()).toBeVisible({ timeout: 10_000 });
-      const badgeText = (await guestCount.first().textContent()) || "";
-      const n = parseInt(badgeText.replace(/[^0-9]/g, ""), 10);
-      // Received count is bounded: >=2 (multiple round-tripped) and never more
-      // than the clicks issued (no phantom amplification / double-echo).
-      expect(n).toBeGreaterThanOrEqual(2);
-      expect(n).toBeLessThanOrEqual(BURST);
+      // The guest sees a SEPARATE float per received reaction — assert DOM, never
+      // pixels. >=2 proves the repeats did not merge into one; the exact count
+      // can vary with round-trip timing, so we assert the lower bound + the cap.
+      const guestFloats = guestPage.locator('[data-testid="reaction-float"]');
+      await expect
+        .poll(async () => await guestFloats.count(), { timeout: 10_000 })
+        .toBeGreaterThanOrEqual(2);
 
-      // The hard concurrency cap (MAX_CONCURRENT_REACTIONS = 12) is never
-      // exceeded. The exact drop-newest math is pinned by the host test
-      // integrate_drops_newest_at_the_hard_cap; here we assert the DOM bound.
-      const floatCount = await guestPage.locator('[data-testid="reaction-float"]').count();
-      expect(floatCount).toBeLessThanOrEqual(12);
+      // No count badge exists ANYWHERE — the ×N coalescing UI was removed. This
+      // is the assertion that FAILS on the old coalescing build (which merged
+      // repeats into one float carrying a reaction-float-count badge).
+      await expect(guestPage.locator('[data-testid="reaction-float-count"]')).toHaveCount(0);
+
+      // The hard concurrency cap (MAX_CONCURRENT_REACTIONS = 24) is never
+      // exceeded. The exact drop-oldest math is pinned by the host test
+      // integrate_drops_oldest_at_the_hard_cap; here we assert the DOM bound.
+      const floatCount = await guestFloats.count();
+      expect(floatCount).toBeLessThanOrEqual(24);
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+
+  test("custom emoji picker: guest sees the picked emoji as a float", async ({ baseURL }) => {
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_reaction_custom_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest@videocall.rs",
+        "GuestUser",
+        uiURL,
+      );
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+      await enterTwoUserMeeting(hostPage, guestPage, meetingId);
+
+      // Issue 1884: open the standard-emoji picker and pick a specific emoji.
+      // The grid's first cell in the default category (Smileys & Emotion) is a
+      // stable target; we read its glyph rather than hard-coding one so the test
+      // does not depend on the emoji-table ordering.
+      await openEmojiPicker(hostPage);
+      const firstEmoji = hostPage.locator('[data-testid="emoji-option-0"]');
+      await expect(firstEmoji).toBeVisible({ timeout: 5000 });
+      const glyph = (
+        (await firstEmoji.locator(".reaction-option__emoji").textContent()) || ""
+      ).trim();
+      expect(glyph.length).toBeGreaterThan(0);
+
+      await firstEmoji.click();
+
+      // The sender renders its own local "You" echo (relay self-skips the sender).
+      const hostEcho = hostPage
+        .locator('[data-testid="reaction-float"]')
+        .filter({ hasText: glyph })
+        .first();
+      await expect(hostEcho).toBeVisible({ timeout: 10_000 });
+
+      // The guest receives a float whose emoji text is exactly the picked glyph
+      // (rendered from the validated custom_emoji string, escaped by Dioxus).
+      const guestGlyphFloats = guestPage
+        .locator('[data-testid="reaction-float"] .reaction-float__emoji')
+        .filter({ hasText: glyph });
+      await expect(guestGlyphFloats.first()).toBeVisible({ timeout: 10_000 });
+
+      // Issue 1884 (recents): the picked emoji is now a palette quick-pick
+      // "recent" on the sender. It carries the same glyph and sits at index 0.
+      const recent0 = hostPage.locator('[data-testid="reaction-recent-0"]');
+      await expect(recent0).toBeVisible({ timeout: 5000 });
+      await expect(recent0.locator(".reaction-option__emoji")).toHaveText(glyph);
+
+      // Clicking the recent re-sends it as a CUSTOM reaction — the guest gets
+      // ANOTHER float of that glyph (count strictly increases). Space the click
+      // past the client's 350ms send min-interval so it definitely sends.
+      const before = await guestGlyphFloats.count();
+      await hostPage.waitForTimeout(500);
+      await recent0.click();
+      await expect
+        .poll(async () => await guestGlyphFloats.count(), { timeout: 10_000 })
+        .toBeGreaterThan(before);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("recent custom emojis: valid localStorage seed renders a quick-pick, invalid seed does not", async ({
+    baseURL,
+  }) => {
+    // Palette-only (recents render regardless of peers), so a single host is
+    // enough. Two contexts in one browser: one seeded with a VALID recent, one
+    // with a TAMPERED (non-emoji) recent. localStorage is seeded BEFORE nav (the
+    // app loads + sanitizes it at mount), per the repo's addInitScript precedent.
+    const uiURL = baseURL || "http://localhost:80";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      // VALID seed: 🚀 (a standard emoji NOT in the fixed row) must appear as
+      // reaction-recent-0 with its glyph.
+      const goodCtx = await createAuthenticatedContext(
+        browser1,
+        "host@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
+      await goodCtx.addInitScript(
+        `localStorage.setItem("reactions.recent_custom", ${JSON.stringify(JSON.stringify(["🚀"]))});`,
+      );
+      const goodPage = await goodCtx.newPage();
+      await fillAndSubmitJoinForm(goodPage, `e2e_recent_ok_${Date.now()}`, "HostUser");
+      await goodPage.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(goodPage)).toBe("in-meeting");
+      await ensureReactionsPaletteOpen(goodPage);
+      const recent0 = goodPage.locator('[data-testid="reaction-recent-0"]');
+      await expect(recent0).toBeVisible({ timeout: 5000 });
+      await expect(recent0.locator(".reaction-option__emoji")).toHaveText("🚀");
+      await goodPage.close();
+
+      // TAMPERED seed: "hello" is not an emoji — sanitize-on-load drops it, so the
+      // palette opens with NO recent quick-pick (validation on load; the
+      // assertion FAILS if load-validation is removed and "hello" is injected).
+      const badCtx = await createAuthenticatedContext(
+        browser1,
+        "guest@videocall.rs",
+        "GuestUser",
+        uiURL,
+      );
+      await badCtx.addInitScript(
+        `localStorage.setItem("reactions.recent_custom", ${JSON.stringify(JSON.stringify(["hello"]))});`,
+      );
+      const badPage = await badCtx.newPage();
+      await fillAndSubmitJoinForm(badPage, `e2e_recent_bad_${Date.now()}`, "GuestUser");
+      await badPage.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(badPage)).toBe("in-meeting");
+      await ensureReactionsPaletteOpen(badPage);
+      await expect(badPage.locator('[data-testid="reactions-palette"]')).toBeVisible();
+      await expect(badPage.locator('[data-testid="reaction-recent-0"]')).toHaveCount(0);
+    } finally {
+      await browser1.close();
     }
   });
 

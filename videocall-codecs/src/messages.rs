@@ -203,9 +203,20 @@ pub struct FreshnessSkipMessage {
     /// distinguish a bounded-freeze escalation (the #1662 fix firing) from a routine freshness skip.
     #[serde(default)]
     pub escalated: bool,
+    /// Wall-clock gap (ms) between the two jitter-buffer polls that bracketed this skip (issue
+    /// #1851). Under a normal ~10ms worker cadence this is a few ms; a value in the seconds means
+    /// the decode worker's `setInterval` was starved (backgrounded-tab timer clamp/freeze, or the
+    /// worker event loop blocked) and this is the FIRST poll after it resumed. Surfaced so field
+    /// analysis can tell a TICK-starvation freeze (worker not sampling — huge `tick_gap_ms` on the
+    /// resume poll) apart from a DELIVERY-starvation freeze (frames simply not arriving — small
+    /// `tick_gap_ms`). `#[serde(default)]` keeps it optional on the wire so an older worker build
+    /// that omits it still deserializes (reads `0.0`).
+    #[serde(default)]
+    pub tick_gap_ms: f64,
 }
 
 impl FreshnessSkipMessage {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         from_peer: Option<String>,
         to_peer: Option<String>,
@@ -213,6 +224,7 @@ impl FreshnessSkipMessage {
         keyframe_seq: Option<u64>,
         dropped: u64,
         escalated: bool,
+        tick_gap_ms: f64,
     ) -> Self {
         Self {
             kind: FRESHNESS_SKIP_KIND.to_string(),
@@ -222,6 +234,7 @@ impl FreshnessSkipMessage {
             keyframe_seq,
             dropped,
             escalated,
+            tick_gap_ms,
         }
     }
 
@@ -239,7 +252,10 @@ impl FreshnessSkipMessage {
     /// held-last-good case and renders as `none (held last-good)`. The `escalated=`
     /// token (issue #1662) is `true` only for the keyframe-less hold-ceiling escalation
     /// (decoder-pipeline reset) and `false` for routine skips, so the field investigation
-    /// can grep the bounded-freeze escalations apart from ordinary freshness skips.
+    /// can grep the bounded-freeze escalations apart from ordinary freshness skips. The
+    /// `tick_gap=` token (issue #1851) is the wall-clock gap since the previous poll, so a
+    /// tick-starvation freeze (seconds-large `tick_gap` on the resume poll) is greppable
+    /// apart from a delivery-starvation freeze (small `tick_gap`).
     pub fn console_line(&self) -> String {
         let from = self.from_peer.as_deref().unwrap_or_default();
         let to = self.to_peer.as_deref().unwrap_or_default();
@@ -248,8 +264,8 @@ impl FreshnessSkipMessage {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "none (held last-good)".to_string());
         format!(
-            "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms dropped={} keyframe_seq={keyframe} escalated={}",
-            self.head_age_ms, self.dropped, self.escalated
+            "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms tick_gap={:.0}ms dropped={} keyframe_seq={keyframe} escalated={}",
+            self.head_age_ms, self.tick_gap_ms, self.dropped, self.escalated
         )
     }
 }
@@ -379,7 +395,7 @@ mod worker_log_disambiguation_tests {
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
         );
 
-        let fs = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7, false);
+        let fs = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7, false, 0.0);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&fs).unwrap()).is_err()
         );
@@ -413,6 +429,7 @@ mod freshness_skip_console_line_tests {
             Some(42),
             7,
             false,
+            0.0,
         )
         .console_line();
         // The load-bearing grep prefix.
@@ -436,6 +453,12 @@ mod freshness_skip_console_line_tests {
             line.contains("escalated="),
             "missing escalated= token: {line}"
         );
+        // Tick-gap token (issue #1851): the field investigation greps it to separate a
+        // tick-starvation freeze (seconds-large gap) from a delivery-starvation freeze.
+        assert!(
+            line.contains("tick_gap="),
+            "missing tick_gap= token: {line}"
+        );
         // Peer attribution rendered as from->to.
         assert!(
             line.contains("alice->bob"),
@@ -448,12 +471,14 @@ mod freshness_skip_console_line_tests {
         // Issue #1662: the keyframe-less hold-ceiling escalation renders `escalated=true`; a routine
         // skip renders `escalated=false`. Both renderings are pinned because the field investigation
         // greps the token to count bounded-freeze escalations apart from ordinary skips.
-        let escalated = FreshnessSkipMessage::new(None, None, 6000.0, None, 0, true).console_line();
+        let escalated =
+            FreshnessSkipMessage::new(None, None, 6000.0, None, 0, true, 0.0).console_line();
         assert!(
             escalated.contains("escalated=true"),
             "escalation must render escalated=true: {escalated}"
         );
-        let routine = FreshnessSkipMessage::new(None, None, 1800.0, None, 7, false).console_line();
+        let routine =
+            FreshnessSkipMessage::new(None, None, 1800.0, None, 7, false, 0.0).console_line();
         assert!(
             routine.contains("escalated=false"),
             "routine skip must render escalated=false: {routine}"
@@ -461,8 +486,28 @@ mod freshness_skip_console_line_tests {
     }
 
     #[test]
+    fn renders_tick_gap_rounded_to_whole_millis() {
+        // Issue #1851: the resume poll after a starved worker carries a seconds-large tick_gap.
+        // `{:.0}` rounds, matching the head_age rendering, so the grep token is integer-ms.
+        let line = FreshnessSkipMessage::new(None, None, 103_328.0, None, 0, true, 102_000.4)
+            .console_line();
+        assert!(
+            line.contains("tick_gap=102000ms"),
+            "a starvation-resume skip must render its tick_gap: {line}"
+        );
+        // A routine skip on a healthy cadence renders a small tick_gap.
+        let healthy =
+            FreshnessSkipMessage::new(None, None, 1800.0, Some(7), 1, false, 10.0).console_line();
+        assert!(
+            healthy.contains("tick_gap=10ms"),
+            "a healthy-cadence skip renders a small tick_gap: {healthy}"
+        );
+    }
+
+    #[test]
     fn renders_keyframe_some_as_bare_sequence() {
-        let line = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7, false).console_line();
+        let line =
+            FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7, false, 0.0).console_line();
         assert!(
             line.contains("keyframe_seq=42"),
             "Some(42) should render as keyframe_seq=42: {line}"
@@ -477,7 +522,8 @@ mod freshness_skip_console_line_tests {
     fn renders_keyframe_none_as_held_last_good() {
         // The keyframe-less held case (#1020 evict-and-hold) is the distinct signal the
         // investigation distinguishes from a skip-to-live, so its rendering is pinned.
-        let line = FreshnessSkipMessage::new(None, None, 1800.0, None, 7, false).console_line();
+        let line =
+            FreshnessSkipMessage::new(None, None, 1800.0, None, 7, false, 0.0).console_line();
         assert!(
             line.contains("keyframe_seq=none (held last-good)"),
             "None should render as keyframe_seq=none (held last-good): {line}"
@@ -487,7 +533,8 @@ mod freshness_skip_console_line_tests {
     #[test]
     fn rounds_head_age_to_whole_millis() {
         // `{:.0}` rounds: 1234.6 -> 1235.
-        let line = FreshnessSkipMessage::new(None, None, 1234.6, Some(1), 0, false).console_line();
+        let line =
+            FreshnessSkipMessage::new(None, None, 1234.6, Some(1), 0, false, 0.0).console_line();
         assert!(
             line.contains("head_age=1235ms"),
             "head_age should round to 1235ms: {line}"
@@ -505,7 +552,8 @@ mod freshness_skip_console_line_tests {
         // shape stable for the grep. With issue #1640 this is now rare (SetContext is
         // sent at peer creation), but can still occur if the freshness deadline trips
         // on the very first frame before the postMessage delivering SetContext arrives.
-        let line = FreshnessSkipMessage::new(None, None, 100.0, Some(5), 1, false).console_line();
+        let line =
+            FreshnessSkipMessage::new(None, None, 100.0, Some(5), 1, false, 0.0).console_line();
         assert!(
             line.contains("freshness_skip ->:"),
             "empty peers should render as `->`: {line}"
@@ -528,6 +576,7 @@ mod freshness_skip_console_line_tests {
             Some(7),
             3,
             false,
+            0.0,
         )
         .console_line();
         assert!(

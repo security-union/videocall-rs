@@ -1,0 +1,11 @@
+{{- if .Values.csp.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "videocall-ui.fullname" . }}-csp
+  labels:
+    {{- include "videocall-ui.labels" . | nindent 4 }}
+data:
+  csp.conf: |-
+    add_header {{ ternary "Content-Security-Policy" "Content-Security-Policy-Report-Only" .Values.csp.enforce }} "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; worker-src 'self' blob:; connect-src {{ include "videocall-ui.cspConnectSrc" . }}; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; upgrade-insecure-requests" always;
+{{- end }}

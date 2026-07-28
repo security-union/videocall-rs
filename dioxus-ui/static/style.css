@@ -671,12 +671,46 @@ h3 {
     padding: var(--space-2) var(--space-2) 72px var(--space-2);
   }
 
-  /* Host video adjustments */
+  /* Host self-tile — square above the action bar, face-cropped */
   .host {
-    width: 25% !important;
-    max-width: 25vw !important;
-    bottom: clamp(4rem, 10vh, 5rem) !important;
+    width: 35% !important;
+    max-width: 140px !important;
+    aspect-ratio: 1 / 1 !important;
     right: clamp(0.5rem, 2vw, 1rem) !important;
+    bottom: var(--controls-dock-clearance, 112px) !important;
+  }
+
+  /* Override the 16:9 wrapper so it fills the square tile */
+  .host .host-video-wrapper {
+    aspect-ratio: unset !important;
+    width: 100% !important;
+    height: 100% !important;
+    flex-shrink: 1 !important;
+  }
+
+  /* Camera video — fill the square, crop the sides */
+  .host .self-camera {
+    object-fit: cover !important;
+  }
+
+  /* Camera-off placeholder wrapper (has inline aspect-ratio:16/9) */
+  .host > div:has(> .placeholder-content) {
+    aspect-ratio: unset !important;
+    padding: var(--space-2) !important;
+    width: 100% !important;
+    height: 100% !important;
+  }
+
+  /* Scale placeholder icon & text */
+  .host .placeholder-content {
+    gap: 0.25rem !important;
+  }
+  .host .placeholder-content svg {
+    width: 28px !important;
+    height: 28px !important;
+  }
+  .host .placeholder-text {
+    font-size: 0.55rem !important;
   }
 
   .top-bar {
@@ -823,7 +857,9 @@ canvas {
 
 .host {
   position: absolute;
-  bottom: clamp(1rem, 2vh, 1.5rem);
+  /* Sit above the action bar — uses the shared clearance token so the
+     self-tile automatically adjusts if the dock height changes. */
+  bottom: var(--controls-dock-clearance, 112px);
   right: clamp(1rem, 2vw, 1.5rem);
   width: clamp(10rem, 18vw, 15rem);
   max-width: 240px;
@@ -2068,16 +2104,158 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
      plain meeting. Removing the border here reclaims those 4px so the canvas
      fills the full viewport identically in both contexts. */
   border: none;
+  /* Match the maximized backdrop to the normal-grid pin. `.grid-item-pinned`
+     explicitly repaints to `var(--surface)` when maximized, but the base
+     `.split-peer-tile` background (`var(--surface-elevated)`) was never
+     overridden here, so a pinned side-panel tile kept the lighter elevated
+     shade. This is FULLY visible in the camera-OFF (avatar placeholder) case:
+     the `.canvas-container` is transparent, so the outer tile background shows
+     across the whole viewport behind the centered avatar. Repainting to
+     `var(--surface)` makes the screen-share pin's backdrop identical to the
+     plain-meeting pin's (measured: rgb(28,28,30) in both). */
+  background-color: var(--surface);
 }
 
 .split-peer-tile.grid-item-pinned .canvas-container {
-  width: min(100%, calc(100vh * 16 / 9));
-  height: min(100%, calc(100vw * 9 / 16));
+  /* Fill the FULL viewport, matching the no-screen-share pinned camera. In a
+     2-peer meeting the no-share pin renders as
+     `.grid-item.full-bleed.grid-item-pinned`, whose
+     `.grid-item.full-bleed .canvas-container` (global.css) is
+     `width: 100%; height: 100%` — the container spans the entire viewport and
+     the `object-fit: cover` canvas fills it edge-to-edge.
+
+     This rule previously used a `min(100%, 100vh * 16 / 9)` / `min(100%,
+     100vw * 9 / 16)` 16:9 box to mirror the BASE `.grid-item-pinned
+     .canvas-container` rule (style.css above). But that base rule is itself
+     overridden by full-bleed in the 2-peer case, so the split (screen-share)
+     pin resolved to a 16:9 box while the no-share pin was full-bleed. On any
+     viewport WIDER than 16:9 — most desktop/laptop windows — the 16:9 box is
+     narrower than the viewport, so the dark tile background showed as vertical
+     PILLARBOX bars on the left and right of the live camera during screen share
+     while the no-share pin filled the viewport edge-to-edge (user report, PR
+     #1892 round 4). `object-fit: cover` was never the cause: the canvas always
+     filled its container in both contexts; the CONTAINER geometry differed.
+
+     Filling `100% / 100%` makes the pinned camera's container identical to the
+     no-share pin. Verified live at a 1600x720 viewport: the no-share container
+     is 1600x720 (canvas left:0, right:1600) and, after this change, the
+     screen-share container is likewise 1600x720 (was 1280x720, left:160 —
+     160px pillarbox each side). Both stay `object-fit: cover`, so a 4:3 camera
+     crops top/bottom to fill the width identically in both contexts. This
+     targets only the peer CAMERA tile (`.split-peer-tile`); the screen-share
+     canvas (`.split-screen-tile`) keeps its own aspect-preserving contain rule
+     (global.css `canvas[id^="screen-share-"]`). */
+  width: 100%;
+  height: 100%;
   /* Corner radius is intentionally NOT overridden: the base
      `.split-peer-tile .canvas-container` radius (10px) already matches the
      normal-grid `.grid-item .canvas-container` radius (calc(var(--radius-lg) -
      2px) = 10px in global.css), so a maximized camera tile keeps the SAME
      rounded corners with or without screen share. */
+}
+
+/* Camera-OFF (avatar "Video Disabled" placeholder) parity when maximized.
+   The base `.split-peer-tile .placeholder-content …` rules hardcode SMALL,
+   thumbnail-appropriate sizes (40px avatar, `--fs-3` = 12px label, 0.4rem gap)
+   for the compact side-panel tiles. Those fixed sizes do NOT scale up when the
+   tile is pinned to the full viewport, so a maximized camera-OFF tile rendered
+   a tiny centered avatar during screen share while the normal-grid pin renders
+   a large one — the "tile content is not on full screen" field report (the
+   `.canvas-container` box itself already matches via `border: none` above; this
+   is the placeholder-content half the earlier border fix did not touch).
+   These three overrides restore the SAME formulas the normal grid's base
+   `.placeholder-content` rules use (style.css `.placeholder-content` /
+   `.placeholder-content svg` / `.placeholder-text`), so with an equal `--tile-h`
+   (measured 580px in BOTH the grid-pinned and split-pinned contexts) the avatar,
+   label and gap resolve to identical sizes (64px / 1.1rem / 1rem) as the
+   plain-meeting pin. Using the formulas rather than the resolved cap values
+   keeps the two paths in lockstep if `--tile-h` ever changes. Specificity
+   (0,3,1) beats the base `.split-peer-tile .placeholder-content svg` (0,2,1). */
+.split-peer-tile.grid-item-pinned .placeholder-content {
+  gap: min(1rem, calc(var(--tile-h, 240px) * 0.06));
+}
+.split-peer-tile.grid-item-pinned .placeholder-content svg {
+  width: min(64px, calc(var(--tile-h, 240px) * 0.3));
+  height: min(64px, calc(var(--tile-h, 240px) * 0.3));
+}
+.split-peer-tile.grid-item-pinned .placeholder-text {
+  font-size: clamp(0.5rem, calc(var(--tile-h, 240px) * 0.06), 1.1rem);
+}
+
+/* Name badge (top-left) parity when maximized. The base
+   `.split-peer-tile .floating-name` rule hardcodes SMALL, thumbnail-appropriate
+   position and type (top/left 6px, 3px 7px padding, `--fs-4` font, 2px gap,
+   `--radius-sm`) for the compact side-panel tiles. Those fixed values do NOT
+   scale up when the tile is pinned to the full viewport, so a maximized split
+   badge sits inset from the corner with visibly smaller letters than the
+   normal-grid pin's badge (user report: "name of the tile not in left corner
+   and written with smaller letters than … pin without screen share"). These
+   overrides restore the SAME `--tile-h`/`--tile-w`-driven formulas the normal
+   grid's base `.floating-name` rule uses (style.css `.floating-name`), so with
+   equal `--tile-h`/`--tile-w` (measured identical in both pinned contexts) the
+   badge inset, padding, radius, gap and font-size resolve identically to the
+   plain-meeting pin. Using the formulas (not resolved px) keeps the two paths
+   in lockstep if the vars change. Specificity (0,3,0) beats the base
+   `.split-peer-tile .floating-name` (0,2,0). */
+.split-peer-tile.grid-item-pinned .floating-name {
+  top: min(12px, calc(var(--tile-h, 240px) * 0.06));
+  left: min(12px, calc(var(--tile-w, 320px) * 0.04));
+  gap: min(6px, calc(var(--tile-w, 320px) * 0.02));
+  padding: min(6px, calc(var(--tile-h, 240px) * 0.03))
+    min(10px, calc(var(--tile-w, 320px) * 0.03));
+  border-radius: min(12px, calc(var(--tile-h, 240px) * 0.06));
+  font-size: clamp(9px, calc(var(--tile-h, 240px) * 0.07), 14px);
+  max-width: 55%;
+}
+
+/* Top-icon cluster (top-right) parity when maximized. Base
+   `.split-peer-tile .tile-top-icons` pins the cluster at a fixed 4px inset with
+   a 3px gap, and the base icon-button block sizes every button to a fixed
+   22×22 container with a 14×14 svg — thumbnail sizes that stay small when
+   pinned, so the maximized cluster sits inset from the corner with smaller
+   icons than the normal-grid pin (user report: "icons on the right side not in
+   the right corner and … smaller than … pin without screenshare"). Restore the
+   SAME `--tile-h`/`--tile-w` formulas the normal grid's base rules use
+   (`.tile-top-icons`, `.audio-indicator`, `.signal-indicator`,
+   `.pin-icon`/`.crop-icon`, `.tile-mute-btn` and their svgs) so both contexts
+   resolve identically at equal vars. */
+.split-peer-tile.grid-item-pinned .tile-top-icons {
+  top: min(8px, calc(var(--tile-h, 240px) * 0.04));
+  right: min(8px, calc(var(--tile-w, 320px) * 0.03));
+  gap: min(8px, calc(var(--tile-w, 320px) * 0.025));
+}
+/* Fixed-box buttons (signal/pin/crop/mute): normal grid sizes the container to
+   `min(32px, --tile-h*0.15)`; the split base clamps them to 22px. */
+.split-peer-tile.grid-item-pinned .signal-indicator,
+.split-peer-tile.grid-item-pinned .pin-icon,
+.split-peer-tile.grid-item-pinned .crop-icon,
+.split-peer-tile.grid-item-pinned .tile-mute-btn {
+  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  padding: 0;
+}
+/* Audio pill is content-sized in the normal grid (padding + svg, no fixed box);
+   the split base forces a fixed 22px box. Reset to the grid's padding formula. */
+.split-peer-tile.grid-item-pinned .audio-indicator {
+  width: auto;
+  height: auto;
+  padding: min(6px, calc(var(--tile-h, 240px) * 0.025));
+}
+/* Per-button svg sizes match each element's own normal-grid formula (audio/pin/
+   crop 0.1, signal 0.09, mute 0.08 of --tile-h); the split base clamps to 14px. */
+.split-peer-tile.grid-item-pinned .audio-indicator svg,
+.split-peer-tile.grid-item-pinned .pin-icon svg,
+.split-peer-tile.grid-item-pinned .crop-icon svg {
+  width: min(20px, calc(var(--tile-h, 240px) * 0.1));
+  height: min(20px, calc(var(--tile-h, 240px) * 0.1));
+}
+.split-peer-tile.grid-item-pinned .signal-indicator svg {
+  width: min(18px, calc(var(--tile-h, 240px) * 0.09));
+  height: min(18px, calc(var(--tile-h, 240px) * 0.09));
+}
+.split-peer-tile.grid-item-pinned .tile-mute-btn svg {
+  width: min(16px, calc(var(--tile-h, 240px) * 0.08));
+  height: min(16px, calc(var(--tile-h, 240px) * 0.08));
 }
 
 /* Screen-share split layout: a pinned LEFT-panel screen tile must maximize over
@@ -2100,6 +2278,30 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   width: 100%;
   height: 100%;
   z-index: 100;
+}
+
+/* Keep the global always-on-top chrome ABOVE a maximized (pinned) tile.
+   `#host-controls-nav.host` (the host self-view corner AND the bottom controls
+   dock live inside it) is `position: absolute; z-index: 10` (see `.host`), so it
+   establishes its OWN stacking context inside `#grid-container` (itself
+   `position: absolute; z-index: 0`). The controls dock's `z-index: 9000` is
+   therefore resolved ONLY within that nav context — relative to `#grid-container`
+   the WHOLE nav subtree stacks at the nav's own z-index (10). A pinned tile is a
+   sibling in the same `#grid-container` context: the normal-grid `.grid-item-pinned`
+   is `z-index: 10` (ties the nav and loses to it by DOM order, since the nav is
+   emitted last — so the dock stays visible), but the screen-share pinned tiles
+   `.split-peer-tile.grid-item-pinned` / `.split-screen-tile.grid-item-pinned` are
+   `z-index: 100` (to clear the split-area tiles/handle), which OUTRANKS the nav's
+   10 and buries the entire controls dock + "Camera Off" self-view badge under the
+   maximized tile — visible in the DOM but not paintable/clickable. Lifting the nav
+   above the pinned-tile ceiling restores the screenshot-2 behavior (dock + badge on
+   top of the pin) in BOTH contexts. Must stay > the pinned-tile z-index (100) and
+   is intentionally LOW (not 9000): sibling overlay drawers (`#peer-list-container`
+   9300, `#diagnostics-sidebar` 9300 desktop / 9301 mobile, device-settings modal)
+   render OUTSIDE `#grid-container`, so they already outrank this whole subtree via
+   `#grid-container`'s z-index:0 and must keep covering the dock when open. */
+#host-controls-nav.host {
+  z-index: 200;
 }
 
 /* ============================================================
@@ -5460,6 +5662,19 @@ html[data-theme="light"] .decode-paused-pill-action {
   animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* ------------------------------------------------------------------
+   Local recording status banner. Like .screen-share-toast, its
+   visibility is state-machine-controlled (`record_state()` in
+   attendants.rs stays Starting/Recording/Stopping/Saving for the whole
+   recording, which may run for minutes), NOT auto-dismissing. It carries
+   the `.peer-toast` class for layout, so we override the inherited
+   `toast-exit ... 7.5s forwards` back to enter-only — otherwise it would
+   silently fade to opacity 0 after ~8s while recording continues.
+   ------------------------------------------------------------------ */
+.peer-toast.recording-status-banner {
+  animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 .peer-toast.toast-loading .toast-icon {
   background: var(--toast-icon-neutral-bg);
 }
@@ -6689,6 +6904,11 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   border-color: var(--settings-swatch-border-hover);
 }
 
+.color-swatch:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--focus-ring);
+  border-color: var(--settings-swatch-border-hover);
+}
+
 .color-swatch.selected {
   /* Remove glow effect, keep only border for selection */
   box-shadow: none;
@@ -6701,16 +6921,17 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
      outside the swatch box and got cropped by `.color-swatches { overflow: hidden }`
      — issue #1406). At 0/0 the whole button renders inside the swatch's 24px box,
      so it is never clipped regardless of which row/cell the swatch lands in.
-     Sized 16px (not the old 18px) so a corner-anchored button leaves more of the
-     24px swatch face visible on hover — the user can still see which color they
-     are deleting. */
+    Sized 16px with transparent hit-slop so the visible glyph stays compact
+    while the hit target still meets 24px minimum guidance. */
   top: 0;
   right: 0;
   width: 16px;
   height: 16px;
+  padding: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
+  box-sizing: content-box;
   background: var(--error);
   border: none;
   border-radius: var(--radius-pill);
@@ -6727,8 +6948,19 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   opacity: 1;
 }
 
+/* Keyboard parity: show delete control when focus enters a swatch. */
+.color-swatch:has(.color-swatch-delete-btn):focus-within .color-swatch-delete-btn {
+  opacity: 1;
+}
+
 .color-swatch-delete-btn:hover {
   background: var(--error);
+}
+
+.color-swatch-delete-btn:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--text-primary);
+  outline-offset: 1px;
 }
 
 .add-color-btn {
@@ -7816,6 +8048,19 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .preview-tile {
+  --preview-glow-r: 100;
+  --preview-glow-g: 100;
+  --preview-glow-b: 100;
+  --preview-glow-outer-blur: 0;
+  --preview-glow-outer-spread: 0;
+  --preview-glow-outer-alpha: 0;
+  --preview-glow-inner-blur: 0;
+  --preview-glow-inner-spread: 0;
+  --preview-glow-inner-alpha: 0;
+  --preview-glow-border-alpha: 1;
+  --preview-glow-fade-in: 0.15s;
+  --preview-glow-fade-out: 0.30s;
+  --preview-glow-hold-delay: 0s;
   width: 100%;
   aspect-ratio: 16 / 9;
   display: flex;
@@ -7826,8 +8071,20 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   padding: 0;
   overflow: hidden;
   transition:
-    box-shadow 0.15s ease-in,
-    border-color 0.15s ease-in;
+    box-shadow var(--preview-glow-fade-in) ease-in,
+    border-color var(--preview-glow-fade-in) ease-in;
+}
+
+.preview-tile.preview-tile--speaking {
+  box-shadow: var(--preview-glow-speaking-box-shadow);
+  border-color: var(--preview-glow-speaking-border-color);
+  transition: var(--preview-glow-speaking-transition);
+}
+
+.preview-tile.preview-tile--silent {
+  box-shadow: none;
+  border-color: var(--preview-glow-silent-border-color);
+  transition: var(--preview-glow-silent-transition);
 }
 
 @keyframes preview-pulse {
@@ -7905,6 +8162,13 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 
 .appearance-settings-panel.glow-disabled .preview-tile-pulsing {
   animation-play-state: paused;
+}
+
+.appearance-settings-panel.glow-disabled .preview-tile,
+.appearance-settings-panel.glow-disabled .preview-tile.preview-tile--speaking,
+.appearance-settings-panel.glow-disabled .preview-tile.preview-tile--silent {
+  box-shadow: none;
+  border-color: var(--appearance-preview-tile-border-color);
 }
 
 /* Mobile */
@@ -8821,19 +9085,132 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   cursor: default;
 }
 
-/* issue 1884 (UX N1): the close (X) is now a keyboard-reachable toolbar control,
-   so it needs the same focus-visible ring as the options and should match their
-   44px hit target. Scoped to the palette so the shared 32px .close-button base
-   (chat / peer list / diagnostics) is untouched. */
-.reactions-palette .close-button {
-  width: 44px;
-  height: 44px;
+/* issue 1884: the reactions palette close (X) is a small circular badge that
+   HANGS half off the palette's top-right corner (translate(50%,-50%)) rather
+   than sitting inline. Absolutely positioned inside the palette (its transform /
+   fixed position is the containing block); the palette has no overflow:hidden,
+   so the overhang is not clipped. Keeps the shared .close-button color + hover
+   tokens; adds a subtle ring/shadow from the popover token set. A 24px box is a
+   compact visual, and it stays keyboard-focusable with a visible ring. The
+   interactive/touch hit target is enlarged to ~44px by the ::before below. */
+.reactions-close-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  transform: translate(50%, -50%);
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  border-radius: 999px;
+  border: 1px solid var(--glass-popover-border);
+  box-shadow: var(--glass-popover-shadow);
+  font-size: var(--fs-2);
+  z-index: 1;
 }
 
-.reactions-palette .close-button:focus-visible {
+/* issue 1884: enlarge the touch/click target of the 24px visual badge to ~44px
+   WITHOUT enlarging the badge itself. The badge's center sits ON the palette's
+   top-right corner (translate(50%,-50%)), so three of its four quadrants (up,
+   right, up-right) overhang into EMPTY space outside the palette. We therefore
+   grow the hit area only UP and RIGHT (into that empty overhang) — top/right
+   -20px — and pin the bottom/left edges to the badge itself (inset 0), so the
+   inward (down-left) reach toward the top-right reaction option is UNCHANGED from
+   the visual badge. Verified: this adds NO new overlap with any option's click
+   zone; the extra target lives entirely in the corner overhang. Clicks on a
+   pseudo-element hit-test as the element, so this is a real, focusless target. */
+.reactions-close-badge::before {
+  content: "";
+  position: absolute;
+  top: -20px;
+  right: -20px;
+  bottom: 0;
+  left: 0;
+}
+
+.reactions-close-badge:focus-visible {
+  outline: 2px solid var(--accent, rgba(120, 160, 220, 0.55));
+  /* @token-exempt: var() fallback */
+  outline-offset: 2px;
+}
+
+/* issue 1884: thin divider between the fixed reactions and the recent-CUSTOM
+   quick-picks. Only rendered when there is at least one recent, so the fixed row
+   never carries a dangling separator. Stretches to the option height within the
+   wrapping flex row. */
+.reactions-recent-sep {
+  align-self: stretch;
+  width: 1px;
+  margin: 0 2px;
+  background: var(--glass-popover-border);
+}
+
+/* ===== Standard-emoji picker (CUSTOM reaction, issue 1884) ===== */
+/* Full-width panel that wraps below the palette's quick row (flex-basis:100%).
+   Only the selected category's grid is mounted, so the full ~3600-emoji table
+   is never rendered at once. */
+.emoji-picker {
+  flex-basis: 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--glass-popover-border);
+}
+
+.emoji-picker__tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  justify-content: center;
+}
+
+.emoji-tab {
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  transition: background 0.15s ease;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+}
+
+.emoji-tab:hover {
+  background: var(--settings-ghost-bg-hover);
+}
+
+.emoji-tab.active {
+  background: var(--settings-ghost-bg-selected);
+}
+
+.emoji-tab:focus-visible {
   outline: 2px solid var(--accent, rgba(120, 160, 220, 0.55));
   /* @token-exempt: var() fallback */
   outline-offset: -2px;
+}
+
+.emoji-picker__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Denser than the 44px quick-row option so a category grid fits the panel. */
+.emoji-option {
+  width: 40px;
+  height: 40px;
+  font-size: 22px;
 }
 
 /* ===== Floating reactions overlay (net-new animation, issue 1884) ===== */
@@ -8886,18 +9263,6 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.reaction-float__count {
-  /* @token-exempt: on-accent white */
-  background: var(--accent);
-  color: #fff;
-  font-size: var(--fs-2);
-  font-weight: 700;
-  border-radius: 999px;
-  padding: 0 6px;
-  min-width: 18px;
-  text-align: center;
 }
 
 @keyframes reaction-rise {

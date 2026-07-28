@@ -22,6 +22,7 @@ use meeting_api::config::Config;
 use meeting_api::cors::{ALLOWED_CUSTOM_HEADERS, ALLOWED_HEADERS, ALLOWED_METHODS};
 use meeting_api::nats_consumers;
 use meeting_api::routes;
+use meeting_api::session_refresh;
 use meeting_api::state::AppState;
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -75,9 +76,11 @@ async fn main() {
 
     // CORS: In production set `CORS_ALLOWED_ORIGIN` to the exact frontend
     // origin (e.g. "https://app.videocall.rs").  Comma-separate for multiple
-    // origins. When unset, the server mirrors the request origin which is
-    // convenient for development but **insecure** in production (any site can
-    // make credentialed requests).
+    // origins. `Config::from_env` rejects an empty origin list unless DEV_USER
+    // is active, so the mirror fallback below is reachable only for local dev.
+    // The empty-list arm is additionally guarded on `dev_user.is_some()` here so
+    // the invariant sits with its consumer: if the `from_env` guard were ever
+    // weakened, this still fails closed (deny-all) rather than mirroring.
     //
     // `AllowOrigin::list` echoes back only the matched origin so the response
     // header always contains a single value, which is required by the spec.
@@ -85,7 +88,9 @@ async fn main() {
     // `allow_credentials(true)` requires explicit methods and headers (not *).
     let cors = CorsLayer::new()
         .allow_origin(match config.cors_allowed_origin.as_slice() {
-            [] => AllowOrigin::mirror_request(),
+            [] if config.dev_user.is_some() => AllowOrigin::mirror_request(),
+            // Unreachable in production (from_env fails closed); deny-all if hit.
+            [] => AllowOrigin::list(Vec::<http::HeaderValue>::new()),
             origins => {
                 let hvs: Vec<http::HeaderValue> = origins
                     .iter()
@@ -177,7 +182,13 @@ async fn main() {
     let _purge_handle = meeting_api::console_log_purge::spawn_purge_task();
 
     let state = AppState::new(pool, &config, nats, feed_tx);
-    let app = routes::router().layer(cors).with_state(state);
+    let app = routes::router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            session_refresh::slide_session_cookie,
+        ))
+        .layer(cors)
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)
         .await

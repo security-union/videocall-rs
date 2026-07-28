@@ -17,6 +17,13 @@
  */
 
 //! WebCodecs-based Opus decoder using browser's native hardware acceleration
+//!
+//! ## Packet-loss concealment (issue 620)
+//! The WebCodecs `AudioDecoder` interface exposes no libopus-style PLC
+//! primitive, so this decoder does NOT override `AudioDecoder::decode_plc`; it
+//! keeps the trait default (`None`). When a packet is lost, NetEQ's concealment
+//! therefore falls back to the quiet-noise `Expand` path rather than codec PLC.
+//! Codec-level PLC is available only on native targets (see `NativeOpusDecoder`).
 
 use crate::codec::AudioDecoder;
 use crate::Result;

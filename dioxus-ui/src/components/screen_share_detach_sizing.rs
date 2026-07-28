@@ -68,6 +68,80 @@ pub(crate) fn detached_window_inner_dims(
     (vw, vh + bar_h)
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1821: Maximize behaviour + button presentation (host-testable pure
+// helpers; the wasm `screen_share_detach` module drives the real DOM off them).
+// ---------------------------------------------------------------------------
+
+/// How the Maximize control behaves, chosen by how the detached window was opened.
+///
+/// Document PiP windows are UA-clamped and spec-forbidden from
+/// `requestFullscreen`, so they can NEVER fill the display in place (the user's
+/// exact complaint on issue #1821) — the only route to a maximized-window geometry
+/// is to migrate the mirror into a script-opened popup. A popup can toggle real
+/// fullscreen directly.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum MaximizeAction {
+    /// Document PiP: open a maximized popup and migrate the mirror into it.
+    MigrateToMaximizedPopup,
+    /// Popup: toggle real fullscreen on the viewport.
+    ToggleFullscreen,
+}
+
+/// Select the Maximize behaviour from how the detached window was opened
+/// (`via_pip`). The wasm handler matches on this so the choice is guarded by
+/// [`maximize_action_selects_by_open_mode`].
+pub(crate) fn maximize_action_for(via_pip: bool) -> MaximizeAction {
+    if via_pip {
+        MaximizeAction::MigrateToMaximizedPopup
+    } else {
+        MaximizeAction::ToggleFullscreen
+    }
+}
+
+/// The `window.open` feature string that requests a maximized-window geometry: the
+/// FULL available display box (`screen.availLeft/availTop/availWidth/availHeight`),
+/// which mirrors the OS taskbar/dock-respecting bounds of an OS-maximized window.
+///
+/// Script-opened popups are EXPECTED to honour these size/position features (unlike
+/// UA-clamped Document PiP windows — the reason Maximize on a PiP window migrates to
+/// a popup rather than resizing in place). That the UA actually applies the full box
+/// is spec-reasoned but PENDING a live headed receipt on real Chrome Document PiP;
+/// the e2e stage will attempt it. Whatever the UA grants, the geometry is a request,
+/// not a guarantee, and the mirror renders correctly at any size.
+pub(crate) fn maximized_popup_features(left: i32, top: i32, width: i32, height: i32) -> String {
+    format!("popup=yes,left={left},top={top},width={width},height={height}")
+}
+
+/// Issue #1821: the Maximize button's initial presentation, by open mode. A popup
+/// toggles fullscreen (a two-state control → gets `aria-pressed`); a Document PiP
+/// performs a one-shot migrate-to-maximized-popup (no pressed state). `label` is
+/// the initial `aria-label`/`title`; `glyph` the button text.
+pub(crate) struct MaximizeButtonSpec {
+    pub label: &'static str,
+    pub glyph: &'static str,
+    /// Whether the control is a two-state toggle (renders `aria-pressed`).
+    pub toggle: bool,
+}
+
+pub(crate) fn maximize_button_spec(via_pip: bool) -> MaximizeButtonSpec {
+    if via_pip {
+        MaximizeButtonSpec {
+            // One-shot: first click migrates the mirror to a maximized popup, where
+            // the (then-fullscreen-toggle) Maximize button takes over.
+            label: "Maximize to full display",
+            glyph: "\u{2922}", // U+2922 ⤢
+            toggle: false,
+        }
+    } else {
+        MaximizeButtonSpec {
+            label: "Enter full screen (Escape to exit)",
+            glyph: "\u{26F6}", // U+26F6 ⛶
+            toggle: true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +232,48 @@ mod tests {
         let (w, h) = detached_window_inner_dims(1920, 1080, 100, 100, BAR);
         assert_eq!(w, DETACHED_MIN_W);
         assert_eq!(h, DETACHED_MIN_H + BAR);
+    }
+
+    // ── Issue #1821: Maximize behaviour + button presentation ────────────────
+
+    #[test]
+    fn maximize_action_selects_by_open_mode() {
+        // Document PiP cannot fill the display in place → migrate to a popup.
+        assert_eq!(
+            maximize_action_for(true),
+            MaximizeAction::MigrateToMaximizedPopup
+        );
+        // A popup can go fullscreen directly.
+        assert_eq!(maximize_action_for(false), MaximizeAction::ToggleFullscreen);
+    }
+
+    #[test]
+    fn maximized_popup_features_uses_full_avail_box() {
+        // Distinct values on every axis so a dropped/swapped field is caught.
+        assert_eq!(
+            maximized_popup_features(11, 22, 1920, 1200),
+            "popup=yes,left=11,top=22,width=1920,height=1200"
+        );
+    }
+
+    #[test]
+    fn maximize_button_spec_differs_by_open_mode() {
+        let pip = maximize_button_spec(true);
+        assert!(
+            !pip.toggle,
+            "PiP Maximize is a one-shot migrate, not a two-state toggle"
+        );
+        assert_eq!(pip.label, "Maximize to full display");
+
+        let popup = maximize_button_spec(false);
+        assert!(
+            popup.toggle,
+            "popup Maximize toggles fullscreen (aria-pressed)"
+        );
+        assert_ne!(
+            popup.glyph, pip.glyph,
+            "the two modes must show distinct glyphs"
+        );
+        assert_ne!(popup.label, pip.label);
     }
 }

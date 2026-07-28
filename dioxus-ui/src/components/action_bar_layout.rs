@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn keyboard_reorder_arrow_delta_moves_and_clamps() {
         // Right arrow from the middle. ScreenShare sits at index 3 in
-        // DEFAULT_SLOTS (after Mic, Camera, Reactions — issue #1884 inserted
+        // DEFAULT_SLOTS (after Mic, Camera, Reactions — issue 1884 inserted
         // Reactions at index 2), so a +1 arrow moves it to index 4.
         let mut slots: Vec<ActionBarSlot> = DEFAULT_SLOTS.to_vec();
         let result = apply_keyboard_reorder(&mut slots, ActionBarSlot::ScreenShare, Some(1), None)
@@ -704,7 +704,7 @@ mod tests {
     fn keyboard_reorder_returns_none_for_absent_or_empty() {
         let mut slots: Vec<ActionBarSlot> = vec![ActionBarSlot::Mic, ActionBarSlot::Camera];
         assert_eq!(
-            apply_keyboard_reorder(&mut slots, ActionBarSlot::PeerList, Some(1), None),
+            apply_keyboard_reorder(&mut slots, ActionBarSlot::ScreenShare, Some(1), None),
             None,
         );
         // Original list is untouched.

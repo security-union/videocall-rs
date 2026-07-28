@@ -21,7 +21,9 @@ use axum::response::Response;
 use axum::Router;
 use http_body_util::BodyExt;
 use meeting_api::cors::{ALLOWED_CUSTOM_HEADERS, ALLOWED_HEADERS, ALLOWED_METHODS};
-use meeting_api::{config::DevUser, routes, state::AppState, token::generate_session_token};
+use meeting_api::{
+    config::DevUser, routes, session_refresh, state::AppState, token::generate_session_token,
+};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -73,6 +75,8 @@ fn build_app_inner(pool: PgPool, dev_user: Option<DevUser>) -> Router {
         jwt_secret: TEST_JWT_SECRET.to_string(),
         token_ttl_secs: TEST_TOKEN_TTL,
         session_ttl_secs: TEST_SESSION_TTL,
+        session_refresh_threshold_secs: 300,
+        session_absolute_max_secs: 604800,
         oauth: None,
         jwks_cache: None,
         cookie_domain: None,
@@ -90,7 +94,16 @@ fn build_app_inner(pool: PgPool, dev_user: Option<DevUser>) -> Router {
         display_name_rate_limit_disabled: false,
         dev_user,
     };
-    routes::router().with_state(state)
+    build_app_from_state(state)
+}
+
+pub fn build_app_from_state(state: AppState) -> Router {
+    routes::router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            session_refresh::slide_session_cookie,
+        ))
+        .with_state(state)
 }
 
 /// Build the Axum router with the production CORS layer attached.
@@ -119,8 +132,14 @@ pub fn build_app_with_cors(pool: PgPool) -> Router {
 /// This replaces the old `Cookie: email=<email>` pattern. The JWT is signed
 /// with [`TEST_JWT_SECRET`] and contains the email in the `sub` claim.
 pub fn request_with_cookie(method: &str, uri: &str, email: &str) -> http::request::Builder {
-    let session_jwt = generate_session_token(TEST_JWT_SECRET, email, email, TEST_SESSION_TTL)
-        .expect("signing session JWT for test should not fail");
+    let session_jwt = generate_session_token(
+        TEST_JWT_SECRET,
+        email,
+        email,
+        TEST_SESSION_TTL,
+        chrono::Utc::now().timestamp(),
+    )
+    .expect("signing session JWT for test should not fail");
     http::Request::builder()
         .method(method)
         .uri(uri)

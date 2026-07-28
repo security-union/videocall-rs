@@ -48,6 +48,7 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use videocall_transport::webtransport::FrameDropMeta;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::health_packet::HealthPacket;
@@ -57,7 +58,9 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
 
-use super::reactions::{resolve_reaction_display_name, REACTION_DISPLAY_NAME_MAX_CHARS};
+use super::reactions::{
+    resolve_reaction_display_name, validate_custom_emoji, REACTION_DISPLAY_NAME_MAX_CHARS,
+};
 use videocall_types::protos::layer_hint_packet::{layer_hint_packet::MediaKind, LayerHintPacket};
 use videocall_types::protos::layer_preference_packet::{
     layer_preference_packet::Entry as LayerPreferenceEntry, LayerPreferencePacket,
@@ -200,6 +203,13 @@ impl std::fmt::Debug for RefreshRoomTokenCallback {
 }
 
 /// Configuration options for creating a [`VideoCallClient`].
+/// Callback payload for an inbound peer reaction (issue 1884):
+/// `(sender_session_id, reaction_enum_i32, resolved_name, custom_emoji)`.
+/// `custom_emoji` is `Some(validated_emoji)` ONLY for a CUSTOM (12) reaction and
+/// `None` for every 1..=11 reaction. Aliased so the nested-tuple callback type
+/// stays under clippy's `type_complexity` bar at every use site.
+pub type ReactionCallback = Callback<(u64, i32, String, Option<String>)>;
+
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
 /// initialise the client.  Pass an instance of this struct to
@@ -333,15 +343,20 @@ pub struct VideoCallClientOptions {
     ///   and is otherwise client-forgeable — a REACTION's sender_session_id is a
     ///   trustworthy identity anchor: a peer cannot forge a reaction attributed
     ///   to someone else;
-    /// - `reaction_enum_i32` is a defined `ReactionType` value (1..=7) — the
+    /// - `reaction_enum_i32` is a defined `ReactionType` value (1..=12) — the
     ///   client already dropped `UNSPECIFIED`/unknown, so the UI can map it to
     ///   an emoji/label directly;
     /// - `resolved_name` is the display name resolved via the display-name
-    ///   cache, falling back to the sanitized in-packet name, then "Someone".
+    ///   cache, falling back to the sanitized in-packet name, then "Someone";
+    /// - `custom_emoji` is `Some(validated_emoji)` ONLY for a CUSTOM (12)
+    ///   reaction — the client has already validated it against the exact
+    ///   standard-emoji allowlist + byte cap ([`validate_custom_emoji`]) before
+    ///   firing, so an invalid custom emoji never reaches the callback (it is
+    ///   dropped on receive). `None` for every 1..=11 reaction.
     ///
     /// The client never fires this for the local user's OWN reaction (the relay
     /// self-skips the sender); the UI renders its own echo on click instead.
-    pub on_reaction: Option<Callback<(u64, i32, String)>>,
+    pub on_reaction: Option<ReactionCallback>,
 
     /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
     /// silently discarded and no peer decoder workers are created.  Only
@@ -416,7 +431,7 @@ struct InnerOptions {
     on_peer_event: Option<Callback<(String, String, String)>>,
     on_peer_left: Option<Callback<(String, String, String)>>,
     on_peer_joined: Option<Callback<(String, String, String)>>,
-    on_reaction: Option<Callback<(u64, i32, String)>>,
+    on_reaction: Option<ReactionCallback>,
     on_display_name_changed: Option<Callback<(String, String, u64)>>,
     decode_media: bool,
 }
@@ -2221,18 +2236,36 @@ impl VideoCallClient {
     /// line blocking — an audio packet is never queued behind a stalled
     /// video frame.  WebSocket ignores `stream_key`.
     pub(crate) fn send_media_packet(&self, media: PacketWrapper, stream_key: MediaStreamKey) {
-        self.send_packet_on_stream(media, stream_key);
+        self.send_media_packet_with_drop_meta(media, stream_key, None);
+    }
+
+    pub(crate) fn send_media_packet_with_drop_meta(
+        &self,
+        media: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) {
+        self.send_packet_on_stream_with_drop_meta(media, stream_key, meta);
     }
 
     /// Internal helper: dispatch `media` through the active
     /// `ConnectionController` on the persistent stream identified by
     /// `stream_key`.
     fn send_packet_on_stream(&self, media: PacketWrapper, stream_key: MediaStreamKey) {
+        self.send_packet_on_stream_with_drop_meta(media, stream_key, None);
+    }
+
+    fn send_packet_on_stream_with_drop_meta(
+        &self,
+        media: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) {
         let packet_type = media.packet_type.enum_value();
         match self.connection_controller.try_borrow() {
             Ok(cc) => {
                 if let Some(controller) = cc.as_ref() {
-                    if let Err(e) = controller.send_packet(media, stream_key) {
+                    if let Err(e) = controller.send_packet_with_drop_meta(media, stream_key, meta) {
                         debug!(
                             "Failed to send {packet_type:?} packet on stream {stream_key:?}: {e}"
                         );
@@ -2280,6 +2313,24 @@ impl VideoCallClient {
                         "websocket"
                     }
                 });
+            }
+        }
+        None
+    }
+
+    /// This client's active-connection WebSocket send-queue depth
+    /// (`bufferedAmount`, bytes), or `None` on WebTransport — which exposes no
+    /// such counter because screen rides its own reliable QUIC unistream with no
+    /// cross-media head-of-line queue — or when no connection is elected yet.
+    ///
+    /// Read once per screen frame by the issue #1921 WS send-side freshness
+    /// gate. A cheap synchronous getter forwarded to the currently-elected
+    /// connection, so it tracks election, reconnect, and WT↔WS fallback: a fresh
+    /// socket after a reconnect reports `Some(0)`, below any drop threshold.
+    pub(crate) fn send_queue_depth(&self) -> Option<u64> {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                return controller.get_send_queue_depth();
             }
         }
         None
@@ -3493,6 +3544,54 @@ impl VideoCallClient {
             ..Default::default()
         };
         self.send_packet(wrapper);
+    }
+
+    /// Broadcast a CUSTOM reaction carrying a picker-selected standard Unicode
+    /// `emoji` (issue 1884). Returns `true` if the packet was sent, `false` if
+    /// the emoji failed validation and nothing was sent.
+    ///
+    /// Defense in depth (mirrors the proto `custom_emoji` threat model): this
+    /// re-validates `emoji` against the exact standard-emoji allowlist + byte
+    /// cap ([`validate_custom_emoji`]) at the wire boundary even though the UI
+    /// already validated before calling — an invalid string never reaches the
+    /// wire. Like [`send_reaction`](Self::send_reaction) it does NOT self-throttle;
+    /// the UI gates each click through `ReactionSelfThrottle` first.
+    pub fn send_custom_reaction(&self, emoji: &str) -> bool {
+        if !validate_custom_emoji(emoji) {
+            warn!("Refusing to send CUSTOM reaction with invalid emoji");
+            return false;
+        }
+        let display_name: Vec<u8> = self
+            .options
+            .display_name
+            .chars()
+            .take(REACTION_DISPLAY_NAME_MAX_CHARS)
+            .collect::<String>()
+            .into_bytes();
+        // `validate_custom_emoji` above already asserted `emoji.len() <=
+        // REACTION_CUSTOM_EMOJI_MAX_BYTES`, so the whole string fits the cap; send its
+        // exact bytes (truncating raw UTF-8 bytes here could split a codepoint).
+        let packet = ReactionPacket {
+            reaction: ReactionType::CUSTOM.into(),
+            display_name,
+            custom_emoji: emoji.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let data = match packet.write_to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize CUSTOM ReactionPacket: {e}");
+                return false;
+            }
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::REACTION.into(),
+            user_id: self.options.user_id.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+        self.send_packet(wrapper);
+        true
     }
 
     /// Ensure the `SharedAudioContext` is initialised and expose it together
@@ -5017,28 +5116,57 @@ impl Inner {
                         // Unknown/reserved (Err) or UNSPECIFIED: not a renderable
                         // reaction — ignore, matching the relay ingress allowlist.
                         Err(_) | Ok(ReactionType::REACTION_TYPE_UNSPECIFIED) => {}
-                        // Any defined 1..=7 reaction.
-                        Ok(_) => {
+                        // Any defined 1..=12 reaction.
+                        Ok(reaction_type) => {
                             if let Some(cb) = &self.options.on_reaction {
-                                // Attribution anchor: the envelope session_id,
-                                // resolved via the display-name cache. For
-                                // REACTION the relay stamps this UNCONDITIONALLY
-                                // with the sender's authenticated session before
-                                // fan-out (stamp_reaction_for_broadcast in
-                                // actix-api), so it is a TRUSTWORTHY identity
-                                // anchor here — a peer cannot forge a reaction
-                                // attributed to another participant (the general
-                                // "stamped only when the client sends 0" rule,
-                                // which leaves other cleartext types forgeable,
-                                // does not apply to REACTION). The in-packet
-                                // display_name remains a sanitized cosmetic
-                                // fallback ONLY, never identity.
-                                let cached = self
-                                    .peer_decode_manager
-                                    .get_peer_display_name(&response.session_id.to_string());
-                                let name =
-                                    resolve_reaction_display_name(cached, &reaction.display_name);
-                                cb.emit((response.session_id, reaction.reaction.value(), name));
+                                // For CUSTOM, validate the attacker-controlled
+                                // custom_emoji against the exact standard-emoji
+                                // allowlist + byte cap BEFORE render (defense in
+                                // depth; the relay should already have dropped an
+                                // invalid one at ingress). `Some(None)` => emit
+                                // with no custom string (1..=11); `Some(Some(s))`
+                                // => emit the validated CUSTOM emoji; `None` =>
+                                // drop this reaction (invalid CUSTOM emoji).
+                                let custom = if reaction_type == ReactionType::CUSTOM {
+                                    let candidate = String::from_utf8_lossy(&reaction.custom_emoji)
+                                        .into_owned();
+                                    if validate_custom_emoji(&candidate) {
+                                        Some(Some(candidate))
+                                    } else {
+                                        debug!("Dropping REACTION with invalid custom_emoji");
+                                        None
+                                    }
+                                } else {
+                                    Some(None)
+                                };
+                                if let Some(custom) = custom {
+                                    // Attribution anchor: the envelope session_id,
+                                    // resolved via the display-name cache. For
+                                    // REACTION the relay stamps this UNCONDITIONALLY
+                                    // with the sender's authenticated session before
+                                    // fan-out (stamp_reaction_for_broadcast in
+                                    // actix-api), so it is a TRUSTWORTHY identity
+                                    // anchor here — a peer cannot forge a reaction
+                                    // attributed to another participant (the general
+                                    // "stamped only when the client sends 0" rule,
+                                    // which leaves other cleartext types forgeable,
+                                    // does not apply to REACTION). The in-packet
+                                    // display_name remains a sanitized cosmetic
+                                    // fallback ONLY, never identity.
+                                    let cached = self
+                                        .peer_decode_manager
+                                        .get_peer_display_name(&response.session_id.to_string());
+                                    let name = resolve_reaction_display_name(
+                                        cached,
+                                        &reaction.display_name,
+                                    );
+                                    cb.emit((
+                                        response.session_id,
+                                        reaction.reaction.value(),
+                                        name,
+                                        custom,
+                                    ));
+                                }
                             }
                         }
                     },

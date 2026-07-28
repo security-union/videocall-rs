@@ -32,6 +32,10 @@ pub struct AppState {
     pub token_ttl_secs: i64,
     /// Session JWT time-to-live in seconds.
     pub session_ttl_secs: i64,
+    /// Remaining lifetime threshold below which a session cookie is refreshed.
+    pub session_refresh_threshold_secs: i64,
+    /// Absolute maximum session lifetime from original authentication time.
+    pub session_absolute_max_secs: i64,
     /// OAuth configuration. `None` disables OAuth endpoints.
     pub oauth: Option<OAuthConfig>,
     /// JWKS key cache for ID token signature verification. `None` when JWKS is
@@ -106,6 +110,8 @@ impl AppState {
             jwt_secret: config.jwt_secret.clone(),
             token_ttl_secs: config.token_ttl_secs,
             session_ttl_secs: config.session_ttl_secs,
+            session_refresh_threshold_secs: config.session_refresh_threshold_secs,
+            session_absolute_max_secs: config.session_absolute_max_secs,
             oauth: config.oauth.clone(),
             jwks_cache,
             cookie_domain: config.cookie_domain.clone(),

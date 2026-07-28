@@ -62,39 +62,12 @@ use videocall_meeting_types::responses::{
 };
 
 use crate::auth::AuthUser;
+use crate::cookie::build_session_cookie;
 use crate::db::oauth as db_oauth;
 use crate::error::AppError;
 use crate::oauth;
 use crate::state::AppState;
 use crate::token;
-
-// ---------------------------------------------------------------------------
-// Cookie helpers
-// ---------------------------------------------------------------------------
-
-/// Build a `Set-Cookie` header value for the session JWT.
-///
-/// Used by the legacy `GET /login/callback` handler when `OAUTH_BROWSER_PKCE`
-/// is `false` (the default).  Attributes match OWASP session-cookie guidance:
-/// `HttpOnly` (JavaScript cannot read it), `SameSite=Lax` (CSRF mitigation),
-/// `Secure` when `cookie_secure` is `true` (HTTPS-only transmission),
-/// and `Max-Age` for an explicit TTL so the browser expires it correctly.
-fn build_session_cookie(
-    name: &str,
-    jwt: &str,
-    ttl_secs: i64,
-    domain: Option<&str>,
-    secure: bool,
-) -> String {
-    let mut cookie = format!("{name}={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
-    if secure {
-        cookie.push_str("; Secure");
-    }
-    if let Some(d) = domain {
-        cookie.push_str(&format!("; Domain={d}"));
-    }
-    cookie
-}
 
 /// Build a `Set-Cookie` header that clears the session cookie.
 fn build_clear_session_cookie(name: &str, domain: Option<&str>, secure: bool) -> String {
@@ -308,16 +281,24 @@ pub async fn callback(
         Ok(Redirect::to(&redirect_url).into_response())
     } else {
         // Legacy mode: issue a signed session JWT inside an HttpOnly cookie.
-        let session_jwt = token::generate_session_token(
-            &state.jwt_secret,
-            &email,
-            &display_name,
+        // Clamp the initial TTL to the absolute cap (#1966) so the FIRST cookie
+        // can never outlive `auth_time + SESSION_ABSOLUTE_MAX_SECS` — the cap
+        // must hold at every mint, not only on sliding refresh. At login
+        // auth_time == now, so this is min(session_ttl, absolute_max).
+        let now = chrono::Utc::now().timestamp();
+        let ttl = token::capped_session_ttl(
             state.session_ttl_secs,
-        )?;
+            now,
+            state.session_absolute_max_secs,
+            now,
+        )
+        .max(1);
+        let session_jwt =
+            token::generate_session_token(&state.jwt_secret, &email, &display_name, ttl, now)?;
         let session_cookie = build_session_cookie(
             &state.cookie_name,
             &session_jwt,
-            state.session_ttl_secs,
+            ttl,
             state.cookie_domain.as_deref(),
             state.cookie_secure,
         );
@@ -1137,56 +1118,6 @@ mod tests {
         }
     }
 
-    // --- build_session_cookie ---
-
-    #[test]
-    fn session_cookie_contains_name_and_jwt() {
-        let cookie = build_session_cookie("session", "my.jwt.token", 3600, None, false);
-        assert!(cookie.starts_with("session=my.jwt.token;"));
-    }
-
-    #[test]
-    fn session_cookie_custom_name() {
-        let cookie = build_session_cookie("pr1-session", "my.jwt.token", 3600, None, false);
-        assert!(cookie.starts_with("pr1-session=my.jwt.token;"));
-        // Must not be mistakable for a plain "session=" cookie.
-        assert!(!cookie.starts_with("session="));
-    }
-
-    #[test]
-    fn session_cookie_includes_required_attributes() {
-        let cookie = build_session_cookie("session", "tok", 3600, None, false);
-        assert!(cookie.contains("Path=/"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Lax"));
-        assert!(cookie.contains("Max-Age=3600"));
-    }
-
-    #[test]
-    fn session_cookie_secure_flag_added_when_true() {
-        let cookie = build_session_cookie("session", "tok", 3600, None, true);
-        assert!(cookie.contains("; Secure"));
-    }
-
-    #[test]
-    fn session_cookie_no_secure_flag_when_false() {
-        let cookie = build_session_cookie("session", "tok", 3600, None, false);
-        assert!(!cookie.contains("Secure"));
-    }
-
-    #[test]
-    fn session_cookie_domain_appended() {
-        let cookie =
-            build_session_cookie("session", "tok", 3600, Some(".sandbox.videocall.rs"), false);
-        assert!(cookie.contains("Domain=.sandbox.videocall.rs"));
-    }
-
-    #[test]
-    fn session_cookie_no_domain_when_none() {
-        let cookie = build_session_cookie("session", "tok", 3600, None, false);
-        assert!(!cookie.contains("Domain="));
-    }
-
     #[test]
     fn build_end_session_url_includes_client_id() {
         let cfg = minimal_oauth_config(None, None);
@@ -1294,6 +1225,8 @@ mod tests {
             jwt_secret: "test-secret".to_string(),
             token_ttl_secs: 60,
             session_ttl_secs: 3600,
+            session_refresh_threshold_secs: 7200,
+            session_absolute_max_secs: 604800,
             oauth,
             jwks_cache: None,
             cookie_domain: None,

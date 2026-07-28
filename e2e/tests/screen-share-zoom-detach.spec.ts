@@ -481,6 +481,33 @@ async function sampleDetachedMirror(popup: Page): Promise<{ mean: number; sig: n
 }
 
 /**
+ * Issue #1821: find the detached DOCUMENT among the context's pages. A real
+ * Document PiP window (and a script-opened maximized popup) each surface as a
+ * Playwright `Page` whose document carries `#ss-detached-maximize`. Polls because
+ * the page-event → DOM-built latency is not instantaneous, and skips pages in
+ * `exclude` (the main window) and any that error while navigating.
+ */
+async function findDetachedDocPage(
+  context: import("@playwright/test").BrowserContext,
+  exclude: Page[],
+  timeoutMs: number,
+): Promise<Page | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const p of context.pages()) {
+      if (exclude.includes(p) || p.isClosed()) continue;
+      try {
+        if (await p.evaluate(() => !!document.getElementById("ss-detached-maximize"))) return p;
+      } catch {
+        /* page mid-navigation / not ready — retry on the next sweep */
+      }
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return null;
+}
+
+/**
  * Assert the MAIN window is in the "regular no-share meeting" look while a share
  * is detached: `#grid-container` carries `share-detached`, the share pane is
  * off-screen (left:-99999px) but STILL mounted (canvas keeps its node identity)
@@ -1639,6 +1666,164 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       // preventDefault held → the detached document did not browser layout-zoom.
       const clientWidthAfter = await popup.evaluate(() => document.documentElement.clientWidth);
       expect(clientWidthAfter).toBe(clientWidthBefore);
+    } finally {
+      await fx.browser1.close();
+      await fx.browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Issue #1821 (HEADED, REAL Document PiP) — Maximize on a Document PiP detached
+  // window MIGRATES the mirror into a script-opened popup sized to the full
+  // available display, closes the PiP, and the popup survives; Reattach from the
+  // popup restores the meeting.
+  //
+  // This is the ONLY detach test that uses REAL Document Picture-in-Picture: it
+  // passes NO `FORCE_POPUP_DETACH_SCRIPT`, so `open()` takes the `via_pip=true`
+  // path where the fix lives. It needs a HEADED Chromium with a real compositor —
+  // `documentPictureInPicture.requestWindow()` resolves there, the PiP surfaces as
+  // a Playwright Page, and a TRUSTED Playwright click inside the PiP carries the
+  // transient activation `window.open` needs, which then honors the requested
+  // maximized geometry. (All four were confirmed empirically before this spec was
+  // written — a standalone real-PiP probe against the running stack.)
+  //
+  // Fails-on-unfixed: the pre-fix PiP Maximize did `moveTo`/`resizeTo` the PiP
+  // window IN PLACE — no new popup ever opens, the migration marker string does
+  // not exist, and the PiP is never closed. So the popup-page wait times out and
+  // the marker / PiP-closed / geometry assertions all go red on the un-fixed code.
+  // The PiP button's aria-label was also "Maximize window" pre-fix, not "Maximize
+  // to full display".
+  // ──────────────────────────────────────────────────────────────────────────
+  test("Document-PiP Maximize migrates the mirror to a maximized popup at the full display, closes the PiP, and Reattach restores (headed, real PiP)", async ({
+    baseURL,
+  }) => {
+    test.skip(
+      !process.env.HEADED,
+      "Real Document PiP (requestWindow) + window.open geometry need a real " +
+        "compositor/window. Run with HEADED=1. (issue #1821)",
+    );
+    test.setTimeout(240_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `ss_pip_maximize_${Date.now()}`;
+    // hostExtraInit is UNDEFINED on purpose — REAL Document PiP, not the forced
+    // window.open popup the other detach tests use.
+    const fx = await setupViewerSeeingSharedScreen(
+      uiURL,
+      meetingId,
+      "SsPipHost",
+      "SsPipGuest",
+      undefined,
+      ANIMATED_SHARE_MOCK,
+      false,
+    );
+    const { hostPage, tile } = fx;
+    const ctx = hostPage.context();
+
+    // The wasm `log` facade logs to the MAIN realm, where the migrate closure runs
+    // (it was created in the main window's wasm and attached to the PiP document).
+    const consoleLines: string[] = [];
+    hostPage.on("console", (m) => consoleLines.push(m.text()));
+
+    try {
+      const canvas = tile.locator('canvas[id^="screen-share-"]');
+      await expect(canvas).toHaveCount(1);
+      const canvasId = await tagCanvasIdentity(canvas);
+
+      const detach = tile.locator('[data-testid="ss-detach"]');
+      await expect(detach).toBeVisible();
+      await tile.hover();
+
+      // Detach → REAL Document PiP; it surfaces as a Playwright Page.
+      await detach.click();
+      const pip = await findDetachedDocPage(ctx, [hostPage], 15_000);
+      expect(pip, "the Document PiP window never surfaced as a page").not.toBeNull();
+
+      // Main window flips to the detached look (share off-screen + inert).
+      await assertMainWindowDetachedLook(hostPage, canvas, canvasId);
+
+      // The PiP's Maximize is the ONE-SHOT migrate control: PiP label + NO
+      // aria-pressed (not the popup's fullscreen toggle). Fails-on-unfixed: the old
+      // PiP label was "Maximize window" and it resized in place.
+      const pipMax = pip!.locator("#ss-detached-maximize");
+      await expect(pipMax).toBeVisible({ timeout: 10_000 });
+      await expect(pipMax).toHaveAttribute("aria-label", "Maximize to full display");
+      expect(await pipMax.getAttribute("aria-pressed")).toBeNull();
+
+      // The available display box the popup is requested to fill.
+      const avail = await hostPage.evaluate(() => ({
+        w: screen.availWidth,
+        h: screen.availHeight,
+      }));
+
+      // Click Maximize INSIDE the PiP. A trusted Playwright click carries the
+      // transient activation window.open consumes → migrate to a maximized popup.
+      const popupWait = ctx.waitForEvent("page", { timeout: 15_000 });
+      await pipMax.click();
+      const popup = await popupWait;
+      await popup.waitForLoadState("domcontentloaded").catch(() => {});
+
+      // 1) Success marker logged in the main-window console.
+      await expect
+        .poll(
+          () =>
+            consoleLines.some((l) =>
+              l.includes("detached content migrated to maximized popup (issue 1821)"),
+            ),
+          { timeout: 10_000, message: "migration success marker never logged" },
+        )
+        .toBe(true);
+
+      // 2) The popup IS the migrated detached document, sized to (near) the full
+      //    available display — the "true display" the issue asks for. Poll for the
+      //    window to settle to its requested size.
+      await expect(popup.locator("#ss-detached-video")).toHaveCount(1, { timeout: 10_000 });
+      let inner = { w: 0, h: 0 };
+      await expect
+        .poll(
+          async () => {
+            inner = await popup.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+            return inner.w;
+          },
+          { timeout: 10_000, message: "popup never sized up to the maximized geometry" },
+        )
+        .toBeGreaterThan(800);
+      // Width tracks availWidth closely; height loses a little to browser chrome.
+      expect(inner.w).toBeGreaterThan(avail.w * 0.85);
+      expect(inner.h).toBeGreaterThan(avail.h * 0.6);
+
+      // 3) The PiP window is CLOSED by the migration (share moved, not duplicated).
+      await expect
+        .poll(() => pip!.isClosed(), { timeout: 10_000, message: "PiP not closed after migration" })
+        .toBe(true);
+
+      // 4) The mirror rebuilt in the popup and is PLAYING (non-blank + advancing).
+      let s1: { mean: number; sig: number } | null = null;
+      await expect
+        .poll(
+          async () => {
+            s1 = await sampleDetachedMirror(popup);
+            return s1?.mean ?? -1;
+          },
+          { timeout: 12_000, message: "popup mirror produced no non-blank frame" },
+        )
+        .toBeGreaterThan(8);
+      await popup.waitForTimeout(700);
+      const s2 = await sampleDetachedMirror(popup);
+      expect(s2, "popup mirror stopped after one frame").not.toBeNull();
+      expect(s2!.sig).not.toBe(s1!.sig);
+
+      // 5) The popup's Maximize is now the real fullscreen TOGGLE (aria-pressed) —
+      //    the two-stage semantic: PiP → maximized popup → fullscreen.
+      await expect(popup.locator("#ss-detached-maximize")).toHaveAttribute("aria-pressed", "false");
+
+      // 6) The share is STILL detached in the main window — the retired PiP's late
+      //    close events did not tear the live popup down (the session guard).
+      await expect(hostPage.locator("#grid-container")).toHaveClass(/\bshare-detached\b/);
+
+      // 7) Reattach FROM THE POPUP restores the meeting and closes the popup.
+      await popup.locator("#ss-detached-reattach").click();
+      await assertMainWindowRestoredLook(hostPage, tile, canvas, canvasId);
+      await expect.poll(() => popup.isClosed(), { timeout: 10_000 }).toBe(true);
     } finally {
       await fx.browser1.close();
       await fx.browser2.close();

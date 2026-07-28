@@ -331,6 +331,21 @@ window.__APP_CONFIG = Object.freeze({
 
 The threshold can also be set via the `VAD_THRESHOLD` environment variable when running in Docker (see `docker/start-dioxus.sh`), or via `runtimeConfig.vadThreshold` in Helm values.
 
+### Encoder Bitrate Tuning
+
+Encoder bitrates are not runtime `config.js` settings. The legacy
+`audioBitrateKbps`, `videoBitrateKbps`, and `screenBitrateKbps` keys were removed
+by #1193 because simulcast and adaptive quality already select live targets from
+code-owned tier tables; stale copies of those keys are ignored.
+
+Tune camera, screen, and adaptive-audio targets in
+`videocall-aq/src/constants.rs` (`VIDEO_QUALITY_TIERS`,
+`SIMULCAST_VIDEO_LAYERS`, `SCREEN_QUALITY_TIERS`, and
+`AUDIO_QUALITY_TIERS`). Audio simulcast's `[12, 24, 48]` kbps publisher ladder
+is defined in `videocall-client/src/encode/microphone_encoder.rs` and is checked
+against the receiver ladder. These values affect encoder CPU and sender uplink;
+the relay then fans each selected layer out per receiver.
+
 ### Local/Docker: start-dioxus.sh
 
 `docker/start-dioxus.sh` generates `/app/dioxus-ui/scripts/config.js` from environment variables at container startup. For the current list of supported variables and defaults, refer directly to `docker/start-dioxus.sh`. Restart the container to apply changes.

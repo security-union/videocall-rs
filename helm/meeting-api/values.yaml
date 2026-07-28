@@ -25,8 +25,15 @@ env:
         key: secret
   - name: TOKEN_TTL_SECS
     value: "86400"
+  # #1750/#1966: idle/re-mint increment (7d). With sliding refresh this is NOT
+  # the total session length — an active session slides up to
+  # SESSION_ABSOLUTE_MAX_SECS. Deploys override per-cluster.
   - name: SESSION_TTL_SECS
-    value: "315360000"
+    value: "604800"
+  # #1966: hard absolute session cap from original auth time (30d). MUST be
+  # greater than SESSION_TTL_SECS or sliding refresh is a no-op.
+  - name: SESSION_ABSOLUTE_MAX_SECS
+    value: "2592000"
   - name: COOKIE_SECURE
     value: "true"
   - name: COOKIE_DOMAIN

@@ -21,7 +21,17 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 NAMESPACE="${NAMESPACE:-videocall}"
 GRAFANA_URL="${GRAFANA_URL:-https://grafana.videocall.fnxlabs.com}"
 GRAFANA_USER="${GRAFANA_USER:-admin}"
-GRAFANA_PASS="${GRAFANA_PASS:-password}"
+if [ -z "${GRAFANA_PASS:-}" ]; then
+  # Grafana admin creds live in the grafana-admin Secret (rotated off the old
+  # plaintext default in PR #2018). Pull the password from it; set GRAFANA_PASS
+  # explicitly to target a different instance.
+  GRAFANA_PASS="$(kubectl get secret grafana-admin -n "${NAMESPACE}" -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d || true)"
+fi
+if [ -z "${GRAFANA_PASS:-}" ]; then
+  echo "ERROR: GRAFANA_PASS is empty and the grafana-admin Secret is not readable in namespace '${NAMESPACE}'." >&2
+  echo "       Set GRAFANA_PASS explicitly, or point KUBECONFIG at the cluster holding the Secret." >&2
+  exit 1
+fi
 DASHBOARD_UID="e2e-scoreboard"
 DASHBOARD_JSON="${REPO_ROOT}/helm/grafana/dashboards/e2e-scoreboard.json"
 

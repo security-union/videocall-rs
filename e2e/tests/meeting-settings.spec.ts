@@ -139,17 +139,17 @@ test.describe("Meeting settings – Options toggles", () => {
     await expect(page.locator(".settings-stat-separator")).toHaveCount(0);
   });
 
-  test("settings page displays both Waiting Room and Participants can admit others toggles", async ({
+  test("settings page displays both Waiting Room and Admitted can admit toggles", async ({
     page,
   }) => {
     const meetingId = `e2e_opt_show_${Date.now()}`;
     await createMeetingAndOpenSettings(page, meetingId, "opt-show-user");
 
     await expect(page.getByText("Waiting Room")).toBeVisible();
-    await expect(page.getByText("Participants can admit others")).toBeVisible();
+    await expect(page.getByText("Admitted can admit")).toBeVisible();
 
     const wrToggle = optionToggle(page, "Waiting Room");
-    const acaToggle = optionToggle(page, "Participants can admit others");
+    const acaToggle = optionToggle(page, "Admitted can admit");
 
     await expect(wrToggle).toBeVisible();
     await expect(acaToggle).toBeVisible();
@@ -181,14 +181,12 @@ test.describe("Meeting settings – Options toggles", () => {
     });
   });
 
-  test("Participants can admit others toggle is disabled when Waiting Room is off", async ({
-    page,
-  }) => {
+  test("Admitted can admit toggle is disabled when Waiting Room is off", async ({ page }) => {
     const meetingId = `e2e_opt_aca_dis_${Date.now()}`;
     await createMeetingAndOpenSettings(page, meetingId, "aca-dis-user");
 
     const wrToggle = optionToggle(page, "Waiting Room");
-    const acaToggle = optionToggle(page, "Participants can admit others");
+    const acaToggle = optionToggle(page, "Admitted can admit");
 
     // Turn waiting room OFF first
     await wrToggle.click();
@@ -201,14 +199,12 @@ test.describe("Meeting settings – Options toggles", () => {
     await expect(acaToggle).toHaveAttribute("aria-checked", "false");
   });
 
-  test("Participants can admit others toggle can be enabled when Waiting Room is on", async ({
-    page,
-  }) => {
+  test("Admitted can admit toggle can be enabled when Waiting Room is on", async ({ page }) => {
     const meetingId = `e2e_opt_aca_on_${Date.now()}`;
     await createMeetingAndOpenSettings(page, meetingId, "aca-on-user");
 
     const wrToggle = optionToggle(page, "Waiting Room");
-    const acaToggle = optionToggle(page, "Participants can admit others");
+    const acaToggle = optionToggle(page, "Admitted can admit");
 
     // Waiting room should be ON by default
     await expect(wrToggle).toHaveAttribute("aria-checked", "true");
@@ -230,12 +226,12 @@ test.describe("Meeting settings – Options toggles", () => {
     });
   });
 
-  test("disabling Waiting Room also turns off Participants can admit others", async ({ page }) => {
+  test("disabling Waiting Room also turns off Admitted can admit", async ({ page }) => {
     const meetingId = `e2e_opt_cascade_${Date.now()}`;
     await createMeetingAndOpenSettings(page, meetingId, "cascade-user");
 
     const wrToggle = optionToggle(page, "Waiting Room");
-    const acaToggle = optionToggle(page, "Participants can admit others");
+    const acaToggle = optionToggle(page, "Admitted can admit");
 
     // Enable admitted-can-admit (waiting room is already ON by default)
     await acaToggle.click();
@@ -307,7 +303,7 @@ test.describe("Meeting settings – Options toggles", () => {
     const meetingId = `e2e_opt_persist_${Date.now()}`;
     await createMeetingAndOpenSettings(page, meetingId, "persist-user");
 
-    const acaToggle = optionToggle(page, "Participants can admit others");
+    const acaToggle = optionToggle(page, "Admitted can admit");
 
     // Enable admitted-can-admit
     await acaToggle.click();
@@ -321,10 +317,7 @@ test.describe("Meeting settings – Options toggles", () => {
 
     // Both toggles should reflect the persisted state
     await expect(optionToggle(page, "Waiting Room")).toHaveAttribute("aria-checked", "true");
-    await expect(optionToggle(page, "Participants can admit others")).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
+    await expect(optionToggle(page, "Admitted can admit")).toHaveAttribute("aria-checked", "true");
   });
 
   test("End meeting when host leaves toggle appears and persists", async ({ page }) => {
@@ -713,7 +706,7 @@ test.describe("Meeting settings – admitted_can_admit live propagation", () => 
     await waitForServices();
   });
 
-  test("host toggles Participants can admit others mid-meeting and admitted participant gains controls live", async ({
+  test("host toggles Admitted can admit mid-meeting and admitted participant gains controls live", async ({
     baseURL,
   }) => {
     test.skip(!baseURL?.includes("3001"), "Meeting settings tests are Dioxus-only");
@@ -790,7 +783,7 @@ test.describe("Meeting settings – admitted_can_admit live propagation", () => 
       // Host toggles admitted_can_admit ON mid-meeting.
       await hostPage.goto(`/meeting/${meetingId}/settings`);
       await expect(hostPage.getByText("Options")).toBeVisible({ timeout: 10_000 });
-      const admittedCanAdmitToggle = settingsToggle(hostPage, "Participants can admit others");
+      const admittedCanAdmitToggle = settingsToggle(hostPage, "Admitted can admit");
       await expect(admittedCanAdmitToggle).toHaveAttribute("aria-checked", "false", {
         timeout: 5_000,
       });

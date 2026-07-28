@@ -880,6 +880,175 @@ test.describe("Speaker highlight glow on video tiles", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
+  // 5c-bis. Global controls dock stays ON TOP of a tile pinned during screen
+  //          share — regression for PR #1892 review finding (controls + host
+  //          self-view "Camera Off" badge vanished when pinning during a share).
+  //
+  // Bug: `#host-controls-nav.host` (which wraps BOTH the bottom controls dock and
+  // the bottom-right host self-view badge) is `position: absolute; z-index: 10`,
+  // so it forms its own stacking context inside `#grid-container` (z-index:0). The
+  // dock's inner `z-index: 9000` is therefore capped to the nav's 10 relative to
+  // `#grid-container`. The screen-share pinned tile `.split-peer-tile.grid-item-pinned`
+  // is `z-index: 100` (added in 5c to clear the split tiles), which OUTRANKS 10 and
+  // buried the entire dock + badge under the maximized tile — present in the DOM but
+  // not paintable/clickable. Fix lifts `#host-controls-nav.host` to z-index:200
+  // (above the pinned-tile ceiling). In the NO-screen-share case the pinned tile is
+  // only z-index:10 (ties the nav, loses by DOM order), so the dock was never buried
+  // there — that is the contrast baseline asserted at the end.
+  //
+  // Mutation sensitivity: `toBeVisible()` alone does NOT catch this — the dock keeps
+  // a non-zero box and opacity while buried, so it stays "visible" to Playwright.
+  // The load-bearing checks are (a) a DOM hit-test: `elementFromPoint` at the dock's
+  // centre must resolve to a node CONTAINED in the dock, not the pinned tile's
+  // canvas; and (b) a `{ trial: true }` click on a real control button, which runs
+  // Playwright's full actionability check (including "receives pointer events" /
+  // not obscured) with no side effect. On the un-fixed z-index:10 both FAIL: the
+  // hit-test returns the pinned `.canvas-container` and the trial click times out
+  // because the button is obscured.
+  // ──────────────────────────────────────────────────────────────────────
+  test("controls dock stays interactable when a tile is pinned during screen share", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pin_ss_controls_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SsCtlHost",
+      "SsCtlGuest",
+      {
+        prepareHostPage: installSyntheticDisplayCapture,
+      },
+    );
+
+    try {
+      // Host starts sharing → guest gets the split layout.
+      const shareBtn = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator("span.tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareBtn).toBeVisible({ timeout: 10_000 });
+      await shareBtn.click();
+
+      await expect(guestPage.locator(".split-screen-tile")).toBeVisible({ timeout: 30_000 });
+      const peerTile = guestPage.locator(".split-peer-tile").first();
+      await expect(peerTile).toBeVisible({ timeout: 30_000 });
+
+      // Guest's own controls dock is present and on top BEFORE pinning.
+      const dock = guestPage.locator(".video-controls-container");
+      await expect(dock).toBeVisible({ timeout: 10_000 });
+
+      // Pin the side-panel peer → tile maximizes over the split area.
+      await peerTile.hover();
+      await guestPage.waitForTimeout(400);
+      await peerTile.locator(".pin-icon").first().click({ force: true });
+      await expect
+        .poll(async () => peerTile.evaluate((el) => getComputedStyle(el).position), {
+          timeout: 10_000,
+          message: "pinned split tile should become position:fixed (maximize must not regress)",
+        })
+        .toBe("fixed");
+
+      // The maximize itself must NOT regress: the pinned tile still fills the viewport.
+      const pinnedBox = await peerTile.boundingBox();
+      const vp = guestPage.viewportSize();
+      expect(pinnedBox).not.toBeNull();
+      if (pinnedBox && vp) {
+        expect(pinnedBox.width).toBeGreaterThan(vp.width * 0.9);
+        expect(pinnedBox.height).toBeGreaterThan(vp.height * 0.9);
+      }
+
+      // (a) DOM hit-test — the dock centre must NOT be covered by the pinned tile.
+      //     On the un-fixed code elementFromPoint returns the pinned canvas.
+      await expect
+        .poll(
+          async () =>
+            dock.evaluate((el) => {
+              const r = el.getBoundingClientRect();
+              const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+              return top ? el.contains(top) : false;
+            }),
+          {
+            timeout: 10_000,
+            message:
+              "controls dock is buried under the pinned tile (regression: #host-controls-nav z-index below the pinned tile)",
+          },
+        )
+        .toBe(true);
+
+      // (b) A real control button must be actionable (not obscured). `trial: true`
+      //     runs the full actionability check without performing the click.
+      const controlButton = dock.locator("button").first();
+      await expect(controlButton).toBeVisible({ timeout: 10_000 });
+      await controlButton.click({ trial: true, timeout: 8_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 5c-ter. Contrast baseline — the SAME dock hit-test in a NO-screen-share pin.
+  //          This path was never broken (pinned tile is z-index:10, ties the nav,
+  //          loses by DOM order), so it passes on BOTH fixed and un-fixed code and
+  //          exists only to prove the assertion above is specific to the
+  //          screen-share pin, not to pinning in general.
+  // ──────────────────────────────────────────────────────────────────────
+  test("controls dock stays interactable when a tile is pinned WITHOUT screen share (baseline)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pin_nossctl_${Date.now()}`;
+
+    // `hostPage` is intentionally not destructured — the host only needs to
+    // exist so the guest has a remote peer tile to pin; the assertions run
+    // entirely on the guest.
+    const { guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "NoSsCtlHost",
+      "NoSsCtlGuest",
+    );
+
+    try {
+      const peerTile = guestPage.locator("#grid-container .grid-item").first();
+      await expect(peerTile).toBeVisible({ timeout: 30_000 });
+
+      const dock = guestPage.locator(".video-controls-container");
+      await expect(dock).toBeVisible({ timeout: 10_000 });
+
+      await peerTile.hover();
+      await guestPage.waitForTimeout(400);
+      await peerTile.locator(".pin-icon").first().click({ force: true });
+      await expect
+        .poll(async () => peerTile.evaluate((el) => getComputedStyle(el).position), {
+          timeout: 10_000,
+        })
+        .toBe("fixed");
+
+      await expect
+        .poll(
+          async () =>
+            dock.evaluate((el) => {
+              const r = el.getBoundingClientRect();
+              const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+              return top ? el.contains(top) : false;
+            }),
+          { timeout: 10_000, message: "controls dock unexpectedly buried in a no-share pin" },
+        )
+        .toBe(true);
+
+      const controlButton = dock.locator("button").first();
+      await controlButton.click({ trial: true, timeout: 8_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
   // 5d. Pin the SCREEN tile (LEFT panel) — maximizes the SCREEN, not the camera
   //     — regression for the kind-aware pin fix (PR #1892 review finding).
   //
@@ -1327,7 +1496,7 @@ test.describe("Speaker highlight glow on video tiles", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 5e. A pinned camera tile fills the viewport IDENTICALLY with and without
+  // 5h. A pinned camera tile fills the viewport IDENTICALLY with and without
   //     an active screen share — regression (user report on PR #1892).
   //
   // Bug: pinning a peer's camera during a screen share made the video CONTENT
@@ -1451,6 +1620,503 @@ test.describe("Speaker highlight glow on video tiles", () => {
         expect(Math.abs(share.height - normal.height)).toBeLessThanOrEqual(0.5);
         // ...and the same square corners (pre-fix: 10px vs 0px).
         expect(share.borderRadius).toBe(normal.borderRadius);
+      }
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // 5i. A pinned CAMERA-OFF tile (avatar "Video Disabled" placeholder) presents
+  //     IDENTICAL content with and without an active screen share — regression
+  //     (follow-up user report on PR #1892).
+  //
+  // Bug: test 5h proved the letterboxed `.canvas-container` box matches in both
+  // layouts once `border: none` is applied — but that only covers the LIVE
+  // <canvas> path (camera ON). When the peer's camera is OFF the tile renders
+  // the avatar/"Video Disabled" PLACEHOLDER instead, and the split-panel base
+  // rules (`.split-peer-tile .placeholder-content svg { 40px }`,
+  // `.split-peer-tile .placeholder-text { font-size: var(--fs-3) }` = 12px,
+  // `.split-peer-tile .placeholder-content { gap: 0.4rem }`) hardcode SMALL
+  // thumbnail sizes that do NOT scale up when the tile is pinned to the full
+  // viewport. So a maximized camera-off tile showed a tiny 40px avatar + 12px
+  // label during screen share, while the normal-grid pin shows a 64px avatar +
+  // 17.6px label — the "tile content is not on full screen" report. The pinned
+  // split tile ALSO kept the lighter `--surface-elevated` backdrop instead of
+  // the grid pin's `--surface` (fully visible in camera-off mode: the
+  // `.canvas-container` is transparent, so the outer tile background fills the
+  // whole viewport behind the centered avatar).
+  //
+  // Fix (CSS only): `.split-peer-tile.grid-item-pinned` gains
+  // `background-color: var(--surface)`, and three
+  // `.split-peer-tile.grid-item-pinned .placeholder-*` overrides restore the
+  // SAME `--tile-h`-driven formulas the normal grid's base `.placeholder-*`
+  // rules use, so with an equal `--tile-h` (580px in both here) the avatar,
+  // label and gap resolve identically.
+  //
+  // Mutation sensitivity: the assertions compare the pinned placeholder's
+  // avatar (svg) width/height, label font-size, placeholder-content box HEIGHT
+  // (captures the gap), and the maximized tile's background-color in the normal
+  // grid vs. under screen share and require them to MATCH. On the un-fixed CSS
+  // the screen-share avatar is 40px (vs 64px), the label 12px (vs 17.6px), the
+  // box shorter (smaller gap), and the backdrop `--surface-elevated` (vs
+  // `--surface`) — every equality assertion fails. Reverting ANY of the four
+  // fix lines re-breaks the matching assertion. Text/placeholder WIDTH is NOT
+  // asserted: a single-peer grid tile labels "Camera Off" while the split tile
+  // labels "Video Disabled", so the widths legitimately differ by string — the
+  // SIZE (font-size + height) is the load-bearing, user-visible quantity.
+  // ──────────────────────────────────────────────────────────────────────
+  test("pinned camera-off placeholder fills the viewport identically with and without screen share", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pin_ss_ph_symmetry_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "PhSymHost",
+      "PhSymGuest",
+      { prepareHostPage: installSyntheticDisplayCapture },
+    );
+
+    // Reads the pinned tile's avatar (svg) + label sizing + maximized backdrop.
+    // `outerSel` selects whichever maximized tile is live. Cameras stay OFF, so
+    // the tile renders `.placeholder-content` (avatar + "Video Disabled"/"Camera
+    // Off"), NOT a `.canvas-container` <canvas>.
+    const measurePlaceholder = async (outerSel: string) => {
+      return guestPage.evaluate((sel) => {
+        const outer = document.querySelector(sel) as HTMLElement | null;
+        if (!outer) return null;
+        const ph = outer.querySelector(".placeholder-content") as HTMLElement | null;
+        const svg = outer.querySelector(".placeholder-content svg") as HTMLElement | null;
+        const txt = outer.querySelector(".placeholder-text") as HTMLElement | null;
+        if (!ph || !svg || !txt) return null;
+        const svgBox = svg.getBoundingClientRect();
+        const phBox = ph.getBoundingClientRect();
+        return {
+          svgWidth: +svgBox.width.toFixed(2),
+          svgHeight: +svgBox.height.toFixed(2),
+          // Captures the flex gap between avatar and label (larger gap → taller box).
+          placeholderHeight: +phBox.height.toFixed(2),
+          fontSize: getComputedStyle(txt).fontSize,
+          background: getComputedStyle(outer).backgroundColor,
+        };
+      }, outerSel);
+    };
+
+    try {
+      // Keep BOTH cameras OFF (default join state) so the guest renders the
+      // host's avatar/"Video Disabled" PLACEHOLDER tile — the path test 5h (which
+      // toggles the camera ON for a real <canvas>) deliberately does not cover.
+      const gridTile = guestPage.locator("#grid-container .grid-item").first();
+      await expect(gridTile).toBeVisible({ timeout: 30_000 });
+      // The placeholder avatar must be present before we pin/measure.
+      await expect(gridTile.locator(".placeholder-content svg")).toBeVisible({ timeout: 30_000 });
+      await guestPage.waitForTimeout(1000);
+
+      // ---- Reference: pin the camera-off tile in the NORMAL grid ----
+      await gridTile.hover();
+      await guestPage.waitForTimeout(400);
+      await gridTile.locator(".pin-icon").first().click({ force: true });
+      await expect
+        .poll(async () => gridTile.evaluate((el) => getComputedStyle(el).position), {
+          timeout: 10_000,
+        })
+        .toBe("fixed");
+      await guestPage.waitForTimeout(1200);
+      const normal = await measurePlaceholder("#grid-container .grid-item.grid-item-pinned");
+      expect(normal, "normal-grid pinned placeholder should be measurable").not.toBeNull();
+
+      // Unpin before switching layouts.
+      await gridTile.hover();
+      await guestPage.waitForTimeout(300);
+      await gridTile.locator(".pin-icon").first().click({ force: true });
+      await guestPage.waitForTimeout(1000);
+
+      // ---- Under test: host screen-shares, pin the camera-off side-panel tile ----
+      const shareBtn = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator("span.tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareBtn).toBeVisible({ timeout: 10_000 });
+      await shareBtn.click();
+
+      await expect(guestPage.locator(".split-screen-tile")).toBeVisible({ timeout: 30_000 });
+      const peerTile = guestPage.locator(".split-peer-tile").first();
+      await expect(peerTile).toBeVisible({ timeout: 30_000 });
+      await expect(peerTile.locator(".placeholder-content svg")).toBeVisible({ timeout: 30_000 });
+      await peerTile.hover();
+      await guestPage.waitForTimeout(400);
+      await peerTile.locator(".pin-icon").first().click({ force: true });
+      await expect
+        .poll(async () => peerTile.evaluate((el) => getComputedStyle(el).position), {
+          timeout: 10_000,
+        })
+        .toBe("fixed");
+      await guestPage.waitForTimeout(1200);
+      const share = await measurePlaceholder(".split-peer-tile.grid-item-pinned");
+      expect(share, "screen-share pinned placeholder should be measurable").not.toBeNull();
+
+      // The maximized camera-off tile must present IDENTICAL content in both
+      // layouts: same avatar size, same label size, same gap, same backdrop.
+      if (normal && share) {
+        // Pre-fix: 40px avatar (screen share) vs 64px (grid).
+        expect(Math.abs(share.svgWidth - normal.svgWidth)).toBeLessThanOrEqual(0.5);
+        expect(Math.abs(share.svgHeight - normal.svgHeight)).toBeLessThanOrEqual(0.5);
+        // Pre-fix: 0.4rem gap → shorter placeholder box (screen share) vs 1rem (grid).
+        expect(Math.abs(share.placeholderHeight - normal.placeholderHeight)).toBeLessThanOrEqual(
+          0.5,
+        );
+        // Pre-fix: 12px label (screen share) vs 17.6px (grid).
+        expect(share.fontSize).toBe(normal.fontSize);
+        // Pre-fix: rgb(44,44,46) (--surface-elevated) vs rgb(28,28,30) (--surface).
+        expect(share.background).toBe(normal.background);
+      }
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // 5j. A pinned tile's NAME BADGE (top-left) and TOP-ICON CLUSTER (top-right)
+  //     sit at the SAME corner inset and render at the SAME size with and
+  //     without an active screen share — regression (third follow-up user report
+  //     on PR #1892).
+  //
+  // SCOPE NOTE (PR #1946): this test runs a 2-peer meeting (a single remote
+  // tile), so the pre-share grid `--tile-h` is already the large single-tile
+  // value (~580px) and equals the maximized value. It therefore CANNOT catch
+  // the separate PR #1946 bug where the screen-share branch froze a stale,
+  // many-tile grid `--tile-h` into the pinned chrome — that only diverges once
+  // the pre-share grid holds enough tiles to shrink the cell. Multi-tile
+  // coverage for that lives in screen-share-panel.spec.ts test 9 ("pinned
+  // split-tile chrome var is maximized regardless of pre-share tile count").
+  //
+  // Bug: same class as 5i but for the tile chrome. The split-panel base rules
+  // hardcode SMALL, thumbnail-appropriate position + type for the compact
+  // side-panel tiles and never scale up when the tile is pinned to the full
+  // viewport:
+  //   `.split-peer-tile .floating-name`   → top/left 6px, font-size var(--fs-4)
+  //   `.split-peer-tile .tile-top-icons`  → top/right 4px
+  //   `.split-peer-tile .signal-indicator`→ 22×22 box, 14×14 svg
+  // The normal-grid pin uses `--tile-h`/`--tile-w`-scaled formulas instead
+  //   `.floating-name`   → top min(12px,…), left min(12px,…), font-size clamp(…,14px)
+  //   `.tile-top-icons`  → top min(8px,…), right min(8px,…)
+  //   `.signal-indicator`→ min(32px,…) box, svg min(18px,…)
+  // So a maximized split badge sat inset ~6px with smaller letters and the icon
+  // cluster inset ~4px with smaller icons, vs the flush, larger normal-grid pin
+  // — the user report ("name of the tile not in left corner and … smaller
+  // letters", "icons on the right side not in the right corner and … smaller").
+  //
+  // Fix (CSS only): `.split-peer-tile.grid-item-pinned .floating-name`,
+  // `… .tile-top-icons`, and the per-button container/svg overrides restore the
+  // SAME `--tile-h`/`--tile-w` formulas the normal grid uses, so at equal vars
+  // (asserted identical below) the badge inset/font and the cluster inset/icon
+  // size resolve identically.
+  //
+  // Mutation sensitivity: the assertions compare, normal-grid pin vs. under
+  // screen share, the badge's left/top inset + font-size, the cluster's
+  // right/top inset, and the always-visible signal-indicator svg size, and
+  // require them to MATCH. On the un-fixed CSS the split badge is at left 6px
+  // (vs 12) with a smaller font, the cluster at right 4px (vs 8), and the svg
+  // 14px (vs 18) — every equality assertion fails. Reverting ANY of the fix
+  // lines re-breaks its matching assertion. `--tile-h`/`--tile-w` are asserted
+  // equal across the two contexts first so a formula-based parity claim is
+  // sound (an unequal var would defeat the shared formula and is a real bug).
+  // ──────────────────────────────────────────────────────────────────────
+  test("pinned tile name badge and top icon cluster match position/size with and without screen share", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pin_ss_chrome_symmetry_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "ChromeSymHost",
+      "ChromeSymGuest",
+      { prepareHostPage: installSyntheticDisplayCapture },
+    );
+
+    // Reads the pinned tile's name-badge (top-left) + top-icon-cluster
+    // (top-right) position/size from the guest side. Corner insets are measured
+    // relative to the VIEWPORT edges (the pinned tile is position:fixed full
+    // viewport, so a flush corner means inset ≈ the CSS top/left/right value).
+    // The mic + signal icons are always visible (no hover needed); the signal
+    // svg is a stable size probe. `--tile-h`/`--tile-w` are captured so the
+    // shared-formula parity claim can be asserted.
+    const measureChrome = async (outerSel: string) => {
+      return guestPage.evaluate((sel) => {
+        const outer = document.querySelector(sel) as HTMLElement | null;
+        if (!outer) return null;
+        const name = outer.querySelector(".floating-name") as HTMLElement | null;
+        const icons = outer.querySelector(".tile-top-icons") as HTMLElement | null;
+        const sigSvg = outer.querySelector(".signal-indicator svg") as HTMLElement | null;
+        if (!name || !icons || !sigSvg) return null;
+        const nameBox = name.getBoundingClientRect();
+        const iconsBox = icons.getBoundingClientRect();
+        const sigBox = sigSvg.getBoundingClientRect();
+        const cs = getComputedStyle(outer);
+        return {
+          // Badge distance from the top-left viewport corner.
+          nameLeft: +nameBox.left.toFixed(2),
+          nameTop: +nameBox.top.toFixed(2),
+          nameFontSize: getComputedStyle(name).fontSize,
+          // Cluster distance from the top-right viewport corner.
+          iconsRightInset: +(window.innerWidth - iconsBox.right).toFixed(2),
+          iconsTop: +iconsBox.top.toFixed(2),
+          // Always-visible icon size probe.
+          sigSvgWidth: +sigBox.width.toFixed(2),
+          sigSvgHeight: +sigBox.height.toFixed(2),
+          tileH: cs.getPropertyValue("--tile-h").trim(),
+          tileW: cs.getPropertyValue("--tile-w").trim(),
+        };
+      }, outerSel);
+    };
+
+    try {
+      // Cameras stay OFF (default join). The name badge + top-icon cluster
+      // render on the placeholder tile just as on a live-canvas tile, so no
+      // camera toggle is needed to exercise the chrome.
+      const gridTile = guestPage.locator("#grid-container .grid-item").first();
+      await expect(gridTile).toBeVisible({ timeout: 30_000 });
+      await expect(gridTile.locator(".floating-name")).toBeVisible({ timeout: 30_000 });
+      await expect(gridTile.locator(".tile-top-icons .signal-indicator")).toBeVisible({
+        timeout: 30_000,
+      });
+      await guestPage.waitForTimeout(1000);
+
+      // ---- Reference: pin the tile in the NORMAL grid ----
+      await gridTile.hover();
+      await guestPage.waitForTimeout(400);
+      await gridTile.locator(".pin-icon").first().click({ force: true });
+      await expect
+        .poll(async () => gridTile.evaluate((el) => getComputedStyle(el).position), {
+          timeout: 10_000,
+        })
+        .toBe("fixed");
+      await guestPage.waitForTimeout(1200);
+      const normal = await measureChrome("#grid-container .grid-item.grid-item-pinned");
+      expect(normal, "normal-grid pinned chrome should be measurable").not.toBeNull();
+
+      // Unpin before switching layouts.
+      await gridTile.hover();
+      await guestPage.waitForTimeout(300);
+      await gridTile.locator(".pin-icon").first().click({ force: true });
+      await guestPage.waitForTimeout(1000);
+
+      // ---- Under test: host screen-shares, pin the side-panel tile ----
+      const shareBtn = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator("span.tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareBtn).toBeVisible({ timeout: 10_000 });
+      await shareBtn.click();
+
+      await expect(guestPage.locator(".split-screen-tile")).toBeVisible({ timeout: 30_000 });
+      const peerTile = guestPage.locator(".split-peer-tile").first();
+      await expect(peerTile).toBeVisible({ timeout: 30_000 });
+      await expect(peerTile.locator(".floating-name")).toBeVisible({ timeout: 30_000 });
+      await peerTile.hover();
+      await guestPage.waitForTimeout(400);
+      await peerTile.locator(".pin-icon").first().click({ force: true });
+      await expect
+        .poll(async () => peerTile.evaluate((el) => getComputedStyle(el).position), {
+          timeout: 10_000,
+        })
+        .toBe("fixed");
+      await guestPage.waitForTimeout(1200);
+      const share = await measureChrome(".split-peer-tile.grid-item-pinned");
+      expect(share, "screen-share pinned chrome should be measurable").not.toBeNull();
+
+      if (normal && share) {
+        // The shared-formula parity claim only holds if the driving CSS vars are
+        // equal in both pinned contexts. Assert that first (also a real-bug guard
+        // — an unequal var would silently defeat the fix). Parsed to a number with
+        // a sub-pixel tolerance rather than an exact string compare, so this can't
+        // false-fail on a benign float-rounding difference between two
+        // independently-measured elements (e.g. "580px" vs "580.004px").
+        expect(Math.abs(parseFloat(share.tileH) - parseFloat(normal.tileH))).toBeLessThanOrEqual(
+          0.5,
+        );
+        expect(Math.abs(parseFloat(share.tileW) - parseFloat(normal.tileW))).toBeLessThanOrEqual(
+          0.5,
+        );
+
+        // Name badge: same corner inset (pre-fix: left 6px vs 12px) …
+        expect(Math.abs(share.nameLeft - normal.nameLeft)).toBeLessThanOrEqual(0.5);
+        expect(Math.abs(share.nameTop - normal.nameTop)).toBeLessThanOrEqual(0.5);
+        // … and same letter size (pre-fix: var(--fs-4) vs 14px).
+        expect(share.nameFontSize).toBe(normal.nameFontSize);
+
+        // Icon cluster: same corner inset (pre-fix: right 4px vs 8px) …
+        expect(Math.abs(share.iconsRightInset - normal.iconsRightInset)).toBeLessThanOrEqual(0.5);
+        expect(Math.abs(share.iconsTop - normal.iconsTop)).toBeLessThanOrEqual(0.5);
+        // … and same icon size (pre-fix: 14px svg vs 18px svg).
+        expect(Math.abs(share.sigSvgWidth - normal.sigSvgWidth)).toBeLessThanOrEqual(0.5);
+        expect(Math.abs(share.sigSvgHeight - normal.sigSvgHeight)).toBeLessThanOrEqual(0.5);
+      }
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // 5k. A pinned peer's LIVE camera video fills the viewport edge-to-edge
+  //     IDENTICALLY with and without an active screen share, on a viewport
+  //     WIDER than 16:9 — regression (fourth follow-up user report on PR #1892).
+  //
+  // Bug: pinning a peer's live camera DURING a screen share rendered the video
+  // with solid black PILLARBOX bars on the left and right, while pinning the
+  // same camera in a plain meeting filled the viewport edge-to-edge.
+  //
+  // Root cause (CSS): in a 2-peer meeting the no-share pin renders as
+  // `.grid-item.full-bleed.grid-item-pinned`, whose
+  // `.grid-item.full-bleed .canvas-container` (global.css) is
+  // `width: 100%; height: 100%` — the container spans the ENTIRE viewport and
+  // the `object-fit: cover` canvas fills it edge-to-edge. The screen-share
+  // split pin used `.split-peer-tile.grid-item-pinned .canvas-container {
+  // width: min(100%, 100vh * 16 / 9); height: min(100%, 100vw * 9 / 16) }` — a
+  // 16:9 box. On a viewport WIDER than 16:9 that box is narrower than the
+  // viewport, so the dark tile background showed as vertical pillarbox bars.
+  // `object-fit: cover` was never the cause — the canvas always filled its
+  // container; the CONTAINER geometry differed. The fix sets the split
+  // container to `width: 100%; height: 100%` (style.css).
+  //
+  // WHY THE WIDE VIEWPORT: at exactly 16:9 (Playwright's default 1280x720) the
+  // 16:9 box EQUALS the viewport, so BOTH contexts measure identically and the
+  // bug is invisible — that is why the earlier 5h test (default viewport,
+  // measures the `.canvas-container` box) passes on both the fixed and un-fixed
+  // CSS for THIS bug and does not guard it. This test forces a 1600x720
+  // viewport (aspect 2.22 > 1.78) so the 16:9 box pillarboxes to 1280 wide with
+  // a 160px left inset on the un-fixed CSS.
+  //
+  // Mutation sensitivity: measures the pinned LIVE <canvas> element's bounding
+  // rect and asserts it spans the full viewport width (left ~= 0, right ~=
+  // innerWidth) in BOTH contexts, and that the screen-share box matches the
+  // no-share box. On the un-fixed CSS the screen-share canvas is 1280 wide at
+  // left:160 (right:1440 on a 1600 viewport), so the `shareLeft <= 1` and
+  // width-equality assertions fail. Reverting `width: 100%; height: 100%`
+  // back to the 16:9 `min()` box re-breaks this test.
+  // ──────────────────────────────────────────────────────────────────────
+  test("pinned live camera video fills a wide viewport edge-to-edge with and without screen share", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_pin_ss_pillarbox_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "PbxHost",
+      "PbxGuest",
+      { prepareHostPage: installSyntheticDisplayCapture },
+    );
+
+    // Measures the innermost pinned <canvas> (the actual decoded video element)
+    // bounding rect on the guest side, plus the viewport width, so the test can
+    // detect pillarboxing (canvas narrower than / inset from the viewport).
+    const measureCanvasFill = async (outerSel: string) => {
+      return guestPage.evaluate((sel) => {
+        const outer = document.querySelector(sel) as HTMLElement | null;
+        if (!outer) return null;
+        const canvas = outer.querySelector("canvas") as HTMLCanvasElement | null;
+        if (!canvas) return null;
+        const box = canvas.getBoundingClientRect();
+        return {
+          left: box.left,
+          right: box.right,
+          width: box.width,
+          innerWidth: window.innerWidth,
+        };
+      }, outerSel);
+    };
+
+    try {
+      // Force a viewport WIDER than 16:9 so the 16:9 min() box (un-fixed CSS)
+      // is measurably narrower than the viewport and pillarboxes.
+      await guestPage.setViewportSize({ width: 1600, height: 720 });
+
+      // Host camera ON so the guest renders a real decoded <canvas> (default
+      // join is camera-OFF → avatar placeholder, no live canvas).
+      await hostPage.locator('[data-testid="camera-toggle-button"]').click();
+      await guestPage.waitForTimeout(2000);
+
+      // ---- Reference: pin the host camera in the NORMAL grid (no share) ----
+      const gridTile = guestPage.locator("#grid-container .grid-item").first();
+      await expect(gridTile).toBeVisible({ timeout: 30_000 });
+      await expect
+        .poll(async () => gridTile.locator("canvas").count(), { timeout: 30_000 })
+        .toBeGreaterThan(0);
+      await gridTile.hover();
+      await guestPage.waitForTimeout(400);
+      await gridTile.locator(".pin-icon").first().click({ force: true });
+      await expect
+        .poll(async () => gridTile.evaluate((el) => getComputedStyle(el).position), {
+          timeout: 10_000,
+        })
+        .toBe("fixed");
+      await guestPage.waitForTimeout(1500);
+      const normal = await measureCanvasFill("#grid-container .grid-item.grid-item-pinned");
+      expect(normal, "normal-grid pinned canvas should be measurable").not.toBeNull();
+
+      // Unpin before switching layouts.
+      await gridTile.hover();
+      await guestPage.waitForTimeout(300);
+      await gridTile.locator(".pin-icon").first().click({ force: true });
+      await guestPage.waitForTimeout(1000);
+
+      // ---- Under test: host screen-shares, pin the side-panel camera ----
+      const shareBtn = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator("span.tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareBtn).toBeVisible({ timeout: 10_000 });
+      await shareBtn.click();
+
+      await expect(guestPage.locator(".split-screen-tile")).toBeVisible({ timeout: 30_000 });
+      const peerTile = guestPage.locator(".split-peer-tile").first();
+      await expect(peerTile).toBeVisible({ timeout: 30_000 });
+      await expect
+        .poll(async () => peerTile.locator("canvas").count(), { timeout: 30_000 })
+        .toBeGreaterThan(0);
+      await peerTile.hover();
+      await guestPage.waitForTimeout(400);
+      await peerTile.locator(".pin-icon").first().click({ force: true });
+      await expect
+        .poll(async () => peerTile.evaluate((el) => getComputedStyle(el).position), {
+          timeout: 10_000,
+        })
+        .toBe("fixed");
+      await guestPage.waitForTimeout(1500);
+      const share = await measureCanvasFill(".split-peer-tile.grid-item-pinned");
+      expect(share, "screen-share pinned canvas should be measurable").not.toBeNull();
+
+      if (normal && share) {
+        // Sanity: the wide viewport actually took effect on the guest.
+        expect(normal.innerWidth).toBe(1600);
+        expect(share.innerWidth).toBe(1600);
+
+        // The no-share pin fills the viewport edge-to-edge (baseline the user
+        // reports as CORRECT). This holds on both fixed and un-fixed CSS.
+        expect(normal.left).toBeLessThanOrEqual(1);
+        expect(Math.abs(normal.right - normal.innerWidth)).toBeLessThanOrEqual(1);
+
+        // MUTATION-SENSITIVE: the screen-share pin must ALSO fill the viewport
+        // edge-to-edge. Un-fixed CSS: left=160, right=1440 → both fail.
+        expect(
+          share.left,
+          "pinned camera pillarboxed on the left during screen share",
+        ).toBeLessThanOrEqual(1);
+        expect(
+          Math.abs(share.right - share.innerWidth),
+          "pinned camera did not reach the right viewport edge during screen share",
+        ).toBeLessThanOrEqual(1);
+
+        // …and the two contexts must present an IDENTICAL live-video box.
+        expect(Math.abs(share.left - normal.left)).toBeLessThanOrEqual(1);
+        expect(Math.abs(share.width - normal.width)).toBeLessThanOrEqual(1);
       }
     } finally {
       await browser1.close();

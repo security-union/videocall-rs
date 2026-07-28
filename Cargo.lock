@@ -2716,6 +2716,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "emojis"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b1514ced566c94991ed9563258ecf61e311fd773bf0a3f20606830386bf66e3"
+dependencies = [
+ "phf",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8453,6 +8462,7 @@ dependencies = [
  "base64 0.13.1",
  "bytes",
  "chrono",
+ "emojis",
  "futures",
  "futures-util",
  "jsonwebtoken",
@@ -8529,6 +8539,7 @@ dependencies = [
  "anyhow",
  "async-broadcast",
  "cbc",
+ "emojis",
  "futures",
  "gloo",
  "gloo-timers 0.3.0",
@@ -8756,6 +8767,7 @@ dependencies = [
  "console_error_panic_hook",
  "console_log",
  "dioxus",
+ "emojis",
  "futures",
  "getrandom 0.2.16",
  "gloo-timers 0.2.6",

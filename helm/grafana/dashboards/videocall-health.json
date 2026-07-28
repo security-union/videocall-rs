@@ -49,7 +49,7 @@
       "targets": [
         {
           "expr": "videocall_self_audio_enabled{meeting_id=~\"$meeting_id\"}",
-          "legendFormat": "{{display_name}}",
+          "legendFormat": "{{peer_id}}",
           "refId": "A"
         }
       ],
@@ -88,7 +88,7 @@
       "targets": [
         {
           "expr": "videocall_self_video_enabled{meeting_id=~\"$meeting_id\"}",
-          "legendFormat": "{{display_name}}",
+          "legendFormat": "{{peer_id}}",
           "refId": "A"
         }
       ],
@@ -167,7 +167,7 @@
       "targets": [
         {
           "expr": "videocall_video_packets_buffered{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": "A"
         }
       ],
@@ -254,7 +254,7 @@
         {
           "expr": "videocall_peer_can_listen{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": "A"
         }
       ],
@@ -333,7 +333,7 @@
       "targets": [
         {
           "expr": "videocall_video_fps{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": "A"
         }
       ],
@@ -504,7 +504,7 @@
         {
           "expr": "videocall_neteq_audio_buffer_ms{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": "A"
         }
       ],
@@ -589,7 +589,7 @@
         {
           "expr": "videocall_neteq_packets_awaiting_decode{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": "A"
         }
       ],
@@ -672,7 +672,7 @@
         {
           "expr": "videocall_peer_can_see{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": "A"
         }
       ],
@@ -753,37 +753,37 @@
         {
           "expr": "videocall_neteq_normal_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}}\u2192{{peer_name}} Normal",
+          "legendFormat": "{{from_peer}}\u2192{{to_peer}} Normal",
           "refId": "A"
         },
         {
           "expr": "videocall_neteq_expand_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}}\u2192{{peer_name}} Expand",
+          "legendFormat": "{{from_peer}}\u2192{{to_peer}} Expand",
           "refId": "B"
         },
         {
           "expr": "videocall_neteq_accelerate_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}}\u2192{{peer_name}} Accelerate",
+          "legendFormat": "{{from_peer}}\u2192{{to_peer}} Accelerate",
           "refId": "C"
         },
         {
           "expr": "videocall_neteq_fast_accelerate_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}}\u2192{{peer_name}} Fast Accel",
+          "legendFormat": "{{from_peer}}\u2192{{to_peer}} Fast Accel",
           "refId": "D"
         },
         {
           "expr": "videocall_neteq_preemptive_expand_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}}\u2192{{peer_name}} Expand",
+          "legendFormat": "{{from_peer}}\u2192{{to_peer}} Expand",
           "refId": "E"
         },
         {
           "expr": "videocall_neteq_merge_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{reporter_name}}\u2192{{peer_name}} Merge",
+          "legendFormat": "{{from_peer}}\u2192{{to_peer}} Merge",
           "refId": "F"
         }
       ],
@@ -819,7 +819,7 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting_id\"}",
+          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting_id\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}} ({{server_type}})",
           "refId": "A"
         }
@@ -858,7 +858,7 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_active_server{meeting_id=~\"$meeting_id\"}",
+          "expr": "videocall_client_active_server{meeting_id=~\"$meeting_id\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}} ({{server_type}})",
           "refId": "A"
         }
@@ -896,7 +896,7 @@
       "targets": [
         {
           "expr": "videocall_neteq_packets_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": "A"
         }
       ],
@@ -1003,7 +1003,7 @@
           "editorMode": "code",
           "expr": "videocall_call_quality_score{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "A"
         }
@@ -1098,7 +1098,7 @@
           "editorMode": "code",
           "expr": "videocall_audio_quality_score{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "A"
         }
@@ -1193,7 +1193,7 @@
           "editorMode": "code",
           "expr": "videocall_video_quality_score{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "A"
         }
@@ -1301,7 +1301,7 @@
           "editorMode": "code",
           "expr": "videocall_neteq_expand_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "A"
         }
@@ -1397,7 +1397,7 @@
           "editorMode": "code",
           "expr": "videocall_neteq_target_delay_ms{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "A"
         }
@@ -1493,7 +1493,7 @@
           "editorMode": "code",
           "expr": "videocall_audio_concealment_pct{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "A"
         }
@@ -1580,7 +1580,7 @@
           "editorMode": "code",
           "expr": "videocall_neteq_packets_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "A"
         }
@@ -1681,7 +1681,7 @@
           "editorMode": "code",
           "expr": "videocall_video_bitrate_kbps{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "A"
         }
@@ -1775,7 +1775,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting_id\"}",
+          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting_id\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "instant": false,
           "legendFormat": "{{display_name}} ({{server_type}})",
           "range": true,
@@ -1877,7 +1877,7 @@
           "editorMode": "code",
           "expr": "count(videocall_call_quality_score{meeting_id=~\"$meeting_id\"} < 40) or vector(0)",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "A"
         },
@@ -1886,7 +1886,7 @@
           "editorMode": "code",
           "expr": "count(videocall_call_quality_score{meeting_id=~\"$meeting_id\"} >= 40) or vector(0)",
           "instant": false,
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "range": true,
           "refId": "B"
         }
@@ -2058,7 +2058,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "videocall_client_tab_visible{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\"}",
+          "expr": "videocall_client_tab_visible{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "instant": false,
           "legendFormat": "{{display_name}}",
           "range": true,
@@ -2146,7 +2146,7 @@
         {
           "datasource": "Prometheus",
           "editorMode": "code",
-          "expr": "videocall_client_memory_used_bytes{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\"} / 1e6",
+          "expr": "videocall_client_memory_used_bytes{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\"} / 1e6 * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "instant": false,
           "legendFormat": "{{display_name}}",
           "range": true,
@@ -2154,6 +2154,112 @@
         }
       ],
       "title": "Client Memory Usage (MB)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "Publisher-to-relay inbound MEDIA frame inter-arrival gap (ms), p50/p95/p99 from relay_publisher_inbound_frame_gap_ms (#1699). Measures how evenly a publisher feeds the relay, split by cleartext media_kind and bounded frame_kind (key/delta/unknown). This is a relay-instance metric with NO room/meeting label, so it is intentionally NOT filtered by $meeting_id. Rising p95/p99 => bursty or stalled publisher ingest.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 120
+      },
+      "id": 922,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, media_kind, frame_kind) (rate(relay_publisher_inbound_frame_gap_ms_bucket[5m])))",
+          "instant": false,
+          "legendFormat": "p50 {{media_kind}}/{{frame_kind}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, media_kind, frame_kind) (rate(relay_publisher_inbound_frame_gap_ms_bucket[5m])))",
+          "instant": false,
+          "legendFormat": "p95 {{media_kind}}/{{frame_kind}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": "Prometheus",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, media_kind, frame_kind) (rate(relay_publisher_inbound_frame_gap_ms_bucket[5m])))",
+          "instant": false,
+          "legendFormat": "p99 {{media_kind}}/{{frame_kind}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Publisher→Relay Inbound Frame Gap (p50/p95/p99) (#1699)",
       "type": "timeseries"
     }
   ],

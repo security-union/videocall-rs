@@ -39,7 +39,7 @@ use std::cell::{Cell, RefCell};
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
 use videocall_codecs::jitter_buffer::{
-    decide_keyframe_less_escalation, paint_lag_ms, FreshnessSkip, JitterBuffer,
+    decide_keyframe_less_escalation, paint_lag_ms, EscalationSignal, FreshnessSkip, JitterBuffer,
 };
 use videocall_codecs::messages::{
     FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerLogMessage,
@@ -797,27 +797,38 @@ fn initialize_jitter_buffer() -> Result<JitterBuffer<DecodedFrame>, String> {
     ))
 }
 
-/// Worker-side keyframe-less hold-ceiling escalation gate (issue #1662). Invoked by the jitter
-/// buffer with the current `head_age_ms` when the keyframe-less freeze has crossed the ceiling.
-/// Returns `true` iff the cooldown permits an escalation now; the buffer then fires its decoder
-/// reset. Owns the cooldown anchor (a worker thread-local that survives the buffer rebuild — review
-/// B1) and force-posts the `escalated: true` diagnostic synchronously when it gates one in, so it is
-/// forwarded on the SAME poll, before the deferred `reset_jitter_buffer()` runs and before/without
-/// any interaction with the buffer's `record_freshness_skip` throttle (review B2).
-fn gate_keyframe_less_escalation(head_age_ms: f64) -> bool {
-    let now_ms = js_sys::Date::now() as u128;
+/// Worker-side keyframe-less hold-ceiling escalation gate (issues #1662/#1851). Invoked by the
+/// jitter buffer with an [`EscalationSignal`] (effective freeze-age, this poll's `tick_gap_ms`, and
+/// the poll `now_ms`) when the keyframe-less freeze has crossed the ceiling. Returns `true` iff an
+/// escalation is permitted now — the cooldown has elapsed OR this is a starvation-resume poll that
+/// bypasses the cooldown one-shot (issue #1851) — at which point the buffer fires its decoder reset.
+/// Owns the cooldown anchor (a worker thread-local that survives the buffer rebuild — review B1) and
+/// force-posts the `escalated: true` diagnostic (now carrying `tick_gap_ms`) synchronously when it
+/// gates one in, so it is forwarded on the SAME poll, before the deferred `reset_jitter_buffer()`
+/// runs and before/without any interaction with the buffer's `record_freshness_skip` throttle
+/// (review B2).
+///
+/// Uses `signal.now_ms` (the buffer's poll clock, `Date::now()`-derived) as the cooldown "now"
+/// rather than a fresh `Date::now()`, so the anchor it stores and the cooldown comparisons future
+/// polls make are on one consistent clock — and so the decision is fully native-testable through
+/// `find_and_move_continuous_frames`.
+fn gate_keyframe_less_escalation(signal: EscalationSignal) -> bool {
     let last = LAST_KEYFRAME_LESS_ESCALATION_MS.with(|c| c.get());
-    // The cooldown decision AND the "advance anchor + build escalated diagnostic" wiring live in the
-    // pure `decide_keyframe_less_escalation` (natively tested) so a regression here — forgetting the
-    // anchor advance, or building the skip with `escalated: false` — is caught off the wasm path.
-    let Some((new_anchor, skip)) = decide_keyframe_less_escalation(last, now_ms, head_age_ms)
-    else {
+    // The cooldown/bypass decision AND the "advance anchor + build escalated diagnostic + stamp
+    // tick_gap" wiring live in the pure `decide_keyframe_less_escalation` (natively tested) so a
+    // regression here — forgetting the anchor advance, building the skip with `escalated: false`, or
+    // dropping the resume bypass — is caught off the wasm path.
+    let Some((new_anchor, skip)) = decide_keyframe_less_escalation(last, signal) else {
         return false;
     };
     // Advance the worker-held anchor (survives the buffer rebuild the reset triggers — review B1).
+    // A bypassed resume escalation advances it too, so an immediately-following normal poll is
+    // cooldown-gated again (the one-shot property).
     LAST_KEYFRAME_LESS_ESCALATION_MS.with(|c| c.set(Some(new_anchor)));
     log::warn!(
-        "[JITTER_BUFFER] Keyframe-less hold exceeded ceiling (head age {head_age_ms:.0}ms) with NO buffered keyframe. Escalating: resetting the decoder pipeline to clear stuck decode state and re-arm keyframe recovery (issue #1662)."
+        "[JITTER_BUFFER] Keyframe-less hold exceeded ceiling (freeze age {:.0}ms, tick_gap {:.0}ms) with NO buffered keyframe. Escalating: resetting the decoder pipeline to clear stuck decode state and re-arm keyframe recovery (issue 1662).",
+        signal.effective_age_ms,
+        signal.tick_gap_ms
     );
     // Force-post the escalation diagnostic directly to main, synchronously this poll — before the
     // deferred `reset_jitter_buffer()` runs and without going through the buffer's ~1s
@@ -870,6 +881,7 @@ fn post_freshness_skip_to_main(skip: &FreshnessSkip) {
         skip.keyframe_seq,
         skip.dropped,
         skip.escalated,
+        skip.tick_gap_ms,
     );
     match serde_wasm_bindgen::to_value(&msg) {
         Ok(val) => {

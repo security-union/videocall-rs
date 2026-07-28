@@ -283,4 +283,47 @@ test.describe("Action bar overflow menu", () => {
       }
     }
   });
+
+  // -- iOS UA: ScreenShare absent from overflow popover --------------------
+  //
+  // On iOS devices, `is_ios()` returns true (UA contains "iPhone" / "iPad" /
+  // "iPod") and `visible_action_bar_slots()` filters out ScreenShare
+  // (attendants.rs:1646). At narrow viewports this means the ScreenShare
+  // slot must NOT appear as an overflow popover item. This test guards that
+  // filter — removing the `is_ios()` argument from the overflow effect
+  // (attendants.rs:2018) would re-introduce a dead popover item on iOS.
+  //
+  // Uses `test.use()` to set an iPhone UA string BEFORE the page navigates,
+  // so the wasm `is_ios()` (cached via `OnceLock`) picks it up on first read.
+
+  test.describe("iOS user agent", () => {
+    test.use({
+      userAgent:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 " +
+        "Mobile/15E148 Safari/604.1",
+    });
+
+    test("ScreenShare overflow item is absent on iOS @bvt1", async ({ page }) => {
+      await joinMeeting(page, "ios_no_screenshare");
+      await page.setViewportSize({ width: 400, height: 720 });
+      await hoverActionBar(page);
+
+      // Open the overflow popover
+      await expect(page.locator("#overflow-menu-trigger")).toBeVisible({ timeout: 5_000 });
+      await page.locator("#overflow-menu-trigger").click();
+      await expect(page.locator(".action-bar-overflow-popover")).toBeVisible({ timeout: 5_000 });
+
+      // The popover must NOT contain a "Screen" item (ScreenShare slot).
+      const screenItem = page.locator(".action-bar-overflow-popover .overflow-item", {
+        hasText: /Screen/i,
+      });
+      await expect(screenItem).toHaveCount(0);
+
+      // Guard against vacuous pass: at least one other overflow item must be
+      // present (e.g. Chat), proving the popover isn't simply empty.
+      const anyItem = page.locator(".action-bar-overflow-popover .overflow-item");
+      expect(await anyItem.count()).toBeGreaterThan(0);
+    });
+  });
 });

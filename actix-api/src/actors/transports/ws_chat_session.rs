@@ -32,7 +32,8 @@ use crate::constants::{
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{
-    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL,
+    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH,
+    RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION, RELAY_PACKET_DROPS_TOTAL,
 };
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -168,6 +169,14 @@ impl WsChatSession {
             RELAY_OUTBOUND_QUEUE_DEPTH
                 .with_label_values(&[&act.logic.room, "websocket"])
                 .set(depth as f64);
+            RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
+                .with_label_values(&[
+                    &act.logic.room,
+                    "websocket",
+                    &act.logic.id.to_string(),
+                    "ws",
+                ])
+                .set(depth as f64);
 
             if Instant::now().duration_since(act.heartbeat) > CLIENT_TIMEOUT {
                 error!("WebSocket client heartbeat failed, disconnecting!");
@@ -205,10 +214,11 @@ impl Actor for WsChatSession {
         //
         // Sizing the mailbox AT the outbound channel capacity (issue #1057)
         // relocates a *steady-state* overflow onto `outbound_tx`, which is
-        // policy-aware: it sheds VIDEO/SCREEN first, protects AUDIO to ~95%,
-        // never preempts CONTROL/CONGESTION/MEETING, and records drops via
-        // `on_outbound_drop`. So a genuine overflow becomes video-first +
-        // audio-protected instead of a total stall.
+        // policy-aware: it sheds camera VIDEO first (~80%), then SCREEN (~90%,
+        // issue 1977), protects AUDIO to ~95%, never preempts
+        // CONTROL/CONGESTION/MEETING, and records drops via `on_outbound_drop`.
+        // So a genuine overflow becomes camera-first + screen-and-audio-protected
+        // instead of a total stall.
         //
         // BUT a publisher-join fan-out BURST (issue #1144) overflows even a
         // mailbox sized AT the channel: #1144 saw 303 `mailbox_full` drops in
@@ -320,9 +330,10 @@ impl Actor for WsChatSession {
 /// per-session `actors::priority_drop` evaluator decides whether to
 /// preempt the enqueue based on packet priority and channel fill:
 ///
-/// * Video / screen frames are shed at ~80% channel fill so audio
-///   gets the headroom (one 1-2 Mbps video frame buffer is worth
-///   ~200 audio frames at ~50 kbps).
+/// * Camera VIDEO frames are shed first at ~80% channel fill, then SCREEN
+///   frames at ~90% (issue 1977: screen outranks cameras), so audio gets the
+///   headroom (one 1-2 Mbps video frame buffer is worth ~200 audio frames at
+///   ~50 kbps).
 /// * Audio frames preserved until ~95% fill.
 /// * Control packets are never preempted by the policy. Critical
 ///   lifecycle packets (`SESSION_ASSIGNED`, `CONGESTION`,

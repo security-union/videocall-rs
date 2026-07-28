@@ -284,6 +284,32 @@ test.describe("Recording feature", () => {
         timeout: 15_000,
       });
 
+      // ── Item 1 (a11y): honour `prefers-reduced-motion: reduce` ────────
+      // The infinite `rec-pulse` on the active record button and on the
+      // `.rec-dot` must stop when the user prefers reduced motion. Because
+      // `animation` is not an inherited property, each element opts out
+      // individually via the `@media (prefers-reduced-motion: reduce)` block
+      // in global.css. Toggling the emulated preference must flip the
+      // computed `animation-name` between `rec-pulse` (default) and `none`
+      // (reduce) — proving that guard, not some unrelated rule, disables it.
+      //
+      // Mutation sensitivity: delete the reduced-motion block for
+      // `.rec-dot, .video-control-button.record-active` in global.css and the
+      // `reduce` branch below stays `rec-pulse`, failing the `toBe("none")`.
+      const animName = (page: Page, selector: string) =>
+        page.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          return el ? getComputedStyle(el).animationName : null;
+        }, selector);
+
+      await hostPage.emulateMedia({ reducedMotion: "reduce" });
+      expect(await animName(hostPage, ".video-control-button.record-active")).toBe("none");
+      expect(await animName(hostPage, ".recording-status-banner .rec-dot")).toBe("none");
+
+      await hostPage.emulateMedia({ reducedMotion: "no-preference" });
+      expect(await animName(hostPage, ".video-control-button.record-active")).toBe("rec-pulse");
+      expect(await animName(hostPage, ".recording-status-banner .rec-dot")).toBe("rec-pulse");
+
       // ── Assert the persistent meeting-wide status bar appears ─────────
       // `.meeting-status-bar` is driven by the `any_session_recording`
       // aggregate over the session-keyed recording set. It is shown to EVERY
@@ -793,6 +819,19 @@ test.describe("Recording feature", () => {
       await expect(guestSeesHostListIcon).toHaveCount(1, { timeout: 15_000 });
       await expect(guestSeesHostListIcon.first()).toBeVisible();
 
+      // ── Item 3 (a11y): the RecordingIcon span must carry `role="img"` so
+      // its `aria-label="Recording"` is authoritative for screen readers — a
+      // bare generic-role span surfaces the label unreliably (some readers
+      // announce the emoji's own Unicode name instead). A DOM-shape assertion
+      // is the practical ceiling here; it cannot prove SR announcement, only
+      // that the authoritative-name markup is present. Assert on the icon the
+      // guest sees on the host's tile.
+      //
+      // Mutation sensitivity: remove `role: "img"` from RecordingIcon
+      // (recording.rs) and the role assertion below fails.
+      await expect(guestSeesHostTileIcon.first()).toHaveAttribute("role", "img");
+      await expect(guestSeesHostTileIcon.first()).toHaveAttribute("aria-label", "Recording");
+
       // Negative: the host must NOT see a recording icon on the (non-recording)
       // guest's tile — the indicator is per-recorder, not a global banner.
       await expect(hostSeesGuestTileIcon).toHaveCount(0);
@@ -1066,6 +1105,29 @@ test.describe("Recording feature", () => {
       await expect(guestIndicator).toBeVisible();
       await expect(hostIndicator).toBeVisible();
 
+      // ── Item 2 regression: the recorder's OWN `.recording-status-banner` ─
+      // carries `.peer-toast` for layout, but its visibility is state-machine-
+      // controlled by `record_state()` (Recording persists for the whole
+      // multi-minute recording), NOT auto-dismissing. It must therefore
+      // override the inherited base `.peer-toast` `toast-exit ... 7.5s
+      // forwards` auto-fade. The 9s wait above is well past that ~7.9s exit
+      // window, so — with the `.peer-toast.recording-status-banner` override
+      // in style.css — the host's banner must still be fully opaque and its
+      // computed `animation-name` must NOT include `toast-exit`.
+      //
+      // Mutation sensitivity: drop the `.peer-toast.recording-status-banner`
+      // override in style.css and this banner fades to opacity 0 after ~8s
+      // (opacity assertion fails) and `animation-name` regains `toast-exit`.
+      const hostBanner = await hostPage.evaluate(() => {
+        const el = document.querySelector(".recording-status-banner");
+        if (!el) return null;
+        const cs = getComputedStyle(el);
+        return { opacity: parseFloat(cs.opacity), animationName: cs.animationName };
+      });
+      expect(hostBanner).not.toBeNull();
+      expect(hostBanner!.opacity).toBeGreaterThan(0.5);
+      expect(hostBanner!.animationName).not.toContain("toast-exit");
+
       // ── (b) Second recorder (guest) starts — no change to the indicator ─
       const guestRecordBtn = guestPage.getByTestId("record-button");
       await expect(guestRecordBtn).toBeVisible({ timeout: 15_000 });
@@ -1095,6 +1157,111 @@ test.describe("Recording feature", () => {
       await guestPage.getByTestId("record-button").click();
       await expect(hostIndicator).toHaveCount(0, { timeout: 20_000 });
       await expect(guestIndicator).toHaveCount(0, { timeout: 20_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * Item C: a Record click that cannot hand off to the JS recorder
+   * (recording.js missing / stale / 404) must SURFACE AN ERROR and must NOT
+   * announce a phantom recording.
+   *
+   * Before the fix, `js_recording_start` returned `()` and the click handler
+   * ignored it: it unconditionally stored the state callback and fanned out
+   * `PEER_EVENT_RECORDING_STARTED` to every peer. When the JS hand-off silently
+   * failed, the JS `onStateChange` callback never fired, so `record_state` stayed
+   * `Idle` and `RECORDING_STOPPED` was never sent — leaving every peer with a
+   * permanent phantom "Recording" banner for a recording that never happened.
+   *
+   * Repro without a real 404: delete `window.__vcRecording` right before the
+   * click. `js_recording_start` then bails at the `start not found` branch and
+   * (with the fix) returns `false`, so the handler shows the
+   * `.recording-error-banner` and never marks itself recording. A guest present
+   * in the same meeting must NEVER see the meeting-wide `.meeting-status-bar`.
+   *
+   * Mutation sensitivity: revert `js_recording_start` to return `()` / ignore the
+   * result at the call site and the click announces STARTED again → the guest's
+   * `.meeting-status-bar` appears (assertion below fails) and no error banner
+   * shows on the host.
+   */
+  test("failed recording hand-off shows an error and does not announce a phantom recording", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_recording_handoff_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-handoff@videocall.rs",
+        "HandoffHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-handoff@videocall.rs",
+        "HandoffGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // ── Join meeting (host + guest, so we can assert no phantom fan-out) ──
+      await fillAndSubmitJoinForm(hostPage, meetingId, "HandoffHost");
+      await hostPage.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(hostPage)).toBe("in-meeting");
+
+      await fillAndSubmitJoinForm(guestPage, meetingId, "HandoffGuest");
+      await guestPage.waitForTimeout(1500);
+      const guestResult = await joinMeetingFromPage(guestPage);
+      if (guestResult === "waiting") {
+        const admitButton = hostPage.getByTitle("Admit").first();
+        await expect(admitButton).toBeVisible({ timeout: 20_000 });
+        await hostPage.waitForTimeout(500);
+        await admitButton.dispatchEvent("click");
+        await guestPage.locator("#grid-container").waitFor({ timeout: 20_000 });
+      }
+
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      // Ensure the peer session is established so a (phantom) STARTED fan-out
+      // would actually reach the guest.
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // ── Break the JS recorder hand-off, then click Record ────────────────
+      await hostPage.evaluate(() => {
+        // Simulate recording.js failing to load / a stale bundle: the global
+        // the Rust side reflects into is gone.
+        delete (window as unknown as { __vcRecording?: unknown }).__vcRecording;
+      });
+
+      const recordBtn = hostPage.getByTestId("record-button");
+      await expect(recordBtn).toBeVisible({ timeout: 15_000 });
+      await recordBtn.click();
+
+      // ── The local user is told it failed ─────────────────────────────────
+      await expect(hostPage.locator(".recording-error-banner .toast-name")).toHaveText(
+        /Couldn't start recording/,
+        { timeout: 10_000 },
+      );
+
+      // ── The host must NOT have transitioned to a recording state ─────────
+      // (no local status banner text), and — critically — the guest must NOT
+      // see a phantom meeting-wide recording bar from a spurious STARTED.
+      await expect(hostPage.locator(".recording-status-banner")).toHaveCount(0);
+      // Give any (erroneous) STARTED fan-out ample time to propagate before
+      // asserting its ABSENCE, so this is not a race that passes by being fast.
+      await guestPage.waitForTimeout(3000);
+      await expect(guestPage.locator(".meeting-status-bar")).toHaveCount(0);
+      await expect(hostPage.locator(".meeting-status-bar")).toHaveCount(0);
     } finally {
       await browser1.close();
       await browser2.close();

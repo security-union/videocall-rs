@@ -25,8 +25,8 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::{
     classify_packet, keyframe_per_pair_budget, outbound_keyframe_observation,
-    stamp_reaction_for_broadcast, KeyframeRequestLimiter, KeyframeTarget, PacketKind,
-    ReactionRateLimiter,
+    stamp_reaction_for_broadcast, InboundFrameKind, KeyframeRequestLimiter, KeyframeTarget,
+    PacketKind, ReactionRateLimiter,
 };
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
@@ -35,7 +35,9 @@ use crate::constants::{
 };
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
-use crate::metrics::{RELAY_ACTIVE_SESSIONS_PER_ROOM, RELAY_ROOM_BYTES_TOTAL};
+use crate::metrics::{
+    RELAY_ACTIVE_SESSIONS_PER_ROOM, RELAY_PUBLISHER_INBOUND_FRAME_GAP_MS, RELAY_ROOM_BYTES_TOTAL,
+};
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
 };
@@ -48,6 +50,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
+use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
 
 pub type SessionId = u64;
 pub type RoomId = String;
@@ -64,6 +67,30 @@ lazy_static! {
     /// [`downlink_congested_epoch_now`]). Both sides agree on the same origin so
     /// the closure's windowed-decay read matches the writer's clock.
     static ref PROCESS_START: Instant = Instant::now();
+}
+
+#[derive(Default)]
+struct PublisherInboundFrameGapTracker {
+    video: Option<Instant>,
+    screen: Option<Instant>,
+}
+
+impl PublisherInboundFrameGapTracker {
+    fn observe(&mut self, transport: &str, media_kind: MediaKind, frame_kind: InboundFrameKind) {
+        let now = Instant::now();
+        let (last_arrival, media_kind_label) = match media_kind {
+            MediaKind::VIDEO => (&mut self.video, "video"),
+            MediaKind::SCREEN => (&mut self.screen, "screen"),
+            MediaKind::AUDIO | MediaKind::MEDIA_KIND_UNSPECIFIED => return,
+        };
+
+        if let Some(previous) = last_arrival.replace(now) {
+            let gap_ms = now.duration_since(previous).as_secs_f64() * 1000.0;
+            RELAY_PUBLISHER_INBOUND_FRAME_GAP_MS
+                .with_label_values(&[transport, media_kind_label, frame_kind.as_label()])
+                .observe(gap_ms);
+        }
+    }
 }
 
 /// Sentinel for [`SessionLogic::downlink_congested_epoch`] meaning "this
@@ -398,6 +425,11 @@ pub struct SessionLogic {
     /// time-decaying window to it, so this is a level (not edge) signal: it
     /// never needs an explicit "clear" write when the link recovers.
     pub downlink_congested_epoch: Arc<AtomicU64>,
+    /// Last publisher-to-relay inbound VIDEO/SCREEN arrivals for this session.
+    ///
+    /// Fresh `SessionLogic` actors are constructed on reconnect/re-election, so
+    /// the first frame after a transition intentionally has no previous sample.
+    publisher_inbound_frame_gap_tracker: PublisherInboundFrameGapTracker,
 }
 
 impl SessionLogic {
@@ -443,7 +475,17 @@ impl SessionLogic {
             keyframe_limiter: KeyframeRequestLimiter::new(),
             reaction_limiter: ReactionRateLimiter::new(),
             downlink_congested_epoch: Arc::new(AtomicU64::new(DOWNLINK_EPOCH_NEVER)),
+            publisher_inbound_frame_gap_tracker: PublisherInboundFrameGapTracker::default(),
         }
+    }
+
+    fn observe_publisher_inbound_frame_gap(
+        &mut self,
+        media_kind: MediaKind,
+        frame_kind: InboundFrameKind,
+    ) {
+        self.publisher_inbound_frame_gap_tracker
+            .observe(&self.transport, media_kind, frame_kind);
     }
 
     /// Record a per-session outbound drop on `relay_session_drops_total`
@@ -590,6 +632,11 @@ impl SessionLogic {
         // re-regression here.
         let session_id = self.id.to_string();
         crate::metrics::forget_session_drops(&self.room, &self.transport, &session_id);
+        crate::metrics::forget_outbound_queue_depth_by_session(
+            &self.room,
+            &self.transport,
+            &session_id,
+        );
         send_connection_ended(&self.tracker_sender, self.id);
         self.addr.do_send(Disconnect {
             session: self.id,
@@ -815,6 +862,26 @@ impl SessionLogic {
 
                 InboundAction::Forward(Arc::new(data.to_vec()))
             }
+            PacketKind::Media {
+                media_kind,
+                frame_kind,
+            } => {
+                if self.observer {
+                    trace!(
+                        "Observer session {} dropping media packet from {}",
+                        self.id,
+                        self.user_id
+                    );
+                    return InboundAction::Processed;
+                }
+
+                // Observe AFTER the observer guard so the metric counts only
+                // publisher→relay frames that are actually forwarded to the room
+                // — an observer/waiting-room session's inbound media is dropped
+                // (never reaches receivers) and must not pollute the gap series.
+                self.observe_publisher_inbound_frame_gap(media_kind, frame_kind);
+                InboundAction::Forward(Arc::new(data.to_vec()))
+            }
         }
     }
 
@@ -941,9 +1008,12 @@ impl SessionLogic {
     /// overflows (a slow socket / parked event loop) — NOT the relay-side
     /// actor-mailbox `Full` (room-wide fan-out burst). The fan-out closure
     /// (`chat_server::handle_msg`) reads the epoch against
-    /// [`RECEIVER_DOWNLINK_RELIEF_WINDOW`] to (a) shed non-base VIDEO/SCREEN
-    /// layers and (b) emit one DOWNLINK_CONGESTION packet so the client steps
-    /// down. Recovery is automatic once the window elapses with no fresh drops.
+    /// [`RECEIVER_DOWNLINK_RELIEF_WINDOW`] to (a) shed non-base camera VIDEO
+    /// layers — SCREEN is protected per issue 1977 (the shared content outranks
+    /// cameras; its own relief is the priority_drop 90% fill backstop, one rung
+    /// above camera VIDEO's 80%) — and (b) emit one DOWNLINK_CONGESTION packet so
+    /// the client steps down. Recovery is automatic once the window elapses with
+    /// no fresh drops.
     /// Receiver-only scope: this never touches the publisher's encoder.
     ///
     /// Every drop — regardless of whether the windowed `CongestionTracker` is
@@ -1525,6 +1595,89 @@ mod tests {
         assert!(SessionLogic::should_activate_on_action(
             &InboundAction::KeepAlive
         ));
+    }
+
+    /// #1699 Phase 1: publisher-leg keyframe-arrival instrumentation must be
+    /// wired through the REAL production path — `handle_inbound` classifying a
+    /// MEDIA `PacketWrapper` as `PacketKind::Media` and calling the per-session
+    /// observer. This drives two real VIDEO `PacketWrapper`s (a delta then a
+    /// keyframe) through `SessionLogic::handle_inbound` and asserts one
+    /// inter-arrival sample landed on the arriving keyframe's `{websocket, video,
+    /// key}` label set, AND that both were still forwarded (behavior neutrality).
+    ///
+    /// MUTATION PROOF: removing the `PacketKind::Media` arm's
+    /// `self.observe_publisher_inbound_frame_gap(...)` call in `handle_inbound`
+    /// (or deleting the `.observe(...)` in `PublisherInboundFrameGapTracker`)
+    /// leaves the sample count flat and fails the `after > before` assert.
+    /// Because it goes through `classify_packet`, it also guards the new
+    /// `PacketKind::Media` classification itself.
+    #[actix_rt::test]
+    #[serial_test::serial(relay_publisher_inbound_frame_gap)]
+    async fn handle_inbound_media_frame_observes_publisher_gap_and_forwards() {
+        use protobuf::Message as _;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        // Build a real MEDIA PacketWrapper: outer media_kind = VIDEO (cleartext),
+        // inner MediaPacket.frame_type distinguishes delta vs key.
+        let media_bytes = |frame_type: &str| -> Vec<u8> {
+            let inner = MediaPacket {
+                media_type: MediaType::VIDEO.into(),
+                frame_type: frame_type.to_string(),
+                ..Default::default()
+            };
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::MEDIA.into(),
+                media_kind: MediaKind::VIDEO.into(),
+                data: inner.write_to_bytes().expect("inner encode"),
+                ..Default::default()
+            };
+            wrapper.write_to_bytes().expect("wrapper encode")
+        };
+
+        let mut logic = build_test_receiver_logic(nats_client, "room-1699-inbound").await;
+
+        let labels = ["websocket", "video", "key"];
+        let before = RELAY_PUBLISHER_INBOUND_FRAME_GAP_MS
+            .with_label_values(&labels)
+            .get_sample_count();
+
+        // First VIDEO frame (delta): seeds the tracker's last-arrival, no gap yet.
+        // It must still FORWARD (behavior neutrality — same as the old Data arm).
+        let delta = media_bytes("delta");
+        assert!(
+            matches!(logic.handle_inbound(&delta), InboundAction::Forward(_)),
+            "a regular MEDIA frame must still be forwarded (behavior-neutral)"
+        );
+
+        // Ensure a measurable gap, then a VIDEO keyframe: this produces exactly one
+        // inter-arrival sample on {websocket, video, key} and must also forward.
+        std::thread::sleep(Duration::from_millis(1));
+        let key = media_bytes("key");
+        assert!(
+            matches!(logic.handle_inbound(&key), InboundAction::Forward(_)),
+            "a keyframe MEDIA frame must still be forwarded (behavior-neutral)"
+        );
+
+        let after = RELAY_PUBLISHER_INBOUND_FRAME_GAP_MS
+            .with_label_values(&labels)
+            .get_sample_count();
+        assert!(
+            after > before,
+            "handle_inbound must observe one keyframe-arrival gap sample for \
+             {labels:?} via the PacketKind::Media path (before={before}, after={after})"
+        );
     }
 
     // =====================================================================

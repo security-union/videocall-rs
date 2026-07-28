@@ -383,6 +383,58 @@ test.describe("Protocol selection (transport preference)", () => {
     });
   });
 
+  // 9c. Issue #1745 PR2: the primary in-call join logs the applied transport
+  // preference AND its provenance. Seeding a sticky WebSocket pin must surface
+  // `pref=websocket source=sticky` on the browser console when the meeting is
+  // joined — this is the observability line a triager relies on to tell "WT
+  // list empty because the user pinned WS" apart from "empty because the server
+  // disabled it". Behaviour is unchanged; only the log line is asserted.
+  test("logs applied transport preference and source on join (sticky websocket)", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_proto_pref_log_${Date.now()}`;
+
+    // Capture console output for the whole test. Attach BEFORE seeding/joining
+    // so the join-time log line cannot be missed.
+    const consoleLines: string[] = [];
+    page.on("console", (msg) => {
+      consoleLines.push(msg.text());
+    });
+
+    // Seed a sticky WebSocket pin the same way tests 9/9b/12 do, then reload so
+    // the wasm bundle boots with the pin in place.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+    await page.evaluate(() => {
+      localStorage.setItem("vc_transport_preference", "websocket");
+      localStorage.setItem("vc_transport_sticky", "true");
+    });
+    await page.reload();
+
+    await joinMeeting(page, meetingId, "proto-user-9c");
+
+    // The primary-join site emits:
+    //   "Transport preference applied: pref=websocket source=sticky wt_urls=… ws_urls=…"
+    // Poll because the log fires during async client construction after the
+    // grid becomes visible.
+    await expect
+      .poll(() => consoleLines.some((l) => l.includes("Transport preference applied:")), {
+        timeout: 15_000,
+      })
+      .toBe(true);
+
+    const prefLine = consoleLines.find((l) => l.includes("Transport preference applied:"));
+    expect(prefLine).toBeTruthy();
+    expect(prefLine).toContain("pref=websocket");
+    expect(prefLine).toContain("source=sticky");
+
+    // Cleanup the sticky pin so subsequent tests aren't polluted.
+    await page.evaluate(() => {
+      localStorage.removeItem("vc_transport_preference");
+      localStorage.removeItem("vc_transport_sticky");
+    });
+  });
+
   // 10. Diagnostics panel shows transport preference dropdown
   test("diagnostics panel shows transport preference dropdown", async ({ page }) => {
     const meetingId = `e2e_proto_diag_${Date.now()}`;

@@ -1279,6 +1279,41 @@ const TRANSPORT_SESSION_KEY: &str = "vc_transport_session";
 /// `WebTransport` variant carries the WT-with-WS-fallback semantics that
 /// `Auto` used to mean, so user behaviour is unchanged.
 pub fn load_transport_preference() -> TransportPreference {
+    // Single source of truth: delegate to the source-aware variant and drop the
+    // provenance tag. This keeps the storage-resolution logic (sticky vs.
+    // session vs. default, plus the legacy "auto" migration and stale-pref
+    // cleanup) in exactly one place so the two functions cannot drift.
+    load_transport_preference_with_source().0
+}
+
+/// Like [`load_transport_preference`], but also returns *where* the resolved
+/// preference came from, as a stable tag for observability logging:
+///
+/// - `"sticky"`  — a value was read from `vc_transport_preference` in
+///   `localStorage` while the persistent pin was set (`vc_transport_sticky ==
+///   "true"`). This is the explicit "remember my choice" path.
+/// - `"session"` — a value was read from the per-session `vc_transport_session`
+///   in `sessionStorage`, written when the user changes the protocol without
+///   ticking "remember".
+/// - `"default"` — no stored value applied, so the implicit default
+///   (`WebTransport`) is returned. This covers BOTH the fall-through with no
+///   storage at all AND the defensive case where the sticky flag is set but no
+///   `vc_transport_preference` value is present: in each the *value* originates
+///   from the default, not from storage, so the provenance tag reflects that.
+///
+/// This function is the single source of truth for transport-preference
+/// resolution — [`load_transport_preference`] delegates to it. The dioxus-ui
+/// call sites that build a `VideoCallClient` use the tag to log how the user's
+/// preference filtered the WebTransport/WebSocket candidate lists, so a triager
+/// can distinguish "WT list empty because the server disabled it" from "WT list
+/// empty because the user pinned WebSocket" (issue #1745 PR2). It is
+/// LOGGING/OBSERVABILITY only — it does not change which transport is selected.
+///
+/// The legacy `"auto"` migration and the non-sticky stale-pref cleanup are
+/// preserved exactly as in the original single-return implementation; both are
+/// idempotent, so calling this at multiple sites after app boot has no
+/// additional side effect.
+pub fn load_transport_preference_with_source() -> (TransportPreference, &'static str) {
     let local_storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
     let session_storage = web_sys::window().and_then(|w| w.session_storage().ok().flatten());
 
@@ -1303,10 +1338,13 @@ pub fn load_transport_preference() -> TransportPreference {
                     );
                     let _ = storage.set_item(TRANSPORT_PREF_KEY, &parsed.to_string());
                 }
-                return parsed;
+                return (parsed, "sticky");
             }
         }
-        return TransportPreference::default();
+        // Sticky flag set but no persisted value: the effective preference is
+        // the default, so report "default" — the tag tracks value provenance,
+        // not which branch was entered.
+        return (TransportPreference::default(), "default");
     }
 
     // Backward-compat: silently drop a stale persistent preference left over
@@ -1327,10 +1365,10 @@ pub fn load_transport_preference() -> TransportPreference {
                 );
                 let _ = storage.set_item(TRANSPORT_SESSION_KEY, &parsed.to_string());
             }
-            return parsed;
+            return (parsed, "session");
         }
     }
-    TransportPreference::default()
+    (TransportPreference::default(), "default")
 }
 
 /// Persist the transport preference to `localStorage` (the sticky path).

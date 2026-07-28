@@ -66,11 +66,22 @@ impl Expand {
         self.overlap_length
     }
 
+    /// Fill `output` with a concealment frame and crossfade it against the
+    /// surrounding real audio in `input`.
+    ///
+    /// `concealment` is an optional codec-level PLC frame (native libopus, issue
+    /// 620). When it is `Some` and its length matches `output`, it is used as the
+    /// concealment signal — it interpolates the lost audio near-imperceptibly.
+    /// When it is `None` (web decoders, unregistered payload type, cold decoder,
+    /// or libopus failure) the previous quiet-random-noise fallback is used. The
+    /// `ExpandStart`/`ExpandEnd` overlap crossfade is applied identically in both
+    /// cases, so seams are avoided regardless of the concealment source.
     pub fn process(
         &mut self,
         input: &[f32],
         output: &mut [f32],
         phase: ExpandPhase,
+        concealment: Option<&[f32]>,
     ) -> ExpandResult {
         let samples_required = self.samples_required(phase);
         if input.len() < samples_required || output.len() < samples_required {
@@ -80,9 +91,17 @@ impl Expand {
             return ExpandResult::NoExpand;
         }
 
-        // Generate concealment audio (simple noise for now)
-        for sample in output.iter_mut() {
-            *sample = (self.simple_random() - 0.5) * 0.0001; // Very quiet noise
+        // Fill the concealment signal: codec PLC when supplied (and the right
+        // length), otherwise the very-quiet random-noise fallback.
+        match concealment {
+            Some(plc) if plc.len() == output.len() => {
+                output.copy_from_slice(plc);
+            }
+            _ => {
+                for sample in output.iter_mut() {
+                    *sample = (self.simple_random() - 0.5) * 0.0001; // Very quiet noise
+                }
+            }
         }
 
         if phase == ExpandPhase::ExpandStart {
@@ -156,7 +175,7 @@ mod tests {
         let output_energy = calculate_energy(&output);
         assert!(output_energy < 0.00000000000000000001);
 
-        let result = expand.process(&input, &mut output, ExpandPhase::Expand);
+        let result = expand.process(&input, &mut output, ExpandPhase::Expand, None);
 
         // Should successfully generate concealment noise
         assert!(matches!(result, ExpandResult::Success));
@@ -178,7 +197,7 @@ mod tests {
         let output_energy = calculate_energy(&output);
         assert!(output_energy < 0.00000000000000000001);
 
-        let result = expand.process(&input, &mut output, ExpandPhase::ExpandStart);
+        let result = expand.process(&input, &mut output, ExpandPhase::ExpandStart, None);
 
         // Should successfully crossfade into concealment
         assert!(matches!(result, ExpandResult::Success));
@@ -196,6 +215,54 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_uses_codec_plc_source() {
+        // issue 620: when a codec-PLC concealment source is supplied to a plain
+        // Expand (no overlap crossfade), the output must be that PLC signal
+        // verbatim — NOT the quiet random noise. Reverting `process` to always
+        // fill noise makes this assertion fail (noise energy ~3e-5, PLC energy
+        // ~0.09 here), which is exactly the pre-fix behavior.
+        let mut expand = Expand::new(48000);
+
+        let input: Vec<f32> = vec![];
+        let mut output = vec![0.0; 480];
+        // A loud, obviously-non-noise concealment frame (constant 0.3).
+        let plc = vec![0.3f32; 480];
+
+        let result = expand.process(&input, &mut output, ExpandPhase::Expand, Some(&plc));
+
+        assert!(matches!(result, ExpandResult::Success));
+        assert_eq!(output, plc, "codec-PLC source must be copied verbatim");
+        // Energy is that of the PLC signal (0.3^2 = 0.09), far above the noise
+        // fallback's ~1e-9 energy.
+        let energy = calculate_energy(&output);
+        assert!(
+            (energy - 0.09).abs() < 1e-6,
+            "expected PLC energy ~0.09, got {energy}"
+        );
+    }
+
+    #[test]
+    fn test_expand_wrong_length_plc_falls_back_to_noise() {
+        // issue 620: a concealment source whose length does not match the output
+        // must be ignored (defensive guard) and the quiet-noise path used.
+        let mut expand = Expand::new(48000);
+
+        let input: Vec<f32> = vec![];
+        let mut output = vec![0.0; 480];
+        let plc = vec![0.3f32; 240]; // wrong length
+
+        let result = expand.process(&input, &mut output, ExpandPhase::Expand, Some(&plc));
+
+        assert!(matches!(result, ExpandResult::Success));
+        // Fell back to quiet noise: energy is tiny, nothing like the 0.09 PLC.
+        let energy = calculate_energy(&output);
+        assert!(
+            energy < 0.00001,
+            "expected quiet-noise energy, got {energy}"
+        );
+    }
+
+    #[test]
     fn test_expand_end() {
         let mut expand = Expand::new(16000);
 
@@ -206,7 +273,7 @@ mod tests {
         let output_energy = calculate_energy(&output);
         assert!(output_energy < 0.00000000000000000001);
 
-        let result = expand.process(&input, &mut output, ExpandPhase::ExpandEnd);
+        let result = expand.process(&input, &mut output, ExpandPhase::ExpandEnd, None);
 
         // Should successfully crossfade out of concealment
         assert!(matches!(result, ExpandResult::Success));

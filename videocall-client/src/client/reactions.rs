@@ -54,6 +54,40 @@ pub const REACTION_DISPLAY_NAME_MAX_CHARS: usize = 64;
 /// display-name cache and carries no usable in-packet fallback.
 pub const REACTION_UNKNOWN_SENDER_NAME: &str = "Someone";
 
+/// Maximum bytes of a CUSTOM reaction's emoji string. A hard cap against
+/// oversized/bloated payloads on top of the exact-emoji allowlist below,
+/// mirroring `display_name`'s length cap. 32 bytes admits every
+/// PICKER-OFFERED emoji: the picker enumerates `emojis::iter()` /
+/// `Group::emojis()`, which yield the DEFAULT-skin-tone set only, whose longest
+/// members are ~28-byte tag-sequence flags (e.g. 🏴󠁧󠁢󠁳󠁣󠁴󠁿) — 4 bytes of headroom
+/// (pinned by `custom_emoji_cap_admits_every_standard_emoji`). It is NOT true
+/// that the whole `emojis` table fits: the table also contains ~35-byte
+/// non-default skin-tone ZWJ couples (e.g. a kiss couple with two skin tones),
+/// reachable via `emojis::get` / `Emoji::skin_tones()` but never surfaced by the
+/// picker, and those are DELIBERATELY rejected by this cap (fail-closed). So the
+/// cap is live, load-bearing defense-in-depth — it bounds an attacker's decoded
+/// `custom_emoji` (including a real-but-over-cap skin-tone emoji), not just a
+/// hypothetical future addition.
+pub const REACTION_CUSTOM_EMOJI_MAX_BYTES: usize = 32;
+
+/// Is `s` a valid CUSTOM-reaction emoji (issue 1884)? The single source of
+/// truth for the CUSTOM allowlist, enforced in THREE places (defense in depth,
+/// mirroring the proto's `custom_emoji` threat model): the client's send path,
+/// the client's receive/render path, and — independently — the relay ingress.
+///
+/// A string passes iff it is:
+///   1. at most [`REACTION_CUSTOM_EMOJI_MAX_BYTES`] bytes, AND
+///   2. an EXACT match for a single standard Unicode emoji in the compile-time
+///      `emojis` table (`emojis::get` — exact, so ZWJ sequences and skin-tone
+///      variants match as a whole, but a two-emoji string, arbitrary text, or
+///      markup like `<script>` does not).
+///
+/// Pure and host-testable (no DOM/clock). The byte cap is checked FIRST so an
+/// over-cap payload is rejected regardless of whether it is a real emoji.
+pub fn validate_custom_emoji(s: &str) -> bool {
+    s.len() <= REACTION_CUSTOM_EMOJI_MAX_BYTES && emojis::get(s).is_some()
+}
+
 /// Client-side send self-throttle for reactions (issue #1884).
 ///
 /// Enforces TWO limits together, both STRICTLY under the relay ceiling so a
@@ -350,6 +384,108 @@ mod tests {
         assert_eq!(
             sanitize_reaction_display_name(b"  Carol  "),
             Some("Carol".to_string())
+        );
+    }
+
+    // =====================================================================
+    // Custom-emoji validation (issue 1884)
+    // =====================================================================
+
+    #[test]
+    fn custom_emoji_accepts_exact_standard_emoji() {
+        // A single-codepoint emoji, a flag (two regional indicators), and a ZWJ
+        // sequence (people holding hands) are all EXACT entries in the emoji
+        // table, so each must validate.
+        assert!(validate_custom_emoji("👍"), "single emoji must validate");
+        assert!(validate_custom_emoji("🇲🇽"), "a flag must validate");
+        assert!(
+            validate_custom_emoji("🧑‍🤝‍🧑"),
+            "a ZWJ people-holding-hands sequence must validate"
+        );
+    }
+
+    #[test]
+    fn custom_emoji_rejects_non_emoji_and_markup() {
+        // Empty, a bare letter, a word, and markup are not emoji-table entries.
+        // ADVERSARIAL: drop the `emojis::get(s).is_some()` term and "a"/"hello"/
+        // "<script>" would slip through (they are all <=32 bytes).
+        assert!(!validate_custom_emoji(""), "empty string must reject");
+        assert!(!validate_custom_emoji("a"), "a bare letter must reject");
+        assert!(!validate_custom_emoji("hello"), "a word must reject");
+        assert!(
+            !validate_custom_emoji("<script>"),
+            "markup must reject (never a table entry)"
+        );
+    }
+
+    #[test]
+    fn custom_emoji_rejects_multi_emoji_string() {
+        // Two concatenated emoji are NOT a single table entry — `emojis::get`
+        // is an exact whole-string lookup, so this must reject (it would
+        // otherwise let a client smuggle several glyphs in one CUSTOM float).
+        assert!(
+            !validate_custom_emoji("👍👍"),
+            "a two-emoji string is not a single standard emoji"
+        );
+    }
+
+    #[test]
+    fn custom_emoji_cap_admits_every_standard_emoji() {
+        // Every PICKER-OFFERED emoji is <= the cap. The picker enumerates
+        // `emojis::iter()` (the union of `Group::emojis()`), which yields the
+        // DEFAULT-skin-tone set only; its longest members are ~28-byte
+        // tag-sequence flags, so none exceed the 32-byte cap and the picker hides
+        // nothing on length grounds. This pins that invariant: lowering
+        // REACTION_CUSTOM_EMOJI_MAX_BYTES below the longest picker-offered emoji
+        // would start silently dropping valid picker emoji, failing here.
+        //
+        // NB: this does NOT claim the WHOLE table fits — non-default skin-tone ZWJ
+        // couples (~35 bytes, reachable via `emojis::get`/`Emoji::skin_tones` but
+        // NOT via `emojis::iter`) DO exceed the cap and are deliberately rejected;
+        // that fail-closed rejection is pinned by the next test.
+        let offenders: Vec<(&str, usize)> = emojis::iter()
+            .map(|e| (e.as_str(), e.as_str().len()))
+            .filter(|(_, len)| *len > REACTION_CUSTOM_EMOJI_MAX_BYTES)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these picker-offered emoji exceed the {REACTION_CUSTOM_EMOJI_MAX_BYTES}-byte cap and \
+             would be wrongly rejected: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn custom_emoji_rejects_over_byte_cap_including_real_skin_tone_emoji() {
+        // The byte cap is LIVE, load-bearing defense — not merely future-proofing.
+        // (1) An oversized multi-glyph string rejects (here the cap AND the
+        //     allowlist would each reject it):
+        let over_cap = "👍".repeat(20); // 80 bytes, well over the 32-byte cap
+        assert!(over_cap.len() > REACTION_CUSTOM_EMOJI_MAX_BYTES);
+        assert!(
+            !validate_custom_emoji(&over_cap),
+            "a string over the {REACTION_CUSTOM_EMOJI_MAX_BYTES}-byte cap must reject"
+        );
+
+        // (2) The cap INDEPENDENTLY rejects a REAL, single, valid emoji that
+        //     exceeds 32 bytes: the table's non-default skin-tone ZWJ couples
+        //     (~35 bytes), reachable via `Emoji::skin_tones()` (the picker never
+        //     surfaces them — it enumerates default skin tones only). `emojis::get`
+        //     ACCEPTS it, so this is the cap's mutation receipt: deleting the
+        //     `s.len() <= CAP` term would make `validate_custom_emoji` return true
+        //     for it and the final assert would fail.
+        let over_cap_emoji = emojis::iter()
+            .filter_map(|e| e.skin_tones())
+            .flatten()
+            .map(|e| e.as_str())
+            .find(|s| s.len() > REACTION_CUSTOM_EMOJI_MAX_BYTES)
+            .expect("the emojis table must contain a >32-byte skin-tone ZWJ variant");
+        assert!(
+            emojis::get(over_cap_emoji).is_some(),
+            "sanity: the located over-cap string is itself a real table entry (the allowlist alone accepts it)"
+        );
+        assert!(
+            !validate_custom_emoji(over_cap_emoji),
+            "a real >{REACTION_CUSTOM_EMOJI_MAX_BYTES}-byte skin-tone emoji must be rejected by the cap"
         );
     }
 }

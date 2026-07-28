@@ -59,6 +59,28 @@ The bot opens a headed Chrome window, joins the meeting as `alice`, and holds th
 
 Set `--ttl infinite` for a session that only ends on signal.
 
+### Clock video mode
+
+Pass `--video-mode clock` to publish a live 1280x720 wall clock as the
+bot's camera with a silent audio track. The default, `--video-mode costume`,
+and the accepted `file` alias preserve the existing manifest/override-backed
+fake-device behavior.
+
+```bash
+npm run bot -- run \
+  --meeting-url https://app.videocall.fnxlabs.com/meeting/TonyBots \
+  --users 6 \
+  --video-mode clock \
+  --headless
+```
+
+Clock mode currently applies only to locally launched bots. The SSH launch
+path does not forward `--video-mode`, so remote-launched bots ignore this
+option and use the default costume mode. Forwarding video mode through the SSH
+launcher is a possible future enhancement. Freeze/sync checks should use a
+tolerance rather than exact equality because capture, encode, transport, and
+decode add real jitter near second and color boundaries.
+
 ## Multi-bot mode (`--users N`)
 
 To fill a meeting around a human peer, pass `--users N` instead of `--participant <name>`. The bot picks the first N named participants from the manifest in order (alice, bob, carol, dave, eve, ...) and launches them concurrently in one Node process. All bots share the same `--ttl`, `--meeting-url`, and auth backend.
@@ -357,6 +379,7 @@ bots-app gen
 cd e2e
 npm run ci:lint               # eslint + prettier + tsc
 npm run test:unit             # vitest unit tests for bots-app/
+npx playwright test --config bots-app/src/playwright.clock.config.ts # real-Chromium clock advancement test
 ```
 
 ## Remote hosts (SSH) — v1

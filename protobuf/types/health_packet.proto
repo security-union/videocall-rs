@@ -419,6 +419,11 @@ message HealthPacket {
   // separate from audio_congestion_ceiling so a manual user cap is never
   // attributed to congestion in telemetry.
   optional uint32 active_audio_layers = 101; // (#1561)
+
+  optional uint64 unistream_bytes_offered_total = 102; // (#1737 Phase 0)
+  optional uint64 unistream_bytes_drained_total = 103; // (#1737 Phase 0)
+
+  optional uint64 unistream_stale_delta_drops_total = 104; // (#1737 Phase 1)
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

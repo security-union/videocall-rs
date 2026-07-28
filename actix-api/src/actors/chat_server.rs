@@ -21,7 +21,8 @@ use crate::{
         LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_RECOMPUTE_COALESCE_MS,
         LAYER_HINT_SUPPRESS_DEBOUNCE_MS, LAYER_PREFERENCE_MAX_ENTRIES,
         LAYER_PREFERENCE_MAX_LAYER_ID, LAYER_PREFERENCE_MIN_UPDATE_INTERVAL,
-        LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, PARTICIPANT_REBROADCAST_COALESCE_MS,
+        LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL,
+        LAYER_PREFERENCE_SESSIONS_SWEEP_ROOMS_PER_MESSAGE, PARTICIPANT_REBROADCAST_COALESCE_MS,
         RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL,
     },
     messages::{
@@ -45,7 +46,7 @@ use actix::{
 use actix::prelude::SendError;
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -828,18 +829,26 @@ struct RebroadcastPending {
     saw_other_requester: bool,
 }
 
-/// Periodic self-tick that refreshes the DEMAND-side simulcast gauge
-/// `relay_layer_preference_sessions{room, kind, layer_id}` (#1170 item 2).
+/// Bounded DEMAND-side simulcast gauge sweep command (#1170 item 2, #1284).
 ///
-/// Sent by the [`LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL`] `run_interval`
-/// armed in [`Actor::started`]. The handler is a READ-ONLY pass over the live
-/// rooms (`RwLock::read()` on each session's prefs, bounded by
-/// [`LAYER_HINT_MAX_RECEIVERS_SCANNED`] per room) that re-SETs every active
-/// room's gauge cells. It never takes a write lock and never mutates actor
-/// state, so it cannot block the forwarding hot path or starve the mailbox.
+/// [`StartCycle`](Self::StartCycle) is sent every
+/// [`LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL`]. Each handler turn refreshes at
+/// most [`LAYER_PREFERENCE_SESSIONS_SWEEP_ROOMS_PER_MESSAGE`] rooms, then appends
+/// one [`ContinueCycle`](Self::ContinueCycle) behind existing mailbox work until
+/// the round-robin cycle is complete. Per-room preference reads remain bounded by
+/// [`LAYER_HINT_MAX_RECEIVERS_SCANNED`].
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
-struct SweepLayerPreferenceGauge;
+enum SweepLayerPreferenceGauge {
+    StartCycle,
+    ContinueCycle,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LayerPreferenceSweepChunk {
+    rooms_processed: usize,
+    cycle_complete: bool,
+}
 
 /// Per-`(room, source, media_kind)` emit/debounce state for LAYER_HINT (#1108).
 ///
@@ -1075,6 +1084,36 @@ pub struct ChatServer {
     /// and host status. Used to send PARTICIPANT_JOINED for existing peers to
     /// new joiners and to determine host-leave behavior.
     room_members: HashMap<String, Vec<RoomMemberInfo>>,
+    /// Persistent round-robin index for the bounded room-metric sweep (#1284).
+    ///
+    /// `room_members` remains the authoritative store. This queue avoids an
+    /// O(rooms) key snapshot at the beginning of every sweep cycle. A room is
+    /// enqueued once when its first row is inserted and requeued after each
+    /// refresh while it remains live. Drained rooms are removed lazily when
+    /// their queued id reaches the front; [`layer_preference_sweep_queued`]
+    /// prevents drain/recreate races from adding duplicates.
+    layer_preference_sweep_rooms: VecDeque<String>,
+    /// Deduplication companion to [`layer_preference_sweep_rooms`]. A room stays
+    /// present while its queue entry is live, even if `room_members` temporarily
+    /// drains, so recreating it before the stale entry is visited reuses that
+    /// entry instead of growing the queue.
+    ///
+    /// NOTE: these two structures are cleaned LAZILY by the sweep (a drained
+    /// room is dropped when its queue entry reaches the front and `room_members`
+    /// no longer has it), NOT eagerly on teardown (`forget_session` /
+    /// `forget_room_if_empty` / `stopping`). Steady-state size is bounded by
+    /// (live rooms + rooms drained within ~1-2 cycles) and is fully reaped each
+    /// cycle, so this is self-healing, not a monotonic leak — under a high-churn
+    /// reconnection wave the transient size can briefly approach ~2x peak
+    /// concurrent rooms before the next cycle purges the dead entries. Metrics
+    /// series themselves are reaped on the normal teardown path
+    /// (`forget_room_metrics`), independent of this queue.
+    layer_preference_sweep_queued: HashSet<String>,
+    /// Entries left from the queue length captured at the current cycle's start.
+    /// Rooms created mid-cycle wait for the next 10-second cycle, preserving the
+    /// prior periodic snapshot semantics while bounded continuations add only the
+    /// cycle's mailbox scheduling time.
+    layer_preference_sweep_remaining: usize,
     /// Per-room policy flag cache. Refreshed by
     /// [`MEETING_SETTINGS_UPDATE_SUBJECT`] events so toggles like
     /// `end_on_host_leave` take effect mid-meeting without requiring a host
@@ -1140,9 +1179,10 @@ pub struct ChatServer {
     ///
     /// Absent or empty = fail-open (forward all layers). Like
     /// `session_desired_streams` this is a **subtract-only** filter layered
-    /// AFTER JWT/observer authorization; it never grants access. The actor never
-    /// *reads* this map; the map exists purely to own the shared handle and
-    /// bound its lifetime (entries are removed on `leave_rooms`/`forget_session`).
+    /// AFTER JWT/observer authorization; it never grants access. The actor reads
+    /// the handles for LAYER_HINT union recomputes and the periodic demand-gauge
+    /// sweep; the spawned NATS task reads the same shared state on the forwarding
+    /// path. Entries are removed on `leave_rooms`/`forget_session`.
     session_layer_prefs: HashMap<SessionId, LayerPrefs>,
     /// Reverse index: `SessionId` → `room_id`. Enables O(1) room lookup in
     /// paths like `RebroadcastPresence` instead of scanning all rooms.
@@ -1248,6 +1288,9 @@ impl ChatServer {
             session_manager: SessionManager::new(),
             connection_states: HashMap::new(),
             room_members: HashMap::new(),
+            layer_preference_sweep_rooms: VecDeque::new(),
+            layer_preference_sweep_queued: HashSet::new(),
+            layer_preference_sweep_remaining: 0,
             room_policy: HashMap::new(),
             pending_departures: HashMap::new(),
             suppress_join_broadcast: std::collections::HashSet::new(),
@@ -2215,88 +2258,134 @@ impl ChatServer {
         }
     }
 
-    /// Refresh the DEMAND-side gauge `relay_layer_preference_sessions{room, kind,
-    /// layer_id}` for every live room (#1170 item 2).
+    /// Add a live room to the persistent round-robin sweep index (#1284).
     ///
-    /// READ-ONLY: takes each session's `LayerPrefs` read lock and never a write
-    /// lock; mutates no actor state. Cost is O(rooms × min(sessions, 256)) —
-    /// per-room session scans are bounded by [`LAYER_HINT_MAX_RECEIVERS_SCANNED`]
-    /// exactly as the union scan is, so a pathological room cannot stall the
-    /// actor. For each active room it SETs all
-    /// `LAYER_PREFERENCE_GAUGE_KINDS.len() × RELAY_LAYER_ID_BUCKETS.len()` cells
-    /// (explicit zeros included) so a bucket whose demand vanished reads `0`
-    /// rather than a stale count. Drained rooms are not iterated here (they are
-    /// gone from `room_members`); their series are removed by
-    /// [`crate::metrics::forget_room_metrics`] at drain time.
-    fn sweep_layer_preference_gauge(&self) {
-        for (room, members) in &self.room_members {
-            // #1202: SET the cross-instance divergence gauge = count of mirrored
-            // remote-origin rows in this room. >0 means this room is split across
-            // the ws/wt relay binaries. SET (not inc) per live room each sweep so
-            // a room that lost its remote rows reads 0; drained rooms stop being
-            // iterated and their series is removed by `forget_room_metrics`.
-            //
-            // Gated on the master switch so that with the mirror OFF (the default)
-            // this emits NO new series at all — keeping "default OFF == today's
-            // behavior" byte-for-byte. When OFF no Remote row can ever exist, so
-            // the gauge would only ever read 0 anyway; skipping the SET avoids one
-            // always-zero series per room on the disabled path.
-            if self.membership_mirror_enabled {
-                crate::metrics::RELAY_ROOM_MEMBERSHIP_DIVERGENCE
-                    .with_label_values(&[room])
-                    .set(
-                        members
-                            .iter()
-                            .filter(|m| m.origin == MemberOrigin::Remote)
-                            .count() as f64,
-                    );
+    /// Call this immediately before every production `room_members.entry()`
+    /// insertion. The set deliberately retains a drained room until its queued
+    /// entry is visited, making drain→recreate idempotent without an O(queue)
+    /// removal scan.
+    fn track_room_for_layer_preference_sweep(&mut self, room: &str) {
+        if self.layer_preference_sweep_queued.insert(room.to_string()) {
+            self.layer_preference_sweep_rooms
+                .push_back(room.to_string());
+        }
+    }
+
+    /// Capture the number of currently indexed rooms for one periodic cycle.
+    /// Returns `false` when a prior cycle is still draining or there is no work.
+    fn start_layer_preference_gauge_sweep(&mut self) -> bool {
+        if self.layer_preference_sweep_remaining != 0 {
+            return false;
+        }
+        self.layer_preference_sweep_remaining = self.layer_preference_sweep_rooms.len();
+        self.layer_preference_sweep_remaining != 0
+    }
+
+    /// Refresh one bounded chunk of the current round-robin cycle (#1284).
+    ///
+    /// Each invocation touches at most
+    /// [`LAYER_PREFERENCE_SESSIONS_SWEEP_ROOMS_PER_MESSAGE`] room entries. Live
+    /// rooms rotate to the back; drained rooms leave the queue and dedup set.
+    /// Rooms inserted after the cycle started remain queued for the next cycle.
+    fn sweep_layer_preference_gauge_chunk(&mut self) -> LayerPreferenceSweepChunk {
+        let rooms_to_process = self
+            .layer_preference_sweep_remaining
+            .min(LAYER_PREFERENCE_SESSIONS_SWEEP_ROOMS_PER_MESSAGE);
+
+        for _ in 0..rooms_to_process {
+            let room = self
+                .layer_preference_sweep_rooms
+                .pop_front()
+                .expect("sweep remaining never exceeds the indexed room queue");
+            self.layer_preference_sweep_remaining -= 1;
+
+            if let Some(members) = self.room_members.get(&room) {
+                self.refresh_layer_preference_gauge_for_room(&room, members);
+                self.layer_preference_sweep_rooms.push_back(room);
+            } else {
+                self.layer_preference_sweep_queued.remove(&room);
             }
+        }
 
-            // Tally counts: [kind_idx][bucket_idx]. Indexed parallel to
-            // LAYER_PREFERENCE_GAUGE_KINDS and RELAY_LAYER_ID_BUCKETS.
-            let mut counts =
-                [[0u64; RELAY_LAYER_ID_BUCKETS.len()]; LAYER_PREFERENCE_GAUGE_KINDS.len()];
+        debug_assert_eq!(
+            self.layer_preference_sweep_rooms.len(),
+            self.layer_preference_sweep_queued.len(),
+            "the room sweep queue and dedup index must remain in lockstep"
+        );
 
-            for member in members.iter().take(LAYER_HINT_MAX_RECEIVERS_SCANNED) {
-                let Some(prefs) = self.session_layer_prefs.get(&member.session) else {
-                    // No prefs handle for this session at all = fail-open
-                    // (expressed no demand) → contributes nothing, like an empty
-                    // map. Matches the union scan's `None` arm.
-                    continue;
-                };
-                // Lock-free short-circuit: an empty prefs map (no LAYER_PREFERENCE
-                // recorded yet) expresses no demand for any kind, so skip the read
-                // lock entirely — keeps the simulcast-off / no-prefs case free.
-                if !prefs.has_any() {
-                    continue;
-                }
-                // Poisoned lock = fail-open (uncounted), mirroring the forward
-                // filter's `unwrap_or`.
-                let Ok(guard) = prefs.state.read() else {
-                    continue;
-                };
-                let buckets = classify_session_max_layer_buckets(&guard.layers);
-                drop(guard);
-                for (kind_idx, bucket) in buckets.iter().enumerate() {
-                    // `None` = no preference for this kind = fail-open, not counted.
-                    if let Some(bucket) = bucket {
-                        let bucket_idx = RELAY_LAYER_ID_BUCKETS
-                            .iter()
-                            .position(|b| b == bucket)
-                            .expect("layer_id_bucket only returns RELAY_LAYER_ID_BUCKETS values");
-                        counts[kind_idx][bucket_idx] += 1;
-                    }
+        LayerPreferenceSweepChunk {
+            rooms_processed: rooms_to_process,
+            cycle_complete: self.layer_preference_sweep_remaining == 0,
+        }
+    }
+
+    /// Refresh all bounded gauge cells for one live room (#1170, #1202).
+    fn refresh_layer_preference_gauge_for_room(&self, room: &str, members: &[RoomMemberInfo]) {
+        // #1202: SET the cross-instance divergence gauge = count of mirrored
+        // remote-origin rows in this room. >0 means this room is split across
+        // the ws/wt relay binaries. SET (not inc) per live room each sweep so
+        // a room that lost its remote rows reads 0; drained rooms stop being
+        // iterated and their series is removed by `forget_room_metrics`.
+        //
+        // Gated on the master switch so that with the mirror OFF (the default)
+        // this emits NO new series at all — keeping "default OFF == today's
+        // behavior" byte-for-byte. When OFF no Remote row can ever exist, so
+        // the gauge would only ever read 0 anyway; skipping the SET avoids one
+        // always-zero series per room on the disabled path.
+        if self.membership_mirror_enabled {
+            crate::metrics::RELAY_ROOM_MEMBERSHIP_DIVERGENCE
+                .with_label_values(&[room])
+                .set(
+                    members
+                        .iter()
+                        .filter(|m| m.origin == MemberOrigin::Remote)
+                        .count() as f64,
+                );
+        }
+
+        // Tally counts: [kind_idx][bucket_idx]. Indexed parallel to
+        // LAYER_PREFERENCE_GAUGE_KINDS and RELAY_LAYER_ID_BUCKETS.
+        let mut counts = [[0u64; RELAY_LAYER_ID_BUCKETS.len()]; LAYER_PREFERENCE_GAUGE_KINDS.len()];
+
+        for member in members.iter().take(LAYER_HINT_MAX_RECEIVERS_SCANNED) {
+            let Some(prefs) = self.session_layer_prefs.get(&member.session) else {
+                // No prefs handle for this session at all = fail-open
+                // (expressed no demand) → contributes nothing, like an empty
+                // map. Matches the union scan's `None` arm.
+                continue;
+            };
+            // Lock-free short-circuit: an empty prefs map (no LAYER_PREFERENCE
+            // recorded yet) expresses no demand for any kind, so skip the read
+            // lock entirely — keeps the simulcast-off / no-prefs case free.
+            if !prefs.has_any() {
+                continue;
+            }
+            // Poisoned lock = fail-open (uncounted), mirroring the forward
+            // filter's `unwrap_or`.
+            let Ok(guard) = prefs.state.read() else {
+                continue;
+            };
+            let buckets = classify_session_max_layer_buckets(&guard.layers);
+            drop(guard);
+            for (kind_idx, bucket) in buckets.iter().enumerate() {
+                // `None` = no preference for this kind = fail-open, not counted.
+                if let Some(bucket) = bucket {
+                    let bucket_idx = RELAY_LAYER_ID_BUCKETS
+                        .iter()
+                        .position(|b| b == bucket)
+                        .expect("layer_id_bucket only returns RELAY_LAYER_ID_BUCKETS values");
+                    counts[kind_idx][bucket_idx] += 1;
                 }
             }
+        }
 
-            // SET every cell for this active room, including zeros, so a bucket
-            // that lost all demand since the last sweep reads 0 not a stale value.
-            for (kind_idx, (_, kind_label)) in LAYER_PREFERENCE_GAUGE_KINDS.iter().enumerate() {
-                for (bucket_idx, bucket_label) in RELAY_LAYER_ID_BUCKETS.iter().enumerate() {
-                    RELAY_LAYER_PREFERENCE_SESSIONS
-                        .with_label_values(&[room, kind_label, bucket_label])
-                        .set(counts[kind_idx][bucket_idx] as f64);
-                }
+        // SET every cell for this active room, including zeros, so a bucket
+        // that lost all demand since the last sweep reads 0 not a stale value.
+        for (kind_idx, (_, kind_label)) in LAYER_PREFERENCE_GAUGE_KINDS.iter().enumerate() {
+            for (bucket_idx, bucket_label) in RELAY_LAYER_ID_BUCKETS.iter().enumerate() {
+                RELAY_LAYER_PREFERENCE_SESSIONS
+                    .with_label_values(&[room, kind_label, bucket_label])
+                    .set(counts[kind_idx][bucket_idx] as f64);
             }
         }
     }
@@ -2426,16 +2515,13 @@ impl Actor for ChatServer {
             }
         });
 
-        // Arm the periodic DEMAND-side gauge sweep (#1170 item 2). `run_interval`
-        // invokes the closure inside the actor with `&mut self` access, so the
-        // sweep runs on the actor thread and reads `room_members` /
-        // `session_layer_prefs` directly — no cross-thread snapshot needed. We
-        // delegate to a `do_send` of `SweepLayerPreferenceGauge` (rather than
-        // inlining) so the sweep body lives in one Handler that is reachable from
-        // tests and keeps each tick a discrete, short mailbox message rather than
-        // work spliced into the timer driver.
+        // Arm the periodic DEMAND-side gauge cycle (#1170 item 2, #1284). The
+        // start command captures the O(1) queue length; the handler processes a
+        // bounded room chunk and appends continuation commands behind existing
+        // mailbox work until that cycle converges. No O(rooms) key snapshot or
+        // single actor turn remains.
         ctx.run_interval(LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, |_act, ctx| {
-            ctx.address().do_send(SweepLayerPreferenceGauge);
+            ctx.address().do_send(SweepLayerPreferenceGauge::StartCycle);
         });
     }
 
@@ -3048,6 +3134,7 @@ impl Handler<TestSeedActiveMember> for ChatServer {
 
     fn handle(&mut self, msg: TestSeedActiveMember, _ctx: &mut Self::Context) -> Self::Result {
         self.session_room.insert(msg.session, msg.room.clone());
+        self.track_room_for_layer_preference_sweep(&msg.room);
         self.room_members
             .entry(msg.room)
             .or_default()
@@ -3288,6 +3375,7 @@ impl Handler<MirrorRemoteMembership> for ChatServer {
                 // has had its `room_members` entry removed by the local_is_empty
                 // GC, so a remote JOIN must be able to RE-CREATE the entry (the
                 // GC consequence in the design brief).
+                self.track_room_for_layer_preference_sweep(&msg.room);
                 self.room_members
                     .entry(msg.room.clone())
                     .or_default()
@@ -3307,10 +3395,40 @@ impl Handler<MirrorRemoteMembership> for ChatServer {
                 // Remove ONLY a Remote row for this session — NEVER a Local row.
                 // This makes a spoofed/mis-ordered LEFT for a still-local session
                 // (LEFT-before-JOIN, or a duplicate of our own broadcast) inert.
+                // Track whether a Remote row was ACTUALLY removed so the #1852 reap
+                // below stays inert on that same spurious-LEFT path.
+                let mut removed_remote_row = false;
                 if let Some(members) = self.room_members.get_mut(&msg.room) {
+                    let before = members.len();
                     members.retain(|m| {
                         !(m.session == msg.session && m.origin == MemberOrigin::Remote)
                     });
+                    removed_remote_row = members.len() != before;
+                }
+                // #1852: reap the departed remote session's per-SOURCE layer-hint
+                // debounce state + any armed suppress-lazy re-check timer, MIRRORING
+                // what `leave_rooms` / `forget_session` do for a departing LOCAL
+                // session. When the mirror is ON a remote row is a real receiver-union
+                // participant AND a hintable publisher (`max_requested_layer` /
+                // `recompute_layer_hints_for_source` count it), so a remote publisher
+                // can accumulate a `layer_hint_state[(room, remote_session, kind)]`
+                // entry and a `layer_hint_recheck_handles` timer keyed by that session.
+                // Removing only the `room_members` row (above) left both maps to grow
+                // for the process lifetime. Session ids are globally-unique 64-bit
+                // randoms so a stale entry is never re-matched (no correctness impact),
+                // but it must still be reaped — same teardown contract as a local leave.
+                //
+                // GATED on `removed_remote_row`: a spurious/mis-ordered LEFT for a
+                // still-LOCAL session (the inert case guarded above) must NOT reap —
+                // the reap is source-keyed and would otherwise delete a LIVE local
+                // publisher's `layer_hint_state` and cancel its in-flight suppress
+                // re-check timer, resetting/delaying that local publisher's LAYER_HINT
+                // debounce even though no Remote row was removed. A LEFT that removed
+                // nothing (already-reaped duplicate, or local-session target) has
+                // nothing legitimate to reap: hint state for a remote source only
+                // exists while its Remote row exists.
+                if removed_remote_row {
+                    self.forget_layer_hint_state_for_source(&msg.room, msg.session, ctx);
                 }
                 self.schedule_coalesced_recompute(&msg.room, ctx);
                 // GC an empty remote-only room (local_is_empty-keyed): without this
@@ -3355,12 +3473,21 @@ impl Handler<FlushPendingRecomputes> for ChatServer {
 impl Handler<SweepLayerPreferenceGauge> for ChatServer {
     type Result = ();
 
-    fn handle(
-        &mut self,
-        _msg: SweepLayerPreferenceGauge,
-        _ctx: &mut Self::Context,
-    ) -> Self::Result {
-        self.sweep_layer_preference_gauge();
+    fn handle(&mut self, msg: SweepLayerPreferenceGauge, ctx: &mut Self::Context) -> Self::Result {
+        if matches!(msg, SweepLayerPreferenceGauge::StartCycle)
+            && !self.start_layer_preference_gauge_sweep()
+        {
+            return;
+        }
+
+        let chunk = self.sweep_layer_preference_gauge_chunk();
+        if !chunk.cycle_complete {
+            // Append behind work already waiting in the mailbox. This is the
+            // fairness boundary: even a several-thousand-room cycle cannot turn
+            // into one long head-of-line actor call.
+            ctx.address()
+                .do_send(SweepLayerPreferenceGauge::ContinueCycle);
+        }
     }
 }
 
@@ -4067,6 +4194,7 @@ impl Handler<JoinRoom> for ChatServer {
         // Track this session in room_members (only for non-observers)
         if !observer {
             self.session_room.insert(session, room.clone());
+            self.track_room_for_layer_preference_sweep(&room);
             self.room_members
                 .entry(room.clone())
                 .or_default()
@@ -5289,6 +5417,66 @@ impl DownlinkRelayState {
     }
 }
 
+/// Priority-ordered classifier for the #1219 receiver-downlink emergency shed
+/// (issue 1977).
+///
+/// Decides whether ONE forwarded media packet is a candidate to be dropped by
+/// the emergency shed while the receiver is congested (`congested_now`). It is
+/// the SINGLE source of truth for that decision: the per-packet fan-out closure
+/// calls it, and the unit test pins it against the same function — so the
+/// production path and the test can never diverge. (Before issue 1977 the test
+/// re-implemented the predicate inline and would have passed even if production
+/// drifted.)
+///
+/// ## The issue-1977 priority ordering
+///
+/// When a screen share is active, congestion shedding must sacrifice streams in
+/// this order (first sacrificed → last protected):
+///   4. other participants' cameras
+///   3. the sharer's own camera
+///   2. the screen share
+///   1. audio
+///
+/// This classifier delivers priorities 1, 2 and 4 at the emergency-shed gate:
+///   * **AUDIO** (priority 1) is NEVER a shed candidate — audio loss is worse
+///     than any video-quality loss. An AUDIO `media_kind` is not `VIDEO`, so it
+///     returns `false`.
+///   * **SCREEN** (priority 2) is NEVER shed here — when someone is presenting,
+///     the shared content is the meeting. The relay protects every screen layer
+///     and lets the receiver's own layer chooser (the graceful, damped path in
+///     `layer_chooser.rs`, enforced UPSTREAM by the #989 layer filter) reduce
+///     screen ONLY if this receiver's downlink genuinely cannot carry it. Before
+///     issue 1977 SCREEN was shed here with the SAME priority as camera VIDEO,
+///     which is exactly why field observers saw peer camera tiles stay sharp
+///     while the shared content froze/pixelated (discussion 1960).
+///   * **Camera VIDEO** (priority 4) IS shed first: only its NON-BASE simulcast
+///     layers (`simulcast_layer_id != 0`) are dropped, collapsing every camera to
+///     its base layer to free downlink headroom for audio and screen. The base
+///     layer is always kept, so no camera goes fully black.
+///
+/// Priority 3 (protecting the SHARER's own camera above OTHER cameras) is NOT
+/// distinguished at this gate: doing so would require the relay to know, per
+/// forwarded packet, whether the packet's source is currently screen-sharing —
+/// per-room "is sharing" state derived from traffic and read on the hottest
+/// fan-out path. That cost is not justified here (issue 1977). The sharer's own
+/// camera is instead already de-prioritized AT THE SOURCE: while sharing, the
+/// sharer's AQ caps its camera to the "low" tier (`videocall-aq`'s
+/// `notify_screen_sharing` → `screen_share_camera_ceiling_index`), so it already
+/// consumes less than a full-quality peer camera.
+///
+/// `media_kind` is `PacketWrapper.media_kind.enum_value()` — the OUTER cleartext
+/// kind, readable even under E2EE — so this shed is E2EE-safe, unlike the
+/// inner-`MediaType` priority-drop at the transport actors.
+fn downlink_shed_candidate(
+    media_kind: Result<videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind, i32>,
+    simulcast_layer_id: u32,
+) -> bool {
+    use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+    // Camera VIDEO (priority 4) is shed first; SCREEN (priority 2) and AUDIO
+    // (priority 1) are protected. Base layer (0) is always kept.
+    matches!(media_kind, Ok(MediaKind::VIDEO)) && simulcast_layer_id != 0
+}
+
 /// Server-authoritative packet filter for observer (waiting-room) sessions.
 ///
 /// # Enforcement Model
@@ -5980,29 +6168,27 @@ fn handle_msg(
             }
         }
 
-        // While congested, discard non-base-layer VIDEO/SCREEN BEFORE reaching
+        // While congested, discard non-base-layer camera VIDEO BEFORE reaching
         // try_send. This reduces volume, giving the slow downlink headroom to
-        // drain. AUDIO is NEVER shed (audio loss is worse than video quality
-        // loss). Control packets are NEVER shed. Base layer (layer 0) is NEVER
-        // shed.
+        // drain. Per the issue-1977 ordering (audio > screen > sharer camera >
+        // other cameras), SCREEN is NEVER shed here (priority 2 — the shared
+        // content is protected; the receiver's own layer chooser reduces it if
+        // truly unsustainable), AUDIO is NEVER shed (priority 1), Control packets
+        // are NEVER shed, and base layer (layer 0) is NEVER shed. Only non-base
+        // camera VIDEO (priority 4) is shed here. See `downlink_shed_candidate`.
         //
         // This runs AFTER the viewport and layer filters above — a packet that
         // reaches here has already survived those gates, so shedding it is a
         // FURTHER reduction beyond what the receiver's own preferences chose.
         if congested_now {
             if let Some(pw) = parsed {
-                use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
                 let media_kind = pw.media_kind.enum_value();
-                let is_shed_candidate =
-                    matches!(media_kind, Ok(MediaKind::VIDEO) | Ok(MediaKind::SCREEN))
-                        && pw.simulcast_layer_id != 0;
-
-                if is_shed_candidate {
+                if downlink_shed_candidate(media_kind, pw.simulcast_layer_id) {
                     RELAY_DOWNLINK_SHED_TOTAL
                         .with_label_values(&[&transport])
                         .inc();
                     debug!(
-                        "Downlink shed: dropping layer {} {:?} for congested receiver session {} in room {}",
+                        "Downlink shed: dropping layer {} {:?} camera VIDEO for congested receiver session {} in room {} (issue 1977: SCREEN protected)",
                         pw.simulcast_layer_id, media_kind, session, room
                     );
                     return Ok(());
@@ -6287,31 +6473,57 @@ mod downlink_relay_state_tests {
     }
 
     #[test]
-    fn shed_candidate_classification_pins_base_layer_and_audio_exemptions() {
-        // This is the policy the closure applies when `congested_now` is true:
-        // only non-base-layer VIDEO/SCREEN is shed. Encoded here against the
-        // same predicate so a future edit to either must update both.
+    fn shed_candidate_classification_pins_1977_priority_ordering() {
+        // Exercises the SAME production predicate the fan-out closure applies
+        // when `congested_now` is true — `super::downlink_shed_candidate`, NOT a
+        // re-implemented copy — so mutating the production ordering breaks this
+        // test (issue 1977).
+        use super::downlink_shed_candidate;
         use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
-        let is_shed_candidate = |kind: MediaKind, layer: u32| -> bool {
-            matches!(kind, MediaKind::VIDEO | MediaKind::SCREEN) && layer != 0
-        };
-        assert!(is_shed_candidate(MediaKind::VIDEO, 1));
-        assert!(is_shed_candidate(MediaKind::SCREEN, 2));
+
+        // Priority 4: camera VIDEO is shed first — its non-base layers drop.
         assert!(
-            !is_shed_candidate(MediaKind::VIDEO, 0),
-            "base layer is kept"
+            downlink_shed_candidate(Ok(MediaKind::VIDEO), 1),
+            "non-base camera VIDEO is the first thing shed (priority 4)"
+        );
+        assert!(downlink_shed_candidate(Ok(MediaKind::VIDEO), 2));
+
+        // Priority 2: SCREEN is NEVER shed at this gate. This is the crux of
+        // issue 1977 — it FAILS on the pre-1977 code, where SCREEN shared the
+        // camera shed band.
+        assert!(
+            !downlink_shed_candidate(Ok(MediaKind::SCREEN), 1),
+            "SCREEN must be protected during downlink congestion (issue 1977, priority 2)"
         );
         assert!(
-            !is_shed_candidate(MediaKind::SCREEN, 0),
-            "base layer is kept"
+            !downlink_shed_candidate(Ok(MediaKind::SCREEN), 2),
+            "SCREEN is protected at every non-base layer (issue 1977, priority 2)"
+        );
+
+        // Priority 1: AUDIO is never shed.
+        assert!(
+            !downlink_shed_candidate(Ok(MediaKind::AUDIO), 1),
+            "audio is never shed (priority 1)"
+        );
+
+        // Base layer (0) is always kept — no stream goes fully black.
+        assert!(
+            !downlink_shed_candidate(Ok(MediaKind::VIDEO), 0),
+            "camera VIDEO base layer is kept"
         );
         assert!(
-            !is_shed_candidate(MediaKind::AUDIO, 1),
-            "audio is never shed"
+            !downlink_shed_candidate(Ok(MediaKind::SCREEN), 0),
+            "SCREEN base layer is kept"
         );
+
+        // Unspecified / unknown outer kind is never shed (fail-open).
         assert!(
-            !is_shed_candidate(MediaKind::MEDIA_KIND_UNSPECIFIED, 1),
+            !downlink_shed_candidate(Ok(MediaKind::MEDIA_KIND_UNSPECIFIED), 1),
             "unspecified/control is never shed"
+        );
+        assert!(
+            !downlink_shed_candidate(Err(999), 1),
+            "an unknown outer media_kind is never shed (fail-open)"
         );
     }
 
@@ -10024,6 +10236,41 @@ mod tests {
         kind: i32,
     }
 
+    /// #1852: report the number of live per-`(room, source, kind)` entries in the
+    /// two LAYER_HINT maps that are keyed by SOURCE publisher —
+    /// [`ChatServer::layer_hint_state`] and [`ChatServer::layer_hint_recheck_handles`]
+    /// — for a given `(room, source)` across all media kinds. Reads the REAL private
+    /// fields the teardown path reaps, so a test can assert both maps are emptied for
+    /// a departed source WITHOUT reaching into private state from outside the module.
+    #[derive(ActixMessage)]
+    #[rtype(result = "(usize, usize)")]
+    struct TestLayerHintEntryCounts {
+        room: String,
+        source: SessionId,
+    }
+
+    impl Handler<TestLayerHintEntryCounts> for ChatServer {
+        type Result = MessageResult<TestLayerHintEntryCounts>;
+
+        fn handle(
+            &mut self,
+            msg: TestLayerHintEntryCounts,
+            _ctx: &mut Self::Context,
+        ) -> Self::Result {
+            let state = self
+                .layer_hint_state
+                .keys()
+                .filter(|(r, s, _kind)| *r == msg.room && *s == msg.source)
+                .count();
+            let handles = self
+                .layer_hint_recheck_handles
+                .keys()
+                .filter(|(r, s, _kind)| *r == msg.room && *s == msg.source)
+                .count();
+            MessageResult((state, handles))
+        }
+    }
+
     impl Handler<TestMaxRequestedLayer> for ChatServer {
         type Result = MessageResult<TestMaxRequestedLayer>;
 
@@ -12046,6 +12293,246 @@ mod tests {
             l_row.expect("L row present").origin,
             MemberOrigin::Local,
             "L's row must remain origin == Local"
+        );
+    }
+
+    /// #1852 — a mirrored Remote row's LEFT must REAP the per-SOURCE LAYER_HINT
+    /// state keyed by that remote session, not just remove the `room_members` row.
+    ///
+    /// With the mirror ON a remote row is a real union participant AND a hintable
+    /// publisher, so a remote publisher R with a LOCAL receiver L that has recorded
+    /// a downgrade preference against R accumulates an entry in BOTH source-keyed
+    /// maps: `layer_hint_state[(room, R, kind)]` and an armed re-check timer in
+    /// `layer_hint_recheck_handles[(room, R, kind)]`. Before this fix `MirrorEvent::Left`
+    /// removed only the `room_members` row, leaking both entries for the process
+    /// lifetime. This asserts the entries EXIST after the downgrade (the leak
+    /// precondition) and are GONE after LEFT — exactly the `leave_rooms` /
+    /// `forget_session` teardown contract, now mirrored on the remote-leave path.
+    ///
+    /// MUTATION PROOF: comment out the new
+    /// `self.forget_layer_hint_state_for_source(&msg.room, msg.session, ctx)` call in
+    /// the `MirrorEvent::Left` arm and the post-LEFT assert trips — both maps still
+    /// hold the `(room, R, video)` entry (counts stay `(1, 1)` instead of `(0, 0)`),
+    /// because removing the `room_members` row alone never touches the two
+    /// source-keyed hint maps. (Verified by reverting locally: the post-LEFT assert
+    /// fails with `left == (1, 1)`.)
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1852_mirror_left_reaps_source_keyed_layer_hint_state() {
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "test-1852-mirror-left-reap".to_string();
+        let r: SessionId = 5701; // REMOTE publisher (other relay binary), the leak key
+        let l: SessionId = 5702; // LOCAL receiver constraining R's video down
+        const VIDEO_KIND: i32 = 1; // a real LAYER_HINT_MEDIA_KIND
+
+        // The mirror path (`MirrorRemoteMembership` handler + remote rows counting
+        // in the union / recompute) is only reachable when the flag is ON. Use the
+        // deterministic field-setter seam (NOT the racy env var) exactly like the
+        // sibling mirror tests.
+        chat.send(TestSetMembershipMirrorEnabled(true))
+            .await
+            .expect("set flag");
+
+        // Seed the LOCAL receiver L as a real Active member so its recorded
+        // preference contributes to R's receiver union.
+        chat.send(TestSeedActiveMember {
+            session: l,
+            room: room.clone(),
+            user_id: "l@example.com".to_string(),
+            display_name: "L".to_string(),
+        })
+        .await
+        .expect("seed L");
+
+        // Inject the REMOTE publisher R via the PRODUCTION mirror JOIN handler.
+        chat.send(MirrorRemoteMembership {
+            room: room.clone(),
+            session: r,
+            user_id: "r@example.com".to_string(),
+            display_name: "R".to_string(),
+            event: MirrorEvent::Join,
+        })
+        .await
+        .expect("mirror JOIN R");
+
+        // L asks for a lower layer (0) of R's VIDEO. This records L's downgrade
+        // preference AND runs the REAL `recompute_layer_hints_for_source(R)`: the
+        // union (0) drops below the sentinel last-emitted, so the `ScheduleRecheck`
+        // arm inserts `layer_hint_state[(room, R, video)]` AND arms a re-check timer
+        // in `layer_hint_recheck_handles[(room, R, video)]`. The seam returns the
+        // armed-timer count for (room, R), proving the timer map entry exists.
+        let armed = chat
+            .send(TestSeedPrefAndRecompute {
+                room: room.clone(),
+                receiver: l,
+                source: r,
+                kind: VIDEO_KIND,
+                desired: Some(0),
+            })
+            .await
+            .expect("seed downgrade for R");
+        assert_eq!(
+            armed, 1,
+            "a downgrade of R's video must arm exactly ONE re-check timer keyed by \
+             the remote source R (the timer half of the leak)"
+        );
+
+        // LEAK PRECONDITION: both source-keyed maps hold an entry for the remote R.
+        let before = chat
+            .send(TestLayerHintEntryCounts {
+                room: room.clone(),
+                source: r,
+            })
+            .await
+            .expect("counts before LEFT");
+        assert_eq!(
+            before,
+            (1, 1),
+            "before LEFT: both `layer_hint_state` and `layer_hint_recheck_handles` \
+             must hold exactly one (room, R, video) entry keyed by the remote source"
+        );
+
+        // Fire the remote LEFT for R.
+        chat.send(MirrorRemoteMembership {
+            room: room.clone(),
+            session: r,
+            user_id: "r@example.com".to_string(),
+            display_name: "R".to_string(),
+            event: MirrorEvent::Left,
+        })
+        .await
+        .expect("mirror LEFT R");
+
+        // CORE ASSERT: the LEFT handler must have reaped BOTH source-keyed maps for
+        // R — mirroring `leave_rooms` / `forget_session`. Read immediately (the
+        // coalesced room-wide recompute is a deferred 300ms timer and, even if it
+        // fired, R is no longer a member so it would not re-touch R's entries).
+        let after = chat
+            .send(TestLayerHintEntryCounts {
+                room: room.clone(),
+                source: r,
+            })
+            .await
+            .expect("counts after LEFT");
+        assert_eq!(
+            after,
+            (0, 0),
+            "after LEFT: MirrorEvent::Left must reap the departed remote source's \
+             `layer_hint_state` AND `layer_hint_recheck_handles` entries (#1852) — \
+             removing the room_members row alone leaves both maps growing for the \
+             process lifetime"
+        );
+    }
+
+    /// #1852 (spurious-LEFT safety) — a mirror LEFT that removes NO Remote row must
+    /// NOT reap source-keyed LAYER_HINT state. The reap is gated on an actual Remote
+    /// row removal precisely so a spoofed / mis-ordered / duplicate LEFT naming a
+    /// still-LOCAL publisher (the case `MirrorEvent::Left` documents as inert) cannot
+    /// delete that LIVE local publisher's `layer_hint_state` or cancel its in-flight
+    /// suppress re-check timer — which would reset/delay its LAYER_HINT debounce even
+    /// though nothing was removed from `room_members`.
+    ///
+    /// Setup mirrors the reap test but the source under LEFT is a LOCAL publisher P:
+    /// a local receiver Q downgrades P's video, arming both source-keyed maps for P.
+    /// A remote LEFT for P is inert on the row (P is Local, `retain` removes nothing),
+    /// so `removed_remote_row` is false and the reap must be skipped — P's entries
+    /// survive.
+    ///
+    /// MUTATION PROOF: drop the `if removed_remote_row {` guard around the
+    /// `forget_layer_hint_state_for_source` call in the `MirrorEvent::Left` arm and
+    /// the post-LEFT assert trips — the unconditional reap deletes P's live entries,
+    /// so the counts fall to `(0, 0)` instead of holding at `(1, 1)`.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1852_spurious_left_for_local_source_does_not_reap_hint_state() {
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "test-1852-spurious-left-local".to_string();
+        let p: SessionId = 5801; // LOCAL publisher — the (mis-)target of a remote LEFT
+        let q: SessionId = 5802; // LOCAL receiver constraining P's video down
+        const VIDEO_KIND: i32 = 1;
+
+        chat.send(TestSetMembershipMirrorEnabled(true))
+            .await
+            .expect("set flag");
+
+        // Seed P and Q as real LOCAL Active members. P is a local publisher; a remote
+        // LEFT for P is therefore spurious and must be inert.
+        for (session, tag) in [(p, "p@example.com"), (q, "q@example.com")] {
+            chat.send(TestSeedActiveMember {
+                session,
+                room: room.clone(),
+                user_id: tag.to_string(),
+                display_name: tag.to_string(),
+            })
+            .await
+            .expect("seed local member");
+        }
+
+        // Q downgrades P's video → arms both source-keyed maps for the LOCAL source P.
+        let armed = chat
+            .send(TestSeedPrefAndRecompute {
+                room: room.clone(),
+                receiver: q,
+                source: p,
+                kind: VIDEO_KIND,
+                desired: Some(0),
+            })
+            .await
+            .expect("seed downgrade for P");
+        assert_eq!(
+            armed, 1,
+            "a downgrade of P's video must arm exactly ONE re-check timer keyed by \
+             the local source P"
+        );
+        let before = chat
+            .send(TestLayerHintEntryCounts {
+                room: room.clone(),
+                source: p,
+            })
+            .await
+            .expect("counts before spurious LEFT");
+        assert_eq!(
+            before,
+            (1, 1),
+            "before LEFT: both source-keyed maps must hold one (room, P, video) entry"
+        );
+
+        // Spurious remote LEFT for the LOCAL session P: `retain` removes no Remote row
+        // (P is origin == Local), so `removed_remote_row` is false.
+        chat.send(MirrorRemoteMembership {
+            room: room.clone(),
+            session: p,
+            user_id: "p@example.com".to_string(),
+            display_name: "p@example.com".to_string(),
+            event: MirrorEvent::Left,
+        })
+        .await
+        .expect("spurious mirror LEFT for local P");
+
+        // CORE ASSERT: P's live hint state must SURVIVE — the reap is gated on an
+        // actual Remote-row removal, and none happened.
+        let after = chat
+            .send(TestLayerHintEntryCounts {
+                room: room.clone(),
+                source: p,
+            })
+            .await
+            .expect("counts after spurious LEFT");
+        assert_eq!(
+            after,
+            (1, 1),
+            "after a spurious LEFT that removed NO Remote row, the LOCAL publisher P's \
+             `layer_hint_state` and `layer_hint_recheck_handles` entries must SURVIVE — \
+             an unconditional reap would corrupt a live local publisher's LAYER_HINT \
+             debounce (#1852 spurious-LEFT guard)"
         );
     }
 
@@ -14527,8 +15014,48 @@ mod tests {
         );
     }
 
+    /// Issue 1977: a congested receiver must FORWARD non-base SCREEN — the shared
+    /// content outranks every camera (audio > screen > cameras), so the emergency
+    /// shed protects it while it collapses cameras to base. Exercises the REAL
+    /// `handle_msg` forwarding closure, not just the pure predicate, proving the
+    /// change is wired into the actual code path.
+    ///
+    /// MUTATION PROOF: reverting `downlink_shed_candidate` to the pre-1977
+    /// predicate (SCREEN shed alongside VIDEO) sheds this non-base SCREEN, so
+    /// `count == 1` FAILS (it becomes 0). Paired with
+    /// `test_handle_msg_sheds_nonbase_video_when_downlink_congested`, this pins the
+    /// asymmetry: same congestion, same non-base layer, camera shed vs screen kept.
+    #[actix_rt::test]
+    async fn test_handle_msg_forwards_nonbase_screen_when_downlink_congested() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let (handler, _emit) = handle_msg_congested(actor.recipient(), "dl-room-scr", 150);
+
+        // Non-base (layer 2) SCREEN from source 999 — survives the (empty) layer
+        // prefs. On pre-1977 code the relief shed would drop it; now it is kept.
+        let nats_msg = make_nats_message(
+            "room.dl-room-scr.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "issue 1977: a congested receiver must FORWARD non-base SCREEN (screen \
+             outranks cameras; only camera VIDEO is shed)"
+        );
+    }
+
     /// INVARIANT: even while congested, AUDIO and the base VIDEO layer (0) are
-    /// NEVER shed — only non-base VIDEO/SCREEN is.
+    /// NEVER shed — and per issue 1977 only non-base camera VIDEO is shed (SCREEN
+    /// is protected; see `test_handle_msg_forwards_nonbase_screen_when_downlink_congested`).
     ///
     /// MUTATION PROOF: broadening the shed predicate to include AUDIO or layer 0
     /// would drop one of these and flip the corresponding `count == N` assert.
@@ -14886,8 +15413,8 @@ mod tests {
         );
     }
 
-    /// #1283: direct coverage for the actor-driven DEMAND-gauge sweep loop
-    /// (`sweep_layer_preference_gauge`): room iteration, the per-session
+    /// #1283: direct coverage for the actor-driven DEMAND-gauge room refresh:
+    /// round-robin iteration, the per-session
     /// `has_any()` skip, the per-kind MAX-bucket tally, and — the easiest path to
     /// silently regress — the explicit-zero `SET` for an active room whose demand
     /// vanished. The unit tests already pin the pure classifier; this seeds actor
@@ -14908,8 +15435,8 @@ mod tests {
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
-        // `sweep_layer_preference_gauge` is `&self` (no actor context), so we drive
-        // it directly on a constructed (un-started) server with seeded state.
+        // The chunk helper needs no actor context, so drive it directly on a
+        // constructed (un-started) server with seeded state.
         let mut server = ChatServer::new(nats_client).await;
 
         // Unique room names → isolated global-gauge series (and `#[serial]` keeps
@@ -14942,6 +15469,7 @@ mod tests {
         server
             .session_layer_prefs
             .insert(1003, layer_prefs_with_kinds(&[(900, 1, 7), (901, 3, 2)]));
+        server.track_room_for_layer_preference_sweep(active_room);
         server.room_members.insert(
             active_room.to_string(),
             vec![member(1001), member(1002), member(1003)],
@@ -14951,6 +15479,7 @@ mod tests {
         // (`has_any()` false). The room is still iterated and must be SET to 0
         // across every cell — the explicit-zero path. ---
         server.session_layer_prefs.insert(2001, empty_layer_prefs());
+        server.track_room_for_layer_preference_sweep(empty_room);
         server
             .room_members
             .insert(empty_room.to_string(), vec![member(2001)]);
@@ -14967,7 +15496,14 @@ mod tests {
             }
         }
 
-        server.sweep_layer_preference_gauge();
+        assert!(server.start_layer_preference_gauge_sweep());
+        assert_eq!(
+            server.sweep_layer_preference_gauge_chunk(),
+            LayerPreferenceSweepChunk {
+                rooms_processed: 2,
+                cycle_complete: true,
+            }
+        );
 
         let g = |room: &str, kind: &str, bucket: &str| {
             RELAY_LAYER_PREFERENCE_SESSIONS
@@ -15020,6 +15556,183 @@ mod tests {
                      (explicit-zero path) at {kind_label}/{bucket}, not left stale"
                 );
             }
+        }
+    }
+
+    /// #1284: several thousand live rooms must converge through the production
+    /// gauge refresh path without any one actor turn scaling with the room count.
+    ///
+    /// Every room's `video/0` cell is pre-poisoned, then the real round-robin
+    /// cycle is driven chunk by chunk. This proves both sides of the contract:
+    /// each call is structurally bounded (mutation: removing `.min(CHUNK)` makes
+    /// the first call process all 4,096 rooms and fails) and the bounded calls
+    /// still visit every room (mutation: stopping after one chunk leaves poisoned
+    /// cells and fails).
+    #[actix_rt::test]
+    #[serial]
+    async fn test_layer_preference_gauge_sweep_bounds_chunks_and_converges_at_scale() {
+        const ROOM_COUNT: usize = 4_096;
+        const MAX_ACCEPTABLE_ROOMS_PER_MESSAGE: usize = 16;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut server = ChatServer::new(nats_client).await;
+        let mut rooms = Vec::with_capacity(ROOM_COUNT);
+
+        for idx in 0..ROOM_COUNT {
+            let room = format!("test-1284-scale-{idx}");
+            let session = 50_000 + idx as SessionId;
+            server.track_room_for_layer_preference_sweep(&room);
+            server.room_members.insert(
+                room.clone(),
+                vec![RoomMemberInfo {
+                    session,
+                    user_id: format!("u{session}"),
+                    display_name: format!("d{session}"),
+                    is_host: false,
+                    end_on_host_leave: false,
+                    origin: MemberOrigin::Local,
+                }],
+            );
+            RELAY_LAYER_PREFERENCE_SESSIONS
+                .with_label_values(&[&room, "video", "0"])
+                .set(99.0);
+            rooms.push(room);
+        }
+
+        // Drain/recreate before the queued id is visited. The retained dedup-set
+        // entry must reuse the existing queue slot rather than append a duplicate.
+        let recreated_room = rooms[0].clone();
+        let recreated_members = server
+            .room_members
+            .remove(&recreated_room)
+            .expect("seeded room exists");
+        server.track_room_for_layer_preference_sweep(&recreated_room);
+        server.track_room_for_layer_preference_sweep(&recreated_room);
+        server
+            .room_members
+            .insert(recreated_room, recreated_members);
+        assert_eq!(server.layer_preference_sweep_rooms.len(), ROOM_COUNT);
+        assert_eq!(server.layer_preference_sweep_queued.len(), ROOM_COUNT);
+
+        assert!(server.start_layer_preference_gauge_sweep());
+        let mut total_processed = 0;
+        let mut chunk_count = 0;
+        let mut max_chunk_elapsed = std::time::Duration::ZERO;
+        loop {
+            let started = std::time::Instant::now();
+            let chunk = server.sweep_layer_preference_gauge_chunk();
+            max_chunk_elapsed = max_chunk_elapsed.max(started.elapsed());
+            chunk_count += 1;
+            total_processed += chunk.rooms_processed;
+            assert!(
+                chunk.rooms_processed <= MAX_ACCEPTABLE_ROOMS_PER_MESSAGE,
+                "one actor turn processed {} rooms; the #1284 structural budget is {}",
+                chunk.rooms_processed,
+                MAX_ACCEPTABLE_ROOMS_PER_MESSAGE
+            );
+            if chunk.cycle_complete {
+                break;
+            }
+        }
+
+        assert_eq!(total_processed, ROOM_COUNT);
+        assert_eq!(
+            chunk_count,
+            ROOM_COUNT.div_ceil(LAYER_PREFERENCE_SESSIONS_SWEEP_ROOMS_PER_MESSAGE)
+        );
+        for room in &rooms {
+            assert_eq!(
+                RELAY_LAYER_PREFERENCE_SESSIONS
+                    .with_label_values(&[room, "video", "0"])
+                    .get(),
+                0.0,
+                "room {room} was not reached before the cycle completed"
+            );
+        }
+
+        // A room that stays drained is removed lazily when the next cycle visits
+        // its queue slot; all remaining live rooms stay indexed exactly once.
+        let drained_room = &rooms[1];
+        server.room_members.remove(drained_room);
+        assert!(server.start_layer_preference_gauge_sweep());
+        while !server.sweep_layer_preference_gauge_chunk().cycle_complete {}
+        assert!(!server.layer_preference_sweep_queued.contains(drained_room));
+        assert_eq!(server.layer_preference_sweep_rooms.len(), ROOM_COUNT - 1);
+        assert_eq!(server.layer_preference_sweep_queued.len(), ROOM_COUNT - 1);
+
+        eprintln!(
+            "#1284 scale sweep: {ROOM_COUNT} rooms in {chunk_count} chunks; max chunk {:?}",
+            max_chunk_elapsed
+        );
+        for room in rooms {
+            crate::metrics::forget_room_metrics(&room);
+        }
+    }
+
+    /// #1284 runtime-path guard: a started actor must enqueue continuation
+    /// messages until the captured cycle is complete. The final room is beyond
+    /// three production chunks, so it cannot clear its poisoned metric if the
+    /// handler refreshes only the `StartCycle` chunk or forgets to self-send
+    /// `ContinueCycle`.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_layer_preference_gauge_handler_continues_until_cycle_complete() {
+        const ROOM_COUNT: usize = 25;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut server = ChatServer::new(nats_client).await;
+        let mut rooms = Vec::with_capacity(ROOM_COUNT);
+
+        for idx in 0..ROOM_COUNT {
+            let room = format!("test-1284-handler-{idx}");
+            server.track_room_for_layer_preference_sweep(&room);
+            server.room_members.insert(
+                room.clone(),
+                vec![RoomMemberInfo {
+                    session: 70_000 + idx as SessionId,
+                    user_id: format!("u{idx}"),
+                    display_name: format!("d{idx}"),
+                    is_host: false,
+                    end_on_host_leave: false,
+                    origin: MemberOrigin::Local,
+                }],
+            );
+            rooms.push(room);
+        }
+
+        let last_room = rooms.last().expect("non-empty room list");
+        RELAY_LAYER_PREFERENCE_SESSIONS
+            .with_label_values(&[last_room, "video", "0"])
+            .set(99.0);
+
+        let addr = server.start();
+        addr.send(SweepLayerPreferenceGauge::StartCycle)
+            .await
+            .expect("sweep start reaches actor");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if RELAY_LAYER_PREFERENCE_SESSIONS
+                    .with_label_values(&[last_room, "video", "0"])
+                    .get()
+                    == 0.0
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("continuation messages must reach the final room");
+
+        for room in rooms {
+            crate::metrics::forget_room_metrics(&room);
         }
     }
 

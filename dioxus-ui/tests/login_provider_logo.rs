@@ -37,9 +37,6 @@ fn inject_app_config_with_provider(provider: &str) {
     set("usersAllowedToStream", &"".into());
     set("oauthProvider", &provider.into());
     set("serverElectionPeriodMs", &wasm_bindgen::JsValue::from(2000));
-    set("audioBitrateKbps", &wasm_bindgen::JsValue::from(65));
-    set("videoBitrateKbps", &wasm_bindgen::JsValue::from(100));
-    set("screenBitrateKbps", &wasm_bindgen::JsValue::from(100));
 
     let frozen = js_sys::Object::freeze(&config);
     let window = gloo_utils::window();

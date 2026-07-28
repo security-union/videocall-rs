@@ -104,8 +104,8 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
         Ok(task)
     }
 
-    /// WebSocket has a single TCP stream — there is no per-media-type
-    /// routing.  The `stream_key` argument is intentionally ignored.
+    /// WebSocket has a single TCP stream, so the media key does not affect
+    /// routing. It is retained for backpressure-counter attribution.
     fn send_bytes(&self, bytes: Vec<u8>, stream_key: MediaStreamKey) {
         // Phase 3b (discussion #793). When the `netsim` feature is
         // off this entire block is compiled out and the send path is
@@ -119,11 +119,6 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
                 return;
             }
         }
-        // `stream_key` is intentionally ignored on the WS path —
-        // single TCP stream serves everything. Bind to `_` only when
-        // the netsim feature would otherwise leave it unused.
-        #[cfg(not(feature = "netsim"))]
-        let _ = stream_key;
-        self.send_binary(bytes);
+        self.send_binary_for_stream(bytes, stream_key.as_u8());
     }
 }

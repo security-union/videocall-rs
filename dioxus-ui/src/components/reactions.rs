@@ -6,25 +6,39 @@
 //! `#[test]`:
 //!   1. the enum→(emoji, label, slug) table — the CLIENT-side single source of
 //!      truth for how a wire `ReactionType` renders (spec §1), and
-//!   2. the floating-overlay integration logic — coalescing repeats of the same
-//!      (sender, reaction) and enforcing the hard concurrency cap (spec §4d).
+//!   2. the floating-overlay integration logic — pushing EVERY reaction as its
+//!      own float and enforcing the hard concurrency cap by evicting the OLDEST
+//!      float (spec §4d, issue 1884 tweak: repeats each animate separately).
 //!
 //! The Dioxus rendering (palette + rising-emoji overlay) in `attendants.rs`
-//! calls these; it does not re-implement the table or the cap/coalesce math.
+//! calls these; it does not re-implement the table or the cap math.
 
+use videocall_client::validate_custom_emoji;
 use videocall_types::protos::reaction_packet::reaction_packet::ReactionType;
 
-/// The 7 user-selectable reactions, in palette order. `ReactionType` is a plain
-/// C-like enum (`value()` == `*self as i32`), so callers convert to the wire i32
-/// with `reaction as i32` where needed.
-pub const REACTIONS: [ReactionType; 7] = [
+/// The user-selectable quick reactions, in palette DISPLAY order: 6 positives
+/// (👍😂👏❤️🤔🎉) then 5 negatives (👎😭🙅😢💔) — THUMBS_DOWN sits with the
+/// negatives cluster rather than beside THUMBS_UP (issue 1884, UX). This array
+/// controls ONLY rendering + roving order; the wire value is the enum
+/// discriminant (unchanged) and DOM testids key on the slug, so reordering is
+/// display-only. `CUSTOM` is deliberately absent — it is reached through the
+/// emoji picker, not the quick row. `ReactionType` is a plain C-like enum
+/// (`value()` == `*self as i32`), so callers convert to the wire i32 with
+/// `reaction as i32` where needed.
+pub const REACTIONS: [ReactionType; 11] = [
+    // Positives.
     ReactionType::THUMBS_UP,
-    ReactionType::THUMBS_DOWN,
     ReactionType::LAUGH,
     ReactionType::APPLAUSE,
     ReactionType::HEART,
     ReactionType::THINKING,
     ReactionType::PARTY,
+    // Negatives.
+    ReactionType::THUMBS_DOWN,
+    ReactionType::CRY,
+    ReactionType::DISAGREE,
+    ReactionType::SAD,
+    ReactionType::HEART_BROKEN,
 ];
 
 /// Step the palette highlight by `delta` positions through [`REACTIONS`] with
@@ -44,12 +58,14 @@ pub fn step_reaction(current: ReactionType, delta: i32) -> ReactionType {
     REACTIONS[next as usize]
 }
 
-/// Client-side single source of truth: map a reaction to its
-/// `(emoji, human label, dom slug)`. `REACTION_TYPE_UNSPECIFIED` (and, via
-/// [`reaction_glyph_from_i32`], any unknown/reserved wire value) maps to `None`
-/// so the caller renders nothing rather than a blank/placeholder glyph. The
-/// glyphs are native Unicode emoji; the label is the accessible name
-/// ("React with {label}"); the slug is the DOM/testid token.
+/// Client-side single source of truth: map a STATIC-glyph reaction to its
+/// `(emoji, human label, dom slug)`. `REACTION_TYPE_UNSPECIFIED` and `CUSTOM`
+/// map to `None`: UNSPECIFIED (and, via [`reaction_glyph_from_i32`], any
+/// unknown/reserved wire value) renders nothing; `CUSTOM` has NO static glyph —
+/// its emoji travels in `ReactionPacket.custom_emoji` and is rendered from that
+/// string by the receive path, never from this table. The glyphs are native
+/// Unicode emoji; the label is the accessible name ("React with {label}"); the
+/// slug is the DOM/testid token.
 pub fn reaction_glyph(
     reaction: ReactionType,
 ) -> Option<(&'static str, &'static str, &'static str)> {
@@ -61,14 +77,21 @@ pub fn reaction_glyph(
         ReactionType::HEART => Some(("❤️", "heart", "heart")),
         ReactionType::THINKING => Some(("🤔", "thinking", "thinking")),
         ReactionType::PARTY => Some(("🎉", "party", "party")),
-        ReactionType::REACTION_TYPE_UNSPECIFIED => None,
+        ReactionType::CRY => Some(("😭", "crying", "cry")),
+        ReactionType::DISAGREE => Some(("🙅", "disagree", "disagree")),
+        ReactionType::SAD => Some(("😢", "sad", "sad")),
+        ReactionType::HEART_BROKEN => Some(("💔", "heart broken", "heart-broken")),
+        // CUSTOM carries its emoji in the packet, not this table; UNSPECIFIED is
+        // the non-reaction sentinel. Both render nothing from here.
+        ReactionType::CUSTOM | ReactionType::REACTION_TYPE_UNSPECIFIED => None,
     }
 }
 
 /// Map a raw wire reaction value (as delivered to the `on_reaction` callback —
-/// `ReactionPacket.reaction.value()`) to its glyph. `0` (UNSPECIFIED) and any
-/// out-of-range / reserved value (8..=31, negatives, junk) map to `None`,
-/// matching the relay's closed-enum allowlist. The `1..=7` arm delegates to
+/// `ReactionPacket.reaction.value()`) to its STATIC glyph. `0` (UNSPECIFIED),
+/// `12` (CUSTOM — rendered from `custom_emoji`, not a static glyph), and any
+/// out-of-range / reserved value (13..=31, negatives, junk) map to `None`,
+/// matching the relay's closed-enum allowlist. The `1..=11` arm delegates to
 /// [`reaction_glyph`], so the two functions can never disagree (pinned by test).
 pub fn reaction_glyph_from_i32(value: i32) -> Option<(&'static str, &'static str, &'static str)> {
     let reaction = match value {
@@ -79,26 +102,27 @@ pub fn reaction_glyph_from_i32(value: i32) -> Option<(&'static str, &'static str
         5 => ReactionType::HEART,
         6 => ReactionType::THINKING,
         7 => ReactionType::PARTY,
+        8 => ReactionType::CRY,
+        9 => ReactionType::DISAGREE,
+        10 => ReactionType::SAD,
+        11 => ReactionType::HEART_BROKEN,
         _ => return None,
     };
     reaction_glyph(reaction)
 }
 
-/// Coalesce window (issue #1884): a repeat of the SAME (sender, reaction) within
-/// this many ms of the existing float's birth increments its count instead of
-/// spawning a second float.
-pub const REACTION_COALESCE_WINDOW_MS: f64 = 2000.0;
-
-/// Hard cap on concurrent floats (issue #1884). Beyond this a new distinct
-/// reaction is DROPPED (drop-newest) so a burst can never spawn unbounded DOM /
-/// animations.
-pub const MAX_CONCURRENT_REACTIONS: usize = 12;
+/// Hard cap on concurrent floats (issue 1884). When the overlay is full, the
+/// OLDEST float is evicted to make room for a newcomer (drop-oldest), so a NEW
+/// reaction always appears — a rapid burst can never be silently swallowed; at
+/// worst it shortens the oldest floats' on-screen lives. Bounds DOM/animation
+/// count so a burst can never spawn unbounded floats.
+pub const MAX_CONCURRENT_REACTIONS: usize = 24;
 
 /// Lifetime of one float (ms) before its removal Timeout fires. Slightly longer
 /// than the CSS rise animation so the emoji finishes its travel + fade before
-/// the node is dropped. A coalesce resets the float's `born_ms` and schedules a
-/// fresh timer, so a repeated reaction lives a full lifetime from its latest
-/// repeat (issue #1884).
+/// the node is dropped. Each reaction is its own float with its own timer keyed
+/// on `(id, born_ms)`; a float evicted early by the drop-oldest cap simply
+/// leaves its (now-stale) timer to no-op when it fires (issue 1884).
 pub const REACTION_FLOAT_LIFETIME_MS: u32 = 4200;
 
 /// Screen-reader announcement throttle (ms). At most one live-region update is
@@ -114,101 +138,79 @@ pub const REACTION_SR_THROTTLE_MS: u32 = 2000;
 /// or not. Escape / outside-click / the X close immediately and pre-empt it.
 pub const REACTION_PALETTE_AUTOHIDE_MS: u32 = 5000;
 
-/// One rising-emoji float in the overlay (issue #1884).
+/// One rising-emoji float in the overlay (issue 1884). EVERY reaction — even a
+/// rapid repeat of the same emoji from the same sender — is its own float with
+/// its own animation; there is no coalescing/count.
 #[derive(Clone, PartialEq, Debug)]
 pub struct FloatingReaction {
-    /// Stable id (removal Timeout key + Dioxus list key).
+    /// Stable id (removal Timeout key + Dioxus list key). Monotonic, so it alone
+    /// uniquely identifies a float.
     pub id: u64,
-    /// Relay-stamped sender session id (coalesce key half; `u64::MAX` for the
-    /// local "You" echo, which has no session of its own on the receive path).
+    /// Relay-stamped sender session id (`u64::MAX` for the local "You" echo,
+    /// which has no session of its own on the receive path). Carried for
+    /// potential attribution/debug; not used to merge floats.
     pub sender_session: u64,
-    /// Rendered emoji (coalesce key half — 1:1 with the reaction enum).
+    /// Rendered emoji (a static-table glyph, or a validated CUSTOM emoji).
     pub emoji: String,
     /// Resolved sender display name (already escaped by Dioxus at render).
     pub name: String,
-    /// Repeat count; rendered as a "×N" badge when > 1.
-    pub count: u32,
     /// Horizontal launch jitter in percent, in [-35.0, 35.0].
     pub offset_pct: f32,
-    /// Birth time (ms). Reset on coalesce so the extended float lives a full
-    /// lifetime from the latest repeat.
+    /// Birth time (ms). Half of the `(id, born_ms)` key the removal Timeout
+    /// matches on so a stale timer (its float already evicted by the cap) is a
+    /// no-op.
     pub born_ms: f64,
 }
 
-/// What [`integrate_reaction`] did with an incoming reaction, so the caller can
-/// manage removal Timeouts precisely.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum IntegrateOutcome {
-    /// Coalesced into an existing float (its lifetime reset); the caller should
-    /// reset that id's removal timer. Carries the existing float's id.
-    Coalesced(u64),
-    /// Pushed a new float; the caller schedules a removal timer for this id.
-    Pushed(u64),
-    /// Dropped at the concurrency cap; the caller does nothing.
-    Dropped,
-}
-
-/// Index of the float `incoming` would coalesce into: the first with the same
-/// `(sender_session, emoji)` born within [`REACTION_COALESCE_WINDOW_MS`], or
-/// `None`. The SINGLE source of truth for the coalesce predicate — both
-/// [`integrate_reaction`] (which mutates that float) and
-/// [`would_integrate_mutate`] (read-only) go through it, so the "would this
-/// mutate?" pre-check can never drift from the actual apply.
-fn coalesce_target_index(
-    active: &[FloatingReaction],
-    incoming: &FloatingReaction,
-    now_ms: f64,
-) -> Option<usize> {
-    active.iter().position(|r| {
-        r.sender_session == incoming.sender_session
-            && r.emoji == incoming.emoji
-            && now_ms - r.born_ms < REACTION_COALESCE_WINDOW_MS
-    })
-}
-
-/// Read-only: would [`integrate_reaction`] MUTATE `active` for this `incoming`?
-/// A coalesce (bump an existing float) and a push (append) both mutate; a
-/// drop-at-cap does NOT. Lets the caller skip a signal `write()` — and the
-/// re-render it triggers — when the reaction would merely be dropped (issue
-/// #1884, perf: a burst past the cap must not dirty the overlay for nothing).
-pub fn would_integrate_mutate(
-    active: &[FloatingReaction],
-    incoming: &FloatingReaction,
-    now_ms: f64,
-) -> bool {
-    coalesce_target_index(active, incoming, now_ms).is_some()
-        || active.len() < MAX_CONCURRENT_REACTIONS
-}
-
-/// Integrate `incoming` into the `active` float list (issue #1884), mutating it
-/// in place and returning the [`IntegrateOutcome`]:
-///   * COALESCE — if a float with the same `(sender_session, emoji)` exists and
-///     was born within [`REACTION_COALESCE_WINDOW_MS`], bump its `count` and
-///     reset `born_ms` to `now_ms` (extending its lifetime); the list length is
-///     unchanged.
-///   * CAP — else, if `active` already holds [`MAX_CONCURRENT_REACTIONS`], DROP
-///     the newcomer (drop-newest) and leave the list unchanged.
-///   * PUSH — else append `incoming`.
-///
-/// Pure (no DOM/clock): `now_ms` is passed in, so the coalesce window is
-/// deterministically host-testable. The `Dropped` arm is the ONLY non-mutating
-/// outcome — [`would_integrate_mutate`] predicts it read-only.
-pub fn integrate_reaction(
-    active: &mut Vec<FloatingReaction>,
-    incoming: FloatingReaction,
-    now_ms: f64,
-) -> IntegrateOutcome {
-    if let Some(idx) = coalesce_target_index(active, &incoming, now_ms) {
-        active[idx].count += 1;
-        active[idx].born_ms = now_ms;
-        return IntegrateOutcome::Coalesced(active[idx].id);
-    }
+/// Integrate `incoming` into the `active` float list (issue 1884). EVERY
+/// reaction becomes its own float — repeats of the same (sender, emoji) are NOT
+/// coalesced, so each animates separately. The list is bounded at
+/// [`MAX_CONCURRENT_REACTIONS`] by DROP-OLDEST: when full, the front (oldest by
+/// push order) float is evicted before the newcomer is appended, so a new
+/// reaction always becomes visible. Pure (no DOM/clock) so it is host-testable.
+pub fn integrate_reaction(active: &mut Vec<FloatingReaction>, incoming: FloatingReaction) {
     if active.len() >= MAX_CONCURRENT_REACTIONS {
-        return IntegrateOutcome::Dropped;
+        // Evict the oldest float (front): the Vec is ordered by insertion, so
+        // index 0 is the longest-lived. Its removal Timeout, still pending, will
+        // find the float gone and no-op.
+        active.remove(0);
     }
-    let id = incoming.id;
     active.push(incoming);
-    IntegrateOutcome::Pushed(id)
+}
+
+/// Maximum number of recently-used CUSTOM (picker) emojis kept as palette
+/// quick-picks (issue 1884).
+pub const MAX_RECENT_CUSTOM_EMOJIS: usize = 3;
+
+/// Record `emoji` as the most-recently-used CUSTOM reaction in `recents` (issue
+/// 1884): move-to-front with DEDUPE (an emoji already present is lifted to the
+/// front, never duplicated), then cap at [`MAX_RECENT_CUSTOM_EMOJIS`], keeping
+/// the list most-recent-first. The caller passes an ALREADY-validated emoji (the
+/// send path validated it), so this does no allowlist check itself.
+pub fn push_recent_custom_emoji(recents: &mut Vec<String>, emoji: &str) {
+    recents.retain(|e| e != emoji);
+    recents.insert(0, emoji.to_string());
+    recents.truncate(MAX_RECENT_CUSTOM_EMOJIS);
+}
+
+/// Sanitize a persisted recents list read from `localStorage` (issue 1884): keep
+/// only entries that pass the exact standard-emoji allowlist
+/// ([`validate_custom_emoji`]), de-duplicated, ORDER PRESERVED (most-recent-first
+/// as stored), capped at [`MAX_RECENT_CUSTOM_EMOJIS`]. A tampered storage value —
+/// arbitrary text, markup, duplicates, over-length — therefore can NEVER inject a
+/// non-emoji into the palette: invalid/duplicate/overflow entries are silently
+/// dropped.
+pub fn sanitize_recent_custom_emojis(candidates: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(MAX_RECENT_CUSTOM_EMOJIS);
+    for c in candidates {
+        if out.len() >= MAX_RECENT_CUSTOM_EMOJIS {
+            break;
+        }
+        if validate_custom_emoji(&c) && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Compose the screen-reader announcement for a flushed batch of peer reactions
@@ -238,7 +240,6 @@ mod tests {
             sender_session: sender,
             emoji: emoji.to_string(),
             name: "n".to_string(),
-            count: 1,
             offset_pct: 0.0,
             born_ms: born,
         }
@@ -247,9 +248,11 @@ mod tests {
     // --- enum table --------------------------------------------------------
 
     #[test]
-    fn glyph_table_complete_for_all_seven() {
-        // Every defined reaction maps to a NON-EMPTY (emoji, label, slug), and
-        // the slugs match the wire vocabulary / testids the spec pins.
+    fn glyph_table_complete_for_all_static_reactions() {
+        // Every static-glyph reaction (1..=11) maps to a NON-EMPTY
+        // (emoji, label, slug), and the slugs match the wire vocabulary /
+        // testids the spec pins. CUSTOM(12) + UNSPECIFIED(0) have NO static
+        // glyph and are asserted separately below.
         let expected = [
             (ReactionType::THUMBS_UP, "thumbs_up"),
             (ReactionType::THUMBS_DOWN, "thumbs_down"),
@@ -258,11 +261,16 @@ mod tests {
             (ReactionType::HEART, "heart"),
             (ReactionType::THINKING, "thinking"),
             (ReactionType::PARTY, "party"),
+            (ReactionType::CRY, "cry"),
+            (ReactionType::DISAGREE, "disagree"),
+            (ReactionType::SAD, "sad"),
+            (ReactionType::HEART_BROKEN, "heart-broken"),
         ];
+        // REACTIONS (the quick palette) is exactly the 11 static reactions.
         assert_eq!(REACTIONS.len(), expected.len());
         for (r, slug) in expected {
             let (emoji, label, got_slug) =
-                reaction_glyph(r).expect("every 1..=7 reaction must have a glyph");
+                reaction_glyph(r).expect("every 1..=11 reaction must have a glyph");
             assert!(!emoji.is_empty(), "emoji must be non-empty for {r:?}");
             assert!(!label.is_empty(), "label must be non-empty for {r:?}");
             assert_eq!(got_slug, slug, "slug mismatch for {r:?}");
@@ -270,34 +278,68 @@ mod tests {
     }
 
     #[test]
-    fn glyph_none_for_unspecified() {
+    fn glyph_none_for_unspecified_and_custom() {
+        // UNSPECIFIED is the non-reaction sentinel; CUSTOM renders from the
+        // packet's custom_emoji string, never from the static table. Both None.
         assert_eq!(
             reaction_glyph(ReactionType::REACTION_TYPE_UNSPECIFIED),
             None
         );
+        assert_eq!(
+            reaction_glyph(ReactionType::CUSTOM),
+            None,
+            "CUSTOM must have no static glyph — it routes through custom_emoji"
+        );
     }
 
     #[test]
-    fn glyph_from_i32_matches_enum_path_and_rejects_unknown() {
-        // 1..=7 agree with the enum-keyed table (the two paths can't drift).
+    fn every_reaction_type_value_is_handled() {
+        // The Some/None contract across ALL defined enum values: the 11 static
+        // reactions (== REACTIONS) have a glyph; UNSPECIFIED(0) and CUSTOM(12) do
+        // not. `reaction_glyph`'s match is exhaustive, so a future enum variant
+        // fails to COMPILE there until handled — this test then pins whether each
+        // routes to a static glyph or to none (custom/sentinel).
+        for r in REACTIONS {
+            assert!(
+                reaction_glyph(r).is_some(),
+                "{r:?} must have a static glyph"
+            );
+        }
+        for r in [
+            ReactionType::REACTION_TYPE_UNSPECIFIED,
+            ReactionType::CUSTOM,
+        ] {
+            assert!(
+                reaction_glyph(r).is_none(),
+                "{r:?} must have no static glyph"
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_from_i32_matches_enum_path_and_rejects_unknown_and_custom() {
+        // 1..=11 agree with the enum-keyed table (the two paths can't drift).
         for r in REACTIONS {
             assert_eq!(reaction_glyph_from_i32(r as i32), reaction_glyph(r));
         }
-        // UNSPECIFIED(0), a reserved future value (8), out-of-range (99), and a
-        // negative all map to None (matches the relay allowlist).
+        // UNSPECIFIED(0), CUSTOM(12, no static glyph), a reserved future value
+        // (13), out-of-range (99), and a negative all map to None.
         assert_eq!(reaction_glyph_from_i32(0), None);
-        assert_eq!(reaction_glyph_from_i32(8), None);
+        assert_eq!(
+            reaction_glyph_from_i32(12),
+            None,
+            "CUSTOM(12) has no static glyph — the caller renders custom_emoji"
+        );
+        assert_eq!(reaction_glyph_from_i32(13), None);
         assert_eq!(reaction_glyph_from_i32(99), None);
         assert_eq!(reaction_glyph_from_i32(-1), None);
     }
 
     #[test]
     fn step_reaction_wraps_both_directions_and_recovers_from_stale() {
-        // +1 advances; wraps from the last entry back to the first.
-        assert_eq!(
-            step_reaction(ReactionType::THUMBS_UP, 1),
-            ReactionType::THUMBS_DOWN
-        );
+        // +1 advances to the next palette entry (indices, so this stays correct
+        // under a display reorder); wraps from the last entry back to the first.
+        assert_eq!(step_reaction(REACTIONS[0], 1), REACTIONS[1]);
         assert_eq!(
             step_reaction(REACTIONS[REACTIONS.len() - 1], 1),
             REACTIONS[0]
@@ -315,76 +357,59 @@ mod tests {
         );
     }
 
-    // --- coalesce / cap ----------------------------------------------------
+    // --- push-always / drop-oldest cap -------------------------------------
 
     #[test]
-    fn integrate_coalesces_same_sender_and_emoji_within_window() {
-        let mut active = vec![float(1, 42, "👍", 0.0)];
-        // Same sender + emoji, 500ms later (< 2000ms window) → coalesce.
-        let out = integrate_reaction(&mut active, float(2, 42, "👍", 500.0), 500.0);
-        assert_eq!(
-            out,
-            IntegrateOutcome::Coalesced(1),
-            "must coalesce into id 1"
-        );
-        assert_eq!(active.len(), 1, "no new float on coalesce");
-        assert_eq!(active[0].count, 2, "count increments on coalesce");
-        assert_eq!(
-            active[0].born_ms, 500.0,
-            "lifetime resets to now on coalesce"
-        );
-    }
-
-    #[test]
-    fn integrate_does_not_coalesce_across_sender_emoji_or_window() {
-        // Different sender → new float.
-        let mut active = vec![float(1, 42, "👍", 0.0)];
-        assert!(matches!(
-            integrate_reaction(&mut active, float(2, 43, "👍", 100.0), 100.0),
-            IntegrateOutcome::Pushed(2)
-        ));
-        assert_eq!(active.len(), 2);
-
-        // Different emoji → new float.
-        let mut active = vec![float(1, 42, "👍", 0.0)];
-        assert!(matches!(
-            integrate_reaction(&mut active, float(2, 42, "🎉", 100.0), 100.0),
-            IntegrateOutcome::Pushed(2)
-        ));
-        assert_eq!(active.len(), 2);
-
-        // Same sender+emoji but OUTSIDE the window (2000ms elapsed) → new float.
-        let mut active = vec![float(1, 42, "👍", 0.0)];
-        assert!(matches!(
-            integrate_reaction(&mut active, float(2, 42, "👍", 2000.0), 2000.0),
-            IntegrateOutcome::Pushed(2)
-        ));
-        assert_eq!(active.len(), 2);
-    }
-
-    #[test]
-    fn integrate_drops_newest_at_the_hard_cap() {
-        // Fill to MAX_CONCURRENT_REACTIONS distinct floats (distinct senders so
-        // none coalesce), then the next distinct one is DROPPED.
+    fn integrate_pushes_every_repeat_separately() {
+        // A repeat of the SAME (sender, emoji) does NOT coalesce — each becomes
+        // its own float, so the list GROWS and there is no count to bump.
         //
-        // ADVERSARIAL: remove the cap check and the 13th would push (len 13) —
-        // this test fails, which is the burst-cap guarantee the e2e also asserts.
+        // ADVERSARIAL: re-introduce coalescing (merge same sender+emoji into one
+        // float) and this fails — len would stay 1.
+        let mut active = vec![float(1, 42, "👍", 0.0)];
+        integrate_reaction(&mut active, float(2, 42, "👍", 500.0));
+        integrate_reaction(&mut active, float(3, 42, "👍", 600.0));
+        assert_eq!(
+            active.len(),
+            3,
+            "three identical reactions must be three separate floats"
+        );
+        assert_eq!(
+            active.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "each float keeps its own id, in arrival order"
+        );
+    }
+
+    #[test]
+    fn integrate_drops_oldest_at_the_hard_cap() {
+        // Fill to MAX_CONCURRENT_REACTIONS floats, then one more: the OLDEST
+        // (id 0, the front) is evicted and the newcomer appended, so the list
+        // stays exactly at the cap and the newcomer is present.
+        //
+        // ADVERSARIAL: change drop-oldest to drop-newest (drop the incoming
+        // instead of remove(0)) and the id-999 assertion fails; remove the cap
+        // entirely and the length assertion fails (len would be cap+1).
         let mut active: Vec<FloatingReaction> = Vec::new();
         for i in 0..MAX_CONCURRENT_REACTIONS as u64 {
-            let out = integrate_reaction(&mut active, float(i, i, "👍", 0.0), 0.0);
-            assert!(matches!(out, IntegrateOutcome::Pushed(_)));
+            integrate_reaction(&mut active, float(i, i, "👍", 0.0));
         }
         assert_eq!(active.len(), MAX_CONCURRENT_REACTIONS);
-        let out = integrate_reaction(&mut active, float(999, 999, "👍", 0.0), 0.0);
-        assert_eq!(
-            out,
-            IntegrateOutcome::Dropped,
-            "13th distinct float must drop"
-        );
+        assert_eq!(active[0].id, 0, "front is the oldest before eviction");
+
+        integrate_reaction(&mut active, float(999, 999, "🎉", 1.0));
         assert_eq!(
             active.len(),
             MAX_CONCURRENT_REACTIONS,
             "the list must never exceed the cap"
+        );
+        assert_eq!(
+            active[0].id, 1,
+            "the oldest (id 0) was evicted; id 1 is now front"
+        );
+        assert!(
+            active.iter().any(|r| r.id == 999),
+            "the newest reaction must always be present (drop-oldest, not drop-newest)"
         );
     }
 
@@ -407,51 +432,79 @@ mod tests {
         );
     }
 
+    // --- recent custom emojis ----------------------------------------------
+
     #[test]
-    fn would_mutate_agrees_with_integrate_outcome() {
-        // The write-skip optimization is only correct if would_integrate_mutate
-        // is true EXACTLY when integrate_reaction would NOT return Dropped.
-        // Cross-check the read-only predictor against the real apply for push,
-        // coalesce, drop-at-cap, and coalesce-at-cap — if the predicate ever
-        // drifts from the coalesce/cap logic this fails.
-        let full: Vec<FloatingReaction> = (0..MAX_CONCURRENT_REACTIONS as u64)
-            .map(|i| float(i, i, "👍", 0.0))
-            .collect();
-        let cases: Vec<(Vec<FloatingReaction>, FloatingReaction, f64)> = vec![
-            (Vec::new(), float(1, 1, "👍", 0.0), 0.0), // push (room)
-            (
-                vec![float(1, 7, "👍", 0.0)],
-                float(2, 7, "👍", 100.0),
-                100.0,
-            ), // coalesce
-            (full.clone(), float(999, 999, "🎉", 0.0), 0.0), // drop at cap
-            (full.clone(), float(999, 0, "👍", 100.0), 100.0), // coalesce at cap
-        ];
-        for (active, incoming, now) in cases {
-            let predicted = would_integrate_mutate(&active, &incoming, now);
-            let mut applied = active.clone();
-            let outcome = integrate_reaction(&mut applied, incoming.clone(), now);
-            let actually_mutated = outcome != IntegrateOutcome::Dropped;
-            assert_eq!(
-                predicted, actually_mutated,
-                "would_integrate_mutate must agree with integrate_reaction (got outcome {outcome:?})"
-            );
-            // And a mutation must actually change the list; a drop must not.
-            assert_eq!(actually_mutated, applied != active);
-        }
+    fn push_recent_is_most_recent_first_and_dedupes() {
+        // Each push puts the emoji at the FRONT; a repeat of one already present
+        // MOVES it to the front rather than duplicating.
+        //
+        // ADVERSARIAL: drop the `retain` (dedupe) and pushing "😭" twice would
+        // leave two "😭" entries — this fails.
+        let mut r: Vec<String> = Vec::new();
+        push_recent_custom_emoji(&mut r, "😭");
+        push_recent_custom_emoji(&mut r, "🎉");
+        assert_eq!(r, vec!["🎉", "😭"], "newest is first");
+        push_recent_custom_emoji(&mut r, "😭"); // re-use an existing one
+        assert_eq!(
+            r,
+            vec!["😭", "🎉"],
+            "re-using an emoji moves it to the front, no duplicate"
+        );
     }
 
     #[test]
-    fn integrate_coalesce_still_works_at_the_cap() {
-        // At the cap, a REPEAT of an existing (sender, emoji) still coalesces
-        // (it does not add a float, so the cap is not a reason to drop it).
-        let mut active: Vec<FloatingReaction> = Vec::new();
-        for i in 0..MAX_CONCURRENT_REACTIONS as u64 {
-            integrate_reaction(&mut active, float(i, i, "👍", 0.0), 0.0);
+    fn push_recent_caps_at_three() {
+        // The list never exceeds MAX_RECENT_CUSTOM_EMOJIS; the oldest falls off.
+        //
+        // ADVERSARIAL: remove the `truncate` and the 4th distinct push leaves 4
+        // entries — this fails.
+        let mut r: Vec<String> = Vec::new();
+        for e in ["😀", "😁", "😂", "🤣"] {
+            push_recent_custom_emoji(&mut r, e);
         }
-        let out = integrate_reaction(&mut active, float(999, 0, "👍", 100.0), 100.0);
-        assert_eq!(out, IntegrateOutcome::Coalesced(0));
-        assert_eq!(active.len(), MAX_CONCURRENT_REACTIONS);
-        assert_eq!(active[0].count, 2);
+        assert_eq!(r.len(), MAX_RECENT_CUSTOM_EMOJIS);
+        assert_eq!(
+            r,
+            vec!["🤣", "😂", "😁"],
+            "newest three kept, oldest (😀) evicted"
+        );
+    }
+
+    #[test]
+    fn sanitize_recents_drops_invalid_dupes_and_overflow() {
+        // A tampered/legacy storage value: arbitrary text, markup, a duplicate,
+        // and more than the cap. Only VALID, DISTINCT emoji survive, in order,
+        // capped at three.
+        //
+        // ADVERSARIAL: drop the `validate_custom_emoji` guard and "hello"/
+        // "<script>" would be injected into the palette — this fails (they'd
+        // appear in the result).
+        let raw = vec![
+            "😭".to_string(),
+            "hello".to_string(), // not an emoji
+            "🎉".to_string(),
+            "<script>".to_string(), // markup
+            "😭".to_string(),       // duplicate of the first
+            "🚀".to_string(),
+            "❤️".to_string(), // 4th valid distinct — over the cap
+        ];
+        let clean = sanitize_recent_custom_emojis(raw);
+        assert_eq!(
+            clean,
+            vec!["😭", "🎉", "🚀"],
+            "only valid, distinct emoji survive, order preserved, capped at three"
+        );
+    }
+
+    #[test]
+    fn sanitize_recents_empty_stays_empty() {
+        // No stored recents (or all invalid) yields an empty list — the palette
+        // renders no recents (and no empty placeholders).
+        assert!(sanitize_recent_custom_emojis(Vec::new()).is_empty());
+        assert!(
+            sanitize_recent_custom_emojis(vec!["nope".into(), "".into()]).is_empty(),
+            "an all-invalid stored list sanitizes to empty"
+        );
     }
 }

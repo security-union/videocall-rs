@@ -130,12 +130,6 @@ pub struct RuntimeConfig {
     pub search_api_base_url: Option<String>,
     #[serde(rename = "serverElectionPeriodMs")]
     pub server_election_period_ms: u64,
-    #[serde(rename = "audioBitrateKbps")]
-    pub audio_bitrate_kbps: u32,
-    #[serde(rename = "videoBitrateKbps")]
-    pub video_bitrate_kbps: u32,
-    #[serde(rename = "screenBitrateKbps")]
-    pub screen_bitrate_kbps: u32,
     #[serde(rename = "vadThreshold", default = "default_vad_threshold")]
     pub vad_threshold: f32,
     #[serde(rename = "consoleLogUploadEnabled")]
@@ -345,15 +339,6 @@ pub fn reset_config_cache_for_test() {
 /// layout-only and bypass this limit.
 pub const CANVAS_LIMIT: usize = 30;
 
-pub fn audio_bitrate_kbps() -> Result<u32, String> {
-    app_config().map(|c| c.audio_bitrate_kbps)
-}
-pub fn video_bitrate_kbps() -> Result<u32, String> {
-    app_config().map(|c| c.video_bitrate_kbps)
-}
-pub fn screen_bitrate_kbps() -> Result<u32, String> {
-    app_config().map(|c| c.screen_bitrate_kbps)
-}
 pub fn vad_threshold() -> Result<f32, String> {
     app_config().map(|c| c.vad_threshold)
 }
@@ -938,6 +923,31 @@ mod simulcast_default_tests {
             default_experimental_simulcast_max_layers(),
             "the read-fn fallback must equal the serde default (lockstep, issue 1082)"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_config_tests {
+    use super::RuntimeConfig;
+
+    /// Issue #1193: bitrate targets are owned by the centralized AQ tables, so
+    /// runtime configuration no longer requires the legacy audio/video/screen
+    /// bitrate keys. Restoring any old required field makes this parse fail.
+    #[test]
+    fn parses_without_legacy_bitrate_keys() {
+        let config: RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "apiBaseUrl": "http://test:8080",
+            "wsUrl": "ws://test:8080",
+            "webTransportHost": "https://test:4433",
+            "oauthEnabled": "false",
+            "e2eeEnabled": "false",
+            "webTransportEnabled": "false",
+            "usersAllowedToStream": "",
+            "serverElectionPeriodMs": 2000
+        }))
+        .expect("config without legacy bitrate keys must parse");
+
+        assert_eq!(config.server_election_period_ms, 2000);
     }
 }
 

@@ -101,7 +101,7 @@ The session JWT contains these claims:
 
 ### CORS
 
-The Meeting Backend supports cross-origin requests with credentials. Set `CORS_ALLOWED_ORIGIN` to the exact frontend origin in production (e.g. `https://app.videocall.rs`). When unset, the server mirrors the request `Origin` for development convenience. See [Meeting Ownership & Architecture](MEETING_OWNERSHIP.md#cors-and-deployment-topology) for deployment recommendations.
+The Meeting Backend supports cross-origin requests with credentials. Set `CORS_ALLOWED_ORIGIN` to the exact frontend origin in production (e.g. `https://app.videocall.rs`). An empty or unset value is **rejected at startup** unless `DEV_USER` is active (local dev); only then does the server mirror the request `Origin`. This fail-closed guard (issue #1751) prevents an empty origin list from producing universal credentialed CORS. See [Meeting Ownership & Architecture](MEETING_OWNERSHIP.md#cors-and-deployment-topology) for deployment recommendations.
 
 ## Room Access Token
 

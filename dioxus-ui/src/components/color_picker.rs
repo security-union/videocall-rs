@@ -356,6 +356,7 @@ pub fn HsvColorPicker(props: HsvColorPickerProps) -> Element {
     let sat_pct = (sat() * 100.0).round() as i32;
     let val_pct = (val() * 100.0).round() as i32;
     let live_text = format!("Saturation {sat_pct}%, brightness {val_pct}%, hue {hue_int}°");
+    let mut copy_live_text = use_signal(String::new);
 
     // Copy-to-clipboard state. Set to true when the user successfully copies
     // the hex value; auto-resets after ~1.2s via gloo_timers.
@@ -368,9 +369,11 @@ pub fn HsvColorPicker(props: HsvColorPickerProps) -> Element {
             let promise = clipboard.write_text(&text);
             spawn(async move {
                 if JsFuture::from(promise).await.is_ok() {
+                    copy_live_text.set(format!("Copied {text}"));
                     copied.set(true);
                     TimeoutFuture::new(1200).await;
                     copied.set(false);
+                    copy_live_text.set(String::new());
                 }
             });
         }
@@ -492,6 +495,11 @@ pub fn HsvColorPicker(props: HsvColorPickerProps) -> Element {
                 class: "visually-hidden",
                 "aria-live": "polite",
                 "{live_text}"
+            }
+            div {
+                class: "visually-hidden",
+                "aria-live": "polite",
+                "{copy_live_text}"
             }
         }
     }

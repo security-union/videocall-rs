@@ -1120,4 +1120,129 @@ test.describe("Screen share right panel layout", () => {
       await browser2.close();
     }
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 9. Pinned split-tile chrome vars are MAXIMIZED, not a stale grid cell
+  //    (PR #1946 regression).
+  //
+  // Bug: `container_style`'s `has_screen_share` branch never set
+  // `--tile-w`/`--tile-h`. Those vars drive the pinned split-tile chrome
+  // (`.split-peer-tile.grid-item-pinned .floating-name / .tile-top-icons /
+  // .placeholder-content` in style.css). A pinned side-panel tile maximizes to
+  // the full viewport (`position: fixed; 100%×100%`), so its chrome should be
+  // sized off the maximized tile. Because the branch omitted the vars, Dioxus's
+  // `set_attribute.ts` silently PRESERVED whatever `--tile-h` the last pre-share
+  // grid render wrote — a value that SHRINKS as the pre-share participant count
+  // grows. Two clients could freeze different pinned-chrome sizes for the same
+  // meeting state (nondeterministic by join/render order).
+  //
+  // The existing 2-peer parity tests (speaker-highlight.spec.ts 5h/5i/5j)
+  // STRUCTURALLY cannot catch this: with a single remote tile the pre-share
+  // grid `--tile-h` is already the large single-tile value (~580px at 1280×720),
+  // so the frozen leftover equals the correct maximized value and the bug is
+  // invisible. This test forces a MANY-tile pre-share grid (via mock peers) so
+  // the grid `--tile-h` collapses well below the maximized value, exposing the
+  // stale-leftover divergence.
+  //
+  // Mutation sensitivity: with ~11 tiles the pre-share grid `--tile-h` is
+  // ~183px (< the 293px chrome-saturation threshold). After the fix, the
+  // screen-share `--tile-h` jumps to the maximized single-tile height (~580px);
+  // on the un-fixed code it stays frozen at ~183px. The assertions require the
+  // screen-share `--tile-h` to (a) exceed the 293px saturation threshold and
+  // (b) be far larger than the pre-share grid value and near viewport height —
+  // all THREE fail on the un-fixed code (frozen ~183px), and reverting the
+  // `--tile-w`/`--tile-h` declaration in `container_style` re-breaks them.
+  // ──────────────────────────────────────────────────────────────────────
+  test("pinned split-tile chrome var is maximized regardless of pre-share tile count", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_pin_tilevar_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSPinVarHost",
+      "SSPinVarGuest",
+    );
+
+    // Read the `--tile-h` custom property (px) set inline on `#grid-container`.
+    const readTileH = async () =>
+      hostPage.evaluate(() => {
+        const el = document.querySelector("#grid-container") as HTMLElement | null;
+        if (!el) return NaN;
+        const raw = getComputedStyle(el).getPropertyValue("--tile-h").trim();
+        return parseFloat(raw);
+      });
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const mockButton = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
+      });
+      const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
+      if (!mockPeersAvailable) {
+        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
+        return;
+      }
+
+      // Inflate the host's grid to many tiles (1 real guest + 10 mocks = 11),
+      // so the grid `--tile-h` collapses below the maximized value.
+      await addMockPeers(hostPage, 10);
+      await hostPage.waitForTimeout(2000);
+
+      // Confirm the pre-share grid actually rendered many tiles. The decode
+      // budget caps the number of VISIBLE `.grid-item`s (the rest fold into a
+      // "+N more" overflow badge), but the layout `tile_count` that drives
+      // `--tile-h` still reflects the crowded grid — so 6+ visible cells is
+      // ample to shrink the cell below the saturation threshold asserted next.
+      const preTileCount = await hostPage.locator("#grid-container .grid-item").count();
+      expect(preTileCount).toBeGreaterThanOrEqual(6);
+
+      // Pre-share grid `--tile-h`: the many-tile grid cell height. Must be below
+      // the 293px chrome-saturation threshold, otherwise the setup does not
+      // exercise the bug (the whole point is that the grid cell has shrunk).
+      const preShareTileH = await readTileH();
+      expect(preShareTileH, "pre-share --tile-h should be a real number").toBeGreaterThan(0);
+      expect(
+        preShareTileH,
+        "pre-share grid --tile-h should be below the 293px saturation threshold (enough tiles to expose the bug)",
+      ).toBeLessThan(293);
+
+      // Guest starts screen share → host viewer switches to the split layout.
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+      await expect(hostPage.locator(".split-peer-tile").first()).toBeVisible({ timeout: 15_000 });
+      await hostPage.waitForTimeout(1500);
+
+      // During screen share `--tile-h` must describe the MAXIMIZED pinned tile,
+      // not the frozen many-tile grid cell.
+      const shareTileH = await readTileH();
+      const innerH = await hostPage.evaluate(() => window.innerHeight);
+
+      // (a) Chrome-saturation regime: pinned chrome renders at full size.
+      //     Un-fixed code freezes ~183px here → fails.
+      expect(
+        shareTileH,
+        "screen-share --tile-h must reach the maximized (saturated) regime, not stay at the frozen grid cell size",
+      ).toBeGreaterThanOrEqual(293);
+
+      // (b) Clearly larger than the frozen pre-share grid value. Un-fixed code
+      //     keeps them equal (Dioxus preserves the omitted property) → fails.
+      expect(shareTileH - preShareTileH).toBeGreaterThan(150);
+
+      // (c) Viewport-scale: the maximized tile fills most of the height.
+      //     (~580px vs 720px inner height at the default viewport.)
+      expect(shareTileH).toBeGreaterThanOrEqual(innerH * 0.6);
+      expect(shareTileH).toBeLessThanOrEqual(innerH);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
 });

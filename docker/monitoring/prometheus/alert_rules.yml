@@ -62,7 +62,7 @@ groups:
       component: video-playout
     annotations:
       summary: "Video playout latency elevated (600-1800ms)"
-      description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Approaching the #1252 lag threshold."
+      description: "{{ $labels.to_peer }} as seen by {{ $labels.from_peer }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Approaching the #1252 lag threshold."
 
   # CRITICAL: latency > 1800ms sustained for > 10s — the #1252 lag.
   - alert: VideoPlayoutLatencyHigh
@@ -73,7 +73,7 @@ groups:
       component: video-playout
     annotations:
       summary: "Video playout latency > 1800ms (#1252 lag)"
-      description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Audio-ahead-of-video lag (#1252)."
+      description: "{{ $labels.to_peer }} as seen by {{ $labels.from_peer }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Audio-ahead-of-video lag (#1252)."
 
   # AUDIO sibling. DEPENDS ON #1360 (videocall_audio_playout_latency_ms)
   # merging — inert until that gauge exists. NetEQ buffer scale differs from
@@ -87,7 +87,7 @@ groups:
       component: audio-playout
     annotations:
       summary: "Audio playout latency > 1800ms (threshold needs NetEQ tuning)"
-      description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} (session {{ $labels.session_id }}) audio is {{ $value | printf \"%.0f\" }}ms behind live. Threshold inherited from video, pending NetEQ tuning (#1360)."
+      description: "{{ $labels.to_peer }} as seen by {{ $labels.from_peer }} (session {{ $labels.session_id }}) audio is {{ $value | printf \"%.0f\" }}ms behind live. Threshold inherited from video, pending NetEQ tuning (#1360)."
 
 # =====================================================================
 # videocall.relay_viewport (#1437)

@@ -10,6 +10,11 @@ pub fn RecordingIcon() -> Element {
     rsx! {
         span {
             class: "recording-indicator",
+            // `role="img"` makes `aria-label` authoritative for screen
+            // readers; on a default generic-role span the label is
+            // unreliably surfaced (some readers announce the emoji's own
+            // Unicode name, "large red circle", or nothing instead).
+            role: "img",
             "aria-label": "Recording",
             title: "Recording",
             "🔴"

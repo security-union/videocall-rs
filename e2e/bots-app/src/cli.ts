@@ -26,6 +26,7 @@ import {
   NETSIM_PRESETS,
 } from "./meeting-config";
 import { runBotsToCompletion, type BotTask } from "./orchestrator";
+import { type VideoMode } from "./bot";
 import { prepareParticipantAudio } from "./stitcher";
 import { parseDuration, Ttl } from "./ttl";
 
@@ -64,6 +65,11 @@ program
   )
   .option("--display-name <name>", "Display name shown in the meeting", undefined)
   .option("--headless", "Run Chrome headless (default: headed)", false)
+  .option(
+    "--video-mode <costume|file|clock>",
+    "Camera source: existing manifest/override fake-file behavior (costume or file), or a synchronized wall-clock canvas (clock).",
+    "costume",
+  )
   .option(
     "--ttl <duration>",
     'Bot lifespan — "<int>s|m|h" or "infinite". On expiry the bot leaves the meeting and exits. Shared across all bots in --users mode.',
@@ -108,6 +114,12 @@ program
     }
     if (modeCount === 0) {
       console.error("bots-app: one of --participant, --users, or --config is required");
+      process.exit(2);
+    }
+    if (!["costume", "file", "clock"].includes(opts.videoMode)) {
+      console.error(
+        `bots-app: --video-mode must be "costume", "file", or "clock", got "${opts.videoMode}"`,
+      );
       process.exit(2);
     }
 
@@ -279,6 +291,7 @@ program
         participant,
         displayName,
         headless: opts.headless,
+        videoMode: opts.videoMode as VideoMode,
         authBackend: effectiveAuthBackend,
         storageStateFile,
         ssoStateFile: effectiveSsoStateFile,
@@ -346,6 +359,7 @@ interface RunCommandOptions {
   config?: string;
   displayName?: string;
   headless: boolean;
+  videoMode: string;
   ttl: string;
   manifest: string;
   assetsDir: string;

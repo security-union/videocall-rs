@@ -13,7 +13,8 @@ use wasm_bindgen_test::*;
 use dioxus_ui::context::{
     apply_notification_prefs, apply_transport_decision, clear_display_name_from_storage,
     clear_transport_sticky_and_pref, email_to_display_name, load_appearance_settings_from_storage,
-    load_display_name_from_storage, load_transport_preference, resolve_transport_config,
+    load_display_name_from_storage, load_transport_preference,
+    load_transport_preference_with_source, resolve_transport_config,
     save_appearance_settings_to_storage, save_display_name_to_storage, save_transport_preference,
     save_transport_sticky, validate_display_name, AppearanceSettings, TransportPreference,
     DISPLAY_NAME_MAX_LEN,
@@ -618,6 +619,157 @@ fn transport_preference_storage_invalid_value_returns_default() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item("vc_transport_preference");
     }
+}
+
+// ---------------------------------------------------------------------------
+// load_transport_preference_with_source — provenance tagging (issue #1745 PR2)
+//
+// These pin the SOURCE STRING the dioxus-ui call sites log ("sticky" |
+// "session" | "default"). They call the production
+// `load_transport_preference_with_source` (the single source of truth that
+// `load_transport_preference` delegates to), so a regression in either the
+// value resolution or the tag mapping fails here.
+//
+// Mutation sensitivity: each test asserts BOTH the resolved preference AND its
+// exact source tag, so swapping any of the three source strings in the
+// production match (e.g. returning "session" from the sticky arm) flips at
+// least one assertion to failure. As with the other transport-preference wasm
+// tests, they share one storage origin, so each clears storage at start AND
+// end via `clear_transport_sticky_and_pref()`.
+// ---------------------------------------------------------------------------
+
+/// Sticky path: a value read from `localStorage` while the sticky pin is set
+/// must be tagged `"sticky"`.
+#[wasm_bindgen_test]
+fn load_with_source_sticky_reports_sticky() {
+    clear_transport_sticky_and_pref();
+
+    let local_storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("test environment must have localStorage");
+    local_storage
+        .set_item("vc_transport_sticky", "true")
+        .expect("plant sticky");
+    local_storage
+        .set_item("vc_transport_preference", "websocket")
+        .expect("plant WS pref");
+
+    let (pref, source) = load_transport_preference_with_source();
+    assert_eq!(
+        pref,
+        TransportPreference::WebSocket,
+        "sticky localStorage value must resolve to the stored preference"
+    );
+    assert_eq!(
+        source, "sticky",
+        "a value read from the sticky localStorage path must be tagged \"sticky\""
+    );
+
+    clear_transport_sticky_and_pref();
+}
+
+/// Session path: with sticky NOT set, a value read from `sessionStorage` must
+/// be tagged `"session"`.
+#[wasm_bindgen_test]
+fn load_with_source_session_reports_session() {
+    clear_transport_sticky_and_pref();
+
+    let session_storage = web_sys::window()
+        .and_then(|w| w.session_storage().ok().flatten())
+        .expect("test environment must have sessionStorage");
+    // No sticky flag planted — the session path is only reached when sticky is
+    // absent/false.
+    session_storage
+        .set_item("vc_transport_session", "websocket")
+        .expect("plant session value");
+
+    let (pref, source) = load_transport_preference_with_source();
+    assert_eq!(
+        pref,
+        TransportPreference::WebSocket,
+        "sessionStorage value must resolve to the stored preference"
+    );
+    assert_eq!(
+        source, "session",
+        "a value read from the sessionStorage path must be tagged \"session\""
+    );
+
+    clear_transport_sticky_and_pref();
+}
+
+/// Default path: nothing stored → the implicit default, tagged `"default"`.
+#[wasm_bindgen_test]
+fn load_with_source_nothing_stored_reports_default() {
+    clear_transport_sticky_and_pref();
+
+    let (pref, source) = load_transport_preference_with_source();
+    assert_eq!(
+        pref,
+        TransportPreference::WebTransport,
+        "with nothing stored the default (WebTransport) applies"
+    );
+    assert_eq!(
+        source, "default",
+        "no stored value must be tagged \"default\""
+    );
+
+    clear_transport_sticky_and_pref();
+}
+
+/// Edge case: sticky flag set but NO `vc_transport_preference` value stored.
+/// The effective value is the default, so the tag must be `"default"` (it
+/// tracks value provenance, not which branch was entered) — never `"sticky"`.
+#[wasm_bindgen_test]
+fn load_with_source_sticky_without_value_reports_default() {
+    clear_transport_sticky_and_pref();
+
+    let local_storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("test environment must have localStorage");
+    // Sticky flag on, but the preference value is absent.
+    local_storage
+        .set_item("vc_transport_sticky", "true")
+        .expect("plant sticky");
+
+    let (pref, source) = load_transport_preference_with_source();
+    assert_eq!(
+        pref,
+        TransportPreference::WebTransport,
+        "sticky-on with no stored value must resolve to the default"
+    );
+    assert_eq!(
+        source, "default",
+        "sticky-on with no stored value must be tagged \"default\", not \"sticky\""
+    );
+
+    clear_transport_sticky_and_pref();
+}
+
+/// Delegation invariant: `load_transport_preference()` must return exactly the
+/// `.0` of `load_transport_preference_with_source()` for the same storage
+/// state — proving the two share one resolution path and cannot drift.
+#[wasm_bindgen_test]
+fn load_transport_preference_delegates_to_with_source() {
+    clear_transport_sticky_and_pref();
+
+    let local_storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("test environment must have localStorage");
+    local_storage
+        .set_item("vc_transport_sticky", "true")
+        .expect("plant sticky");
+    local_storage
+        .set_item("vc_transport_preference", "websocket")
+        .expect("plant WS pref");
+
+    let (with_source_pref, _) = load_transport_preference_with_source();
+    assert_eq!(
+        load_transport_preference(),
+        with_source_pref,
+        "load_transport_preference must equal load_transport_preference_with_source().0"
+    );
+
+    clear_transport_sticky_and_pref();
 }
 
 // ---------------------------------------------------------------------------

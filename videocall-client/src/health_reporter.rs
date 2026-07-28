@@ -338,6 +338,153 @@ fn audio_layer_telemetry(
     (congestion_ceiling, active_layers)
 }
 
+// ── issue 1853: receiver-side audio-scale instrumentation (log-only) ──────────
+//
+// Diagnostics to discriminate the multi-source audio-breakup pathology (a
+// receiver hearing MANY concurrent sources concealed, independent of CPU class)
+// from the low-core decode-starvation of issue 1389 and from a receiver-downlink
+// fault. INSTRUMENTATION ONLY — no runtime behavior changes. The report loop
+// emits one greppable AUDIO_SCALE line every ~5s summarizing the receiver's
+// audio-scale posture so scripts/meeting_quality_xref.py can correlate audio
+// concealment against concurrent source count, downlink estimate, and per-source
+// buffer depth before any behavioral fix is designed.
+
+/// Audio-source activity gate, in packets/sec. At or above this rate a source is
+/// actively delivering audio and its windowed expand/packets concealment ratio
+/// is meaningful; below it the sender is likely in DTX silence and the ratio is
+/// unreliable. Shared by the per-stream `PeerStats::audio_concealment_pct`
+/// computation and the AUDIO_SCALE aggregate (both go through
+/// [`audio_source_sample_from_neteq`]) so the two can never drift apart.
+const AUDIO_ACTIVE_PPS_GATE: f64 = 2.0;
+
+/// Minimum spacing between AUDIO_SCALE diagnostic lines, in ms. The line is
+/// emitted from the existing health-report loop (whose interval is
+/// `health_reporting_interval_ms`, default 5000ms — see
+/// `VideoCallClient`), gated by a wall-clock delta rather than a new timer. This
+/// caps the aggregate at one line per ~5s regardless of the configured report
+/// interval: at the 5s default it emits ~every report tick, and if the interval
+/// is ever set faster it rate-limits to ~5s.
+const AUDIO_SCALE_LOG_INTERVAL_MS: u64 = 5_000;
+
+/// Concealment percentage above which a source is counted in the AUDIO_SCALE
+/// `concealed=` field. Chosen clearly above the low ambient concealment of
+/// healthy Opus/NetEQ playout (a well-fed jitter buffer conceals only
+/// occasionally) and below R5's 15% "audible breakup" threshold in
+/// scripts/meeting_quality_xref.py, so `concealed` is an early, sensitive count
+/// of how many sources are degrading — not a restatement of the breakup rule.
+const AUDIO_SCALE_CONCEAL_THRESHOLD_PCT: f64 = 10.0;
+
+/// True when a source delivering `packets_per_sec` audio packets is active
+/// enough for its concealment ratio to be meaningful
+/// (>= [`AUDIO_ACTIVE_PPS_GATE`]).
+fn audio_source_active(packets_per_sec: f64) -> bool {
+    packets_per_sec >= AUDIO_ACTIVE_PPS_GATE
+}
+
+/// One receiver-side audio source sampled during a single health-report tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AudioSourceSample {
+    /// Windowed audio concealment for this source, in percent (0–100). Mirrors
+    /// `PeerStats::audio_concealment_pct`; 0.0 for inactive sources.
+    concealment_pct: f64,
+    /// NetEQ current jitter-buffer depth for this source, in ms
+    /// (`current_buffer_size_ms`, 0.0 when absent).
+    buffer_ms: f64,
+    /// True when the source is actively delivering audio this tick (its
+    /// `packets_per_sec` passes [`audio_source_active`]). Only active sources
+    /// contribute to the AUDIO_SCALE aggregates.
+    active: bool,
+}
+
+/// Derive an [`AudioSourceSample`] from a peer's raw NetEQ stats JSON, using the
+/// SAME windowed rates, gate, and clamp as the per-stream
+/// `PeerStats::audio_concealment_pct` mapping in `create_health_packet` (which
+/// also calls this helper). Missing fields default to 0.0 / inactive.
+fn audio_source_sample_from_neteq(neteq: &Value) -> AudioSourceSample {
+    let expand_per_sec = neteq
+        .get("network")
+        .and_then(|n| n.get("operation_counters"))
+        .and_then(|oc| oc.get("expand_per_sec"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let packets_per_sec = neteq
+        .get("packets_per_sec")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let buffer_ms = neteq
+        .get("current_buffer_size_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let active = audio_source_active(packets_per_sec);
+    // Clamp to 0–100: concealment cannot exceed 100% by definition, and
+    // unsynchronised window rollovers can momentarily inflate the ratio.
+    let concealment_pct = if active {
+        ((expand_per_sec / packets_per_sec) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    AudioSourceSample {
+        concealment_pct,
+        buffer_ms,
+        active,
+    }
+}
+
+/// Format the periodic AUDIO_SCALE diagnostic line (issue 1853), or `None` when
+/// the receiver has no ACTIVE audio source this tick.
+///
+/// A `sources=0` line (empty room, everyone muted, or all senders in DTX
+/// silence) is pure noise for the meeting-log analyzer, so it is suppressed: the
+/// line is emitted only when at least one source is actively delivering audio.
+/// Every field is a machine-parseable `key=value` token in the same style
+/// scripts/meeting_quality_xref.py already parses (e.g. the prejoin
+/// `cores=`/`network=` preamble):
+///
+/// - `sources`       number of ACTIVE audio sources this tick (the concurrent
+///   source load the receiver is decoding; silent/DTX peers are excluded, so
+///   this shares its denominator with every field below).
+/// - `concealed`     how many active sources exceed
+///   [`AUDIO_SCALE_CONCEAL_THRESHOLD_PCT`].
+/// - `worst_pct`     max concealment over active sources (1 decimal).
+/// - `mean_pct`      mean concealment over active sources (1 decimal).
+/// - `downlink_mbps` receiver downlink estimate, or `-1.0` when unknown (`<= 0`,
+///   matching the health packet's `> 0` known-gate).
+/// - `min_buf_ms`    min NetEQ buffer depth over active sources (1 decimal).
+/// - `mean_buf_ms`   mean NetEQ buffer depth over active sources (1 decimal).
+/// - `cores`         `navigator.hardwareConcurrency`, or `-1` when unknown (0).
+fn format_audio_scale_line(
+    samples: &[AudioSourceSample],
+    downlink_mbps: f64,
+    cores: u32,
+) -> Option<String> {
+    let active: Vec<&AudioSourceSample> = samples.iter().filter(|s| s.active).collect();
+    if active.is_empty() {
+        return None;
+    }
+    let n = active.len() as f64;
+    let concealed = active
+        .iter()
+        .filter(|s| s.concealment_pct > AUDIO_SCALE_CONCEAL_THRESHOLD_PCT)
+        .count();
+    let worst_pct = active
+        .iter()
+        .map(|s| s.concealment_pct)
+        .fold(f64::MIN, f64::max);
+    let mean_pct = active.iter().map(|s| s.concealment_pct).sum::<f64>() / n;
+    let min_buf_ms = active.iter().map(|s| s.buffer_ms).fold(f64::MAX, f64::min);
+    let mean_buf_ms = active.iter().map(|s| s.buffer_ms).sum::<f64>() / n;
+    let downlink = if downlink_mbps > 0.0 {
+        downlink_mbps
+    } else {
+        -1.0
+    };
+    let cores = if cores > 0 { i64::from(cores) } else { -1 };
+    Some(format!(
+        "[AUDIO_SCALE] sources={} concealed={} worst_pct={:.1} mean_pct={:.1} downlink_mbps={:.1} min_buf_ms={:.1} mean_buf_ms={:.1} cores={}",
+        active.len(), concealed, worst_pct, mean_pct, downlink, min_buf_ms, mean_buf_ms, cores,
+    ))
+}
+
 fn populate_received_layers(
     packet: &mut PbHealthPacket,
     received_layers: &HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
@@ -1319,6 +1466,12 @@ impl HealthReporter {
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
 
+            // issue 1853: last-emit clock (ms since epoch) for the ~5s-paced
+            // AUDIO_SCALE diagnostic. A loop-local (not a struct field) because it
+            // only needs to persist across iterations of this single spawned task;
+            // the modulo lives inline below off the shared health-report clock.
+            let mut last_audio_scale_log_ms: u64 = 0;
+
             loop {
                 // Wait for the interval
                 gloo_timers::future::TimeoutFuture::new(interval_ms as u32).await;
@@ -1509,6 +1662,22 @@ impl HealthReporter {
                         client_meta.cpu_throttled =
                             compute_cpu_throttled(client_meta.capability_score, client_meta.cores);
 
+                        // issue 1853: decide whether this tick emits the ~5s-paced
+                        // AUDIO_SCALE line, and snapshot the two receiver scalars it
+                        // needs BEFORE `client_meta` is moved into create_health_packet.
+                        let audio_scale_now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let emit_audio_scale = audio_scale_now_ms
+                            .saturating_sub(last_audio_scale_log_ms)
+                            >= AUDIO_SCALE_LOG_INTERVAL_MS;
+                        if emit_audio_scale {
+                            last_audio_scale_log_ms = audio_scale_now_ms;
+                        }
+                        let audio_scale_downlink_mbps = client_meta.network_downlink;
+                        let audio_scale_cores = client_meta.cores;
+
                         let health_packet = Self::create_health_packet(
                             &session_id_val,
                             &meeting_id,
@@ -1526,6 +1695,9 @@ impl HealthReporter {
                             adaptive_video_tier.borrow().load(Ordering::Relaxed),
                             adaptive_audio_tier.borrow().load(Ordering::Relaxed),
                             videocall_transport::webtransport::datagram_drop_count(),
+                            videocall_transport::webtransport::unistream_bytes_offered_total(),
+                            videocall_transport::webtransport::unistream_bytes_drained_total(),
+                            videocall_transport::webtransport::unistream_stale_delta_drop_count(),
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
                             queue_depth_report_val,
@@ -1572,6 +1744,34 @@ impl HealthReporter {
                             // keep-list.
                             trace!("Sent health packet for session: {session_id_val}");
                         }
+
+                        // issue 1853 (instrumentation-only): once per
+                        // AUDIO_SCALE_LOG_INTERVAL_MS, summarize this receiver's
+                        // audio-scale posture in one greppable line so the meeting
+                        // analyzer can correlate concealment against concurrent
+                        // source count, downlink estimate, and per-source buffer
+                        // depth. Samples are built from the SAME `health_map`
+                        // snapshot create_health_packet just read (same tick, no
+                        // stale mixing) via the SAME helper, so the aggregate and the
+                        // per-stream audio_concealment_pct stay in lockstep. Emitted
+                        // at debug! like its sibling "audio health (buffer:)" sample.
+                        if emit_audio_scale {
+                            let audio_samples: Vec<AudioSourceSample> = health_map
+                                .values()
+                                .filter_map(|hd| {
+                                    hd.last_neteq_stats
+                                        .as_ref()
+                                        .map(audio_source_sample_from_neteq)
+                                })
+                                .collect();
+                            if let Some(line) = format_audio_scale_line(
+                                &audio_samples,
+                                audio_scale_downlink_mbps,
+                                audio_scale_cores,
+                            ) {
+                                debug!("{line}");
+                            }
+                        }
                     }
                 } else {
                     debug!("HealthReporter dropped, stopping health reporting");
@@ -1600,6 +1800,9 @@ impl HealthReporter {
         adaptive_video_tier: u32,
         adaptive_audio_tier: u32,
         datagram_drops_total: u64,
+        unistream_bytes_offered_total: u64,
+        unistream_bytes_drained_total: u64,
+        unistream_stale_delta_drops_total: u64,
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
         encoder_queue_depth_report: f64,
@@ -1700,6 +1903,9 @@ impl HealthReporter {
         pb.adaptive_video_tier = Some(adaptive_video_tier);
         pb.adaptive_audio_tier = Some(adaptive_audio_tier);
         pb.datagram_drops_total = Some(datagram_drops_total);
+        pb.unistream_bytes_offered_total = Some(unistream_bytes_offered_total);
+        pb.unistream_bytes_drained_total = Some(unistream_bytes_drained_total);
+        pb.unistream_stale_delta_drops_total = Some(unistream_stale_delta_drops_total);
         pb.websocket_drops_total = Some(websocket_drops_total);
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
@@ -2097,28 +2303,18 @@ impl HealthReporter {
                     ns.playout_latency_ms = v;
                 }
 
-                // Calculate audio packet loss percentage from WINDOWED rates (not lifetime)
-                // Use expand_per_sec (concealment events/sec) and packets_per_sec (packets/sec)
-                let expand_per_sec = neteq
-                    .get("network")
-                    .and_then(|n| n.get("operation_counters"))
-                    .and_then(|oc| oc.get("expand_per_sec"))
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-
-                let packets_per_sec = neteq
-                    .get("packets_per_sec")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-
-                // Calculate loss % from windowed rates (resets every ~1 second).
-                // Gate on >= 2.0 pps (matches quality-score gate): below that the
-                // speaker is likely in DTX silence and the ratio is unreliable.
-                // Clamp to 0–100: packet loss cannot exceed 100% by definition,
-                // and unsynchronised window rollovers can momentarily inflate it.
-                if packets_per_sec >= 2.0 {
-                    ps.audio_concealment_pct =
-                        ((expand_per_sec / packets_per_sec) * 100.0).clamp(0.0, 100.0);
+                // Windowed receive-side audio concealment for this source, from
+                // WINDOWED rates (not lifetime): expand_per_sec / packets_per_sec.
+                // issue 1853: computed via the shared `audio_source_sample_from_neteq`
+                // helper (same >= AUDIO_ACTIVE_PPS_GATE pps gate — below that the
+                // speaker is likely in DTX silence and the ratio is unreliable — and
+                // same 0–100 clamp) so the per-stream `audio_concealment_pct`
+                // published here and the aggregate AUDIO_SCALE line emitted by the
+                // report loop can never drift. Only set when active; otherwise the
+                // proto field stays at its 0.0 default.
+                let audio_sample = audio_source_sample_from_neteq(neteq);
+                if audio_sample.active {
+                    ps.audio_concealment_pct = audio_sample.concealment_pct;
                 }
 
                 if let Some(network) = neteq.get("network") {
@@ -2505,6 +2701,247 @@ mod tests {
     use protobuf::Message;
     use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
 
+    // ── issue 1853: AUDIO_SCALE instrumentation ──────────────────────────────
+
+    /// One ACTIVE `AudioSourceSample` with the given concealment% and buffer
+    /// depth (test convenience).
+    fn active_sample(concealment_pct: f64, buffer_ms: f64) -> AudioSourceSample {
+        AudioSourceSample {
+            concealment_pct,
+            buffer_ms,
+            active: true,
+        }
+    }
+
+    /// Full byte-exact pin of the AUDIO_SCALE line. The meeting analyzer greps
+    /// individual `key=value` tokens, so ANY format drift (a renamed key, a lost
+    /// token, a changed decimal count) silently breaks field analysis — this
+    /// asserts the ENTIRE line. Dropping any token from the format string fails
+    /// here. Arithmetic: concealment [20,40,60] => mean 40.0 / worst 60.0;
+    /// buffers [100,200,300] => min 100.0 / mean 200.0 (all distinct, so a
+    /// min↔mean or mean↔worst swap also fails).
+    #[test]
+    fn audio_scale_line_byte_exact_format() {
+        let samples = [
+            active_sample(20.0, 100.0),
+            active_sample(40.0, 200.0),
+            active_sample(60.0, 300.0),
+        ];
+        let line = format_audio_scale_line(&samples, 5.5, 8)
+            .expect(">=1 active source must produce a line");
+        assert_eq!(
+            line,
+            "[AUDIO_SCALE] sources=3 concealed=3 worst_pct=60.0 mean_pct=40.0 downlink_mbps=5.5 min_buf_ms=100.0 mean_buf_ms=200.0 cores=8"
+        );
+    }
+
+    /// Unknown downlink (`<= 0`) and unknown cores (`0`) render as the `-1.0` and
+    /// `-1` sentinels — never a fabricated zero. Fails if either sentinel branch
+    /// is dropped.
+    #[test]
+    fn audio_scale_line_unknown_downlink_and_cores_sentinels() {
+        let samples = [active_sample(50.0, 150.0)];
+        let line = format_audio_scale_line(&samples, 0.0, 0)
+            .expect(">=1 active source must produce a line");
+        assert_eq!(
+            line,
+            "[AUDIO_SCALE] sources=1 concealed=1 worst_pct=50.0 mean_pct=50.0 downlink_mbps=-1.0 min_buf_ms=150.0 mean_buf_ms=150.0 cores=-1"
+        );
+    }
+
+    /// The `concealed` count uses a STRICT `>` at exactly 10.0%
+    /// (AUDIO_SCALE_CONCEAL_THRESHOLD_PCT): a source sitting on the threshold is
+    /// NOT counted, one just above it is. Fails if the comparison flips to `>=`
+    /// (both would count => concealed=2) or the constant moves off 10.0.
+    #[test]
+    fn audio_scale_conceal_threshold_is_strict_at_10() {
+        let samples = [active_sample(10.0, 120.0), active_sample(10.1, 120.0)];
+        let line = format_audio_scale_line(&samples, 3.0, 4)
+            .expect(">=1 active source must produce a line");
+        assert!(
+            line.contains(" concealed=1 "),
+            "exactly-10.0% must not count, only 10.1%; got: {line}"
+        );
+    }
+
+    /// No ACTIVE source this tick (empty room / everyone muted / all DTX) => no
+    /// line at all. A `sources=0` line is pure analyzer noise, so it is
+    /// suppressed rather than emitted.
+    #[test]
+    fn audio_scale_line_none_when_no_active_sources() {
+        assert_eq!(format_audio_scale_line(&[], 5.0, 8), None);
+        let inactive = [AudioSourceSample {
+            concealment_pct: 0.0,
+            buffer_ms: 0.0,
+            active: false,
+        }];
+        assert_eq!(format_audio_scale_line(&inactive, 5.0, 8), None);
+    }
+
+    /// Inactive sources are excluded from EVERY aggregate. A muted peer showing a
+    /// stale 100% concealment / 0ms buffer must not pollute sources, worst_pct,
+    /// mean_pct, or min_buf_ms. The expected line is identical to the all-active
+    /// case above precisely because the outlier is dropped.
+    #[test]
+    fn audio_scale_aggregates_only_active_sources() {
+        let samples = [
+            active_sample(20.0, 100.0),
+            active_sample(40.0, 200.0),
+            active_sample(60.0, 300.0),
+            AudioSourceSample {
+                concealment_pct: 100.0,
+                buffer_ms: 0.0,
+                active: false,
+            },
+        ];
+        let line = format_audio_scale_line(&samples, 5.5, 8)
+            .expect(">=1 active source must produce a line");
+        assert_eq!(
+            line,
+            "[AUDIO_SCALE] sources=3 concealed=3 worst_pct=60.0 mean_pct=40.0 downlink_mbps=5.5 min_buf_ms=100.0 mean_buf_ms=200.0 cores=8"
+        );
+    }
+
+    /// The active gate is exactly `packets_per_sec >= AUDIO_ACTIVE_PPS_GATE`
+    /// (2.0): 2.0 is active, anything below is not. This is the SAME gate the
+    /// per-stream audio_concealment_pct uses, so the two cannot diverge. Fails if
+    /// the constant moves off 2.0 or the comparison loosens.
+    #[test]
+    fn audio_source_active_gate_pinned_at_2_pps() {
+        assert!(audio_source_active(2.0), "2.0 pps must be active");
+        assert!(audio_source_active(50.0));
+        assert!(
+            !audio_source_active(1.999),
+            "just below 2.0 must be inactive"
+        );
+        assert!(!audio_source_active(0.0));
+    }
+
+    /// Build a HealthPacket through the production `create_health_packet` path
+    /// from a NetEQ JSON, and return the on-the-wire
+    /// `(PeerStats.audio_concealment_pct, NetEqStats.current_buffer_size_ms)`.
+    fn health_packet_audio_stats(neteq: Value) -> (f64, f64) {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.update_audio_stats(neteq);
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
+            0.0, // encoder_queue_depth_report
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
+            None,
+            None,
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            0,              // active_audio_layers (#1561)
+            HashMap::new(), // received_layers (#1561)
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf");
+        let ps = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present");
+        let buf = ps
+            .neteq_stats
+            .as_ref()
+            .map(|n| n.current_buffer_size_ms)
+            .unwrap_or(0.0);
+        (ps.audio_concealment_pct, buf)
+    }
+
+    /// LOCKSTEP: the AUDIO_SCALE sample's concealment% and buffer depth must
+    /// equal what the production `create_health_packet` path puts on the wire for
+    /// the same NetEQ JSON (both go through `audio_source_sample_from_neteq`). If
+    /// the shared helper and the per-stream mapping ever diverge (different gate,
+    /// clamp, or field), the `concealed`/`worst`/`mean` counts in AUDIO_SCALE
+    /// would stop matching the per-stream audio_concealment_pct the analyzer ALSO
+    /// reads — this test breaks first.
+    #[test]
+    fn audio_scale_sample_matches_health_packet_concealment() {
+        // 2 expand/s over 10 pkt/s => 20% concealment; 200ms buffer.
+        let neteq = json!({
+            "current_buffer_size_ms": 200.0,
+            "packets_per_sec": 10.0,
+            "network": { "operation_counters": { "expand_per_sec": 2.0 } },
+        });
+        let sample = audio_source_sample_from_neteq(&neteq);
+        assert!(sample.active);
+        let (proto_pct, proto_buf) = health_packet_audio_stats(neteq);
+        assert!(
+            (sample.concealment_pct - proto_pct).abs() < 1e-9,
+            "helper {} vs proto {}",
+            sample.concealment_pct,
+            proto_pct
+        );
+        assert!((sample.concealment_pct - 20.0).abs() < 1e-9);
+        assert!((sample.buffer_ms - proto_buf).abs() < 1e-9);
+        assert!((sample.buffer_ms - 200.0).abs() < 1e-9);
+    }
+
+    /// Below the pps gate the production path leaves audio_concealment_pct at 0.0
+    /// AND the helper reports inactive with 0.0 — verified in lockstep so a
+    /// DTX-silent source never inflates the AUDIO_SCALE aggregates.
+    #[test]
+    fn audio_scale_sample_inactive_below_gate_matches_health_packet() {
+        // 1.0 pkt/s is below the 2.0 gate: concealment must NOT be computed.
+        let neteq = json!({
+            "current_buffer_size_ms": 120.0,
+            "packets_per_sec": 1.0,
+            "network": { "operation_counters": { "expand_per_sec": 5.0 } },
+        });
+        let sample = audio_source_sample_from_neteq(&neteq);
+        assert!(!sample.active, "1.0 pps is below the gate");
+        assert_eq!(sample.concealment_pct, 0.0);
+        let (proto_pct, _) = health_packet_audio_stats(neteq);
+        assert_eq!(
+            proto_pct, 0.0,
+            "production path must leave concealment at 0.0 below the gate"
+        );
+    }
+
     #[test]
     fn cpu_throttled_boundary_and_missing_inputs() {
         assert_eq!(compute_cpu_throttled(149, 1), Some(true));
@@ -2639,6 +3076,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -2726,6 +3166,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -2796,6 +3239,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -2904,6 +3350,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3011,6 +3460,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3043,6 +3495,111 @@ mod tests {
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #1737 Phase 0: build a HealthPacket through the production path with the
+    /// given unistream offered/drained byte totals, then round-trip it through
+    /// protobuf so the assertion is on exactly what goes on the wire.
+    fn health_packet_with_unistream_bytes(
+        offered_bytes: u64,
+        drained_bytes: u64,
+        stale_delta_drops: u64,
+    ) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,                 // datagram_drops_total
+            offered_bytes,     // unistream_bytes_offered_total (#1737)
+            drained_bytes,     // unistream_bytes_drained_total (#1737)
+            stale_delta_drops, // unistream_stale_delta_drops_total (#1737 Phase 1)
+            0,                 // websocket_drops_total
+            0,                 // keyframe_requests_sent_total
+            0.0,               // encoder_queue_depth_report
+            0.0,               // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
+            None,
+            None,           // agent_memory_bytes
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            0,              // active_audio_layers (#1561)
+            HashMap::new(), // received_layers (#1561)
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #1737 Phase 0: the two new unistream byte totals must survive the encode
+    /// -> wire -> decode round-trip on the correct wire tags and in the correct
+    /// argument slots. DISTINCT non-zero values (offered != drained) are used so
+    /// a tag collision, a generated-code mistake, or an offered/drained argument
+    /// transposition in `create_health_packet` all fail this test — the zero-only
+    /// coverage in the sibling builder tests cannot catch any of those.
+    ///
+    /// MUTATION: swapping the offered/drained/stale-drop arguments (or dropping any
+    /// `pb.unistream_*_total = Some(..)` assignment) makes the decoded value wrong
+    /// or `None`, failing the corresponding assertion. The #1737 Phase-1
+    /// `unistream_stale_delta_drops_total` (field 104) is covered with a third
+    /// distinct value so a tag collision or arg transposition against the two
+    /// Phase-0 byte totals is also caught.
+    #[test]
+    fn create_health_packet_roundtrips_unistream_byte_totals() {
+        let pb = health_packet_with_unistream_bytes(5000, 1200, 37);
+        assert_eq!(
+            pb.unistream_bytes_offered_total,
+            Some(5000),
+            "offered byte total must round-trip as Some(5000) on its own wire tag"
+        );
+        assert_eq!(
+            pb.unistream_bytes_drained_total,
+            Some(1200),
+            "drained byte total must round-trip as Some(1200) — distinct from offered, \
+             so an offered/drained transposition is caught"
+        );
+        assert_eq!(
+            pb.unistream_stale_delta_drops_total,
+            Some(37),
+            "stale-delta-drops total must round-trip as Some(37) on field 104 — distinct \
+             from the byte totals so a tag collision or arg transposition is caught"
+        );
     }
 
     fn health_packet_with_camera_playout_stats(fps_received: f64) -> PbHealthPacket {
@@ -3080,6 +3637,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3394,6 +3954,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3523,6 +4086,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3635,6 +4201,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,

@@ -218,6 +218,52 @@ const _: () = assert!(MAX_KEYFRAME_LESS_HOLD_MS > MAX_PLAYOUT_AGE_MS);
 /// keyframe even had a chance to arrive — thrashing the decode pipeline.
 const _: () = assert!(KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS > MAX_KEYFRAME_LESS_HOLD_MS);
 
+/// Tick-starvation gap threshold (ms): a `find_and_move_continuous_frames` poll whose wall-clock
+/// gap since the PREVIOUS poll exceeds this is a "starvation-resume" poll — the decode worker's
+/// ~10ms `setInterval` (and its insert-driven polls) stopped sampling for that long and just
+/// resumed (issue #1851).
+///
+/// The field motivation (Labs_Planning 2026-07-15): the #1662 keyframe-less hold ceiling is
+/// evaluated ONLY inside `find_and_move_continuous_frames`, which is driven ONLY by the worker's
+/// ~10ms tick (`JITTER_BUFFER_CHECK_INTERVAL_MS` in `bin/worker_decoder.rs`). When that tick is
+/// starved — a backgrounded-tab timer clamp/freeze, or the worker event loop blocked — the head
+/// age is never sampled, so the ceiling escalation cannot fire. A field log showed `head_age`
+/// jumping 1,808ms → 103,328ms with NO intermediate tick: ~102s of frozen video on a build that
+/// already contained the ceiling, because the escalation was tick-gated. On the resume tick this
+/// signal lets the escalation fire IMMEDIATELY and cooldown-UNGATED (see
+/// `decide_keyframe_less_escalation`) rather than deferring recovery behind a now-stale cooldown.
+///
+/// Rationale for 2000ms — it must sit FAR above worst-case legitimate cadence jitter yet clearly
+/// BELOW the recovery deadlines it accelerates:
+/// - It is 200× the 10ms tick cadence (`JITTER_BUFFER_CHECK_INTERVAL_MS`), so a merely slow/jittery
+///   worker never trips it. Even a moderately backgrounded tab whose worker `setInterval` is clamped
+///   to the ~1s minimum keeps polling at ~1000ms gaps — comfortably under 2000ms, so a 1s clamp is
+///   NOT misread as starvation (the ceiling still works normally at a 1s cadence, escalating within
+///   ~6-7s). Only a true multi-second freeze/clamp crosses this.
+/// - It is BELOW `MAX_KEYFRAME_LESS_HOLD_MS` (6000ms) and `KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS`
+///   (8000ms), which is what makes the cooldown-bypass meaningful: a resume gap can exceed this
+///   threshold while a recent prior escalation still has the 8s cooldown warm, so the resume poll
+///   must be able to bypass that cooldown. The compile-time assert below pins the ordering.
+/// - The bypass it enables is COOLDOWN-only. It does NOT lower the ceiling: a resume poll still
+///   escalates only when the effective freeze-age is at/above `MAX_KEYFRAME_LESS_HOLD_MS`
+///   (`signal_keyframe_less_ceiling`), so a large `tick_gap` right after a benign restart (fresh
+///   head, freeze-age ~0) cannot escalate. This keeps the bypass safe independent of the flush
+///   choice for the tick clock.
+const TICK_STARVATION_GAP_MS: f64 = 2000.0;
+
+/// Compile-time guard on the #1851 tick-starvation invariant: the resume-gap threshold MUST sit
+/// STRICTLY BELOW both the keyframe-less ceiling it accelerates and the escalation cooldown it
+/// bypasses. Below the ceiling so a resume poll can never itself be the thing that trips the ceiling
+/// (the effective freeze-age must still cross `MAX_KEYFRAME_LESS_HOLD_MS` independently), and below
+/// the cooldown so a resume gap larger than the threshold can still occur while the cooldown is warm
+/// — the exact case the bypass exists for. If a future re-tune inverted either, the fast-path would
+/// be dead code (no gap could both exceed the threshold and leave the cooldown warm) or would
+/// pre-empt the ceiling.
+const _: () = assert!(
+    TICK_STARVATION_GAP_MS < MAX_KEYFRAME_LESS_HOLD_MS
+        && TICK_STARVATION_GAP_MS < KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS
+);
+
 /// Keyframe-less hold-ceiling escalation cooldown gate (issue #1662), as a PURE function so the
 /// hysteresis decision is natively unit-testable off the wasm-only worker path that owns the anchor.
 ///
@@ -242,42 +288,74 @@ pub fn keyframe_less_escalation_due(last_escalation_ms: Option<u128>, now_ms: u1
     }
 }
 
-/// Pure decision for the worker's keyframe-less escalation gate (issue #1662), extracted so the
-/// load-bearing WIRING — "if the cooldown allows it, advance the anchor to `now_ms` AND emit an
-/// `escalated: true` diagnostic" — is natively unit-testable instead of living only in the wasm-only
-/// `bin/worker_decoder.rs` hook (#1662 review follow-up).
+/// Inputs to the keyframe-less hold-ceiling escalation gate (issues #1662/#1851), passed from the
+/// buffer's `signal_keyframe_less_ceiling` to the worker-owned `request_escalation` hook on each
+/// poll where the effective freeze-age is at/above `MAX_KEYFRAME_LESS_HOLD_MS`.
 ///
-/// Given the worker-held cooldown anchor (`last_escalation_ms`), the current `now_ms`, and the
-/// `head_age_ms` that crossed the ceiling, returns:
-/// - `Some((now_ms, FreshnessSkip { escalated: true, .. }))` when [`keyframe_less_escalation_due`]
-///   says an escalation is permitted — the first element is the NEW anchor the caller must store
-///   (so the cooldown survives the buffer rebuild the reset triggers), the second is the diagnostic
-///   the caller must force-post (immediately, bypassing the buffer throttle). The caller then fires
-///   the decoder reset.
-/// - `None` when the cooldown has not elapsed — the caller does nothing (no anchor update, no post,
-///   no reset).
+/// A struct rather than positional `f64`s because the gate now needs three correlated values whose
+/// argument order would otherwise be easy to transpose.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EscalationSignal {
+    /// Effective freeze-age (ms): `max(head_of_line_age, keyframe_less_hold_duration)` — the value
+    /// the ceiling was tested against and that is stamped into the escalation diagnostic.
+    pub effective_age_ms: f64,
+    /// Wall-clock gap (ms) since the previous `find_and_move_continuous_frames` poll (issue #1851).
+    /// A gap above `TICK_STARVATION_GAP_MS` marks this as a starvation-resume poll, which bypasses
+    /// the escalation cooldown one-shot.
+    pub tick_gap_ms: f64,
+    /// The buffer's current poll time (ms) — the SAME `Date::now()`-derived clock the worker's
+    /// cooldown anchor is stored on, used as the cooldown "now" so the gate math is consistent with
+    /// the poll that raised the signal (and so the decision is fully native-testable).
+    pub now_ms: u128,
+}
+
+/// Pure decision for the worker's keyframe-less escalation gate (issues #1662/#1851), extracted so
+/// the load-bearing WIRING — "if the cooldown allows it (or a starvation-resume poll bypasses it),
+/// advance the anchor to `now_ms` AND emit an `escalated: true` diagnostic" — is natively
+/// unit-testable instead of living only in the wasm-only `bin/worker_decoder.rs` hook (#1662 review
+/// follow-up).
 ///
-/// The returned `FreshnessSkip` carries `keyframe_seq: None` (still no buffered keyframe) and
-/// `dropped: 0` (the escalation event itself drops nothing; the tick's eviction, if any, is recorded
-/// separately by the buffer's routine skip path). Keeping the anchor-advance and the
-/// `escalated: true` stamp in ONE pure function means a native test pins both at once — catching the
-/// two wiring regressions a wasm-only hook would hide: forgetting to advance the anchor, and posting
-/// with `escalated: false`.
+/// Given the worker-held cooldown anchor (`last_escalation_ms`) and the [`EscalationSignal`],
+/// returns:
+/// - `Some((now_ms, FreshnessSkip { escalated: true, .. }))` when an escalation is permitted —
+///   either [`keyframe_less_escalation_due`] says the cooldown has elapsed, OR
+///   `signal.tick_gap_ms > TICK_STARVATION_GAP_MS` (a starvation-resume poll bypasses the cooldown,
+///   issue #1851). The first element is the NEW anchor the caller must store (so the cooldown
+///   survives the buffer rebuild the reset triggers), the second is the diagnostic the caller must
+///   force-post (immediately, bypassing the buffer throttle). The caller then fires the decoder reset.
+/// - `None` when the cooldown has not elapsed AND this is not a starvation-resume poll — the caller
+///   does nothing (no anchor update, no post, no reset).
+///
+/// The starvation-resume bypass is ONE-SHOT and cannot storm: it is keyed to THIS poll's
+/// `tick_gap_ms`, so the next normal-cadence poll (gap ~10ms) is cooldown-gated again, and because a
+/// bypassed escalation still ADVANCES the anchor to `now_ms`, any immediately-following normal poll
+/// that also crosses the ceiling is throttled by the freshly-set cooldown. Nor can it worsen the
+/// #1479 PLI backoff: a worker whose tick was starved for seconds was, by definition, not sampling
+/// the buffer and therefore not emitting PLIs during the gap, so there is no in-flight request rate
+/// for a single resume escalation to compound.
+///
+/// The returned `FreshnessSkip` carries `keyframe_seq: None` (still no buffered keyframe), `dropped:
+/// 0` (the escalation event itself drops nothing; the poll's eviction, if any, is recorded
+/// separately by the buffer's routine skip path), and `signal.tick_gap_ms` (so field logs can
+/// attribute a tick-starvation freeze). Keeping the anchor-advance, the `escalated: true` stamp, the
+/// bypass, and the `tick_gap` stamp in ONE pure function means a native test pins all at once —
+/// catching the wiring regressions a wasm-only hook would hide.
 pub fn decide_keyframe_less_escalation(
     last_escalation_ms: Option<u128>,
-    now_ms: u128,
-    head_age_ms: f64,
+    signal: EscalationSignal,
 ) -> Option<(u128, FreshnessSkip)> {
-    if !keyframe_less_escalation_due(last_escalation_ms, now_ms) {
+    let starvation_resume = signal.tick_gap_ms > TICK_STARVATION_GAP_MS;
+    if !starvation_resume && !keyframe_less_escalation_due(last_escalation_ms, signal.now_ms) {
         return None;
     }
     Some((
-        now_ms,
+        signal.now_ms,
         FreshnessSkip {
-            head_age_ms,
+            head_age_ms: signal.effective_age_ms,
             keyframe_seq: None,
             dropped: 0,
             escalated: true,
+            tick_gap_ms: signal.tick_gap_ms,
         },
     ))
 }
@@ -517,6 +595,14 @@ pub struct FreshnessSkip {
     /// freshness skip from a bounded-freeze escalation, and so a future "reconnecting video" UI
     /// state could key off it.
     pub escalated: bool,
+    /// Wall-clock gap (ms) since the previous `find_and_move_continuous_frames` poll (issue #1851).
+    /// A few ms under the normal ~10ms worker cadence; seconds-large on the FIRST poll after the
+    /// worker tick was starved (backgrounded-tab clamp/freeze, or the worker event loop blocked).
+    /// Carried on every skip — routine and escalation alike — so field analysis can attribute a
+    /// TICK-starvation freeze (huge `tick_gap_ms` on the resume poll) apart from a DELIVERY-starvation
+    /// freeze (frames not arriving, small `tick_gap_ms`); it is also the signal that let this skip's
+    /// escalation, if any, bypass the cooldown one-shot (see `decide_keyframe_less_escalation`).
+    pub tick_gap_ms: f64,
 }
 
 pub struct JitterBuffer<T> {
@@ -647,6 +733,21 @@ pub struct JitterBuffer<T> {
     /// which was the 1:1 coupling that created the storm.
     awaiting_proactive_keyframe: bool,
 
+    /// Stream-open one-shot for the proactive keyframe request (issue 1899 / discussion 1960).
+    /// `true` once the buffer has fired its FIRST-frame keyframe request for the current stream —
+    /// the immediate request sent when the very first frame(s) of a never-decoded stream arrive as
+    /// DELTAS with no buffered keyframe (the mid-GOP late-joiner shape). Without it a fresh joiner
+    /// into an active share buffers undecodable deltas and waits the full `MAX_PLAYOUT_AGE_MS`
+    /// (~1.8s) freshness deadline before the keyframe-less eviction path fires its first PLI; the
+    /// intended `peer_decode_manager` late-joiner accelerator that would have covered this is a
+    /// no-op on the wasm path (`WasmDecoder::is_waiting_for_keyframe` always returns `false`), so
+    /// the buffer is the only place that can see "frames present, no keyframe, never decoded".
+    /// Fires at most ONCE per stream: set here on fire, re-armed by `flush()` (stream restart) so a
+    /// re-published share requests again. NOT fired when the first insert IS a keyframe (recovery is
+    /// already in hand) — the buffered-keyframe guard below suppresses it. Coordinated with the
+    /// #1479 `awaiting_proactive_keyframe` gate so it and the eviction path cannot double-fire.
+    stream_open_keyframe_request_fired: bool,
+
     /// Wall-clock (ms) at which the CURRENT continuous keyframe-less-stale hold began (issue #1903).
     /// Set on the first `enforce_freshness_deadline` tick that enters the keyframe-less branch
     /// (stale head, NO buffered keyframe) while this is `None`; cleared the instant a keyframe is
@@ -666,11 +767,29 @@ pub struct JitterBuffer<T> {
     /// progress.
     keyframe_less_hold_since_ms: Option<u128>,
 
-    /// Keyframe-less hold-ceiling escalation hook (issue #1662). Invoked with the effective
-    /// freeze-age (the larger of the buffered `head_age_ms` and the continuous keyframe-less-hold
-    /// duration, issue #1903) on EVERY tick that the keyframe-less held-last-good freeze is at/above
+    /// Wall-clock (ms) of the PREVIOUS `find_and_move_continuous_frames` poll (issue #1851). Both the
+    /// worker's ~10ms `setInterval` polls and its insert-driven polls advance this. `current_time -
+    /// last_tick` is the per-poll `tick_gap_ms`: a few ms under the normal cadence, seconds-large on
+    /// the first poll after the worker tick was STARVED (backgrounded-tab timer clamp/freeze, or the
+    /// worker event loop blocked). The #1662 keyframe-less ceiling is evaluated ONLY inside this poll,
+    /// so while the tick is starved the head age is never sampled and the escalation cannot fire; a
+    /// large `tick_gap_ms` on the resume poll is what lets the escalation fire immediately and
+    /// cooldown-ungated then (see `decide_keyframe_less_escalation`), and it is stamped into every
+    /// `FreshnessSkip` for field attribution.
+    ///
+    /// Lifecycle: `None` on `new()` and after `flush()` — the same "no prior poll to measure from"
+    /// state — so the FIRST poll after construction OR a stream restart reads `tick_gap_ms = 0` and is
+    /// never misread as a starvation resume. A successful escalation resets the decoder, which rebuilds
+    /// the whole buffer via `new()`, so the post-reset buffer's first poll likewise reads 0 (no
+    /// phantom re-escalation off the reset boundary).
+    last_tick_time_ms: Option<u128>,
+
+    /// Keyframe-less hold-ceiling escalation hook (issues #1662/#1851). Invoked with an
+    /// [`EscalationSignal`] (effective freeze-age, this poll's `tick_gap_ms`, and the poll `now_ms`)
+    /// on EVERY poll that the keyframe-less held-last-good freeze is at/above
     /// `MAX_KEYFRAME_LESS_HOLD_MS`. Returns `true` iff the worker GATED IN this escalation (cooldown
-    /// elapsed) — only then does the buffer call `self.decoder.reset()` for the actual recovery.
+    /// elapsed, OR a starvation-resume poll bypassed the cooldown) — only then does the buffer call
+    /// `self.decoder.reset()` for the actual recovery.
     ///
     /// The buffer is a pure *detector* (mirroring `request_keyframe`): it does NOT own the cooldown
     /// or the escalation diagnostic. Those live in the WORKER hook ([`bin/worker_decoder.rs`]) on
@@ -684,7 +803,7 @@ pub struct JitterBuffer<T> {
     /// thread-local mid-poll without panicking). Defaults to "never escalate" (`new`), so native/mock
     /// callers need not supply one; the worker injects the real one via
     /// [`JitterBuffer::with_recovery_hooks`].
-    request_escalation: Box<dyn Fn(f64) -> bool>,
+    request_escalation: Box<dyn Fn(EscalationSignal) -> bool>,
 
     /// Most recent freshness-deadline skip this poll produced (issue #1045), set by
     /// `enforce_freshness_deadline` and consumed by the worker via
@@ -756,14 +875,15 @@ impl<T> JitterBuffer<T> {
     }
 
     /// Like [`JitterBuffer::with_keyframe_request`] but also injects the keyframe-less hold-ceiling
-    /// escalation hook (issue #1662). The escalation hook is invoked with the current `head_age_ms`
-    /// on every tick the keyframe-less freeze is at/above `MAX_KEYFRAME_LESS_HOLD_MS`; the worker's
-    /// implementation owns the cooldown anchor (which must survive the buffer rebuild the reset
-    /// triggers) and the actual `reset()` + escalation diagnostic. See `request_escalation`.
+    /// escalation hook (issues #1662/#1851). The escalation hook is invoked with an
+    /// [`EscalationSignal`] on every poll the keyframe-less freeze is at/above
+    /// `MAX_KEYFRAME_LESS_HOLD_MS`; the worker's implementation owns the cooldown anchor (which must
+    /// survive the buffer rebuild the reset triggers) and the actual `reset()` + escalation
+    /// diagnostic. See `request_escalation`.
     pub fn with_recovery_hooks(
         decoder: Box<dyn Decodable<Frame = T>>,
         request_keyframe: Box<dyn Fn(f64)>,
-        request_escalation: Box<dyn Fn(f64) -> bool>,
+        request_escalation: Box<dyn Fn(EscalationSignal) -> bool>,
     ) -> Self {
         Self {
             buffered_frames: BTreeMap::new(),
@@ -783,7 +903,9 @@ impl<T> JitterBuffer<T> {
             last_keyframe_request_ms: None,
             consecutive_proactive_keyframe_requests: 0,
             awaiting_proactive_keyframe: false,
+            stream_open_keyframe_request_fired: false,
             keyframe_less_hold_since_ms: None,
+            last_tick_time_ms: None,
             last_freshness_skip: None,
             last_freshness_skip_emit_ms: None,
             pending_freshness_skip: None,
@@ -817,6 +939,10 @@ impl<T> JitterBuffer<T> {
         // visible: it is a strictly more severe event than a routine skip, so OR it in rather than
         // overwrite — a window that contained an escalation reports `escalated: true`.
         existing.escalated |= next.escalated;
+        // Keep the LARGEST tick_gap in the coalescing window (issue #1851): the starvation-resume
+        // poll is the informative one, so a window that contained it must report its gap rather than
+        // let a following normal-cadence skip overwrite it to ~10ms.
+        existing.tick_gap_ms = existing.tick_gap_ms.max(next.tick_gap_ms);
         existing
     }
 
@@ -927,6 +1053,42 @@ impl<T> JitterBuffer<T> {
         let fb = FrameBuffer::new(frame, arrival_time_ms);
         self.buffered_frames.insert(seq, fb);
 
+        // Stream-open immediate keyframe request (issue 1899 / discussion 1960). A never-decoded
+        // buffer that has accumulated frame(s) but holds NO keyframe cannot release anything (CASE 3
+        // in `find_and_move_continuous_frames` waits for the first keyframe), so it is frozen from
+        // the instant the stream opens. This is the mid-GOP late-joiner shape: a receiver joining a
+        // room where a share is ALREADY active starts receiving deltas with the keyframe long past.
+        // Rather than wait the full `MAX_PLAYOUT_AGE_MS` (~1.8s) for the keyframe-less eviction path
+        // to fire its first PLI, request a keyframe NOW, once, the moment we can prove "frames
+        // present, no keyframe, never decoded". The gap-driven and freshness-deadline paths remain
+        // the backstops; this only pulls the FIRST request earlier for the cold-open case.
+        //
+        // Bounded exactly like the eviction PLI it front-runs: ONE request per stream-open (the
+        // `stream_open_keyframe_request_fired` one-shot, re-armed only by `flush()`), gated by the
+        // #1479 `awaiting_proactive_keyframe` flag it sets, and routed through the SAME
+        // `request_keyframe` hook — so on the main thread it flows through the identical per-receiver
+        // PLI budget and relay per-(receiver,session) limiter as every other proactive request and
+        // cannot storm the publisher. Fires for BOTH transports (the hook is transport-agnostic).
+        if self.last_decoded_sequence_number.is_none()
+            && !self.stream_open_keyframe_request_fired
+            && !self.awaiting_proactive_keyframe
+            && !self.buffered_frames.values().any(|f| f.is_keyframe())
+        {
+            log::debug!(
+                "[JITTER_BUFFER] Stream opened with delta-only backlog and no keyframe; requesting a keyframe immediately (issue 1899)."
+            );
+            self.stream_open_keyframe_request_fired = true;
+            // Close the #1479 arrival gate so the ~10ms eviction tick does not fire a second,
+            // redundant PLI while this one is in flight; a keyframe arrival (or the gate timeout)
+            // reopens it. Anchor the throttle clock so the eviction path measures its backoff from
+            // this request, not from `None`.
+            self.awaiting_proactive_keyframe = true;
+            self.last_keyframe_request_ms = Some(arrival_time_ms);
+            // Head-of-line age is ~0 for a just-opened stream; a first-in-window request is always
+            // admitted by the main-thread budget regardless, so 0.0 is the honest value.
+            (self.request_keyframe)(0.0);
+        }
+
         self.find_and_move_continuous_frames(arrival_time_ms);
     }
 
@@ -948,6 +1110,19 @@ impl<T> JitterBuffer<T> {
     /// Checks the buffered frames and moves any continuous frames to the decodable queue.
     pub fn find_and_move_continuous_frames(&mut self, current_time_ms: u128) {
         let mut frames_were_moved = false;
+
+        // Tick-starvation gap (issue #1851): wall-clock since the previous poll. `None` on the first
+        // poll after `new()`/`flush()`/a reset-rebuild reads 0 (no prior poll to measure from), so a
+        // cold start or stream restart is never misread as a resume. `saturating_sub` guards a
+        // non-monotonic clock (a back-dated insert poll can precede a wall-clock tick, e.g. the
+        // #1022 stale-frame injection path) — that reads 0, never a spurious huge gap. Recorded
+        // BEFORE the release work so every skip this poll produces (routine and escalation) is
+        // stamped with the same gap, and updated unconditionally so the next poll measures from here.
+        let tick_gap_ms = match self.last_tick_time_ms {
+            Some(last) => current_time_ms.saturating_sub(last) as f64,
+            None => 0.0,
+        };
+        self.last_tick_time_ms = Some(current_time_ms);
 
         log::trace!(
             "[JB_POLL] Checking buffer. Last decoded: {:?}, Buffer size: {}, Target delay: {:.2}ms",
@@ -977,7 +1152,7 @@ impl<T> JitterBuffer<T> {
             // stale head can't be dropped (e.g. the chosen keyframe is already the head, or a stale
             // keyframe-less backlog), it returns `false` and we fall through to the normal release
             // gate instead of looping. This guarantees the loop terminates.
-            if self.enforce_freshness_deadline(current_time_ms) {
+            if self.enforce_freshness_deadline(current_time_ms, tick_gap_ms) {
                 continue;
             }
 
@@ -1200,7 +1375,7 @@ impl<T> JitterBuffer<T> {
     ///   so the buffer cannot keep growing, leave the last-good frame on screen, and rely on the
     ///   existing PLI / keyframe-request recovery path (driven from the client when it observes the
     ///   gap) to fetch a fresh keyframe. See TODO(#1020) below re: triggering a PLI from here.
-    fn enforce_freshness_deadline(&mut self, current_time_ms: u128) -> bool {
+    fn enforce_freshness_deadline(&mut self, current_time_ms: u128, tick_gap_ms: f64) -> bool {
         // Identify the frame the decoder is currently waiting to release.
         let head_key = match self.last_decoded_sequence_number {
             Some(last_seq) => {
@@ -1272,6 +1447,10 @@ impl<T> JitterBuffer<T> {
                         "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms >= {MAX_PLAYOUT_AGE_MS:.0}ms). Skipped to live keyframe {keyframe_seq}, dropped {dropped} stale frame(s)."
                     );
                     // Surface the skip for field-log visibility (#1045); the worker forwards it.
+                    // The has_keyframe skip-to-live already recovers ON this poll (issue #1851): a
+                    // starvation-resume poll with a buffered keyframe jumps straight to it and needs
+                    // no escalation — but we still stamp `tick_gap_ms` here for attribution symmetry
+                    // with the keyframe-less branch, so a tick-starvation recovery is greppable too.
                     self.record_freshness_skip(
                         current_time_ms,
                         FreshnessSkip {
@@ -1279,6 +1458,7 @@ impl<T> JitterBuffer<T> {
                             keyframe_seq: Some(keyframe_seq),
                             dropped,
                             escalated: false,
+                            tick_gap_ms,
                         },
                     );
                     true
@@ -1345,7 +1525,12 @@ impl<T> JitterBuffer<T> {
                 .keyframe_less_hold_since_ms
                 .get_or_insert(current_time_ms);
             let keyframe_less_hold_duration_ms = current_time_ms.saturating_sub(hold_since) as f64;
-            self.signal_keyframe_less_ceiling(head_age_ms, keyframe_less_hold_duration_ms);
+            let escalated_this_poll = self.signal_keyframe_less_ceiling(
+                head_age_ms,
+                keyframe_less_hold_duration_ms,
+                current_time_ms,
+                tick_gap_ms,
+            );
 
             let stale_cutoff = head_key + 1;
             let dropped_before = self.dropped_frames_count;
@@ -1357,7 +1542,8 @@ impl<T> JitterBuffer<T> {
                     "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {dropped} stale delta frame(s); holding last-good frame and proactively requesting a keyframe (#1025)."
                 );
                 // Surface the skip for field-log visibility (#1045); the worker forwards it.
-                // `keyframe_seq: None` marks the keyframe-less (held last-good) case.
+                // `keyframe_seq: None` marks the keyframe-less (held last-good) case; `tick_gap_ms`
+                // (#1851) lets field analysis see whether this eviction was a resume poll.
                 self.record_freshness_skip(
                     current_time_ms,
                     FreshnessSkip {
@@ -1365,6 +1551,7 @@ impl<T> JitterBuffer<T> {
                         keyframe_seq: None,
                         dropped,
                         escalated: false,
+                        tick_gap_ms,
                     },
                 );
                 // Issue #1025 (resolves the TODO(#1020) here): proactively ask the client to
@@ -1415,7 +1602,39 @@ impl<T> JitterBuffer<T> {
                     );
                 }
 
-                if self.awaiting_proactive_keyframe {
+                // Starvation-resume PLI fast-path (issue #1851). When this poll is the first after a
+                // starved worker tick AND the freeze crossed the ceiling this poll (so the escalation
+                // just fired a decoder reset), pair the reset with exactly ONE immediate keyframe
+                // request: the reset clears stuck decode state but does NOT fetch a keyframe, and the
+                // awaiting-gate + backoff interval both went STALE during the frozen gap (a PLI we
+                // "sent" seconds/minutes ago cannot have been answered — the worker was not even
+                // sampling). Firing here makes recovery one keyframe-RTT away rather than deferred
+                // behind a dead throttle or the reset's later rebuild.
+                //
+                // Coupled to `escalated_this_poll` (NOT to a bare resume) on purpose. A keyframe-less
+                // resume poll's head is an old pre-freeze delta whose `head_age` is at least the gap,
+                // so for the freezes this fix targets — the multi-second-to-minutes tail — the ceiling
+                // is crossed and the poll escalates, engaging this fast-path. A SHORTER resume (gap in
+                // the ~2-6s band) whose head only just crossed the freshness deadline can have an
+                // effective freeze-age still below the 6s ceiling; then `escalated_this_poll` is false
+                // and `force_immediate_pli` is correctly false, and this poll falls through to the
+                // normal throttle below — the right call, since a freeze only a few seconds old does
+                // not warrant pre-empting the throttle. The coupling also keeps this fast-path from
+                // firing on the artificial large-clock-jumps the #1479 throttle unit tests use to
+                // advance time (those inject a never-escalate hook, so `escalated_this_poll` is false
+                // and their throttle assertions are unchanged).
+                //
+                // ONE-SHOT and storm-safe: `starvation_resume` is keyed to THIS poll's `tick_gap_ms`,
+                // so the next normal-cadence poll (gap ~10ms) re-enters the gate — finding
+                // `awaiting_proactive_keyframe` set true by the fire below — and stays silent; and the
+                // escalation it is coupled to is itself 8s-cooldown-gated + one-shot per resume. No
+                // #1479 storm is possible: a worker starved for seconds was, by definition, not
+                // emitting PLIs during the gap, so a single resume PLI cannot compound an in-flight
+                // rate.
+                let starvation_resume = tick_gap_ms > TICK_STARVATION_GAP_MS;
+                let force_immediate_pli = starvation_resume && escalated_this_poll;
+
+                if self.awaiting_proactive_keyframe && !force_immediate_pli {
                     // Gate closed: a PLI is already in flight; suppress until keyframe arrives.
                     return false;
                 }
@@ -1432,12 +1651,13 @@ impl<T> JitterBuffer<T> {
                     .min(PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP);
                 let required_interval_ms =
                     PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS * (2u32.pow(backoff_exp) as f64);
-                let should_request = match self.last_keyframe_request_ms {
-                    Some(last) => {
-                        (current_time_ms.saturating_sub(last)) as f64 >= required_interval_ms
-                    }
-                    None => true,
-                };
+                let should_request = force_immediate_pli
+                    || match self.last_keyframe_request_ms {
+                        Some(last) => {
+                            (current_time_ms.saturating_sub(last)) as f64 >= required_interval_ms
+                        }
+                        None => true,
+                    };
                 if should_request {
                     self.last_keyframe_request_ms = Some(current_time_ms);
                     self.consecutive_proactive_keyframe_requests = self
@@ -1454,10 +1674,42 @@ impl<T> JitterBuffer<T> {
         }
     }
 
-    /// Keyframe-less hold-ceiling escalation trigger (issue #1662).
+    /// Keyframe-less hold-ceiling escalation trigger (issues #1662/#1851).
     ///
     /// Called from the keyframe-less branch of `enforce_freshness_deadline` once the head-of-line
     /// backlog is confirmed stale (`head_age_ms >= MAX_PLAYOUT_AGE_MS`) AND no keyframe is buffered.
+    /// It packages an [`EscalationSignal`] — the effective freeze-age, this poll's `tick_gap_ms`, and
+    /// the poll `now_ms` — and hands it to the worker-owned `request_escalation` hook.
+    ///
+    /// Tick-starvation fast-path (issue #1851): the whole `#1662` ceiling is evaluated ONLY inside
+    /// this per-poll path, so while the worker's ~10ms tick is starved (backgrounded-tab clamp/freeze,
+    /// or the worker event loop blocked) the head age is never sampled and the escalation cannot fire —
+    /// field-observed as `head_age` jumping 1,808ms → 103,328ms with no intermediate poll, ~102s of
+    /// frozen video on a build that already had the ceiling. The `tick_gap_ms` carried in the signal is
+    /// what lets the resume poll's escalation bypass the escalation cooldown one-shot (see
+    /// `decide_keyframe_less_escalation`), so recovery is one keyframe-RTT away at resume rather than
+    /// deferred behind a now-stale cooldown. The ceiling threshold itself is UNCHANGED: a resume poll
+    /// still escalates only when the effective freeze-age is at/above `MAX_KEYFRAME_LESS_HOLD_MS`.
+    ///
+    /// Deferred main-thread watchdog seam (issue #1851, Part B — NOT implemented). A complementary
+    /// main-thread watchdog could, while the worker is frozen but the MAIN thread is still alive
+    /// (worker-event-loop-blocked case, distinct from tab-background where both threads freeze),
+    /// fire ONE keyframe request the instant the worker goes silent — queuing the recovery keyframe
+    /// in the worker's mailbox so it decodes the moment the worker resumes, instead of waiting for
+    /// this resume-poll escalation + its reset + PLI RTT. It was deliberately NOT built here because
+    /// the required "expected-live vs paused" gate is not cleanly available at the only main-thread
+    /// site that both (a) sees a worker-activity heartbeat and (b) can send a keyframe request
+    /// (`WasmDecoder`'s worker `onmessage` closure + its `keyframe_request_route`,
+    /// `videocall-client/src/decode/peer_decoder.rs`): the AUTHORITATIVE decode-pause flag
+    /// (`PeerDecode::visible`, gated via `should_decode_visible_peer` in
+    /// `videocall-client/src/decode/peer_decode_manager.rs`) lives one layer up in the MANAGER, not
+    /// at the decoder; the decoder only has `paint_enabled` (a paint proxy). Without the authoritative
+    /// gate — plus a main-thread self-starvation guard to avoid firing for every stream on a shared
+    /// tab-background resume — a watchdog would risk a meeting-wide PLI burst for legitimately-paused
+    /// tiles at scale (the #1479 storm shape). Building it safely needs the manager's `visible` state
+    /// threaded down into the decoder AND a main-thread tick-gap guard mirroring this one; until then
+    /// Part A (this resume-poll fast-path) is the bounded, self-contained fix.
+    ///
     /// The escalation fires on the EFFECTIVE freeze-age = `head_age_ms.max(hold_duration_ms)` (issue
     /// #1903), where `hold_duration_ms` is how long this keyframe-less freeze has continuously
     /// persisted (`keyframe_less_hold_since_ms`). When that effective age `>= MAX_KEYFRAME_LESS_HOLD_MS`
@@ -1522,7 +1774,15 @@ impl<T> JitterBuffer<T> {
     /// case is a pre-existing limitation of where the deadline runs (the last-good frame lives in the
     /// decoder, not the buffer); it is out of scope here and is covered by the client's reactive
     /// `peer_decode_manager` recovery and the publisher's periodic keyframe.
-    fn signal_keyframe_less_ceiling(&self, head_age_ms: f64, hold_duration_ms: f64) {
+    /// Returns `true` iff this poll escalated (the gate permitted it and the decoder was reset), so
+    /// the caller can pair a starvation-resume escalation with an immediate keyframe request.
+    fn signal_keyframe_less_ceiling(
+        &self,
+        head_age_ms: f64,
+        hold_duration_ms: f64,
+        now_ms: u128,
+        tick_gap_ms: f64,
+    ) -> bool {
         // Issue #1903: escalate on whichever is larger — the buffered head-of-line age (aging-backlog
         // shape) or the continuous keyframe-less-hold duration (deltas-flowing shape). Passing the
         // effective age to the escalation hook keeps the `escalated: true` diagnostic's `head_age_ms` a
@@ -1530,13 +1790,23 @@ impl<T> JitterBuffer<T> {
         // diagnostic path — the separate #1479 cross-sender PLI budget is fed by the `request_keyframe`
         // hook at the eviction site with the raw `head_age_ms`, and is unchanged by this.)
         let effective_age_ms = head_age_ms.max(hold_duration_ms);
-        if effective_age_ms >= MAX_KEYFRAME_LESS_HOLD_MS
-            && (self.request_escalation)(effective_age_ms)
-        {
-            // The worker's cooldown gated this escalation IN and already force-posted the
-            // `escalated: true` diagnostic. Fire the recovery primitive on our own decoder.
+        // Issue #1851: the ceiling threshold is unchanged (still `effective_age >= ceiling`); the
+        // `tick_gap_ms` in the signal only governs whether the WORKER's cooldown is bypassed on a
+        // starvation-resume poll (see `decide_keyframe_less_escalation`). `now_ms` is the poll clock
+        // the worker uses as the cooldown "now".
+        let signal = EscalationSignal {
+            effective_age_ms,
+            tick_gap_ms,
+            now_ms,
+        };
+        if effective_age_ms >= MAX_KEYFRAME_LESS_HOLD_MS && (self.request_escalation)(signal) {
+            // The worker's cooldown gated this escalation IN (or a resume poll bypassed it) and
+            // already force-posted the `escalated: true` diagnostic. Fire the recovery primitive on
+            // our own decoder.
             self.decoder.reset();
+            return true;
         }
+        false
     }
 
     /// Skip to the newest buffered keyframe, dropping every frame before it.
@@ -1763,12 +2033,31 @@ impl<T> JitterBuffer<T> {
         self.last_keyframe_request_ms = None;
         self.consecutive_proactive_keyframe_requests = 0;
         self.awaiting_proactive_keyframe = false;
+        // Re-arm the stream-open one-shot keyframe request (issue 1899 / discussion 1960): a flush is
+        // a genuine stream restart (keyframe-with-old-seq or the consecutive-old-frames path), after
+        // which `last_decoded_sequence_number` is `None` again — so the next never-decoded delta must
+        // be allowed to fire an immediate recovery PLI exactly as a cold-start joiner does. Same
+        // `None`-after-cold-start == reset-after-flush invariant the fields above hold.
+        self.stream_open_keyframe_request_fired = false;
         // Reset the continuous keyframe-less-hold clock (issue #1903) so a post-flush stream restart
         // does not inherit a stale freeze-duration that could escalate (decoder reset) the instant the
         // first post-restart keyframe-less tick runs. A restart is a fresh start: any keyframe-less
         // hold begins counting from zero. `None`-after-cold-start and `None`-after-flush are the same
         // state.
         self.keyframe_less_hold_since_ms = None;
+        // Reset the tick-starvation clock (issue #1851): `flush()` clears it to `None` so the FIRST
+        // post-flush poll reads `tick_gap_ms = 0` and is never misread as a starvation resume —
+        // matching the `None`-after-cold-start == `None`-after-flush invariant the fields above hold.
+        // A flush is a genuine stream restart (keyframe-with-old-seq or the consecutive-old-frames
+        // path), so "time since the last poll" must re-baseline: a restart that happens to follow a
+        // long idle gap should NOT stamp a huge `tick_gap` onto its first routine skip (attribution
+        // cleanliness), nor could it — the post-flush buffer is empty, so `enforce_freshness_deadline`
+        // returns at its empty guard and no escalation is reachable until real content re-accrues a
+        // fresh freeze from zero anyway. The resume fast-path this fix targets arrives via a delta
+        // insert or a poll (NOT a flush: a keyframe-restart is rejected+flushed before its own
+        // find-and-move, and streaming deltas keep `num_consecutive_old_frames` at 0), so clearing on
+        // flush does not blunt it.
+        self.last_tick_time_ms = None;
         // NOTE (issue #1662): the keyframe-less hold-ceiling escalation cooldown anchor is NOT a
         // field of this buffer — it lives in the worker thread-local (`LAST_KEYFRAME_LESS_ESCALATION_MS`
         // in `bin/worker_decoder.rs`) so it survives the buffer rebuild a reset triggers. There is
@@ -2683,6 +2972,114 @@ mod tests {
             requests2.load(Ordering::SeqCst),
             0,
             "skipping to a buffered keyframe must NOT fire a proactive request"
+        );
+    }
+
+    /// Issue 1899 / discussion 1960: a never-decoded buffer that receives its first
+    /// frame(s) as DELTAS with no buffered keyframe (the mid-GOP late-joiner shape)
+    /// must fire ONE immediate proactive keyframe request the instant it can prove
+    /// "frames present, no keyframe, never decoded" — WITHOUT waiting the full
+    /// `MAX_PLAYOUT_AGE_MS` (~1.8s) for the keyframe-less eviction path. It must fire
+    /// exactly once per stream-open (one-shot), NOT fire when the first insert is a
+    /// keyframe, and re-arm after `flush()` so a re-published stream requests again.
+    ///
+    /// Mutation coverage (each mutation is caught in isolation):
+    /// - Deleting the `(self.request_keyframe)(0.0)` fire drops the first-delta count to 0.
+    /// - Deleting `stream_open_keyframe_request_fired = true` lets a later delta re-fire once the
+    ///   #1479 arrival gate is cleared (the "gate cleared → still no re-fire" assert goes to 2).
+    /// - Deleting the `!buffered_frames.values().any(is_keyframe)` guard fires on the
+    ///   keyframe-first path (the `keyframe first → 0` assert fails).
+    /// - Deleting the re-arm in `flush()` leaves the flag latched, so the post-flush
+    ///   late-join fires 0 (the final assert fails).
+    #[test]
+    fn stream_open_delta_backlog_fires_one_immediate_keyframe_request() {
+        // --- fresh stream, delta-only: exactly ONE immediate request, before any aging ---
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move |_head_age_ms| {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // First frames of a mid-GOP join: deltas, no keyframe, never decoded. All at the SAME
+        // fresh arrival so NO time passes — the freshness deadline (1.8s) provably cannot have
+        // fired, isolating the stream-open path as the only possible source of the request.
+        let open = 1000u128;
+        jb.insert_frame(create_test_frame(7, FrameType::DeltaFrame), open);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the first never-decoded delta with no keyframe must fire one immediate request"
+        );
+        // A second delta in the same instant must NOT fire again: while a request is in flight the
+        // #1479 `awaiting_proactive_keyframe` gate suppresses further requests.
+        jb.insert_frame(create_test_frame(8, FrameType::DeltaFrame), open);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the #1479 arrival gate suppresses an immediate second request"
+        );
+        // Isolate the stream-open one-shot flag FROM the arrival gate: clear the gate (as an
+        // arrival-gate timeout would, without pulling in the eviction path) and confirm the flag
+        // ALONE still blocks a second immediate stream-open blast — after a timeout, retries are
+        // the eviction/backoff path's job, not another cold-open PLI. This is the assert that makes
+        // deleting `stream_open_keyframe_request_fired = true` observable.
+        jb.awaiting_proactive_keyframe = false;
+        jb.insert_frame(create_test_frame(9, FrameType::DeltaFrame), open);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the stream-open one-shot must not re-fire even once the arrival gate reopens"
+        );
+        // Nothing decoded (still no keyframe) and no time advanced past the freshness deadline.
+        assert!(
+            decoded.lock().unwrap().is_empty(),
+            "no delta may decode without a keyframe"
+        );
+        assert_eq!(
+            jb.last_decoded_sequence_number, None,
+            "buffer must still be in the never-decoded state"
+        );
+
+        // --- contrast: first insert IS a keyframe → recovery already in hand → 0 requests ---
+        let requests_kf = Arc::new(AtomicU32::new(0));
+        let decoded_kf = Arc::new(Mutex::new(Vec::new()));
+        let rkf = requests_kf.clone();
+        let mut jb_kf = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded_kf.clone())),
+            Box::new(move |_head_age_ms| {
+                rkf.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        jb_kf.insert_frame(create_test_frame(1, FrameType::KeyFrame), 2000);
+        jb_kf.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 2000);
+        assert_eq!(
+            requests_kf.load(Ordering::SeqCst),
+            0,
+            "a stream that opens with a keyframe must NOT fire a stream-open request"
+        );
+
+        // --- re-arm on flush(): a re-published stream (last_decoded reset to None) requests again ---
+        // Bring the first buffer to a decoded state, then flush (stream restart). Poll well past the
+        // playout delay (but far below the 1.8s freshness deadline) so the keyframe releases and
+        // anchors playout without any eviction firing.
+        jb.insert_frame(create_test_frame(6, FrameType::KeyFrame), open + 10);
+        jb.find_and_move_continuous_frames(open + 500);
+        assert!(
+            jb.last_decoded_sequence_number.is_some(),
+            "the arriving keyframe should anchor playout before the flush"
+        );
+        let before_flush = requests.load(Ordering::SeqCst);
+        jb.flush();
+        // Post-flush late-join: delta-only again, fresh arrival → one more immediate request.
+        jb.insert_frame(create_test_frame(20, FrameType::DeltaFrame), open + 100);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            before_flush + 1,
+            "flush() must re-arm the stream-open one-shot so a re-published stream requests again"
         );
     }
 
@@ -4705,15 +5102,17 @@ mod tests {
     // === Issue #1662: keyframe-less hold-ceiling escalation ===
 
     /// Shared handle to the escalation signals a `JitterBuffer` raised: the count of
-    /// `request_escalation` invocations, the last `head_age_ms` passed, and a controllable return
-    /// value standing in for the worker's cooldown gate. The buffer DETECTS the ceiling (every tick)
-    /// and OWNS the `reset()` call; the cooldown/diagnostic live in the worker (#1662), so this spy
-    /// lets a test drive the gate decision and observe both the per-tick signal and (via the mock's
+    /// `request_escalation` invocations, the last effective freeze-age passed, the last `tick_gap_ms`
+    /// passed (issue #1851), and a controllable return value standing in for the worker's cooldown
+    /// gate. The buffer DETECTS the ceiling (every poll) and OWNS the `reset()` call; the
+    /// cooldown/diagnostic live in the worker (#1662), so this spy lets a test drive the gate decision
+    /// and observe both the per-poll signal (including the observed `tick_gap_ms`) and (via the mock's
     /// reset counter) the gated reset.
     #[derive(Clone)]
     struct EscalationSpy {
         count: Arc<AtomicU32>,
         last_head_age_bits: Arc<std::sync::atomic::AtomicU64>,
+        last_tick_gap_bits: Arc<std::sync::atomic::AtomicU64>,
         gate_open: Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -4723,6 +5122,7 @@ mod tests {
             Self {
                 count: Arc::new(AtomicU32::new(0)),
                 last_head_age_bits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                last_tick_gap_bits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 gate_open: Arc::new(std::sync::atomic::AtomicBool::new(gate_open)),
             }
         }
@@ -4732,13 +5132,18 @@ mod tests {
         fn last_head_age(&self) -> f64 {
             f64::from_bits(self.last_head_age_bits.load(Ordering::SeqCst))
         }
-        fn hook(&self) -> Box<dyn Fn(f64) -> bool> {
+        fn last_tick_gap(&self) -> f64 {
+            f64::from_bits(self.last_tick_gap_bits.load(Ordering::SeqCst))
+        }
+        fn hook(&self) -> Box<dyn Fn(EscalationSignal) -> bool> {
             let count = self.count.clone();
             let bits = self.last_head_age_bits.clone();
+            let gap_bits = self.last_tick_gap_bits.clone();
             let gate_open = self.gate_open.clone();
-            Box::new(move |head_age_ms: f64| {
+            Box::new(move |signal: EscalationSignal| {
                 count.fetch_add(1, Ordering::SeqCst);
-                bits.store(head_age_ms.to_bits(), Ordering::SeqCst);
+                bits.store(signal.effective_age_ms.to_bits(), Ordering::SeqCst);
+                gap_bits.store(signal.tick_gap_ms.to_bits(), Ordering::SeqCst);
                 gate_open.load(Ordering::SeqCst)
             })
         }
@@ -4943,10 +5348,18 @@ mod tests {
     fn decide_keyframe_less_escalation_advances_anchor_and_marks_escalated() {
         let interval = KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS as u128;
         let head_age = MAX_KEYFRAME_LESS_HOLD_MS + 250.0;
+        // Normal-cadence tick_gap (well below TICK_STARVATION_GAP_MS) so this test exercises the
+        // pure COOLDOWN semantics — the #1851 resume-bypass is off. A separate test drives the bypass.
+        let normal_gap = 10.0;
+        let sig = |now: u128| EscalationSignal {
+            effective_age_ms: head_age,
+            tick_gap_ms: normal_gap,
+            now_ms: now,
+        };
 
         // Cold start → escalates: anchor advances to now, diagnostic is marked escalated.
         let now = 50_000u128;
-        let (anchor, skip) = decide_keyframe_less_escalation(None, now, head_age)
+        let (anchor, skip) = decide_keyframe_less_escalation(None, sig(now))
             .expect("cold-start escalation must be permitted");
         assert_eq!(
             anchor, now,
@@ -4963,18 +5376,23 @@ mod tests {
         assert_eq!(skip.dropped, 0, "the escalation event itself drops nothing");
         assert_eq!(
             skip.head_age_ms, head_age,
-            "the diagnostic must carry the real head_age"
+            "the diagnostic must carry the real effective freeze-age"
+        );
+        assert_eq!(
+            skip.tick_gap_ms, normal_gap,
+            "the diagnostic must carry the observed tick_gap (issue #1851)"
         );
 
-        // Within the cooldown window → None (no anchor advance, no diagnostic, no reset).
+        // Within the cooldown window, normal cadence → None (no anchor advance, no diagnostic, no
+        // reset).
         assert!(
-            decide_keyframe_less_escalation(Some(now), now + interval - 100, head_age).is_none(),
-            "within the cooldown window the gate must return None"
+            decide_keyframe_less_escalation(Some(now), sig(now + interval - 100)).is_none(),
+            "within the cooldown window a normal-cadence poll must return None"
         );
 
         // Past the window → escalates again with the advanced anchor.
         let later = now + interval + 1;
-        let (anchor2, skip2) = decide_keyframe_less_escalation(Some(now), later, head_age)
+        let (anchor2, skip2) = decide_keyframe_less_escalation(Some(now), sig(later))
             .expect("past the cooldown a still-frozen stream re-escalates");
         assert_eq!(
             anchor2, later,
@@ -5063,6 +5481,409 @@ mod tests {
         assert!(
             jb.keyframe_less_hold_since_ms.is_none(),
             "a keyframe arrival must clear the continuous keyframe-less-hold clock (#1903)"
+        );
+    }
+
+    // === Issue #1851: tick-starvation resume fast-path ===
+
+    /// A `request_escalation` hook that faithfully MODELS the worker gate
+    /// (`bin/worker_decoder.rs::gate_keyframe_less_escalation`): it calls the REAL
+    /// `decide_keyframe_less_escalation` against a test-held cooldown anchor, advances the anchor on a
+    /// gated-in escalation, and captures the built diagnostic — exactly as the wasm worker does. This
+    /// lets a native test drive the cooldown-vs-bypass decision end-to-end through
+    /// `find_and_move_continuous_frames`, rather than only through the pure function.
+    #[derive(Clone)]
+    struct GateModelSpy {
+        anchor: Arc<Mutex<Option<u128>>>,
+        last_skip: Arc<Mutex<Option<FreshnessSkip>>>,
+        gated_in_count: Arc<AtomicU32>,
+    }
+
+    impl GateModelSpy {
+        /// `initial_anchor` seeds the cooldown: `Some(t)` models a prior escalation at `t` (warm if
+        /// close to the poll `now`), `None` a cold gate.
+        fn new(initial_anchor: Option<u128>) -> Self {
+            Self {
+                anchor: Arc::new(Mutex::new(initial_anchor)),
+                last_skip: Arc::new(Mutex::new(None)),
+                gated_in_count: Arc::new(AtomicU32::new(0)),
+            }
+        }
+        fn last_skip(&self) -> Option<FreshnessSkip> {
+            self.last_skip.lock().unwrap().clone()
+        }
+        fn hook(&self) -> Box<dyn Fn(EscalationSignal) -> bool> {
+            let anchor = self.anchor.clone();
+            let last_skip = self.last_skip.clone();
+            let count = self.gated_in_count.clone();
+            Box::new(move |signal: EscalationSignal| {
+                let last = *anchor.lock().unwrap();
+                match decide_keyframe_less_escalation(last, signal) {
+                    Some((new_anchor, skip)) => {
+                        *anchor.lock().unwrap() = Some(new_anchor);
+                        *last_skip.lock().unwrap() = Some(skip);
+                        count.fetch_add(1, Ordering::SeqCst);
+                        true
+                    }
+                    None => false,
+                }
+            })
+        }
+    }
+
+    /// PRIMARY #1851 regression (pure decision): a starvation-resume poll (huge `tick_gap_ms`)
+    /// escalates even while the escalation cooldown is WARM from a recent prior escalation, whereas a
+    /// normal-cadence poll with the same warm cooldown is deferred. The bypass advances the anchor and
+    /// stamps `tick_gap_ms` into the diagnostic.
+    ///
+    /// FAILS ON UNFIXED CODE: pre-fix there is no `tick_gap` input and no bypass, so the warm-cooldown
+    /// case returns `None` (the escalation defers) regardless of how long the tick was starved —
+    /// exactly the ~97s-late escalation the field showed. Reverting the `!starvation_resume` guard in
+    /// `decide_keyframe_less_escalation` makes the resume assertion fail.
+    #[test]
+    fn decide_keyframe_less_escalation_bypasses_cooldown_on_starvation_resume() {
+        let effective_age = MAX_KEYFRAME_LESS_HOLD_MS + 250.0;
+        let now = 200_000u128;
+        // WARM cooldown: a prior escalation only 100ms ago (now - anchor = 100 << 8000).
+        let warm_anchor = Some(now - 100);
+
+        // Normal-cadence poll while the cooldown is warm → deferred. Baseline proving it is the
+        // tick_gap bypass — NOT the ceiling (effective_age is above it in every arm here) — that
+        // flips the outcome.
+        let normal = EscalationSignal {
+            effective_age_ms: effective_age,
+            tick_gap_ms: 10.0,
+            now_ms: now,
+        };
+        assert!(
+            decide_keyframe_less_escalation(warm_anchor, normal).is_none(),
+            "a normal-cadence poll must respect the warm cooldown"
+        );
+
+        // Starvation-resume poll (102s gap) while the SAME cooldown is warm → bypass → escalates.
+        let resume = EscalationSignal {
+            effective_age_ms: effective_age,
+            tick_gap_ms: 102_000.0,
+            now_ms: now,
+        };
+        let (anchor, skip) = decide_keyframe_less_escalation(warm_anchor, resume)
+            .expect("a starvation-resume poll must bypass the warm cooldown (#1851)");
+        assert_eq!(
+            anchor, now,
+            "a bypassed escalation still advances the anchor to now_ms (one-shot property)"
+        );
+        assert!(
+            skip.escalated,
+            "a bypassed escalation is still marked escalated"
+        );
+        assert_eq!(
+            skip.tick_gap_ms, 102_000.0,
+            "the escalation diagnostic must carry the resume tick_gap for field attribution"
+        );
+
+        // A gap exactly AT the threshold (not strictly above) while warm → still gated: the bypass is
+        // `>`, so a boundary gap does not slip through.
+        let at_threshold = EscalationSignal {
+            effective_age_ms: effective_age,
+            tick_gap_ms: TICK_STARVATION_GAP_MS,
+            now_ms: now,
+        };
+        assert!(
+            decide_keyframe_less_escalation(warm_anchor, at_threshold).is_none(),
+            "a gap AT the threshold (not strictly above) must not bypass the cooldown"
+        );
+    }
+
+    /// ACCEPTANCE test for issue #1851, driving the REAL production path
+    /// (`find_and_move_continuous_frames` → `enforce_freshness_deadline` keyframe-less branch →
+    /// `signal_keyframe_less_ceiling` → hook → `decoder.reset()`) with a synthetic 102s tick gap and a
+    /// WARM cooldown modelled by [`GateModelSpy`]. The escalation MUST fire ON the resume poll
+    /// (not deferred behind the cooldown), and the diagnostic MUST carry `tick_gap_ms ≈ 102_000`.
+    ///
+    /// FAILS ON UNFIXED CODE: pre-fix the warm cooldown defers the escalation on the resume poll (no
+    /// reset), and there is no tick_gap attribution. Reverting either the tick-clock plumbing or the
+    /// `!starvation_resume` bypass guard fails the reset assertion.
+    #[test]
+    fn starved_tick_resume_escalates_immediately_despite_warm_cooldown() {
+        let decoded_frames = Arc::new(Mutex::new(Vec::new()));
+        let reset_count = Arc::new(AtomicU32::new(0));
+        let mock = Box::new(MockDecoder::new_with_vec_and_depth(
+            decoded_frames,
+            Arc::new(AtomicU32::new(0)),
+            reset_count.clone(),
+        ));
+
+        // The resume poll fires at `resume_now`; seed the cooldown anchor to 100ms before it, so a
+        // recent prior escalation would (on a normal poll) defer for the full 8s cooldown. Only the
+        // tick-gap bypass lets the resume poll through.
+        let arrival_ms = 1000u128;
+        let freeze_poll = 2900u128; // head_age 1900ms: stale (> 1800) but below the 6000ms ceiling.
+        let resume_now = freeze_poll + 102_000; // 104_900: tick_gap = 102_000 on the resume poll.
+        let spy = GateModelSpy::new(Some(resume_now - 100));
+        let mut jb = JitterBuffer::with_recovery_hooks(mock, Box::new(|_| {}), spy.hook());
+
+        // last-good = seq 1, then a keyframe-LESS delta backlog (no keyframe to skip to).
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        for s in 2u64..=200 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), arrival_ms);
+        }
+
+        // Establish the freeze BELOW the ceiling: tick_gap here (freeze_poll - 1000 = 1900) is under
+        // TICK_STARVATION_GAP_MS, so this is NOT a resume poll and does NOT escalate.
+        jb.find_and_move_continuous_frames(freeze_poll);
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "below the ceiling and at normal cadence there must be no escalation yet"
+        );
+        // Drain the routine freeze skip recorded so far so the next `take` returns the resume skip.
+        let _ = jb.take_freshness_skip();
+
+        // The resume poll: 102s later, freeze still keyframe-less. tick_gap = 102_000 (>> 2000) and
+        // head_age = 103_900 (>> 6000 ceiling). The warm cooldown WOULD defer this, but the bypass
+        // fires it immediately.
+        jb.find_and_move_continuous_frames(resume_now);
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            1,
+            "the starvation-resume poll must escalate (decoder reset) despite the warm cooldown (#1851)"
+        );
+
+        // The escalation diagnostic (built by the modelled worker gate) carries the resume tick_gap.
+        let esc = spy
+            .last_skip()
+            .expect("the gated-in escalation must have produced a diagnostic");
+        assert!(
+            esc.escalated,
+            "the captured diagnostic must be the escalation"
+        );
+        assert!(
+            (esc.tick_gap_ms - 102_000.0).abs() < 1.0,
+            "the escalation diagnostic must carry tick_gap ≈ 102_000, got {}",
+            esc.tick_gap_ms
+        );
+
+        // The routine keyframe-less skip recorded on the same poll ALSO carries the tick_gap, so field
+        // attribution works whether or not the escalation gate is open.
+        let routine = jb
+            .take_freshness_skip()
+            .expect("the resume poll's keyframe-less eviction surfaces a routine skip");
+        assert!(
+            (routine.tick_gap_ms - 102_000.0).abs() < 1.0,
+            "the routine resume skip must carry tick_gap ≈ 102_000, got {}",
+            routine.tick_gap_ms
+        );
+    }
+
+    /// #1851 one-shot safety (buffer path): a resume poll escalates ONCE; the immediately-following
+    /// normal-cadence poll — same ongoing freeze, still above the ceiling — is cooldown-gated again
+    /// (the bypass advanced the anchor and is keyed only to THIS poll's gap). Proves a resume poll
+    /// does NOT disable the storm protections for subsequent polls.
+    ///
+    /// FAILS if the bypass were made sticky (e.g. `last_tick_time_ms` not updated each poll, so every
+    /// poll reads a huge gap, or the anchor not advanced): the second poll would reset again and the
+    /// count would climb to 2.
+    #[test]
+    fn starvation_resume_bypass_is_one_shot() {
+        let decoded_frames = Arc::new(Mutex::new(Vec::new()));
+        let reset_count = Arc::new(AtomicU32::new(0));
+        let mock = Box::new(MockDecoder::new_with_vec_and_depth(
+            decoded_frames,
+            Arc::new(AtomicU32::new(0)),
+            reset_count.clone(),
+        ));
+        // Cold anchor: the resume poll escalates on the gap alone. NOTE the mock `reset()` only
+        // increments a counter (it does NOT rebuild the buffer as the real reset would), so the
+        // buffer state persists across the escalation and the second poll re-enters the same freeze —
+        // which is exactly the adversarial condition for the one-shot check.
+        let spy = GateModelSpy::new(None);
+        let mut jb = JitterBuffer::with_recovery_hooks(mock, Box::new(|_| {}), spy.hook());
+
+        let arrival_ms = 1000u128;
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        for s in 2u64..=200 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), arrival_ms);
+        }
+
+        // Resume poll: huge gap, head_age above the ceiling → escalates once.
+        let resume_now = arrival_ms + 100_000;
+        jb.find_and_move_continuous_frames(resume_now);
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            1,
+            "the resume poll escalates once"
+        );
+
+        // Next poll 10ms later: normal cadence, freeze still above the ceiling. The cooldown is now
+        // warm (anchor advanced to resume_now) AND the gap is ~10ms → NOT a resume → gated.
+        jb.find_and_move_continuous_frames(resume_now + 10);
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            1,
+            "the poll after a resume must be cooldown-gated again — the bypass is one-shot (#1851)"
+        );
+    }
+
+    /// #1851 tick-clock lifecycle (white-box, no-false-positive): the clock is `None` at
+    /// construction and again after `flush()` — the two "no prior poll to measure from" states — and
+    /// each poll records its own time. So the FIRST poll after `new()` OR a stream restart reads
+    /// `tick_gap_ms = 0` (the `None` branch), and can never be misread as a starvation resume off a
+    /// phantom origin.
+    ///
+    /// FAILS ON UNFIXED CODE: seeding `last_tick_time_ms` to `Some(0)` instead of `None` fails the
+    /// construction assert; not updating it each poll fails the `Some(9_000_000)` assert; not clearing
+    /// it in `flush()` fails the post-flush assert (a restart following a long idle would then read a
+    /// huge phantom gap).
+    #[test]
+    fn tick_clock_lifecycle_none_at_construction_and_after_flush() {
+        let decoded_frames = Arc::new(Mutex::new(Vec::new()));
+        let reset_count = Arc::new(AtomicU32::new(0));
+        let mock = Box::new(MockDecoder::new_with_vec_and_depth(
+            decoded_frames,
+            Arc::new(AtomicU32::new(0)),
+            reset_count.clone(),
+        ));
+        let mut jb = JitterBuffer::with_recovery_hooks(mock, Box::new(|_| {}), Box::new(|_| false));
+
+        // Cold start: no prior poll to measure from.
+        assert!(
+            jb.last_tick_time_ms.is_none(),
+            "the tick clock starts None so the first poll reads a zero gap, not a phantom origin"
+        );
+        // The first poll records its time; its derived gap is 0 (the `None` branch), so even an empty
+        // buffer polled at a huge wall-clock time cannot be misread as a starvation resume.
+        jb.find_and_move_continuous_frames(9_000_000);
+        assert_eq!(
+            jb.last_tick_time_ms,
+            Some(9_000_000),
+            "each poll records its own time as the next gap's origin"
+        );
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "a fresh buffer's first poll never escalates (no stale head, zero gap)"
+        );
+        // A normal poll 10ms later measures a 10ms gap from the recorded origin.
+        jb.find_and_move_continuous_frames(9_000_010);
+        assert_eq!(jb.last_tick_time_ms, Some(9_000_010));
+        // flush() re-clears the clock so a stream restart re-baselines: None-after-flush ==
+        // None-after-cold-start.
+        jb.flush();
+        assert!(
+            jb.last_tick_time_ms.is_none(),
+            "flush must reset the tick clock to None so a restart re-baselines (#1851)"
+        );
+    }
+
+    /// #1851 no-false-positive: a steady stream of normal ~10ms-cadence polls never reports a
+    /// starvation gap to the escalation hook (every observed `tick_gap` stays at/below
+    /// `TICK_STARVATION_GAP_MS`), so the cooldown bypass can never engage under healthy operation.
+    #[test]
+    fn normal_cadence_never_flags_starvation() {
+        let (mut jb, spy, _reset_count, arrival_ms) = keyframe_less_stall_buffer(true);
+        // The helper left the tick clock at `arrival_ms`; drive one priming poll so the loop's gaps
+        // are the intended 10ms (this priming poll's larger gap is not asserted on).
+        let first = arrival_ms + (MAX_KEYFRAME_LESS_HOLD_MS as u128) + 100;
+        jb.find_and_move_continuous_frames(first - 10);
+        for k in 0..20u128 {
+            jb.find_and_move_continuous_frames(first + k * 10);
+            assert!(
+                spy.last_tick_gap() <= TICK_STARVATION_GAP_MS,
+                "a normal-cadence poll must never observe a starvation gap: {}",
+                spy.last_tick_gap()
+            );
+        }
+    }
+
+    /// #1851 PLI-immediate: a starvation-resume poll that crosses the ceiling (so the escalation
+    /// fires a decoder reset) ALSO fires exactly ONE immediate keyframe request — pairing the reset
+    /// (which clears stuck decode state but fetches nothing) with a fetch — even when the proactive-PLI
+    /// throttle is WARM (`awaiting_proactive_keyframe` still set from a pre-freeze PLI). The very next
+    /// normal-cadence poll is throttle-gated again (no second request).
+    ///
+    /// FAILS if the resume PLI fast-path is removed: with the throttle warm the resume poll's
+    /// awaiting-gate would `return false`, so `requests` would stay 1 instead of reaching 2.
+    #[test]
+    fn starvation_resume_fires_one_immediate_keyframe_request() {
+        let decoded_frames = Arc::new(Mutex::new(Vec::new()));
+        let reset_count = Arc::new(AtomicU32::new(0));
+        let mock = Box::new(MockDecoder::new_with_vec_and_depth(
+            decoded_frames,
+            Arc::new(AtomicU32::new(0)),
+            reset_count.clone(),
+        ));
+        let requests = Arc::new(AtomicU32::new(0));
+        let requests_for_hook = requests.clone();
+        // Escalation gate ALWAYS open (a resume poll at the ceiling escalates), so the coupled PLI
+        // fast-path can engage. `starvation_resume && escalated_this_poll` still keys the fast-path to
+        // the resume poll only.
+        let mut jb = JitterBuffer::with_recovery_hooks(
+            mock,
+            Box::new(move |_head_age_ms| {
+                requests_for_hook.fetch_add(1, Ordering::SeqCst);
+            }),
+            Box::new(|_| true),
+        );
+
+        let arrival_ms = 1000u128;
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        for s in 2u64..=200 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), arrival_ms);
+        }
+
+        // Warm the throttle at a normal cadence, BELOW the ceiling (head_age 1900ms < 6000ms, gap
+        // 1900ms < 2000ms so not a resume): a first keyframe-less eviction fires one PLI and sets the
+        // awaiting-gate, and no escalation fires yet.
+        jb.find_and_move_continuous_frames(arrival_ms + 1900); // t=2900
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the first keyframe-less eviction fires one proactive PLI"
+        );
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "no escalation below the ceiling"
+        );
+        // A second normal-cadence poll shortly after is GATED by `awaiting_proactive_keyframe` → no
+        // new request (still below the ceiling).
+        jb.find_and_move_continuous_frames(4000); // gap 1100, head_age 3000, below ceiling
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a normal-cadence poll with the awaiting-gate warm must not fire another PLI"
+        );
+
+        // Starvation-resume poll: gap 3100ms is > TICK_STARVATION_GAP_MS (a resume) but < the 15s
+        // arrival-gate timeout, so `awaiting_proactive_keyframe` is STILL set (the timeout backstop
+        // does NOT clear it) — the awaiting-gate is the load-bearing block here. head_age = 6100ms is
+        // past the ceiling, so the escalation fires and the coupled fast-path bypasses the still-warm
+        // awaiting-gate to fire exactly one immediate request.
+        let resume_now = 7100u128; // gap from 4000 = 3100; head_age = 7100 - 1000 = 6100
+        jb.find_and_move_continuous_frames(resume_now);
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            1,
+            "the resume poll escalates (decoder reset)"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "the starvation-resume escalation fires exactly one immediate keyframe request despite the warm awaiting-gate (#1851)"
+        );
+
+        // The next normal-cadence poll (still above the ceiling, so it escalates again) is NOT a
+        // resume, so the coupled fast-path does not engage and the awaiting-gate (re-set by the resume
+        // fire) suppresses a third request.
+        jb.find_and_move_continuous_frames(resume_now + 10);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "the poll after a resume PLI is throttle-gated again — the fast-path is one-shot (#1851)"
         );
     }
 }

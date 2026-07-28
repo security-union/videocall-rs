@@ -33,7 +33,8 @@ use crate::constants::{
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{
-    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL,
+    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH,
+    RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION, RELAY_PACKET_DROPS_TOTAL,
 };
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -484,7 +485,8 @@ impl WtChatSession {
                 // delivered through two mechanisms that compose, NOT through
                 // sender-side eviction:
                 //   (i) the `evaluate_priority_drop` PRE-check above already shed
-                //       VIDEO/SCREEN at 80% fill and AUDIO at 95% BEFORE this
+                //       camera VIDEO at 80% fill, SCREEN at 90% (issue 1977), and
+                //       AUDIO at 95% BEFORE this
                 //       `try_send` ran (priority_drop.rs), so by the time we
                 //       reach `Full` the policy has already had its say and the
                 //       packets still arriving are the protected/critical ones;
@@ -589,6 +591,13 @@ impl WtChatSession {
             RELAY_OUTBOUND_QUEUE_DEPTH
                 .with_label_values(&[&act.logic.room, "webtransport"])
                 .set(depth as f64);
+            let session_id = act.logic.id.to_string();
+            RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
+                .with_label_values(&[&act.logic.room, "webtransport", &session_id, "unistream"])
+                .set(uni_depth as f64);
+            RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
+                .with_label_values(&[&act.logic.room, "webtransport", &session_id, "datagram"])
+                .set(dgram_depth as f64);
 
             // Check if connection is dead (channel closed)
             if act.is_connection_dead() {
@@ -652,9 +661,9 @@ impl Actor for WtChatSession {
         //
         // Sizing the mailbox at the SUM of both channels (issue #1057, PR
         // #1060) relocates a *steady-state* overflow off the dumb mailbox onto
-        // the policy-aware channels, which shed VIDEO/SCREEN first, protect
-        // AUDIO to ~95%, never preempt Critical lifecycle packets, and record
-        // drops via `on_outbound_drop`.
+        // the policy-aware channels, which shed camera VIDEO first (~80%), then
+        // SCREEN (~90%, issue 1977), protect AUDIO to ~95%, never preempt
+        // Critical lifecycle packets, and record drops via `on_outbound_drop`.
         //
         // A publisher-join fan-out BURST (issue #1144) can still overflow even
         // that sum, because the keyframe/join spike arrives in a tight window

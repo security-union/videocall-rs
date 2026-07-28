@@ -177,7 +177,9 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | Environment | `CORS_ALLOWED_ORIGIN` | Behavior |
 |---|---|---|
 | **Production** | `https://app.videocall.rs` | Only the specified origin can make credentialed requests |
-| **Development** | unset / empty | Mirrors the request `Origin` header (any origin accepted) |
+| **Local dev** (`DEV_USER` set) | unset / empty | Mirrors the request `Origin` header (any origin accepted) |
+
+**Fail-closed (issue #1751):** an empty or unset `CORS_ALLOWED_ORIGIN` is only permitted when `DEV_USER` is set (which itself requires OAuth to be disabled). In any other configuration the server **refuses to start** rather than fall back to mirroring the request origin, since `mirror_request` + credentialed CORS would let any site make credentialed requests. Set the exact frontend origin in every non-dev deployment.
 
 **Production deployment recommendations:**
 
@@ -193,10 +195,12 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `JWT_SECRET` | Yes | -- | Shared HMAC-SHA256 secret (must match Media Server) |
 | `LISTEN_ADDR` | No | `0.0.0.0:8081` | HTTP bind address |
 | `TOKEN_TTL_SECS` | No | `86400` (24h) | Room access token lifetime (seconds). Must cover longest expected meeting + re-election — see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562). |
-| `SESSION_TTL_SECS` | No | `315360000` (~10y) | Session JWT lifetime (seconds) |
+| `SESSION_TTL_SECS` | No | `604800` (7d) | Session cookie idle/re-mint increment (seconds). With sliding refresh (#1966) this is NOT the total session length — an active session slides up to `SESSION_ABSOLUTE_MAX_SECS`; an idle one dies one increment after its last request. Must be `<` `SESSION_ABSOLUTE_MAX_SECS`. |
+| `SESSION_REFRESH_THRESHOLD_SECS` | No | `7200` (2h) | Re-mint the session cookie once its remaining lifetime drops below this (#1966). Must be `<` `SESSION_TTL_SECS`. |
+| `SESSION_ABSOLUTE_MAX_SECS` | No | `2592000` (30d) | Hard absolute session cap from original auth time (#1966). Every mint (initial + sliding) is clamped so no cookie outlives `auth_time + this`. Set `>` `SESSION_TTL_SECS` or sliding is a no-op. Per-deploy: hcl-daily 8h, prod 30d. |
 | `COOKIE_DOMAIN` | No | -- | Cookie `Domain` attribute (e.g. `.videocall.rs`) |
 | `COOKIE_SECURE` | No | `true` | Set `false` for local HTTP development |
-| `CORS_ALLOWED_ORIGIN` | No | -- | Production: exact frontend origin. Unset for dev. |
+| `CORS_ALLOWED_ORIGIN` | Yes, unless `DEV_USER` set | -- | Exact frontend origin(s), comma-separated. Empty/unset is rejected at startup unless `DEV_USER` is active (issue #1751). |
 | `NATS_URL` | No | -- | NATS server URL (e.g. `nats://localhost:4222`). When not set, event publishing is disabled (graceful degradation). |
 | `OAUTH_CLIENT_ID` | No | -- | OAuth client ID (disables OAuth if unset) |
 | `OAUTH_SECRET` | No | -- | OAuth client secret (omit for public clients using PKCE only) |

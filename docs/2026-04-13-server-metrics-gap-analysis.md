@@ -19,7 +19,7 @@
 
 ### Client Diagnostic Metrics (37 metrics, client -> NATS -> metrics_server -> Prometheus)
 
-**Per-pair receiver metrics** (labels: meeting_id, session_id, from_peer, to_peer, reporter_name, peer_name):
+**Per-pair receiver metrics** (labels: meeting_id, session_id, from_peer, to_peer):
 
 | Metric | What It Tells Us |
 |--------|-----------------|

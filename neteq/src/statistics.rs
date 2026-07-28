@@ -267,6 +267,16 @@ pub struct LifetimeStatistics {
     pub buffer_flushes: u64,
     /// Late packets discarded
     pub late_packets_discarded: u64,
+    /// Concealment frames filled by native libopus PLC (issue 620).
+    /// `#[serde(default)]` so stats JSON serialized before issue 620 still
+    /// deserializes.
+    #[serde(default)]
+    pub plc_invocations_opus_native: u64,
+    /// Concealment frames filled by the quiet-noise fallback `Expand` path —
+    /// web decoders (no codec PLC), an unregistered payload type, a cold
+    /// decoder, or a libopus PLC failure (issue 620).
+    #[serde(default)]
+    pub plc_invocations_fallback_noise: u64,
 }
 
 /// Operations and internal state metrics
@@ -377,6 +387,20 @@ impl StatisticsCalculator {
         if is_silent {
             self.lifetime_stats.silent_concealed_samples += concealed_samples;
         }
+    }
+
+    /// Record that a concealment frame was produced by native libopus PLC
+    /// (issue 620). Monotonic over the NetEQ lifetime; surfaced in
+    /// `LifetimeStatistics::plc_invocations_opus_native`.
+    pub fn plc_invocation_opus_native(&mut self) {
+        self.lifetime_stats.plc_invocations_opus_native += 1;
+    }
+
+    /// Record that a concealment frame fell back to the quiet-noise `Expand`
+    /// path (issue 620). Monotonic over the NetEQ lifetime; surfaced in
+    /// `LifetimeStatistics::plc_invocations_fallback_noise`.
+    pub fn plc_invocation_fallback_noise(&mut self) {
+        self.lifetime_stats.plc_invocations_fallback_noise += 1;
     }
 
     /// Record time-stretching operation

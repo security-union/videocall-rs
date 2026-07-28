@@ -170,12 +170,12 @@
       "targets": [
         {
           "expr": "videocall_self_audio_enabled{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{display_name}} mic",
+          "legendFormat": "{{peer_id}} mic",
           "refId": ""
         },
         {
           "expr": "videocall_self_video_enabled{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{display_name}} cam",
+          "legendFormat": "{{peer_id}} cam",
           "refId": ""
         }
       ],
@@ -260,7 +260,7 @@
       },
       "targets": [
         {
-          "expr": "last_over_time(videocall_client_info{meeting_id=~\"$meeting\"}[$__range])",
+          "expr": "last_over_time(videocall_client_info{meeting_id=~\"$meeting\"}[$__range]) * on(meeting_id, session_id) group_left(display_name) videocall_peer_info",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -373,22 +373,22 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "JS heap used: {{display_name}}",
           "refId": "A"
         },
         {
-          "expr": "videocall_client_wasm_memory_bytes{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_wasm_memory_bytes{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "WASM linear: {{display_name}}",
           "refId": "B"
         },
         {
-          "expr": "videocall_client_memory_total_bytes{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_memory_total_bytes{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "JS heap limit: {{display_name}}",
           "refId": "C"
         },
         {
-          "expr": "videocall_client_agent_memory_bytes{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_agent_memory_bytes{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "agent total: {{display_name}}",
           "refId": "D"
         }
@@ -464,7 +464,7 @@
       "targets": [
         {
           "expr": "videocall_call_quality_score{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": ""
         }
       ],
@@ -525,8 +525,8 @@
       },
       "targets": [
         {
-          "expr": "avg by (reporter_name)(videocall_call_quality_score{meeting_id=~\"$meeting\"})",
-          "legendFormat": "{{reporter_name}}",
+          "expr": "avg by (from_peer)(videocall_call_quality_score{meeting_id=~\"$meeting\"})",
+          "legendFormat": "{{from_peer}}",
           "refId": ""
         }
       ],
@@ -587,8 +587,8 @@
       },
       "targets": [
         {
-          "expr": "avg by (peer_name)(videocall_call_quality_score{meeting_id=~\"$meeting\"})",
-          "legendFormat": "{{peer_name}}",
+          "expr": "avg by (to_peer)(videocall_call_quality_score{meeting_id=~\"$meeting\"})",
+          "legendFormat": "{{to_peer}}",
           "refId": ""
         }
       ],
@@ -1155,12 +1155,12 @@
       },
       "targets": [
         {
-          "expr": "rate(videocall_datagram_drops{meeting_id=~\"$meeting\"}[$__rate_interval])",
+          "expr": "rate(videocall_datagram_drops{meeting_id=~\"$meeting\"}[$__rate_interval]) * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "WT {{display_name}}",
           "refId": ""
         },
         {
-          "expr": "rate(videocall_websocket_drops{meeting_id=~\"$meeting\"}[$__rate_interval])",
+          "expr": "rate(videocall_websocket_drops{meeting_id=~\"$meeting\"}[$__rate_interval]) * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "WS {{display_name}}",
           "refId": ""
         }
@@ -1226,7 +1226,7 @@
       },
       "targets": [
         {
-          "expr": "rate(videocall_keyframe_requests_sent_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
+          "expr": "rate(videocall_keyframe_requests_sent_total{meeting_id=~\"$meeting\"}[$__rate_interval]) * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}}",
           "refId": ""
         }
@@ -1434,7 +1434,7 @@
       "targets": [
         {
           "expr": "videocall_audio_quality_score{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": ""
         }
       ],
@@ -1516,12 +1516,12 @@
       "targets": [
         {
           "expr": "videocall_neteq_expand_ops_per_sec{meeting_id=~\"$meeting\"}",
-          "legendFormat": "expand/s: {{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "expand/s: {{from_peer}} sees {{to_peer}}",
           "refId": "A"
         },
         {
           "expr": "videocall_audio_concealment_pct{meeting_id=~\"$meeting\"}",
-          "legendFormat": "concealment %: {{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "concealment %: {{from_peer}} sees {{to_peer}}",
           "refId": "B"
         }
       ],
@@ -1583,7 +1583,7 @@
       "targets": [
         {
           "expr": "videocall_neteq_target_delay_ms{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": ""
         }
       ],
@@ -1657,7 +1657,7 @@
       "targets": [
         {
           "expr": "videocall_video_quality_score{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": ""
         }
       ],
@@ -1718,7 +1718,7 @@
       "targets": [
         {
           "expr": "videocall_video_bitrate_kbps{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
           "refId": ""
         }
       ],
@@ -1778,7 +1778,7 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}} ({{server_type}})",
           "refId": ""
         }
@@ -1836,7 +1836,7 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}} [{{server_type}}]",
           "refId": "A"
         }
@@ -2040,7 +2040,7 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_send_queue_bytes{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_send_queue_bytes{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}}",
           "refId": ""
         }
@@ -2101,7 +2101,7 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_packets_received_per_sec{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_packets_received_per_sec{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}}",
           "refId": ""
         }
@@ -2162,7 +2162,7 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_packets_sent_per_sec{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_packets_sent_per_sec{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}}",
           "refId": ""
         }
@@ -2224,12 +2224,12 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_tab_visible{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_tab_visible{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}} visible",
           "refId": ""
         },
         {
-          "expr": "videocall_client_tab_throttled{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_tab_throttled{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}} throttled",
           "refId": ""
         }
@@ -2310,12 +2310,12 @@
       },
       "targets": [
         {
-          "expr": "videocall_adaptive_video_tier{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_adaptive_video_tier{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "video {{display_name}}",
           "refId": "A"
         },
         {
-          "expr": "videocall_adaptive_audio_tier{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_adaptive_audio_tier{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "audio {{display_name}}",
           "refId": "B"
         }
@@ -2411,22 +2411,22 @@
       "targets": [
         {
           "expr": "videocall_video_seq_loss_per_sec{meeting_id=~\"$meeting\"}",
-          "legendFormat": "seq-loss/s: {{reporter_name}} \u2192 {{peer_name}}",
+          "legendFormat": "seq-loss/s: {{from_peer}} \u2192 {{to_peer}}",
           "refId": "A"
         },
         {
           "expr": "videocall_video_fps{meeting_id=~\"$meeting\"}",
-          "legendFormat": "fps: {{reporter_name}} \u2192 {{peer_name}}",
+          "legendFormat": "fps: {{from_peer}} \u2192 {{to_peer}}",
           "refId": "B"
         },
         {
           "expr": "videocall_video_frames_dropped{meeting_id=~\"$meeting\"}",
-          "legendFormat": "frames-dropped/s: {{reporter_name}} \u2192 {{peer_name}}",
+          "legendFormat": "frames-dropped/s: {{from_peer}} \u2192 {{to_peer}}",
           "refId": "C"
         },
         {
           "expr": "deriv(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
-          "legendFormat": "decode-err/s: {{reporter_name}} \u2192 {{peer_name}}",
+          "legendFormat": "decode-err/s: {{from_peer}} \u2192 {{to_peer}}",
           "refId": "D"
         }
       ],
@@ -2492,7 +2492,7 @@
       "targets": [
         {
           "expr": "videocall_video_seq_loss_per_sec{meeting_id=~\"$meeting\"} > 0",
-          "legendFormat": "{{reporter_name}} \u2192 {{peer_name}}",
+          "legendFormat": "{{from_peer}} \u2192 {{to_peer}}",
           "refId": "A"
         }
       ],
@@ -2590,17 +2590,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le, display_name)(rate(videocall_client_longtask_duration_ms_bucket{meeting_id=~\"$meeting\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, meeting_id, session_id)(rate(videocall_client_longtask_duration_ms_bucket{meeting_id=~\"$meeting\"}[$__rate_interval]))) * on(meeting_id, session_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "longtask p99: {{display_name}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le, display_name)(rate(videocall_client_longtask_duration_ms_bucket{meeting_id=~\"$meeting\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, meeting_id, session_id)(rate(videocall_client_longtask_duration_ms_bucket{meeting_id=~\"$meeting\"}[$__rate_interval]))) * on(meeting_id, session_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "longtask p95: {{display_name}}",
           "refId": "B"
         },
         {
-          "expr": "videocall_client_render_fps{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_client_render_fps{meeting_id=~\"$meeting\"} * on(meeting_id, session_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "render fps: {{display_name}}",
           "refId": "C"
         }
@@ -2665,12 +2665,12 @@
       },
       "targets": [
         {
-          "expr": "videocall_decode_budget_effective_cap{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_decode_budget_effective_cap{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}} cap",
           "refId": "A"
         },
         {
-          "expr": "videocall_decode_budget_natural{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_decode_budget_natural{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "{{display_name}} natural",
           "refId": "B"
         }
@@ -2813,12 +2813,12 @@
       },
       "targets": [
         {
-          "expr": "videocall_decode_budget_override_mode{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_decode_budget_override_mode{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "mode {{display_name}}",
           "refId": "A"
         },
         {
-          "expr": "videocall_decode_budget_override_fixed_n{meeting_id=~\"$meeting\"}",
+          "expr": "videocall_decode_budget_override_fixed_n{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "legendFormat": "fixed-n {{display_name}}",
           "refId": "B"
         }
@@ -3321,17 +3321,17 @@
           },
           "targets": [
             {
-              "expr": "videocall_adaptive_video_tier{meeting_id=~\"$meeting\"}",
+              "expr": "videocall_adaptive_video_tier{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
               "legendFormat": "{{display_name}} video",
               "refId": "A"
             },
             {
-              "expr": "videocall_adaptive_audio_tier{meeting_id=~\"$meeting\"}",
+              "expr": "videocall_adaptive_audio_tier{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
               "legendFormat": "{{display_name}} audio",
               "refId": "B"
             },
             {
-              "expr": "videocall_adaptive_screen_tier{meeting_id=~\"$meeting\"}",
+              "expr": "videocall_adaptive_screen_tier{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
               "legendFormat": "{{display_name}} screen",
               "refId": "C"
             }
@@ -3393,12 +3393,12 @@
           },
           "targets": [
             {
-              "expr": "videocall_encoder_queue_depth{meeting_id=~\"$meeting\"}",
+              "expr": "videocall_encoder_queue_depth{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
               "legendFormat": "{{display_name}} queue_depth",
               "refId": "A"
             },
             {
-              "expr": "videocall_encoder_output_fps{meeting_id=~\"$meeting\"}",
+              "expr": "videocall_encoder_output_fps{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
               "legendFormat": "{{display_name}} output",
               "refId": "B"
             }
@@ -3465,17 +3465,17 @@
           "targets": [
             {
               "expr": "videocall_video_seq_loss_per_sec{meeting_id=~\"$meeting\"}",
-              "legendFormat": "seq-loss/s: {{reporter_name}} \u2192 {{peer_name}}",
+              "legendFormat": "seq-loss/s: {{from_peer}} \u2192 {{to_peer}}",
               "refId": "A"
             },
             {
               "expr": "deriv(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
-              "legendFormat": "decode-err/s: {{reporter_name}} \u2192 {{peer_name}}",
+              "legendFormat": "decode-err/s: {{from_peer}} \u2192 {{to_peer}}",
               "refId": "B"
             },
             {
               "expr": "videocall_video_frames_dropped{meeting_id=~\"$meeting\"}",
-              "legendFormat": "frames-dropped/s: {{reporter_name}} \u2192 {{peer_name}}",
+              "legendFormat": "frames-dropped/s: {{from_peer}} \u2192 {{to_peer}}",
               "refId": "C"
             }
           ],
@@ -3676,164 +3676,400 @@
           },
           "targets": [
             {
-              "expr": "videocall_encoder_effective_layers{meeting_id=~\"$meeting\"}",
+              "expr": "videocall_encoder_effective_layers{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
               "legendFormat": "{{display_name}} {{media_kind}} effective",
               "refId": "A"
             },
             {
-              "expr": "videocall_encoder_active_layers{meeting_id=~\"$meeting\"}",
+              "expr": "videocall_encoder_active_layers{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
               "legendFormat": "{{display_name}} {{media_kind}} active",
               "refId": "B"
             }
           ],
           "title": "Publisher Effective vs Active Layers",
-          "description": "The A3 core-claim panel. effective = ladder depth the publisher is configured to encode; active = layers currently encoding. The effective set should stay constant while one receiver degrades. A gap (active < effective) means AQ shed the top layer(s) at the publisher — a global cut, NOT per-receiver selection.",
+          "description": "The A3 core-claim panel. effective = ladder depth the publisher is configured to encode; active = layers currently encoding. The effective set should stay constant while one receiver degrades. A gap (active < effective) means AQ shed the top layer(s) at the publisher \u2014 a global cut, NOT per-receiver selection.",
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "prometheus" },
+          "datasource": {
+            "type": "prometheus"
+          },
           "fieldConfig": {
             "defaults": {
-              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
               "min": 0,
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
               "unit": "short"
             },
             "overrides": []
           },
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 221 },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 221
+          },
           "id": 86,
           "options": {
-            "legend": { "calcs": ["last", "min"], "displayMode": "table", "placement": "bottom" },
-            "tooltip": { "mode": "multi", "sort": "desc" }
+            "legend": {
+              "calcs": [
+                "last",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
           },
           "targets": [
-            { "expr": "videocall_received_layer{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} → {{from_peer}} {{media_kind}}", "refId": "A" }
+            {
+              "expr": "videocall_received_layer{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+              "legendFormat": "{{display_name}} \u2192 {{from_peer}} {{media_kind}}",
+              "refId": "A"
+            }
           ],
           "title": "Receiver Layer Selection (per-peer)",
           "description": "Which simulcast layer each receiver is subscribing to for each peer. 0=base, 1=mid, 2=high. Only constrained peers appear (below top layer). Empty = all receivers healthy.",
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "prometheus" },
+          "datasource": {
+            "type": "prometheus"
+          },
           "fieldConfig": {
             "defaults": {
-              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
               "min": 0,
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
               "unit": "short"
             },
             "overrides": []
           },
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 221 },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 221
+          },
           "id": 87,
           "options": {
-            "legend": { "calcs": ["last", "min"], "displayMode": "table", "placement": "bottom" },
-            "tooltip": { "mode": "multi", "sort": "desc" }
+            "legend": {
+              "calcs": [
+                "last",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
           },
           "targets": [
-            { "expr": "videocall_audio_congestion_ceiling{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} ceiling", "refId": "A" },
-            { "expr": "videocall_encoder_effective_layers{meeting_id=~\"$meeting\", media_kind=\"audio\"}", "legendFormat": "{{display_name}} effective", "refId": "B" }
+            {
+              "expr": "videocall_audio_congestion_ceiling{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+              "legendFormat": "{{display_name}} ceiling",
+              "refId": "A"
+            },
+            {
+              "expr": "videocall_encoder_effective_layers{meeting_id=~\"$meeting\", media_kind=\"audio\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+              "legendFormat": "{{display_name}} effective",
+              "refId": "B"
+            }
           ],
           "title": "Audio Congestion Ceiling",
           "description": "Audio congestion-driven layer ceiling vs effective (configured) layers. ceiling < effective = audio layers are being shed under congestion. ceiling == effective = uncapped (healthy).",
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "prometheus" },
+          "datasource": {
+            "type": "prometheus"
+          },
           "fieldConfig": {
             "defaults": {
-              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
-              "min": 0, "max": 1,
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 0.2 }] },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "max": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 0.2
+                  }
+                ]
+              },
               "unit": "percentunit"
             },
             "overrides": []
           },
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 229 },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 229
+          },
           "id": 88,
           "options": {
-            "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom" },
-            "tooltip": { "mode": "multi", "sort": "desc" }
+            "legend": {
+              "calcs": [
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
           },
           "targets": [
-            { "expr": "videocall_client_battery_level{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} level", "refId": "A" },
-            { "expr": "videocall_client_battery_charging{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} charging", "refId": "B" }
+            {
+              "expr": "videocall_client_battery_level{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+              "legendFormat": "{{display_name}} level",
+              "refId": "A"
+            },
+            {
+              "expr": "videocall_client_battery_charging{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+              "legendFormat": "{{display_name}} charging",
+              "refId": "B"
+            }
           ],
           "title": "Battery Level & Charging State",
           "description": "Client battery level (0-1) and charging state (1=charging, 0=discharging). Helps distinguish power-throttle from CPU-throttle.",
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "prometheus" },
+          "datasource": {
+            "type": "prometheus"
+          },
           "fieldConfig": {
             "defaults": {
-              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
               "min": 0,
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
               "unit": "Mbps"
             },
             "overrides": []
           },
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 229 },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 229
+          },
           "id": 89,
           "options": {
-            "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom" },
-            "tooltip": { "mode": "multi", "sort": "desc" }
+            "legend": {
+              "calcs": [
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
           },
           "targets": [
-            { "expr": "videocall_client_network_downlink_max{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} downlinkMax", "refId": "A" }
+            {
+              "expr": "videocall_client_network_downlink_max{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+              "legendFormat": "{{display_name}} downlinkMax",
+              "refId": "A"
+            }
           ],
           "title": "Network Downlink Max (Mbps)",
           "description": "Max downlink speed of the connection medium in Mbps (navigator.connection.downlinkMax). wifi=54, ethernet=1000. Absent on Firefox/Safari.",
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "prometheus" },
+          "datasource": {
+            "type": "prometheus"
+          },
           "fieldConfig": {
             "defaults": {
-              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
-              "min": 0, "max": 1,
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "max": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
               "unit": "short"
             },
             "overrides": []
           },
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 237 },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 237
+          },
           "id": 90,
           "options": {
-            "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom" },
-            "tooltip": { "mode": "multi", "sort": "desc" }
+            "legend": {
+              "calcs": [
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
           },
           "targets": [
-            { "expr": "videocall_client_cpu_throttled{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}}", "refId": "A" }
+            {
+              "expr": "videocall_client_cpu_throttled{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+              "legendFormat": "{{display_name}}",
+              "refId": "A"
+            }
           ],
           "title": "CPU Throttle Indicator",
           "description": "1 when capability_score / hardware_concurrency < 150, indicating a restrictive power plan, thermal throttle, or heavy background load. 0 = normal.",
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "prometheus" },
+          "datasource": {
+            "type": "prometheus"
+          },
           "fieldConfig": {
             "defaults": {
-              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
               "min": 0,
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
               "unit": "short"
             },
             "overrides": []
           },
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 237 },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 237
+          },
           "id": 91,
           "options": {
-            "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom" },
-            "tooltip": { "mode": "multi", "sort": "desc" }
+            "legend": {
+              "calcs": [
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
           },
           "targets": [
-            { "expr": "videocall_client_network_type{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} {{network_type}}", "refId": "A" }
+            {
+              "expr": "videocall_client_network_type{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+              "legendFormat": "{{display_name}} {{network_type}}",
+              "refId": "A"
+            }
           ],
           "title": "Connection Medium Type",
-          "description": "Network connection type indicator (wifi/ethernet/cellular). Value=1 when that type is active for the client. navigator.connection.type — Chrome/Edge only.",
+          "description": "Network connection type indicator (wifi/ethernet/cellular). Value=1 when that type is active for the client. navigator.connection.type \u2014 Chrome/Edge only.",
           "type": "timeseries"
         },
         {
@@ -4018,8 +4254,8 @@
               "refId": "A"
             }
           ],
-          "title": "CONGESTION Filtered — non-target (#1220)",
-          "description": "CONGESTION control packets the relay dropped for non-target receivers (#1220 unicast-correctness coalesce). Validates that a CONGESTION signal is delivered only to the intended receiver, not broadcast — the #1219 collapse fix.",
+          "title": "CONGESTION Filtered \u2014 non-target (#1220)",
+          "description": "CONGESTION control packets the relay dropped for non-target receivers (#1220 unicast-correctness coalesce). Validates that a CONGESTION signal is delivered only to the intended receiver, not broadcast \u2014 the #1219 collapse fix.",
           "type": "timeseries"
         },
         {
@@ -4085,7 +4321,7 @@
             }
           ],
           "title": "#1057 Guard: relay packet drops by reason",
-          "description": "Relay backpressure loss by drop_reason and transport, filtered to this meeting. A 'mailbox_full' spike (red) is the #1057 room-wide-freeze signature — the 16-slot actix mailbox is dropping inbound messages. This must stay ~0; any sustained nonzero is the freeze precursor.",
+          "description": "Relay backpressure loss by drop_reason and transport, filtered to this meeting. A 'mailbox_full' spike (red) is the #1057 room-wide-freeze signature \u2014 the 16-slot actix mailbox is dropping inbound messages. This must stay ~0; any sustained nonzero is the freeze precursor.",
           "type": "timeseries"
         },
         {
@@ -4150,8 +4386,8 @@
               "refId": "A"
             }
           ],
-          "title": "#1057 Guard: outbound channel drops — FLEET-WIDE (not per-meeting)",
-          "description": "Outbound per-session channel drops by transport and kind. FLEET-WIDE: videocall_outbound_channel_drops_total carries only 'transport' and 'kind' labels (no room/meeting_id), so this is intentionally NOT filtered by $meeting — a $meeting filter would return empty. Read alongside the per-meeting relay-packet-drops panel; this is the cluster-wide backpressure backstop for #1057.",
+          "title": "#1057 Guard: outbound channel drops \u2014 FLEET-WIDE (not per-meeting)",
+          "description": "Outbound per-session channel drops by transport and kind. FLEET-WIDE: videocall_outbound_channel_drops_total carries only 'transport' and 'kind' labels (no room/meeting_id), so this is intentionally NOT filtered by $meeting \u2014 a $meeting filter would return empty. Read alongside the per-meeting relay-packet-drops panel; this is the cluster-wide backpressure backstop for #1057.",
           "type": "timeseries"
         }
       ]
@@ -4232,12 +4468,12 @@
           "targets": [
             {
               "expr": "max_over_time(videocall_video_playout_latency_ms{meeting_id=~\"$meeting\"}[1m])",
-              "legendFormat": "total: {{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "total: {{session_id}} {{from_peer}} sees {{to_peer}}",
               "refId": "A"
             },
             {
               "expr": "max_over_time(videocall_video_playout_stage1_span_ms{meeting_id=~\"$meeting\"}[1m])",
-              "legendFormat": "stage1: {{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "stage1: {{session_id}} {{from_peer}} sees {{to_peer}}",
               "refId": "B"
             }
           ],
@@ -4307,18 +4543,18 @@
           "targets": [
             {
               "expr": "max_over_time(videocall_video_playout_paint_lag_ms{meeting_id=~\"$meeting\"}[1m])",
-              "legendFormat": "{{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "{{session_id}} {{from_peer}} sees {{to_peer}}",
               "refId": "A"
             }
           ],
-          "title": "Video Playout Paint Lag — Stage 3 (#1338)",
+          "title": "Video Playout Paint Lag \u2014 Stage 3 (#1338)",
           "type": "timeseries"
         },
         {
           "datasource": {
             "type": "prometheus"
           },
-          "description": "Per-session buffered AUDIO playout latency (companion to the video panel). DEPENDS ON #1360 (videocall_audio_playout_latency_ms) merging into PR-staging — the gauge is declared on that branch and this panel will read empty until it lands. NOTE: audio playout is governed by the NetEQ adaptive jitter buffer, whose scale differs from the video jitter buffer; the 600/1800ms threshold bands are inherited from the video panel as a starting point and likely need field tuning against videocall_neteq_target_delay_ms. max_over_time[1m] per session_id.",
+          "description": "Per-session buffered AUDIO playout latency (companion to the video panel). DEPENDS ON #1360 (videocall_audio_playout_latency_ms) merging into PR-staging \u2014 the gauge is declared on that branch and this panel will read empty until it lands. NOTE: audio playout is governed by the NetEQ adaptive jitter buffer, whose scale differs from the video jitter buffer; the 600/1800ms threshold bands are inherited from the video panel as a starting point and likely need field tuning against videocall_neteq_target_delay_ms. max_over_time[1m] per session_id.",
           "fieldConfig": {
             "defaults": {
               "custom": {
@@ -4377,11 +4613,11 @@
           "targets": [
             {
               "expr": "max_over_time(videocall_audio_playout_latency_ms{meeting_id=~\"$meeting\"}[1m])",
-              "legendFormat": "{{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "{{session_id}} {{from_peer}} sees {{to_peer}}",
               "refId": "A"
             }
           ],
-          "title": "Audio Playout Latency (#1360 — pending merge)",
+          "title": "Audio Playout Latency (#1360 \u2014 pending merge)",
           "type": "timeseries"
         }
       ],
@@ -4464,12 +4700,12 @@
           "targets": [
             {
               "expr": "max_over_time(videocall_screen_video_playout_latency_ms{meeting_id=~\"$meeting\"}[1m])",
-              "legendFormat": "total: {{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "total: {{session_id}} {{from_peer}} sees {{to_peer}}",
               "refId": "A"
             },
             {
               "expr": "max_over_time(videocall_screen_video_playout_stage1_span_ms{meeting_id=~\"$meeting\"}[1m])",
-              "legendFormat": "stage1: {{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "stage1: {{session_id}} {{from_peer}} sees {{to_peer}}",
               "refId": "B"
             }
           ],
@@ -4539,7 +4775,7 @@
           "targets": [
             {
               "expr": "max_over_time(videocall_screen_video_playout_paint_lag_ms{meeting_id=~\"$meeting\"}[1m])",
-              "legendFormat": "{{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "{{session_id}} {{from_peer}} sees {{to_peer}}",
               "refId": "A"
             }
           ],
@@ -4609,7 +4845,7 @@
           "targets": [
             {
               "expr": "max_over_time(videocall_screen_video_content_staleness_ms{meeting_id=~\"$meeting\"}[1m])",
-              "legendFormat": "{{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "{{session_id}} {{from_peer}} sees {{to_peer}}",
               "refId": "A"
             }
           ],
@@ -4671,7 +4907,7 @@
           "targets": [
             {
               "expr": "increase(videocall_screen_video_skip_to_live_total{meeting_id=~\"$meeting\"}[1m])",
-              "legendFormat": "{{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "{{session_id}} {{from_peer}} sees {{to_peer}}",
               "refId": "A"
             }
           ],
@@ -4733,7 +4969,7 @@
           "targets": [
             {
               "expr": "videocall_screen_video_fps{meeting_id=~\"$meeting\"}",
-              "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "{{from_peer}} sees {{to_peer}}",
               "refId": "A"
             }
           ],
@@ -4795,7 +5031,7 @@
           "targets": [
             {
               "expr": "videocall_screen_video_bitrate_kbps{meeting_id=~\"$meeting\"}",
-              "legendFormat": "{{reporter_name}} sees {{peer_name}}",
+              "legendFormat": "{{from_peer}} sees {{to_peer}}",
               "refId": "A"
             }
           ],
@@ -4805,6 +5041,271 @@
       ],
       "title": "Screen-Share Playout & Quality (#1660)",
       "type": "row"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 245
+      },
+      "id": 103,
+      "title": "Backpressure & Datagram Loss (#1737/#1878)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Per-pair receive-side audio datagram loss rate (lost audio packets/sec) observed by a WebTransport receiver (#1878). Sustained nonzero => plaintext-datagram audio being dropped (e.g. incoming-datagram queue overflow on a main-thread stall) — burst loss NetEQ cannot conceal. Reads 0 on WebSocket (audio rides ordered TCP) and ~0 on E2EE-WT (audio on the reliable unistream). Filtered to > 0 so only lossy pairs plot.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 246
+      },
+      "id": 99,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_audio_datagram_loss_per_sec{meeting_id=~\"$meeting\"} > 0",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Audio Datagram Loss/sec (WT receiver) (#1878)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Per-receiver relay outbound channel depth (slots occupied), keyed by session and split by channel (#1737). Labeled by room (== meeting name), transport, session_id, channel. The per-rx mpsc capacity is 512 with shedding at ~80% (#979); sustained high depth means the receiver's downlink cannot drain as fast as the relay fans in. Wrapped in topk(25, ...) to bound rendered series because $meeting defaults to All and this is a high-cardinality {room,transport,session_id,channel} metric.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 246
+      },
+      "id": 100,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, videocall_relay_outbound_queue_depth_by_session{room=~\"$meeting\"})",
+          "legendFormat": "{{transport}} {{session_id}} {{channel}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Relay Outbound Queue Depth by Session (#1737)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "WT persistent-unistream publisher throughput vs client WritableStream backpressure (#1737). Offered = bytes the publisher tried to write; Drained = bytes accepted past the backpressure gate. A persistent gap (offered >> drained) indicates client-side downlink backpressure. rate(...[1m]) converts the cumulative _total counters to bytes/sec (rate() correctly handles counter resets on reconnect, unlike deriv); joined to videocall_peer_info for display_name.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 254
+      },
+      "id": 101,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(videocall_unistream_bytes_offered_total{meeting_id=~\"$meeting\"}[1m]) * on(meeting_id,session_id,peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "offered: {{display_name}}",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(videocall_unistream_bytes_drained_total{meeting_id=~\"$meeting\"}[1m]) * on(meeting_id,session_id,peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "drained: {{display_name}}",
+          "refId": "B"
+        }
+      ],
+      "title": "WT Unistream Offered vs Drained (client backpressure) (#1737)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "WT persistent-unistream camera DELTA frames age-dropped by the publisher per minute (#1737 Phase 1 age_evicted_frames_total). Nonzero => the publisher is shedding stale delta frames because the client's unistream is backpressured. increase(...[1m]) over the cumulative _total series; joined to videocall_peer_info for display_name.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 254
+      },
+      "id": 102,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "increase(videocall_unistream_stale_delta_drops_total{meeting_id=~\"$meeting\"}[1m]) * on(meeting_id,session_id,peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}}",
+          "refId": "A"
+        }
+      ],
+      "title": "WT Camera Delta Frames Age-Dropped /1m (#1737)",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",

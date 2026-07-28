@@ -11,8 +11,9 @@ use crate::constants::{
     actix_websocket_base, e2ee_enabled, webtransport_enabled, webtransport_host_base,
 };
 use crate::context::{
-    resolve_transport_config, save_display_name_to_storage, validate_display_name, DisplayNameCtx,
-    TransportPreference, TransportPreferenceCtx, DISPLAY_NAME_MAX_LEN,
+    load_transport_preference_with_source, resolve_transport_config, save_display_name_to_storage,
+    validate_display_name, DisplayNameCtx, TransportPreference, TransportPreferenceCtx,
+    DISPLAY_NAME_MAX_LEN,
 };
 use crate::meeting_api::{join_meeting_as_guest, JoinMeetingResponse};
 use crate::theme::color as theme_color;
@@ -169,6 +170,19 @@ fn start_observer_connection(
         webtransport_enabled().unwrap_or(false),
         websocket_urls,
         webtransport_urls,
+    );
+
+    // Issue #1745 PR2 (observability only): record the applied preference + its
+    // provenance for the guest lobby OBSERVER client. `transport_pref` is the
+    // value passed in from the context signal that filtered the lists above;
+    // the source tag comes from the storage the signal was seeded from.
+    let (_, pref_source) = load_transport_preference_with_source();
+    log::info!(
+        "Transport preference applied: pref={} source={} wt_urls={} ws_urls={}",
+        transport_pref,
+        pref_source,
+        webtransport_urls.len(),
+        websocket_urls.len()
     );
 
     let opts = VideoCallClientOptions {
@@ -670,6 +684,7 @@ mod tests {
             host_user_id: Some("host-1".to_string()),
             allow_guests: true,
             recording_allowed_for_all: false,
+            chat_allowed_for_all: true,
         }
     }
 

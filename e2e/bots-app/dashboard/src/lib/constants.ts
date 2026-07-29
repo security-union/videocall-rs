@@ -53,6 +53,14 @@ export const AUTH_BACKENDS = [
 
 export type AuthBackend = (typeof AUTH_BACKENDS)[number]["value"];
 
+export const VIDEO_MODES = [
+  { value: "costume", label: "Costume (manifest / fake files)" },
+  { value: "clock", label: "Clock (live wall clock)" },
+  { value: "file", label: "File override" },
+] as const;
+
+export type VideoMode = (typeof VIDEO_MODES)[number]["value"];
+
 /**
  * Network preset metadata surfaced by the Help page. Each entry
  * mirrors a `videocall-netsim` preset and carries the

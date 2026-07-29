@@ -14,7 +14,58 @@ import {
   installClickDiagnostics,
   joinMeetingAndEnableMedia,
   logPostClickDiagnostics,
+  waitForJoinButton,
 } from "./meeting-join";
+
+// #865 regression lock (the deterministic one). The end-to-end Playwright
+// spec (bot-join-flow.spec.ts) is smoke coverage of the real join flow but is
+// NOT a #865 lock: reverting the gate reintroduces a Promise.race whose prompt
+// arm still usually wins, so the spec false-passes (verified via mutation).
+// This unit test pins the GATE directly: while the display-name form is still
+// visible, the join-button race arm must NOT resolve. Flip
+// `if (blockWhileFormsPresent)` to `if (false)` in meeting-join.ts and the
+// first test below goes red — the property #2023 added to resolve #865.
+describe("waitForJoinButton — #865 form-gating", () => {
+  const resolvedWait = () => Promise.resolve();
+  // A wait that never settles (the watched element never reaches the state).
+  const pendingWait = () => new Promise<void>(() => {});
+  const mkLocator = (waitFor: (opts: { state: string }) => Promise<void>) =>
+    ({ waitFor: vi.fn(waitFor) }) as unknown as Parameters<typeof waitForJoinButton>[0];
+
+  it("blocks the join-button arm while the display-name form is still visible", async () => {
+    const joinButton = mkLocator(() => resolvedWait()); // Join button IS present…
+    const homepageMeetingInput = mkLocator(() => resolvedWait()); // …homepage form gone…
+    // …but the display-name prompt is STILL visible (never goes hidden).
+    const displayNameInput = mkLocator(({ state }) =>
+      state === "hidden" ? pendingWait() : resolvedWait(),
+    );
+    const outcome = await Promise.race([
+      waitForJoinButton(
+        joinButton,
+        homepageMeetingInput,
+        displayNameInput,
+        10_000,
+        false,
+        true,
+      ).then(() => "RESOLVED" as const),
+      new Promise<"BLOCKED">((r) => setTimeout(() => r("BLOCKED"), 60)),
+    ]);
+    // With the #865 gate on, the arm must stay blocked so the prompt arm wins
+    // the race and the display-name input is filled first. With the gate
+    // reverted (`if (false)`), the join-button arm resolves and this is
+    // "RESOLVED" — the mutation that makes this assertion fail.
+    expect(outcome).toBe("BLOCKED");
+  });
+
+  it("resolves once both forms are hidden", async () => {
+    const joinButton = mkLocator(() => resolvedWait());
+    const homepageMeetingInput = mkLocator(() => resolvedWait());
+    const displayNameInput = mkLocator(() => resolvedWait()); // hidden -> gate passes
+    await expect(
+      waitForJoinButton(joinButton, homepageMeetingInput, displayNameInput, 10_000, false, true),
+    ).resolves.toBeUndefined();
+  });
+});
 
 describe("meeting-join module surface", () => {
   it("exports joinMeetingAndEnableMedia as a function", () => {

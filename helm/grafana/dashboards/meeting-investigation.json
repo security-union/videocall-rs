@@ -5306,6 +5306,323 @@
       ],
       "title": "WT Camera Delta Frames Age-Dropped /1m (#1737)",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "id": 104,
+      "title": "Relay Outbound Datagram Send Failures /sec — FLEET-WIDE (issue 2030)",
+      "description": "Server-side view of WebTransport outbound datagram loss (issue 2030): datagrams the relay failed to hand to quinn, counted in spawn_datagram_writer's send_datagram error branch, broken down by failure reason. FLEET-WIDE — relay_outbound_bridge_datagram_send_failures_total carries only 'transport' (always webtransport) and 'reason' labels (no room/meeting), so this is NOT filtered by $meeting. reason=connection_lost is benign teardown churn; a sustained too_large / unsupported / disabled is an actionable MTU or datagram-config bug. Server-side sibling of the receiver-side Audio Datagram Loss panel above — this signal survives a wedged client. Does NOT count datagrams quinn accepts (returns Ok) and then silently evicts when its bounded send buffer (datagram_send_buffer_size) overflows — quinn pops the oldest queued datagram and still returns Ok, so this call site can't see it (pacing/cwnd only set the drain rate). That class needs a quinn-level hook, out of scope for issue 2030.",
+      "type": "timeseries",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.001
+              }
+            ]
+          },
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason)(rate(relay_outbound_bridge_datagram_send_failures_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 262
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Per-client max gap (ms) between successive incoming-datagram read resolutions on the main-thread reader, over the last health interval (issue 2031). The DIRECT causal signal for the audio-loss class: a long task starves the reader, the browser age-drops the OLDEST queued datagrams, and audio is silently lost. Sustained hundreds of ms => reader starvation. WebTransport-only (0 on WebSocket). Joined to videocall_peer_info for display_name; filtered to > 0 so only starved clients plot.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 270
+      },
+      "id": 105,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "(videocall_client_datagram_read_loop_max_gap_ms{meeting_id=~\"$meeting\"} > 0) * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Datagram Read-Loop Max Gap (reader starvation) (issue 2031)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Per-client mean audio concealment percentage over active sources, SPLIT BY the reporter's active transport (issue 2031). The ground-truth WS-vs-WT severity gap: audio on unreliable WebTransport datagrams conceals far more than on ordered-TCP WebSocket under the identical main-thread stall (56% vs 2% observed in the field). Legend split by transport so the two populations are directly comparable.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 270
+      },
+      "id": 106,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_client_audio_concealment_pct{meeting_id=~\"$meeting\"}",
+          "legendFormat": "{{transport}} {{session_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Audio Concealment % by Transport (WS vs WT) (issue 2031)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Per-pair receive-side audio datagram RAW (uncapped) loss rate (skipped sequences/sec) observed by a WebTransport receiver (issue 2031). The MAGNITUDE companion to the capped Audio Datagram Loss panel above, which saturates at ~64/gap due to the 64-slot reorder window and so cannot distinguish 1% from 80% loss. A large gap between this and the capped panel is the burst severity. Filtered to > 0 so only lossy pairs plot.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 278
+      },
+      "id": 107,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_audio_datagram_raw_loss_per_sec{meeting_id=~\"$meeting\"} > 0",
+          "legendFormat": "{{from_peer}} sees {{to_peer}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Audio Datagram RAW (uncapped) Loss/sec (issue 2031)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Per-client observed post-set incoming-datagram queue parameters (issue 2031 read-back of the issue-1878 mitigation). Empirically answers, per browser, whether Chromium honored the setters: highWaterMark at the requested target (2048) confirms the capacity knob took effect; maxAge near 3000ms confirms the staleness knob took effect (a value of -1 is the sentinel for unbounded / setter not honored). WebTransport-only.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 278
+      },
+      "id": 108,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_wt_incoming_datagram_high_water_mark{meeting_id=~\"$meeting\"}",
+          "legendFormat": "hwm {{session_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_wt_incoming_datagram_max_age_ms{meeting_id=~\"$meeting\"}",
+          "legendFormat": "maxAge ms {{session_id}}",
+          "refId": "B"
+        }
+      ],
+      "title": "WT Incoming Datagram Queue Read-back (issue 2031)",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",

@@ -396,6 +396,7 @@ describe("control server: SSH host registry endpoints", () => {
           headless: true,
           network: "none",
           authBackend: "jwt",
+          videoMode: "clock",
         },
       });
       expect(res.status).toBe(200);
@@ -410,6 +411,7 @@ describe("control server: SSH host registry endpoints", () => {
       expect(body.remoteCommand).toContain("npm run bot");
       expect(body.remoteCommand).toContain("--participant 'alice'");
       expect(body.remoteCommand).toContain("--ttl '5m'");
+      expect(body.remoteCommand).toContain("--video-mode 'clock'");
     });
 
     it("returns 404 when the host is not registered", async () => {
@@ -486,6 +488,13 @@ describe("control server: SSH host registry endpoints", () => {
             profileFile: "~/.bash_profile",
             preCommand: ". ~/.nvm/nvm.sh && nvm use 22",
           },
+          launchSpec: {
+            meetingURL: "https://example.com/meeting/X",
+            participant: "clock-bot",
+            ttl: "5m",
+            authBackend: "jwt",
+            videoMode: "clock",
+          },
         },
       });
       expect(res.status).toBe(200);
@@ -494,10 +503,9 @@ describe("control server: SSH host registry endpoints", () => {
       expect(body.argv[0]).toBe("ssh");
       expect(body.argv).toContain("alice@lab.intra");
       expect(body.display).toMatch(/^ssh /);
-      // Default placeholder tokens are visible (no real participant /
-      // meeting URL supplied).
-      expect(body.remoteCommand).toContain("--participant '<participant>'");
-      expect(body.remoteCommand).toContain("--meeting-url '<meeting-url>'");
+      expect(body.remoteCommand).toContain("--participant 'clock-bot'");
+      expect(body.remoteCommand).toContain("--meeting-url 'https://example.com/meeting/X'");
+      expect(body.remoteCommand).toContain("--video-mode 'clock'");
       // The structured prefix shows up in the wrapper payload (last argv slot).
       const tail = body.argv[body.argv.length - 1];
       expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");

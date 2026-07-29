@@ -1307,6 +1307,19 @@ impl PeerDecode for VideoPeerDecoder {
         // flag we return `first_frame: true` exactly once, which lets
         // `peer_decode_manager` fire the `PEER_EVENT(screen_decode_started)`
         // ack to the publisher.
+        //
+        // HCL #893 E2E hook: if a test armed a synthetic "screen frame painted"
+        // (only reachable under `MOCK_PEERS_ENABLED`; see
+        // `crate::screen_first_render_inject`), apply it here through the SAME
+        // `mark_first_render` the real rAF paint closure uses, so the `consume`
+        // below returns `first_frame: true` exactly once and the manager's real
+        // ack path fires. This is a no-op in production (the pending flag is
+        // never set) and only fires for the SCREEN decoder.
+        apply_screen_first_render_inject(
+            self.media_type,
+            &self.first_render_fired,
+            &self.first_render_pending_ack,
+        );
         let first_frame = consume_first_render_flag(&self.first_render_pending_ack);
 
         Ok(DecodeStatus {
@@ -1408,6 +1421,36 @@ fn mark_first_render(fired: &Rc<RefCell<bool>>, ack: &Rc<RefCell<bool>>) {
     if !*fired.borrow() {
         *fired.borrow_mut() = true;
         *ack.borrow_mut() = true;
+    }
+}
+
+/// HCL #893 E2E hook consume-side. If a test armed a synthetic
+/// "screen frame painted" via [`crate::screen_first_render_inject`] AND this is
+/// the SCREEN decoder, apply it through the real [`mark_first_render`] so the
+/// caller's subsequent [`consume_first_render_flag`] returns `first_frame: true`
+/// exactly once — driving the byte-for-byte manager ack path a real paint
+/// drives.
+///
+/// The SCREEN gate short-circuits BEFORE taking the pending flag, so a CAMERA
+/// decoder's `decode()` can never consume an injection meant for the screen
+/// decoder (the flag stays armed for the screen decoder's next `decode()`).
+/// Because it routes through `mark_first_render`, the once-per-share latch
+/// (`fired`) is respected: if a real paint already acked this share, the
+/// injection is a harmless no-op; after a re-share `rearm_first_render_ack`
+/// resets the latch so a fresh injection re-arms the ack.
+///
+/// Inert in production: the pending flag's only setter is the
+/// `MOCK_PEERS_ENABLED`-gated `window.__videocall_inject_screen_first_render`
+/// global, which is never attached in a production build.
+fn apply_screen_first_render_inject(
+    media_type: &'static str,
+    fired: &Rc<RefCell<bool>>,
+    ack: &Rc<RefCell<bool>>,
+) {
+    if media_type == MEDIA_TYPE_SCREEN
+        && crate::screen_first_render_inject::take_screen_first_render_inject_pending()
+    {
+        mark_first_render(fired, ack);
     }
 }
 
@@ -1792,6 +1835,68 @@ mod tests {
             "after re-arm, the second share's first render must re-ack — \
              otherwise the publisher falsely reports no receivers on every \
              share after the first in a page session"
+        );
+    }
+
+    /// HCL #893 E2E hook: `apply_screen_first_render_inject` must route a
+    /// test-armed "screen frame painted" through the REAL `mark_first_render`
+    /// so a subsequent `consume_first_render_flag` returns `first_frame: true`
+    /// exactly once — but ONLY for the SCREEN decoder, one-shot per request, and
+    /// re-armable for the re-share flow.
+    ///
+    /// Mutation sensitivity:
+    ///   - Drop the `media_type == MEDIA_TYPE_SCREEN` gate → the camera call
+    ///     consumes the pending flag, so the later screen `ack` assertion fails.
+    ///   - Drop the `mark_first_render` call → `ack` never set → screen assert
+    ///     fails.
+    ///   - Make `take_screen_first_render_inject_pending` non-consuming → the
+    ///     one-shot assertion fails.
+    #[test]
+    fn screen_first_render_inject_only_acks_screen_and_is_rearmable() {
+        use crate::screen_first_render_inject::{
+            request_screen_first_render_inject, take_screen_first_render_inject_pending,
+        };
+
+        // Clean slate — the pending flag is a thread-local shared within this
+        // test thread.
+        let _ = take_screen_first_render_inject_pending();
+
+        let fired = Rc::new(RefCell::new(false));
+        let ack = Rc::new(RefCell::new(false));
+
+        request_screen_first_render_inject();
+
+        // A CAMERA decoder must NOT consume the screen injection (the `&&`
+        // short-circuits before `take`, leaving the flag armed for SCREEN).
+        apply_screen_first_render_inject(MEDIA_TYPE_CAMERA, &fired, &ack);
+        assert!(
+            !*ack.borrow(),
+            "camera decode must ignore the screen-decode injection"
+        );
+
+        // The SCREEN decoder applies it through the real `mark_first_render`.
+        apply_screen_first_render_inject(MEDIA_TYPE_SCREEN, &fired, &ack);
+        assert!(*ack.borrow(), "screen decode must apply the injection");
+        assert!(
+            consume_first_render_flag(&ack),
+            "screen injection must make consume return first_frame:true once"
+        );
+
+        // One-shot: a second SCREEN decode without a new request does not re-ack.
+        apply_screen_first_render_inject(MEDIA_TYPE_SCREEN, &fired, &ack);
+        assert!(
+            !consume_first_render_flag(&ack),
+            "the injection is one-shot per request"
+        );
+
+        // Re-share: after `rearm_first_render`, a fresh injection re-acks — the
+        // exact re-share path the E2E spec exercises.
+        rearm_first_render(&fired, &ack);
+        request_screen_first_render_inject();
+        apply_screen_first_render_inject(MEDIA_TYPE_SCREEN, &fired, &ack);
+        assert!(
+            consume_first_render_flag(&ack),
+            "after re-arm, a fresh injection must re-ack the second share"
         );
     }
 

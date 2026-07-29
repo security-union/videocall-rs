@@ -19,7 +19,7 @@ import {
   type OrchestratorControlSurface,
 } from "./control/server";
 import { getHost, type SshHost } from "./control/ssh-hosts";
-import { spawnRemoteBot, type SshBotHandle } from "./control/ssh-launcher";
+import { spawnRemoteBot, type SshBotHandle, type SshLaunchSpec } from "./control/ssh-launcher";
 import { loadManifest, type Manifest } from "./manifest";
 import { JoinRejectedError, MeetingNavigatedAwayError, WaitingRoomError } from "./meeting-join";
 import { formatDuration, parseDuration, type Ttl } from "./ttl";
@@ -73,6 +73,87 @@ export interface RunOptions {
      */
     onListen?: (info: { port: number; token: string }) => Promise<void>;
   };
+}
+
+interface RegisterSshTaskDeps {
+  registry: Map<string, BotRegistryEntry>;
+  inFlight: Map<string, Promise<BotExitReason>>;
+  inFlightWaiters: Array<() => void>;
+  runDir?: string;
+  spawnRemoteBot?: (spec: SshLaunchSpec) => SshBotHandle;
+}
+
+/**
+ * Register and launch one SSH-hosted bot. Exported so the control
+ * server's real orchestration path can be tested with a fake SSH
+ * process while preserving the production launch-spec construction.
+ */
+export async function registerSshTask(
+  spec: LaunchSpec,
+  host: SshHost,
+  deps: RegisterSshTaskDeps,
+): Promise<string> {
+  const botId = generateBotId();
+  const ttl = spec.ttl;
+  const task: BotTask = {
+    botId,
+    meetingURL: spec.meetingURL,
+    participant: spec.participant,
+    displayName: spec.displayName ?? defaultDisplayName(spec.participant),
+    headless: spec.headless,
+    authBackend: spec.authBackend,
+    videoMode: spec.videoMode ?? null,
+    storageStateFile: spec.storageStateFile ?? null,
+    ssoStateFile: spec.ssoStateFile ?? null,
+    manifest: null,
+    manifestDir: null,
+    runDir: null,
+    costumeOverride: null,
+    audioOverride: null,
+    ttl,
+    network: spec.network === "none" ? null : spec.network,
+  };
+  const hostKind: BotHostKind = { kind: "ssh", hostLabel: host.label };
+  const entry = newRegistryEntry(task, hostKind);
+  deps.registry.set(botId, entry);
+  const ssoStateFile =
+    spec.authBackend === "jwt"
+      ? (spec.ssoStateFile ?? (deps.runDir ? defaultSsoStatePath(deps.runDir) : null))
+      : null;
+  const spawnRemoteBotImpl = deps.spawnRemoteBot ?? spawnRemoteBot;
+  const sshHandle: SshBotHandle = spawnRemoteBotImpl({
+    host,
+    ttl: formatDuration(ttl),
+    meetingURL: spec.meetingURL,
+    participant: spec.participant,
+    videoMode: spec.videoMode ?? null,
+    network: task.network,
+    authBackend: spec.authBackend,
+    displayName: task.displayName,
+    headless: spec.headless,
+    ssoStateFile,
+    botId,
+  });
+  entry.sshHandle = sshHandle;
+  entry.status = "in-meeting";
+  console.log(
+    `[orchestrator] ssh-launch → ${task.participant}@${shortBotId(botId)} → ${host.user}@${host.host}`,
+  );
+  const exitPromise: Promise<BotExitReason> = sshHandle.exit.then((code) => {
+    entry.status = code === 0 ? "done" : "failed";
+    entry.finishReason = code === 0 ? "ssh-exit-ok" : `ssh-exit-${code ?? "killed"}`;
+    entry.finishedAt = Date.now();
+    if (code !== 0 && code !== null) {
+      entry.lastError = `remote bot exited with code ${code}`;
+    }
+    return { kind: "shutdown-signal" } as BotExitReason;
+  });
+  deps.inFlight.set(botId, exitPromise);
+  while (deps.inFlightWaiters.length > 0) {
+    const w = deps.inFlightWaiters.shift();
+    if (w) w();
+  }
+  return botId;
 }
 
 /**
@@ -292,7 +373,12 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
         if (host === null) {
           throw new Error(`SSH host "${runLocation.hostLabel}" not in registry`);
         }
-        const botId = await registerSshTask(spec, host);
+        const botId = await registerSshTask(spec, host, {
+          registry,
+          inFlight,
+          inFlightWaiters,
+          runDir,
+        });
         return botId;
       }
       const newTask = buildLaunchedBotTask(spec, {
@@ -368,84 +454,6 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       const w = inFlightWaiters.shift();
       if (w) w();
     }
-  }
-
-  /**
-   * Register a bot that runs on a remote SSH host. We bypass
-   * `runSingleBotTask` (it owns Playwright + the in-process bot
-   * lifecycle); instead the entry tracks a `sshHandle` and the
-   * wait-loop observes the SSH ChildProcess's exit promise.
-   *
-   * Returns the new bot's id so the control server can respond with
-   * 201 + the id, same shape as the local path.
-   */
-  async function registerSshTask(spec: LaunchSpec, host: SshHost): Promise<string> {
-    const botId = generateBotId();
-    const ttl = spec.ttl;
-    const task: BotTask = {
-      botId,
-      meetingURL: spec.meetingURL,
-      participant: spec.participant,
-      displayName: spec.displayName ?? defaultDisplayName(spec.participant),
-      headless: spec.headless,
-      authBackend: spec.authBackend,
-      storageStateFile: spec.storageStateFile ?? null,
-      ssoStateFile: spec.ssoStateFile ?? null,
-      manifest: null,
-      manifestDir: null,
-      runDir: null,
-      costumeOverride: null,
-      audioOverride: null,
-      ttl,
-      network: spec.network === "none" ? null : spec.network,
-    };
-    const hostKind: BotHostKind = { kind: "ssh", hostLabel: host.label };
-    const entry = newRegistryEntry(task, hostKind);
-    registry.set(botId, entry);
-    // Resolve the local SSO state path used for the stdin-forward path.
-    // The dashboard's `POST /sso/recapture` writes to
-    // `<runDir>/auth/hcl-sso.json`; we feed that path to the launcher so
-    // SSH-launched bots can pass through the HCL SSO portal without
-    // having to re-capture state on every remote host. When the host
-    // record has `forwardSsoState: false`, the launcher's gate will
-    // short-circuit and the un-wrapped command shape stays intact.
-    const runDirForSso = opts.control?.runDir;
-    const ssoStateFile =
-      spec.authBackend === "jwt"
-        ? (spec.ssoStateFile ?? (runDirForSso ? defaultSsoStatePath(runDirForSso) : null))
-        : null;
-    const sshHandle: SshBotHandle = spawnRemoteBot({
-      host,
-      ttl: formatDuration(ttl),
-      meetingURL: spec.meetingURL,
-      participant: spec.participant,
-      network: task.network,
-      authBackend: spec.authBackend,
-      displayName: task.displayName,
-      headless: spec.headless,
-      ssoStateFile,
-      botId,
-    });
-    entry.sshHandle = sshHandle;
-    entry.status = "in-meeting";
-    console.log(
-      `[orchestrator] ssh-launch → ${task.participant}@${shortBotId(botId)} → ${host.user}@${host.host}`,
-    );
-    const exitPromise: Promise<BotExitReason> = sshHandle.exit.then((code) => {
-      entry.status = code === 0 ? "done" : "failed";
-      entry.finishReason = code === 0 ? "ssh-exit-ok" : `ssh-exit-${code ?? "killed"}`;
-      entry.finishedAt = Date.now();
-      if (code !== 0 && code !== null) {
-        entry.lastError = `remote bot exited with code ${code}`;
-      }
-      return { kind: "shutdown-signal" } as BotExitReason;
-    });
-    inFlight.set(botId, exitPromise);
-    while (inFlightWaiters.length > 0) {
-      const w = inFlightWaiters.shift();
-      if (w) w();
-    }
-    return botId;
   }
 
   for (const task of initialTasks) {
@@ -921,6 +929,7 @@ export function buildLaunchedBotTask(
     displayName: spec.displayName ?? defaultDisplayName(spec.participant),
     headless: spec.headless,
     authBackend: spec.authBackend,
+    videoMode: spec.videoMode ?? null,
     storageStateFile: spec.authBackend === "storage-state" ? (spec.storageStateFile ?? null) : null,
     ssoStateFile,
     manifest: deps.manifest,

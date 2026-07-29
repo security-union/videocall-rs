@@ -41,6 +41,7 @@ export interface ProfileBotSpec {
   headless: boolean;
   network: string;
   authBackend: "jwt" | "storage-state" | "none";
+  videoMode?: "costume" | "file" | "clock" | null;
   storageStateFile?: string;
   /**
    * Where this bot's Chrome ran when the profile was captured. Re-used
@@ -248,6 +249,7 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
   // it now. Absence is treated as "this profile predates the field"
   // and is filled in with `{ kind: "local" }` by the launch route.
   const runLocation = parseRunLocationField(o.runLocation, `${where}.runLocation`);
+  const videoMode = parseVideoModeField(o.videoMode, `${where}.videoMode`);
   return {
     meetingURL,
     participant,
@@ -258,6 +260,7 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
     authBackend: auth,
     storageStateFile,
     runLocation,
+    videoMode,
   };
 }
 
@@ -279,6 +282,12 @@ function parseRunLocationField(raw: unknown, where: string): ProfileBotSpec["run
     return { kind: "ssh", hostLabel: o.hostLabel };
   }
   throw new ProfileValidationError(`${where}.kind must be "local" or "ssh"`);
+}
+
+function parseVideoModeField(raw: unknown, where: string): ProfileBotSpec["videoMode"] {
+  if (raw === undefined || raw === null) return undefined;
+  if (raw === "costume" || raw === "file" || raw === "clock") return raw;
+  throw new ProfileValidationError(`${where} must be "costume", "file", or "clock"`);
 }
 
 function expectString(v: unknown, where: string): string {
@@ -412,5 +421,6 @@ export function launchSpecToProfileBot(spec: LaunchSpec): ProfileBotSpec {
     authBackend: spec.authBackend,
     storageStateFile: spec.storageStateFile,
     runLocation: spec.runLocation,
+    videoMode: spec.videoMode,
   };
 }

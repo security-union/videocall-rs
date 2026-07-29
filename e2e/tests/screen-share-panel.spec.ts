@@ -1153,7 +1153,7 @@ test.describe("Screen share right panel layout", () => {
   // all THREE fail on the un-fixed code (frozen ~183px), and reverting the
   // `--tile-w`/`--tile-h` declaration in `container_style` re-breaks them.
   // ──────────────────────────────────────────────────────────────────────
-  test("pinned split-tile chrome var is maximized regardless of pre-share tile count", async ({
+  test("pinned split-tile chrome var is maximized regardless of pre-share tile count @bvt1", async ({
     baseURL,
   }) => {
     test.setTimeout(120_000);

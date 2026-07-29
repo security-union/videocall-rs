@@ -46,17 +46,18 @@ type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
     AUDIO_CONCEALMENT_PCT, AUDIO_CONGESTION_CEILING, AUDIO_DATAGRAM_LOSS_PER_SEC,
-    AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, BATTERY_CHARGING, BATTERY_LEVEL,
-    CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
-    CLIENT_AGENT_MEMORY_BYTES, CLIENT_CPU_THROTTLED, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
-    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_NETWORK_DOWNLINK_MAX,
-    CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
-    CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
-    CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL,
-    DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
-    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
-    ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH,
-    ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    AUDIO_DATAGRAM_RAW_LOSS_PER_SEC, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE,
+    BATTERY_CHARGING, BATTERY_LEVEL, CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER,
+    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_AUDIO_CONCEALMENT_PCT,
+    CLIENT_CPU_THROTTLED, CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS, CLIENT_INFO,
+    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
+    CLIENT_NETWORK_DOWNLINK_MAX, CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC,
+    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS,
+    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES,
+    DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP,
+    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
+    DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS,
+    ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
     KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
     NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
@@ -71,6 +72,7 @@ use sec_api::metrics::{
     VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS,
     VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE,
     VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
+    WT_INCOMING_DATAGRAM_HIGH_WATER_MARK, WT_INCOMING_DATAGRAM_MAX_AGE_MS,
 };
 
 async fn metrics_handler(
@@ -262,6 +264,24 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = UNISTREAM_STALE_DELTA_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
+    // Issue 2031: per-client WT receive-health gauges.
+    let _ = CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS.remove_label_values(&reporter_labels);
+    let _ = WT_INCOMING_DATAGRAM_HIGH_WATER_MARK.remove_label_values(&reporter_labels);
+    let _ = WT_INCOMING_DATAGRAM_MAX_AGE_MS.remove_label_values(&reporter_labels);
+    // Concealment carries a transport label — sweep both possible values so no
+    // residual series lingers after the reporter departs on either transport.
+    let _ = CLIENT_AUDIO_CONCEALMENT_PCT.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_user_id,
+        "webtransport",
+    ]);
+    let _ = CLIENT_AUDIO_CONCEALMENT_PCT.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_user_id,
+        "websocket",
+    ]);
     // #522 RTT-probe resilience gauges: same per-reporter GC so the high-cardinality
     // session_id label leaves no residual series on disconnect.
     let _ = RTT_PROBE_DROPPED_TOTAL.remove_label_values(&reporter_labels);
@@ -458,6 +478,7 @@ fn remove_per_peer_metrics(
     let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_SEQ_LOSS_PER_SEC.remove_label_values(&labels);
     let _ = AUDIO_DATAGRAM_LOSS_PER_SEC.remove_label_values(&labels);
+    let _ = AUDIO_DATAGRAM_RAW_LOSS_PER_SEC.remove_label_values(&labels); // issue 2031
     let _ = VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
@@ -859,6 +880,57 @@ fn process_health_packet_to_metrics_pb(
             DATAGRAM_DROPS
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
+        }
+
+        // Issue 2031: per-client WebTransport receive-health telemetry.
+        // read-loop max gap folds unconditionally on the client (0.0 on WS), so
+        // .set() lets the gauge recover to 0 instead of latching. The `if let
+        // Some` guards an older client that omits it.
+        if let Some(gap) = health_packet.wt_datagram_read_loop_max_gap_ms {
+            CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS
+                .with_label_values(&reporter_labels)
+                .set(gap);
+        }
+        // Queue read-back: a one-shot per-browser constant, present only once the
+        // WT queue was configured (absent for a WS-only client).
+        if let Some(hwm) = health_packet.wt_incoming_datagram_high_water_mark {
+            WT_INCOMING_DATAGRAM_HIGH_WATER_MARK
+                .with_label_values(&reporter_labels)
+                .set(hwm);
+        }
+        if let Some(max_age) = health_packet.wt_incoming_datagram_max_age_ms {
+            WT_INCOMING_DATAGRAM_MAX_AGE_MS
+                .with_label_values(&reporter_labels)
+                .set(max_age);
+        }
+        // Per-client mean audio concealment, SPLIT BY the reporter's active
+        // transport (the ground-truth WS-vs-WT severity gap). Only exported for a
+        // known transport so an empty/unknown active_server_type never spawns a
+        // junk `transport=""` series.
+        if let Some(concealment) = health_packet.client_audio_concealment_pct {
+            let transport = health_packet.active_server_type.as_str();
+            if transport == "webtransport" || transport == "websocket" {
+                CLIENT_AUDIO_CONCEALMENT_PCT
+                    .with_label_values(&[meeting_id, session_id, reporting_user_id, transport])
+                    .set(concealment);
+                // Issue 2031: a live WT<->WS switch (routine once the issue-2029
+                // fallback ships) would otherwise leave the OLD transport's series
+                // for this same identity latched at its last value until session
+                // GC, misleading the by-transport panel. Clear the sibling series
+                // so only the currently-active transport reports. Ignore the
+                // not-found error (no prior sibling series is the common case).
+                let sibling = if transport == "webtransport" {
+                    "websocket"
+                } else {
+                    "webtransport"
+                };
+                let _ = CLIENT_AUDIO_CONCEALMENT_PCT.remove_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    sibling,
+                ]);
+            }
         }
         if let Some(bytes) = health_packet.unistream_bytes_offered_total {
             UNISTREAM_BYTES_OFFERED_TOTAL
@@ -1511,6 +1583,17 @@ fn process_health_packet_to_metrics_pb(
                     AUDIO_DATAGRAM_LOSS_PER_SEC
                         .with_label_values(&peer_labels)
                         .set(loss);
+                }
+
+                // Issue 2031: uncapped magnitude companion. Current clients fold
+                // it unconditionally (live value on WT, definitional 0.0 on WS),
+                // so it is always set and the gauge recovers to 0 rather than
+                // latching — including on a mid-call WT->WS fallback. The
+                // `if let Some` still guards an older client that omits it.
+                if let Some(raw_loss) = peer_data.audio_datagram_raw_loss_per_sec {
+                    AUDIO_DATAGRAM_RAW_LOSS_PER_SEC
+                        .with_label_values(&peer_labels)
+                        .set(raw_loss);
                 }
 
                 // Audio concealment percentage (from NetEQ expand events)
@@ -2342,6 +2425,191 @@ mod tests {
             Some(12.5),
             "the AUDIO_DATAGRAM_LOSS_PER_SEC export path must run and set the folded loss rate; \
              None here means the .set(loss) export line is missing"
+        );
+    }
+
+    #[test]
+    fn test_audio_datagram_raw_loss_metric_export() {
+        // Issue 2031. The uncapped magnitude companion to the capped per-peer
+        // loss gauge. Reverting the AUDIO_DATAGRAM_RAW_LOSS_PER_SEC `.set(raw_loss)`
+        // export line makes gauge_value() return None and breaks this test.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut ps = PbPeerStats::new();
+        ps.can_listen = true;
+        ps.audio_enabled = true;
+        // A heavy burst: capped saturates at ~64, raw reads the true 210 magnitude.
+        ps.audio_datagram_loss_per_sec = Some(63.0);
+        ps.audio_datagram_raw_loss_per_sec = Some(210.0);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_raw_2031".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_raw_2031",
+            "meet_raw_2031",
+            "alice_raw_2031",
+            peer_stats,
+        );
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        assert!(result.is_ok());
+
+        assert_eq!(
+            gauge_value(
+                "videocall_audio_datagram_raw_loss_per_sec",
+                &[
+                    ("meeting_id", "meet_raw_2031"),
+                    ("session_id", "sess_raw_2031"),
+                    ("from_peer", "alice_raw_2031"),
+                    ("to_peer", "bob_raw_2031"),
+                ],
+            ),
+            Some(210.0),
+            "the AUDIO_DATAGRAM_RAW_LOSS_PER_SEC export path must set the uncapped magnitude; \
+             None here means the .set(raw_loss) export line is missing"
+        );
+    }
+
+    #[test]
+    fn test_wt_receive_telemetry_per_client_metrics_export() {
+        // Issue 2031. The four per-client WT receive-health gauges: read-loop max
+        // gap, queue hwm/max-age read-back, and concealment SPLIT BY transport.
+        // Reverting any of the corresponding `.set(...)` export lines makes the
+        // matching assertion return None (or the wrong transport label) and fails.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet(
+            "sess_wtrx_2031",
+            "meet_wtrx_2031",
+            "alice_wtrx_2031",
+            std::collections::HashMap::new(),
+        );
+        // Reporter is on WebTransport — the concealment must land under
+        // transport="webtransport".
+        hp.active_server_type = "webtransport".to_string();
+        hp.wt_datagram_read_loop_max_gap_ms = Some(420.0);
+        hp.wt_incoming_datagram_high_water_mark = Some(2048.0);
+        hp.wt_incoming_datagram_max_age_ms = Some(3000.0);
+        hp.client_audio_concealment_pct = Some(56.0);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        assert!(result.is_ok());
+
+        let reporter = [
+            ("meeting_id", "meet_wtrx_2031"),
+            ("session_id", "sess_wtrx_2031"),
+            ("peer_id", "alice_wtrx_2031"),
+        ];
+
+        assert_eq!(
+            gauge_value("videocall_client_datagram_read_loop_max_gap_ms", &reporter),
+            Some(420.0),
+            "read-loop max gap must export as the per-client gauge (reader-starvation signal)"
+        );
+        assert_eq!(
+            gauge_value("videocall_wt_incoming_datagram_high_water_mark", &reporter),
+            Some(2048.0),
+            "observed incomingHighWaterMark read-back must export"
+        );
+        assert_eq!(
+            gauge_value("videocall_wt_incoming_datagram_max_age_ms", &reporter),
+            Some(3000.0),
+            "observed incomingMaxAge read-back must export"
+        );
+        // Concealment must carry the transport label sourced from active_server_type.
+        assert_eq!(
+            gauge_value(
+                "videocall_client_audio_concealment_pct",
+                &[
+                    ("meeting_id", "meet_wtrx_2031"),
+                    ("session_id", "sess_wtrx_2031"),
+                    ("peer_id", "alice_wtrx_2031"),
+                    ("transport", "webtransport"),
+                ],
+            ),
+            Some(56.0),
+            "per-client concealment must export split by transport=webtransport"
+        );
+        // And it must NOT appear under the wrong transport.
+        assert_eq!(
+            gauge_value(
+                "videocall_client_audio_concealment_pct",
+                &[
+                    ("meeting_id", "meet_wtrx_2031"),
+                    ("session_id", "sess_wtrx_2031"),
+                    ("peer_id", "alice_wtrx_2031"),
+                    ("transport", "websocket"),
+                ],
+            ),
+            None,
+            "a WebTransport reporter's concealment must not appear under transport=websocket"
+        );
+    }
+
+    #[test]
+    fn test_concealment_sibling_transport_series_cleared_on_switch() {
+        // Issue 2031. A live WT->WS switch (routine once the issue-2029 fallback
+        // ships) must not leave the old transport's concealment series latched.
+        // Report concealment first as webtransport, then as websocket for the SAME
+        // (meeting, session, peer) identity; the webtransport series must be GONE.
+        //
+        // MUTATION: removing the sibling `remove_label_values` at the ingest site
+        // leaves the stale webtransport series at 40.0, so the `None` assertion
+        // below fails — the sensitivity this test guards.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let wt_labels = [
+            ("meeting_id", "meet_sib_2031"),
+            ("session_id", "sess_sib_2031"),
+            ("peer_id", "carol_sib_2031"),
+            ("transport", "webtransport"),
+        ];
+        let ws_labels = [
+            ("meeting_id", "meet_sib_2031"),
+            ("session_id", "sess_sib_2031"),
+            ("peer_id", "carol_sib_2031"),
+            ("transport", "websocket"),
+        ];
+
+        // 1) On WebTransport, concealment 40%.
+        let mut hp_wt = create_test_health_packet(
+            "sess_sib_2031",
+            "meet_sib_2031",
+            "carol_sib_2031",
+            std::collections::HashMap::new(),
+        );
+        hp_wt.active_server_type = "webtransport".to_string();
+        hp_wt.client_audio_concealment_pct = Some(40.0);
+        assert!(process_health_packet_to_metrics_pb(&hp_wt, &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_client_audio_concealment_pct", &wt_labels),
+            Some(40.0),
+            "webtransport concealment series must be present after the WT report"
+        );
+
+        // 2) The SAME client switches to WebSocket, concealment 15%.
+        let mut hp_ws = create_test_health_packet(
+            "sess_sib_2031",
+            "meet_sib_2031",
+            "carol_sib_2031",
+            std::collections::HashMap::new(),
+        );
+        hp_ws.active_server_type = "websocket".to_string();
+        hp_ws.client_audio_concealment_pct = Some(15.0);
+        assert!(process_health_packet_to_metrics_pb(&hp_ws, &tracker).is_ok());
+
+        // The stale sibling (webtransport) series must be CLEARED...
+        assert_eq!(
+            gauge_value("videocall_client_audio_concealment_pct", &wt_labels),
+            None,
+            "the stale webtransport concealment series must be cleared on the WT->WS switch"
+        );
+        // ...and the now-active websocket series present with the new value.
+        assert_eq!(
+            gauge_value("videocall_client_audio_concealment_pct", &ws_labels),
+            Some(15.0),
+            "the active websocket concealment series must be present after the switch"
         );
     }
 

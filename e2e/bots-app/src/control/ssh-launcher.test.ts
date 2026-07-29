@@ -573,6 +573,34 @@ describe("buildSshCommand", () => {
     expect(r.remoteCommand).toContain("--network 'lossy_mobile'");
   });
 
+  it("emits a non-default video mode and omits unset or default modes", () => {
+    const clock = buildSshCommand(h(), {
+      host: h(),
+      ttl: "5m",
+      meetingURL: "u",
+      participant: "p",
+      videoMode: "clock",
+    });
+    expect(clock.remoteCommand).toContain("--video-mode 'clock'");
+
+    const unset = buildSshCommand(h(), {
+      host: h(),
+      ttl: "5m",
+      meetingURL: "u",
+      participant: "p",
+    });
+    expect(unset.remoteCommand).not.toContain("--video-mode");
+
+    const costume = buildSshCommand(h(), {
+      host: h(),
+      ttl: "5m",
+      meetingURL: "u",
+      participant: "p",
+      videoMode: "costume",
+    });
+    expect(costume.remoteCommand).not.toContain("--video-mode");
+  });
+
   it("emits --headless by default and omits it when explicitly false", () => {
     const headless = buildSshCommand(h(), {
       host: h(),

@@ -565,7 +565,8 @@ export function shellEscape(value: string): string {
  *
  *   cd '<reposPath>'/e2e && npm run bot -- run --headless \
  *     --ttl '<ttl>' --meeting-url '<url>' --participant '<p>' \
- *     [--network '<net>'] [--auth '<auth>'] [--display-name '<name>']
+ *     [--video-mode '<mode>'] [--network '<net>'] [--auth '<auth>'] \
+ *     [--display-name '<name>']
  *
  * Every dynamic value is escaped via {@link shellEscape}. The
  * `'<reposPath>'/e2e` form (closing the quote before the literal
@@ -578,6 +579,7 @@ export interface RemoteLaunchCmd {
   ttl: string;
   meetingURL: string;
   participant: string;
+  videoMode?: "costume" | "file" | "clock" | null;
   network?: string | null;
   authBackend?: string | null;
   displayName?: string | null;
@@ -601,6 +603,9 @@ export function buildRemoteLaunchCommand(spec: RemoteLaunchCmd): string {
   cmd.push("--ttl", shellEscape(spec.ttl));
   cmd.push("--meeting-url", shellEscape(spec.meetingURL));
   cmd.push("--participant", shellEscape(spec.participant));
+  if (spec.videoMode && spec.videoMode !== "costume") {
+    cmd.push("--video-mode", shellEscape(spec.videoMode));
+  }
   if (spec.network && spec.network !== "none") {
     cmd.push("--network", shellEscape(spec.network));
   }

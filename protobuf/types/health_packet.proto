@@ -144,7 +144,24 @@ message PeerStats {
   // browser's incoming-datagram queue overflowing during a main-thread stall) —
   // a pathology previously invisible in every dashboard. ~0 on WebSocket and on
   // E2EE-on WebTransport (both reliable paths).
+  //
+  // PRESENCE signal, not magnitude: capped at ~64 lost per contiguous gap by
+  // the 64-slot reorder window, so it cannot distinguish 1% from 80% loss. Read
+  // it alongside audio_datagram_raw_loss_per_sec (field 18, uncapped) — a large
+  // raw/capped ratio is the burst-severity indicator.
   optional double audio_datagram_loss_per_sec = 17;
+
+  // Per-peer receive-side audio DATAGRAM RAW loss rate (uncapped skipped-
+  // sequence sum per second, windowed) observed for this peer while THIS client
+  // is on WebTransport (issue 2031). The magnitude companion to
+  // audio_datagram_loss_per_sec (field 17): field 17 saturates at ~64/gap due to
+  // the reorder window and so reads "nonzero, sustained" during a heavy burst,
+  // while this field sums the actual sequence-gap sizes un-truncated, so a
+  // battery-throttled receiver losing 20-44 pkt/s reads its true magnitude here.
+  // Same WebTransport gate and ~1 Hz cadence as field 17; folds definitional 0.0
+  // on WebSocket (audio rides ordered TCP — no datagram loss possible) so the
+  // gauge un-latches on a mid-call WT->WS fallback.
+  optional double audio_datagram_raw_loss_per_sec = 18;
 }
 
 message HealthPacket {
@@ -424,6 +441,57 @@ message HealthPacket {
   optional uint64 unistream_bytes_drained_total = 103; // (#1737 Phase 0)
 
   optional uint64 unistream_stale_delta_drops_total = 104; // (#1737 Phase 1)
+
+  // ---- issue 2031: WebTransport receive-health telemetry (per-client) --------
+  // All four are per-CLIENT (receiver) properties, re-sent every health packet.
+  // Wire presence on a WebSocket session differs per field (proto3 omits only
+  // absent/None fields):
+  //   * 105 (read-loop max gap) is ALWAYS present — folded unconditionally for
+  //     recover-to-0 semantics, so it carries its 0.0 default (~9 bytes) on WS.
+  //   * 106 (concealment) is present on WS whenever an audio source is active
+  //     (it is transport-agnostic; the server splits it by transport at ingest).
+  //   * 107/108 (queue read-back) are proto3-absent on a WebSocket-only client —
+  //     the incoming-datagram queue is never configured, so they cost nothing on
+  //     the wire there.
+
+  // Max gap in milliseconds between successive incoming-datagram `.read()`
+  // resolutions on the main-thread reader, over the interval since the last
+  // health packet (read-and-reset window). The direct causal signal for "the
+  // main-thread datagram reader was starved": a long task blocks `.read()`, the
+  // browser's network process age-drops the OLDEST queued datagrams, and audio
+  // is silently lost. A sustained high value (hundreds of ms) is reader
+  // starvation; ~0 is a healthy reader. WebTransport-only.
+  //
+  // CAVEAT — meaningful only while datagrams are actually flowing. `.read()`
+  // legitimately blocks when there is nothing to read: total audio silence (all
+  // peers muted or in DTX) registers large BENIGN gaps, and a transport teardown
+  // can register a one-shot gap on the final read before the next session resets
+  // the anchor. Read alongside the inbound datagram rate (packets_received_per_sec
+  // / neteq packets_per_sec) — a large gap with a live inbound rate is real
+  // starvation; a large gap with ~0 inbound is just silence, not a fault.
+  optional double wt_datagram_read_loop_max_gap_ms = 105; // (issue 2031)
+
+  // Per-client mean audio concealment percentage (0-100) over ACTIVE audio
+  // sources this tick — the same windowed expand/packets ratio the per-peer
+  // PeerStats.audio_concealment_pct and the [AUDIO_SCALE] aggregate use, meaned
+  // across sources. Exported server-side split by the reporter's active
+  // transport (active_server_type, field 9) so the WS-vs-WT concealment severity
+  // gap is a single labeled gauge. Absent when no source is actively delivering
+  // audio (absent != 0% concealment).
+  optional double client_audio_concealment_pct = 106; // (issue 2031)
+
+  // Observed post-set incoming-datagram queue parameters (issue-1878 mitigation
+  // read-back): the values `WebTransportDatagramDuplexStream` reports AFTER the
+  // client set incomingHighWaterMark / incomingMaxAge. Empirically answers, per
+  // browser, whether the current Chromium honors the setters (an open question):
+  // a high_water_mark reading back at the requested target confirms the capacity
+  // knob took effect.
+  optional double wt_incoming_datagram_high_water_mark = 107; // (issue 2031)
+  // Observed post-set incomingMaxAge in milliseconds. -1.0 is a sentinel for
+  // "unbounded" (the spec's `null` default, read back as NaN) — either the
+  // browser left the queue un-age-capped or did not honor the setter; any finite
+  // value near the requested cap confirms the staleness knob took effect.
+  optional double wt_incoming_datagram_max_age_ms = 108; // (issue 2031)
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

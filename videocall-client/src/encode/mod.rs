@@ -18,6 +18,7 @@
 
 mod camera_encoder;
 pub(crate) mod classify_encode_error;
+mod dimensions;
 mod encoder_state;
 mod microphone_encoder;
 mod screen_encoder;

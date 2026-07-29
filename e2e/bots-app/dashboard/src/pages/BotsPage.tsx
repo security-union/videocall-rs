@@ -301,6 +301,7 @@ export function BotsPage() {
                   displayName: snap.participant,
                   ttl: snap.ttl,
                   network: snap.network ?? "none",
+                  videoMode: "costume",
                   headless: false,
                   authBackend: "jwt",
                   storageStateFile: "",

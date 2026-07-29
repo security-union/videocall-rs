@@ -33,6 +33,60 @@ pub fn datagram_drop_count() -> u64 {
     DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// Issue 2031: windowed max-gap summarizer for the incoming-datagram read loop,
+/// shared across every WT session's reader (the metric is a per-CLIENT receiver
+/// property, not per-connection). The reader records each `.read()` resolution
+/// timestamp; the health reporter drains the window ~once per health interval.
+/// wasm is single-threaded so this `Mutex` never actually contends.
+static READ_LOOP_LAG: StdMutex<crate::read_loop_lag::DatagramReadLoopLagTracker> =
+    StdMutex::new(crate::read_loop_lag::DatagramReadLoopLagTracker::new());
+
+/// Drain and return the max gap (ms) between successive incoming-datagram
+/// `.read()` resolutions since the previous call (read-and-reset window). A
+/// sustained high value is main-thread reader starvation — the direct causal
+/// signal for the issue-1878 audio-loss class. Returns 0.0 if the lock is
+/// poisoned (never in practice on single-threaded wasm).
+pub fn take_datagram_read_loop_max_gap_ms() -> f64 {
+    READ_LOOP_LAG
+        .lock()
+        .map(|mut t| t.take_max_gap_ms())
+        .unwrap_or(0.0)
+}
+
+/// Issue 2031: observed post-set incoming-datagram queue parameters
+/// `(incoming_high_water_mark, incoming_max_age_ms)`, captured once per WT
+/// session by [`configure_incoming_datagram_queue`]. `None` until the queue has
+/// been configured (a WebSocket-only client never sets it). `max_age_ms` is
+/// `NaN` when the browser reports the queue as unbounded (the spec `null`
+/// default) — the caller maps that to a sentinel before it goes on the wire.
+static INCOMING_QUEUE_READBACK: StdMutex<Option<(f64, f64)>> = StdMutex::new(None);
+
+/// Return the observed post-set incoming-datagram queue parameters
+/// `(high_water_mark, max_age_ms)`, or `None` if the queue has not been
+/// configured yet. Empirically answers, per browser, whether Chromium honored
+/// the issue-1878 `incomingHighWaterMark` / `incomingMaxAge` setters.
+pub fn incoming_datagram_queue_readback() -> Option<(f64, f64)> {
+    INCOMING_QUEUE_READBACK.lock().ok().and_then(|g| *g)
+}
+
+/// Resolve the `performance` object ONCE for the read-loop clock. Hoisted out of
+/// the per-datagram path (issue 2031 perf review): `window()` + `performance()`
+/// are two JS boundary crossings that never change over a session's lifetime, so
+/// the read loop resolves this before its `spawn_local` and reuses the handle.
+/// `None` where `performance` is unavailable (falls back to `Date.now()`).
+fn resolve_read_loop_clock() -> Option<web_sys::Performance> {
+    web_sys::window().and_then(|w| w.performance())
+}
+
+/// Read the monotonic clock (ms) from a pre-resolved `performance` handle for the
+/// read-loop gap measurement. Prefers `performance.now()` (monotonic — immune to
+/// NTP steps); falls back to `Date.now()` when the handle is `None`. Exactly ONE
+/// JS crossing per call (vs three when resolving `window`/`performance` inline).
+/// The gap summarizer clamps any backward step to 0 regardless.
+fn read_loop_now_ms(perf: Option<&web_sys::Performance>) -> f64 {
+    perf.map(|p| p.now()).unwrap_or_else(js_sys::Date::now)
+}
+
 /// Issue #1878 mitigation — INCOMING datagram queue CAPACITY (number of
 /// datagrams the browser buffers in the network process before dropping the
 /// OLDEST). Aggregate incoming audio scales with the number of SENDERS (each
@@ -103,13 +157,18 @@ fn configure_incoming_datagram_queue(datagrams: &WebTransportDatagramDuplexStrea
     if prev_age.is_nan() || prev_age < INCOMING_DATAGRAM_MAX_AGE_MS {
         datagrams.set_incoming_max_age(INCOMING_DATAGRAM_MAX_AGE_MS);
     }
+    // Read the values BACK after setting them — the browser may clamp or ignore
+    // the setters — and both log and stash for telemetry (issue 2031). The
+    // stashed pair lets the health reporter confirm on a given browser that the
+    // issue-1878 mitigation actually took effect.
+    let observed_hwm = datagrams.incoming_high_water_mark();
+    let observed_age = datagrams.incoming_max_age();
     log!(format!(
-        "WT incoming datagram queue tuned (issue #1878): highWaterMark {} -> {}, maxAge {} -> {} ms",
-        prev_hwm,
-        datagrams.incoming_high_water_mark(),
-        prev_age,
-        datagrams.incoming_max_age()
+        "WT incoming datagram queue tuned (issue #1878): highWaterMark {prev_hwm} -> {observed_hwm}, maxAge {prev_age} -> {observed_age} ms"
     ));
+    if let Ok(mut slot) = INCOMING_QUEUE_READBACK.lock() {
+        *slot = Some((observed_hwm, observed_age));
+    }
 }
 
 /// Cumulative count of frames dropped on the persistent unidirectional QUIC
@@ -1308,11 +1367,33 @@ impl WebTransportService {
         // Issue #1878: widen the incoming datagram queue BEFORE taking the reader
         // so a main-thread stall does not overflow it and silently drop audio.
         configure_incoming_datagram_queue(&datagrams);
+        // Issue 2031: this read-loop-lag tracker is a process-global shared across
+        // WT sessions; forget the previous session's last-read anchor so the first
+        // `.read()` below is a fresh baseline, not a gap spanning reconnect downtime.
+        if let Ok(mut lag) = READ_LOOP_LAG.lock() {
+            lag.reset_anchor();
+        }
         let incoming_datagrams: ReadableStreamDefaultReader =
             datagrams.readable().get_reader().unchecked_into();
+        // Issue 2031 (perf): resolve the `performance` clock handle ONCE here, not
+        // per datagram — `window()`/`performance()` are session-invariant, so the
+        // hot path below spends a single JS crossing (`perf.now()`) per datagram.
+        let clock = resolve_read_loop_clock();
         wasm_bindgen_futures::spawn_local(async move {
             loop {
                 let read_result = JsFuture::from(incoming_datagrams.read()).await;
+                // Issue 2031: record the resolution instant BEFORE any further
+                // work, so the measured gap is the time the reader spent blocked
+                // between `.read()` resolutions (main-thread starvation), not the
+                // time it then spends processing. `.await` above is the only
+                // suspension point in the loop, so a large gap means the main
+                // thread was busy elsewhere and the browser was age-dropping the
+                // OLDEST queued datagrams meanwhile. Read the timestamp BEFORE
+                // taking the lock so the lock is held for the minimal span.
+                let now = read_loop_now_ms(clock.as_ref());
+                if let Ok(mut lag) = READ_LOOP_LAG.lock() {
+                    lag.record(now);
+                }
                 match read_result {
                     Err(_) => {
                         // Expected when the transport is closed (Drop or network

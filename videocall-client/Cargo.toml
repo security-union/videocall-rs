@@ -61,6 +61,13 @@ default = []
 # / `force_websocket_drop` counter bumpers exist for the `__vcNetsim` e2e
 # bindings (issue #1398).
 netsim = ["dep:videocall-netsim", "videocall-transport/netsim"]
+# Cross-crate test seam. Enables `VideoCallClient::new_for_test` /
+# `with_inner_borrowed_for_test` so external crates (e.g. `videocall-ui`) can
+# reproduce the transient `inner` busy-borrow contention (issue #1172) that
+# `peer_user_id_present` guards, without exposing the private `Inner` type.
+# OFF by default — `videocall-ui` turns it on only as a dev-dependency, so
+# production builds compile these helpers out entirely.
+testing = []
 
 [dependencies.web-sys]
 version = "0.3"

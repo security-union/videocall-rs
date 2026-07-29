@@ -8,6 +8,7 @@ import { existsSync } from "node:fs";
 
 import {
   deleteProfile,
+  launchSpecToProfileBot,
   listProfiles,
   PROFILE_SCHEMA_VERSION,
   profilePath,
@@ -19,6 +20,7 @@ import {
   saveProfile,
   type ProfileBotSpec,
 } from "./profiles";
+import { buildRemoteLaunchCommand } from "./ssh-hosts";
 
 function sampleBot(participant = "alice"): ProfileBotSpec {
   return {
@@ -131,6 +133,55 @@ describe("saveProfile / readProfile / listProfiles / deleteProfile", () => {
     await saveProfile(dir, "guest", [{ ...sampleBot("guest1"), authBackend: "none" }]);
     const p = await readProfile(dir, "guest");
     expect(p.bots[0].authBackend).toBe("none");
+  });
+
+  it("round-trips videoMode from launch specs through saved profile decoding", async () => {
+    const clock = launchSpecToProfileBot({
+      ...sampleBot("clock-bot"),
+      ttl: 300_000,
+      videoMode: "clock",
+    });
+    const costume = launchSpecToProfileBot({
+      ...sampleBot("costume-bot"),
+      ttl: 300_000,
+      videoMode: "costume",
+    });
+    const absent = launchSpecToProfileBot({
+      ...sampleBot("legacy-bot"),
+      ttl: 300_000,
+    });
+
+    expect(clock.videoMode).toBe("clock");
+    await saveProfile(dir, "video-modes", [clock, costume, absent]);
+    const reloaded = await readProfile(dir, "video-modes");
+    expect(reloaded.bots.map((bot) => bot.videoMode)).toEqual(["clock", "costume", undefined]);
+
+    for (const bot of reloaded.bots.slice(1)) {
+      const command = buildRemoteLaunchCommand({
+        reposPath: "/repo",
+        ttl: bot.ttl,
+        meetingURL: bot.meetingURL,
+        participant: bot.participant,
+        videoMode: bot.videoMode,
+      });
+      expect(command).not.toContain("--video-mode");
+    }
+  });
+
+  it("rejects a saved profile with an invalid videoMode", async () => {
+    mkdirSync(join(dir, "profiles"), { recursive: true });
+    const path = profilePath(dir, "bad-video-mode");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        name: "bad-video-mode",
+        savedAt: new Date().toISOString(),
+        version: 1,
+        bots: [{ ...sampleBot(), videoMode: "stopwatch" }],
+      }),
+      "utf8",
+    );
+    await expect(readProfile(dir, "bad-video-mode")).rejects.toThrow(ProfileValidationError);
   });
 
   it("round-trips runLocation: ssh in saved bots", async () => {

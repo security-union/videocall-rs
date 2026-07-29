@@ -217,11 +217,104 @@ test.describe("Action bar overflow menu", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await hoverActionBar(page);
 
+    // Presence-before-measurement: assert the bar itself is up (a sacred button
+    // is visible) FIRST, so the "trigger not visible" check below cannot pass
+    // vacuously by the whole bar being hidden — it must genuinely mean the
+    // overflow cleared.
+    await expect(page.locator('.action-bar-slot-wrapper[data-slot="mic"]')).toBeVisible({
+      timeout: 5_000,
+    });
+
     // Overflow trigger should disappear
     await expect(page.locator("#overflow-menu-trigger")).not.toBeVisible({ timeout: 5_000 });
 
-    // Previously hidden buttons should be visible again.
-    // Check at least the chat slot as a representative overflowable button.
+    // Previously hidden buttons must be visible again — this is the restore
+    // regression: a slot that overflowed at 400px must un-hide once it fits,
+    // not stay stuck behind a stale inline display:none.
+    const chatSlot = page.locator('.action-bar-slot-wrapper[data-slot="chat"]');
+    if ((await chatSlot.count()) > 0) {
+      await expect(chatSlot).toBeVisible({ timeout: 5_000 });
+    }
+  });
+
+  // -- Widening never re-hides buttons (issue 2044 monotonic restore) -------
+  //
+  // The reported bug: the action bar compacts as the window narrows but does
+  // NOT expand back as it widens. Root cause was a non-monotonic fit — the
+  // overflow calc budgeted each button with the CSS's *tightened* spacing at
+  // ≤540px but the *full* 1.2rem spacing above 540px, so widening the window
+  // ACROSS the 540px breakpoint shrank the fit budget faster than the width
+  // grew and pushed already-visible buttons back into the "..." menu. Widening
+  // must only ever REVEAL buttons; it may never hide more.
+  //
+  // We count the secondary (non-sacred) slots currently shown in the bar at a
+  // width just at the breakpoint, then again at a clearly wider width straddling
+  // it. On the un-fixed code the wider viewport showed FEWER buttons; the fix
+  // makes the count monotonically non-decreasing as the window widens.
+
+  test("widening the window never hides more action-bar buttons @bvt1", async ({ page }) => {
+    await joinMeeting(page, "widen_monotonic");
+
+    // Count secondary slot wrappers currently visible (not tucked into the
+    // overflow menu). Hover keeps the bar expanded so only overflow — not the
+    // collapse animation — governs visibility.
+    async function visibleSecondaryCount(): Promise<number> {
+      const wrappers = page.locator(".action-bar-slot-wrapper.slot-secondary");
+      const total = await wrappers.count();
+      let shown = 0;
+      for (let i = 0; i < total; i++) {
+        if (await wrappers.nth(i).isVisible()) {
+          shown++;
+        }
+      }
+      return shown;
+    }
+
+    // At the 540px breakpoint (tightened spacing) a batch of buttons fit.
+    await page.setViewportSize({ width: 540, height: 800 });
+    await hoverActionBar(page);
+    await page.waitForTimeout(300); // let the rAF-throttled resize settle
+    const atBreakpoint = await visibleSecondaryCount();
+
+    // Widen clearly across the breakpoint. The un-fixed spacing jump hid MORE
+    // buttons here; the fix must keep the visible count from dropping.
+    await page.setViewportSize({ width: 620, height: 800 });
+    await hoverActionBar(page);
+    await page.waitForTimeout(300);
+    const atWider = await visibleSecondaryCount();
+
+    expect(atWider).toBeGreaterThanOrEqual(atBreakpoint);
+  });
+
+  // -- Widen restores WITHOUT hover and BEYOND the arithmetic dead zone ------
+  //
+  // Two field-report hypotheses in one guard:
+  //  (a) No-hover: the overflow recompute is reactive to the resize signal, so
+  //      buttons must come back on widen WITHOUT any pointer interaction (auto-
+  //      hide defaults off, so the bar is already visible + expanded). If the
+  //      recompute were gated on hover/interaction the trigger would linger.
+  //  (b) Beyond the dead zone: widen to 1000px — well past the ~830px point
+  //      where even the un-fixed arithmetic restores — so a *frozen viewport
+  //      signal* (a listener-lifecycle ratchet) would surface as the trigger
+  //      never clearing at any width. Deliberately no hover, no other input.
+
+  test("widening restores buttons with no hover, well beyond the dead zone @bvt1", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "widen_no_hover");
+
+    // Narrow so the overflow trigger appears — no hover.
+    await page.setViewportSize({ width: 540, height: 800 });
+    await page.waitForTimeout(300); // let the rAF-throttled resize settle
+    await expect(page.locator("#overflow-menu-trigger")).toBeVisible({ timeout: 5_000 });
+
+    // Widen far past the dead zone, WITHOUT hovering or any other interaction.
+    await page.setViewportSize({ width: 1000, height: 800 });
+    await page.waitForTimeout(300);
+
+    // The recompute alone (no hover) must clear the overflow: trigger gone …
+    await expect(page.locator("#overflow-menu-trigger")).not.toBeVisible({ timeout: 5_000 });
+    // … and a representative overflowable button is shown again.
     const chatSlot = page.locator('.action-bar-slot-wrapper[data-slot="chat"]');
     if ((await chatSlot.count()) > 0) {
       await expect(chatSlot).toBeVisible({ timeout: 5_000 });

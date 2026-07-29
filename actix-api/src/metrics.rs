@@ -648,6 +648,20 @@ lazy_static! {
     )
     .expect("Failed to create audio_datagram_loss_per_sec metric");
 
+    /// Per-peer windowed receive-side audio datagram RAW (uncapped) loss rate
+    /// (issue 2031). The magnitude companion to
+    /// `videocall_audio_datagram_loss_per_sec`, which saturates at ~64/gap by the
+    /// 64-slot reorder window and so cannot distinguish 1% from 80% loss. This
+    /// sums the sequence-gap sizes un-truncated, so a heavy burst reads its true
+    /// magnitude; a large raw/capped ratio is the burst severity. Same recover-
+    /// to-0 semantics and WebTransport gate; 0.0 on WebSocket / E2EE-WT.
+    pub static ref AUDIO_DATAGRAM_RAW_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_audio_datagram_raw_loss_per_sec",
+        "Per-peer windowed receive-side audio datagram RAW (uncapped) loss rate (skipped sequences/sec) observed by a WebTransport receiver; the magnitude companion to videocall_audio_datagram_loss_per_sec",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create audio_datagram_raw_loss_per_sec metric");
+
     /// Per-peer buffered video playout latency in ms (#1252): how far behind live a receiver's
     /// decoded video is, spanning the jitter-buffer backlog (stage 1) + WebCodecs decoder queue
     /// (stage 2). Reported only while the tile is actively receiving (fps_received > 0); 0 = at
@@ -797,6 +811,61 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create datagram_drops metric");
+
+    /// Per-client max gap (ms) between successive incoming-datagram `.read()`
+    /// resolutions on the main-thread reader, over the last health interval
+    /// (issue 2031). The direct causal signal for the issue-1878 audio-loss
+    /// class: a long task starves the reader, the browser age-drops the OLDEST
+    /// queued datagrams, and audio is silently lost. Sustained hundreds of ms =>
+    /// reader starvation; ~0 => healthy reader. WebTransport-only; 0 on WebSocket.
+    ///
+    /// CAVEAT — meaningful only while datagrams are actually flowing. `.read()`
+    /// legitimately blocks when there is nothing to read, so total audio silence
+    /// (all peers muted / in DTX) registers large BENIGN gaps, and a transport
+    /// teardown can register a one-shot gap on its final read. Interpret alongside
+    /// the inbound datagram rate (videocall_client_packets_received_per_sec /
+    /// videocall_neteq_packets_per_sec): a large gap with a live inbound rate is
+    /// real starvation; a large gap with ~0 inbound is just silence.
+    pub static ref CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS: GaugeVec = register_gauge_vec!(
+        "videocall_client_datagram_read_loop_max_gap_ms",
+        "Per-client max gap (ms) between successive incoming-datagram read resolutions over the last health interval; sustained high => main-thread reader starvation (issue 2031)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create client_datagram_read_loop_max_gap_ms metric");
+
+    /// Per-client mean audio concealment percentage (0-100) over active sources,
+    /// SPLIT BY the reporter's active transport (issue 2031). The ground-truth
+    /// WS-vs-WT concealment severity gap as a single labeled gauge: audio on
+    /// unreliable WT datagrams conceals far more than on ordered-TCP WebSocket
+    /// under the identical main-thread stall. Absent when no source is active.
+    pub static ref CLIENT_AUDIO_CONCEALMENT_PCT: GaugeVec = register_gauge_vec!(
+        "videocall_client_audio_concealment_pct",
+        "Per-client mean audio concealment percentage over active sources, split by active transport (issue 2031)",
+        &["meeting_id", "session_id", "peer_id", "transport"]
+    )
+    .expect("Failed to create client_audio_concealment_pct metric");
+
+    /// Per-client observed post-set incoming-datagram queue high-water mark
+    /// (issue 2031 read-back). Confirms, per browser, whether Chromium honored
+    /// the issue-1878 `incomingHighWaterMark` setter: a value at the requested
+    /// target (2048) means the capacity knob took effect. WebTransport-only.
+    pub static ref WT_INCOMING_DATAGRAM_HIGH_WATER_MARK: GaugeVec = register_gauge_vec!(
+        "videocall_wt_incoming_datagram_high_water_mark",
+        "Per-client observed post-set incoming-datagram queue high-water mark (issue 2031 read-back of the issue-1878 mitigation)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create wt_incoming_datagram_high_water_mark metric");
+
+    /// Per-client observed post-set incoming-datagram queue max age in ms
+    /// (issue 2031 read-back). A value near the requested cap (3000) confirms the
+    /// `incomingMaxAge` staleness knob took effect; -1.0 is the sentinel for
+    /// "unbounded" (spec `null`, or setter not honored). WebTransport-only.
+    pub static ref WT_INCOMING_DATAGRAM_MAX_AGE_MS: GaugeVec = register_gauge_vec!(
+        "videocall_wt_incoming_datagram_max_age_ms",
+        "Per-client observed post-set incoming-datagram queue max age in ms; -1.0 = unbounded/not-honored (issue 2031 read-back)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create wt_incoming_datagram_max_age_ms metric");
 
     /// Cumulative WT persistent-unistream bytes offered by the publisher.
     pub static ref UNISTREAM_BYTES_OFFERED_TOTAL: GaugeVec = register_gauge_vec!(
@@ -1928,6 +1997,65 @@ lazy_static! {
         &["transport", "reason"]
     )
     .expect("Failed to create relay_outbound_bridge_stream_resets_total metric");
+
+    /// Outbound (relay→client) WebTransport DATAGRAM send failures at the
+    /// outbound bridge writer (`webtransport/bridge.rs` `spawn_datagram_writer`),
+    /// by transport and `reason` (issue 2030).
+    ///
+    /// Fills the last quadrant of the bridge-drop counter family: inbound
+    /// datagram/unistream drops are `relay_inbound_bridge_drops_total`; outbound
+    /// unistream resets are `relay_outbound_bridge_stream_resets_total`. This
+    /// covers the OUTBOUND DATAGRAM writer, which previously logged send errors
+    /// at `debug!` and continued with no durable/alertable signal — the relay
+    /// had zero server-side visibility into datagram send loss. (Field case: a
+    /// receiver lost 20-44 audio pkts/s on WT, invisible from the server; only
+    /// the client-side gauge saw it, and that vanishes if the client wedges.)
+    ///
+    /// WHAT IS COUNTED: exactly the events where `Session::send_datagram`
+    /// returns `Err` — quinn REJECTED the datagram at enqueue time (too large
+    /// for the current max datagram size, the connection is gone, or the
+    /// peer/config does not support datagrams). Each such datagram is dropped;
+    /// datagrams are unreliable and are never retransmitted.
+    ///
+    /// WHAT IS NOT COUNTED: datagrams that quinn ACCEPTS at enqueue (returns
+    /// `Ok`) and then silently evicts from its bounded outgoing datagram queue.
+    /// That queue is sized by quinn's `datagram_send_buffer_size`; when a new
+    /// datagram would overflow it, quinn pops and drops the OLDEST queued
+    /// datagram and STILL returns `Ok` from `send_datagram` (pacing / the
+    /// congestion window only govern how fast that queue drains, so a slow
+    /// drain is what lets it fill and overflow). This call site therefore
+    /// cannot observe those send-buffer-overflow evictions. Surfacing that
+    /// class would need a quinn-level dropped-datagram hook and is deliberately
+    /// out of scope for issue 2030 (that is the territory of the relay->client
+    /// sequence-number idea, subsumed by the reliable-audio reframe).
+    ///
+    /// `transport` is always `webtransport` here (only the WT bridge sends QUIC
+    /// datagrams; the WS path has no datagram primitive), kept for label-shape
+    /// parity with the sibling bridge counters so a single query reads naturally
+    /// alongside them.
+    ///
+    /// `reason` is a BOUNDED classification of `web_transport_quinn::SessionError`
+    /// (NEVER the error's Display string — that carries an unbounded
+    /// peer-supplied close reason). Closed set: `too_large`, `connection_lost`,
+    /// `unsupported`, `disabled`, `webtransport`. See
+    /// `datagram_send_failure_reason` in the bridge for the exhaustive mapping.
+    /// This lets an operator tell benign teardown churn (`connection_lost`)
+    /// apart from an actionable MTU/config bug (`too_large`, `unsupported`,
+    /// `disabled`). Labeling nuance: a lost-connection failure may occasionally
+    /// classify as `reason="webtransport"` rather than `connection_lost` —
+    /// web-transport-quinn's `map_error` substitutes the cached session error
+    /// for a `ConnectionLost`, and a session torn down via a WebTransport CLOSE
+    /// lands in the `WebTransportError` arm; both are benign-teardown signals,
+    /// so read the two together.
+    ///
+    /// CARDINALITY BOUND: at most 5 series (`webtransport` x the 5 reasons
+    /// above). Safe for indefinite retention; no cleanup required.
+    pub static ref RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL: CounterVec = register_counter_vec!(
+        "relay_outbound_bridge_datagram_send_failures_total",
+        "Outbound relay->client WebTransport datagram send failures at the bridge writer, by transport and reason (too_large|connection_lost|unsupported|disabled|webtransport) (issue 2030)",
+        &["transport", "reason"]
+    )
+    .expect("Failed to create relay_outbound_bridge_datagram_send_failures_total metric");
 
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///

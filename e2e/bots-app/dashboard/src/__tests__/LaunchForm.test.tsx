@@ -207,6 +207,96 @@ describe("<LaunchForm />", () => {
     expect((captured as { network?: string } | null)?.network).toBe("none");
   });
 
+  it("sends the default costume video mode in the launch request", async () => {
+    let captured: Record<string, unknown> | null = null;
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/launch") {
+        captured = JSON.parse(init?.body as string);
+        return new Response(JSON.stringify({ botId: "bot-costume" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url === "/api/assets/manifest") {
+        return new Response(JSON.stringify({ participants: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.startsWith("/api/assets")) {
+        return new Response(JSON.stringify({ files: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          filePath: "/runDir/auth/hcl-sso.json",
+          exists: false,
+          capturedAt: null,
+          ageHours: null,
+          size: null,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://example.com/meeting/Costume" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => expect(captured).not.toBeNull());
+    expect(captured).toEqual(expect.objectContaining({ videoMode: "costume" }));
+  });
+
+  it("sends clock video mode when selected", async () => {
+    let captured: Record<string, unknown> | null = null;
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/launch") {
+        captured = JSON.parse(init?.body as string);
+        return new Response(JSON.stringify({ botId: "bot-clock" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url === "/api/assets/manifest") {
+        return new Response(JSON.stringify({ participants: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.startsWith("/api/assets")) {
+        return new Response(JSON.stringify({ files: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          filePath: "/runDir/auth/hcl-sso.json",
+          exists: false,
+          capturedAt: null,
+          ageHours: null,
+          size: null,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    await userEvent.click(screen.getByTestId("video-mode-select"));
+    await userEvent.click(await screen.findByRole("option", { name: "Clock (live wall clock)" }));
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://example.com/meeting/Clock" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => expect(captured).not.toBeNull());
+    expect(captured).toEqual(expect.objectContaining({ videoMode: "clock" }));
+  });
+
   it("renders per-field help triggers", () => {
     renderWithClient(<LaunchForm onLaunched={() => {}} onError={() => {}} />);
     // A representative subset — these are the ARIA-described controls.
@@ -878,6 +968,7 @@ describe("<LaunchForm /> manifest auto-match", () => {
       displayName: "alice",
       ttl: "5m",
       network: "none",
+      videoMode: "costume" as const,
       headless: false,
       authBackend: "jwt" as const,
       storageStateFile: "",
@@ -1001,6 +1092,7 @@ describe("<LaunchForm /> load-previous (v1.5.0)", () => {
         displayName: "Carol",
         ttl: "30m",
         network: "none",
+        videoMode: "costume",
         headless: false,
         authBackend: "jwt",
         storageStateFile: "",
@@ -1040,6 +1132,7 @@ describe("<LaunchForm /> load-previous (v1.5.0)", () => {
         displayName: "",
         ttl: "30m",
         network: "none",
+        videoMode: "costume",
         headless: false,
         authBackend: "jwt",
         storageStateFile: "",

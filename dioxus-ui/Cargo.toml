@@ -126,6 +126,11 @@ features = [
 ]
 
 [dev-dependencies]
+# Enable videocall-client's `testing` feature for the test/dev build ONLY.
+# This turns on the `new_for_test` / `with_inner_borrowed_for_test` seams the
+# stale-pin wiring test needs (issue #1172). As a dev-dependency it never
+# affects the production `dioxus-ui` bin build.
+videocall-client = { path = "../videocall-client", features = ["testing"] }
 wasm-bindgen-test = "0.3.37"
 wasm-bindgen-futures = { workspace = true }
 gloo-utils = "0.1"

@@ -595,7 +595,8 @@ const JOIN_ACTION_TIMEOUT_MS = 5_000;
 const JOIN_ATTEMPTS = 3;
 const JOIN_ATTEMPT_TIMEOUT_MS = 45_000;
 
-async function waitForJoinButton(
+// Exported for unit testing the #865 gate (see meeting-join.test.ts).
+export async function waitForJoinButton(
   joinButton: Locator,
   homepageMeetingInput: Locator,
   displayNameInput: Locator,

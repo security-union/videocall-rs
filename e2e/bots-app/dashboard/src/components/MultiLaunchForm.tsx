@@ -22,8 +22,10 @@ import {
   NETSIM_PRESETS,
   RUN_LOCATIONS,
   TTL_SUGGESTIONS,
+  VIDEO_MODES,
   type AuthBackend,
   type RunLocation,
+  type VideoMode,
 } from "../lib/constants";
 import { useFieldHistory } from "../lib/fieldHistory";
 import { isValidMeetingUrl } from "../lib/validation";
@@ -88,6 +90,7 @@ interface MultiLaunchFormValues {
   meetingURL: string;
   ttl: string;
   network: string;
+  videoMode: VideoMode;
   headless: boolean;
   authBackend: AuthBackend;
   storageStateFile: string;
@@ -111,6 +114,7 @@ const DEFAULTS: MultiLaunchFormValues = {
   meetingURL: "",
   ttl: "5m",
   network: "none",
+  videoMode: "costume",
   headless: false,
   authBackend: "jwt",
   storageStateFile: "",
@@ -230,6 +234,7 @@ export function MultiLaunchForm({ onLaunched, onError, onToast }: MultiLaunchFor
         displayName: "",
         ttl: values.ttl,
         network: values.network,
+        videoMode: values.videoMode,
         headless: values.headless,
         authBackend: values.authBackend,
         storageStateFile: values.storageStateFile,
@@ -286,6 +291,7 @@ export function MultiLaunchForm({ onLaunched, onError, onToast }: MultiLaunchFor
       meetingURL: entry.spec.meetingURL,
       ttl: entry.spec.ttl,
       network: entry.spec.network,
+      videoMode: entry.spec.videoMode ?? "costume",
       headless: entry.spec.headless,
       authBackend: entry.spec.authBackend,
       storageStateFile: entry.spec.storageStateFile,
@@ -342,6 +348,7 @@ export function MultiLaunchForm({ onLaunched, onError, onToast }: MultiLaunchFor
       meetingURL: values.meetingURL.trim(),
       ttl: values.ttl.trim(),
       network: values.network,
+      videoMode: values.videoMode,
       headless: values.headless,
       authBackend: values.authBackend,
       ssoStateFile,
@@ -484,6 +491,7 @@ export function MultiLaunchForm({ onLaunched, onError, onToast }: MultiLaunchFor
                 ttl: values.ttl.trim(),
                 headless: values.headless,
                 network: values.network,
+                videoMode: values.videoMode,
                 authBackend: values.authBackend,
               }}
               subtitle="Preview for first participant — every bot in the batch runs on this same host with this same command shape; only --participant differs."
@@ -762,6 +770,22 @@ export function MultiLaunchForm({ onLaunched, onError, onToast }: MultiLaunchFor
                 onValueChange={(v) => setField("network", v)}
                 options={NETSIM_PRESETS.map((p) => ({ value: p, label: p }))}
                 testId="multi-network"
+              />
+            </Field>
+
+            <Field
+              label="Video mode"
+              help={
+                <HelpPopover fieldLabel="Video mode" testId="help-multi-video-mode">
+                  <p>Select the fake video source used by all spawned bots.</p>
+                </HelpPopover>
+              }
+            >
+              <Select
+                value={values.videoMode}
+                onValueChange={(v) => setField("videoMode", v as VideoMode)}
+                options={[...VIDEO_MODES]}
+                testId="multi-video-mode-select"
               />
             </Field>
           </div>

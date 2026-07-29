@@ -155,6 +155,7 @@ use super::super::client::VideoCallClient;
 use super::classify_encode_error::{
     classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
 };
+use super::dimensions::{corrected_source_dims, resolve_capture_dimensions};
 use super::encoder_state::{
     keyframe_tick_decision, periodic_keyframe_due, EncoderState, KeyframeTickInput,
 };
@@ -2882,6 +2883,7 @@ impl CameraEncoder {
                     }
                 }
 
+                // Each restart extracts a track from its newly acquired stream; no track is cached.
                 let video_track = Box::new(
                     device
                         .get_video_tracks()
@@ -2898,17 +2900,26 @@ impl CameraEncoder {
                     .unchecked_into::<MediaStreamTrack>();
                 let track_settings = media_track.get_settings();
 
-                let width = track_settings.get_width().expect("width is None");
-                let height = track_settings.get_height().expect("height is None");
+                let (width, height) = resolve_capture_dimensions(
+                    track_settings.get_width().map(f64::from),
+                    track_settings.get_height().map(f64::from),
+                    video_element.video_width(),
+                    video_element.video_height(),
+                );
 
-                // Native capture dims (the true source aspect), stamped onto
-                // every emitted camera packet so receiver diagnostics can detect
-                // aspect distortion at the source (issue #1196). Mirrors the
-                // screen encoder's `source_width_atomic` / `source_height_atomic`
-                // stamping; the camera dims are fixed for the encoder's lifetime
-                // here, so plain captured `u32`s suffice (no atomic needed).
-                let source_width = width as u32;
-                let source_height = height as u32;
+                // Seed the #1196 source-aspect atomics at acquisition from the
+                // resolved dims (settings -> preview -> 640x480 fallback). The
+                // camera CORRECTS these shared atomics from the first valid
+                // decoded frame (and any later size change) below, so a fallback
+                // seed self-heals within a frame and the stamp reflects the true
+                // source aspect. This is why the camera can seed a non-zero
+                // fallback safely; the screen encoder, which does NOT
+                // per-frame-correct, instead seeds 0="unknown" when settings are
+                // absent so it never stamps a fabricated aspect (see
+                // settings_source_stamp). So the seeds intentionally DIVERGE in
+                // the settings-absent case.
+                let source_width_atomic = Arc::new(AtomicU32::new(width));
+                let source_height_atomic = Arc::new(AtomicU32::new(height));
 
                 // --- Setup video encoders (LAZY per-layer construction, #1204) ─
                 // The output and error handler closures must be re-created on
@@ -2967,6 +2978,8 @@ impl CameraEncoder {
                                    initial_seq: u64|
                  -> Result<LayerEncoder, LayerBuildError> {
                     let layer_id = layer_idx as u32;
+                    let source_width_for_handler = source_width_atomic.clone();
+                    let source_height_for_handler = source_height_atomic.clone();
 
                     let (video_output_box, seq_out) = {
                         let client = client.clone();
@@ -3023,8 +3036,8 @@ impl CameraEncoder {
                                     buffer.as_mut_slice(),
                                     &userid,
                                     aes.clone(),
-                                    source_width,
-                                    source_height,
+                                    source_width_for_handler.load(Ordering::Relaxed),
+                                    source_height_for_handler.load(Ordering::Relaxed),
                                     layer_id,
                                 );
                                 // Phase 2 of WT freeze fix: route camera video on
@@ -3108,8 +3121,8 @@ impl CameraEncoder {
                             // raw 16:9 tier dims. `width`/`height` are the native
                             // track dims read up front (the true source aspect).
                             let (fit_w, fit_h) = fit_within_preserving_aspect(
-                                width as u32,
-                                height as u32,
+                                width,
+                                height,
                                 tier.max_width,
                                 tier.max_height,
                             );
@@ -3128,10 +3141,10 @@ impl CameraEncoder {
                             // layer dims to keep them well-defined. No per-layer fps
                             // cap — the stream follows the capture/adaptive cadence.
                             (
-                                width as u32,
-                                height as u32,
-                                width as u32,
-                                height as u32,
+                                width,
+                                height,
+                                width,
+                                height,
                                 current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0,
                                 None,
                             )
@@ -3868,6 +3881,21 @@ impl CameraEncoder {
                             // clamps to its own current dims + the shared tier max.
                             let frame_width = video_frame.display_width();
                             let frame_height = video_frame.display_height();
+                            // #1196: correct the source-aspect stamp from the
+                            // first real frame (and later size changes). The
+                            // decision lives in the unit-tested pure
+                            // `corrected_source_dims`; steady-state frames store
+                            // nothing, and a blank (0x0) frame never clobbers a
+                            // known stamp.
+                            if let Some((corrected_w, corrected_h)) = corrected_source_dims(
+                                frame_width,
+                                frame_height,
+                                source_width_atomic.load(Ordering::Relaxed),
+                                source_height_atomic.load(Ordering::Relaxed),
+                            ) {
+                                source_width_atomic.store(corrected_w, Ordering::Relaxed);
+                                source_height_atomic.store(corrected_h, Ordering::Relaxed);
+                            }
 
                             // Restart reason captured from a fatal per-frame
                             // encode/reconfigure cause (issue #527). `None` while
@@ -4260,10 +4288,10 @@ mod tests {
         clear_video_at_floor_on_enable_edge, encoders_to_build, format_layer_transition,
         frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
         keyframe_tick_decision, layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin,
-        periodic_keyframe_due, record_camera_restart, screen_ready_stall_threshold_update,
-        shed_reason, should_encode_layer_frame, should_pin_single_layer_low,
-        should_teardown_shed_layer, video_at_floor_on_tick, wt_drop_step_down_decision,
-        wt_saturation_step_down_decision, KeyframeTickInput, LayerView,
+        periodic_keyframe_due, record_camera_restart, resolve_capture_dimensions,
+        screen_ready_stall_threshold_update, shed_reason, should_encode_layer_frame,
+        should_pin_single_layer_low, should_teardown_shed_layer, video_at_floor_on_tick,
+        wt_drop_step_down_decision, wt_saturation_step_down_decision, KeyframeTickInput, LayerView,
         ScreenReadyStallThresholdTracker, SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS,
         SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
         SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
@@ -4274,6 +4302,44 @@ mod tests {
         WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS, WT_SELF_CONGESTION_DROP_THRESHOLD,
         WT_SELF_CONGESTION_WINDOW_MS,
     };
+
+    // These regression tests guard issue #2034's width-less capture track path.
+    #[test]
+    fn resolve_capture_dimensions_uses_video_element_when_settings_are_absent() {
+        assert_eq!(
+            resolve_capture_dimensions(None, None, 1280, 720),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn resolve_capture_dimensions_uses_video_element_when_settings_are_zero() {
+        assert_eq!(
+            resolve_capture_dimensions(Some(0.0), Some(0.0), 1280, 720),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn resolve_capture_dimensions_prefers_valid_settings() {
+        assert_eq!(
+            resolve_capture_dimensions(Some(800.0), Some(600.0), 1280, 720),
+            (800, 600)
+        );
+    }
+
+    #[test]
+    fn resolve_capture_dimensions_keeps_partial_settings_pair_coherent() {
+        assert_eq!(
+            resolve_capture_dimensions(Some(1280.0), None, 0, 0),
+            (640, 480)
+        );
+    }
+
+    #[test]
+    fn resolve_capture_dimensions_uses_safe_default_without_dimensions() {
+        assert_eq!(resolve_capture_dimensions(None, None, 0, 0), (640, 480));
+    }
 
     #[test]
     fn screen_ready_stall_threshold_tracks_live_tier_changes() {

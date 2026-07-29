@@ -347,6 +347,21 @@ describe("POST /launch/multi", () => {
     expect(surface.launchSpecs[1].ssoStateFile).toBe("/run/auth/hcl-sso.json");
   });
 
+  it("forwards clock video mode to every spawned launchOne spec", async () => {
+    await fetchJson(handle.port, "/launch/multi", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        mode: "first-n",
+        count: 2,
+        meetingURL: "https://example.com/meeting/X",
+        ttl: "5m",
+        videoMode: "clock",
+      },
+    });
+    expect(surface.launchSpecs.map((spec) => spec.videoMode)).toEqual(["clock", "clock"]);
+  });
+
   it("collects errors mid-batch but keeps already-spawned bots", async () => {
     surface.failNextNLaunches = 1; // fail the first one only
     const res = await fetchJson(handle.port, "/launch/multi", {

@@ -129,6 +129,7 @@ export interface LaunchSpec {
   headless: boolean;
   network: string;
   authBackend: "jwt" | "storage-state" | "none";
+  videoMode?: "costume" | "file" | "clock" | null;
   storageStateFile?: string;
   /**
    * Absolute path to a captured SSO state file (typically
@@ -873,6 +874,7 @@ async function launchProfileRoute(opts: ControlServerOptions, name: string): Pro
       // after the extension carry the original host verbatim so an
       // SSH-hosted bot resumes on the same registered host.
       runLocation: bot.runLocation ?? { kind: "local" },
+      videoMode: bot.videoMode ?? null,
     };
     const id = await opts.surface.launchOne(spec);
     botIds.push(id);
@@ -900,6 +902,7 @@ function snapshotCurrentBotsForProfile(surface: OrchestratorControlSurface): Pro
       network: t.network ?? "none",
       authBackend: t.authBackend,
       storageStateFile: t.storageStateFile ?? undefined,
+      videoMode: t.videoMode ?? null,
       // Capture where this bot is currently running so the profile
       // replays each bot on the same host on the next launch. Bots
       // running locally serialize as `{ kind: "local" }`; SSH bots
@@ -958,6 +961,7 @@ function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
   // and pass `undefined` through silently when the caller's bot spec
   // predates the field — the launch route fills in a local default.
   const runLocation = parseRunLocationFromSaveBody(o.runLocation, `${where}.runLocation`);
+  const videoMode = parseVideoModeFromSaveBody(o.videoMode, `${where}.videoMode`);
   return {
     meetingURL: o.meetingURL,
     participant: o.participant,
@@ -968,6 +972,7 @@ function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
     authBackend: auth,
     storageStateFile,
     runLocation,
+    videoMode,
   };
 }
 
@@ -990,6 +995,12 @@ function parseRunLocationFromSaveBody(raw: unknown, where: string): ProfileBotSp
     return { kind: "ssh", hostLabel: o.hostLabel };
   }
   throw new ControlServerError(400, `${where}.kind must be "local" or "ssh"`);
+}
+
+function parseVideoModeFromSaveBody(raw: unknown, where: string): ProfileBotSpec["videoMode"] {
+  if (raw === undefined || raw === null) return undefined;
+  if (raw === "costume" || raw === "file" || raw === "clock") return raw;
+  throw new ControlServerError(400, `${where} must be "costume", "file", or "clock"`);
 }
 
 function listBots(surface: OrchestratorControlSurface): RouteResult {
@@ -1219,6 +1230,7 @@ async function launchOne(
   if (authBackend !== "jwt" && authBackend !== "storage-state" && authBackend !== "none") {
     throw new ControlServerError(400, '"authBackend" must be "jwt", "storage-state", or "none"');
   }
+  const videoMode = parseVideoModeField(body.videoMode);
   const storageStateFile = body.storageStateFile;
   if (storageStateFile !== undefined && typeof storageStateFile !== "string") {
     throw new ControlServerError(400, '"storageStateFile" must be a string when provided');
@@ -1300,6 +1312,7 @@ async function launchOne(
     headless,
     network,
     authBackend,
+    videoMode,
     storageStateFile: storageStateFile as string | undefined,
     ssoStateFile: ssoStateFile as string | undefined,
     costume: costume as string | undefined,
@@ -1361,6 +1374,12 @@ export function parseRunLocationField(
     );
   }
   throw new ControlServerError(400, "runLocation must be a string or { kind, hostLabel }");
+}
+
+function parseVideoModeField(raw: unknown): "costume" | "file" | "clock" | null {
+  if (raw === undefined || raw === null) return null;
+  if (raw === "costume" || raw === "file" || raw === "clock") return raw;
+  throw new ControlServerError(400, '"videoMode" must be "costume", "file", or "clock"');
 }
 
 async function duplicate(
@@ -1829,6 +1848,7 @@ async function launchMultiRoute(
   if (authBackend !== "jwt" && authBackend !== "storage-state" && authBackend !== "none") {
     throw new ControlServerError(400, '"authBackend" must be "jwt", "storage-state", or "none"');
   }
+  const videoMode = parseVideoModeField(body.videoMode);
   const storageStateFile =
     body.storageStateFile !== undefined && body.storageStateFile !== null
       ? String(body.storageStateFile)
@@ -1917,6 +1937,7 @@ async function launchMultiRoute(
       headless,
       network,
       authBackend,
+      videoMode,
       storageStateFile,
       ssoStateFile,
       runLocation,
@@ -2614,6 +2635,7 @@ async function previewLaunchRoute(
       ttl: formatDuration(spec.ttl),
       meetingURL: spec.meetingURL,
       participant: spec.participant,
+      videoMode: spec.videoMode,
       network: spec.network === "none" ? null : spec.network,
       authBackend: spec.authBackend,
       displayName: spec.displayName ?? null,
@@ -2696,6 +2718,7 @@ function previewHostRoute(opts: ControlServerOptions, body: Record<string, unkno
     launchOverride !== null && typeof launchOverride.displayName === "string"
       ? launchOverride.displayName
       : null;
+  const videoMode = launchOverride !== null ? parseVideoModeField(launchOverride.videoMode) : null;
   // Apply the same SSO-wrap decision the real launcher would: only
   // when the unsaved host has `forwardSsoState !== false`, the
   // override sets `authBackend === "jwt"`, AND a local SSO state file
@@ -2716,6 +2739,7 @@ function previewHostRoute(opts: ControlServerOptions, body: Record<string, unkno
       ttl,
       meetingURL,
       participant,
+      videoMode,
       network,
       authBackend,
       displayName,
@@ -2748,6 +2772,7 @@ function parseLaunchSpecForPreview(body: Record<string, unknown>): {
   headless: boolean;
   network: string;
   authBackend: "jwt" | "storage-state" | "none";
+  videoMode: "costume" | "file" | "clock" | null;
 } {
   const meetingURL = body.meetingURL;
   if (typeof meetingURL !== "string" || meetingURL === "") {
@@ -2800,6 +2825,7 @@ function parseLaunchSpecForPreview(body: Record<string, unknown>): {
   if (authBackend !== "jwt" && authBackend !== "storage-state" && authBackend !== "none") {
     throw new ControlServerError(400, '"authBackend" must be "jwt", "storage-state", or "none"');
   }
+  const videoMode = parseVideoModeField(body.videoMode);
   return {
     meetingURL,
     participant,
@@ -2808,6 +2834,7 @@ function parseLaunchSpecForPreview(body: Record<string, unknown>): {
     headless,
     network,
     authBackend,
+    videoMode,
   };
 }
 

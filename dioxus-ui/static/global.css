@@ -2168,6 +2168,17 @@ html[data-theme="light"] #invite-overlay p {
   display: inline-flex;
 }
 
+/* Slots the JS overflow detector can't fit at the current width are hidden
+   here. The state is carried on a CLASS (toggled by attendants.rs), NOT an
+   inline style: Dioxus did not reliably clear an inline `display:none
+   !important` when it diffed back to empty, so a slot that overflowed at a
+   narrow width stayed stuck-hidden after the window widened again even though
+   the overflow set had emptied. `!important` beats the `.controls-expanded` /
+   `:hover` reveal rules above. */
+.action-bar-slot-wrapper.is-overflow-hidden {
+  display: none !important;
+}
+
 /* Overflow "more" trigger — hidden by default, shown at narrow viewports */
 .action-bar-overflow-trigger {
   display: none;
@@ -2195,6 +2206,13 @@ html[data-theme="light"] #invite-overlay p {
   box-shadow: var(--glass-popover-shadow);
   z-index: 9001;
   animation: overflow-popover-fade-in 0.12s ease-out;
+  /* Cap the height so the upward-opening list can't clip off the top of a
+     short / landscape viewport now that up to 5-7 items can land here. The
+     popover's bottom edge sits ~120px above the viewport bottom (20px bar
+     offset + ~79px bar height + 12px gap); leave that plus a small top margin,
+     and scroll anything taller. */
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
 }
 
 @keyframes overflow-popover-fade-in {

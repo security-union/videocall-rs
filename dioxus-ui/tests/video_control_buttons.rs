@@ -21,11 +21,39 @@ use wasm_bindgen_test::*;
 
 use dioxus::prelude::*;
 use dioxus_ui::components::video_control_buttons::{
-    CameraButton, DeviceSettingsButton, HangUpButton, MeetingOptionsButton, MicButton,
-    ScreenShareButton,
+    CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MeetingOptionsButton,
+    MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
 };
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+fn assert_button_aria_label_matches_tooltip_title(mount: &web_sys::Element) {
+    let button = mount
+        .query_selector("button")
+        .unwrap()
+        .expect("button should exist")
+        .dyn_into::<web_sys::HtmlButtonElement>()
+        .unwrap();
+    let aria_label = button
+        .get_attribute("aria-label")
+        .expect("button should expose an aria-label");
+    assert!(
+        !aria_label.trim().is_empty(),
+        "aria-label should be non-empty"
+    );
+
+    let title = mount
+        .query_selector(".tooltip .tooltip-title")
+        .unwrap()
+        .expect(".tooltip-title should exist");
+    let title_text = title
+        .text_content()
+        .expect(".tooltip-title should expose text content");
+    assert_eq!(
+        aria_label, title_text,
+        "button aria-label should match tooltip title"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // MicButton tests
@@ -66,6 +94,8 @@ async fn mic_button_enabled_shows_mute_tooltip() {
         "enabled MicButton should have the 'active' CSS class"
     );
 
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
     cleanup(&mount);
 }
 
@@ -103,6 +133,8 @@ async fn mic_button_disabled_shows_unmute_tooltip() {
         !button.class_list().contains("active"),
         "disabled MicButton should NOT have the 'active' CSS class"
     );
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
 
     cleanup(&mount);
 }
@@ -155,6 +187,14 @@ async fn mic_button_stays_clickable_when_unavailable() {
         "unavailable MicButton tooltip must not claim the device was 'not detected', got: {desc_text:?}"
     );
 
+    assert_eq!(
+        button.get_attribute("aria-label").as_deref(),
+        Some("Microphone unavailable — click to retry."),
+        "unavailable MicButton must expose its actual unavailable state"
+    );
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
     cleanup(&mount);
 }
 
@@ -186,6 +226,8 @@ async fn camera_button_enabled_shows_stop_video_tooltip() {
         desc.text_content()
     );
 
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
     cleanup(&mount);
 }
 
@@ -212,6 +254,8 @@ async fn camera_button_disabled_shows_start_video_tooltip() {
         "start-video description should mention the camera, got: {:?}",
         desc.text_content()
     );
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
 
     cleanup(&mount);
 }
@@ -255,6 +299,14 @@ async fn camera_button_stays_clickable_when_unavailable() {
         !desc_text.contains("detected"),
         "unavailable CameraButton tooltip must not claim the device was 'not detected', got: {desc_text:?}"
     );
+
+    assert_eq!(
+        button.get_attribute("aria-label").as_deref(),
+        Some("Camera unavailable — click to retry."),
+        "unavailable CameraButton must expose its actual unavailable state"
+    );
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
 
     cleanup(&mount);
 }
@@ -335,6 +387,8 @@ async fn screen_share_button_idle_shows_share_screen_tooltip() {
         desc.text_content()
     );
 
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
     cleanup(&mount);
 }
 
@@ -393,6 +447,8 @@ async fn screen_share_button_active_shows_stop_screen_share_tooltip() {
         "active ScreenShareButton should carry the 'active' CSS class"
     );
 
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
     cleanup(&mount);
 }
 
@@ -425,6 +481,8 @@ async fn device_settings_button_closed_shows_full_tooltip() {
         "closed device-settings description should mention the microphone and \
          camera devices it switches, got: {desc_text:?}"
     );
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
 
     cleanup(&mount);
 }
@@ -462,6 +520,8 @@ async fn device_settings_button_open_shows_close_tooltip() {
         desc.text_content()
     );
 
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
     cleanup(&mount);
 }
 
@@ -493,6 +553,8 @@ async fn meeting_options_button_closed_shows_full_tooltip() {
         desc_text.contains("waiting room"),
         "closed meeting-options description should mention the waiting room, got: {desc_text:?}"
     );
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
 
     cleanup(&mount);
 }
@@ -526,6 +588,8 @@ async fn meeting_options_button_open_shows_close_tooltip() {
         "open meeting-options description should explain it hides the panel, got: {:?}",
         desc.text_content()
     );
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
 
     cleanup(&mount);
 }
@@ -576,6 +640,72 @@ async fn hang_up_button_has_danger_class() {
         "hang-up description should mention leaving the call, got: {:?}",
         desc.text_content()
     );
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
+    cleanup(&mount);
+}
+
+// ---------------------------------------------------------------------------
+// Additional action-bar button aria-label coverage
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+async fn peer_list_button_open_and_closed_match_tooltip_titles() {
+    let mount = create_mount_point();
+    fn wrapper() -> Element {
+        rsx! { PeerListButton { open: false, onclick: move |_| {} } }
+    }
+    render_into(&mount, wrapper);
+    yield_now().await;
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
+    cleanup(&mount);
+
+    let mount = create_mount_point();
+    fn wrapper_open() -> Element {
+        rsx! { PeerListButton { open: true, onclick: move |_| {} } }
+    }
+    render_into(&mount, wrapper_open);
+    yield_now().await;
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn diagnostics_button_open_and_closed_match_tooltip_titles() {
+    let mount = create_mount_point();
+    fn wrapper() -> Element {
+        rsx! { DiagnosticsButton { open: false, onclick: move |_| {} } }
+    }
+    render_into(&mount, wrapper);
+    yield_now().await;
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
+    cleanup(&mount);
+
+    let mount = create_mount_point();
+    fn wrapper_open() -> Element {
+        rsx! { DiagnosticsButton { open: true, onclick: move |_| {} } }
+    }
+    render_into(&mount, wrapper_open);
+    yield_now().await;
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn mock_peers_button_matches_tooltip_title() {
+    let mount = create_mount_point();
+    fn wrapper() -> Element {
+        rsx! { MockPeersButton { open: false, onclick: move |_| {} } }
+    }
+    render_into(&mount, wrapper);
+    yield_now().await;
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
 
     cleanup(&mount);
 }

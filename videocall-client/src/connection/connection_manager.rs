@@ -285,6 +285,257 @@ fn uplink_rtt_baseline_feed(elected_avg_rtt: Option<f64>, rtt_probe_stale: bool)
     elected_avg_rtt
 }
 
+// ---------------------------------------------------------------------------
+// Issue 2029: automatic WebSocket fallback on sustained, cross-sender-uniform
+// WebTransport audio-datagram loss.
+//
+// A receiver measures per-peer audio-datagram loss (issue 1878, the
+// `wt_datagram_audio_loss_per_sec` gauge) but nothing acted on it, and the one
+// watchdog that could — `check_rtt_degradation` — is suppressed by the exact
+// condition that produces the loss (a constrained receiver keeps trickling
+// audio, so `recent_inbound` stays true, and sets `cpu_overloaded`). The
+// detector below runs on the same 1 Hz tick but INDEPENDENTLY of that
+// suppression, and on a sustained + uniform loss signal forces this session
+// onto WebSocket for the rest of its life. Uniform loss across every
+// audio-active sender is a receive-queue drop (WS fixes it); per-sender-only
+// loss is network-path loss (WS would NOT fix it — do not fire).
+// ---------------------------------------------------------------------------
+
+/// Loss rate (lost audio packets/sec) at or above which one WebTransport audio
+/// peer counts as "lossy" in a single 1 Hz sample.
+///
+/// Audio rides roughly 50 packets/sec (Opus 20 ms frames), so 5 pkt/s is about
+/// 10% loss — already concealment-audible, well below the field incident
+/// (2026-07-28: 20–44 pkt/s uniform, 80% concealment, unusable) yet comfortably
+/// above benign single-datagram jitter (1–2 pkt/s). Deliberately NOT tuned to
+/// the exact field magnitude; it is a presence threshold, not a severity gauge
+/// (the source window under-reports burst magnitude by design — see
+/// `AudioDatagramLossTracker` in `peer_decode_manager`).
+const WT_AUDIO_LOSS_THRESHOLD_PER_SEC: f64 = 5.0;
+
+/// Rolling detector window length, in 1 Hz samples (≈ seconds). Long enough
+/// that a transient burst (a GC pause, a momentary main-thread hitch) cannot
+/// trip it; short enough to switch within a reasonable time of a genuine
+/// sustained stall.
+const WT_AUDIO_LOSS_WINDOW_SAMPLES: usize = 12;
+
+/// K-of-M minimum lossy samples when at least one sample in the window saw ≥ 2
+/// audio-active WT peers (uniformity is cross-checkable). Windowed, NOT
+/// strictly-consecutive, per the repo hysteresis rule: a couple of good seconds
+/// do not reset progress, so ongoing contention cannot wedge the detector short
+/// of firing. 8 of 12 ≈ two-thirds of the last ~12 s uniformly lossy.
+const WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI: usize = 8;
+
+/// K-of-M minimum lossy samples for a single-remote-peer call. Uniformity is
+/// undefined with one sender (we cannot distinguish a receive-queue drop from
+/// that one path's loss), so we compensate by demanding a stronger sustained
+/// signal — 10 of 12 ≈ 83% of the window — before acting. A 1:1 call on a
+/// throttled laptop is exactly the field-case class, so we still fire; a merely
+/// flaky single path must be persistently bad.
+const WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE: usize = 10;
+
+/// A peer whose most recent loss sample is older than this (ms) is aged out of
+/// the uniformity denominator. Loss emits ~1 Hz per audio-active WT peer, so
+/// three missed samples means the peer muted or left — it must no longer count
+/// against (or toward) uniformity.
+const WT_AUDIO_LOSS_PEER_STALE_MS: f64 = 3_000.0;
+
+/// Uniformity ratio (numerator / denominator): a sample is "uniformly lossy"
+/// only when ≥ 80% of the audio-active WT peers are lossy. Integer-compared to
+/// avoid float rounding at the boundary.
+const WT_AUDIO_LOSS_UNIFORMITY_NUM: usize = 4;
+const WT_AUDIO_LOSS_UNIFORMITY_DEN: usize = 5;
+
+/// One 1 Hz classification of the WT audio-loss detector: how many audio-active
+/// WT peers were observed this tick, and whether their loss was UNIFORM (see
+/// [`wt_audio_tick_classify`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WtAudioLossSample {
+    active_peers: usize,
+    uniform_lossy: bool,
+}
+
+/// Pure: classify one tick's per-peer loss vector. `losses` holds the current
+/// windowed loss rate (pkt/s) of every audio-active WT peer this tick.
+///
+/// - 0 peers → not lossy (nothing to fall back for).
+/// - 1 peer → lossy iff that peer is at/over `threshold` (single-peer rule; the
+///   stronger sustained bar in [`wt_audio_fallback_should_fire`] compensates for
+///   the missing cross-check).
+/// - ≥ 2 peers → lossy iff ≥ 80% of them are at/over `threshold` (uniform
+///   receive-queue drop). One lossy sender among healthy peers is path loss and
+///   is deliberately classified NOT uniform.
+fn wt_audio_tick_classify(losses: &[f64], threshold: f64) -> WtAudioLossSample {
+    let active_peers = losses.len();
+    if active_peers == 0 {
+        return WtAudioLossSample {
+            active_peers: 0,
+            uniform_lossy: false,
+        };
+    }
+    let lossy = losses.iter().filter(|l| **l >= threshold).count();
+    let uniform_lossy = if active_peers == 1 {
+        lossy == 1
+    } else {
+        lossy * WT_AUDIO_LOSS_UNIFORMITY_DEN >= active_peers * WT_AUDIO_LOSS_UNIFORMITY_NUM
+    };
+    WtAudioLossSample {
+        active_peers,
+        uniform_lossy,
+    }
+}
+
+/// Pure: decide whether the sustained-uniform-loss predicate fires over the
+/// rolling window. Windowed (K-of-M), not strictly-consecutive. The multi-peer
+/// bar applies when the window ever saw ≥ 2 peers (cross-check available);
+/// otherwise the stricter single-peer bar applies. Both bars inherently gate
+/// warmup — needing K lossy samples requires at least K ticks of history — so a
+/// cold start (short window) cannot fire.
+fn wt_audio_fallback_should_fire(window: &[WtAudioLossSample]) -> bool {
+    let lossy = window.iter().filter(|s| s.uniform_lossy).count();
+    let multi_peer_seen = window.iter().any(|s| s.active_peers >= 2);
+    let needed = if multi_peer_seen {
+        WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI
+    } else {
+        WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE
+    };
+    lossy >= needed
+}
+
+/// Pure: whether an election may spawn WebTransport candidates. Empty once the
+/// issue-2029 WS-only latch is engaged — a session-scoped exclusion applied on
+/// top of whatever WT URLs the server offered, WITHOUT rewriting the user's
+/// stored transport preference.
+fn wt_election_includes_wt(ws_only_latched: bool) -> bool {
+    !ws_only_latched
+}
+
+/// One election candidate: which transport, its index within that transport's
+/// configured URL list (for the `ws_N` / `wt_N` connection id), and the base
+/// URL to dial.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ElectionCandidate {
+    is_webtransport: bool,
+    index: usize,
+    base_url: String,
+}
+
+/// Pure: build the ordered election candidate set that `create_all_connections`
+/// spawns 1:1. WebSocket candidates come first (in configured order), then
+/// WebTransport (in configured order) — UNLESS the issue-2029 WS-only latch is
+/// engaged, in which case every WebTransport candidate is excluded regardless of
+/// how many WT URLs the server offered.
+///
+/// Extracted as a side-effect-free function so the latch's WT-exclusion is
+/// natively unit-testable: `create_all_connections` calls `Connection::connect`,
+/// which is wasm-only, so the guard could not otherwise be exercised in the host
+/// `#[test]` suite. Driving this helper pins BOTH directions (latched => no WT;
+/// unlatched => WT present, in order), so deleting or reordering the guard is
+/// red on host.
+fn build_election_candidates(
+    websocket_urls: &[String],
+    webtransport_urls: &[String],
+    ws_only_latched: bool,
+) -> Vec<ElectionCandidate> {
+    let mut candidates: Vec<ElectionCandidate> = websocket_urls
+        .iter()
+        .enumerate()
+        .map(|(index, base_url)| ElectionCandidate {
+            is_webtransport: false,
+            index,
+            base_url: base_url.clone(),
+        })
+        .collect();
+
+    if wt_election_includes_wt(ws_only_latched) {
+        candidates.extend(
+            webtransport_urls
+                .iter()
+                .enumerate()
+                .map(|(index, base_url)| ElectionCandidate {
+                    is_webtransport: true,
+                    index,
+                    base_url: base_url.clone(),
+                }),
+        );
+    }
+
+    candidates
+}
+
+/// Stateful accumulator behind the issue-2029 WT→WS audio fallback.
+///
+/// `latest` holds each audio-active WT peer's most recent loss sample and the
+/// manager-clock timestamp it arrived; `window` holds the last
+/// [`WT_AUDIO_LOSS_WINDOW_SAMPLES`] 1 Hz classifications. Fed per-peer by
+/// [`ConnectionManager::observe_peer_audio_datagram_loss`]; advanced once per
+/// second by [`ConnectionManager::check_audio_datagram_fallback`].
+#[derive(Debug, Default)]
+struct WtAudioLossTracker {
+    /// peer_id -> (loss_per_sec, last_sample_ms on the manager clock).
+    latest: HashMap<String, (f64, f64)>,
+    window: VecDeque<WtAudioLossSample>,
+}
+
+impl WtAudioLossTracker {
+    /// Record one per-peer loss observation (pure bookkeeping; no decision).
+    ///
+    /// Borrow-first update: the steady state is the SAME set of peers reporting
+    /// ~1 Hz forever, so overwrite the existing slot in place and only allocate a
+    /// `String` key when a genuinely new peer appears. This keeps the per-sample
+    /// hot path allocation-free on exactly the throttled devices this feature
+    /// exists to rescue.
+    fn observe(&mut self, peer_id: &str, loss_per_sec: f64, now_ms: f64) {
+        if let Some(slot) = self.latest.get_mut(peer_id) {
+            *slot = (loss_per_sec, now_ms);
+        } else {
+            self.latest
+                .insert(peer_id.to_string(), (loss_per_sec, now_ms));
+        }
+    }
+
+    /// Advance the 1 Hz window by one sample and return whether the fallback
+    /// should fire. Ages out peers whose last sample is stale first, so a
+    /// departed/muted peer leaves the uniformity denominator.
+    fn tick(&mut self, now_ms: f64) -> bool {
+        self.latest
+            .retain(|_, (_, last_ms)| now_ms - *last_ms <= WT_AUDIO_LOSS_PEER_STALE_MS);
+        let losses: Vec<f64> = self.latest.values().map(|(loss, _)| *loss).collect();
+        let sample = wt_audio_tick_classify(&losses, WT_AUDIO_LOSS_THRESHOLD_PER_SEC);
+        self.window.push_back(sample);
+        while self.window.len() > WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            self.window.pop_front();
+        }
+        wt_audio_fallback_should_fire(self.window.make_contiguous())
+    }
+
+    /// Drop all transient window + per-peer state. Called on every fresh
+    /// election (so stale entries never cross a transport change) and when the
+    /// fallback latches (so the detector goes quiescent). Does NOT touch the
+    /// session latch — that lives on `ConnectionManager` and is one-way.
+    fn clear(&mut self) {
+        self.latest.clear();
+        self.window.clear();
+    }
+
+    /// Count of uniformly-lossy samples currently in the window (for the fire
+    /// log / diagnostic event).
+    fn window_lossy_count(&self) -> usize {
+        self.window.iter().filter(|s| s.uniform_lossy).count()
+    }
+
+    /// Current window length (for the fire log / diagnostic event).
+    fn window_len(&self) -> usize {
+        self.window.len()
+    }
+
+    /// Count of currently-tracked (non-aged-out) audio-active WT peers (for the
+    /// fire log / diagnostic event).
+    fn active_peer_count(&self) -> usize {
+        self.latest.len()
+    }
+}
+
 /// One candidate's structured election line. Pure so the exact log text is
 /// host-testable without a tracing/log capture seam.
 fn format_election_candidate(
@@ -1156,6 +1407,26 @@ pub struct ConnectionManager {
     /// [`total_suppression_duration_ms`] accumulator is cleared. Single-threaded
     /// access — no atomic needed.
     last_suppression_release_at_ms: Option<f64>,
+
+    /// Issue 2029: rolling detector for sustained, cross-sender-uniform
+    /// WebTransport audio-datagram loss. Fed per-peer at ~1 Hz from the
+    /// diagnostics pipeline via [`Self::observe_peer_audio_datagram_loss`];
+    /// sampled on the 1 Hz tick by [`Self::check_audio_datagram_fallback`].
+    /// Never fires on WebSocket (the loss emitter is gated on
+    /// `receiver_on_webtransport`, so no sample is ever fed) nor on E2EE-on
+    /// WebTransport sessions (there audio rides the reliable audio unistream, so
+    /// it has NO datagram sequence gaps — the gauge feeds a steady 0.0, which the
+    /// detector classifies as not-lossy).
+    audio_loss_tracker: WtAudioLossTracker,
+
+    /// Issue 2029: one-way, session-scoped WebSocket-only latch. Once the
+    /// detector fires, this client stays WebSocket-only for the rest of the
+    /// session — [`Self::create_all_connections`] skips every WebTransport
+    /// candidate and the detector goes quiescent (no probe-back, no flap). NOT
+    /// persisted to the user's stored transport preference (that lives in the
+    /// UI layer / localStorage): an automatic quality decision must never
+    /// rewrite an explicit user setting.
+    wt_audio_fallback_latched: bool,
 }
 
 fn should_filter_self_packet(packet: &PacketWrapper, own_session_id: Option<u64>) -> bool {
@@ -1244,6 +1515,8 @@ impl ConnectionManager {
             suppression_started_at_ms: None,
             total_suppression_duration_ms: 0.0,
             last_suppression_release_at_ms: None,
+            audio_loss_tracker: WtAudioLossTracker::default(),
+            wt_audio_fallback_latched: false,
         };
 
         Ok(manager)
@@ -1336,6 +1609,14 @@ impl ConnectionManager {
             map.clear();
         }
 
+        // Issue 2029: drop the WT audio-loss detector's transient window and
+        // per-peer samples so no stale entry survives a transport change /
+        // reconnect. The one-way `wt_audio_fallback_latched` flag is
+        // deliberately NOT cleared here — it must outlive every reconnect for
+        // the session (that is what keeps a WS-latched client on WebSocket, and
+        // the loss gauge is ~0 on WS so the detector stays quiescent anyway).
+        self.audio_loss_tracker.clear();
+
         // Cancel any lingering timers from the previous election.
         if let ElectionState::Testing { probe_timer, .. } = &mut self.election_state {
             if let Some(timer) = probe_timer.take() {
@@ -1414,80 +1695,58 @@ impl ConnectionManager {
 
     /// Create connections to all configured servers
     fn create_all_connections(&mut self) -> Result<()> {
-        // Create WebSocket connections
-        for (i, base_url) in self.options.websocket_urls.iter().enumerate() {
-            let conn_id = self.make_connection_id("ws", i);
-            let url = self.append_instance_id(base_url);
-            let connect_options = ConnectOptions {
-                websocket_url: url.clone(),
-                webtransport_url: String::new(), // Not used for WebSocket
-                on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
-                on_connected: self.create_connected_callback(conn_id.clone()),
-                on_connection_lost: self.create_connection_lost_callback(
-                    conn_id.clone(),
-                    url.clone(),
-                    false, // WebSocket
-                ),
-                peer_monitor: self.options.peer_monitor.clone(),
-            };
+        // Build the ordered candidate set (WS first, then WT) with the pure,
+        // natively-tested [`build_election_candidates`] — which is also where the
+        // issue-2029 WS-only latch excludes every WebTransport candidate. This
+        // loop then dials the set 1:1, so the guard is exercised by whatever the
+        // helper returns (no separate, untested inline branch).
+        let candidates = build_election_candidates(
+            &self.options.websocket_urls,
+            &self.options.webtransport_urls,
+            self.wt_audio_fallback_latched,
+        );
 
-            match Connection::connect(false, connect_options, self.aes.clone()) {
-                Ok(connection) => {
-                    self.connections.insert(conn_id.clone(), connection);
-                    self.rtt_measurements.insert(
-                        conn_id.clone(),
-                        ServerRttMeasurement {
-                            url: url.clone(),
-                            is_webtransport: false,
-                            measurements: VecDeque::new(),
-                            average_rtt: None,
-                            connection_id: conn_id.clone(),
-                            active: false,
-                            connected: false,
-                            consecutive_implausible_discards: 0,
-                            in_flight_probes: VecDeque::new(),
-                            consecutive_probe_timeouts: 0,
-                        },
-                    );
-                    debug!(
-                        "Created WebSocket connection {conn_id}: {}",
-                        strip_query_for_log(&url)
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to create WebSocket connection to {}: {e}",
-                        strip_query_for_log(&url)
-                    );
-                }
-            }
+        // Session-scoped skip notice: the configured URLs are left untouched (a
+        // later token refresh may repopulate them) and the user's stored
+        // transport preference is never rewritten; the latch alone excludes WT.
+        if self.wt_audio_fallback_latched && !self.options.webtransport_urls.is_empty() {
+            info!(
+                "[WT_AUDIO_FALLBACK] WebSocket-only latch engaged — skipping {} \
+                 WebTransport candidate(s) this election",
+                self.options.webtransport_urls.len()
+            );
         }
 
-        // Create WebTransport connections
-        for (i, base_url) in self.options.webtransport_urls.iter().enumerate() {
-            let conn_id = self.make_connection_id("wt", i);
-            let url = self.append_instance_id(base_url);
+        for candidate in &candidates {
+            let is_wt = candidate.is_webtransport;
+            let (prefix, transport_label) = if is_wt {
+                ("wt", "WebTransport")
+            } else {
+                ("ws", "WebSocket")
+            };
+            let conn_id = self.make_connection_id(prefix, candidate.index);
+            let url = self.append_instance_id(&candidate.base_url);
             let connect_options = ConnectOptions {
-                websocket_url: String::new(), // Not used for WebTransport
-                webtransport_url: url.clone(),
+                websocket_url: if is_wt { String::new() } else { url.clone() },
+                webtransport_url: if is_wt { url.clone() } else { String::new() },
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
                 on_connection_lost: self.create_connection_lost_callback(
                     conn_id.clone(),
                     url.clone(),
-                    true, // WebTransport
+                    is_wt,
                 ),
                 peer_monitor: self.options.peer_monitor.clone(),
             };
 
-            match Connection::connect(true, connect_options, self.aes.clone()) {
+            match Connection::connect(is_wt, connect_options, self.aes.clone()) {
                 Ok(connection) => {
                     self.connections.insert(conn_id.clone(), connection);
                     self.rtt_measurements.insert(
                         conn_id.clone(),
                         ServerRttMeasurement {
                             url: url.clone(),
-                            is_webtransport: true,
+                            is_webtransport: is_wt,
                             measurements: VecDeque::new(),
                             average_rtt: None,
                             connection_id: conn_id.clone(),
@@ -1499,13 +1758,13 @@ impl ConnectionManager {
                         },
                     );
                     debug!(
-                        "Created WebTransport connection {conn_id}: {}",
+                        "Created {transport_label} connection {conn_id}: {}",
                         strip_query_for_log(&url)
                     );
                 }
                 Err(e) => {
                     error!(
-                        "Failed to create WebTransport connection to {}: {e}",
+                        "Failed to create {transport_label} connection to {}: {e}",
                         strip_query_for_log(&url)
                     );
                 }
@@ -1528,7 +1787,11 @@ impl ConnectionManager {
             wt_count,
             self.connections.len()
         );
-        if !self.options.webtransport_urls.is_empty() && wt_count == 0 {
+        if self.wt_audio_fallback_latched {
+            // wt_count == 0 here is INTENTIONAL (issue 2029 WS-only latch), not a
+            // connect failure — do not emit the "all WT failed" warning.
+            info!("WebSocket only -- issue 2029 audio-datagram-loss fallback latch engaged");
+        } else if !self.options.webtransport_urls.is_empty() && wt_count == 0 {
             warn!(
                 "All {} WebTransport connections failed -- falling back to WebSocket only",
                 self.options.webtransport_urls.len()
@@ -4267,6 +4530,109 @@ impl ConnectionManager {
         videocall_transport::webtransport::set_uplink_rtt_baseline_ms(feed);
     }
 
+    /// Issue 2029: record one per-peer WebTransport audio-datagram loss
+    /// observation (peer id + windowed loss rate in pkt/s), fed at ~1 Hz per
+    /// audio-active WT peer from the diagnostics-bus subscription in
+    /// `health_reporter` (where the `wt_datagram_audio_loss_per_sec` gauge is
+    /// already ingested). Pure bookkeeping — the 1 Hz
+    /// [`Self::check_audio_datagram_fallback`] tick does the windowing and the
+    /// decision. `now_ms` is the manager clock ([`monotonic_now_ms`]) so the
+    /// detector's per-peer staleness aging is clock-consistent with the tick.
+    ///
+    /// No-op once WS-latched: the detector is quiescent and any late WT sample
+    /// (e.g. an in-flight bus event straddling the switch) is ignored.
+    pub fn observe_peer_audio_datagram_loss(
+        &mut self,
+        peer_id: &str,
+        loss_per_sec: f64,
+        now_ms: f64,
+    ) {
+        if self.wt_audio_fallback_latched {
+            return;
+        }
+        self.audio_loss_tracker
+            .observe(peer_id, loss_per_sec, now_ms);
+    }
+
+    /// Issue 2029: 1 Hz evaluation of the WebTransport→WebSocket audio fallback.
+    /// On SUSTAINED, cross-sender-UNIFORM audio-datagram loss it latches the
+    /// session WebSocket-only and re-elects through the unified reconnect path
+    /// ([`Self::reset_and_start_election`]) — mirroring what the manual
+    /// diagnostics WebSocket toggle produces (election with no WT candidates),
+    /// but session-scoped and WITHOUT persisting to the user's stored transport
+    /// preference.
+    ///
+    /// SUPPRESSION BYPASS: unlike [`Self::check_rtt_degradation`], this
+    /// deliberately does NOT consult `cpu_overloaded` / `recent_inbound`. A
+    /// constrained-receiver CPU stall is exactly what produces the uniform
+    /// datagram loss AND what suppresses RTT-based re-election, so the two must
+    /// not share a gate — the stall is the reason to switch, not a reason to
+    /// wait. This does not weaken that RTT suppression for its own purpose; it
+    /// is an independent detector on the same tick.
+    ///
+    /// Returns whether the fallback fired THIS tick — the caller then re-elects
+    /// via [`Self::reset_and_start_election`] (the unified full-election path),
+    /// mirroring how [`Self::check_rtt_degradation`] returns a decision the 1 Hz
+    /// timer acts on. The decision is separated from the (wasm-only) election so
+    /// it is host-unit-testable. One way: the latch short-circuits every
+    /// subsequent call, so it fires at most once per session — no probe-back, no
+    /// flap. Latching here (before the caller re-elects) is what makes the
+    /// ensuing `create_all_connections` skip every WebTransport candidate.
+    pub fn check_audio_datagram_fallback(&mut self, now_ms: f64) -> bool {
+        if self.wt_audio_fallback_latched {
+            return false;
+        }
+        if !self.audio_loss_tracker.tick(now_ms) {
+            return false;
+        }
+
+        let lossy = self.audio_loss_tracker.window_lossy_count();
+        let window = self.audio_loss_tracker.window_len();
+        let peers = self.audio_loss_tracker.active_peer_count();
+        warn!(
+            "[WT_AUDIO_FALLBACK] sustained uniform WebTransport audio-datagram \
+             loss detected ({lossy}/{window} recent 1s samples uniformly lossy \
+             across {peers} audio-active peer(s), threshold \
+             {WT_AUDIO_LOSS_THRESHOLD_PER_SEC:.0} pkt/s) — forcing this session \
+             to WebSocket-only and re-electing"
+        );
+
+        // Latch + go quiescent. The caller re-elects immediately, but even if
+        // that fails the latch alone keeps every future election WebSocket-only,
+        // and observe_* ignores any in-flight WT sample from here on.
+        self.wt_audio_fallback_latched = true;
+        self.audio_loss_tracker.clear();
+        self.emit_audio_fallback_diagnostic(lossy, window, peers);
+        true
+    }
+
+    /// Issue 2029: emit a one-shot diagnostics-bus event when the WT→WS audio
+    /// fallback fires, so the switch is correlatable in the same pipeline that
+    /// surfaced the loss (the `connection_manager` subsystem the health reporter
+    /// already consumes). Observability-only; no control flow depends on it.
+    fn emit_audio_fallback_diagnostic(
+        &self,
+        lossy_samples: usize,
+        window_samples: usize,
+        audio_active_peers: usize,
+    ) {
+        let event = DiagEvent {
+            subsystem: "connection_manager",
+            stream_id: None,
+            ts_ms: now_ms(),
+            metrics: vec![
+                metric!("wt_audio_fallback_fired", 1_u64),
+                metric!("wt_audio_fallback_lossy_samples", lossy_samples as u64),
+                metric!("wt_audio_fallback_window_samples", window_samples as u64),
+                metric!(
+                    "wt_audio_fallback_audio_active_peers",
+                    audio_active_peers as u64
+                ),
+            ],
+        };
+        let _ = global_sender().try_broadcast(event);
+    }
+
     /// Report RTT metrics to diagnostics system
     fn report_diagnostics(&self) {
         // PER-TICK hot path: fires on every 1 Hz diagnostics report. Demoted
@@ -5081,6 +5447,8 @@ mod tests {
             suppression_started_at_ms: None,
             total_suppression_duration_ms: 0.0,
             last_suppression_release_at_ms: None,
+            audio_loss_tracker: WtAudioLossTracker::default(),
+            wt_audio_fallback_latched: false,
         }
     }
 
@@ -7602,6 +7970,330 @@ mod tests {
         );
         // Stale AND not elected still resets.
         assert_eq!(uplink_rtt_baseline_feed(None, true), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 2029: WT→WS audio-datagram-loss fallback.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wt_audio_tick_classify_uniformity_rules() {
+        let thr = WT_AUDIO_LOSS_THRESHOLD_PER_SEC;
+        // No audio-active peers this tick: nothing to fall back for.
+        assert_eq!(
+            wt_audio_tick_classify(&[], thr),
+            WtAudioLossSample {
+                active_peers: 0,
+                uniform_lossy: false
+            }
+        );
+        // Single peer: lossy at/over the threshold, not below.
+        assert!(wt_audio_tick_classify(&[thr], thr).uniform_lossy);
+        assert!(!wt_audio_tick_classify(&[thr - 0.1], thr).uniform_lossy);
+        // Two peers both lossy => uniform receive-queue drop.
+        assert!(wt_audio_tick_classify(&[30.0, 30.0], thr).uniform_lossy);
+        // Two peers, only one lossy => path loss, NOT uniform (WS would not fix
+        // it) — this is the core gate against firing on per-sender loss.
+        assert!(!wt_audio_tick_classify(&[30.0, 0.0], thr).uniform_lossy);
+        // Five peers: 4/5 = 80% lossy => uniform; 3/5 = 60% => not.
+        assert!(wt_audio_tick_classify(&[30.0, 30.0, 30.0, 30.0, 0.0], thr).uniform_lossy);
+        assert!(!wt_audio_tick_classify(&[30.0, 30.0, 30.0, 0.0, 0.0], thr).uniform_lossy);
+    }
+
+    #[test]
+    fn wt_audio_fallback_should_fire_k_of_m_rules() {
+        let multi_lossy = WtAudioLossSample {
+            active_peers: 2,
+            uniform_lossy: true,
+        };
+        let multi_clean = WtAudioLossSample {
+            active_peers: 2,
+            uniform_lossy: false,
+        };
+        let single_lossy = WtAudioLossSample {
+            active_peers: 1,
+            uniform_lossy: true,
+        };
+
+        // Empty / cold-start window never fires.
+        assert!(!wt_audio_fallback_should_fire(&[]));
+
+        // Multi-peer: exactly K_MULTI lossy fires; one fewer does not.
+        assert!(wt_audio_fallback_should_fire(
+            &[multi_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI]
+        ));
+        assert!(!wt_audio_fallback_should_fire(
+            &[multi_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1]
+        ));
+
+        // Intermittent / decayed: (K_MULTI - 1) lossy diluted by clean samples
+        // stays below the bar (windowed, not consecutive — clean samples do not
+        // "reset" progress, but they also don't count toward it).
+        let mut intermittent = vec![multi_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1];
+        intermittent.resize(WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1 + 5, multi_clean);
+        assert!(!wt_audio_fallback_should_fire(&intermittent));
+
+        // Single remote peer: the multi bar (8) is NOT enough — the stricter
+        // single-peer bar (10) applies because uniformity is uncheckable.
+        assert!(!wt_audio_fallback_should_fire(
+            &[single_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI]
+        ));
+        assert!(wt_audio_fallback_should_fire(
+            &[single_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE]
+        ));
+    }
+
+    #[test]
+    fn wt_election_excludes_wt_only_when_latched() {
+        assert!(
+            wt_election_includes_wt(false),
+            "no latch: WebTransport candidates are allowed"
+        );
+        assert!(
+            !wt_election_includes_wt(true),
+            "WS-only latch: the election must exclude every WebTransport candidate"
+        );
+    }
+
+    // These two pin the WS-fallback ACTION natively: `create_all_connections`
+    // dials `build_election_candidates(...)` 1:1, and `Connection::connect` is
+    // wasm-only, so this pure helper is the only host-reachable seam for the
+    // WT-exclusion guard. Deleting the latch check (WT never excluded) reddens
+    // the latched test; reordering to put WT before WS reddens the unlatched
+    // test — so the guard is red-on-mutation in both directions.
+    #[test]
+    fn build_election_candidates_unlatched_ws_then_wt_in_order() {
+        let ws = vec!["ws://a".to_string(), "ws://b".to_string()];
+        let wt = vec![
+            "https://x".to_string(),
+            "https://y".to_string(),
+            "https://z".to_string(),
+        ];
+        let candidates = build_election_candidates(&ws, &wt, false);
+        assert_eq!(
+            candidates,
+            vec![
+                ElectionCandidate {
+                    is_webtransport: false,
+                    index: 0,
+                    base_url: "ws://a".to_string()
+                },
+                ElectionCandidate {
+                    is_webtransport: false,
+                    index: 1,
+                    base_url: "ws://b".to_string()
+                },
+                ElectionCandidate {
+                    is_webtransport: true,
+                    index: 0,
+                    base_url: "https://x".to_string()
+                },
+                ElectionCandidate {
+                    is_webtransport: true,
+                    index: 1,
+                    base_url: "https://y".to_string()
+                },
+                ElectionCandidate {
+                    is_webtransport: true,
+                    index: 2,
+                    base_url: "https://z".to_string()
+                },
+            ],
+            "unlatched: every WS candidate first (in order), then every WT candidate (in order)"
+        );
+    }
+
+    #[test]
+    fn build_election_candidates_latched_excludes_all_wt() {
+        let ws = vec!["ws://a".to_string()];
+        let wt = vec!["https://x".to_string(), "https://y".to_string()];
+        let candidates = build_election_candidates(&ws, &wt, true);
+        assert!(
+            candidates.iter().all(|c| !c.is_webtransport),
+            "WS-only latch must exclude every WebTransport candidate regardless of configured WT URLs"
+        );
+        assert_eq!(
+            candidates,
+            vec![ElectionCandidate {
+                is_webtransport: false,
+                index: 0,
+                base_url: "ws://a".to_string()
+            }],
+            "latched: WS candidates only, unchanged"
+        );
+    }
+
+    #[test]
+    fn wt_audio_tracker_fires_on_sustained_uniform_two_peer_loss() {
+        let mut tracker = WtAudioLossTracker::default();
+        let mut fired_at = None;
+        for i in 0..WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            let now = i as f64 * 1000.0;
+            tracker.observe("peer-a", 30.0, now);
+            tracker.observe("peer-b", 30.0, now);
+            if tracker.tick(now) && fired_at.is_none() {
+                fired_at = Some(i);
+            }
+        }
+        assert_eq!(
+            fired_at,
+            Some(WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1),
+            "two uniformly-lossy peers must fire on the {}th (K_MULTI-th) 1s sample",
+            WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI
+        );
+    }
+
+    #[test]
+    fn wt_audio_tracker_does_not_fire_on_per_sender_only_loss() {
+        // One lossy sender, one healthy sender, every second for two full
+        // windows: never uniform, so WS (which cannot fix a single path's loss)
+        // is never forced.
+        let mut tracker = WtAudioLossTracker::default();
+        for i in 0..(WT_AUDIO_LOSS_WINDOW_SAMPLES * 2) {
+            let now = i as f64 * 1000.0;
+            tracker.observe("peer-a", 30.0, now);
+            tracker.observe("peer-b", 0.0, now);
+            assert!(
+                !tracker.tick(now),
+                "one lossy sender among healthy peers is path loss, not a \
+                 uniform receive-queue drop — must not fire"
+            );
+        }
+    }
+
+    #[test]
+    fn wt_audio_tracker_does_not_fire_on_short_burst() {
+        // A 4-second burst then clean: the window can never reach K-of-M.
+        let mut tracker = WtAudioLossTracker::default();
+        for i in 0..WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            let now = i as f64 * 1000.0;
+            let loss = if i < 4 { 30.0 } else { 0.0 };
+            tracker.observe("peer-a", loss, now);
+            tracker.observe("peer-b", loss, now);
+            assert!(
+                !tracker.tick(now),
+                "a 4s burst must never reach the {}-of-{} bar",
+                WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI,
+                WT_AUDIO_LOSS_WINDOW_SAMPLES
+            );
+        }
+    }
+
+    #[test]
+    fn wt_audio_tracker_single_peer_requires_full_strength() {
+        // A single continuously-lossy remote sender must hold out for the
+        // stricter single-peer bar (10), NOT the multi-peer bar (8): asserting
+        // it fires exactly at SINGLE-1 proves the multi bar did not fire it
+        // early.
+        let mut tracker = WtAudioLossTracker::default();
+        let mut fired_at = None;
+        for i in 0..WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            let now = i as f64 * 1000.0;
+            tracker.observe("solo-peer", 30.0, now);
+            if tracker.tick(now) && fired_at.is_none() {
+                fired_at = Some(i);
+            }
+        }
+        assert_eq!(
+            fired_at,
+            Some(WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE - 1),
+            "a single lossy sender must require the full-strength ({}-of-{}) window",
+            WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE,
+            WT_AUDIO_LOSS_WINDOW_SAMPLES
+        );
+    }
+
+    #[test]
+    fn wt_audio_tracker_ages_out_departed_peer() {
+        let mut tracker = WtAudioLossTracker::default();
+        tracker.observe("peer-a", 30.0, 0.0);
+        tracker.observe("peer-b", 30.0, 0.0);
+        tracker.tick(0.0);
+        assert_eq!(tracker.active_peer_count(), 2, "both peers seen this tick");
+
+        // Only peer-a keeps emitting; advance past the stale window.
+        let after = WT_AUDIO_LOSS_PEER_STALE_MS + 1000.0;
+        tracker.observe("peer-a", 30.0, after);
+        tracker.tick(after);
+        assert_eq!(
+            tracker.active_peer_count(),
+            1,
+            "a peer with no fresh sample within the stale window must leave the \
+             uniformity denominator"
+        );
+    }
+
+    // Regression (issue 2029): on the UN-fixed code neither
+    // `observe_peer_audio_datagram_loss` nor `check_audio_datagram_fallback`
+    // exists and nothing consumes the per-peer WT audio-loss gauge, so the
+    // WS-fallback action asserted below cannot occur. Concretely: reverting the
+    // decision (making the detector never return `true`) breaks `assert!(fired)`,
+    // and reverting the action (not setting `wt_audio_fallback_latched`) breaks
+    // the latch assertion. Drives the PRODUCTION feed + tick methods — it does
+    // not re-implement the predicate.
+    #[test]
+    fn check_audio_datagram_fallback_fires_latches_and_is_one_way() {
+        let mut mgr = make_test_manager();
+        assert!(!mgr.wt_audio_fallback_latched, "cold start: not latched");
+
+        // Cold start (no observations) must not fire.
+        assert!(
+            !mgr.check_audio_datagram_fallback(0.0),
+            "no peers / no loss must not fire"
+        );
+
+        // Sustained, cross-sender-uniform loss across two audio-active WT peers.
+        let mut fired = false;
+        for i in 1..=WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            let now = i as f64 * 1000.0;
+            mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, now);
+            mgr.observe_peer_audio_datagram_loss("peer-b", 30.0, now);
+            if mgr.check_audio_datagram_fallback(now) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(
+            fired,
+            "sustained uniform WT audio loss must trigger the WS fallback"
+        );
+        assert!(
+            mgr.wt_audio_fallback_latched,
+            "firing must latch the session WebSocket-only"
+        );
+
+        // One-way latch: no re-fire, and post-latch observations are ignored so
+        // the detector is quiescent (the WS switch makes the source gauge ~0).
+        mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, 99_000.0);
+        assert!(
+            !mgr.check_audio_datagram_fallback(100_000.0),
+            "latch is one-way — must not re-fire"
+        );
+        assert_eq!(
+            mgr.audio_loss_tracker.active_peer_count(),
+            0,
+            "post-latch observations must be ignored (detector quiescent)"
+        );
+    }
+
+    #[test]
+    fn check_audio_datagram_fallback_does_not_fire_on_per_sender_loss() {
+        // Manager-level mirror of the per-sender case: two WT peers, only one
+        // lossy, for two full windows — never fires, never latches.
+        let mut mgr = make_test_manager();
+        for i in 1..=(WT_AUDIO_LOSS_WINDOW_SAMPLES * 2) {
+            let now = i as f64 * 1000.0;
+            mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, now);
+            mgr.observe_peer_audio_datagram_loss("peer-b", 0.0, now);
+            assert!(
+                !mgr.check_audio_datagram_fallback(now),
+                "per-sender-only loss must not force WebSocket"
+            );
+        }
+        assert!(
+            !mgr.wt_audio_fallback_latched,
+            "per-sender-only loss must never latch"
+        );
     }
 
     #[test]

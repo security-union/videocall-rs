@@ -45,7 +45,7 @@ export interface BotRunOptions {
    * page-lifetime canvas source and skips all asset preparation and
    * Chrome fake-file capture flags.
    */
-  videoMode?: VideoMode;
+  videoMode?: VideoMode | null;
   /**
    * Auth backend selection. `"jwt"` injects a session cookie signed with
    * the server-known JWT_SECRET (local + HCL daily + previews).

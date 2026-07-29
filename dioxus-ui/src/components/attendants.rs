@@ -1826,6 +1826,76 @@ fn visible_action_bar_slots(
         .collect()
 }
 
+/// Pure fit computation for the action-bar overflow ("…") menu.
+///
+/// Given the viewport size and the ordered list of *secondary* slots (every
+/// visible slot except the sacred Mic/Camera, which never overflow), returns
+/// the trailing slots that do NOT fit and must therefore be tucked behind the
+/// overflow trigger. `sacred_count` is the number of always-visible buttons
+/// (Mic + Camera + Hangup) and `rem_px` is the computed root font size so the
+/// estimate tracks browser zoom / OS text scaling.
+///
+/// The result is a **monotonically non-increasing** function of the available
+/// dimension: widening the window can only ever REVEAL more secondary slots,
+/// never hide additional ones. That property is what makes the bar expand back
+/// as the window widens (issue 2044). It is guaranteed by budgeting every
+/// button at the action bar's *full-size* spacing (1.2rem gap / 1.5rem×2 pad)
+/// at ALL widths — never the tightened narrow-viewport spacing. Because the
+/// tightened CSS spacing only makes the RENDERED bar NARROWER than this
+/// estimate, using the widest spacing here is also strictly clip-safe: the bar
+/// can never exceed the viewport it was budgeted against.
+fn action_bar_overflow_hidden(
+    vw: f64,
+    vh: f64,
+    is_vertical: bool,
+    rem_px: f64,
+    sacred_count: usize,
+    secondary: &[ActionBarSlot],
+) -> Vec<ActionBarSlot> {
+    let available = (if is_vertical { vh } else { vw }) - 40.0;
+
+    // Button size is 3.1rem, scaled by the root font size (zoom / OS text size).
+    let btn_size = 3.1 * rem_px;
+    // Full-size spacing at EVERY width. Using the widest gap/padding — rather
+    // than the narrow-viewport tightened values that the CSS applies at ≤540px
+    // / ≤440px — keeps the per-button cost independent of width, so the fitted
+    // count is monotonic and widening never re-hides a slot (issue 2044). The
+    // rendered bar's tighter spacing at narrow widths only leaves it narrower
+    // than this estimate, so the bar still never overflows the viewport.
+    let gap = 1.2 * rem_px;
+    let pad = 1.5 * rem_px * 2.0;
+
+    // Sacred (Mic + Camera + Hangup) always occupy the bar.
+    let sacred_width = (sacred_count as f64) * btn_size + (sacred_count as f64) * gap + pad + 2.0;
+    let trigger_width = btn_size + gap;
+
+    // Budget for the secondary buttons once the sacred set and the overflow
+    // trigger are accounted for. The trigger width is always reserved: if every
+    // secondary slot fits inside this (smaller) budget it certainly fits with
+    // the larger dock button that replaces the trigger when nothing overflows,
+    // so no dead zone is introduced.
+    let budget = available - sacred_width - trigger_width;
+
+    let mut fit_count = 0usize;
+    let mut used = 0.0_f64;
+    for (i, _) in secondary.iter().enumerate() {
+        let needed = btn_size + if i > 0 { gap } else { 0.0 };
+        if used + needed <= budget {
+            used += needed;
+            fit_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if fit_count == secondary.len() {
+        // Everything fits even against the trigger-reserved budget.
+        Vec::new()
+    } else {
+        secondary[fit_count..].to_vec()
+    }
+}
+
 fn merge_visible_action_bar_slots(
     full_slots: &[ActionBarSlot],
     reordered_visible_slots: &[ActionBarSlot],
@@ -2058,10 +2128,11 @@ pub fn AttendantsComponent(
     //
     // Pure signal-based: a `viewport_width` signal tracks window size via
     // a resize event listener.  The render function reads viewport_width,
-    // the visible slots, and computes which secondary slots don't fit
-    // using known button sizes (matching the CSS media query breakpoints).
-    // No DOM measurement, no style manipulation — Dioxus is the sole
-    // authority on element visibility.
+    // the visible slots, and computes which secondary slots don't fit via
+    // `action_bar_overflow_hidden` — a monotonic estimate that only ever
+    // reveals more slots as the window widens (issue 2044). No DOM
+    // measurement, no style manipulation — Dioxus is the sole authority on
+    // element visibility.
     let mut viewport_width = use_signal(|| {
         web_sys::window()
             .and_then(|w| w.inner_width().ok())
@@ -2170,25 +2241,14 @@ pub fn AttendantsComponent(
         );
 
         let is_vertical = dock != DockPosition::Bottom;
-        let available = if is_vertical { vh } else { vw } - 40.0;
 
-        // Button size is 3.1rem. Scale by computed root font-size to handle
-        // browser zoom and OS text-size settings (where 1rem > 16px).
+        // Root font size (browser zoom / OS text scaling), so the button and
+        // spacing estimate tracks environments where 1rem > 16px.
         let rem_px = web_sys::window()
             .and_then(|w| w.document())
             .and_then(|d| d.document_element())
             .and_then(|el| w_sys_computed_font_size(&el))
             .unwrap_or(16.0);
-        let btn_size = 3.1 * rem_px;
-
-        // Gap/padding shrink at narrow viewports to match CSS media queries.
-        let (gap, pad) = if !is_vertical && vw <= 440.0 {
-            (0.4 * rem_px, 0.8 * rem_px * 2.0) // 0.4rem gap, 0.8rem×2 pad
-        } else if !is_vertical && vw <= 540.0 {
-            (0.6 * rem_px, 1.0 * rem_px * 2.0) // 0.6rem gap, 1rem×2 pad
-        } else {
-            (1.2 * rem_px, 1.5 * rem_px * 2.0) // 1.2rem gap, 1.5rem×2 pad
-        };
 
         // Sacred = Mic + Camera + Hangup — always visible.
         let primary_count = visible
@@ -2200,43 +2260,13 @@ pub fn AttendantsComponent(
             .copied()
             .filter(|s| !matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
             .collect();
-
         let sacred_count = primary_count + 1; // +1 hangup
-        let sacred_width =
-            (sacred_count as f64) * btn_size + (sacred_count as f64) * gap + pad + 2.0;
 
-        let trigger_width = btn_size + gap;
-
-        // --- Single-pass overflow with consistent budgeting ---
-        // Budget when no overflow: sacred + dock + all secondary.
-        // Budget when overflow: sacred + trigger (dock hides) + fitting secondary.
-        //
-        // We compute the overflow-mode budget directly. If ALL secondary
-        // slots fit in the overflow budget, no overflow is needed (they'd
-        // also fit with the larger dock). This eliminates the dead zone
-        // where pass-1 detected overflow but pass-2 fit everything.
-        let budget = available - sacred_width - trigger_width;
-        let mut fit_count = 0usize;
-        let mut used = 0.0_f64;
-
-        for (i, _) in secondary.iter().enumerate() {
-            let needed = btn_size + if i > 0 { gap } else { 0.0 };
-            if used + needed <= budget {
-                used += needed;
-                fit_count += 1;
-            } else {
-                break;
-            }
-        }
-
-        let hidden: Vec<ActionBarSlot> = if fit_count == secondary.len() {
-            // Everything fits even with the smaller trigger budget,
-            // so it certainly fits with the larger dock. No overflow.
-            Vec::new()
-        } else {
-            // At least one slot overflows — hide from fit_count onward.
-            secondary[fit_count..].to_vec()
-        };
+        // Pure, monotonic fit: widening only ever reveals more slots (issue
+        // 2044). See `action_bar_overflow_hidden` for why full-size spacing is
+        // budgeted at every width.
+        let hidden =
+            action_bar_overflow_hidden(vw, vh, is_vertical, rem_px, sacred_count, &secondary);
 
         if *overflowed_slots.peek() != hidden {
             overflowed_slots.set(hidden.clone());
@@ -6488,6 +6518,16 @@ pub fn AttendantsComponent(
     // on `MOCK_PEERS_ENABLED`, so a no-op in production.
     use_hook(crate::components::freshness_inject::register_freshness_inject_hooks);
 
+    // Register `window.__videocall_inject_screen_first_render` so an E2E spec
+    // can deterministically drive the SCREEN first-render ack (HCL #893) — the
+    // next real SCREEN decode() then fires the real
+    // `PEER_EVENT(screen_decode_started)` to the publisher. Also gated on
+    // `MOCK_PEERS_ENABLED`, so a no-op (nothing attached to `window`) in
+    // production.
+    use_hook(
+        crate::components::screen_first_render_inject::register_screen_first_render_inject_hooks,
+    );
+
     // Host self-view speaking glow — update DOM directly to avoid re-rendering
     // the entire meeting view on every audio-level tick.
     // Note: host glow is intentionally not suppressed by pin state so the local
@@ -7781,9 +7821,7 @@ pub fn AttendantsComponent(
     {
         let current_pinned = pinned_peer_id();
         if let Some(ref pin) = current_pinned {
-            let pid = pin.user_id.as_str();
-            let present = client.peer_user_id_present(pid);
-            if should_clear_stale_pin(Some(pid), present) {
+            if should_clear_stale_pin_for_client(&client, pin.user_id.as_str()) {
                 pinned_peer_id.set(None);
             }
         }
@@ -9265,11 +9303,26 @@ pub fn AttendantsComponent(
                                                     _ => "slot-secondary",
                                                 };
                                                 let is_dragging = dragging_slot() == Some(slot) && drag_started();
-                                                let wrapper_class = if is_dragging {
-                                                    format!("action-bar-slot-wrapper {tier} is-drag-placeholder")
-                                                } else {
-                                                    format!("action-bar-slot-wrapper {tier}")
-                                                };
+                                                // Hide secondary slots the overflow detector
+                                                // determined don't fit. This is carried on the
+                                                // CLASS (with `!important` in CSS), NOT an inline
+                                                // style: Dioxus does not reliably clear an inline
+                                                // `display:none !important` when the style diffs
+                                                // back to empty, so a slot that overflowed at a
+                                                // narrow width stayed stuck-hidden after widening
+                                                // even though `overflowed_slots` emptied. A class
+                                                // toggle diffs cleanly (same as `is-drag-placeholder`).
+                                                let overflow_hidden = tier == "slot-secondary"
+                                                    && !customize_mode()
+                                                    && overflowed_slots.read().contains(&slot);
+                                                let mut wrapper_class =
+                                                    format!("action-bar-slot-wrapper {tier}");
+                                                if is_dragging {
+                                                    wrapper_class.push_str(" is-drag-placeholder");
+                                                }
+                                                if overflow_hidden {
+                                                    wrapper_class.push_str(" is-overflow-hidden");
+                                                }
                                                 let drag_slot_size_c = drag_slot_size.clone();
                                                 let drag_pointer_id_c = drag_pointer_id.clone();
                                                 let drag_grab_dx_c = drag_grab_dx.clone();
@@ -9278,22 +9331,11 @@ pub fn AttendantsComponent(
                                                 let drag_start_y_c = drag_start_y.clone();
                                                 let drag_nav_left_c = drag_nav_left.clone();
                                                 let drag_nav_top_c = drag_nav_top.clone();
-                                                // Hide secondary slots that the overflow
-                                                // detector determined don't fit.
-                                                let overflow_hidden = tier == "slot-secondary"
-                                                    && !customize_mode()
-                                                    && overflowed_slots.read().contains(&slot);
-                                                let overflow_style = if overflow_hidden {
-                                                    "display: none !important"
-                                                } else {
-                                                    ""
-                                                };
                                                 rsx! {
                                                     div {
                                                         key: "{slug}",
                                                         "data-slot": slug,
                                                         class: "{wrapper_class}",
-                                                        style: "{overflow_style}",
                                                         onpointerdown: move |evt: PointerEvent| {
                                                             if !customize_mode() { return; }
                                                             let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
@@ -9857,6 +9899,7 @@ pub fn AttendantsComponent(
                                             class: "video-control-button",
                                             title: "More actions",
                                             "aria-label": "More actions",
+                                            "aria-haspopup": "menu",
                                             "aria-expanded": if overflow_menu_open() { "true" } else { "false" },
                                             onclick: move |e: MouseEvent| {
                                                 e.stop_propagation();
@@ -11667,6 +11710,28 @@ pub(crate) fn should_clear_stale_pin(
     pinned.is_some() && pinned_still_present == Some(false)
 }
 
+/// Per-render stale-pin decision wired to a live client — the exact production
+/// path the render loop runs each tick for the pinned peer.
+///
+/// This is deliberately a NAMED function rather than an inline block so the
+/// full wiring is testable end-to-end (issue #1172): it must read presence via
+/// [`VideoCallClient::peer_user_id_present`] (which returns `Option<bool>`, so a
+/// busy-borrow tick surfaces as `None`) and pass that `Option<bool>` straight
+/// into [`should_clear_stale_pin`] WITHOUT collapsing it to a fail-closed
+/// `bool` first. Feeding `Some(client.has_peer_with_user_id(pid))` here instead
+/// would map a transient borrow-fail to `Some(false)` ("confirmed absent") and
+/// spuriously release the pin on a tick where the peer never left — the exact
+/// regression the wiring test `busy_borrow_holds_pin_via_client` guards.
+pub(crate) fn should_clear_stale_pin_for_client(
+    client: &VideoCallClient,
+    pinned_user_id: &str,
+) -> bool {
+    should_clear_stale_pin(
+        Some(pinned_user_id),
+        client.peer_user_id_present(pinned_user_id),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests for reconnect_delay_ms
 // ---------------------------------------------------------------------------
@@ -11677,6 +11742,108 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    // ── Action-bar overflow fit: must expand back as the window widens ──
+    // (issue 2044). `action_bar_overflow_hidden` must be a monotonically
+    // non-increasing function of viewport width: widening can only ever REVEAL
+    // secondary slots, never hide more of them. The pre-fix code budgeted each
+    // button with the CSS's *tightened* narrow-viewport spacing (0.6rem gap at
+    // ≤540px, 0.4rem at ≤440px) but the *full* 1.2rem spacing above 540px — so
+    // crossing 540px going WIDER shrank the fit budget faster than the width
+    // grew and pushed already-shown buttons back into the overflow menu.
+    // Reverting `action_bar_overflow_hidden` to that width-dependent spacing
+    // makes both tests below fail at the 540→560 boundary.
+
+    /// A fixed, order-independent set of secondary slots (Mic/Camera excluded).
+    fn overflow_test_secondary() -> Vec<ActionBarSlot> {
+        vec![
+            ActionBarSlot::Reactions,
+            ActionBarSlot::ScreenShare,
+            ActionBarSlot::PeerList,
+            ActionBarSlot::DensityMode,
+            ActionBarSlot::Diagnostics,
+            ActionBarSlot::DeviceSettings,
+        ]
+    }
+
+    #[test]
+    fn action_bar_overflow_is_monotonic_as_window_widens() {
+        let secondary = overflow_test_secondary();
+        let sacred_count = 3; // Mic + Camera + Hangup
+        let rem_px = 16.0;
+
+        let mut prev_hidden = usize::MAX;
+        let mut w = 300.0_f64;
+        while w <= 1400.0 {
+            let hidden =
+                action_bar_overflow_hidden(w, 800.0, false, rem_px, sacred_count, &secondary).len();
+            assert!(
+                hidden <= prev_hidden,
+                "widening to {w}px hid MORE slots ({hidden}) than at the previous narrower \
+                 width ({prev_hidden}); the action bar must expand monotonically as the \
+                 window widens (issue 2044)",
+            );
+            prev_hidden = hidden;
+            w += 5.0;
+        }
+    }
+
+    #[test]
+    fn action_bar_overflow_crossing_540px_wider_never_hides_more() {
+        // The exact dead zone from the report: at 540px a batch of secondary
+        // buttons fit; the pre-fix spacing jump made 560px (which is WIDER)
+        // hide MORE of them. Pin the two representative widths directly.
+        let secondary = overflow_test_secondary();
+        let at_540 = action_bar_overflow_hidden(540.0, 800.0, false, 16.0, 3, &secondary).len();
+        let at_560 = action_bar_overflow_hidden(560.0, 800.0, false, 16.0, 3, &secondary).len();
+        assert!(
+            at_560 <= at_540,
+            "560px (wider) hid {at_560} slots but 540px (narrower) hid only {at_540} — \
+             widening must not re-hide buttons (issue 2044)",
+        );
+    }
+
+    #[test]
+    fn action_bar_overflow_reveals_all_when_wide_and_overflows_when_narrow() {
+        let secondary = overflow_test_secondary();
+        // A wide window reveals every secondary slot (nothing overflows).
+        assert_eq!(
+            action_bar_overflow_hidden(1600.0, 800.0, false, 16.0, 3, &secondary).len(),
+            0,
+            "a wide window must reveal every action-bar button",
+        );
+        // A narrow window tucks at least one slot behind the overflow trigger.
+        assert!(
+            !action_bar_overflow_hidden(360.0, 800.0, false, 16.0, 3, &secondary).is_empty(),
+            "a narrow window must move at least one button into the overflow menu",
+        );
+    }
+
+    #[test]
+    fn action_bar_overflow_pins_spacing_constants() {
+        // Drift guard: pins the exact fit at a canonical width so any change to
+        // the button/gap/pad constants in `action_bar_overflow_hidden` trips a
+        // deliberate test update. Clip-safety depends on these exact values, so
+        // a silent few-px drift must not ship unnoticed.
+        //
+        // Derivation at vw=620px, root 16px, 3 sacred + 6 secondary:
+        //   available    = 620 - 40                    = 580.0
+        //   btn_size     = 3.1rem                       =  49.6
+        //   gap          = 1.2rem                       =  19.2
+        //   pad          = 1.5rem × 2                   =  48.0
+        //   sacred_width = 3·49.6 + 3·19.2 + 48 + 2     = 256.4
+        //   trigger      = 49.6 + 19.2                  =  68.8
+        //   budget       = 580 - 256.4 - 68.8           = 254.8
+        //   fit: 49.6, 118.4, 187.2 all ≤ 254.8 (3 fit); 4th needs 256.0 > 254.8
+        //   → 3 fit, 3 hidden
+        let secondary = overflow_test_secondary();
+        assert_eq!(
+            action_bar_overflow_hidden(620.0, 800.0, false, 16.0, 3, &secondary).len(),
+            3,
+            "at 620px exactly 3 of 6 secondary slots fit (3 hidden) with the current \
+             spacing constants; a change here means btn/gap/pad drifted",
+        );
+    }
 
     // ── Deferred leave-sound debounce (notifications-OFF + sound-ON) ──
     // Pure host `#[test]`s over the helpers on_peer_left / on_peer_joined call.
@@ -12909,5 +13076,55 @@ mod tests {
     #[test]
     fn unread_tick_holds_pin() {
         assert!(!should_clear_stale_pin(Some("alice"), None));
+    }
+
+    /// End-to-end WIRING guard for issue #1172 (the deferred PR #1892 finding).
+    /// The 11 pure `should_clear_stale_pin` tests above prove the DECISION; this
+    /// proves the CALL SITE feeds it correctly. It drives the real production
+    /// path `should_clear_stale_pin_for_client` against a live `VideoCallClient`
+    /// and forces the transient `inner` busy-borrow that
+    /// `peer_user_id_present` was built to survive: the `None` it returns on a
+    /// borrow-fail tick must reach `should_clear_stale_pin` AS `None` — never
+    /// collapsed to a fail-closed `bool` — so a pinned peer is HELD, not
+    /// released, on a tick that merely coincided with a decode/audio borrow.
+    ///
+    /// Structure mirrors the in-crate precedent
+    /// `set_peer_tile_hints_returns_false_when_inner_borrowed`:
+    /// clean -> contended -> clean. The clean ticks reach a definite presence
+    /// decision; the contended tick in the middle must NOT clear the pin.
+    ///
+    /// MUTATION SENSITIVITY: reverting `should_clear_stale_pin_for_client` to
+    /// feed `Some(client.has_peer_with_user_id(pid))` (the fail-closed bool that
+    /// PR #1892 removed) maps the contended borrow-fail to `Some(false)`
+    /// ("confirmed absent"), so the pin is wrongly cleared and the middle
+    /// assertion fails. Confirmed by performing exactly that mutation.
+    #[test]
+    fn busy_borrow_holds_pin_via_client() {
+        let client = VideoCallClient::new_for_test("local_user");
+        let pinned = "pinned_peer";
+
+        // Clean tick, peer absent: a definite read (`Some(false)`) -> clear.
+        assert!(
+            should_clear_stale_pin_for_client(&client, pinned),
+            "a clean read that CONFIRMS the peer is absent must clear the pin"
+        );
+
+        // Contended tick: hold `inner` under a live mutable borrow so
+        // `peer_user_id_present` hits `try_borrow() == Err` and returns `None`
+        // (unread table). The pin must be HELD, not released.
+        let cleared_while_contended = client
+            .with_inner_borrowed_for_test(|| should_clear_stale_pin_for_client(&client, pinned));
+        assert!(
+            !cleared_while_contended,
+            "a busy-borrow tick (unread peer table, issue 1172) must HOLD the pin — \
+             it must not release a peer that never left"
+        );
+
+        // Borrow released: the read is definite again -> clear. Contention was
+        // transient, exactly like the tile-hints precedent.
+        assert!(
+            should_clear_stale_pin_for_client(&client, pinned),
+            "once the borrow is released the read is definite again -> clear"
+        );
     }
 }

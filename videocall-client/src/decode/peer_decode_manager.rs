@@ -601,16 +601,22 @@ const AUDIO_SEQ_RESET_REANCHOR_GAP: u64 = 1024;
 ///
 /// ## Known limitations
 ///
-/// 1. **Burst severity is under-reported; treat this as a PRESENCE signal, not a
-///    precise magnitude.** Loss is only declared when a skipped position shifts
-///    off the 64-slot reorder window, so a single contiguous forward gap can
-///    contribute at most ~64 to the count regardless of how many hundreds of
-///    consecutive datagrams were actually lost. A multi-second burst therefore
-///    reads as "nonzero, sustained" rather than its true magnitude. This is
-///    inherited verbatim from the video [`SequenceTracker`] window and is
-///    consistent by design — the goal is to make the previously-invisible
-///    datagram loss OBSERVABLE (nonzero when audio is dropping, ~0 otherwise),
-///    which the window delivers.
+/// 1. **Burst severity is under-reported by the CAPPED count; treat
+///    [`Self::loss_per_sec`] as a PRESENCE signal, not a precise magnitude.**
+///    Loss is only declared when a skipped position shifts off the 64-slot
+///    reorder window, so a single contiguous forward gap can contribute at most
+///    ~64 to the count regardless of how many hundreds of consecutive datagrams
+///    were actually lost. A multi-second burst therefore reads as "nonzero,
+///    sustained" rather than its true magnitude. This is inherited verbatim from
+///    the video [`SequenceTracker`] window and is consistent by design — the goal
+///    is to make the previously-invisible datagram loss OBSERVABLE (nonzero when
+///    audio is dropping, ~0 otherwise), which the window delivers. Issue 2031
+///    adds the MAGNITUDE companion [`Self::raw_loss_per_sec`], which sums the
+///    uncapped forward-gap sizes so the true burst size (e.g. 200) is recoverable
+///    alongside the presence signal; a large raw/capped ratio is the burst
+///    severity. The raw sum does NOT credit back later in-window reordering, so
+///    it can slightly over-report under genuine reordering — acceptable for a
+///    single-path datagram burst-loss magnitude.
 /// 2. **Audio simulcast (non-default `max_layers > 1`) can blind the tracker
 ///    across a layer switch.** Each simulcast layer carries its own dense
 ///    sequence, so a receive switch to a LAGGING audio layer is a BACKWARD jump.
@@ -641,11 +647,20 @@ struct AudioDatagramLossTracker {
     seen_bits: u64,
     /// Start of the current ~1s rate window (ms). 0 = not yet started.
     window_start_ms: u64,
-    /// Lost packets accumulated in the current window.
+    /// Lost packets accumulated in the current window (CAPPED at ~64 per
+    /// contiguous gap by the reorder window — a PRESENCE signal).
     window_lost: u32,
+    /// Issue 2031: RAW (uncapped) skipped-sequence sum accumulated in the current
+    /// window. Unlike [`Self::window_lost`], a single contiguous forward gap of N
+    /// missing sequence numbers contributes the full N here, so this carries the
+    /// burst MAGNITUDE the capped count saturates away.
+    window_raw_lost: u64,
     /// Most recently computed windowed loss rate (lost packets/sec). Stable
     /// between window rollovers.
     loss_per_sec: f64,
+    /// Issue 2031: most recently computed windowed RAW (uncapped) loss rate
+    /// (skipped sequences/sec). The magnitude companion to [`Self::loss_per_sec`].
+    raw_loss_per_sec: f64,
 }
 
 impl AudioDatagramLossTracker {
@@ -655,7 +670,9 @@ impl AudioDatagramLossTracker {
             seen_bits: 0,
             window_start_ms: 0,
             window_lost: 0,
+            window_raw_lost: 0,
             loss_per_sec: 0.0,
+            raw_loss_per_sec: 0.0,
         }
     }
 
@@ -674,16 +691,35 @@ impl AudioDatagramLossTracker {
                 self.seen_bits = 0;
             }
         }
+        // Issue 2031: accumulate the RAW (uncapped) forward gap for magnitude,
+        // BEFORE the shared reorder-window call advances `high_seq`. A forward
+        // jump from `high` to `seq` skipped `seq - high - 1` sequence numbers;
+        // summed un-truncated this reads the true burst size (e.g. 200) that the
+        // 64-slot window caps `window_lost` at. Only counted on a forward jump
+        // past the current high-water mark; after a re-anchor `high_seq` is None
+        // (fresh baseline) so this contributes 0, exactly like the capped count.
+        // Reordering within the window is NOT credited back here (see the
+        // "Burst severity" limitation note on the struct), so under genuine
+        // reordering this over-reports slightly — acceptable for a burst-loss
+        // magnitude signal on a single-path datagram flow.
+        if let Some(high) = self.high_seq {
+            if seq > high {
+                self.window_raw_lost = self.window_raw_lost.saturating_add(seq - high - 1);
+            }
+        }
         record_seq_into_reorder_window(&mut self.high_seq, &mut self.seen_bits, seq)
     }
 
-    /// Feed this window's newly-lost count and roll the ~1s rate window when it
-    /// expires. Returns `Some(loss_per_sec)` exactly on rollover (so the caller
-    /// throttles bus emission to ~1 Hz per peer), else `None`. Mirrors
+    /// Feed this window's newly-lost (capped) count and roll the ~1s rate window
+    /// when it expires. Returns `Some((loss_per_sec, raw_loss_per_sec))` exactly
+    /// on rollover (so the caller throttles bus emission to ~1 Hz per peer), else
+    /// `None`. The raw component (issue 2031) is normalised from the uncapped
+    /// `window_raw_lost` accumulated in [`Self::record_seq`], over the SAME
+    /// elapsed window, so the two rates are directly comparable. Mirrors
     /// [`SequenceTracker::observe_window`] (same 1000 ms window, same
     /// elapsed-normalised rate) minus the keyframe-request accounting audio
     /// does not have.
-    fn observe_window(&mut self, now: u64, new_lost: u32) -> Option<f64> {
+    fn observe_window(&mut self, now: u64, new_lost: u32) -> Option<(f64, f64)> {
         if self.window_start_ms == 0 {
             self.window_start_ms = now;
         }
@@ -697,17 +733,25 @@ impl AudioDatagramLossTracker {
             // `denom` is never zero.
             let denom = elapsed as f64;
             self.loss_per_sec = self.window_lost as f64 * 1000.0 / denom;
+            self.raw_loss_per_sec = self.window_raw_lost as f64 * 1000.0 / denom;
             self.window_lost = 0;
+            self.window_raw_lost = 0;
             self.window_start_ms = now;
-            return Some(self.loss_per_sec);
+            return Some((self.loss_per_sec, self.raw_loss_per_sec));
         }
         None
     }
 
-    /// Most recently computed windowed loss rate (lost audio packets/sec).
+    /// Most recently computed windowed loss rate (lost audio packets/sec, capped).
     #[cfg(test)]
     fn loss_per_sec(&self) -> f64 {
         self.loss_per_sec
+    }
+
+    /// Most recently computed windowed RAW (uncapped) loss rate (issue 2031).
+    #[cfg(test)]
+    fn raw_loss_per_sec(&self) -> f64 {
+        self.raw_loss_per_sec
     }
 }
 
@@ -2135,7 +2179,12 @@ impl Peer {
     ///
     /// `local_user_id` is the reporting (local) client — the `from_peer`;
     /// `self.sid_str` is the observed remote peer — the `to_peer`.
-    fn emit_audio_datagram_loss(&self, local_user_id: &str, loss_per_sec: f64) {
+    fn emit_audio_datagram_loss(
+        &self,
+        local_user_id: &str,
+        loss_per_sec: f64,
+        raw_loss_per_sec: f64,
+    ) {
         let evt = DiagEvent {
             subsystem: "neteq",
             stream_id: None,
@@ -2144,6 +2193,9 @@ impl Peer {
                 metric!("from_peer", local_user_id.to_string()),
                 metric!("to_peer", self.sid_str.clone()),
                 metric!("wt_datagram_audio_loss_per_sec", loss_per_sec),
+                // Issue 2031: uncapped magnitude companion, emitted on the same
+                // event/cadence so the health reporter folds both per-peer rates.
+                metric!("wt_datagram_audio_raw_loss_per_sec", raw_loss_per_sec),
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -2436,10 +2488,14 @@ impl Peer {
                 if self.receiver_on_webtransport {
                     if let Some(seq) = packet.audio_metadata.as_ref().map(|am| am.sequence) {
                         let new_lost = self.audio_datagram_loss.record_seq(seq);
-                        if let Some(loss_per_sec) =
+                        if let Some((loss_per_sec, raw_loss_per_sec)) =
                             self.audio_datagram_loss.observe_window(now, new_lost)
                         {
-                            self.emit_audio_datagram_loss(local_user_id, loss_per_sec);
+                            self.emit_audio_datagram_loss(
+                                local_user_id,
+                                loss_per_sec,
+                                raw_loss_per_sec,
+                            );
                         }
                     }
                 }
@@ -5349,7 +5405,8 @@ mod tests {
     }
 
     /// The ~1s window normalises accumulated loss into a per-second rate on
-    /// rollover, and only on rollover.
+    /// rollover, and only on rollover. The raw component is 0 here because no
+    /// forward-gap sequences were recorded (only a synthetic capped count).
     #[test]
     fn audio_datagram_loss_windowed_rate() {
         let mut t = AudioDatagramLossTracker::new();
@@ -5360,10 +5417,99 @@ mod tests {
         );
         assert_eq!(t.observe_window(10_500, 2), None);
         // Exactly 1000ms elapsed (10_000 -> 11_000) with 2 lost => 2.0/sec.
-        assert_eq!(t.observe_window(11_000, 0), Some(2.0));
+        assert_eq!(t.observe_window(11_000, 0), Some((2.0, 0.0)));
         assert_eq!(t.loss_per_sec(), 2.0);
         // A fresh window has started; no immediate second rollover.
         assert_eq!(t.observe_window(11_500, 0), None);
+    }
+
+    /// Issue 2031: a single contiguous burst of ~200 lost audio datagrams must
+    /// surface its TRUE magnitude in the RAW rate while the reorder-window CAPPED
+    /// rate saturates at ~64. This is the fails-on-unfixed discriminator: on the
+    /// pre-2031 tracker the raw sum does not exist, so the divergence this asserts
+    /// cannot be produced. Mutating the `seq - high - 1` arithmetic in
+    /// `record_seq` (e.g. dropping the `- 1`, or the `.saturating_add`) shifts the
+    /// raw total off ~200 and fails the assertion.
+    #[test]
+    fn audio_datagram_raw_sum_diverges_from_capped_on_large_burst() {
+        let mut t = AudioDatagramLossTracker::new();
+        let mut total_capped = 0u32;
+        // A clean run first fills the 64-slot reorder window with received
+        // positions (so the burst below is measured against a full window, as in
+        // the field — a stall follows normal audio flow).
+        for seq in 0..=100u64 {
+            total_capped += t.record_seq(seq);
+        }
+        // The burst: sequences 101..=300 (200 contiguous audio datagrams) are
+        // dropped by a main-thread stall; the next datagram received is 301.
+        total_capped += t.record_seq(301);
+        // Audio then resumes cleanly. These consecutive arrivals drain the
+        // now-unseen tail of the reorder window, letting the CAPPED counter climb
+        // toward — but never past — its 64-slot ceiling.
+        for seq in 302..=365u64 {
+            total_capped += t.record_seq(seq);
+        }
+
+        // Establish the window baseline at t=10_000, then roll at +1000ms with
+        // the accumulated capped count; the raw sum was accumulated inside
+        // record_seq. (Nonzero timestamps: window_start_ms == 0 is the
+        // "not-yet-started" sentinel, so a real clock is never 0.)
+        assert_eq!(
+            t.observe_window(10_000, 0),
+            None,
+            "first tick sets the baseline"
+        );
+        let (capped_rate, raw_rate) = t
+            .observe_window(11_000, total_capped)
+            .expect("window must roll at +1000ms");
+
+        // The capped rate is bounded by the 64-slot reorder window, so it CANNOT
+        // convey the 200-datagram magnitude — it saturates as a PRESENCE signal.
+        assert!(
+            capped_rate <= 64.0,
+            "capped rate must stay <= 64 (reorder-window cap); got {capped_rate}"
+        );
+        assert!(
+            capped_rate > 0.0,
+            "the burst must still register as PRESENCE on the capped signal; got {capped_rate}"
+        );
+        // The raw rate carries the true burst magnitude, uncapped: 200 skipped
+        // sequence numbers over the 1s window.
+        assert!(
+            (raw_rate - 200.0).abs() < f64::EPSILON,
+            "raw rate must read the true ~200 burst magnitude; got {raw_rate}"
+        );
+        // The whole point of issue 2031: the two DIVERGE — raw dwarfs capped, so
+        // 1% loss and 80% loss are finally distinguishable.
+        assert!(
+            raw_rate > capped_rate * 2.0,
+            "raw magnitude ({raw_rate}) must dwarf the capped presence signal ({capped_rate})"
+        );
+        assert_eq!(t.raw_loss_per_sec(), raw_rate);
+    }
+
+    /// Issue 2031: a clean stream (no gaps) yields raw == 0, and mild reordering
+    /// within the window does not by itself fabricate raw loss on a forward-only
+    /// arrival order. Guards against the raw accumulator counting normal advances.
+    #[test]
+    fn audio_datagram_raw_sum_zero_on_clean_stream() {
+        let mut t = AudioDatagramLossTracker::new();
+        for seq in 0..=200u64 {
+            t.record_seq(seq);
+        }
+        // Establish the window baseline, then roll a full 1000ms window with zero
+        // capped loss fed in. (Nonzero timestamps: 0 is the not-yet-started
+        // sentinel for window_start_ms.)
+        assert_eq!(
+            t.observe_window(10_000, 0),
+            None,
+            "first tick sets the baseline"
+        );
+        let (capped_rate, raw_rate) = t
+            .observe_window(11_000, 0)
+            .expect("window rolls at +1000ms from the baseline");
+        assert_eq!(capped_rate, 0.0, "a gapless stream has no capped loss");
+        assert_eq!(raw_rate, 0.0, "a gapless stream has no raw loss");
     }
 
     /// A large BACKWARD jump (mic-encoder restart resets `sequence` to 0)

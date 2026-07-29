@@ -53,6 +53,7 @@ use super::super::client::VideoCallClient;
 use super::classify_encode_error::{
     classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
 };
+use super::dimensions::{resolve_capture_dimensions, settings_source_stamp};
 use super::encoder_state::{
     keyframe_tick_decision, periodic_keyframe_due, EncoderState, KeyframeTickInput,
 };
@@ -3219,14 +3220,16 @@ impl ScreenEncoder {
         let mut width: u32 = 0;
         let mut height: u32 = 0;
 
-        // Shared atomics carrying the publisher's *source* track dimensions
-        // (from `MediaStreamTrack.getSettings()`). The output-chunk handler
-        // below is created once and outlives the `'restart:` loop, so it can
-        // not capture `width` / `height` directly — they get reassigned on
-        // restart. Atomics let the per-chunk closure read the most recent
-        // source dims at frame-stamping time without locking. `0` means
-        // "unknown" and triggers the proto3 default-skip, so older publishers
-        // / pre-capture frames stay backward-compatible.
+        // Shared atomics carrying the publisher's source track dimensions
+        // (resolved from `MediaStreamTrack.getSettings()`, or a safe default
+        // pair if the track has not reported them yet). Seeded on acquisition
+        // and re-seeded on each `'restart` re-acquire. The output-chunk handler
+        // outlives the `'restart:` loop and cannot capture `width` / `height`
+        // directly (they get reassigned on restart), so atomics let the
+        // per-chunk closure read the most recent source dims at frame-stamping
+        // time without locking. `0` means "unknown" and triggers the proto3
+        // default-skip, so older publishers / pre-capture frames stay
+        // backward-compatible.
         let source_width_atomic = Arc::new(AtomicU32::new(0));
         let source_height_atomic = Arc::new(AtomicU32::new(0));
 
@@ -3333,8 +3336,8 @@ impl ScreenEncoder {
                 }
 
                 // Read the latest source dimensions snapshot. The encoder
-                // loop updates the atomics whenever the track is (re)acquired
-                // and reports its native capture size via `get_settings()`.
+                // loop seeds the atomics whenever the track is (re)acquired,
+                // from `get_settings()` (or a safe default if absent).
                 // `Ordering::Relaxed` is sufficient — these values are
                 // descriptive metadata, not synchronization signals.
                 let source_width_now = source_width_for_handler.load(Ordering::Relaxed);
@@ -3539,13 +3542,21 @@ impl ScreenEncoder {
                 };
 
                 let track_settings = track.get_settings();
-                width = track_settings.get_width().expect("width is None") as u32;
-                height = track_settings.get_height().expect("height is None") as u32;
+                let settings_w = track_settings.get_width().map(f64::from);
+                let settings_h = track_settings.get_height().map(f64::from);
+                (width, height) = resolve_capture_dimensions(settings_w, settings_h, 0, 0);
 
-                // Publish the source dims to the per-chunk stamper. Read by
-                // the screen_output_handler closure on every encoded frame.
-                source_width_atomic.store(width, Ordering::Relaxed);
-                source_height_atomic.store(height, Ordering::Relaxed);
+                // Publish the source dims to the per-chunk stamper. Read by the
+                // screen_output_handler closure on every encoded frame.
+                // resolve_capture_dimensions returns a safe non-zero pair (the
+                // 640x480 fallback) so the encoder ladder can build, but the
+                // #1196 STAMP must not fabricate an aspect: publish 0 = "unknown"
+                // (proto3 default-skip) when getSettings() omits a complete pair.
+                // Screen seeds-only (no per-frame correction), so an honest 0
+                // beats a wrong constant a receiver would read as a real aspect.
+                let (stamp_w, stamp_h) = settings_source_stamp(settings_w, settings_h);
+                source_width_atomic.store(stamp_w, Ordering::Relaxed);
+                source_height_atomic.store(stamp_h, Ordering::Relaxed);
 
                 current_stream = Some(acquired_stream);
                 current_track = Some(track);
@@ -3597,13 +3608,16 @@ impl ScreenEncoder {
                 };
 
                 let track_settings = track.get_settings();
-                width = track_settings.get_width().expect("width is None") as u32;
-                height = track_settings.get_height().expect("height is None") as u32;
+                let settings_w = track_settings.get_width().map(f64::from);
+                let settings_h = track_settings.get_height().map(f64::from);
+                (width, height) = resolve_capture_dimensions(settings_w, settings_h, 0, 0);
 
                 // Publish the source dims to the per-chunk stamper (see the
-                // matching `.store()` in the restart-acquire branch above).
-                source_width_atomic.store(width, Ordering::Relaxed);
-                source_height_atomic.store(height, Ordering::Relaxed);
+                // matching `.store()` in the restart-acquire branch above). Stamp
+                // 0 = "unknown" when settings omit a complete pair (rationale there).
+                let (stamp_w, stamp_h) = settings_source_stamp(settings_w, settings_h);
+                source_width_atomic.store(stamp_w, Ordering::Relaxed);
+                source_height_atomic.store(stamp_h, Ordering::Relaxed);
 
                 current_track = Some(track);
             }
@@ -3695,10 +3709,11 @@ impl ScreenEncoder {
                 // (`tier_w`/`tier_h` recorded below) when the share's source
                 // aspect changes mid-share, exactly like the base screen
                 // layer's per-frame reconfigure and the camera's per-layer
-                // path. `width` / `height` are the real capture dims read
-                // from `getSettings()` above, so a non-16:9 display (16:10,
-                // ultrawide, portrait) is never per-axis-squashed into the
-                // 16:9 tier dims on rungs 1..n.
+                // path. `width` / `height` are the acquisition dims resolved
+                // from `getSettings()` above (or a safe default pair if the
+                // track had not reported them yet), so a non-16:9 display
+                // (16:10, ultrawide, portrait) is not per-axis-squashed into
+                // the 16:9 tier dims on rungs 1..n.
                 let (layer_w, layer_h) =
                     fit_within_preserving_aspect(width, height, tier.max_width, tier.max_height);
                 let init_bitrate_bps = tier.ideal_bitrate_kbps as f64 * 1000.0;

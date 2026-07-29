@@ -42,6 +42,9 @@ pub mod preferences_settings_panel;
 pub mod emoji_picker;
 pub mod reactions;
 pub mod reactions_overlay;
+// HCL #893: test-only injection hook for the SCREEN first-render ack (gated on
+// MOCK_PEERS_ENABLED). Registers window.__videocall_inject_screen_first_render.
+pub mod screen_first_render_inject;
 // Issue 1175: pure zoom/pan math for received shared content (host-testable).
 pub mod screen_share_zoom;
 // Issue 1175: imperative glue to detach shared content into a separate window.

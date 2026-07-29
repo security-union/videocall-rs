@@ -88,6 +88,7 @@ export interface LaunchRequest {
   ttl: string;
   headless: boolean;
   network: string;
+  videoMode?: "costume" | "file" | "clock";
   authBackend: "jwt" | "storage-state" | "none";
   storageStateFile?: string;
   /**
@@ -286,6 +287,7 @@ export interface MultiLaunchRequest {
   meetingURL: string;
   ttl: string;
   network?: string;
+  videoMode?: "costume" | "file" | "clock";
   headless?: boolean;
   authBackend?: "jwt" | "storage-state" | "none";
   storageStateFile?: string;
@@ -517,6 +519,7 @@ export interface SshPreviewLaunchRequest {
   ttl: string;
   headless: boolean;
   network: string;
+  videoMode?: "costume" | "file" | "clock";
   authBackend: "jwt" | "storage-state" | "none";
 }
 

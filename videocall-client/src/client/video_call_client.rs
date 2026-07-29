@@ -2550,7 +2550,7 @@ impl VideoCallClient {
                 Some(present)
             }
             Err(_) => {
-                warn!("Failed to borrow inner in peer_user_id_present for user_id: {user_id}");
+                debug!("Failed to borrow inner in peer_user_id_present for user_id: {user_id}");
                 None
             }
         }
@@ -5265,6 +5265,93 @@ fn parse_rsa_packet(response_data: &[u8]) -> Result<RsaPacket> {
 fn parse_public_key(rsa_packet: RsaPacket) -> Result<RsaPublicKey> {
     RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
         .map_err(|e| anyhow!("Failed to parse rsa public key: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-crate test seams (feature = "testing")
+//
+// `inner` is a PRIVATE field, so an external crate (e.g. `videocall-ui`) cannot
+// reach it to reproduce the transient busy-borrow contention that
+// `peer_user_id_present` was designed to survive (issue #1172). These helpers
+// expose exactly that capability — build a minimal client, and run a closure
+// while `inner` is held mutably-borrowed — WITHOUT leaking the private `Inner`
+// type across the crate boundary (returning a `RefMut<'_, Inner>` would).
+//
+// Gated behind the `testing` feature, which `videocall-ui` enables only as a
+// dev-dependency, so production builds compile these out entirely. This is the
+// cross-crate analogue of the in-crate
+// `set_peer_tile_hints_returns_false_when_inner_borrowed` test, which can touch
+// `client.inner.borrow_mut()` directly only because it lives in the same crate.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "testing")]
+impl VideoCallClient {
+    /// Test-only: build a minimal, never-connected client suitable for
+    /// exercising presence/pin wiring from another crate. Diagnostics and
+    /// health reporting are OFF so no timers or reporting tasks are spawned;
+    /// the peer table starts empty (no connected peers).
+    pub fn new_for_test(user_id: &str) -> Self {
+        Self::new(VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            on_peer_added: Callback::noop(),
+            on_peer_first_frame: Callback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            get_peer_video_canvas_id: Callback::from(|id| id),
+            get_peer_screen_canvas_id: Callback::from(|id| id),
+            user_id: user_id.to_string(),
+            display_name: user_id.to_string(),
+            meeting_id: "test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_connected: Callback::noop(),
+            on_connection_lost: Callback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            on_participant_kicked: None,
+            on_host_granted: None,
+            on_host_revoked: None,
+            on_peer_event: None,
+            on_peer_left: None,
+            on_display_name_changed: None,
+            on_peer_joined: None,
+            on_reaction: None,
+            decode_media: true,
+            is_guest: false,
+            allow_post_rebase_retry: true,
+            refresh_room_token_callback: None,
+        })
+    }
+
+    /// Test-only: run `f` while this client's `inner` is held under a live
+    /// mutable borrow, forcing every `try_borrow()`-based reader on `inner`
+    /// (`peer_user_id_present`, `has_peer_with_user_id`, ...) to observe
+    /// contention (`Err`) for the duration of the call — the exact runtime
+    /// state a decode/audio mutable borrow produces mid-render (issue #1172).
+    ///
+    /// Returns whatever `f` returns; the mutable borrow is released on return.
+    /// Panics if `inner` is already borrowed (that would be a test bug).
+    pub fn with_inner_borrowed_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.inner.borrow_mut();
+        f()
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

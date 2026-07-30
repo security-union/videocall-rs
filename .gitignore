@@ -97,7 +97,14 @@ bot/assets/costumes/
 # state that gets swept into `git add -A`).
 CLAUDE.local.md
 .claude/worktrees/
+# Codex/agent scratch artifacts (briefs, run prompts, review transcripts) that
+# would otherwise be swept into `git add -A`. Never commit these.
+.codex-*
 .claude/settings.local.json
 .claude/agent-memory/
 .claude/skills/
 .claude/hooks/
+
+# Python bytecode
+__pycache__/
+*.pyc

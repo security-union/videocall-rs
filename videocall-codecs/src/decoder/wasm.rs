@@ -542,6 +542,12 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                         // consumer (e.g. a future "reconnecting video" UI) key off the escalation
                         // without parsing the console line.
                         metric!("escalated", i64::from(skip_msg.escalated)),
+                        // Issue #1851: wall-clock gap since the previous worker poll. Seconds-large
+                        // means the decode worker's tick was starved and this skip is the resume
+                        // poll; small means a normal-cadence skip. Lets a structured consumer
+                        // distinguish a tick-starvation freeze from a delivery-starvation freeze
+                        // without parsing the console line.
+                        metric!("tick_gap_ms", skip_msg.tick_gap_ms),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);

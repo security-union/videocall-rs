@@ -175,16 +175,15 @@ where
 ///
 /// Returns `Ok(())` if the refresh produced a token, `Err(())` otherwise.
 ///
-/// Routing an external caller through here — rather than calling
-/// `auth::refresh_access_token()` directly — means an external-caller refresh and
-/// a concurrent meeting-driven refresh COALESCE through the same
-/// `REFRESH_INFLIGHT` slot: the underlying PKCE network POST fires exactly once
-/// per wave even if the meeting path 401s and the external caller observes
-/// `token_expired` at the same instant (a likely race, since both auth on the
-/// SAME session token and expire together). Without this, two separate refreshes
-/// could fire, the second using a refresh-token the first already rotated away
-/// (Okta rotates refresh tokens) → a spurious `invalid_grant` that clears the
-/// now-valid token and logs the user out.
+/// Routing an out-of-band refresh through here — rather than calling
+/// `auth::refresh_access_token()` directly — means it COALESCES with a concurrent
+/// meeting-driven refresh through the same `REFRESH_INFLIGHT` slot: the underlying
+/// PKCE network POST fires exactly once per wave even if two paths that auth on
+/// the SAME session token 401 at the same instant (a likely race, since they
+/// expire together). Without this, two separate refreshes could fire, the second
+/// using a refresh-token the first already rotated away (Okta rotates refresh
+/// tokens) → a spurious `invalid_grant` that clears the now-valid token and logs
+/// the user out.
 pub async fn refresh_token_single_flight() -> Result<(), ()> {
     refresh_single_flight().await
 }
@@ -267,6 +266,7 @@ pub async fn update_meeting(
     end_on_host_leave: Option<bool>,
     allow_guests: Option<bool>,
     recording_allowed_for_all: Option<bool>,
+    chat_allowed_for_all: Option<bool>,
 ) -> Result<MeetingInfo, JoinError> {
     let req = videocall_meeting_types::requests::UpdateMeetingRequest {
         waiting_room_enabled,
@@ -274,6 +274,7 @@ pub async fn update_meeting(
         end_on_host_leave,
         allow_guests,
         recording_allowed_for_all,
+        chat_allowed_for_all,
     };
     let req = &req;
     with_refresh_retry(|| async move { client()?.update_meeting(meeting_id, req).await }).await
@@ -345,6 +346,7 @@ pub async fn create_meeting(
         allow_guests: Some(allow_guests),
         end_on_host_leave: None,
         recording_allowed_for_all: None,
+        chat_allowed_for_all: None,
     };
     let req = &req;
     with_refresh_retry(|| async move { client()?.create_meeting(req).await }).await

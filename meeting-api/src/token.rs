@@ -42,12 +42,63 @@ pub struct SessionTokenClaims {
     pub exp: i64,
     /// Issued-at (Unix timestamp).
     pub iat: i64,
+    /// Original authentication time (Unix timestamp), used to enforce the
+    /// absolute session lifetime across sliding refreshes.
+    #[serde(default)]
+    pub auth_time: Option<i64>,
     /// Issuer.
     pub iss: String,
 }
 
 impl SessionTokenClaims {
     pub const ISSUER: &'static str = "videocall-meeting-backend";
+}
+
+#[derive(Deserialize)]
+struct UnverifiedSessionExpiration {
+    exp: i64,
+}
+
+/// Read only a session JWT's expiration without verifying its signature.
+///
+/// SECURITY: this value is an untrusted performance hint. Callers may use it
+/// only to skip refresh work for a fresh-looking token; authorization and every
+/// re-mint must still use [`decode_session_token`].
+pub(crate) fn decode_session_exp_unverified(token: &str) -> Option<i64> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let mut parts = token.split('.');
+    let header = parts.next()?;
+    let claims = parts.next()?;
+    let signature = parts.next()?;
+    if header.is_empty() || claims.is_empty() || signature.is_empty() || parts.next().is_some() {
+        return None;
+    }
+
+    let claims = URL_SAFE_NO_PAD.decode(claims).ok()?;
+    serde_json::from_slice::<UnverifiedSessionExpiration>(&claims)
+        .ok()
+        .map(|claims| claims.exp)
+}
+
+/// Compute the session-cookie TTL clamped to the absolute lifetime cap.
+///
+/// The cap invariant (#1966) — "no valid session cookie may exist past
+/// `auth_time + absolute_max_secs`" — must hold at EVERY mint, not only on
+/// sliding refresh. This is the single source of truth used by both the
+/// initial login/dev mints (where `auth_time == now`, so the result is
+/// `min(session_ttl, absolute_max)`) and the refresh middleware (where an older
+/// `auth_time` shrinks the remaining budget). Returns a value `<= session_ttl`;
+/// callers MUST treat `<= 0` as "do not mint / force re-login".
+pub fn capped_session_ttl(
+    session_ttl_secs: i64,
+    auth_time: i64,
+    absolute_max_secs: i64,
+    now: i64,
+) -> i64 {
+    let absolute_deadline = auth_time.saturating_add(absolute_max_secs);
+    session_ttl_secs.min(absolute_deadline.saturating_sub(now))
 }
 
 /// Create a signed session JWT for the given user.
@@ -59,6 +110,7 @@ pub fn generate_session_token(
     user_id: &str,
     name: &str,
     ttl_secs: i64,
+    auth_time: i64,
 ) -> Result<String, AppError> {
     let now = Utc::now().timestamp();
     let claims = SessionTokenClaims {
@@ -66,6 +118,7 @@ pub fn generate_session_token(
         name: name.to_string(),
         exp: now + ttl_secs,
         iat: now,
+        auth_time: Some(auth_time),
         iss: SessionTokenClaims::ISSUER.to_string(),
     };
 
@@ -218,19 +271,75 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn capped_session_ttl_clamps_to_absolute_max_at_initial_mint() {
+        // #1966: the cap must bind at INITIAL mint (auth_time == now), not only
+        // on sliding refresh. When session_ttl exceeds the absolute max, the
+        // minted TTL is clamped to the max — otherwise the first cookie would
+        // outlive the cap (the codex-review P1). This is the single helper both
+        // the login/dev mints and the refresh middleware call.
+        let now = 1_000_000;
+        // session_ttl (10y) >> absolute_max (7d) → clamp to absolute_max.
+        assert_eq!(
+            capped_session_ttl(315_360_000, now, 604_800, now),
+            604_800,
+            "initial mint must clamp to the absolute cap, not the raw session TTL"
+        );
+        // session_ttl <= absolute_max → unchanged.
+        assert_eq!(capped_session_ttl(28_800, now, 604_800, now), 28_800);
+        // Mid-slide: an older auth_time shrinks the remaining budget.
+        assert_eq!(
+            capped_session_ttl(28_800, now - 600_000, 604_800, now),
+            4_800,
+            "remaining budget = auth_time + max - now"
+        );
+        // Past the cap → non-positive (callers force re-login).
+        assert!(capped_session_ttl(28_800, now - 604_801, 604_800, now) <= 0);
+
+        // ttl == max is INERT sliding (#1966 review): a fresh mint (auth_time
+        // == now) yields ttl, but any later re-mint lands on the SAME deadline
+        // (auth_time + max), so the session never extends. Deploys must set
+        // max > ttl for sliding to do anything. This assertion documents the
+        // constraint so a config that collapses them is a conscious choice.
+        assert_eq!(
+            capped_session_ttl(28_800, now, 28_800, now),
+            28_800,
+            "ttl==max: fresh mint gets ttl, but re-mint can't extend (inert sliding)"
+        );
+        assert_eq!(
+            capped_session_ttl(28_800, now - 3_600, 28_800, now),
+            25_200,
+            "ttl==max, 1h in: re-mint lands on the original deadline, not now+ttl"
+        );
+    }
+
+    #[test]
+    fn capped_session_ttl_saturates_absolute_deadline() {
+        let auth_time = i64::MAX - 10;
+        let now = i64::MAX - 20;
+
+        assert_eq!(
+            capped_session_ttl(3_600, auth_time, 100, now),
+            20,
+            "overflowing auth_time + absolute_max must saturate at i64::MAX"
+        );
+    }
+
+    #[test]
     fn session_token_round_trips() {
-        let token = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600)
+        let token = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600, 1234)
             .expect("should sign");
         let claims = decode_session_token(TEST_SECRET, &token).expect("should decode");
 
         assert_eq!(claims.sub, "alice@test.com");
         assert_eq!(claims.name, "Alice");
+        assert_eq!(claims.auth_time, Some(1234));
         assert_eq!(claims.iss, SessionTokenClaims::ISSUER);
     }
 
     #[test]
     fn session_token_wrong_secret_fails() {
-        let token = generate_session_token(TEST_SECRET, "a@b.com", "A", 3600).expect("should sign");
+        let token =
+            generate_session_token(TEST_SECRET, "a@b.com", "A", 3600, 1234).expect("should sign");
         let err = decode_session_token("wrong-secret", &token);
         assert!(err.is_err());
     }
@@ -238,7 +347,8 @@ mod tests {
     #[test]
     fn session_token_expired_fails() {
         // Use a TTL of -120s to exceed jsonwebtoken's default 60s leeway.
-        let token = generate_session_token(TEST_SECRET, "a@b.com", "A", -120).expect("should sign");
+        let token =
+            generate_session_token(TEST_SECRET, "a@b.com", "A", -120, 1234).expect("should sign");
         let err = decode_session_token(TEST_SECRET, &token);
         assert!(err.is_err());
     }
@@ -246,7 +356,8 @@ mod tests {
     #[test]
     fn session_token_has_iat() {
         let before = Utc::now().timestamp();
-        let token = generate_session_token(TEST_SECRET, "a@b.com", "A", 3600).expect("should sign");
+        let token =
+            generate_session_token(TEST_SECRET, "a@b.com", "A", 3600, 1234).expect("should sign");
         let after = Utc::now().timestamp();
 
         let claims = decode_session_token(TEST_SECRET, &token).expect("should decode");

@@ -19,9 +19,10 @@ import {
   type OrchestratorControlSurface,
 } from "./control/server";
 import { getHost, type SshHost } from "./control/ssh-hosts";
-import { spawnRemoteBot, type SshBotHandle } from "./control/ssh-launcher";
+import { spawnRemoteBot, type SshBotHandle, type SshLaunchSpec } from "./control/ssh-launcher";
 import { loadManifest, type Manifest } from "./manifest";
 import { JoinRejectedError, MeetingNavigatedAwayError, WaitingRoomError } from "./meeting-join";
+import { type RemoteResourceManager } from "./resource/session";
 import { formatDuration, parseDuration, type Ttl } from "./ttl";
 
 export interface BotTask extends BotRunOptions {
@@ -73,6 +74,110 @@ export interface RunOptions {
      */
     onListen?: (info: { port: number; token: string }) => Promise<void>;
   };
+  /**
+   * Optional per-bot FPS sink (issue 2032, rider b). When set, every bot's
+   * `launchBot` is given an `onEncoderFps` callback that forwards each parsed
+   * capture/encode FPS reading or no-data signal here, tagged with the bot's id,
+   * so the caller's {@link FpsTracker} can feed the RESOURCE_STARVED verdict.
+   * Local bots only — SSH-hosted bots run `launchBot` on the remote box, out of
+   * this process.
+   */
+  onEncoderFps?: (botId: string, fps: number | null) => void;
+  /**
+   * Optional remote-resource manager (issue 2032). When set, each SSH-hosted
+   * bot triggers `ensureForHost(host)` so the box that actually runs the bot is
+   * sampled, and `finalizeAll()` runs at the end of the run to retrieve + derive
+   * every remote host's CSV. Best-effort and fully guarded — a failure here
+   * never affects the bots themselves.
+   */
+  remoteResource?: RemoteResourceManager;
+}
+
+interface RegisterSshTaskDeps {
+  registry: Map<string, BotRegistryEntry>;
+  inFlight: Map<string, Promise<BotExitReason>>;
+  inFlightWaiters: Array<() => void>;
+  runDir?: string;
+  spawnRemoteBot?: (spec: SshLaunchSpec) => SshBotHandle;
+  /** Remote-resource manager threaded from {@link RunOptions.remoteResource} (issue 2032). */
+  remoteResource?: RemoteResourceManager;
+}
+
+/**
+ * Register and launch one SSH-hosted bot. Exported so the control
+ * server's real orchestration path can be tested with a fake SSH
+ * process while preserving the production launch-spec construction.
+ */
+export async function registerSshTask(
+  spec: LaunchSpec,
+  host: SshHost,
+  deps: RegisterSshTaskDeps,
+): Promise<string> {
+  const botId = generateBotId();
+  const ttl = spec.ttl;
+  const task: BotTask = {
+    botId,
+    meetingURL: spec.meetingURL,
+    participant: spec.participant,
+    displayName: spec.displayName ?? defaultDisplayName(spec.participant),
+    headless: spec.headless,
+    authBackend: spec.authBackend,
+    videoMode: spec.videoMode ?? null,
+    storageStateFile: spec.storageStateFile ?? null,
+    ssoStateFile: spec.ssoStateFile ?? null,
+    manifest: null,
+    manifestDir: null,
+    runDir: null,
+    costumeOverride: null,
+    audioOverride: null,
+    ttl,
+    network: spec.network === "none" ? null : spec.network,
+  };
+  const hostKind: BotHostKind = { kind: "ssh", hostLabel: host.label };
+  const entry = newRegistryEntry(task, hostKind);
+  deps.registry.set(botId, entry);
+  const ssoStateFile =
+    spec.authBackend === "jwt"
+      ? (spec.ssoStateFile ?? (deps.runDir ? defaultSsoStatePath(deps.runDir) : null))
+      : null;
+  const spawnRemoteBotImpl = deps.spawnRemoteBot ?? spawnRemoteBot;
+  const sshHandle: SshBotHandle = spawnRemoteBotImpl({
+    host,
+    ttl: formatDuration(ttl),
+    meetingURL: spec.meetingURL,
+    participant: spec.participant,
+    videoMode: spec.videoMode ?? null,
+    network: task.network,
+    authBackend: spec.authBackend,
+    displayName: task.displayName,
+    headless: spec.headless,
+    ssoStateFile,
+    botId,
+  });
+  entry.sshHandle = sshHandle;
+  entry.status = "in-meeting";
+  // Issue 2032: start (once) a resource sampler ON this remote box so its CPU
+  // is measured where it matters. Fire-and-forget + guarded — a sampler
+  // failure must never disturb the bot launch above.
+  void deps.remoteResource?.ensureForHost(host).catch(() => {});
+  console.log(
+    `[orchestrator] ssh-launch → ${task.participant}@${shortBotId(botId)} → ${host.user}@${host.host}`,
+  );
+  const exitPromise: Promise<BotExitReason> = sshHandle.exit.then((code) => {
+    entry.status = code === 0 ? "done" : "failed";
+    entry.finishReason = code === 0 ? "ssh-exit-ok" : `ssh-exit-${code ?? "killed"}`;
+    entry.finishedAt = Date.now();
+    if (code !== 0 && code !== null) {
+      entry.lastError = `remote bot exited with code ${code}`;
+    }
+    return { kind: "shutdown-signal" } as BotExitReason;
+  });
+  deps.inFlight.set(botId, exitPromise);
+  while (deps.inFlightWaiters.length > 0) {
+    const w = deps.inFlightWaiters.shift();
+    if (w) w();
+  }
+  return botId;
 }
 
 /**
@@ -292,7 +397,13 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
         if (host === null) {
           throw new Error(`SSH host "${runLocation.hostLabel}" not in registry`);
         }
-        const botId = await registerSshTask(spec, host);
+        const botId = await registerSshTask(spec, host, {
+          registry,
+          inFlight,
+          inFlightWaiters,
+          runDir,
+          remoteResource: opts.remoteResource,
+        });
         return botId;
       }
       const newTask = buildLaunchedBotTask(spec, {
@@ -358,6 +469,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
           ttlTimers.delete(botId);
           ctlSignals.delete(botId);
         },
+        onEncoderFps: opts.onEncoderFps,
       }),
     );
     // Wake the wait loop if it was parked waiting for new work
@@ -368,84 +480,6 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       const w = inFlightWaiters.shift();
       if (w) w();
     }
-  }
-
-  /**
-   * Register a bot that runs on a remote SSH host. We bypass
-   * `runSingleBotTask` (it owns Playwright + the in-process bot
-   * lifecycle); instead the entry tracks a `sshHandle` and the
-   * wait-loop observes the SSH ChildProcess's exit promise.
-   *
-   * Returns the new bot's id so the control server can respond with
-   * 201 + the id, same shape as the local path.
-   */
-  async function registerSshTask(spec: LaunchSpec, host: SshHost): Promise<string> {
-    const botId = generateBotId();
-    const ttl = spec.ttl;
-    const task: BotTask = {
-      botId,
-      meetingURL: spec.meetingURL,
-      participant: spec.participant,
-      displayName: spec.displayName ?? defaultDisplayName(spec.participant),
-      headless: spec.headless,
-      authBackend: spec.authBackend,
-      storageStateFile: spec.storageStateFile ?? null,
-      ssoStateFile: spec.ssoStateFile ?? null,
-      manifest: null,
-      manifestDir: null,
-      runDir: null,
-      costumeOverride: null,
-      audioOverride: null,
-      ttl,
-      network: spec.network === "none" ? null : spec.network,
-    };
-    const hostKind: BotHostKind = { kind: "ssh", hostLabel: host.label };
-    const entry = newRegistryEntry(task, hostKind);
-    registry.set(botId, entry);
-    // Resolve the local SSO state path used for the stdin-forward path.
-    // The dashboard's `POST /sso/recapture` writes to
-    // `<runDir>/auth/hcl-sso.json`; we feed that path to the launcher so
-    // SSH-launched bots can pass through the HCL SSO portal without
-    // having to re-capture state on every remote host. When the host
-    // record has `forwardSsoState: false`, the launcher's gate will
-    // short-circuit and the un-wrapped command shape stays intact.
-    const runDirForSso = opts.control?.runDir;
-    const ssoStateFile =
-      spec.authBackend === "jwt"
-        ? (spec.ssoStateFile ?? (runDirForSso ? defaultSsoStatePath(runDirForSso) : null))
-        : null;
-    const sshHandle: SshBotHandle = spawnRemoteBot({
-      host,
-      ttl: formatDuration(ttl),
-      meetingURL: spec.meetingURL,
-      participant: spec.participant,
-      network: task.network,
-      authBackend: spec.authBackend,
-      displayName: task.displayName,
-      headless: spec.headless,
-      ssoStateFile,
-      botId,
-    });
-    entry.sshHandle = sshHandle;
-    entry.status = "in-meeting";
-    console.log(
-      `[orchestrator] ssh-launch → ${task.participant}@${shortBotId(botId)} → ${host.user}@${host.host}`,
-    );
-    const exitPromise: Promise<BotExitReason> = sshHandle.exit.then((code) => {
-      entry.status = code === 0 ? "done" : "failed";
-      entry.finishReason = code === 0 ? "ssh-exit-ok" : `ssh-exit-${code ?? "killed"}`;
-      entry.finishedAt = Date.now();
-      if (code !== 0 && code !== null) {
-        entry.lastError = `remote bot exited with code ${code}`;
-      }
-      return { kind: "shutdown-signal" } as BotExitReason;
-    });
-    inFlight.set(botId, exitPromise);
-    while (inFlightWaiters.length > 0) {
-      const w = inFlightWaiters.shift();
-      if (w) w();
-    }
-    return botId;
   }
 
   for (const task of initialTasks) {
@@ -506,6 +540,15 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   }
   console.log(`[orchestrator] all bot(s) finished`);
 
+  // Issue 2032: retrieve + derive every remote box's resource CSV and print its
+  // RESOURCE_STARVED verdict. Guarded so a remote-capture failure cannot mask a
+  // clean run's completion.
+  if (opts.remoteResource) {
+    await opts.remoteResource.finalizeAll().catch((e: unknown) => {
+      console.warn(`[orchestrator] remote resource finalize failed:`, (e as Error).message);
+    });
+  }
+
   if (controlHandle) {
     await controlHandle.close().catch((e: unknown) => {
       console.error(`[orchestrator] control server close failed:`, (e as Error).message);
@@ -522,6 +565,8 @@ interface SingleBotDeps {
   registerTtlTimer: (botId: string, ctl: { cancel: () => void; rearm: (ttl: Ttl) => void }) => void;
   registerCtlSignal: (botId: string, sig: { trigger: (reason: CtlReason) => void }) => void;
   clearMaps: (botId: string) => void;
+  /** Per-bot FPS sink threaded from {@link RunOptions.onEncoderFps} (issue 2032). */
+  onEncoderFps?: (botId: string, fps: number | null) => void;
 }
 
 async function runSingleBotTask(
@@ -543,6 +588,7 @@ async function runSingleBotTask(
     // eligible, we skip straight to `launching` to match the
     // pre-auto-prime behaviour.
     const willAutoPrime =
+      entry.task.videoMode !== "clock" &&
       entry.task.manifest != null &&
       entry.task.manifestDir != null &&
       entry.task.manifestDir !== "" &&
@@ -561,6 +607,9 @@ async function runSingleBotTask(
     const launchOpts = {
       ...rest,
       botIdShort: shortBotId(task.botId),
+      onEncoderFps: deps.onEncoderFps
+        ? (fps: number | null): void => deps.onEncoderFps?.(task.botId, fps)
+        : null,
       onPrimeProgress: willAutoPrime
         ? (p: PrimeProgress): void => {
             // Mirror the CLI's prefix format so the dashboard log
@@ -920,6 +969,7 @@ export function buildLaunchedBotTask(
     displayName: spec.displayName ?? defaultDisplayName(spec.participant),
     headless: spec.headless,
     authBackend: spec.authBackend,
+    videoMode: spec.videoMode ?? null,
     storageStateFile: spec.authBackend === "storage-state" ? (spec.storageStateFile ?? null) : null,
     ssoStateFile,
     manifest: deps.manifest,

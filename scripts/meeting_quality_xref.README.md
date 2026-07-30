@@ -83,7 +83,7 @@ Each rule is a small function over the normalized event stream + Prometheus + th
 | **R3** | MED | **Layer oscillation.** shed↔restore flapping; sub-classifies cause (CPU watchdog drift / WS uplink saturation / WT slow-ready / capability ceiling) and reports ALL contributing signals. |
 | **R4** | HIGH | **WS send-side HOL / uplink saturation.** `buffered_amount` near the 1MB cliff + backpressure drops → audio HOL-blocked behind video on the shared TCP socket (WS only). |
 | **R5** | HIGH/MED | **Concealment by source.** `audio_concealment_pct` > 15%. Discriminates a **source uplink fault** (heard badly by ≥2 receivers) from a **receiver downlink fault** (one receiver hears many sources badly). |
-| **R6** | MED | **ProtectiveMode thrash.** >10 ENTERED/EMERGENCY cycles; buckets the trigger (`audio_buffer` ⇒ receiver audio-jitter starvation, `fps` ⇒ decode pressure). |
+| **R6** | HIGH | **CPU-stall suppression teardown.** Counts `ConnectionState::Failed` events whose exact reason is `cpu-stall suppression budget exhausted`. ProtectiveMode `EMERGENCY` events are independent and are not used to attribute decoder teardown. |
 | **R7** | HIGH/MED | **Keyframe-starvation freeze.** held-last-good `freshness_skip` (keyframe_seq=none) with high head_age, attributed to the SENDER. Drill-down shows head_age progression + KEYFRAME_REQUEST cadence. |
 | **R9** | INFO | **navigator.connection GUARD.** Prints preamble `network=` but labels it UNRELIABLE — never a bandwidth finding on its own. |
 | **R10** | HIGH/LOW | **Re-election / connection instability.** re-election triggers + connection-lost events. |
@@ -127,7 +127,7 @@ Each rule is a small function over the normalized event stream + Prometheus + th
 | | relay forwarded L0/L1/L2 + 184k filtered | ✅ 184869 filtered, all 3 layers forwarded |
 | **meeting_sync** | R4 Palina + Anhelina (~1MB, thousands of drops) | ✅ both ~1.1MB buffered, 2.5k+ drops |
 | | R5 SOURCE=Palina 18-30%, Anhelina 13-24% | ✅ Palina 5 rx ≤31%, Anhelina 3 rx ≤23% |
-| | R6 IBA users, trigger=audio_buffer | ✅ all IBA users, audio_buffer dominant |
+| | ProtectiveMode audio-buffer events | ✅ parsed independently; not treated as decoder teardown |
 | | R14 IBA RTT 400-7400ms | ✅ Ilya 1940ms, others 529-581ms |
 | | relay healthy (scheduler_lag ~1ms) | ✅ histogram avg 1.36ms |
 

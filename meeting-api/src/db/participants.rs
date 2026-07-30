@@ -722,6 +722,7 @@ impl ParticipantRow {
             host_user_id: None,
             allow_guests: false,
             recording_allowed_for_all: false,
+            chat_allowed_for_all: true,
         }
     }
 }

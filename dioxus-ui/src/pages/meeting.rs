@@ -22,8 +22,9 @@ use crate::constants::{
 };
 use crate::context::{
     email_to_display_name, get_or_create_local_user_id, is_guid_like,
-    load_display_name_from_storage, resolve_transport_config, save_display_name_to_storage,
-    validate_display_name, DisplayNameCtx, HostRefreshNonceCtx, TransportPreferenceCtx,
+    load_display_name_from_storage, load_transport_preference_with_source,
+    resolve_transport_config, save_display_name_to_storage, validate_display_name, DisplayNameCtx,
+    HostRefreshNonceCtx, TransportPreferenceCtx,
 };
 use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
 use crate::theme::color as theme_color;
@@ -188,13 +189,26 @@ pub fn MeetingPage(id: String) -> Element {
                 .collect();
 
             // Apply user's transport preference
+            let applied_pref = (transport_pref_ctx.0)();
             let (effective_wt_enabled, websocket_urls, webtransport_urls) =
                 resolve_transport_config(
-                    (transport_pref_ctx.0)(),
+                    applied_pref,
                     webtransport_enabled().unwrap_or(false),
                     websocket_urls,
                     webtransport_urls,
                 );
+
+            // Issue #1745 PR2 (observability only): record the applied
+            // preference + its provenance for this authenticated pre-meeting
+            // OBSERVER client, mirroring the in-call join sites.
+            let (_, pref_source) = load_transport_preference_with_source();
+            log::info!(
+                "Transport preference applied: pref={} source={} wt_urls={} ws_urls={}",
+                applied_pref,
+                pref_source,
+                webtransport_urls.len(),
+                websocket_urls.len()
+            );
 
             // Use the user's ID so the server can match
             // push-notification `target_user_id` to this observer client.
@@ -209,6 +223,8 @@ pub fn MeetingPage(id: String) -> Element {
                 webtransport_urls,
                 enable_e2ee: false,
                 enable_webtransport: effective_wt_enabled,
+                max_received_layer: crate::constants::max_received_layer(),
+                skip_canvas_paint: crate::constants::skip_canvas_paint(),
                 // Issue #1884: this is the pre-meeting OBSERVER client (waiting for
                 // the meeting to start) — it renders no in-call reaction overlay,
                 // so it takes no reaction callback.

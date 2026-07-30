@@ -1,0 +1,35 @@
+# namespace.yaml — the dedicated bot-fleet namespace on qsk8s (#2035/#2072).
+#
+# `bot-load` is intentionally created WITHOUT a pod-security `enforce` label:
+# a baseline/restricted level would block the NET_ADMIN capability the bots
+# need for per-pod tc/netem in a later increment (one reason the fleet gets its
+# own dedicated namespace rather than borrowing a shared one). The ResourceQuota
+# keeps the fleet a good neighbor on the shared cluster, well under its free
+# headroom. Sizing target: ~20 bots. The binding constraint is limits.cpu vs
+# the pod's 4-CPU limit (bot-pod.yaml raised it to 4 so CFS throttling can't
+# self-induce a false RESOURCE_STARVED verdict): 80 / 4 = 20 pods. The other
+# quotas admit at least that many (requests.cpu 48 / 1500m = 32; limits.memory
+# 96Gi / 2Gi = 48; pods = 30), so limits.cpu is what to raise for a bigger
+# fleet.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bot-load
+  labels:
+    purpose: videocall-bot-load-testing
+    owner: jay.boyd
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: bot-load-quota
+  namespace: bot-load
+spec:
+  hard:
+    requests.cpu: "48"
+    # 80 / 4-CPU pod limit = 20 pods (the sizing target above). This is the
+    # binding constraint; raise it (and pods) to grow the fleet.
+    limits.cpu: "80"
+    requests.memory: 64Gi
+    limits.memory: 96Gi
+    pods: "30"

@@ -19,18 +19,32 @@ syntax = "proto3";
 message ReactionPacket {
   enum ReactionType {
     REACTION_TYPE_UNSPECIFIED = 0;
-    THUMBS_UP   = 1;
-    THUMBS_DOWN = 2;
-    LAUGH       = 3;
-    APPLAUSE    = 4;
-    HEART       = 5;
-    THINKING    = 6;
-    PARTY       = 7;
-    reserved 8 to 31; // future reactions; relay+client treat unknown -> drop
+    THUMBS_UP    = 1;
+    THUMBS_DOWN  = 2;
+    LAUGH        = 3;
+    APPLAUSE     = 4;
+    HEART        = 5;
+    THINKING     = 6;
+    PARTY        = 7;
+    CRY          = 8;
+    DISAGREE     = 9;
+    SAD          = 10;
+    HEART_BROKEN = 11;
+    // CUSTOM carries a picker-selected standard Unicode emoji in `custom_emoji`
+    // instead of mapping to a fixed glyph. Still a closed-enum value the relay
+    // allowlists; the emoji STRING is validated separately (see `custom_emoji`).
+    CUSTOM       = 12;
+    reserved 13 to 31; // future reactions; relay+client treat unknown -> drop
   }
 
   ReactionType reaction = 1;
   // Cosmetic display-name fallback (see message doc). Attacker-controlled:
   // client renders as ESCAPED text and caps length (<=64). Optional.
   bytes display_name = 2;
+  // Standard Unicode emoji for a CUSTOM (12) reaction; empty/ignored otherwise.
+  // Attacker-controlled, SAME threat model as `display_name`: the relay MUST
+  // validate at ingress (exact standard-emoji allowlist + byte cap <=32,
+  // unknown -> drop) and the client ALSO validates before send AND before
+  // render (defense in depth). Rendered as ESCAPED text only (never markup).
+  bytes custom_emoji = 3;
 }

@@ -27,6 +27,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 
+use crate::cookie::build_session_cookie;
 use crate::state::AppState;
 use crate::token;
 
@@ -37,21 +38,26 @@ use crate::token;
 pub async fn auto_login(State(state): State<AppState>) -> Result<Response, StatusCode> {
     let dev_user = state.dev_user.as_ref().ok_or(StatusCode::NOT_FOUND)?;
 
-    let session_jwt = token::generate_session_token(
-        &state.jwt_secret,
-        &dev_user.email,
-        &dev_user.name,
+    // Clamp initial TTL to the absolute cap (#1966), same as the OAuth mint.
+    let now = chrono::Utc::now().timestamp();
+    let ttl = token::capped_session_ttl(
         state.session_ttl_secs,
+        now,
+        state.session_absolute_max_secs,
+        now,
     )
-    .map_err(|e| {
-        tracing::error!("DEV_USER auto-login: failed to generate session JWT: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    .max(1);
+    let session_jwt =
+        token::generate_session_token(&state.jwt_secret, &dev_user.email, &dev_user.name, ttl, now)
+            .map_err(|e| {
+                tracing::error!("DEV_USER auto-login: failed to generate session JWT: {e:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
-    let session_cookie = build_dev_session_cookie(
+    let session_cookie = build_session_cookie(
         &state.cookie_name,
         &session_jwt,
-        state.session_ttl_secs,
+        ttl,
         state.cookie_domain.as_deref(),
         state.cookie_secure,
     );
@@ -68,26 +74,6 @@ pub async fn auto_login(State(state): State<AppState>) -> Result<Response, Statu
         HeaderValue::from_str(&session_cookie).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     );
     Ok(response)
-}
-
-/// Build a `Set-Cookie` header value for the dev session JWT.
-///
-/// Uses the same attributes as the OAuth callback cookie builder.
-fn build_dev_session_cookie(
-    name: &str,
-    jwt: &str,
-    ttl_secs: i64,
-    domain: Option<&str>,
-    secure: bool,
-) -> String {
-    let mut cookie = format!("{name}={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
-    if secure {
-        cookie.push_str("; Secure");
-    }
-    if let Some(d) = domain {
-        cookie.push_str(&format!("; Domain={d}"));
-    }
-    cookie
 }
 
 #[cfg(test)]
@@ -111,6 +97,8 @@ mod tests {
             jwt_secret: TEST_SECRET.to_string(),
             token_ttl_secs: 600,
             session_ttl_secs: 3600,
+            session_refresh_threshold_secs: 7200,
+            session_absolute_max_secs: 604800,
             oauth: None,
             jwks_cache: None,
             cookie_domain: None,
@@ -130,25 +118,6 @@ mod tests {
             display_name_rate_limit_disabled: false,
             dev_user,
         }
-    }
-
-    #[test]
-    fn dev_session_cookie_format() {
-        let cookie = build_dev_session_cookie("session", "my.jwt.tok", 3600, None, false);
-        assert!(cookie.starts_with("session=my.jwt.tok;"));
-        assert!(cookie.contains("Path=/"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Lax"));
-        assert!(cookie.contains("Max-Age=3600"));
-        assert!(!cookie.contains("Secure"));
-        assert!(!cookie.contains("Domain="));
-    }
-
-    #[test]
-    fn dev_session_cookie_with_secure_and_domain() {
-        let cookie = build_dev_session_cookie("session", "tok", 3600, Some(".example.com"), true);
-        assert!(cookie.contains("; Secure"));
-        assert!(cookie.contains("Domain=.example.com"));
     }
 
     /// Production-safety invariant: when `DEV_USER` is unset, the endpoint

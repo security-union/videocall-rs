@@ -86,6 +86,8 @@ pub struct CreateMeetingResponse {
     pub allow_guests: bool,
     #[serde(default)]
     pub recording_allowed_for_all: bool,
+    #[serde(default = "default_true")]
+    pub chat_allowed_for_all: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}`.
@@ -116,6 +118,8 @@ pub struct MeetingInfoResponse {
     pub allow_guests: bool,
     #[serde(default)]
     pub recording_allowed_for_all: bool,
+    #[serde(default = "default_true")]
+    pub chat_allowed_for_all: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings`.
@@ -260,6 +264,8 @@ pub struct MeetingFeedSummary {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recording_allowed_for_all: bool,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub chat_allowed_for_all: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub waiting_room_enabled: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub admitted_can_admit: bool,
@@ -309,6 +315,8 @@ pub struct MeetingSummary {
     pub allow_guests: bool,
     #[serde(default)]
     pub recording_allowed_for_all: bool,
+    #[serde(default = "default_true")]
+    pub chat_allowed_for_all: bool,
 }
 
 /// Participant status returned by join, status, admit, reject, and leave endpoints.
@@ -361,6 +369,12 @@ pub struct ParticipantStatusResponse {
     /// the field) hide the record button from non-hosts.
     #[serde(default)]
     pub recording_allowed_for_all: bool,
+    /// Meeting-level: whether every admitted participant may SEND chat
+    /// messages. Defaults to `true` so older API responses (that lack the
+    /// field) and normal meetings keep chat open for everyone; a host turns
+    /// it off to make chat host-only for an all-hands-style meeting.
+    #[serde(default = "default_true")]
+    pub chat_allowed_for_all: bool,
 }
 
 /// Returns `true`; used as the serde `default` for meeting-policy booleans
@@ -504,7 +518,7 @@ mod tests {
         // `end_on_host_leave`. This is what pins the predicate to the default.
 
         // 1. All-default instance: every scalar holds its schema default,
-        // including the two default-TRUE policy flags. Option fields are a mix.
+        // including the three default-TRUE policy flags. Option fields are a mix.
         let all_default = MeetingFeedSummary {
             meeting_id: "meeting-default".to_string(),
             state: "idle".to_string(),
@@ -521,6 +535,7 @@ mod tests {
             has_password: false,
             allow_guests: false,
             recording_allowed_for_all: false,
+            chat_allowed_for_all: true, // default-true!
             waiting_room_enabled: true, // default-true!
             admitted_can_admit: false,
             end_on_host_leave: true, // default-true!
@@ -545,6 +560,7 @@ mod tests {
             has_password: true,
             allow_guests: true,
             recording_allowed_for_all: true,
+            chat_allowed_for_all: false, // flipped from default-true
             waiting_room_enabled: false, // flipped from default-true
             admitted_can_admit: true,
             end_on_host_leave: false, // flipped from default-true

@@ -133,6 +133,20 @@ describe("MultiLaunchForm", () => {
     await waitFor(() => expect(onLaunched).toHaveBeenCalled());
   });
 
+  it("sends clock video mode in the multi-launch request", async () => {
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    await userEvent.click(screen.getByTestId("multi-video-mode-select"));
+    await userEvent.click(await screen.findByRole("option", { name: "Clock (live wall clock)" }));
+    fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/X" },
+    });
+    fireEvent.click(screen.getByTestId("multi-launch-button"));
+    await waitFor(() => {
+      expect(state.multiLaunchCalls).toHaveLength(1);
+    });
+    expect(state.multiLaunchCalls[0]).toEqual(expect.objectContaining({ videoMode: "clock" }));
+  });
+
   it("submits a random launch with seed + includeObservers", async () => {
     renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
     fireEvent.click(screen.getByLabelText(/Random N/i));
@@ -267,6 +281,7 @@ describe("MultiLaunchForm", () => {
         displayName: "Carol",
         ttl: "30m",
         network: "none",
+        videoMode: "costume",
         headless: true,
         authBackend: "jwt",
         storageStateFile: "",

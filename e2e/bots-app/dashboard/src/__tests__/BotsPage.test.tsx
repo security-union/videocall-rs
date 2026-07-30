@@ -169,6 +169,24 @@ describe("BotsPage partitioning", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("restores clock video mode when duplicating a running bot", async () => {
+    stubFetch({
+      bots: [fakeBot({ videoMode: "clock" })],
+      clearTerminatedCalled: false,
+    });
+    renderWithClient();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Duplicate (pre-fill launch form)",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("video-mode-select")).toHaveTextContent("Clock (live wall clock)");
+    });
+  });
+
   it("renders the 'N live / M total' badge that includes terminated bots in the total", async () => {
     stubFetch({
       bots: [

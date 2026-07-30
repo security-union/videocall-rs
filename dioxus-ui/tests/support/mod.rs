@@ -137,9 +137,6 @@ fn inject_app_config_with_oauth_enabled(oauth_enabled: bool) {
     set("firefoxEnabled", &"false".into());
     set("usersAllowedToStream", &"".into());
     set("serverElectionPeriodMs", &wasm_bindgen::JsValue::from(2000));
-    set("audioBitrateKbps", &wasm_bindgen::JsValue::from(65));
-    set("videoBitrateKbps", &wasm_bindgen::JsValue::from(100));
-    set("screenBitrateKbps", &wasm_bindgen::JsValue::from(100));
     set("vadThreshold", &wasm_bindgen::JsValue::from(0.02));
 
     let frozen = js_sys::Object::freeze(&config);
@@ -196,9 +193,6 @@ pub fn inject_app_config_with_vad_threshold(threshold: f32) {
     set("firefoxEnabled", &"false".into());
     set("usersAllowedToStream", &"".into());
     set("serverElectionPeriodMs", &wasm_bindgen::JsValue::from(2000));
-    set("audioBitrateKbps", &wasm_bindgen::JsValue::from(65));
-    set("videoBitrateKbps", &wasm_bindgen::JsValue::from(100));
-    set("screenBitrateKbps", &wasm_bindgen::JsValue::from(100));
     set("vadThreshold", &wasm_bindgen::JsValue::from(threshold));
 
     let frozen = js_sys::Object::freeze(&config);

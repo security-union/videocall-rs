@@ -1181,6 +1181,28 @@ pub const BITRATE_CHANGE_THRESHOLD: f64 = 0.10;
 /// match VP9 realtime's ability to adapt rate-control state smoothly.
 pub const MAX_BITRATE_SLEW_KBPS_PER_SEC: u32 = 500;
 
+/// Idle timeout before a nonzero camera encoder output FPS is decayed to zero.
+///
+/// The producer floor is one chunk per second (`fps = chunks_in_last_second`,
+/// which is always at least 1 while output is alive), so a live 1 fps stream can
+/// have roughly 1000ms plus scheduling jitter between chunks. 2000ms is a safe
+/// ~2x margin over that ~1000ms floor gap (plus jitter), chosen so a live 1 fps
+/// stream never false-decays.
+pub const ENCODER_FPS_IDLE_DECAY_MS: f64 = 2000.0;
+
+/// Idle timeout before a nonzero screen encoder output FPS is decayed to zero.
+///
+/// This deliberately differs from [`ENCODER_FPS_IDLE_DECAY_MS`]: a fully static
+/// screen track can emit no captured frames, while the retained-frame recovery
+/// path follows the longer ~3s screen GOP cadence. 5000ms avoids false-decaying
+/// a static but healthy screen share across those ~3s layer-0 keyframe chunks.
+/// Note: the static-keyframe floor is itself budget-bounded
+/// (`SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET`), so a share that stays fully static
+/// past ~12s stops emitting layer-0 chunks entirely and WILL then decay to 0 —
+/// which is honest (no new content is being produced). Screen fps is log-only,
+/// so this is cosmetic either way.
+pub const SCREEN_ENCODER_FPS_IDLE_DECAY_MS: f64 = 5000.0;
+
 // ---------------------------------------------------------------------------
 // Keyframe & Error Recovery
 // ---------------------------------------------------------------------------
@@ -1875,9 +1897,9 @@ const _: () = assert!(
 /// WILL shed one rung (arguably a correct early shed, but a real quality drop).
 /// The threshold IS now frame-rate-aware (issue #1618): when dual-streaming
 /// (camera + screen), the producer-side `READY_STALL_THRESHOLD_MS` is raised
-/// to a fixed `8 × screen_top_tier_frame_interval_ms` (800ms for 10fps top tier),
-/// preventing K-amplification false positives on healthy links. This is a FIXED
-/// bound, not recomputed as either stream degrades.
+/// to `8 × live_screen_tier_frame_interval_ms` (800ms at 10fps, 1000ms at 8fps,
+/// or 1600ms at 5fps), preventing K-amplification false positives on healthy
+/// links as the active screen tier degrades or recovers.
 /// VALIDATE the bursty-recovery case on the #1080 netsim before relying on this
 /// to replace the relay CONGESTION signal (#1219).
 pub const WT_SATURATION_STALL_THRESHOLD: u64 = 3;
@@ -1902,6 +1924,36 @@ const _: () = assert!(
     "WT saturation threshold must require more than one slow ready() so a single \
      transient stall (a reordered packet / brief cwnd dip on a lossy link) \
      cannot shed a layer."
+);
+
+// ---------------------------------------------------------------------------
+// Client-Side WebTransport Camera Stale-DELTA Self-Detection (#1737 Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Number of sender-side camera DELTA frames age-dropped on WebTransport within
+/// [`CAMERA_WT_STALE_DROP_WINDOW_MS`] that triggers a local AQ step-down.
+///
+/// A stale-delta drop is a soft, potentially frequent event: the transport has
+/// deliberately skipped one old delta after `writer.ready()` finally resolved,
+/// while keyframes remain exempt. Requiring 12 within a 2s window mirrors the
+/// screen freshness axis and means a transient burst drains without cutting a
+/// rung, while sustained stale-delta gating converges the camera encoder toward
+/// the achievable uplink rate.
+pub const CAMERA_WT_STALE_DROP_THRESHOLD: u64 = 12;
+
+/// Tumbling window (ms) for counting #1737 camera WT stale-delta drops.
+pub const CAMERA_WT_STALE_DROP_WINDOW_MS: f64 = 2000.0;
+
+const _: () = assert!(
+    CAMERA_WT_STALE_DROP_WINDOW_MS >= WS_SELF_CONGESTION_WINDOW_MS,
+    "camera WT stale-drop window must be at least as wide as the WS overflow \
+     window: stale-delta drops are softer and more frequent than hard send \
+     failures, so they must persist longer before shedding."
+);
+const _: () = assert!(
+    CAMERA_WT_STALE_DROP_THRESHOLD > WS_SELF_CONGESTION_DROP_THRESHOLD,
+    "camera WT stale-delta drops can be prolific under congestion, so the \
+     sustained-cluster threshold must exceed the WS overflow threshold."
 );
 
 // ---------------------------------------------------------------------------
@@ -2020,6 +2072,72 @@ const _: () = assert!(
      video). It is 2x (not 4x like WS): a WT drop is hard-edged like the WT \
      saturation signal, so it gets the same 2x separation the saturation axis \
      gets — see the AUDIO_UPLINK_WT_DROP_WINDOW_MS doc."
+);
+
+// ---------------------------------------------------------------------------
+// Client-Side Screen WS Freshness-Gate Self-Detection (#1921)
+// ---------------------------------------------------------------------------
+//
+// The #1921 WS send-side freshness gate (videocall-client `screen_encoder`)
+// DROPS stale screen DELTAS once the browser's WebSocket `bufferedAmount`
+// backlog exceeds ~half a second of screen bitrate, converging the socket queue
+// to ~156KB at the top tier. That is BELOW the 1MB `bufferedAmount` memory cap
+// that increments `websocket_drop_count()` — the counter the WS overflow axis
+// (`WS_SELF_CONGESTION_*`) keys off. So under sustained high-motion congestion
+// in the moderate band the gate absorbs the overrun, `websocket_drop_count()`
+// never moves, and the screen tier stays pinned high: the encoder keeps
+// spending CPU on deltas the gate discards and its keyframes stay large. This
+// axis closes that gap by treating a SUSTAINED cluster of freshness-gate drops
+// (`screen_ws_stale_delta_drops()`) as its own AQ step-down trigger, so the tier
+// converges toward the achievable rate (and the lower tier tightens the gate's
+// own threshold — a beneficial coupling that speeds the drain).
+//
+// Threshold rationale — deliberately NOT the WS 3-in-1000ms shape:
+//   A freshness-gate drop is a SOFT, FREQUENT event (it fires whenever the
+//   backlog exceeds ~half a second of screen bitrate, potentially many times a
+//   second while congested), unlike a WS `bufferedAmount` 1MB overflow, which is
+//   a HARD, rare event. Copying the WS threshold of 3 would fire on a sub-second
+//   `bufferedAmount` spike — the stateless gate already handles such a blip by
+//   resuming deltas the instant the queue drains, so cutting the tier for it
+//   would over-react. We require a SUSTAINED cluster instead: a wider 2000ms
+//   window (≥ ~2 AQ ticks, matching the WT axis) and a count only a
+//   persistently-gated stream reaches (~6 gated deltas/sec sustained). A
+//   transient spike cannot shed a layer; a chronically over-capacity share
+//   converges one rung per window until it fits. Convergence, not oscillation:
+//   each step-down lowers the offered load (and tightens the gate threshold);
+//   step-UP is owned by the separate, dwell-gated AQ ramp, so a cleared episode
+//   earns back slowly rather than yo-yoing against this fast axis.
+
+/// Number of #1921 screen WS freshness-gate DELTA drops
+/// (`videocall_client::encode::screen_ws_stale_delta_drops`) within
+/// [`SCREEN_WS_STALE_DROP_WINDOW_MS`] that triggers a local AQ step-down.
+///
+/// 12 (not the WS overflow axis's 3): a freshness-gate drop is soft and
+/// frequent, so a short `bufferedAmount` spike can drop a handful of deltas
+/// before the queue drains. Requiring 12 within the 2s window (~6/sec sustained)
+/// means only a share that stays OVER CAPACITY across multiple AQ ticks sheds a
+/// rung; an isolated blip is left to the stateless gate, which self-clears.
+pub const SCREEN_WS_STALE_DROP_THRESHOLD: u64 = 12;
+
+/// Tumbling window (ms) for counting #1921 screen WS freshness-gate drops.
+///
+/// 2000ms (wider than the WS overflow axis's 1000ms) so the evidence must
+/// persist across at least ~2 AQ ticks before shedding — a single sub-second
+/// gating burst does not cut the tier.
+pub const SCREEN_WS_STALE_DROP_WINDOW_MS: f64 = 2000.0;
+
+// --- Compile-time invariants (#1921) ---
+const _: () = assert!(
+    SCREEN_WS_STALE_DROP_WINDOW_MS >= WS_SELF_CONGESTION_WINDOW_MS,
+    "screen freshness-drop window must be at least as wide as the WS overflow \
+     window: freshness-gate drops are softer and more frequent than 1MB \
+     bufferedAmount overflows, so they must persist longer before shedding."
+);
+const _: () = assert!(
+    SCREEN_WS_STALE_DROP_THRESHOLD > WS_SELF_CONGESTION_DROP_THRESHOLD,
+    "a freshness-gate drop is far more prolific than a 1MB send-buffer overflow, \
+     so its sustained-cluster threshold must exceed the WS overflow threshold or \
+     a transient bufferedAmount blip would shed a layer."
 );
 
 /// Pure decision helper for the client-side self-congestion self-trigger

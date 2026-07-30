@@ -110,6 +110,31 @@ bots:
     expect(cfg.bots[1].network).toBeUndefined();
   });
 
+  it("parses meeting-level and per-bot video modes", () => {
+    const cfg = parseMeetingConfigText(`
+meeting_url: https://x/y
+video_mode: clock
+bots:
+- participant: alice
+- participant: bob
+  video_mode: file
+`);
+    expect(cfg.videoMode).toBe("clock");
+    expect(cfg.bots[0].videoMode).toBeUndefined();
+    expect(cfg.bots[1].videoMode).toBe("file");
+  });
+
+  it("rejects an unknown video mode", () => {
+    expect(() =>
+      parseMeetingConfigText(`
+meeting_url: https://x/y
+video_mode: stopwatch
+bots:
+- participant: alice
+`),
+    ).toThrow(/meeting\.video_mode must be one of: costume, file, clock.*got "stopwatch"/s);
+  });
+
   it("accepts network: none (the passthrough sentinel)", () => {
     const cfg = parseMeetingConfigText(`
 meeting_url: https://x/y
@@ -178,6 +203,24 @@ bots:
     expect(cfg.bots[1].auth).toBe("none");
   });
 
+  it("parses form-login at meeting and per-bot level (PR #2082 explicit opt-in)", () => {
+    // form-login is a valid config auth value so a meeting config can fully
+    // specify a form-login run (the config's meeting_url names the target).
+    const cfg = parseMeetingConfigText(`
+meeting_url: https://app.videocall.labsworkspace.fnxlabs.com/meeting/bottest
+auth: form-login
+bots:
+- participant: alice
+- participant: bob
+  auth: storage-state
+`);
+    expect(cfg.auth).toBe("form-login");
+    expect(cfg.bots[0].auth).toBeUndefined();
+    expect(cfg.bots[1].auth).toBe("storage-state");
+    // Round-trips through emit without dropping the value.
+    expect(emitMeetingConfigYaml(cfg)).toContain("auth: form-login");
+  });
+
   it("rejects an unknown auth value", () => {
     expect(() =>
       parseMeetingConfigText(`
@@ -243,6 +286,7 @@ meta:
     expect(yaml).not.toContain("ttl:");
     expect(yaml).not.toContain("meta:");
     expect(yaml).not.toContain("network:");
+    expect(yaml).not.toContain("video_mode:");
   });
 
   it("round-trips a meeting-level network field through parse → emit → parse", () => {
@@ -275,6 +319,21 @@ bots:
     expect(reparsed.bots[0].network).toBe("dialup");
     expect(reparsed.bots[1].network).toBe("good_4g");
     expect(reparsed).toEqual(original);
+  });
+
+  it("round-trips meeting-level and per-bot video modes through parse → emit → parse", () => {
+    const original = parseMeetingConfigText(`
+meeting_url: https://x/y
+video_mode: clock
+bots:
+- participant: alice
+- participant: bob
+  video_mode: file
+`);
+    const yaml = emitMeetingConfigYaml(original);
+    expect(yaml).toContain("video_mode: clock");
+    expect(yaml).toContain("video_mode: file");
+    expect(parseMeetingConfigText(yaml)).toEqual(original);
   });
 });
 

@@ -39,7 +39,8 @@ import { waitForServices } from "../helpers/wait-for-services";
  *     ~10ms tick trips the keyframe-less eviction and posts a `freshness_skip`.
  *   - `__videocall_freshness_skips` — an array a diagnostics-bus subscriber
  *     appends each captured `freshness_skip` to (`{ head_age_ms, keyframe_seq,
- *     dropped, ts_ms }`).
+ *     dropped, ts_ms, escalated, tick_gap_ms }`; `escalated` is the #1662
+ *     hold-ceiling flag, `tick_gap_ms` the #1851 gap since the previous worker poll).
  *
  * ## Fails if the feature regresses (genuine fail-when-broken)
  *
@@ -125,6 +126,29 @@ const ESCALATION_INJECT_FRAMES = 100;
 // buffered keyframe; held last-good frame").
 const KEYFRAME_LESS_SENTINEL = -1;
 
+// ── Issue 1899 / discussion 1960: stream-open immediate keyframe request ──
+//
+// Poll ceiling for the stream-open PLI (Test 4). Deliberately BELOW MAX_PLAYOUT_AGE_MS (1800ms):
+// fix (a) fires the request at INSERT time (no ~10ms tick, no throttle), so it surfaces within one
+// worker→main postMessage round-trip; pre-fix, the ONLY source of a keyframe request for a
+// never-decoded keyframe-less stream is the #1025 eviction path, gated on head_age >= 1800ms, which
+// with age≈0 frames cannot fire until ~1800ms after injection. 1200ms sits 600ms below that floor,
+// so the poll times out (FAILS) on the un-fixed code and passes comfortably on the fixed code.
+const STREAM_OPEN_REQUEST_WINDOW_MS = 1200;
+
+// Upper bound on how long after injection the stream-open request may surface, measured on the
+// page's own Date.now() clock. The request is neither tick-gated (it fires inside insert_frame, not
+// on the ~10ms find_and_move tick) nor throttled (a direct one-shot fire, unlike the ~1s-throttled
+// record_freshness_skip) — its only latency is two postMessage hops (inject→worker, worker→main
+// RequestKeyframeMessage), typically <100ms even on a loaded CI box — so 1000ms is a ~10x anti-flake
+// margin while still an order of magnitude below the 1800ms a pre-fix request would have to wait for.
+const STREAM_OPEN_REQUEST_MAX_LATENCY_MS = 1000;
+
+// After the first request, a short settle to prove the one-shot: a second fresh delta must NOT
+// produce a second request. Kept well below the deadline so the eviction path cannot fire either,
+// though fix (a)'s #1479 arrival gate independently suppresses a second request even past it.
+const ONE_SHOT_SETTLE_MS = 400;
+
 interface FreshnessSkip {
   head_age_ms: number;
   keyframe_seq: number;
@@ -133,6 +157,23 @@ interface FreshnessSkip {
   // #1662 keyframe-less hold-ceiling escalation flag, surfaced by the collector
   // (videocall-client/src/freshness_inject.rs) as a real JS boolean.
   escalated: boolean;
+  // #1851 wall-clock gap (ms) since the previous worker poll, surfaced by the collector
+  // (videocall-client/src/freshness_inject.rs) as a real JS number (f64). Absent (undefined) on
+  // the pre-#1851 build, which is what makes the Test 1 assertions below fail-when-unfixed.
+  tick_gap_ms: number;
+}
+
+// Issue 1899 / discussion 1960: a captured proactive keyframe request, appended to
+// window.__videocall_keyframe_requests by the collector
+// (videocall-client/src/freshness_inject.rs::record_keyframe_request) each time the worker's jitter
+// buffer fires its request_keyframe hook and the RequestKeyframeMessage reaches the main thread.
+interface KeyframeRequest {
+  // Backlog age (ms) the worker carried on the request. 0 for the stream-open one-shot (fix (a),
+  // fired at insert time); >= MAX_PLAYOUT_AGE_MS for the #1025 freshness-deadline eviction PLI.
+  head_age_ms: number;
+  // Main-thread wall-clock (Date.now()) at capture, letting the spec bound how quickly the request
+  // surfaced after injection.
+  ts_ms: number;
 }
 
 // The injection + capture hooks are attached only when MOCK_PEERS_ENABLED=true
@@ -184,6 +225,27 @@ const escalatedSkipCount = (page: Page): Promise<number> =>
         (window as unknown as { __videocall_freshness_skips?: { escalated?: boolean }[] })
           .__videocall_freshness_skips ?? []
       ).filter((s) => s.escalated === true).length,
+  );
+
+// Issue 1899 / discussion 1960: read/count captured proactive keyframe requests. Evaluated in the
+// page so we observe the real objects the collector wrote (not a stale snapshot), letting
+// `expect.poll` wait for the stream-open request to land.
+const readKeyframeRequests = (page: Page): Promise<KeyframeRequest[]> =>
+  page.evaluate(
+    () =>
+      (
+        (window as unknown as { __videocall_keyframe_requests?: KeyframeRequest[] })
+          .__videocall_keyframe_requests ?? []
+      ).slice() as KeyframeRequest[],
+  );
+
+const keyframeRequestCount = (page: Page): Promise<number> =>
+  page.evaluate(
+    () =>
+      (
+        (window as unknown as { __videocall_keyframe_requests?: unknown[] })
+          .__videocall_keyframe_requests ?? []
+      ).length,
   );
 
 test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
@@ -290,6 +352,16 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
       return;
     }
 
+    // #1851: capture the main-thread console so we can assert the re-emitted freshness_skip
+    // FIELD-LOG line carries the new `tick_gap=` token. That console.warn is the load-bearing
+    // upload-pipeline delivery — videocall-codecs/src/decoder/wasm.rs warns
+    // `FreshnessSkipMessage::console_line()` on every skip. Attach BEFORE injecting so the warn
+    // (which fires only after the deadline trips) is never missed.
+    const consoleLines: string[] = [];
+    page.on("console", (msg) => {
+      consoleLines.push(msg.text());
+    });
+
     // Inject a stale keyframe-less backlog (back-dated well past the deadline).
     await injectStaleBacklog(page, INJECT_FRAMES, STALE_AGE_MS);
 
@@ -314,6 +386,50 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
     expect(skip.dropped).toBeGreaterThanOrEqual(1);
     //   - no buffered keyframe to skip to → the -1 sentinel.
     expect(skip.keyframe_seq).toBe(KEYFRAME_LESS_SENTINEL);
+
+    // #1851 (a) — the collector entry now carries a numeric tick_gap_ms. On the PRE-#1851 build the
+    // collector never sets this field, so `skip.tick_gap_ms` is `undefined`: `typeof` is
+    // "undefined", `Number.isFinite(undefined)` is false, and `undefined >= 0` is false — so ALL
+    // three assertions fail. That is the fails-on-unfixed guard for the collector surface.
+    //
+    // We assert only finite + `>= 0`, NOT a magnitude, and that is deliberate — traced through
+    // videocall-codecs: the #1022 injection back-dates each frame's arrival, and insert_frame runs
+    // an internal poll at that back-dated time (jitter_buffer.rs: insert_frame →
+    // find_and_move_continuous_frames(arrival_time_ms)), stamping last_tick_time_ms to
+    // `now - STALE_AGE_MS`. The next REAL eviction tick therefore observes tick_gap ≈ STALE_AGE_MS
+    // (~5000ms) — a harness artifact of the back-date, not a ~10ms cadence gap and not a genuinely
+    // starved tab; its exact value is scheduling-dependent, so finite + `>= 0` is the stable
+    // contract. This large gap does NOT escalate the record below: escalation is gated on the
+    // effective freeze-age (max(head_age, hold_duration)) >= MAX_KEYFRAME_LESS_HOLD_MS (6000ms),
+    // which short-circuits BEFORE the tick_gap cooldown-bypass is consulted
+    // (jitter_buffer.rs::signal_keyframe_less_ceiling). STALE_AGE_MS (5000) is below that ceiling —
+    // which is exactly why the escalated===false control below still holds even though this
+    // tick_gap (~5000) exceeds TICK_STARVATION_GAP_MS (2000): the bypass is cooldown-only, never
+    // ceiling-lowering.
+    expect(typeof skip.tick_gap_ms).toBe("number");
+    expect(Number.isFinite(skip.tick_gap_ms)).toBe(true);
+    expect(skip.tick_gap_ms).toBeGreaterThanOrEqual(0);
+
+    // #1851 (b) — the re-emitted field-log console line carries the `tick_gap=` token. The exact
+    // token is from FreshnessSkipMessage::console_line in videocall-codecs/src/messages.rs:
+    // `[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms tick_gap={:.0}ms dropped=...`.
+    // On the PRE-#1851 build the line has NO `tick_gap=` substring, so the filtered count stays 0
+    // and this poll times out and FAILS. The warn is emitted in the SAME
+    // handle_worker_diag_message call that broadcasts the DiagEvent captured above, so it has
+    // already fired by the time skipCount reached 1; the short poll only absorbs CDP
+    // console-event delivery lag.
+    await expect
+      .poll(
+        () =>
+          consoleLines.filter(
+            (l) => l.includes("[JITTER_BUFFER] freshness_skip") && l.includes("tick_gap="),
+          ).length,
+        {
+          timeout: 5_000,
+          message: "expected a re-emitted freshness_skip console line carrying the tick_gap= token",
+        },
+      )
+      .toBeGreaterThanOrEqual(1);
 
     // #1662 below-ceiling CONTROL (mutation-sensitivity guard). STALE_AGE_MS
     // (5000ms) is past the #1020 freshness deadline (so a routine eviction skip
@@ -428,5 +544,92 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
     // triggered it.
     expect(escalated!.keyframe_seq).toBe(KEYFRAME_LESS_SENTINEL);
     expect(escalated!.head_age_ms).toBeGreaterThanOrEqual(MAX_KEYFRAME_LESS_HOLD_MS);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test 4 — Issue 1899 / discussion 1960: a never-decoded stream that opens
+  // with a delta-only backlog fires ONE immediate keyframe request at INSERT
+  // time — well before the freshness deadline the eviction path would wait for.
+  //
+  // The mid-GOP late-joiner shape: a receiver joining a room where a share is
+  // ALREADY active starts receiving deltas with the keyframe long past. Fix (a)
+  // (videocall-codecs/src/jitter_buffer.rs::insert_frame) requests a keyframe the
+  // moment it can prove "frames present, no keyframe, never decoded", instead of
+  // waiting the full MAX_PLAYOUT_AGE_MS (1800ms) for the #1025 keyframe-less
+  // eviction path to fire its first PLI. The request travels the SAME worker→main
+  // RequestKeyframeMessage path a real peer's PLI does, captured by the collector
+  // (videocall-client/src/freshness_inject.rs::record_keyframe_request).
+  //
+  // ## Fails on the un-fixed code (discriminating timing arithmetic)
+  //
+  // We inject a FRESH (age≈0) delta-only backlog, so the head ages at wall-clock
+  // rate from ~0. Pre-fix, NO keyframe request fires at insert time; the only
+  // pre-fix source of a request for a keyframe-less stream is the #1025 eviction
+  // path in enforce_freshness_deadline, gated on head_age >= MAX_PLAYOUT_AGE_MS
+  // (1800ms). With age≈0 frames the EARLIEST a pre-fix request can appear is
+  // ~1800ms after inject. This test polls for the request within
+  // STREAM_OPEN_REQUEST_WINDOW_MS (1200ms) — 600ms below that floor — so on the
+  // un-fixed code the poll observes zero requests and times out (FAIL). On the
+  // fixed code the stream-open one-shot fires the request synchronously inside
+  // insert_frame (no tick, no throttle), surfacing within one worker→main
+  // postMessage round-trip (tens of ms), and the poll passes. Reverting fix (a)
+  // breaks this test.
+  //
+  // Contrast with Test 2: a FRESH backlog produces NO freshness_skip in the same
+  // window (the eviction deadline hasn't tripped) — yet DOES produce a stream-open
+  // keyframe request here. Same fresh injection, different observable: the request
+  // is the insert-time signal, the skip is the deadline signal.
+  // ──────────────────────────────────────────────────────────────────────
+  test("a fresh delta-only backlog on a never-decoded stream fires an immediate keyframe request before the freshness deadline (#1899 / disc. 1960)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "stream_open_pli");
+
+    if (!(await waitForHook(page))) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; freshness injection hooks are not attached");
+      return;
+    }
+
+    const before = await keyframeRequestCount(page);
+
+    // Capture the inject wall-clock on the PAGE's own clock (the same Date.now() the collector
+    // stamps ts_ms with) so the latency bound below is measured consistently.
+    const injectMs = await page.evaluate(() => Date.now());
+
+    // Inject a FRESH (age≈0) delta-only backlog into the never-decoded test stream. The first delta
+    // triggers fix (a)'s stream-open request; the other four are suppressed by the one-shot flag +
+    // the #1479 arrival gate (asserted below).
+    await injectStaleBacklog(page, INJECT_FRAMES, FRESH_AGE_MS);
+
+    // Core fails-on-unfixed assertion: a request must surface within the sub-deadline window.
+    await expect
+      .poll(() => keyframeRequestCount(page), {
+        timeout: STREAM_OPEN_REQUEST_WINDOW_MS,
+        message:
+          "expected a stream-open keyframe request within 1200ms (well before the 1800ms freshness deadline)",
+      })
+      .toBeGreaterThan(before);
+
+    // Exactly ONE request from the 5-frame batch: the stream-open one-shot fires on the first delta
+    // and suppresses the other four (intra-batch one-shot). Only the eviction path could add more,
+    // and it cannot fire this far below the deadline.
+    const afterFirst = await keyframeRequestCount(page);
+    expect(afterFirst).toBe(before + 1);
+
+    const req = (await readKeyframeRequests(page))[before];
+    // Stream-open shape: head_age_ms is 0 for a just-opened stream, cleanly BELOW the deadline — the
+    // #1025 eviction PLI (the only pre-fix source) would instead carry head_age >= MAX_PLAYOUT_AGE_MS.
+    expect(req.head_age_ms).toBeLessThan(MAX_PLAYOUT_AGE_MS);
+    // Latency bound: the request surfaced well within the deadline the eviction path would wait for.
+    expect(req.ts_ms - injectMs).toBeGreaterThanOrEqual(0);
+    expect(req.ts_ms - injectMs).toBeLessThan(STREAM_OPEN_REQUEST_MAX_LATENCY_MS);
+
+    // One-shot (inter-batch): a second fresh delta into the same never-decoded stream must NOT fire
+    // a second request. Fix (a) sets both the stream-open one-shot flag AND the #1479 arrival gate on
+    // the first fire, so a subsequent never-decoded delta cannot re-fire. Stay below the deadline so
+    // the eviction path is silent too.
+    await injectStaleBacklog(page, 1, FRESH_AGE_MS);
+    await page.waitForTimeout(ONE_SHOT_SETTLE_MS);
+    expect(await keyframeRequestCount(page)).toBe(afterFirst);
   });
 });

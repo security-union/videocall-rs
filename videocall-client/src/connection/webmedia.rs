@@ -24,6 +24,7 @@
 use super::connection_lost_reason::ConnectionLostReason;
 use log::error;
 use protobuf::Message;
+use videocall_transport::webtransport::FrameDropMeta;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
@@ -53,8 +54,8 @@ pub struct ConnectOptions {
 /// across reconnects so that diagnostics can attribute stream-restart
 /// events to a media type.
 ///
-/// WebSocket transport ignores this hint — its single TCP stream has no
-/// notion of per-media routing.
+/// WebSocket transport ignores this hint for routing — its single TCP stream
+/// has no per-media lanes — but retains it for drop-counter attribution.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum MediaStreamKey {
     /// Audio packets (mic encoder, ~50 pps).
@@ -82,7 +83,18 @@ impl MediaStreamKey {
             MediaStreamKey::Control => 4,
         }
     }
+
+    /// Highest currently assigned `MediaStreamKey` wire value. This value and
+    /// the transport crate's per-stream counter slot counts are hand-maintained
+    /// as a cross-crate contract; update them together when adding a key.
+    pub const MAX_WIRE_VALUE: u8 = 4;
 }
+
+// Verifies that the declared maximum fits the #1677 per-stream distress arrays
+// (slots 0..=4 in videocall-transport). Unknown larger keys safely remain
+// aggregate-only; maintainers must update this value and the transport slots
+// together to preserve per-stream attribution.
+const _: () = assert!(MediaStreamKey::MAX_WIRE_VALUE < 5);
 
 pub(super) trait WebMedia<TASK> {
     fn connect(options: ConnectOptions) -> anyhow::Result<TASK>;
@@ -91,9 +103,18 @@ pub(super) trait WebMedia<TASK> {
     ///
     /// `stream_key` selects the persistent QUIC stream to ride on.  The
     /// WebTransport implementation maintains one stream per `MediaStreamKey`
-    /// to prevent head-of-line blocking across media types.  WebSocket
-    /// ignores `stream_key` — its single TCP stream serves everything.
+    /// to prevent head-of-line blocking across media types. WebSocket uses one
+    /// TCP stream for every key and retains the key only for counter attribution.
     fn send_bytes(&self, bytes: Vec<u8>, stream_key: MediaStreamKey);
+
+    fn send_bytes_with_drop_meta(
+        &self,
+        bytes: Vec<u8>,
+        stream_key: MediaStreamKey,
+        _meta: Option<FrameDropMeta>,
+    ) {
+        self.send_bytes(bytes, stream_key);
+    }
 
     /// Send bytes via an unreliable, unordered datagram (WebTransport only).
     ///
@@ -116,11 +137,20 @@ pub(super) trait WebMedia<TASK> {
     /// camera → `Video`, screen-share → `Screen`, everything else →
     /// `Control`.  See call-site updates in `video_call_client.rs`.
     fn send_packet(&self, packet: PacketWrapper, stream_key: MediaStreamKey) {
+        self.send_packet_with_drop_meta(packet, stream_key, None);
+    }
+
+    fn send_packet_with_drop_meta(
+        &self,
+        packet: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) {
         match packet
             .write_to_bytes()
             .map_err(|w| JsValue::from(format!("{w:?}")))
         {
-            Ok(bytes) => self.send_bytes(bytes, stream_key),
+            Ok(bytes) => self.send_bytes_with_drop_meta(bytes, stream_key, meta),
             Err(e) => {
                 let packet_type = packet.packet_type.enum_value_or_default();
                 error!("error sending {packet_type} packet: {e:?}");

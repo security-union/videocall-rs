@@ -58,6 +58,13 @@ pub struct CreateMeetingRequest {
     /// so the record button is a host-only affordance out of the box.
     #[serde(default)]
     pub recording_allowed_for_all: Option<bool>,
+
+    /// Whether every admitted participant may SEND chat messages (not just the
+    /// host/co-hosts).  Defaults to `true` on the server when omitted so normal
+    /// meetings are unaffected; a host turns it OFF for all-hands-style meetings
+    /// where only hosts should be able to post, and can flip it back ON live.
+    #[serde(default)]
+    pub chat_allowed_for_all: Option<bool>,
 }
 
 /// Request body for `PATCH /api/v1/meetings/{meeting_id}`.
@@ -82,6 +89,10 @@ pub struct UpdateMeetingRequest {
     /// Toggle whether the record button is shown to all admitted participants.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recording_allowed_for_all: Option<bool>,
+
+    /// Toggle whether every admitted participant may send chat messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_allowed_for_all: Option<bool>,
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/join`.

@@ -26,8 +26,6 @@ struct SessionInfo {
     last_seen: Instant,
     // Peers we have published metrics for in this session (as to_peer)
     to_peers: HashSet<String>,
-    // Maps peer session_id → display_name for cleanup of display_name-labeled metrics
-    to_peer_display_names: HashMap<String, String>,
     // Peer IDs we have published peer connection metrics for
     peer_ids: HashSet<String>,
     // Server info we have published active server metrics for (server_url, server_type)
@@ -43,26 +41,23 @@ struct SessionInfo {
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
 
-/// Maps session_id → display_name so we can resolve peer display names.
-/// Built from incoming health packets (each carries the reporter's display_name).
-type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
-
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
     AUDIO_CONCEALMENT_PCT, AUDIO_CONGESTION_CEILING, AUDIO_DATAGRAM_LOSS_PER_SEC,
-    AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, BATTERY_CHARGING, BATTERY_LEVEL,
-    CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
-    CLIENT_AGENT_MEMORY_BYTES, CLIENT_CPU_THROTTLED, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
-    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_NETWORK_DOWNLINK_MAX,
-    CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
-    CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
-    CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL,
-    DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
-    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
-    ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH,
-    ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    AUDIO_DATAGRAM_RAW_LOSS_PER_SEC, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE,
+    BATTERY_CHARGING, BATTERY_LEVEL, CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER,
+    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_AUDIO_CONCEALMENT_PCT,
+    CLIENT_CPU_THROTTLED, CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS, CLIENT_INFO,
+    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
+    CLIENT_NETWORK_DOWNLINK_MAX, CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC,
+    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS,
+    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES,
+    DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP,
+    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
+    DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS,
+    ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
     KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
     NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
@@ -72,21 +67,22 @@ use sec_api::metrics::{
     SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS, SCREEN_VIDEO_PLAYOUT_LATENCY_MS,
     SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS, SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS,
     SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS,
-    VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
-    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC,
-    VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
+    TIER_TRANSITIONS_TOTAL, UNISTREAM_BYTES_DRAINED_TOTAL, UNISTREAM_BYTES_OFFERED_TOTAL,
+    UNISTREAM_STALE_DELTA_DROPS_TOTAL, VIDEOCALL_PEER_INFO, VIDEO_BITRATE_KBPS,
+    VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS,
+    VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE,
+    VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
+    WT_INCOMING_DATAGRAM_HIGH_WATER_MARK, WT_INCOMING_DATAGRAM_MAX_AGE_MS,
 };
 
 async fn metrics_handler(
     data: web::Data<HealthDataStore>,
     session_tracker: web::Data<SessionTracker>,
-    display_name_map: web::Data<DisplayNameMap>,
 ) -> Result<HttpResponse> {
     drop(data.lock().unwrap_or_else(|e| e.into_inner()));
 
     // Clean up stale sessions before processing metrics
-    cleanup_stale_sessions(&session_tracker, &display_name_map);
+    cleanup_stale_sessions(&session_tracker);
 
     // Do not mutate metrics here. Metrics are updated only on fresh NATS messages.
 
@@ -109,9 +105,8 @@ async fn metrics_handler(
     }
 }
 
-/// Clean up sessions that haven't reported in the last 30 seconds,
-/// and prune display_name_map entries for sessions no longer active.
-fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &DisplayNameMap) {
+/// Clean up sessions that haven't reported in the last 30 seconds.
+fn cleanup_stale_sessions(session_tracker: &SessionTracker) {
     use std::time::Duration;
     let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
@@ -125,7 +120,6 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
         }
     }
 
-    let mut removed_session_ids = Vec::new();
     // Meetings that lost at least one session this pass; their participant gauge
     // must be recomputed (and removed entirely if the meeting is now empty).
     let mut affected_meetings: HashSet<String> = HashSet::new();
@@ -135,7 +129,6 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
                 "Cleaning up stale session: {} (meeting: {}, peer: {})",
                 session_info.session_id, session_info.meeting_id, session_info.reporting_user_id
             );
-            removed_session_ids.push(session_info.session_id.clone());
             affected_meetings.insert(session_info.meeting_id.clone());
 
             // Remove all metrics for this session
@@ -150,16 +143,6 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
     // health packet, so stale meetings drop to 0 / off the dashboards.
     if !affected_meetings.is_empty() {
         recompute_meeting_participants(&tracker, &affected_meetings);
-    }
-
-    // Prune display_name_map for removed sessions
-    if !removed_session_ids.is_empty() {
-        let active_session_ids: HashSet<&str> = tracker
-            .values()
-            .map(|info| info.session_id.as_str())
-            .collect();
-        let mut dn_map = display_name_map.lock().unwrap_or_else(|e| e.into_inner());
-        dn_map.retain(|sid, _| active_session_ids.contains(sid.as_str()));
     }
 }
 
@@ -224,13 +207,13 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         .remove_label_values(&[&session_info.meeting_id, &session_info.session_id]);
 
     // Remove self-reported enabled metrics for the reporting peer in this meeting
-    let _ = SELF_AUDIO_ENABLED.remove_label_values(&[
+    let _ = SELF_AUDIO_ENABLED
+        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_user_id]);
+    let _ = SELF_VIDEO_ENABLED
+        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_user_id]);
+    let _ = VIDEOCALL_PEER_INFO.remove_label_values(&[
         &session_info.meeting_id,
-        &session_info.reporting_user_id,
-        &session_info.display_name,
-    ]);
-    let _ = SELF_VIDEO_ENABLED.remove_label_values(&[
-        &session_info.meeting_id,
+        &session_info.session_id,
         &session_info.reporting_user_id,
         &session_info.display_name,
     ]);
@@ -240,32 +223,27 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         &session_info.meeting_id,
         &session_info.session_id,
         &session_info.reporting_user_id,
-        &session_info.display_name,
     ]);
     let _ = CLIENT_MEMORY_USED_BYTES.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
         &session_info.reporting_user_id,
-        &session_info.display_name,
     ]);
     let _ = CLIENT_MEMORY_TOTAL_BYTES.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
         &session_info.reporting_user_id,
-        &session_info.display_name,
     ]);
     // #1032: non-heap memory series share the JS-heap label family.
     let _ = CLIENT_WASM_MEMORY_BYTES.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
         &session_info.reporting_user_id,
-        &session_info.display_name,
     ]);
     let _ = CLIENT_AGENT_MEMORY_BYTES.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
         &session_info.reporting_user_id,
-        &session_info.display_name,
     ]);
 
     // Remove send queue, packet rates, tab throttled, and receiver-side metrics
@@ -273,7 +251,6 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         &session_info.meeting_id as &str,
         &session_info.session_id,
         &session_info.reporting_user_id,
-        &session_info.display_name,
     ];
     let _ = CLIENT_SEND_QUEUE_BYTES.remove_label_values(&reporter_labels);
     let _ = CLIENT_PACKETS_RECEIVED_PER_SEC.remove_label_values(&reporter_labels);
@@ -282,8 +259,29 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = ADAPTIVE_VIDEO_TIER.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_AUDIO_TIER.remove_label_values(&reporter_labels);
     let _ = DATAGRAM_DROPS.remove_label_values(&reporter_labels);
+    let _ = UNISTREAM_BYTES_OFFERED_TOTAL.remove_label_values(&reporter_labels);
+    let _ = UNISTREAM_BYTES_DRAINED_TOTAL.remove_label_values(&reporter_labels);
+    let _ = UNISTREAM_STALE_DELTA_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
+    // Issue 2031: per-client WT receive-health gauges.
+    let _ = CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS.remove_label_values(&reporter_labels);
+    let _ = WT_INCOMING_DATAGRAM_HIGH_WATER_MARK.remove_label_values(&reporter_labels);
+    let _ = WT_INCOMING_DATAGRAM_MAX_AGE_MS.remove_label_values(&reporter_labels);
+    // Concealment carries a transport label — sweep both possible values so no
+    // residual series lingers after the reporter departs on either transport.
+    let _ = CLIENT_AUDIO_CONCEALMENT_PCT.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_user_id,
+        "webtransport",
+    ]);
+    let _ = CLIENT_AUDIO_CONCEALMENT_PCT.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_user_id,
+        "websocket",
+    ]);
     // #522 RTT-probe resilience gauges: same per-reporter GC so the high-cardinality
     // session_id label leaves no residual series on disconnect.
     let _ = RTT_PROBE_DROPPED_TOTAL.remove_label_values(&reporter_labels);
@@ -306,11 +304,10 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     // Layer gauges carry an extra media_kind label; GC all three kinds
     // (camera, screen, audio) that may have been published.
     for kind in ["camera", "screen", "audio"] {
-        let layer_labels: [&str; 5] = [
+        let layer_labels: [&str; 4] = [
             &session_info.meeting_id,
             &session_info.session_id,
             &session_info.reporting_user_id,
-            &session_info.display_name,
             kind,
         ];
         let _ = ENCODER_EFFECTIVE_LAYERS.remove_label_values(&layer_labels);
@@ -329,7 +326,6 @@ fn remove_session_metrics(session_info: &SessionInfo) {
             session_info.meeting_id.as_str(),
             session_info.session_id.as_str(),
             session_info.reporting_user_id.as_str(),
-            session_info.display_name.as_str(),
             net_type.as_str(),
         ]);
     }
@@ -341,18 +337,13 @@ fn remove_session_metrics(session_info: &SessionInfo) {
             session_info.meeting_id.as_str(),
             session_info.session_id.as_str(),
             session_info.reporting_user_id.as_str(),
-            session_info.display_name.as_str(),
             peer_id.as_str(),
             kind.as_str(),
         ]);
     }
 
-    // TELEM-8/9 cleanup (3-label: meeting_id, session_id, display_name)
-    let telem_labels: [&str; 3] = [
-        &session_info.meeting_id,
-        &session_info.session_id,
-        &session_info.display_name,
-    ];
+    // TELEM-8/9 cleanup (2-label: meeting_id, session_id)
+    let telem_labels: [&str; 2] = [&session_info.meeting_id, &session_info.session_id];
     let _ = CLIENT_LONGTASK_DURATION_MS.remove_label_values(&telem_labels);
     let _ = CLIENT_RENDER_FPS.remove_label_values(&telem_labels);
 
@@ -385,7 +376,6 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         let _ = CLIENT_INFO.remove_label_values(&[
             &session_info.meeting_id,
             &session_info.session_id,
-            &session_info.display_name,
             &info_labels[0],
             &info_labels[1],
             &info_labels[2],
@@ -402,7 +392,6 @@ fn remove_session_metrics(session_info: &SessionInfo) {
             &session_info.reporting_user_id,
             server_url.as_str(),
             server_type.as_str(),
-            &session_info.display_name,
         ];
         let _ = CLIENT_ACTIVE_SERVER.remove_label_values(&server_labels);
         let _ = CLIENT_ACTIVE_SERVER_RTT_MS.remove_label_values(&server_labels);
@@ -415,19 +404,11 @@ fn remove_session_metrics(session_info: &SessionInfo) {
 
     // Remove all to_peer series we set for this session
     for to_peer in &session_info.to_peers {
-        let peer_dn = session_info
-            .to_peer_display_names
-            .get(to_peer)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
         remove_per_peer_metrics(
             &session_info.meeting_id,
             &session_info.session_id,
             &session_info.reporting_user_id,
             to_peer,
-            &session_info.display_name,
-            peer_dn,
         );
     }
 
@@ -465,24 +446,17 @@ fn peers_to_prune(
 }
 
 /// Remove all per-peer Prometheus metrics for a specific reporter→peer pair.
-/// Used both for session cleanup and for removing stale series when a peer's
-/// display_name changes (e.g., from session_id to real name).
+/// Used for session cleanup and for pruning a peer that has left a still-live
+/// reporter's view (issue #1092). Per-pair series are keyed only by the four
+/// stable ids `[meeting_id, session_id, from_peer, to_peer]` (#1954 dropped the
+/// user-supplied `reporter_name`/`peer_name` PII labels).
 fn remove_per_peer_metrics(
     meeting_id: &str,
     session_id: &str,
     reporting_user_id: &str,
     to_peer: &str,
-    reporter_display_name: &str,
-    peer_display_name: &str,
 ) {
-    let labels = [
-        meeting_id,
-        session_id,
-        reporting_user_id,
-        to_peer,
-        reporter_display_name,
-        peer_display_name,
-    ];
+    let labels = [meeting_id, session_id, reporting_user_id, to_peer];
 
     // Per-peer metrics (22 kept, 7 low-value ones removed for cardinality reduction)
     let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
@@ -504,6 +478,7 @@ fn remove_per_peer_metrics(
     let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_SEQ_LOSS_PER_SEC.remove_label_values(&labels);
     let _ = AUDIO_DATAGRAM_LOSS_PER_SEC.remove_label_values(&labels);
+    let _ = AUDIO_DATAGRAM_RAW_LOSS_PER_SEC.remove_label_values(&labels); // issue 2031
     let _ = VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
@@ -524,25 +499,21 @@ fn remove_per_peer_metrics(
     let _ = SCREEN_VIDEO_CONTENT_STALENESS_MS.remove_label_values(&labels);
     let _ = SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL.remove_label_values(&labels);
 
-    // #1561: RECEIVED_LAYER uses a different label set (reporter-centric, not pair).
-    // The `to_peer` in the per-pair labels above is the peer whose media we RECEIVE;
-    // for RECEIVED_LAYER the peer is in the `from_peer` position. Clean all 3 kinds.
-    for kind in ["video", "screen", "audio"] {
-        let _ = RECEIVED_LAYER.remove_label_values(&[
-            meeting_id,
-            session_id,
-            reporting_user_id,
-            reporter_display_name,
-            to_peer,
-            kind,
-        ]);
-    }
+    // NOTE: RECEIVED_LAYER is intentionally NOT reaped here. Its series are
+    // reaped authoritatively from the #1561 tracked set
+    // (`session_info.received_layer_peers`) in `remove_session_metrics` (whole-
+    // session departure) and in the per-packet constraint-clear path — those use
+    // the exact 5-label key `[meeting_id, session_id, peer_id, from_peer,
+    // media_kind]` for series actually published. A speculative
+    // `for kind in [video,screen,audio]` sweep here previously duplicated that
+    // job (and after #1580 passed a stale 6th display_name value, silently
+    // erroring on every call); removed to keep the tracked set the single source
+    // of truth.
 }
 
 fn process_health_packet_to_metrics_pb(
     health_packet: &PbHealthPacket,
     session_tracker: &SessionTracker,
-    display_name_map: &DisplayNameMap,
 ) -> anyhow::Result<()> {
     HEALTH_REPORTS_TOTAL.inc();
 
@@ -565,19 +536,15 @@ fn process_health_packet_to_metrics_pb(
     };
     let reporting_user_id = reporting_user_id_str.as_str();
 
-    // Extract reporter's display name; fall back to email if absent
+    // Extract reporter's display name; fall back to email if absent.
+    // Still feeds the per-client peer_info metric (#1580) and the peer_info
+    // reap/rename-dedup below; it is NOT a per-pair label after #1954.
     let reporter_display_name = health_packet
         .display_name
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(reporting_user_id)
         .to_string();
-
-    // Register this session's display name so peers can be resolved later
-    {
-        let mut dn_map = display_name_map.lock().unwrap_or_else(|e| e.into_inner());
-        dn_map.insert(session_id.to_string(), reporter_display_name.clone());
-    }
 
     // Update session tracker: create entry on first packet, then refresh last_seen only.
     // Using entry().or_insert_with() preserves accumulated to_peers/peer_ids/active_servers
@@ -595,7 +562,6 @@ fn process_health_packet_to_metrics_pb(
                 display_name: reporter_display_name.clone(),
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
-                to_peer_display_names: HashMap::new(),
                 peer_ids: HashSet::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
@@ -603,6 +569,14 @@ fn process_health_packet_to_metrics_pb(
                 received_layer_peers: HashSet::new(),
             });
         info.last_seen = Instant::now();
+        if info.display_name != reporter_display_name {
+            let _ = VIDEOCALL_PEER_INFO.remove_label_values(&[
+                meeting_id,
+                session_id,
+                reporting_user_id,
+                info.display_name.as_str(),
+            ]);
+        }
         info.display_name = reporter_display_name.clone();
     }
 
@@ -657,7 +631,6 @@ fn process_health_packet_to_metrics_pb(
                     reporting_user_id,
                     server_url_clean,
                     server_type_for_rtt,
-                    reporter_display_name.as_str(),
                 ])
                 .set(health_packet.active_server_rtt_ms);
 
@@ -685,7 +658,6 @@ fn process_health_packet_to_metrics_pb(
                     reporting_user_id,
                     server_url_clean,
                     server_type_for_active,
-                    reporter_display_name.as_str(),
                 ])
                 .set(1.0);
 
@@ -712,11 +684,7 @@ fn process_health_packet_to_metrics_pb(
             meeting_id, reporting_user_id, health_packet.reporting_audio_enabled
         );
         SELF_AUDIO_ENABLED
-            .with_label_values(&[
-                meeting_id,
-                reporting_user_id,
-                reporter_display_name.as_str(),
-            ])
+            .with_label_values(&[meeting_id, reporting_user_id])
             .set(if health_packet.reporting_audio_enabled {
                 1.0
             } else {
@@ -728,16 +696,21 @@ fn process_health_packet_to_metrics_pb(
             meeting_id, reporting_user_id, health_packet.reporting_video_enabled
         );
         SELF_VIDEO_ENABLED
-            .with_label_values(&[
-                meeting_id,
-                reporting_user_id,
-                reporter_display_name.as_str(),
-            ])
+            .with_label_values(&[meeting_id, reporting_user_id])
             .set(if health_packet.reporting_video_enabled {
                 1.0
             } else {
                 0.0
             });
+
+        VIDEOCALL_PEER_INFO
+            .with_label_values(&[
+                meeting_id,
+                session_id,
+                reporting_user_id,
+                reporter_display_name.as_str(),
+            ])
+            .set(1.0);
 
         // Tab visibility (HealthPacket level)
         debug!(
@@ -745,12 +718,7 @@ fn process_health_packet_to_metrics_pb(
             meeting_id, session_id, reporting_user_id, health_packet.is_tab_visible
         );
         CLIENT_TAB_VISIBLE
-            .with_label_values(&[
-                meeting_id,
-                session_id,
-                reporting_user_id,
-                reporter_display_name.as_str(),
-            ])
+            .with_label_values(&[meeting_id, session_id, reporting_user_id])
             .set(if health_packet.is_tab_visible {
                 1.0
             } else {
@@ -764,12 +732,7 @@ fn process_health_packet_to_metrics_pb(
                 meeting_id, session_id, reporting_user_id, mem_used
             );
             CLIENT_MEMORY_USED_BYTES
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id])
                 .set(mem_used as f64);
         }
 
@@ -779,24 +742,14 @@ fn process_health_packet_to_metrics_pb(
                 meeting_id, session_id, reporting_user_id, mem_total
             );
             CLIENT_MEMORY_TOTAL_BYTES
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id])
                 .set(mem_total as f64);
         }
 
         // #1032: WASM linear memory (always available on the client).
         if let Some(wasm_mem) = health_packet.wasm_memory_bytes {
             CLIENT_WASM_MEMORY_BYTES
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id])
                 .set(wasm_mem as f64);
         }
 
@@ -804,12 +757,7 @@ fn process_health_packet_to_metrics_pb(
         // otherwise, in which case the series simply never appears).
         if let Some(agent_mem) = health_packet.agent_memory_bytes {
             CLIENT_AGENT_MEMORY_BYTES
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id])
                 .set(agent_mem as f64);
         }
 
@@ -889,12 +837,7 @@ fn process_health_packet_to_metrics_pb(
         }
 
         // Communication and browser state metrics
-        let reporter_labels: [&str; 4] = [
-            meeting_id,
-            session_id,
-            reporting_user_id,
-            reporter_display_name.as_str(),
-        ];
+        let reporter_labels: [&str; 3] = [meeting_id, session_id, reporting_user_id];
 
         if let Some(send_queue) = health_packet.send_queue_bytes {
             CLIENT_SEND_QUEUE_BYTES
@@ -935,6 +878,72 @@ fn process_health_packet_to_metrics_pb(
         }
         if let Some(drops) = health_packet.datagram_drops_total {
             DATAGRAM_DROPS
+                .with_label_values(&reporter_labels)
+                .set(drops as f64);
+        }
+
+        // Issue 2031: per-client WebTransport receive-health telemetry.
+        // read-loop max gap folds unconditionally on the client (0.0 on WS), so
+        // .set() lets the gauge recover to 0 instead of latching. The `if let
+        // Some` guards an older client that omits it.
+        if let Some(gap) = health_packet.wt_datagram_read_loop_max_gap_ms {
+            CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS
+                .with_label_values(&reporter_labels)
+                .set(gap);
+        }
+        // Queue read-back: a one-shot per-browser constant, present only once the
+        // WT queue was configured (absent for a WS-only client).
+        if let Some(hwm) = health_packet.wt_incoming_datagram_high_water_mark {
+            WT_INCOMING_DATAGRAM_HIGH_WATER_MARK
+                .with_label_values(&reporter_labels)
+                .set(hwm);
+        }
+        if let Some(max_age) = health_packet.wt_incoming_datagram_max_age_ms {
+            WT_INCOMING_DATAGRAM_MAX_AGE_MS
+                .with_label_values(&reporter_labels)
+                .set(max_age);
+        }
+        // Per-client mean audio concealment, SPLIT BY the reporter's active
+        // transport (the ground-truth WS-vs-WT severity gap). Only exported for a
+        // known transport so an empty/unknown active_server_type never spawns a
+        // junk `transport=""` series.
+        if let Some(concealment) = health_packet.client_audio_concealment_pct {
+            let transport = health_packet.active_server_type.as_str();
+            if transport == "webtransport" || transport == "websocket" {
+                CLIENT_AUDIO_CONCEALMENT_PCT
+                    .with_label_values(&[meeting_id, session_id, reporting_user_id, transport])
+                    .set(concealment);
+                // Issue 2031: a live WT<->WS switch (routine once the issue-2029
+                // fallback ships) would otherwise leave the OLD transport's series
+                // for this same identity latched at its last value until session
+                // GC, misleading the by-transport panel. Clear the sibling series
+                // so only the currently-active transport reports. Ignore the
+                // not-found error (no prior sibling series is the common case).
+                let sibling = if transport == "webtransport" {
+                    "websocket"
+                } else {
+                    "webtransport"
+                };
+                let _ = CLIENT_AUDIO_CONCEALMENT_PCT.remove_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    sibling,
+                ]);
+            }
+        }
+        if let Some(bytes) = health_packet.unistream_bytes_offered_total {
+            UNISTREAM_BYTES_OFFERED_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(bytes as f64);
+        }
+        if let Some(bytes) = health_packet.unistream_bytes_drained_total {
+            UNISTREAM_BYTES_DRAINED_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(bytes as f64);
+        }
+        if let Some(drops) = health_packet.unistream_stale_delta_drops_total {
+            UNISTREAM_STALE_DELTA_DROPS_TOTAL
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
         }
@@ -1029,61 +1038,31 @@ fn process_health_packet_to_metrics_pb(
         // encoder's state, so these are labeled media_kind="camera".
         if let Some(layers) = health_packet.effective_video_layers {
             ENCODER_EFFECTIVE_LAYERS
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    "camera",
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id, "camera"])
                 .set(layers as f64);
         }
         if let Some(layers) = health_packet.active_video_layers {
             ENCODER_ACTIVE_LAYERS
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    "camera",
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id, "camera"])
                 .set(layers as f64);
         }
 
         // #1561: Screen encoder simulcast layer counts
         if let Some(layers) = health_packet.effective_screen_layers {
             ENCODER_EFFECTIVE_LAYERS
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    "screen",
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id, "screen"])
                 .set(layers as f64);
         }
         if let Some(layers) = health_packet.active_screen_layers {
             ENCODER_ACTIVE_LAYERS
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    "screen",
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id, "screen"])
                 .set(layers as f64);
         }
 
         // #1561: Audio encoder simulcast layer counts
         if let Some(layers) = health_packet.effective_audio_layers {
             ENCODER_EFFECTIVE_LAYERS
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    "audio",
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id, "audio"])
                 .set(layers as f64);
         }
         // Audio active layers are reported independently from the congestion
@@ -1098,13 +1077,7 @@ fn process_health_packet_to_metrics_pb(
                     .unwrap_or(effective)
             });
             ENCODER_ACTIVE_LAYERS
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    "audio",
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id, "audio"])
                 .set(active as f64);
         }
 
@@ -1122,12 +1095,7 @@ fn process_health_packet_to_metrics_pb(
             };
             if let Some(v) = ceiling_val {
                 AUDIO_CONGESTION_CEILING
-                    .with_label_values(&[
-                        meeting_id,
-                        session_id,
-                        reporting_user_id,
-                        reporter_display_name.as_str(),
-                    ])
+                    .with_label_values(&[meeting_id, session_id, reporting_user_id])
                     .set(v);
             }
         }
@@ -1143,7 +1111,6 @@ fn process_health_packet_to_metrics_pb(
                         meeting_id,
                         session_id,
                         reporting_user_id,
-                        reporter_display_name.as_str(),
                         peer_session_id.as_str(),
                         "video",
                     ])
@@ -1156,7 +1123,6 @@ fn process_health_packet_to_metrics_pb(
                         meeting_id,
                         session_id,
                         reporting_user_id,
-                        reporter_display_name.as_str(),
                         peer_session_id.as_str(),
                         "screen",
                     ])
@@ -1169,7 +1135,6 @@ fn process_health_packet_to_metrics_pb(
                         meeting_id,
                         session_id,
                         reporting_user_id,
-                        reporter_display_name.as_str(),
                         peer_session_id.as_str(),
                         "audio",
                     ])
@@ -1185,7 +1150,6 @@ fn process_health_packet_to_metrics_pb(
                         meeting_id,
                         session_id,
                         reporting_user_id,
-                        reporter_display_name.as_str(),
                         peer_id.as_str(),
                         kind.as_str(),
                     ]);
@@ -1197,12 +1161,7 @@ fn process_health_packet_to_metrics_pb(
         // #1556: Battery charging state
         if let Some(charging) = health_packet.client_battery_charging {
             BATTERY_CHARGING
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id])
                 .set(if charging { 1.0 } else { 0.0 });
         }
 
@@ -1218,7 +1177,6 @@ fn process_health_packet_to_metrics_pb(
                                 meeting_id,
                                 session_id,
                                 reporting_user_id,
-                                reporter_display_name.as_str(),
                                 prev.as_str(),
                             ]);
                         }
@@ -1227,37 +1185,21 @@ fn process_health_packet_to_metrics_pb(
                 }
             }
             CLIENT_NETWORK_TYPE
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                    net_type.as_str(),
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id, net_type.as_str()])
                 .set(1.0);
         }
 
         // #1556: Network downlink max
         if let Some(max_mbps) = health_packet.client_network_downlink_max {
             CLIENT_NETWORK_DOWNLINK_MAX
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id])
                 .set(max_mbps);
         }
 
         // #1556: CPU throttle flag
         if let Some(throttled) = health_packet.client_cpu_throttled {
             CLIENT_CPU_THROTTLED
-                .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    reporter_display_name.as_str(),
-                ])
+                .with_label_values(&[meeting_id, session_id, reporting_user_id])
                 .set(if throttled { 1.0 } else { 0.0 });
         }
 
@@ -1268,7 +1210,6 @@ fn process_health_packet_to_metrics_pb(
                     meeting_id,
                     session_id,
                     reporting_user_id,
-                    &reporter_display_name,
                     &t.direction,
                     &t.stream,
                     &t.from_tier,
@@ -1325,13 +1266,7 @@ fn process_health_packet_to_metrics_pb(
                     if let Some(ref prev) = info.client_info_labels {
                         if *prev != new_labels {
                             let _ = CLIENT_INFO.remove_label_values(&[
-                                meeting_id,
-                                session_id,
-                                reporter_display_name.as_str(),
-                                &prev[0],
-                                &prev[1],
-                                &prev[2],
-                                &prev[3],
+                                meeting_id, session_id, &prev[0], &prev[1], &prev[2], &prev[3],
                                 &prev[4],
                             ]);
                         }
@@ -1342,14 +1277,7 @@ fn process_health_packet_to_metrics_pb(
 
             CLIENT_INFO
                 .with_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporter_display_name.as_str(),
-                    &cores_str,
-                    &arch,
-                    &gpu,
-                    &net,
-                    &score,
+                    meeting_id, session_id, &cores_str, &arch, &gpu, &net, &score,
                 ])
                 .set(1.0);
 
@@ -1379,14 +1307,14 @@ fn process_health_packet_to_metrics_pb(
         // TELEM-8: longtask histogram observations
         for dur in &health_packet.longtask_durations_ms {
             CLIENT_LONGTASK_DURATION_MS
-                .with_label_values(&[meeting_id, session_id, reporter_display_name.as_str()])
+                .with_label_values(&[meeting_id, session_id])
                 .observe(*dur);
         }
 
         // TELEM-9: render FPS gauge
         if let Some(fps) = health_packet.render_fps {
             CLIENT_RENDER_FPS
-                .with_label_values(&[meeting_id, session_id, reporter_display_name.as_str()])
+                .with_label_values(&[meeting_id, session_id])
                 .set(fps);
         }
 
@@ -1415,24 +1343,11 @@ fn process_health_packet_to_metrics_pb(
             if let Some(info) = tracker.get_mut(&session_key) {
                 let departed = peers_to_prune(&info.to_peers, &current_peer_ids);
                 for peer_id in &departed {
-                    let peer_dn = info
-                        .to_peer_display_names
-                        .get(peer_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    remove_per_peer_metrics(
-                        meeting_id,
-                        session_id,
-                        reporting_user_id,
-                        peer_id,
-                        reporter_display_name.as_str(),
-                        &peer_dn,
-                    );
-                    // Prune ONLY the per-pair tracking sets. `to_peers` and
-                    // `to_peer_display_names` key the per-pair series that
-                    // `remove_per_peer_metrics` just deleted; dropping the peer from
-                    // them stops those 23 series from being re-written on the next
-                    // packet and lets a future re-appearance re-register cleanly.
+                    remove_per_peer_metrics(meeting_id, session_id, reporting_user_id, peer_id);
+                    // Prune ONLY the per-pair tracking set. `to_peers` keys the per-pair
+                    // series that `remove_per_peer_metrics` just deleted; dropping the peer
+                    // from it stops those series from being re-written on the next packet
+                    // and lets a future re-appearance re-register cleanly.
                     //
                     // `peer_ids` is DELIBERATELY retained. It is the lifetime-of-session
                     // set that drives PEER_CONNECTIONS_TOTAL cleanup in
@@ -1444,7 +1359,6 @@ fn process_health_packet_to_metrics_pb(
                     // `peer_ids` here would silently disable that cleanup and re-leak the
                     // gauge (the exact #1092 class, for PEER_CONNECTIONS_TOTAL).
                     info.to_peers.remove(peer_id);
-                    info.to_peer_display_names.remove(peer_id);
                 }
                 if !departed.is_empty() {
                     debug!(
@@ -1460,43 +1374,17 @@ fn process_health_packet_to_metrics_pb(
 
         // Process peer health data
         if !health_packet.peer_stats.is_empty() {
-            // Snapshot display_name_map once (avoids locking per peer in the loop)
-            let peer_display_names: HashMap<String, String> = {
-                let dn_map = display_name_map.lock().unwrap_or_else(|e| e.into_inner());
-                health_packet
-                    .peer_stats
-                    .keys()
-                    .map(|pid| {
-                        let dn = dn_map.get(pid).cloned().unwrap_or_else(|| pid.to_string());
-                        (pid.clone(), dn)
-                    })
-                    .collect()
-            };
-
-            // Detect display_name changes and remove stale series (one tracker lock)
+            // Record the peers this reporter observes in the per-pair tracking set
+            // (`to_peers`, which drives the #1092 per-packet prune) and the
+            // lifetime-of-session `peer_ids` set (which drives the meeting-scoped
+            // PEER_CONNECTIONS_TOTAL reap in remove_session_metrics). Per-pair series
+            // are keyed only by stable ids after #1954, so there is no display-name
+            // rename to detect here anymore — just maintain the sets under one lock.
             {
                 let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
                 let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                 if let Some(info) = tracker.get_mut(&key) {
-                    for (peer_id, new_dn) in &peer_display_names {
-                        if let Some(old_dn) = info.to_peer_display_names.get(peer_id) {
-                            if old_dn != new_dn {
-                                debug!(
-                                    "Peer display name changed: {} -> {} for peer {}",
-                                    old_dn, new_dn, peer_id
-                                );
-                                remove_per_peer_metrics(
-                                    meeting_id,
-                                    session_id,
-                                    reporting_user_id,
-                                    peer_id,
-                                    reporter_display_name.as_str(),
-                                    old_dn,
-                                );
-                            }
-                        }
-                        info.to_peer_display_names
-                            .insert(peer_id.clone(), new_dn.clone());
+                    for peer_id in health_packet.peer_stats.keys() {
                         info.to_peers.insert(peer_id.clone());
                         info.peer_ids.insert(peer_id.clone());
                     }
@@ -1504,15 +1392,7 @@ fn process_health_packet_to_metrics_pb(
             }
 
             for (peer_id, peer_data) in &health_packet.peer_stats {
-                let peer_dn = &peer_display_names[peer_id];
-                let peer_labels: [&str; 6] = [
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    peer_id,
-                    reporter_display_name.as_str(),
-                    peer_dn.as_str(),
-                ];
+                let peer_labels: [&str; 4] = [meeting_id, session_id, reporting_user_id, peer_id];
 
                 PEER_CONNECTIONS_TOTAL
                     .with_label_values(&[meeting_id, peer_id])
@@ -1705,6 +1585,17 @@ fn process_health_packet_to_metrics_pb(
                         .set(loss);
                 }
 
+                // Issue 2031: uncapped magnitude companion. Current clients fold
+                // it unconditionally (live value on WT, definitional 0.0 on WS),
+                // so it is always set and the gauge recovers to 0 rather than
+                // latching — including on a mid-call WT->WS fallback. The
+                // `if let Some` still guards an older client that omits it.
+                if let Some(raw_loss) = peer_data.audio_datagram_raw_loss_per_sec {
+                    AUDIO_DATAGRAM_RAW_LOSS_PER_SEC
+                        .with_label_values(&peer_labels)
+                        .set(raw_loss);
+                }
+
                 // Audio concealment percentage (from NetEQ expand events)
                 // Always set — allows gauge to recover to 0.0 when concealment clears
                 AUDIO_CONCEALMENT_PCT
@@ -1759,7 +1650,6 @@ async fn nats_health_consumer(
     nats_client: Client,
     health_store: HealthDataStore,
     session_tracker: SessionTracker,
-    display_name_map: DisplayNameMap,
 ) -> anyhow::Result<()> {
     // Subscribe to all health diagnostics topics from all regions.
     //
@@ -1780,9 +1670,7 @@ async fn nats_health_consumer(
 
     while let Some(message) = subscription.next().await {
         debug!("Received health message from NATS: {}", message.subject);
-        if let Err(e) =
-            handle_health_message(message, &health_store, &session_tracker, &display_name_map).await
-        {
+        if let Err(e) = handle_health_message(message, &health_store, &session_tracker).await {
             error!("Failed to handle health message: {}", e);
         }
     }
@@ -1794,7 +1682,6 @@ async fn handle_health_message(
     message: Message,
     health_store: &HealthDataStore,
     session_tracker: &SessionTracker,
-    display_name_map: &DisplayNameMap,
 ) -> anyhow::Result<()> {
     let topic = &message.subject;
     debug!("Received health data from topic: {}", topic);
@@ -1814,9 +1701,7 @@ async fn handle_health_message(
 
     if is_fresh {
         // Update Prometheus metrics immediately on ingest
-        if let Err(e) =
-            process_health_packet_to_metrics_pb(&health_packet, session_tracker, display_name_map)
-        {
+        if let Err(e) = process_health_packet_to_metrics_pb(&health_packet, session_tracker) {
             error!("Failed to process health packet for metrics: {}", e);
         }
     } else {
@@ -1870,18 +1755,12 @@ async fn main() -> anyhow::Result<()> {
     // Create shared session tracker
     let session_tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
-    // Create shared display name map (session_id → display_name)
-    let display_name_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
-
     // Start NATS consumer in background
     let nats_store = health_store.clone();
     let nats_client_clone = nats_client.clone();
     let nats_tracker = session_tracker.clone();
-    let nats_dn_map = display_name_map.clone();
     task::spawn(async move {
-        if let Err(e) =
-            nats_health_consumer(nats_client_clone, nats_store, nats_tracker, nats_dn_map).await
-        {
+        if let Err(e) = nats_health_consumer(nats_client_clone, nats_store, nats_tracker).await {
             error!("NATS consumer failed: {}", e);
         }
     });
@@ -1892,7 +1771,6 @@ async fn main() -> anyhow::Result<()> {
         App::new()
             .app_data(web::Data::new(health_store.clone()))
             .app_data(web::Data::new(session_tracker.clone()))
-            .app_data(web::Data::new(display_name_map.clone()))
             .route("/metrics", web::get().to(metrics_handler))
             .route(
                 "/health",
@@ -1933,11 +1811,7 @@ mod tests {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
         // Process and ensure no error
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         // Metrics presence is indirectly verified by successful processing; we avoid scraping here.
@@ -1991,6 +1865,55 @@ mod tests {
         false
     }
 
+    fn matching_series_count(metric_name: &str, expected_labels: &[(&str, &str)]) -> usize {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == metric_name)
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        expected_labels.iter().all(|(lname, lval)| {
+                            metric.get_label().iter().any(|label| {
+                                label.get_name() == *lname && label.get_value() == *lval
+                            })
+                        })
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn matching_series_has_label(
+        metric_name: &str,
+        expected_labels: &[(&str, &str)],
+        label_name: &str,
+    ) -> bool {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == metric_name)
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        expected_labels.iter().all(|(lname, lval)| {
+                            metric.get_label().iter().any(|label| {
+                                label.get_name() == *lname && label.get_value() == *lval
+                            })
+                        })
+                    })
+                    .any(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.get_name() == label_name)
+                    })
+            })
+            .unwrap_or(false)
+    }
+
     fn gauge_value(metric_name: &str, expected_labels: &[(&str, &str)]) -> Option<f64> {
         let families = prometheus::gather();
         for family in families {
@@ -2014,7 +1937,6 @@ mod tests {
     #[test]
     fn received_layer_series_removed_when_constraint_clears() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
         let mut constrained = create_test_health_packet(
             "session_received_gc_1561",
             "meeting_received_gc_1561",
@@ -2025,7 +1947,7 @@ mod tests {
             .received_video_layer
             .insert("source_received_gc_1561".to_string(), 0);
 
-        process_health_packet_to_metrics_pb(&constrained, &tracker, &dn_map)
+        process_health_packet_to_metrics_pb(&constrained, &tracker)
             .expect("first packet should publish the constrained layer");
         let labels = [
             ("meeting_id", "meeting_received_gc_1561"),
@@ -2046,7 +1968,7 @@ mod tests {
             "reporter_received_gc_1561",
             HashMap::new(),
         );
-        process_health_packet_to_metrics_pb(&recovered, &tracker, &dn_map)
+        process_health_packet_to_metrics_pb(&recovered, &tracker)
             .expect("second packet should clear the constraint");
         assert!(
             !series_exists("videocall_received_layer", &labels),
@@ -2057,7 +1979,6 @@ mod tests {
     #[test]
     fn network_type_change_removes_previous_label_series() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
         let mut wifi = create_test_health_packet(
             "session_network_gc_1556",
             "meeting_network_gc_1556",
@@ -2065,7 +1986,7 @@ mod tests {
             HashMap::new(),
         );
         wifi.client_network_type = Some("wifi".to_string());
-        process_health_packet_to_metrics_pb(&wifi, &tracker, &dn_map)
+        process_health_packet_to_metrics_pb(&wifi, &tracker)
             .expect("wifi packet should publish network type");
 
         let wifi_labels = [
@@ -2078,7 +1999,7 @@ mod tests {
 
         let mut ethernet = wifi.clone();
         ethernet.client_network_type = Some("ethernet".to_string());
-        process_health_packet_to_metrics_pb(&ethernet, &tracker, &dn_map)
+        process_health_packet_to_metrics_pb(&ethernet, &tracker)
             .expect("ethernet packet should replace network type");
         let ethernet_labels = [
             ("meeting_id", "meeting_network_gc_1556"),
@@ -2099,7 +2020,6 @@ mod tests {
     #[test]
     fn audio_active_layers_do_not_relabel_user_cap_as_congestion() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
         let mut packet = create_test_health_packet(
             "session_audio_caps_1561",
             "meeting_audio_caps_1561",
@@ -2109,7 +2029,7 @@ mod tests {
         packet.effective_audio_layers = Some(3);
         packet.active_audio_layers = Some(1);
         packet.audio_congestion_ceiling = None;
-        process_health_packet_to_metrics_pb(&packet, &tracker, &dn_map)
+        process_health_packet_to_metrics_pb(&packet, &tracker)
             .expect("audio layer metrics should be accepted");
 
         let reporter_labels = [
@@ -2202,7 +2122,6 @@ mod tests {
             to_peers: HashSet::new(),
             peer_ids: HashSet::new(),
             display_name: "test_user".to_string(),
-            to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
             client_info_labels: None,
             last_network_type: None,
@@ -2231,7 +2150,6 @@ mod tests {
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
                 display_name: "test_user".to_string(),
-                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
@@ -2278,7 +2196,6 @@ mod tests {
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
                 display_name: "test_user".to_string(),
-                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
@@ -2299,7 +2216,6 @@ mod tests {
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
                 display_name: "test_user".to_string(),
-                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
@@ -2317,7 +2233,7 @@ mod tests {
         }
 
         // Run cleanup
-        cleanup_stale_sessions(&tracker, &Arc::new(Mutex::new(HashMap::new())));
+        cleanup_stale_sessions(&tracker);
 
         // Verify only the fresh session remains
         {
@@ -2341,11 +2257,7 @@ mod tests {
             create_test_health_packet("session_123", "meeting_456", "alice", peer_stats);
 
         // Process the health packet
-        let result = process_health_packet_to_metrics_pb(
-            &health_packet,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
         assert!(result.is_ok());
 
         // Verify session was tracked
@@ -2371,11 +2283,7 @@ mod tests {
         let mut hp = create_test_health_packet("sess_self", "meet_self", "alice", peer_stats);
         hp.reporting_audio_enabled = true;
         hp.reporting_video_enabled = true;
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         assert!(series_exists(
@@ -2399,11 +2307,7 @@ mod tests {
         peer_stats.insert(peer_id.clone(), ps);
 
         let hp = create_test_health_packet("sess_ab", "meet_ab", "alice", peer_stats);
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         assert!(series_exists(
@@ -2454,11 +2358,7 @@ mod tests {
         let hp =
             create_test_health_packet("sess_cs_1641", "meet_cs_1641", "alice_cs_1641", peer_stats);
 
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         // from_peer = reporter (the health-packet's reporting_user_id);
@@ -2507,11 +2407,7 @@ mod tests {
             peer_stats,
         );
 
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         // from_peer = reporter (reporting_user_id); to_peer = the peer being reported on
@@ -2529,6 +2425,191 @@ mod tests {
             Some(12.5),
             "the AUDIO_DATAGRAM_LOSS_PER_SEC export path must run and set the folded loss rate; \
              None here means the .set(loss) export line is missing"
+        );
+    }
+
+    #[test]
+    fn test_audio_datagram_raw_loss_metric_export() {
+        // Issue 2031. The uncapped magnitude companion to the capped per-peer
+        // loss gauge. Reverting the AUDIO_DATAGRAM_RAW_LOSS_PER_SEC `.set(raw_loss)`
+        // export line makes gauge_value() return None and breaks this test.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut ps = PbPeerStats::new();
+        ps.can_listen = true;
+        ps.audio_enabled = true;
+        // A heavy burst: capped saturates at ~64, raw reads the true 210 magnitude.
+        ps.audio_datagram_loss_per_sec = Some(63.0);
+        ps.audio_datagram_raw_loss_per_sec = Some(210.0);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_raw_2031".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_raw_2031",
+            "meet_raw_2031",
+            "alice_raw_2031",
+            peer_stats,
+        );
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        assert!(result.is_ok());
+
+        assert_eq!(
+            gauge_value(
+                "videocall_audio_datagram_raw_loss_per_sec",
+                &[
+                    ("meeting_id", "meet_raw_2031"),
+                    ("session_id", "sess_raw_2031"),
+                    ("from_peer", "alice_raw_2031"),
+                    ("to_peer", "bob_raw_2031"),
+                ],
+            ),
+            Some(210.0),
+            "the AUDIO_DATAGRAM_RAW_LOSS_PER_SEC export path must set the uncapped magnitude; \
+             None here means the .set(raw_loss) export line is missing"
+        );
+    }
+
+    #[test]
+    fn test_wt_receive_telemetry_per_client_metrics_export() {
+        // Issue 2031. The four per-client WT receive-health gauges: read-loop max
+        // gap, queue hwm/max-age read-back, and concealment SPLIT BY transport.
+        // Reverting any of the corresponding `.set(...)` export lines makes the
+        // matching assertion return None (or the wrong transport label) and fails.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet(
+            "sess_wtrx_2031",
+            "meet_wtrx_2031",
+            "alice_wtrx_2031",
+            std::collections::HashMap::new(),
+        );
+        // Reporter is on WebTransport — the concealment must land under
+        // transport="webtransport".
+        hp.active_server_type = "webtransport".to_string();
+        hp.wt_datagram_read_loop_max_gap_ms = Some(420.0);
+        hp.wt_incoming_datagram_high_water_mark = Some(2048.0);
+        hp.wt_incoming_datagram_max_age_ms = Some(3000.0);
+        hp.client_audio_concealment_pct = Some(56.0);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        assert!(result.is_ok());
+
+        let reporter = [
+            ("meeting_id", "meet_wtrx_2031"),
+            ("session_id", "sess_wtrx_2031"),
+            ("peer_id", "alice_wtrx_2031"),
+        ];
+
+        assert_eq!(
+            gauge_value("videocall_client_datagram_read_loop_max_gap_ms", &reporter),
+            Some(420.0),
+            "read-loop max gap must export as the per-client gauge (reader-starvation signal)"
+        );
+        assert_eq!(
+            gauge_value("videocall_wt_incoming_datagram_high_water_mark", &reporter),
+            Some(2048.0),
+            "observed incomingHighWaterMark read-back must export"
+        );
+        assert_eq!(
+            gauge_value("videocall_wt_incoming_datagram_max_age_ms", &reporter),
+            Some(3000.0),
+            "observed incomingMaxAge read-back must export"
+        );
+        // Concealment must carry the transport label sourced from active_server_type.
+        assert_eq!(
+            gauge_value(
+                "videocall_client_audio_concealment_pct",
+                &[
+                    ("meeting_id", "meet_wtrx_2031"),
+                    ("session_id", "sess_wtrx_2031"),
+                    ("peer_id", "alice_wtrx_2031"),
+                    ("transport", "webtransport"),
+                ],
+            ),
+            Some(56.0),
+            "per-client concealment must export split by transport=webtransport"
+        );
+        // And it must NOT appear under the wrong transport.
+        assert_eq!(
+            gauge_value(
+                "videocall_client_audio_concealment_pct",
+                &[
+                    ("meeting_id", "meet_wtrx_2031"),
+                    ("session_id", "sess_wtrx_2031"),
+                    ("peer_id", "alice_wtrx_2031"),
+                    ("transport", "websocket"),
+                ],
+            ),
+            None,
+            "a WebTransport reporter's concealment must not appear under transport=websocket"
+        );
+    }
+
+    #[test]
+    fn test_concealment_sibling_transport_series_cleared_on_switch() {
+        // Issue 2031. A live WT->WS switch (routine once the issue-2029 fallback
+        // ships) must not leave the old transport's concealment series latched.
+        // Report concealment first as webtransport, then as websocket for the SAME
+        // (meeting, session, peer) identity; the webtransport series must be GONE.
+        //
+        // MUTATION: removing the sibling `remove_label_values` at the ingest site
+        // leaves the stale webtransport series at 40.0, so the `None` assertion
+        // below fails — the sensitivity this test guards.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let wt_labels = [
+            ("meeting_id", "meet_sib_2031"),
+            ("session_id", "sess_sib_2031"),
+            ("peer_id", "carol_sib_2031"),
+            ("transport", "webtransport"),
+        ];
+        let ws_labels = [
+            ("meeting_id", "meet_sib_2031"),
+            ("session_id", "sess_sib_2031"),
+            ("peer_id", "carol_sib_2031"),
+            ("transport", "websocket"),
+        ];
+
+        // 1) On WebTransport, concealment 40%.
+        let mut hp_wt = create_test_health_packet(
+            "sess_sib_2031",
+            "meet_sib_2031",
+            "carol_sib_2031",
+            std::collections::HashMap::new(),
+        );
+        hp_wt.active_server_type = "webtransport".to_string();
+        hp_wt.client_audio_concealment_pct = Some(40.0);
+        assert!(process_health_packet_to_metrics_pb(&hp_wt, &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_client_audio_concealment_pct", &wt_labels),
+            Some(40.0),
+            "webtransport concealment series must be present after the WT report"
+        );
+
+        // 2) The SAME client switches to WebSocket, concealment 15%.
+        let mut hp_ws = create_test_health_packet(
+            "sess_sib_2031",
+            "meet_sib_2031",
+            "carol_sib_2031",
+            std::collections::HashMap::new(),
+        );
+        hp_ws.active_server_type = "websocket".to_string();
+        hp_ws.client_audio_concealment_pct = Some(15.0);
+        assert!(process_health_packet_to_metrics_pb(&hp_ws, &tracker).is_ok());
+
+        // The stale sibling (webtransport) series must be CLEARED...
+        assert_eq!(
+            gauge_value("videocall_client_audio_concealment_pct", &wt_labels),
+            None,
+            "the stale webtransport concealment series must be cleared on the WT->WS switch"
+        );
+        // ...and the now-active websocket series present with the new value.
+        assert_eq!(
+            gauge_value("videocall_client_audio_concealment_pct", &ws_labels),
+            Some(15.0),
+            "the active websocket concealment series must be present after the switch"
         );
     }
 
@@ -2575,23 +2656,16 @@ mod tests {
             peer_stats,
         );
 
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         // from_peer = reporter (reporting_user_id); to_peer = the reported peer (peer_stats key).
-        // reporter_name/peer_name fall back to the reporter/peer id when no display name is set
-        // (create_test_health_packet leaves display names unset), so assert all 6 labels.
+        // #1954: per-pair series are keyed only by the 4 stable ids (no reporter_name/peer_name).
         let labels = [
             ("meeting_id", "meet_scr_1660"),
             ("session_id", "sess_scr_1660"),
             ("from_peer", "alice_scr_1660"),
             ("to_peer", "bob_scr_1660"),
-            ("reporter_name", "alice_scr_1660"),
-            ("peer_name", "bob_scr_1660"),
         ];
 
         assert_eq!(
@@ -2656,11 +2730,7 @@ mod tests {
         peer_stats.insert(to_peer.to_string(), ps);
 
         let hp = create_test_health_packet(session_id, meeting_id, reporting_user_id, peer_stats);
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         let labels = [
@@ -2725,13 +2795,9 @@ mod tests {
         {
             let tracker_clone = tracker.clone();
             rt.block_on(async move {
-                let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
-                let resp = metrics_handler(
-                    web::Data::new(health_store),
-                    web::Data::new(tracker_clone),
-                    web::Data::new(dn_map),
-                )
-                .await;
+                let resp =
+                    metrics_handler(web::Data::new(health_store), web::Data::new(tracker_clone))
+                        .await;
                 assert!(resp.is_ok());
             });
         }
@@ -2751,13 +2817,16 @@ mod tests {
         let meeting_id = "meeting_rm";
         let session_id = "session_rm";
         let reporting_user_id = "alice";
-        let packet =
+        let mut packet =
             create_test_health_packet(session_id, meeting_id, reporting_user_id, peer_stats);
-        let result = process_health_packet_to_metrics_pb(
-            &packet,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        // #1737 Phase 0: set the two unistream byte totals so their reporter-keyed
+        // gauges are exported and can be checked for reaping below.
+        packet.unistream_bytes_offered_total = Some(5000);
+        packet.unistream_bytes_drained_total = Some(1200);
+        // #1737 Phase 1: the stale-delta-drops gauge shares the same reporter
+        // labels and reap path.
+        packet.unistream_stale_delta_drops_total = Some(37);
+        let result = process_health_packet_to_metrics_pb(&packet, &tracker);
         assert!(result.is_ok());
 
         // Confirm a series exists
@@ -2770,6 +2839,44 @@ mod tests {
                 ("to_peer", "bob"),
             ],
         ));
+
+        // #1737 Phase 0: the two unistream byte gauges carry an unbounded
+        // session_id label and MUST be reaped by remove_session_metrics. Their
+        // reporter_labels key is (meeting_id, session_id, peer_id=reporting_user_id).
+        // Guarding them here makes the reap mutation-sensitive: deleting either
+        // remove_label_values line in remove_session_metrics leaves the series
+        // live and fails the post-removal assertion below.
+        let unistream_reporter_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("peer_id", reporting_user_id),
+        ];
+        assert!(series_exists(
+            "videocall_unistream_bytes_offered_total",
+            &unistream_reporter_labels,
+        ));
+        assert!(series_exists(
+            "videocall_unistream_bytes_drained_total",
+            &unistream_reporter_labels,
+        ));
+        assert!(series_exists(
+            "videocall_unistream_stale_delta_drops_total",
+            &unistream_reporter_labels,
+        ));
+
+        // #1580: peer_info must also be reaped by remove_session_metrics. Its
+        // key is (meeting_id, session_id, peer_id=reporting_user_id,
+        // display_name). Guarding this here makes the reap-path removal
+        // mutation-sensitive — deleting the VIDEOCALL_PEER_INFO line in
+        // remove_session_metrics fails this assertion (previously untested; the
+        // rename-path test does not exercise the reap path).
+        let peer_info_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("peer_id", reporting_user_id),
+            ("display_name", "alice"),
+        ];
+        assert!(series_exists("videocall_peer_info", &peer_info_labels));
 
         // Remove and ensure it disappears
         let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
@@ -2788,6 +2895,31 @@ mod tests {
                 ("to_peer", "bob"),
             ],
         ));
+        assert!(
+            !series_exists("videocall_peer_info", &peer_info_labels),
+            "peer_info must be reaped by remove_session_metrics (#1580)"
+        );
+        assert!(
+            !series_exists(
+                "videocall_unistream_bytes_offered_total",
+                &unistream_reporter_labels,
+            ),
+            "unistream_bytes_offered_total must be reaped by remove_session_metrics (#1737)"
+        );
+        assert!(
+            !series_exists(
+                "videocall_unistream_bytes_drained_total",
+                &unistream_reporter_labels,
+            ),
+            "unistream_bytes_drained_total must be reaped by remove_session_metrics (#1737)"
+        );
+        assert!(
+            !series_exists(
+                "videocall_unistream_stale_delta_drops_total",
+                &unistream_reporter_labels,
+            ),
+            "unistream_stale_delta_drops_total must be reaped by remove_session_metrics (#1737)"
+        );
     }
 
     #[test]
@@ -2795,10 +2927,7 @@ mod tests {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
         // Build a packet with the two #522 RTT-probe cumulative totals set to
-        // distinct non-zero values. create_test_health_packet leaves display_name
-        // unset, so the exported series' display_name label falls back to the
-        // reporting_user_id ("probeuser") via reporter_display_name (see the
-        // .unwrap_or(reporting_user_id) fallback in process_health_packet_to_metrics_pb).
+        // distinct non-zero values.
         let peer_stats: std::collections::HashMap<String, PbPeerStats> =
             std::collections::HashMap::new();
         let mut packet =
@@ -2806,11 +2935,7 @@ mod tests {
         packet.rtt_probe_dropped_total = Some(7);
         packet.rtt_probe_stale_suppressions_total = Some(3);
 
-        let result = process_health_packet_to_metrics_pb(
-            &packet,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&packet, &tracker);
         assert!(result.is_ok());
 
         // Value-checking helper: mirrors series_exists's label-matching loop but
@@ -2838,7 +2963,6 @@ mod tests {
             ("meeting_id", "meeting_rtt522"),
             ("session_id", "session_rtt522"),
             ("peer_id", "probeuser"),
-            ("display_name", "probeuser"),
         ];
         let suppressions_labels = dropped_labels;
 
@@ -2891,11 +3015,7 @@ mod tests {
         hp.camera_encoder_restarts_closed_codec = Some(3);
         hp.screen_encoder_restarts_configure = Some(5);
 
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         let camera_labels = [
@@ -2955,11 +3075,7 @@ mod tests {
             create_test_health_packet("session_789", "meeting_999", "alice", peer_stats);
 
         // Process the health packet
-        let result = process_health_packet_to_metrics_pb(
-            &health_packet,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
         assert!(result.is_ok());
 
         // Verify session tracking
@@ -2977,11 +3093,7 @@ mod tests {
         // Test minimal packet
         let peer_stats = std::collections::HashMap::new();
         let hp = create_test_health_packet("session_123", "meeting_123", "alice", peer_stats);
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
     }
 
@@ -3003,7 +3115,6 @@ mod tests {
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
                 display_name: "test_user".to_string(),
-                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
@@ -3021,7 +3132,6 @@ mod tests {
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
                 display_name: "test_user".to_string(),
-                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
@@ -3040,7 +3150,6 @@ mod tests {
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
                 display_name: "test_user".to_string(),
-                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
@@ -3056,7 +3165,7 @@ mod tests {
         }
 
         // Run cleanup
-        cleanup_stale_sessions(&tracker, &Arc::new(Mutex::new(HashMap::new())));
+        cleanup_stale_sessions(&tracker);
 
         // Verify cleanup results
         {
@@ -3078,7 +3187,6 @@ mod tests {
             to_peers: HashSet::new(),
             peer_ids: HashSet::new(),
             display_name: "test_user".to_string(),
-            to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
             client_info_labels: None,
             last_network_type: None,
@@ -3107,7 +3215,6 @@ mod tests {
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
                 display_name: "test_user".to_string(),
-                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
@@ -3136,11 +3243,7 @@ mod tests {
             create_test_health_packet("session_empty", "meeting_empty", "alice", empty_peer_stats);
 
         // Process the health packet
-        let result = process_health_packet_to_metrics_pb(
-            &health_packet,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
         assert!(result.is_ok());
 
         // Verify session was still tracked even with empty peer stats
@@ -3169,11 +3272,7 @@ mod tests {
         hp.active_server_rtt_ms = 42.5;
 
         // Process the packet to set RTT metrics
-        let result = process_health_packet_to_metrics_pb(
-            &hp,
-            &tracker,
-            &Arc::new(Mutex::new(HashMap::new())),
-        );
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         // Verify server info was tracked
@@ -3257,7 +3356,6 @@ mod tests {
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
                 display_name: "test_user".to_string(),
-                to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
                 client_info_labels: None,
                 last_network_type: None,
@@ -3269,7 +3367,7 @@ mod tests {
         }
 
         // Run cleanup
-        cleanup_stale_sessions(&tracker, &Arc::new(Mutex::new(HashMap::new())));
+        cleanup_stale_sessions(&tracker);
 
         // Session should be cleaned up (>= 30 seconds is considered stale)
         {
@@ -3281,7 +3379,6 @@ mod tests {
     #[test]
     fn test_jwt_token_stripped_from_server_url() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         // URL with ?token= (only query param)
         let mut hp = create_test_health_packet("s1", "m1", "alice", HashMap::new());
@@ -3292,7 +3389,7 @@ mod tests {
         let (peer_id, ps) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
         hp.peer_stats.insert(peer_id, ps);
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         // Verify the server_url label does NOT contain the token
@@ -3318,7 +3415,6 @@ mod tests {
     #[test]
     fn test_jwt_token_stripped_with_other_params() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         // URL with token among other query params
         let mut hp = create_test_health_packet("s2", "m2", "carol", HashMap::new());
@@ -3329,7 +3425,7 @@ mod tests {
         let (peer_id, ps) = create_test_peer_stats("dave", true, true, 50.0, 2.0);
         hp.peer_stats.insert(peer_id, ps);
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         assert!(
@@ -3351,7 +3447,6 @@ mod tests {
     #[test]
     fn test_rtt_publishes_when_server_url_scrubbed_empty() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Simulate the post-scrub state: URL + server_type both zeroed, RTT set.
         let mut hp = create_test_health_packet("s_scrub", "m_scrub", "eve", HashMap::new());
@@ -3361,7 +3456,7 @@ mod tests {
         let (peer_id, ps) = create_test_peer_stats("frank", true, true, 50.0, 2.0);
         hp.peer_stats.insert(peer_id, ps);
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         // RTT metric must be present with empty server_url / server_type labels.
@@ -3398,7 +3493,6 @@ mod tests {
     #[test]
     fn test_rtt_not_published_when_zero_and_url_empty() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         let mut hp = create_test_health_packet("s_zero", "m_zero", "gina", HashMap::new());
         hp.active_server_url = String::new();
@@ -3407,7 +3501,7 @@ mod tests {
         let (peer_id, ps) = create_test_peer_stats("hank", true, true, 50.0, 2.0);
         hp.peer_stats.insert(peer_id, ps);
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         assert!(
@@ -3424,69 +3518,109 @@ mod tests {
     }
 
     #[test]
-    fn test_display_name_resolution_removes_stale_series() {
+    fn test_per_pair_metrics_carry_no_name_labels() {
+        // #1954: per-pair series keyed only by (meeting_id, session_id, from_peer, to_peer).
+        // Reverting metrics.rs + peer_labels back to 6 labels re-attaches the name labels and
+        // fails the !matching_series_has_label asserts below — the mutation guard.
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
-        // First packet: reporter alice sees peer "12345" (no display name yet)
-        let (peer_id, ps) = create_test_peer_stats("12345", true, true, 50.0, 2.0);
-        let mut hp = create_test_health_packet("s10", "m10", "alice", HashMap::new());
+        // Build a health packet from reporter "alice_1954" observing peer "bob_1954" with a
+        // real display_name set on the packet (PII that must NOT reach a per-pair label).
+        // from_peer = reporting_user_id ("alice_1954"); to_peer = the peer_stats key ("bob_1954").
+        let (peer_id, ps) = create_test_peer_stats("bob_1954", true, true, 50.0, 2.0);
+        let mut hp = create_test_health_packet("s1954", "m1954", "alice_1954", HashMap::new());
         hp.peer_stats.insert(peer_id, ps);
-        hp.display_name = Some("Alice".to_string());
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
-        assert!(result.is_ok());
+        hp.display_name = Some("Alice Real Name".to_string());
 
-        // Verify series exists with session_id as peer_name
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let stable = [
+            ("meeting_id", "m1954"),
+            ("session_id", "s1954"),
+            ("from_peer", "alice_1954"),
+            ("to_peer", "bob_1954"),
+        ];
+        // videocall_peer_can_listen is set unconditionally in the publish loop, so it is
+        // always present for the 4 stable labels — guards against a vacuous pass.
         assert!(
-            series_exists(
-                "videocall_peer_can_listen",
-                &[
-                    ("meeting_id", "m10"),
-                    ("to_peer", "12345"),
-                    ("peer_name", "12345")
-                ]
-            ),
-            "Should have series with session_id as peer_name"
+            series_exists("videocall_peer_can_listen", &stable),
+            "per-pair series must be published for the 4 stable labels"
         );
+        assert!(
+            !matching_series_has_label("videocall_peer_can_listen", &stable, "reporter_name"),
+            "per-pair series must not carry reporter_name (PII)"
+        );
+        assert!(
+            !matching_series_has_label("videocall_peer_can_listen", &stable, "peer_name"),
+            "per-pair series must not carry peer_name (PII)"
+        );
+    }
 
-        // Now the peer sends their own health packet, populating the display_name_map
-        {
-            let mut map = dn_map.lock().unwrap_or_else(|e| e.into_inner());
-            map.insert("12345".to_string(), "Bob".to_string());
-        }
+    #[test]
+    fn test_peer_info_rename_cleanup_and_client_metric_label_shape() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
-        // Second packet from alice: now "12345" resolves to "Bob"
-        let (peer_id2, ps2) = create_test_peer_stats("12345", true, true, 50.0, 2.0);
-        let mut hp2 = create_test_health_packet("s10", "m10", "alice", HashMap::new());
-        hp2.peer_stats.insert(peer_id2, ps2);
-        hp2.display_name = Some("Alice".to_string());
-        let result2 = process_health_packet_to_metrics_pb(&hp2, &tracker, &dn_map);
+        let mut hp1 = create_test_health_packet(
+            "session_peer_info",
+            "meeting_peer_info",
+            "peer_info_user",
+            HashMap::new(),
+        );
+        hp1.display_name = Some("Alice One".to_string());
+        let result1 = process_health_packet_to_metrics_pb(&hp1, &tracker);
+        assert!(result1.is_ok());
+
+        let mut hp2 = create_test_health_packet(
+            "session_peer_info",
+            "meeting_peer_info",
+            "peer_info_user",
+            HashMap::new(),
+        );
+        hp2.display_name = Some("Alice Two".to_string());
+        let result2 = process_health_packet_to_metrics_pb(&hp2, &tracker);
         assert!(result2.is_ok());
 
-        // Old series with session_id as peer_name should be removed
+        let stable_labels = [
+            ("meeting_id", "meeting_peer_info"),
+            ("session_id", "session_peer_info"),
+            ("peer_id", "peer_info_user"),
+        ];
+        assert_eq!(
+            matching_series_count("videocall_peer_info", &stable_labels),
+            1,
+            "display-name rename must leave exactly one peer_info series per stable peer key"
+        );
         assert!(
             !series_exists(
-                "videocall_peer_can_listen",
+                "videocall_peer_info",
                 &[
-                    ("meeting_id", "m10"),
-                    ("to_peer", "12345"),
-                    ("peer_name", "12345")
-                ]
+                    ("meeting_id", "meeting_peer_info"),
+                    ("session_id", "session_peer_info"),
+                    ("peer_id", "peer_info_user"),
+                    ("display_name", "Alice One"),
+                ],
             ),
-            "Stale series with session_id as peer_name should be removed"
+            "old peer_info display_name label set must be removed on rename"
         );
-
-        // New series with resolved display_name should exist
         assert!(
             series_exists(
-                "videocall_peer_can_listen",
+                "videocall_peer_info",
                 &[
-                    ("meeting_id", "m10"),
-                    ("to_peer", "12345"),
-                    ("peer_name", "Bob")
-                ]
+                    ("meeting_id", "meeting_peer_info"),
+                    ("session_id", "session_peer_info"),
+                    ("peer_id", "peer_info_user"),
+                    ("display_name", "Alice Two"),
+                ],
             ),
-            "New series with resolved display_name should exist"
+            "new peer_info display_name label set must exist"
+        );
+        assert!(
+            !matching_series_has_label(
+                "videocall_client_tab_visible",
+                &stable_labels,
+                "display_name",
+            ),
+            "per-client metrics must not carry display_name labels"
         );
     }
 
@@ -3515,7 +3649,6 @@ mod tests {
         // peer_stats.len() + 1. With a single live reporter, the meeting has exactly
         // one tracked session, so the count is 1 even though the reporter sees peers.
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         // One reporter (alice) that observes 2 peers.
         let (p1, ps1) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
@@ -3524,7 +3657,7 @@ mod tests {
         hp.peer_stats.insert(p1, ps1);
         hp.peer_stats.insert(p2, ps2);
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         assert_eq!(
@@ -3537,7 +3670,7 @@ mod tests {
         let mut hp2 = create_test_health_packet("s21", "m20", "bob", HashMap::new());
         let (p3, ps3) = create_test_peer_stats("alice", true, true, 50.0, 2.0);
         hp2.peer_stats.insert(p3, ps3);
-        let result2 = process_health_packet_to_metrics_pb(&hp2, &tracker, &dn_map);
+        let result2 = process_health_packet_to_metrics_pb(&hp2, &tracker);
         assert!(result2.is_ok());
 
         assert_eq!(
@@ -3553,7 +3686,6 @@ mod tests {
         // removed entirely when the meeting empties — instead of latching a phantom
         // count forever.
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Two distinct participants report in meeting "m_leak".
         let mut hp_a = create_test_health_packet("s_a", "m_leak", "alice", HashMap::new());
@@ -3562,8 +3694,8 @@ mod tests {
         let mut hp_b = create_test_health_packet("s_b", "m_leak", "bob", HashMap::new());
         let (pb, psb) = create_test_peer_stats("alice", true, true, 50.0, 2.0);
         hp_b.peer_stats.insert(pb, psb);
-        assert!(process_health_packet_to_metrics_pb(&hp_a, &tracker, &dn_map).is_ok());
-        assert!(process_health_packet_to_metrics_pb(&hp_b, &tracker, &dn_map).is_ok());
+        assert!(process_health_packet_to_metrics_pb(&hp_a, &tracker).is_ok());
+        assert!(process_health_packet_to_metrics_pb(&hp_b, &tracker).is_ok());
 
         assert_eq!(
             meeting_participants_value("m_leak"),
@@ -3580,7 +3712,7 @@ mod tests {
                 }
             }
         }
-        cleanup_stale_sessions(&tracker, &dn_map);
+        cleanup_stale_sessions(&tracker);
 
         assert_eq!(
             meeting_participants_value("m_leak"),
@@ -3595,7 +3727,7 @@ mod tests {
                 info.last_seen = Instant::now() - Duration::from_secs(60);
             }
         }
-        cleanup_stale_sessions(&tracker, &dn_map);
+        cleanup_stale_sessions(&tracker);
 
         assert_eq!(
             meeting_participants_value("m_leak"),
@@ -3607,7 +3739,6 @@ mod tests {
     #[test]
     fn test_p1_metrics_exposed() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         let (peer_id, ps) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
         let mut hp = create_test_health_packet("s30", "m30", "alice", HashMap::new());
@@ -3617,7 +3748,7 @@ mod tests {
         hp.packets_sent_per_sec = Some(45.0);
         hp.is_tab_throttled = true;
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         assert!(
@@ -3651,7 +3782,6 @@ mod tests {
     #[test]
     fn test_nonheap_memory_metrics_exposed() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         let (peer_id, ps) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
         let mut hp = create_test_health_packet("s1032", "m1032", "alice", HashMap::new());
@@ -3659,7 +3789,7 @@ mod tests {
         hp.wasm_memory_bytes = Some(67_108_864); // 64 MiB WASM linear memory
         hp.agent_memory_bytes = Some(2_147_483_648); // 2 GiB total agent memory
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         assert!(
@@ -3683,14 +3813,13 @@ mod tests {
     #[test]
     fn test_nonheap_memory_metrics_absent_when_omitted() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         let (peer_id, ps) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
         let mut hp = create_test_health_packet("s1032b", "m1032b", "alice", HashMap::new());
         hp.peer_stats.insert(peer_id, ps);
         // wasm_memory_bytes / agent_memory_bytes deliberately left None.
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         assert!(
@@ -3705,7 +3834,6 @@ mod tests {
     #[test]
     fn test_health_reports_counter_incremented() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         let before = HEALTH_REPORTS_TOTAL.get();
 
@@ -3713,7 +3841,7 @@ mod tests {
         let mut hp = create_test_health_packet("s40", "m40", "alice", HashMap::new());
         hp.peer_stats.insert(peer_id, ps);
 
-        let _ = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let _ = process_health_packet_to_metrics_pb(&hp, &tracker);
 
         let after = HEALTH_REPORTS_TOTAL.get();
         assert!(
@@ -3725,12 +3853,11 @@ mod tests {
     #[test]
     fn test_client_info_published_for_battery_only_metadata() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         let mut hp = create_test_health_packet("s_battery", "m_battery", "alice", HashMap::new());
         hp.client_battery_level = Some(0.42);
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         assert!(
@@ -3739,7 +3866,6 @@ mod tests {
                 &[
                     ("meeting_id", "m_battery"),
                     ("session_id", "s_battery"),
-                    ("display_name", "alice"),
                     ("cores", ""),
                     ("architecture", ""),
                     ("gpu_family", ""),
@@ -3754,12 +3880,11 @@ mod tests {
     #[test]
     fn test_battery_level_gauge_published_with_reported_value() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         let mut hp = create_test_health_packet("s_batval", "m_batval", "alice", HashMap::new());
         hp.client_battery_level = Some(0.37);
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         // #1392: the battery VALUE must ride on its own numeric gauge (peer_id is
@@ -3779,14 +3904,13 @@ mod tests {
     #[test]
     fn test_battery_level_gauge_absent_when_not_reported() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         // A packet with OTHER client metadata (so the TELEM-7 block runs) but no
         // battery level: the gauge must stay absent, not publish a misleading 0.
         let mut hp = create_test_health_packet("s_nobat", "m_nobat", "carol", HashMap::new());
         hp.client_cores = Some(8);
 
-        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());
 
         let labels = [
@@ -3798,50 +3922,6 @@ mod tests {
             gauge_value("videocall_client_battery_level", &labels),
             None,
             "an absent battery level must leave the gauge absent (not a 0)"
-        );
-    }
-
-    #[test]
-    fn test_display_name_map_cleanup() {
-        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
-
-        // Populate the display_name_map with some entries
-        {
-            let mut map = dn_map.lock().unwrap_or_else(|e| e.into_inner());
-            map.insert("active_session".to_string(), "Alice".to_string());
-            map.insert("stale_session".to_string(), "Bob".to_string());
-        }
-
-        // Only add active_session to the tracker
-        {
-            let mut t = tracker.lock().unwrap_or_else(|e| e.into_inner());
-            t.insert(
-                "m1_active_session_alice".to_string(),
-                SessionInfo {
-                    session_id: "active_session".to_string(),
-                    meeting_id: "m1".to_string(),
-                    reporting_user_id: "alice".to_string(),
-                    display_name: "Alice".to_string(),
-                    last_seen: Instant::now() - Duration::from_secs(60), // stale
-                    to_peers: HashSet::new(),
-                    to_peer_display_names: HashMap::new(),
-                    peer_ids: HashSet::new(),
-                    active_servers: HashSet::new(),
-                    client_info_labels: None,
-                    last_network_type: None,
-                    received_layer_peers: HashSet::new(),
-                },
-            );
-        }
-
-        // Run cleanup — both sessions should be removed (active_session is stale too)
-        cleanup_stale_sessions(&tracker, &dn_map);
-
-        let map = dn_map.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            map.is_empty(),
-            "All display_name_map entries should be cleaned since all sessions are stale"
         );
     }
 
@@ -3888,7 +3968,6 @@ mod tests {
     #[test]
     fn test_departed_peer_per_pair_series_pruned_on_next_packet() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
         let meeting_id = "m_prune_1092";
         let session_id = "s_prune_1092";
@@ -3901,7 +3980,7 @@ mod tests {
         let mut hp1 = create_test_health_packet(session_id, meeting_id, reporter, HashMap::new());
         hp1.peer_stats.insert(pa, psa);
         hp1.peer_stats.insert(pb, psb);
-        assert!(process_health_packet_to_metrics_pb(&hp1, &tracker, &dn_map).is_ok());
+        assert!(process_health_packet_to_metrics_pb(&hp1, &tracker).is_ok());
 
         // Both per-pair series exist after packet 1.
         let labels_a = [
@@ -3929,7 +4008,7 @@ mod tests {
         let (pa2, psa2) = create_test_peer_stats("peer_a_1092", true, true, 150.0, 8.0);
         let mut hp2 = create_test_health_packet(session_id, meeting_id, reporter, HashMap::new());
         hp2.peer_stats.insert(pa2, psa2);
-        assert!(process_health_packet_to_metrics_pb(&hp2, &tracker, &dn_map).is_ok());
+        assert!(process_health_packet_to_metrics_pb(&hp2, &tracker).is_ok());
 
         // peer_b's per-pair series must be GONE; peer_a's must remain.
         assert!(
@@ -3970,7 +4049,6 @@ mod tests {
                 info.to_peers.contains("peer_a_1092"),
                 "peer_a must remain in to_peers"
             );
-            assert!(!info.to_peer_display_names.contains_key("peer_b_1092"));
             assert!(
                 info.peer_ids.contains("peer_b_1092"),
                 "peer_b must REMAIN in peer_ids so whole-session reap removes \
@@ -3981,7 +4059,7 @@ mod tests {
         // Packet 3: reporter sees NOBODY (empty peer_stats). peer_a must be pruned
         // too — this exercises the unconditional prune on the empty-peer_stats path.
         let hp3 = create_test_health_packet(session_id, meeting_id, reporter, HashMap::new());
-        assert!(process_health_packet_to_metrics_pb(&hp3, &tracker, &dn_map).is_ok());
+        assert!(process_health_packet_to_metrics_pb(&hp3, &tracker).is_ok());
 
         assert!(
             !series_exists("videocall_neteq_packets_awaiting_decode", &labels_a),

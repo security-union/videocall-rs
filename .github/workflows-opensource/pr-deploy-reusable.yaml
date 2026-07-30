@@ -555,9 +555,6 @@ jobs:
             --set-string "runtimeConfig.firefoxEnabled=false" \
             --set "runtimeConfig.usersAllowedToStream=" \
             --set "runtimeConfig.serverElectionPeriodMs=2000" \
-            --set "runtimeConfig.audioBitrateKbps=65" \
-            --set "runtimeConfig.videoBitrateKbps=1000" \
-            --set "runtimeConfig.screenBitrateKbps=1000" \
             --set "ingress.hosts[0].host=pr${SLOT}.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

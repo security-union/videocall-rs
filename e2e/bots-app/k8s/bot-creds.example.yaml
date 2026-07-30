@@ -1,0 +1,21 @@
+# bot-creds.example.yaml — TEMPLATE ONLY. Contains PLACEHOLDERS, never real creds.
+#
+# PREFERRED (creds never touch a file / git):
+#   kubectl -n bot-load create secret generic bot-creds \
+#     --from-literal=BOT_EMAIL='<BOT_EMAIL>' \
+#     --from-literal=BOT_PASSWORD='<BOT_PASSWORD>'
+#
+# This manifest exists only to document the Secret's shape (the keys the pod's
+# secretKeyRef expects). If you must apply it instead of the imperative form,
+# replace the placeholders in a LOCAL copy and keep that copy out of git.
+#
+# The bot account should be a dedicated test identity, not a personal login.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bot-creds
+  namespace: bot-load
+type: Opaque
+stringData:
+  BOT_EMAIL: "<BOT_EMAIL>"
+  BOT_PASSWORD: "<BOT_PASSWORD>"

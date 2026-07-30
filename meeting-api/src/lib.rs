@@ -20,6 +20,7 @@
 pub mod auth;
 pub mod config;
 pub mod console_log_purge;
+pub(crate) mod cookie;
 pub mod cors;
 pub mod db;
 pub mod error;
@@ -29,5 +30,6 @@ pub mod nats_events;
 pub mod oauth;
 pub mod routes;
 pub mod search;
+pub mod session_refresh;
 pub mod state;
 pub mod token;

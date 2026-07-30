@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildLaunchedBotTask, countFailed } from "./orchestrator";
+import { buildLaunchedBotTask, countFailed, registerSshTask } from "./orchestrator";
 import {
   appendLocalLog,
   newRegistryEntry,
@@ -9,6 +9,8 @@ import {
   type BotStatus,
 } from "./control/registry";
 import type { LaunchSpec } from "./control/server";
+import type { SshHost } from "./control/ssh-hosts";
+import { buildSshCommand, type SshBotHandle, type SshLaunchSpec } from "./control/ssh-launcher";
 import { parseManifestText } from "./manifest";
 import type { BotTask } from "./orchestrator";
 
@@ -254,6 +256,62 @@ lines:
       runDir: null,
     });
     expect(task.manifestDir).toBeNull();
+  });
+});
+
+describe("orchestrator.registerSshTask", () => {
+  it("forwards clock video mode through the production SSH spawn path", async () => {
+    const host: SshHost = {
+      label: "clock-host",
+      host: "clock-host.intra",
+      user: "alice",
+      sshKey: null,
+      reposPath: "/home/alice/videocall",
+      notes: null,
+      shell: null,
+      profileFile: null,
+      preCommand: null,
+      forwardSsoState: false,
+      addedAt: 1,
+    };
+    const spec: LaunchSpec = {
+      meetingURL: "https://example.com/meeting/X",
+      participant: "clock-bot",
+      ttl: 300_000,
+      headless: true,
+      network: "none",
+      authBackend: "jwt",
+      videoMode: "clock",
+    };
+    const registry = new Map<string, BotRegistryEntry>();
+    const inFlight = new Map<string, Promise<import("./bot").BotExitReason>>();
+    let captured: SshLaunchSpec | null = null;
+    const fakeSpawnRemoteBot = (launchSpec: SshLaunchSpec): SshBotHandle => {
+      captured = launchSpec;
+      return {
+        host: launchSpec.host,
+        child: { kill: () => true } as unknown as SshBotHandle["child"],
+        recentLog: [],
+        totalLines: 0,
+        exitCode: null,
+        finished: false,
+        exit: Promise.resolve(0),
+      };
+    };
+
+    const botId = await registerSshTask(spec, host, {
+      registry,
+      inFlight,
+      inFlightWaiters: [],
+      spawnRemoteBot: fakeSpawnRemoteBot,
+    });
+
+    expect(registry.get(botId)?.task.videoMode).toBe("clock");
+    expect(captured).not.toBeNull();
+    expect(captured!.videoMode).toBe("clock");
+    expect(buildSshCommand(captured!.host, captured!).remoteCommand).toContain(
+      "--video-mode 'clock'",
+    );
   });
 });
 

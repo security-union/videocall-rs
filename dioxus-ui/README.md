@@ -138,12 +138,29 @@ window.__APP_CONFIG = Object.freeze({
     oauthIssuer: "",             // OIDC issuer URL for discovery
     oauthPrompt: "",             // "login", "consent", "select_account", or "" to omit
     serverElectionPeriodMs: 2000,
-    audioBitrateKbps: 65,
-    videoBitrateKbps: 100,
-    screenBitrateKbps: 100,
     vadThreshold: 0.02,         // Voice activity detection sensitivity (0.01=high, 0.05=low)
 });
 ```
+
+`audioBitrateKbps`, `videoBitrateKbps`, and `screenBitrateKbps` are not runtime
+configuration keys. They were retired by #1193 because the adaptive-quality and
+simulcast paths already owned the live targets: audio and screen ignored or
+overwrote the values, while camera used its value only as a short-lived
+single-stream constructor seed. Stale configs may still contain the keys, but
+the UI ignores them.
+
+Encoder bitrate tuning is code-owned and centralized:
+
+- Camera single-stream targets and camera simulcast rungs come from
+  `VIDEO_QUALITY_TIERS` and `SIMULCAST_VIDEO_LAYERS`.
+- Screen targets and rungs come from `SCREEN_QUALITY_TIERS`; the initial tier is
+  selected from current RTT and camera state.
+- Single-stream audio targets come from `AUDIO_QUALITY_TIERS`; audio simulcast
+  uses the `[12, 24, 48]` kbps ladder in `microphone_encoder.rs`.
+
+The shared video, screen, and adaptive-audio tables live in
+`videocall-aq/src/constants.rs`. Retune those source-of-truth tables with their
+tests instead of adding deployment-specific bitrate keys to `config.js`.
 
 **OAuth flow modes:**
 

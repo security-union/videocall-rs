@@ -53,6 +53,7 @@ use super::super::client::VideoCallClient;
 use super::classify_encode_error::{
     classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
 };
+use super::dimensions::{resolve_capture_dimensions, settings_source_stamp};
 use super::encoder_state::{
     keyframe_tick_decision, periodic_keyframe_due, EncoderState, KeyframeTickInput,
 };
@@ -82,6 +83,188 @@ const SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = 3;
 /// unit-testable without a live `ScreenEncoder`.
 fn clamp_screen_layer_count(max_layers: u32) -> u32 {
     max_layers.clamp(1, SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS)
+}
+
+/// Capture-time resolution ceiling requested from `getDisplayMedia` (issue 1973).
+///
+/// Derived from the top `SCREEN_QUALITY_TIERS` rung (currently 1920x1080) so the
+/// capture ceiling can never silently desync from the encode cap. That rung
+/// already caps ENCODED output, so bounding CAPTURE costs no quality while
+/// sparing the encoder its per-frame WebCodecs software rescale: the encoder is
+/// configured at the `fit_within_preserving_aspect` size, but WebCodecs must
+/// rescale each oversized raw capture frame down to those config dims on the
+/// codec queue. Field-proven on an ultra-wide M3 Pro: Chrome delivered native
+/// 3840x1600 frames despite `{ ideal: 1920 }` (a hint), and rescaling that
+/// source every frame stalled the encoder for 60-142s.
+const SCREEN_CAPTURE_MAX_WIDTH: f64 = SCREEN_QUALITY_TIERS[0].max_width as f64;
+const SCREEN_CAPTURE_MAX_HEIGHT: f64 = SCREEN_QUALITY_TIERS[0].max_height as f64;
+/// Preferred capture framerate hint (unchanged; screen share targets ≤10fps).
+const SCREEN_CAPTURE_IDEAL_FPS: f64 = 10.0;
+
+/// Ordered `(key, value)` entries applied to each `MediaTrackConstraints`
+/// sub-dictionary (`width`, `height`, `frameRate`) of the `getDisplayMedia`
+/// video request. Pure + host-testable so the issue-1973 resolution ceiling can
+/// be pinned by a unit test without a live browser; the wasm builder
+/// [`build_screen_display_constraints`] writes exactly these entries onto the JS
+/// constraint object, so the test guards what is actually sent to the browser.
+struct ScreenCaptureConstraintSpec {
+    width: Vec<(&'static str, f64)>,
+    height: Vec<(&'static str, f64)>,
+    framerate: Vec<(&'static str, f64)>,
+}
+
+/// Build the screen-capture constraint spec.
+///
+/// `include_ceiling` selects whether the issue-1973 resolution ceiling (`max`)
+/// is requested. It is `true` on the normal path; the acquire helper retries
+/// with `false` — the pre-issue-1973 `ideal`-only request — once if a browser
+/// rejects the ceiling with `OverconstrainedError`.
+///
+/// # Why `max` (issue 1973)
+/// `ideal` is only a hint, so the browser may still deliver native resolution.
+/// Per the MediaTrackConstraints spec `max` is a mandatory upper bound in the
+/// SelectSettings fitness algorithm (settings above it are excluded from the
+/// candidate set), so the browser bounds resolution at CAPTURE time (hardware
+/// compositor path) before frames reach the encoder. Aspect ratio is preserved
+/// by fitting within the ceiling: a 3840x1600 (21:9) source is delivered at
+/// 1920x800, not letterboxed or cropped. `fit_within_preserving_aspect` is
+/// unchanged: it still bounds the encoder CONFIG dims (defensive on engines that
+/// under-honor `max`), but only the capture ceiling avoids the per-frame rescale.
+fn screen_capture_constraint_spec(include_ceiling: bool) -> ScreenCaptureConstraintSpec {
+    let mut width = Vec::with_capacity(2);
+    let mut height = Vec::with_capacity(2);
+    if include_ceiling {
+        width.push(("max", SCREEN_CAPTURE_MAX_WIDTH));
+        height.push(("max", SCREEN_CAPTURE_MAX_HEIGHT));
+    }
+    // `ideal` keeps native-resolution capture for sources already at/under the
+    // ceiling (readable text/code), which is the pre-issue-1973 behavior.
+    width.push(("ideal", SCREEN_CAPTURE_MAX_WIDTH));
+    height.push(("ideal", SCREEN_CAPTURE_MAX_HEIGHT));
+    ScreenCaptureConstraintSpec {
+        width,
+        height,
+        framerate: vec![("ideal", SCREEN_CAPTURE_IDEAL_FPS)],
+    }
+}
+
+/// Decide whether a rejected `getDisplayMedia` attempt should be retried once
+/// without the issue-1973 resolution ceiling.
+///
+/// Only an `OverconstrainedError` on the FIRST attempt qualifies — that is the
+/// error a browser raises when it cannot satisfy the `max` ceiling. A second
+/// failure (`already_retried == true`) or any other error name (including
+/// `NotAllowedError` user-cancel) returns `false`, letting the caller's normal
+/// error path run. PUBLIC + host-testable so the encoder's acquire path AND the
+/// UI's pre-acquire click handler share one retry policy.
+pub fn should_retry_screen_capture_without_ceiling(
+    error_name: &str,
+    already_retried: bool,
+) -> bool {
+    !already_retried && error_name == "OverconstrainedError"
+}
+
+/// Construct the `getDisplayMedia` constraints from a [`ScreenCaptureConstraintSpec`].
+///
+/// Wasm-only (touches `js_sys`/`web_sys`); every value it writes comes from the
+/// host-testable spec, so [`screen_capture_constraint_spec`]'s unit tests guard
+/// exactly what reaches the browser.
+fn build_screen_display_constraints(
+    spec: &ScreenCaptureConstraintSpec,
+) -> web_sys::DisplayMediaStreamConstraints {
+    fn dim_object(entries: &[(&'static str, f64)]) -> js_sys::Object {
+        let obj = js_sys::Object::new();
+        for &(key, value) in entries {
+            let _ = Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_f64(value));
+        }
+        obj
+    }
+    let video_constraints = js_sys::Object::new();
+    let _ = Reflect::set(
+        &video_constraints,
+        &JsValue::from_str("width"),
+        &dim_object(&spec.width).into(),
+    );
+    let _ = Reflect::set(
+        &video_constraints,
+        &JsValue::from_str("height"),
+        &dim_object(&spec.height).into(),
+    );
+    let _ = Reflect::set(
+        &video_constraints,
+        &JsValue::from_str("frameRate"),
+        &dim_object(&spec.framerate).into(),
+    );
+
+    let constraints = web_sys::DisplayMediaStreamConstraints::new();
+    constraints.set_video(&video_constraints.into());
+    constraints.set_audio(&JsValue::FALSE);
+    constraints
+}
+
+/// Build the `getDisplayMedia` constraints for a screen share with (`true`) or
+/// without (`false`) the issue-1973 resolution ceiling.
+///
+/// PUBLIC single source of truth for screen-capture constraints: the encoder's
+/// own `start()` / re-acquire paths AND the UI's Safari-synchronous pre-acquire
+/// click handler (which feeds [`ScreenEncoder::start_with_stream`]) all call
+/// this, so every capture site requests the identical ceiling and can never
+/// drift out of sync. Pass `include_ceiling = false` only for the one-shot
+/// [`should_retry_screen_capture_without_ceiling`] fallback.
+pub fn screen_capture_display_constraints(
+    include_ceiling: bool,
+) -> web_sys::DisplayMediaStreamConstraints {
+    build_screen_display_constraints(&screen_capture_constraint_spec(include_ceiling))
+}
+
+/// Read the DOMException `name` from a rejected-promise `JsValue`, or the empty
+/// string if absent. Feeds the host-tested [`should_retry_screen_capture_without_ceiling`].
+fn js_error_name(err: &JsValue) -> String {
+    Reflect::get(err, &JsString::from("name"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default()
+}
+
+/// Acquire a screen-capture `MediaStream` via `getDisplayMedia` with the
+/// issue-1973 resolution ceiling applied.
+///
+/// The ceiling is a `max` constraint; per spec a browser that cannot honor it
+/// rejects with `OverconstrainedError`. That is not expected — every mainstream
+/// engine satisfies `max` by downscaling — but to guarantee the ceiling can
+/// never itself kill a share, the FIRST `OverconstrainedError` triggers ONE
+/// retry with the ceiling dropped (the pre-issue-1973 `ideal`-only request).
+/// Any other error, or a second failure, is returned unchanged so the caller's
+/// existing user-cancel (`NotAllowedError`) vs. failure classification runs. The
+/// outer `JsValue` from a synchronous-call error is returned the same way.
+///
+/// NOTE (Safari): the first `getDisplayMedia` is invoked synchronously when this
+/// future is first polled — before any `.await` — preserving the user-gesture
+/// requirement. The fallback retry runs after an `await` and so may fall outside
+/// the gesture on Safari; if it is rejected the share fails exactly as it would
+/// have without this helper, so the retry only ever adds a recovery chance.
+async fn acquire_screen_capture_stream(
+    media_devices: &web_sys::MediaDevices,
+) -> Result<MediaStream, JsValue> {
+    let constraints = screen_capture_display_constraints(true);
+    match JsFuture::from(media_devices.get_display_media_with_constraints(&constraints)?).await {
+        Ok(stream) => Ok(stream.unchecked_into::<MediaStream>()),
+        Err(e) => {
+            if should_retry_screen_capture_without_ceiling(&js_error_name(&e), false) {
+                log::warn!(
+                    "issue 1973: getDisplayMedia rejected the capture resolution ceiling \
+                     (OverconstrainedError); retrying once without the max constraint"
+                );
+                let fallback = screen_capture_display_constraints(false);
+                let stream =
+                    JsFuture::from(media_devices.get_display_media_with_constraints(&fallback)?)
+                        .await?;
+                Ok(stream.unchecked_into::<MediaStream>())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// One screen simulcast layer's encoder + per-layer mutable encode state
@@ -203,12 +386,199 @@ fn record_screen_restart(reason: RestartReason) {
         reason.as_label()
     );
 }
+
+// ── Screen-share WebSocket send-side freshness gate (issue #1921) ─────────────
+//
+// On a WebSocket publisher ALL media shares one ordered TCP stream — unlike
+// WebTransport, where screen rides its own reliable QUIC unistream
+// (`MediaStreamKey::Screen`). A large screen keyframe (30–150 KB) then queues
+// head-of-line behind whatever screen DELTAS are already backed up in the
+// socket, so a receiver's PLI→keyframe turnaround was observed at 30–120 s on
+// WS vs 1–2 s on WT, with macroblock corruption and staleness up to 27 s that
+// survived the entire #1903 receiver-side fix set.
+//
+// The gate below shortens that queue at the source. When the browser's WS
+// `bufferedAmount` shows the stream is genuinely backed up, screen DELTAS are
+// dropped (they would arrive seconds stale regardless) while KEYFRAMES are
+// ALWAYS sent. Because the sequence number still advances on a drop, the
+// receiver's jitter buffer sees a gap — its `find_next_frame_to_decode` only
+// releases sequence-CONTIGUOUS frames — so it holds the deltas behind the gap
+// and skips to the next keyframe. The receiver FREEZES on the last good frame
+// until that next keyframe: ~1.8 s+ when a PLI is served (the receiver's
+// freshness deadline + relay/keyframe RTT) and up to the ~3–5 s periodic/floor
+// keyframe cadence otherwise — bounded, and strictly better than the up-to-27 s
+// staleness and macroblock corruption it replaces (a dropped delta would
+// otherwise decode against a wrong reference).
+//
+// Scope is SCREEN only. Camera deltas are small and continuous — dropping them
+// would stutter the primary video for little queue relief, and shortening the
+// screen backlog already speeds every keyframe (camera included) sharing the
+// pipe. AUDIO and CONTROL never reach this gate. On WebTransport the depth
+// accessor returns `None` (no shared queue), so that path never drops. The
+// decision reads the sender's own pre-encryption frame type and media kind, so
+// it is E2EE-safe: no encrypted payload is inspected.
+
+/// Cumulative screen DELTAS dropped by the WS send-side freshness gate (#1921),
+/// since page load. Mirrors the sibling screen-encoder observability counters;
+/// WebTransport publishers (depth `None`) never increment it.
+static SCREEN_WS_STALE_DELTA_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Wall-clock (epoch ms) of the last throttled freshness-drop log line, and the
+/// cumulative drop total captured at that line — shared by BOTH screen output
+/// handlers (base + per-simulcast-layer) so the aggregated `info!` is emitted at
+/// most once per [`SCREEN_WS_STALE_DROP_LOG_THROTTLE_MS`] no matter how many
+/// handlers or frames are dropping. wasm is single-threaded, so plain
+/// load/store on these atomics needs no CAS.
+static SCREEN_WS_STALE_DROP_LOG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static SCREEN_WS_STALE_DROP_LOG_LAST_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum spacing between aggregated freshness-drop `info!` lines. ≥1s so a
+/// congested share logs a once-per-second summary (dropped-count in the window)
+/// for e2e assertion + field triage, without spamming the console per frame.
+const SCREEN_WS_STALE_DROP_LOG_THROTTLE_MS: u64 = 1000;
+
+/// Cumulative count of stale screen DELTAS dropped at the WS send-side freshness
+/// gate (issue #1921). See [`screen_ws_send_decision`].
+///
+/// DIAGNOSTIC-ONLY pending telemetry wiring: this counter is NOT yet surfaced in
+/// the health/stats packet. The sibling encoder counters (e.g.
+/// `screen_encoder_errors_generic`) are NAMED protobuf fields on the stats
+/// packet, so surfacing this one requires a NEW proto field + Docker codegen (a
+/// cross-crate change deferred out of this PR). Until then it is observable via
+/// the throttled `info!` at the drop site (see [`record_screen_ws_stale_drop`])
+/// and drives the #1921 AQ freshness axis
+/// ([`screen_ws_stale_drop_step_down_decision`]).
+pub fn screen_ws_stale_delta_drops() -> u64 {
+    SCREEN_WS_STALE_DELTA_DROPS.load(Ordering::Relaxed)
+}
+
+/// Record one #1921 freshness-gate drop: bump the cumulative counter and, at most
+/// once per [`SCREEN_WS_STALE_DROP_LOG_THROTTLE_MS`], emit an aggregated `info!`
+/// summarizing how many deltas were gated since the last line plus the live
+/// backlog/threshold. Shared by both screen output handlers (one throttle for
+/// all). wasm-only (reads `js_sys::Date::now()`); the pure send DECISION stays in
+/// [`screen_ws_send_decision`].
+fn record_screen_ws_stale_drop(buffered_bytes: u64, threshold_bytes: u64) {
+    let total = SCREEN_WS_STALE_DELTA_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+    let now_ms = js_sys::Date::now() as u64;
+    let last_ms = SCREEN_WS_STALE_DROP_LOG_LAST_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) >= SCREEN_WS_STALE_DROP_LOG_THROTTLE_MS {
+        SCREEN_WS_STALE_DROP_LOG_LAST_MS.store(now_ms, Ordering::Relaxed);
+        let prev_total = SCREEN_WS_STALE_DROP_LOG_LAST_TOTAL.swap(total, Ordering::Relaxed);
+        let dropped_in_window = total.saturating_sub(prev_total);
+        log::info!(
+            "ScreenEncoder: dropping stale screen delta(s) under WS backpressure (issue #1921) — \
+             dropped={dropped_in_window} in last window, buffered={buffered_bytes}, \
+             threshold={threshold_bytes}"
+        );
+    }
+}
+
+/// Acceptable socket-queue delay before a screen DELTA is treated as stale: the
+/// freshness threshold is this many milliseconds of the encoder's current screen
+/// target bitrate ("half a second of screen video worth of backlog"). 500 ms is
+/// the conservative end of the #1921 range — on a healthy link `bufferedAmount`
+/// flushes to the kernel and sits near zero, so the gate stays dormant; only a
+/// genuine sustained uplink backlog exceeds it.
+const SCREEN_WS_FRESHNESS_DELAY_MS: u64 = 500;
+
+/// Never drop for a backlog smaller than this. A few-KB queue drains within a
+/// frame or two and delays no keyframe meaningfully, so gating below it would
+/// only stutter the share on transient blips.
+const SCREEN_WS_MIN_THRESHOLD_BYTES: u64 = 16_384;
+
+/// Bitrate assumed when the encoder reports an unconstrained target (`0` kbps —
+/// the pre-tier / uncapped default). Uses the top screen tier so the threshold
+/// stays generous rather than collapsing to the floor.
+const SCREEN_WS_DEFAULT_BITRATE_KBPS: u64 = 2500;
+
+/// WS `bufferedAmount` (bytes) above which a screen DELTA is dropped, given the
+/// encoder's current screen target bitrate in kbps. Pure so it is host-testable.
+/// `0` kbps (unconstrained) falls back to [`SCREEN_WS_DEFAULT_BITRATE_KBPS`]; the
+/// result is floored at [`SCREEN_WS_MIN_THRESHOLD_BYTES`].
+fn screen_ws_freshness_threshold_bytes(target_bitrate_kbps: u32) -> u64 {
+    let kbps = if target_bitrate_kbps == 0 {
+        SCREEN_WS_DEFAULT_BITRATE_KBPS
+    } else {
+        target_bitrate_kbps as u64
+    };
+    // bytes = kbps * 1000 / 8 * delay_ms / 1000  ==  kbps * 125 * delay_ms / 1000
+    let bytes = kbps
+        .saturating_mul(125)
+        .saturating_mul(SCREEN_WS_FRESHNESS_DELAY_MS)
+        / 1000;
+    bytes.max(SCREEN_WS_MIN_THRESHOLD_BYTES)
+}
+
+/// Outcome of the screen-share WS send-side freshness gate (issue #1921).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenWsSend {
+    /// Transmit the frame normally.
+    Send,
+    /// Drop this stale screen DELTA — the WS backlog is over the freshness
+    /// threshold and the delta would arrive too late to be useful.
+    DropStaleDelta,
+}
+
+/// Send-side freshness decision for one screen frame on a WebSocket publisher.
+///
+/// * `buffered_amount` — the WS `bufferedAmount`, or `None` when the active
+///   transport is WebTransport (screen has its own QUIC unistream, no shared
+///   queue) or no connection is elected yet. `None` ⇒ always [`ScreenWsSend::Send`].
+/// * `is_keyframe` — keyframes are ALWAYS sent; the decode chain and the #1908
+///   keyframe floor depend on them arriving.
+/// * `threshold_bytes` — from [`screen_ws_freshness_threshold_bytes`].
+///
+/// Pure and stateless: each frame is judged against the live backlog, so the
+/// gate cannot wedge (there is no consecutive-success counter to pin healthy)
+/// and needs no reset on reconnect — a fresh socket starts at
+/// `bufferedAmount == 0`, below any threshold.
+fn screen_ws_send_decision(
+    buffered_amount: Option<u64>,
+    is_keyframe: bool,
+    threshold_bytes: u64,
+) -> ScreenWsSend {
+    match buffered_amount {
+        // WebTransport / no elected connection: no shared queue to shorten.
+        None => ScreenWsSend::Send,
+        // Keyframes are never dropped — the receiver resumes on them.
+        Some(_) if is_keyframe => ScreenWsSend::Send,
+        // Backed-up socket: drop this stale delta so keyframes queue less.
+        Some(buffered) if buffered > threshold_bytes => ScreenWsSend::DropStaleDelta,
+        // Queue is shallow enough that the delta will arrive fresh.
+        Some(_) => ScreenWsSend::Send,
+    }
+}
+
 /// Cumulative count of upper-rung simulcast `VideoEncoder`s torn down after a
 /// sustained shed dwell (issue #1230). Pure observability hook, mirrors the
 /// camera getter: confirms memory is reclaimed on sustained-distress devices and
 /// that teardown is not thrashing.
 pub fn screen_encoder_layers_torn_down() -> u64 {
     SCREEN_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL.load(Ordering::Relaxed)
+}
+
+// ── Screen encoder tick-starvation stall telemetry (discussion 1960, issue 2) ──
+// Monotonic count of detected encoder stall EPISODES (each loop-tick resume whose wall-clock gap
+// exceeded SCREEN_ENCODER_STALL_GAP_MS — a JS-main-thread freeze during which receivers saw
+// re-encoded stale content), plus the MAX observed stall gap (ms). Same zero-cost global-static +
+// non-zero-only export convention as the error/restart counters above; the issue-1972 Grafana work
+// folds these getters into the health packet the relay scrapes (this PR provides the surface only).
+static SCREEN_ENCODER_STALL_EPISODES: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_MAX_STALL_GAP_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative screen encoder tick-starvation stall episodes since page load (discussion 1960,
+/// issue 2). Each increment is one `'encode` loop-tick resume whose wall-clock gap since the previous
+/// tick exceeded [`SCREEN_ENCODER_STALL_GAP_MS`] — a main-thread freeze during which the encoder could
+/// not sample fresh capture and receivers saw `fps > 0` on minutes-stale re-encoded content.
+pub fn screen_encoder_stall_episodes() -> u64 {
+    SCREEN_ENCODER_STALL_EPISODES.load(Ordering::Relaxed)
+}
+/// Largest screen encoder tick-starvation gap observed since page load (ms, rounded) (discussion 1960,
+/// issue 2). Surfaces the worst single freeze duration for field/Grafana attribution of the
+/// "fps > 0 but content minutes stale" symptom.
+pub fn screen_encoder_max_stall_gap_ms() -> u64 {
+    SCREEN_ENCODER_MAX_STALL_GAP_MS.load(Ordering::Relaxed)
 }
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
@@ -225,6 +595,44 @@ fn is_fatal_encoder_error(err: &JsValue) -> bool {
 
 fn should_reacquire_screen_capture(media_acquired: bool, restart_count: u32) -> bool {
     !media_acquired || restart_count > 0
+}
+
+/// What the encode task does after the inner `'encode` loop breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostEncodeExit {
+    /// `break 'restart` — terminate the encode task cleanly. The capture TRACK
+    /// ended and cannot be revived by this task.
+    Shutdown,
+    /// `continue 'restart` — re-enter the restart loop to rebuild the encoder.
+    Restart,
+}
+
+/// Decide whether a broken `'encode` loop should SHUT DOWN or RESTART.
+///
+/// The single deciding input is whether the capture **track** ended
+/// (`stream_ended`: `reader.read()` resolved with `done` / an `undefined`
+/// value — a user stop, the browser's "Stop sharing" button, or an OS/source
+/// revoke). A dead capture track is **unrecoverable from inside this task**:
+/// the only way back is a fresh `getDisplayMedia()`, which the spec gates on
+/// transient user activation this background task does not have. Worse, this
+/// `ScreenEncoder` (and its `EncoderState.enabled` `Arc` plus the shared
+/// `screen_stream` / `active_video_track` cells) is REUSED for the user's next
+/// share, so a post-track-end auto-restart races that next share: it clobbers
+/// the new task's shared stream/track cells and its failed non-gesture
+/// `getDisplayMedia()` stores `enabled = false`, killing the legitimate new
+/// encode task (the stop-tab-then-share-window defect). So a track end MUST
+/// short-circuit straight to clean shutdown.
+///
+/// A NON-track-end exit (a fatal codec fault or a transient read error while
+/// the track is still alive) still returns [`PostEncodeExit::Restart`] — that
+/// is the genuine encoder auto-recovery the restart loop exists for, and it is
+/// deliberately left intact.
+fn post_encode_exit_action(stream_ended: bool) -> PostEncodeExit {
+    if stream_ended {
+        PostEncodeExit::Shutdown
+    } else {
+        PostEncodeExit::Restart
+    }
 }
 
 /// Sustained-shed dwell before an upper-rung screen `VideoEncoder` is torn down
@@ -508,6 +916,263 @@ fn close_retained_frame(retained: &mut Option<VideoFrame>) {
     }
 }
 
+/// Settle window (ms) the source-dimension reconfigure gate (issue #1922) waits for the raw capture
+/// dims to hold STEADY before it applies ONE encoder `configure()` + its single implicit keyframe.
+///
+/// ## Why a settle gate (the field defect)
+/// A screen-share `getDisplayMedia` track re-negotiates its native capture dimensions on EVERY step of
+/// a window drag-resize, delivering a burst of frames whose `display_width()/display_height()` change
+/// continuously (field build ba1a44f1: up to 18 dimension deltas in a single second). The pre-#1922
+/// code rebuilt `VideoEncoderConfig` and called `configure()` IMMEDIATELY on each delta. In WebCodecs
+/// the first `encode()` after a `configure()` is an IMPLICIT keyframe that does NOT pass through the
+/// keyframe cooldown/coalescer (`keyframe_tick_decision` / `ENCODER_PLI_COOLDOWN_MS`), so a drag became
+/// a ~140-keyframe storm — pixelation for every receiver and, when a `configure()` fatally errored
+/// mid-storm, a re-prompting restart that dropped the whole share (issue #1922).
+///
+/// ## Why we can safely DEFER the reconfigure
+/// WebCodecs SCALES a frame whose native dims differ from the encoder's configured dims and emits valid
+/// output — this codebase already relies on that every frame (the #1841 downscaled-tier path and the
+/// #1903 restart-carried retained-frame re-encode; see the comment at the encode loop's restart-carry
+/// point). So DURING a drag we keep encoding at the current config (frames are scaled, output stays
+/// valid) and apply exactly one `configure()` once the source has been stable for `settle_ms`.
+///
+/// ## Choosing 400ms
+/// A drag emits deltas continuously at ~50–100ms gaps (the field's peak 18/sec ≈ 55ms). The window MUST
+/// exceed those inter-delta gaps — and a brief mid-drag PAUSE (repositioning the grip, ~100–250ms) —
+/// so it does not fire a spurious reconfigure mid-drag; 400ms is ~4–8× the delta gap and comfortably
+/// past a repositioning pause. It is also short enough that a genuine one-shot resolution change (window
+/// snapped to a size, a display change) reaches its crisp resolution promptly. The static-share poll
+/// timer (`SCREEN_STATIC_REENCODE_POLL_MS` = 150ms) bounds the apply latency on a resize-then-STATIC
+/// share to ≤ `settle_ms` + one poll.
+const SCREEN_DIM_SETTLE_MS: f64 = 400.0;
+
+/// Settle-gate tracker for source-dimension-driven screen-encoder reconfigures (issue #1922). Pure +
+/// host-testable (a sibling of [`ScreenFloorAccount`]) so the gate's transitions are pinned by native
+/// unit tests off the wasm-only encode loop.
+///
+/// It observes the RAW source dims of each captured frame and answers "have the source dims held steady
+/// long enough to apply a `configure()`?". The two source-dimension reconfigure sites (the base encoder
+/// and each active simulcast rung) gate their existing fitted-dim drift check on [`Self::is_settled`],
+/// and the static-share timer branch reads [`Self::settled_dims`] to apply the final dims once when a
+/// drag ends on content that produces no further frame.
+///
+/// ## Lifecycle
+/// This is transient per-encoder-session state (like `current_encoder_width`), NOT floor accounting: it
+/// is declared INSIDE the encode loop's `'restart` scope so a restart / new share session starts it
+/// fresh ([`Self::new`]) and a stale pending target from a dead track can never carry into a rebuilt
+/// encoder. It deliberately does NOT survive a restart (unlike [`ScreenFloorAccount`], which must).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DimensionSettle {
+    /// The last VALID (both axes > 0) raw source dims observed, with the wall-clock ms
+    /// (`performance.now()`) at which they last CHANGED to this value. `None` until the first valid
+    /// frame. Invalid (0-axis) dims are never stored — see [`Self::observe`].
+    seen: Option<DimSample>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DimSample {
+    w: u32,
+    h: u32,
+    /// When `(w, h)` was last set to its current value; the settle window is measured from here.
+    changed_at_ms: f64,
+}
+
+impl DimensionSettle {
+    /// Fresh per encoder session / `'restart`: no source dims observed yet, so nothing is ever settled
+    /// until a real frame arrives.
+    fn new() -> Self {
+        Self { seen: None }
+    }
+
+    /// Feed the RAW source dims (`VideoFrame::display_width()/display_height()`) of a just-arrived
+    /// frame at `now_ms`.
+    ///
+    /// - 0/invalid dims are IGNORED — a transient 0×0 frame (a minimized/occluded capture) is NOT a
+    ///   settle event and must not re-arm the timer or overwrite the last valid dims (issue #1922
+    ///   req 4d). This is what makes a transient invalid frame mid-hold leave an already-settled value
+    ///   intact rather than resetting its clock.
+    /// - A CHANGE (different from the last valid dims, or the first valid dims) re-arms the settle timer
+    ///   by stamping `changed_at_ms = now_ms`.
+    /// - An UNCHANGED value leaves `changed_at_ms` in place so the steady interval keeps accumulating.
+    fn observe(&mut self, raw_w: u32, raw_h: u32, now_ms: f64) {
+        if raw_w == 0 || raw_h == 0 {
+            return;
+        }
+        match self.seen {
+            Some(s) if s.w == raw_w && s.h == raw_h => { /* unchanged: keep accumulating steady time */
+            }
+            _ => {
+                self.seen = Some(DimSample {
+                    w: raw_w,
+                    h: raw_h,
+                    changed_at_ms: now_ms,
+                });
+            }
+        }
+    }
+
+    /// The settled raw source dims iff the last-observed value has held steady for at least `settle_ms`;
+    /// `None` while a drag is still moving the dims, or before any valid frame. The `>=` boundary is
+    /// inclusive (matching the sibling keyframe helpers).
+    fn settled_dims(&self, now_ms: f64, settle_ms: f64) -> Option<(u32, u32)> {
+        match self.seen {
+            Some(s) if now_ms - s.changed_at_ms >= settle_ms => Some((s.w, s.h)),
+            _ => None,
+        }
+    }
+
+    /// Bool convenience for the frame-arrival reconfigure gate: are the source dims settled now?
+    fn is_settled(&self, now_ms: f64, settle_ms: f64) -> bool {
+        self.settled_dims(now_ms, settle_ms).is_some()
+    }
+}
+
+// ── Sender-side screen encoder stall detection (discussion 1960, issue 2) ──────
+// Field evidence (meeting_sync 2026-07-24): the sharer's 3840×1600 capture froze the JS main thread
+// for 5 windows of 26–130s. During each freeze the encode loop could not run; on resume it answered
+// receiver PLIs by re-encoding the RETAINED (now 60–142s-old) frame, so receivers saw `fps > 0` on
+// minutes-stale content. This is the SENDER-side twin of the receiver-side issue-1851 tick-starvation
+// pattern in `videocall-codecs::jitter_buffer` (see its `TICK_STARVATION_GAP_MS`).
+
+/// Tick-starvation gap threshold (ms) for the screen encode loop (discussion 1960, issue 2). The
+/// loop's `select` re-resolves at least every [`SCREEN_STATIC_REENCODE_POLL_MS`] (150ms) on a static
+/// share (the timer arm fires) or FASTER on a moving share (a real frame arrives), so while the JS
+/// main thread is alive the loop ticks far under this bound. A gap ABOVE this between two consecutive
+/// ticks means the main thread FROZE — it could not even poll its own 150ms timer — i.e. the
+/// compositor/GPU stall the field observed on the ultra-wide capture.
+///
+/// The stall SIGNAL is the loop TICK, deliberately NOT the gap since the last real captured frame: a
+/// real `getDisplayMedia` track delivers frames ONLY on visual change (the very reason the timer arm
+/// exists — see [`SCREEN_STATIC_REENCODE_POLL_MS`]), so a legitimately STATIC share produces NO real
+/// frames for minutes. A real-frame gap would therefore false-positive on every static share; the loop
+/// tick cannot, because the timer arm keeps the tick alive at 150ms even when no frame arrives. This
+/// mirrors the receiver-side signal choice (issue 1851) for the identical reason — a poll loop's own
+/// heartbeat is the only stall signal that survives a legitimately quiet input.
+///
+/// 2000ms matches the receiver-side `TICK_STARVATION_GAP_MS` exactly: ~13× the 150ms nominal tick, so
+/// ordinary jitter, a slow reconfigure, or Chrome's baseline ~1s backgrounded-tab timer clamp never
+/// trips it, while any genuine multi-second freeze does.
+///
+/// One residual FALSE-POSITIVE source is worth naming: Chrome's INTENSIVE throttling clamps background
+/// timers to wake at most ~once per 60s after a tab has been hidden ~5 min. Capture-active tabs are
+/// USUALLY exempt (an active getDisplayMedia capture keeps the page "playing"), but the exemption is
+/// version/platform-dependent and not guaranteed — so a backgrounded STATIC share could see a ~60s
+/// timer-arm gap and register a stall it did not truly suffer. The damage is deliberately bounded to
+/// observability: a false episode inflates ONLY the two telemetry atomics and emits the rate-limited
+/// warn. It CANNOT cause keyframe spam — the one-shot fresh-keyframe latch is consumed ONLY by a REAL
+/// captured frame (see the real-frame arm's `take_resume_force`), and a static share produces none, so
+/// the latch stays armed and idle until real content next arrives. A backgrounded MOVING share is
+/// unaffected: capture-driven frames resolve the `select`'s read future rather than a clamped timer, so
+/// as long as frames flow the tick stays fast and no false stall registers.
+///
+/// Consumer note (issue 1972): when folding the stall exporters into the health packet, disambiguate a
+/// background-throttle gap from a real compositor freeze — e.g. correlate the episode with
+/// `document.hidden` / page-visibility at emit time — so a merely-hidden static share is not charted as
+/// a freeze.
+const SCREEN_ENCODER_STALL_GAP_MS: f64 = 2000.0;
+/// Compile-time guard: the stall gap MUST sit well above the loop's own nominal poll cadence, or a
+/// routine static-share tick would be misread as a stall. Mirrors the issue-1851 ordering assert.
+const _: () = assert!(SCREEN_ENCODER_STALL_GAP_MS > SCREEN_STATIC_REENCODE_POLL_MS as f64);
+
+/// Retained-frame staleness ceiling (ms) for the PLI-answer honesty warn (discussion 1960, issue 2).
+/// When the timer arm answers a receiver PLI by re-encoding the RETAINED frame (the issue-1841
+/// on-demand path) and that frame is older than this, the "fps > 0 but content minutes stale" freeze
+/// is in progress: the receiver gets a keyframe, but of pre-stall content. We LOG this (rate-limited)
+/// so field analysis can attribute the symptom directly — but do NOT refuse the re-encode: a stale
+/// frame still beats a black frame (the receiver keeps the last good content instead of losing it), and
+/// the real recovery is the fresh capture-path keyframe forced on stall resume, not withholding this
+/// one.
+///
+/// 10_000ms sits well past any legitimate coalescing/floor window (the floor cadence is 3s and its
+/// post-quiet budget spans ~12s), so a normal share re-encoding its current retained frame stays
+/// quiet. The one benign case this can still log is a genuinely static share whose late-joiner PLI is
+/// answered with an old-but-CORRECT frame — which is why the emit is rate-limited and the
+/// episode/gap telemetry (not this line alone) is the authoritative stall signal.
+const SCREEN_RETAINED_STALE_MS: f64 = 10_000.0;
+/// Minimum wall-clock gap (ms) between the rate-limited retained-stale warn lines (~1 per 5s).
+const SCREEN_RETAINED_STALE_LOG_THROTTLE_MS: f64 = 5_000.0;
+
+/// Sender-side encoder tick-starvation monitor (discussion 1960, issue 2) — the pure, host-testable
+/// core of the stall detector, mirroring the receiver-side issue-1851 tick-gap decision. Holds the
+/// previous loop-tick wall-clock and a one-shot "force a fresh keyframe on the next real frame" latch.
+///
+/// The wasm encode loop calls [`Self::tick`] once per `'encode` iteration — the loop's heartbeat,
+/// which on a static share is the 150ms timer arm and on a moving share is the frame arm, so
+/// consecutive ticks are ≤150ms apart while the main thread runs. When a real captured frame next
+/// arrives, the loop folds [`Self::take_resume_force`] into the keyframe decision so the FRESH frame
+/// (never the retained one) is emitted as a keyframe. Declared INSIDE the encoder `'restart` scope so a
+/// restart resets the heartbeat: a restart is a deliberate encoder rebuild, not a main-thread freeze,
+/// and its first post-restart tick must not be misread as a stall resume.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EncoderStallMonitor {
+    /// `performance.now()` of the previous loop tick; `None` before the first tick (cold start / first
+    /// tick after a restart), where there is no prior tick to measure a gap against.
+    last_tick_ms: Option<f64>,
+    /// One-shot latch: `true` once a stall resume has been detected, cleared when the next real frame
+    /// consumes it via [`Self::take_resume_force`]. Not a counter — it forces AT MOST one fresh
+    /// keyframe per resume and cannot wedge (on a share that goes truly static right after a resume it
+    /// simply forces a keyframe on whatever real frame arrives next, which is harmless).
+    resume_force_keyframe: bool,
+}
+
+impl EncoderStallMonitor {
+    fn new() -> Self {
+        Self {
+            last_tick_ms: None,
+            resume_force_keyframe: false,
+        }
+    }
+
+    /// Register one loop tick at `now_ms`. Returns `Some(gap_ms)` when this tick RESUMES from a stall
+    /// (a prior tick exists AND the gap since it exceeds `gap_ms`), else `None`. Always advances the
+    /// tick anchor; on a stall resume it ARMS the one-shot fresh-keyframe latch. A `None` prior tick is
+    /// never a stall (nothing to measure against), so a cold start / first post-restart tick cannot
+    /// false-positive. The `>` boundary matches the receiver-side issue-1851 gate.
+    fn tick(&mut self, now_ms: f64, gap_ms: f64) -> Option<f64> {
+        let resumed = match self.last_tick_ms {
+            Some(last) if now_ms - last > gap_ms => Some(now_ms - last),
+            _ => None,
+        };
+        self.last_tick_ms = Some(now_ms);
+        if resumed.is_some() {
+            self.resume_force_keyframe = true;
+        }
+        resumed
+    }
+
+    /// Consume the one-shot fresh-keyframe latch: returns `true` at most once per armed resume, then
+    /// disarms. The next real captured frame folds this into the periodic-keyframe input so it emits a
+    /// FRESH capture-path keyframe (never the retained frame), bypassing the PLI cooldown exactly once.
+    fn take_resume_force(&mut self) -> bool {
+        let armed = self.resume_force_keyframe;
+        self.resume_force_keyframe = false;
+        armed
+    }
+}
+
+/// Pure decision for the retained-frame staleness warn (discussion 1960, issue 2). Returns `true` iff
+/// a PLI is being answered by a retained frame whose age exceeds `stale_ms` AND the rate-limit window
+/// (`throttle_ms` since `last_warn_ms`) has elapsed. Extracted so the age gate AND the rate limit are
+/// pinned together by a native test. It decides only whether to LOG — never whether to serve the
+/// re-encode (the caller always serves it; a stale frame beats a black frame). The `>` age boundary is
+/// strict (an age exactly at the ceiling is not yet "stale"); the throttle boundary is `>=` inclusive,
+/// matching the file's other throttle gates.
+fn retained_stale_warn_due(
+    retained_age_ms: f64,
+    stale_ms: f64,
+    now_ms: f64,
+    last_warn_ms: Option<f64>,
+    throttle_ms: f64,
+) -> bool {
+    if retained_age_ms <= stale_ms {
+        return false;
+    }
+    match last_warn_ms {
+        None => true,
+        Some(last) => now_ms - last >= throttle_ms,
+    }
+}
+
 /// Translate a `TierTransitionRecord::trigger` value into the publisher-side
 /// `cause_hint` string carried on `VideoMetadata` (issue #903).
 ///
@@ -643,6 +1308,37 @@ fn wt_saturation_step_down_decision(
     )
 }
 
+/// One AQ tick of the screen share's #1921 WS FRESHNESS-GATE self-congestion
+/// axis (#5). Given the cumulative `screen_ws_stale_delta_drops()` reading, the
+/// window snapshot, and elapsed window time, returns the
+/// [`SelfCongestionDecision`] under the screen freshness-drop window/threshold
+/// (`SCREEN_WS_STALE_DROP_WINDOW_MS` / `SCREEN_WS_STALE_DROP_THRESHOLD`).
+///
+/// Closes the gap the #1921 send-side gate opened: the gate converges the WS
+/// backlog BELOW the 1MB cap that feeds `websocket_drop_count()` (axis #2's
+/// signal), so under sustained high-motion congestion axis #2 never fires and
+/// the tier stays pinned high while the encoder wastes CPU on discarded deltas.
+/// A SUSTAINED cluster of freshness-gate drops steps the tier down toward the
+/// achievable rate. Extracted from the wasm-only AQ loop so the signal +
+/// constants are pinned by a native `#[test]`, mirroring the WT axes.
+#[inline]
+fn screen_ws_stale_drop_step_down_decision(
+    current_drops: u64,
+    snapshot_drops: u64,
+    elapsed_ms: f64,
+) -> videocall_aq::constants::SelfCongestionDecision {
+    use crate::adaptive_quality_constants::{
+        evaluate_self_congestion, SCREEN_WS_STALE_DROP_THRESHOLD, SCREEN_WS_STALE_DROP_WINDOW_MS,
+    };
+    evaluate_self_congestion(
+        current_drops,
+        snapshot_drops,
+        elapsed_ms,
+        SCREEN_WS_STALE_DROP_WINDOW_MS,
+        SCREEN_WS_STALE_DROP_THRESHOLD,
+    )
+}
+
 /// User-configurable adaptive-quality tier bounds for SCREEN SHARE (issue #961
 /// follow-up), shared from the UI into the running screen encoder control loop.
 ///
@@ -729,6 +1425,7 @@ pub struct ScreenEncoder {
     state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
     current_fps: Arc<AtomicU32>,
+    last_layer0_chunk_ms: Arc<AtomicU64>,
     on_encoder_settings_update: Option<Callback<String>>,
     on_state_change: Option<Callback<ScreenShareEvent>>,
     /// Holds the active MediaStream so `stop()` can synchronously kill all tracks.
@@ -961,6 +1658,7 @@ impl ScreenEncoder {
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(bitrate_kbps)),
             current_fps: Arc::new(AtomicU32::new(0)),
+            last_layer0_chunk_ms: Arc::new(AtomicU64::new(0)),
             on_encoder_settings_update: Some(on_encoder_settings_update),
             on_state_change: Some(on_state_change),
             screen_stream: Rc::new(RefCell::new(None)),
@@ -1255,6 +1953,7 @@ impl ScreenEncoder {
     pub fn set_encoder_control(&mut self) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         let tier_max_width = self.tier_max_width.clone();
@@ -1376,16 +2075,14 @@ impl ScreenEncoder {
             //
             // DROP-COUNTER ATTRIBUTION DECISION (issue #1199, requirement 3):
             // each controller keeps its OWN baseline snapshot + sliding window
-            // against the shared global counters. We deliberately do NOT attempt
-            // to attribute drops to a specific media-kind (the transport does not
-            // tag drops by stream, and a single browser TCP send buffer / QUIC
-            // connection is the shared bottleneck). So a drop burst is observed
-            // independently by BOTH the camera and the screen loop, and BOTH may
-            // shed a layer. That is the CORRECT behavior: the uplink is shared,
-            // so when it is distressed every live egress should back off. The
-            // baselines are SEPARATE (not shared) only so the two loops' sliding
-            // windows roll on their own cadence and neither clears the other's
-            // accounting — they are NOT a partition of the drops.
+            // against the aggregate counters. The transport also exposes
+            // per-stream attribution, but camera and screen intentionally read
+            // aggregate distress because a single browser TCP send buffer / QUIC
+            // connection is the shared bottleneck. A drop burst is therefore
+            // observed independently by BOTH loops, and BOTH may shed a layer.
+            // The baselines are SEPARATE only so the loops' sliding windows roll
+            // on their own cadence and neither clears the other's accounting;
+            // they are not a partition of the drops.
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
@@ -1401,6 +2098,18 @@ impl ScreenEncoder {
             let mut last_wt_stall_snapshot: u64 =
                 videocall_transport::webtransport::unistream_ready_stall_count();
             let mut wt_stall_window_start_ms: f64 = js_sys::Date::now();
+            // Issue #1921: independent sliding window for the WS FRESHNESS-GATE
+            // self-trigger (axis #5). SEPARATE from the WS overflow window above
+            // (overflow = 1MB `bufferedAmount` cap → `websocket_drop_count()`;
+            // freshness = the send-side screen-delta gate → the screen-local
+            // `screen_ws_stale_delta_drops()`). The gate converges the backlog
+            // BELOW the 1MB cap, so the overflow axis stays flat under moderate
+            // sustained congestion and this axis is the one that then steps the
+            // tier down. This counter is screen-encoder-owned (not shared with
+            // the camera loop), so unlike the transport-global counters above it
+            // needs no cross-loop attribution note.
+            let mut last_screen_ws_stale_drop_snapshot: u64 = screen_ws_stale_delta_drops();
+            let mut screen_ws_stale_drop_window_start_ms: f64 = js_sys::Date::now();
             // Issue #1229: previous sharing state, used to detect the rising edge
             // of a (re)share inside the loop. Seeded from the CURRENT value at
             // spawn time. `set_encoder_control` is called during encoder setup —
@@ -1429,6 +2138,23 @@ impl ScreenEncoder {
                     break;
                 }
                 let now = js_sys::Date::now();
+                // #2060 idle-decay: `last_layer0_chunk_ms` is stamped in the base-layer callback
+                // with performance().now() (monotonic), so the staleness check MUST use a fresh
+                // performance().now() here — NOT the loop's `now` above (js_sys::Date::now(),
+                // wall-clock, a DIFFERENT epoch). Do not "simplify" by reusing `now`: a
+                // cross-clock comparison silently breaks the decay and no unit test catches it.
+                let perf_now = window()
+                    .performance()
+                    .expect("Performance API not available")
+                    .now();
+                if let Some(value) = crate::encode::fps_after_idle_decay(
+                    current_fps.load(Ordering::Relaxed),
+                    perf_now,
+                    last_layer0_chunk_ms.load(Ordering::Relaxed) as f64,
+                    crate::adaptive_quality_constants::SCREEN_ENCODER_FPS_IDLE_DECAY_MS,
+                ) {
+                    current_fps.store(value, Ordering::Relaxed);
+                }
                 // ── Issue #1229: share start/stop edge handling ───────────────
                 // Track the previous sharing state so we can (a) re-arm cold
                 // start on the RISING edge of a (re)share and (b) avoid drifting
@@ -1680,6 +2406,48 @@ impl ScreenEncoder {
                     if decision.roll_window {
                         last_wt_stall_snapshot = decision.new_snapshot;
                         wt_stall_window_start_ms = now;
+                    }
+                }
+
+                // 5) Client-side WS FRESHNESS-GATE backpressure → step down
+                // (issue #1921). The #1921 send-side gate DROPS stale screen
+                // deltas once the WS `bufferedAmount` backlog exceeds ~half a
+                // second of screen bitrate, converging the socket queue to
+                // ~156KB — BELOW the 1MB cap that increments
+                // `websocket_drop_count()` (axis #2's signal). So under sustained
+                // high-motion congestion in the moderate band, axis #2 stays flat
+                // and the tier would otherwise stay pinned high while the encoder
+                // wastes CPU on deltas the gate discards. A SUSTAINED cluster of
+                // gate drops (`screen_ws_stale_delta_drops()`, screen-local, flat
+                // at 0 on WebTransport and on healthy WS → no-op) self-sheds a
+                // rung so the encoder output converges toward the achievable rate
+                // and keyframes shrink. The lower tier tightens the gate's own
+                // threshold too — a beneficial coupling that speeds the drain.
+                // Window/snapshot independent of all other axes; at most one rung
+                // per its OWN (wider, 2s) window; decision + constants live in the
+                // host-testable `screen_ws_stale_drop_step_down_decision` helper.
+                {
+                    let current_stale_drops = screen_ws_stale_delta_drops();
+                    let elapsed_ms = now - screen_ws_stale_drop_window_start_ms;
+                    let decision = screen_ws_stale_drop_step_down_decision(
+                        current_stale_drops,
+                        last_screen_ws_stale_drop_snapshot,
+                        elapsed_ms,
+                    );
+                    // Issue #1229: roll the window/snapshot ALWAYS (baseline not
+                    // stale across an idle gap), but only act while sharing.
+                    if decision.step_down && now_sharing {
+                        log::warn!(
+                            "ScreenEncoder: sustained WS freshness-gate backpressure detected ({} \
+                             stale screen deltas dropped in {:.0}ms), forcing video step-down",
+                            current_stale_drops.saturating_sub(last_screen_ws_stale_drop_snapshot),
+                            elapsed_ms,
+                        );
+                        encoder_control.force_video_step_down();
+                    }
+                    if decision.roll_window {
+                        last_screen_ws_stale_drop_snapshot = decision.new_snapshot;
+                        screen_ws_stale_drop_window_start_ms = now;
                     }
                 }
 
@@ -1964,6 +2732,8 @@ impl ScreenEncoder {
     /// It sets the encoder flags, notifies the client at the protocol level,
     /// and synchronously stops all media tracks.
     pub fn stop(&mut self) {
+        crate::encode::reset_output_fps(&self.current_fps);
+
         // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
         clear_screen_sharing_flags(&self.screen_sharing_active, &self.screen_sharing_active_arc);
 
@@ -2124,6 +2894,7 @@ impl ScreenEncoder {
     /// The stream is consumed: this method takes ownership and will stop its
     /// tracks when encoding ends or `stop()` is called.
     pub fn start_with_stream(&mut self, stream: MediaStream, initial_tier: usize) {
+        crate::encode::reset_output_fps(&self.current_fps);
         self.apply_initial_tier(initial_tier);
 
         let EncoderState {
@@ -2138,6 +2909,7 @@ impl ScreenEncoder {
         let aes = client.aes();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let on_state_change = self.on_state_change.clone();
         let screen_stream = self.screen_stream.clone();
         let tier_max_width = self.tier_max_width.clone();
@@ -2178,6 +2950,7 @@ impl ScreenEncoder {
                 aes,
                 current_bitrate,
                 current_fps,
+                last_layer0_chunk_ms,
                 on_state_change,
                 screen_stream,
                 tier_max_width,
@@ -2218,6 +2991,7 @@ impl ScreenEncoder {
     /// use [`start_with_stream`](Self::start_with_stream) instead, obtaining the
     /// stream directly in the click handler.
     pub fn start(&mut self, initial_tier: usize) {
+        crate::encode::reset_output_fps(&self.current_fps);
         self.apply_initial_tier(initial_tier);
 
         let EncoderState {
@@ -2233,6 +3007,7 @@ impl ScreenEncoder {
         let aes = client.aes();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let on_state_change = self.on_state_change.clone();
         let screen_stream = self.screen_stream.clone();
         let tier_max_width = self.tier_max_width.clone();
@@ -2264,84 +3039,33 @@ impl ScreenEncoder {
                 panic!("MediaDevices not available");
             });
 
-            // Build getDisplayMedia constraints requesting high-resolution capture.
-            // This tells the browser to prefer the source's native resolution rather
-            // than downscaling, which is critical for readable text and code.
-            // Use {ideal: N} dictionaries instead of bare numbers — bare numbers are
-            // treated as {exact: N} and will cause the browser to reject capture if
-            // the source (e.g. 1440p or 4K monitor) doesn't match exactly.
-            let width_constraint = js_sys::Object::new();
-            let _ = Reflect::set(
-                &width_constraint,
-                &JsValue::from_str("ideal"),
-                &JsValue::from_f64(1920.0),
-            );
-            let height_constraint = js_sys::Object::new();
-            let _ = Reflect::set(
-                &height_constraint,
-                &JsValue::from_str("ideal"),
-                &JsValue::from_f64(1080.0),
-            );
-            let framerate_constraint = js_sys::Object::new();
-            let _ = Reflect::set(
-                &framerate_constraint,
-                &JsValue::from_str("ideal"),
-                &JsValue::from_f64(10.0),
-            );
-            let video_constraints = js_sys::Object::new();
-            let _ = Reflect::set(
-                &video_constraints,
-                &JsValue::from_str("width"),
-                &width_constraint.into(),
-            );
-            let _ = Reflect::set(
-                &video_constraints,
-                &JsValue::from_str("height"),
-                &height_constraint.into(),
-            );
-            let _ = Reflect::set(
-                &video_constraints,
-                &JsValue::from_str("frameRate"),
-                &framerate_constraint.into(),
-            );
-
-            let constraints = web_sys::DisplayMediaStreamConstraints::new();
-            constraints.set_video(&video_constraints.into());
-            constraints.set_audio(&JsValue::FALSE);
-
+            // Acquire the capture stream with the issue-1973 resolution ceiling
+            // (max 1920x1080) so a native 4K / ultra-wide source is bounded at
+            // capture time, before the per-frame main-thread downscale sees it.
+            // The helper transparently retries once without the ceiling if a
+            // browser rejects it with OverconstrainedError.
             let screen_to_share: MediaStream =
-                match media_devices.get_display_media_with_constraints(&constraints) {
-                    Ok(promise) => match JsFuture::from(promise).await {
-                        Ok(stream) => stream.unchecked_into::<MediaStream>(),
-                        Err(e) => {
-                            // Check if user cancelled (NotAllowedError = permission denied/cancelled)
-                            let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
-                                .ok()
-                                .and_then(|v| v.as_string())
-                                .map(|name| name == "NotAllowedError")
-                                .unwrap_or(false);
-
-                            if is_user_cancel {
-                                log::info!("User cancelled screen sharing");
-                                if let Some(ref callback) = on_state_change {
-                                    callback.emit(ScreenShareEvent::Cancelled);
-                                }
-                            } else {
-                                let error_msg = format!("{e:?}");
-                                error!("Screen sharing error: {error_msg}");
-                                if let Some(ref callback) = on_state_change {
-                                    callback.emit(ScreenShareEvent::Failed(error_msg));
-                                }
-                            }
-                            enabled.store(false, Ordering::Release);
-                            return;
-                        }
-                    },
+                match acquire_screen_capture_stream(&media_devices).await {
+                    Ok(stream) => stream,
                     Err(e) => {
-                        let error_msg = format!("{e:?}");
-                        error!("Failed to get display media: {error_msg}");
-                        if let Some(ref callback) = on_state_change {
-                            callback.emit(ScreenShareEvent::Failed(error_msg));
+                        // Check if user cancelled (NotAllowedError = permission denied/cancelled)
+                        let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
+                            .ok()
+                            .and_then(|v| v.as_string())
+                            .map(|name| name == "NotAllowedError")
+                            .unwrap_or(false);
+
+                        if is_user_cancel {
+                            log::info!("User cancelled screen sharing");
+                            if let Some(ref callback) = on_state_change {
+                                callback.emit(ScreenShareEvent::Cancelled);
+                            }
+                        } else {
+                            let error_msg = format!("{e:?}");
+                            error!("Screen sharing error: {error_msg}");
+                            if let Some(ref callback) = on_state_change {
+                                callback.emit(ScreenShareEvent::Failed(error_msg));
+                            }
                         }
                         enabled.store(false, Ordering::Release);
                         return;
@@ -2361,6 +3085,7 @@ impl ScreenEncoder {
                 aes,
                 current_bitrate,
                 current_fps,
+                last_layer0_chunk_ms,
                 on_state_change,
                 screen_stream,
                 tier_max_width,
@@ -2408,6 +3133,7 @@ impl ScreenEncoder {
         aes: Rc<Aes128State>,
         current_bitrate: Rc<AtomicU32>,
         current_fps: Arc<AtomicU32>,
+        last_layer0_chunk_ms: Arc<AtomicU64>,
         on_state_change: Option<Callback<ScreenShareEvent>>,
         screen_stream: Rc<RefCell<Option<MediaStream>>>,
         tier_max_width: Rc<AtomicU32>,
@@ -2523,14 +3249,16 @@ impl ScreenEncoder {
         let mut width: u32 = 0;
         let mut height: u32 = 0;
 
-        // Shared atomics carrying the publisher's *source* track dimensions
-        // (from `MediaStreamTrack.getSettings()`). The output-chunk handler
-        // below is created once and outlives the `'restart:` loop, so it can
-        // not capture `width` / `height` directly — they get reassigned on
-        // restart. Atomics let the per-chunk closure read the most recent
-        // source dims at frame-stamping time without locking. `0` means
-        // "unknown" and triggers the proto3 default-skip, so older publishers
-        // / pre-capture frames stay backward-compatible.
+        // Shared atomics carrying the publisher's source track dimensions
+        // (resolved from `MediaStreamTrack.getSettings()`, or a safe default
+        // pair if the track has not reported them yet). Seeded on acquisition
+        // and re-seeded on each `'restart` re-acquire. The output-chunk handler
+        // outlives the `'restart:` loop and cannot capture `width` / `height`
+        // directly (they get reassigned on restart), so atomics let the
+        // per-chunk closure read the most recent source dims at frame-stamping
+        // time without locking. `0` means "unknown" and triggers the proto3
+        // default-skip, so older publishers / pre-capture frames stay
+        // backward-compatible.
         let source_width_atomic = Arc::new(AtomicU32::new(0));
         let source_height_atomic = Arc::new(AtomicU32::new(0));
 
@@ -2579,6 +3307,14 @@ impl ScreenEncoder {
         // separately from the emit log so a QUIET (non-emitting) tick can still surface the floor's
         // decision inputs once per window for e2e/field diagnosis without spamming every 150ms tick.
         let mut last_floor_debug_ms: f64 = 0.0;
+        // discussion 1960 (issue 2): wall-clock (`performance.now()`, ms) the RETAINED frame was
+        // captured, so the timer arm can measure its age when answering a PLI (the staleness-honesty
+        // warn). Declared OUTSIDE `'restart` alongside `last_encoded_frame` — whose lifetime it
+        // describes — so it survives an encoder restart together with the frame it timestamps.
+        let mut last_encoded_frame_ms: Option<f64> = None;
+        // discussion 1960 (issue 2): rate-limit anchor for the retained-frame staleness warn (~1/5s).
+        // `None` until the first warn.
+        let mut last_retained_stale_warn_ms: Option<f64> = None;
 
         // Setup FPS tracking and screen output handler.
         // These closures are created once and shared across encoder restarts
@@ -2593,6 +3329,7 @@ impl ScreenEncoder {
             let mut last_chunk_time = performance.now();
             let mut chunks_in_last_second = 0;
             let current_fps = current_fps.clone();
+            let last_layer0_chunk_ms = last_layer0_chunk_ms.clone();
             let userid = userid.clone();
             let aes = aes.clone();
             let client = client.clone();
@@ -2614,6 +3351,7 @@ impl ScreenEncoder {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
 
                 // Update FPS calculation
+                last_layer0_chunk_ms.store(now as u64, Ordering::Relaxed);
                 chunks_in_last_second += 1;
                 if now - last_chunk_time >= 1000.0 {
                     let fps = chunks_in_last_second;
@@ -2629,37 +3367,64 @@ impl ScreenEncoder {
                 }
 
                 // Read the latest source dimensions snapshot. The encoder
-                // loop updates the atomics whenever the track is (re)acquired
-                // and reports its native capture size via `get_settings()`.
+                // loop seeds the atomics whenever the track is (re)acquired,
+                // from `get_settings()` (or a safe default if absent).
                 // `Ordering::Relaxed` is sufficient — these values are
                 // descriptive metadata, not synchronization signals.
                 let source_width_now = source_width_for_handler.load(Ordering::Relaxed);
                 let source_height_now = source_height_for_handler.load(Ordering::Relaxed);
-                // Issue #903: snapshot encoder state for the receiver's
-                // Cause line. Cheap: the bitrate is an atomic load and the
-                // two strings are short labels we clone once per frame.
+                // Issue #903: snapshot the target bitrate for the receiver's
+                // Cause line and for the #1921 freshness threshold. Cheap atomic
+                // load; the two Cause strings are cloned only on the send path
+                // below (skipped when a delta is dropped).
                 let target_bitrate_now = target_bitrate_for_handler.load(Ordering::Relaxed);
-                let adaptive_tier_now = adaptive_tier_for_handler.borrow().clone();
-                let cause_hint_now = cause_hint_for_handler.borrow().clone();
-                let packet: PacketWrapper = transform_screen_chunk(
-                    chunk,
-                    sequence_number,
-                    buffer.as_mut_slice(),
-                    &userid,
-                    aes.clone(),
-                    source_width_now,
-                    source_height_now,
-                    target_bitrate_now,
-                    adaptive_tier_now,
-                    cause_hint_now,
-                    // N=1 single-layer path: layer 0 (wire-absent), byte-identical
-                    // to the pre-simulcast screen publisher.
-                    0,
-                );
-                // Phase 2 of WT freeze fix: route screen-share video on its
-                // own persistent QUIC stream, isolated from the camera and
-                // audio streams.
-                client.send_media_packet(packet, MediaStreamKey::Screen);
+                // Issue #1921: WS send-side freshness gate. Read the frame type
+                // BEFORE `chunk` is moved into `transform_screen_chunk`. On a
+                // backed-up WebSocket socket a stale screen DELTA is dropped
+                // (keyframes are always sent) so keyframes stop queuing
+                // head-of-line behind stale deltas on the single shared TCP
+                // stream. `send_queue_depth()` is `None` on WebTransport (screen
+                // has its own QUIC unistream), so that path never drops. The
+                // sequence number still advances on a drop, so the receiver's
+                // jitter buffer sees a gap and freezes to the next keyframe
+                // instead of decoding a wrong-reference delta into corruption.
+                let is_keyframe = matches!(chunk.type_(), web_sys::EncodedVideoChunkType::Key);
+                let ws_threshold = screen_ws_freshness_threshold_bytes(target_bitrate_now);
+                let ws_buffered = client.send_queue_depth();
+                match screen_ws_send_decision(ws_buffered, is_keyframe, ws_threshold) {
+                    ScreenWsSend::Send => {
+                        let adaptive_tier_now = adaptive_tier_for_handler.borrow().clone();
+                        let cause_hint_now = cause_hint_for_handler.borrow().clone();
+                        let packet: PacketWrapper = transform_screen_chunk(
+                            chunk,
+                            sequence_number,
+                            buffer.as_mut_slice(),
+                            &userid,
+                            aes.clone(),
+                            source_width_now,
+                            source_height_now,
+                            target_bitrate_now,
+                            adaptive_tier_now,
+                            cause_hint_now,
+                            // N=1 single-layer path: layer 0 (wire-absent),
+                            // byte-identical to the pre-simulcast screen publisher.
+                            0,
+                        );
+                        // Phase 2 of WT freeze fix: route screen-share video on
+                        // its own persistent QUIC stream, isolated from the
+                        // camera and audio streams.
+                        client.send_media_packet(packet, MediaStreamKey::Screen);
+                    }
+                    ScreenWsSend::DropStaleDelta => {
+                        // `ws_buffered` is `Some` here (a `None` depth decides
+                        // Send), so `unwrap_or(0)` reports the real backlog.
+                        record_screen_ws_stale_drop(ws_buffered.unwrap_or(0), ws_threshold);
+                    }
+                }
+                // Advance the sequence number whether the frame was sent or
+                // dropped: the gap lets the receiver detect the loss (its jitter
+                // buffer releases only sequence-contiguous frames) and resume on
+                // the next keyframe rather than decode a wrong-reference delta.
                 sequence_number += 1;
             })
         };
@@ -2720,86 +3485,37 @@ impl ScreenEncoder {
                 active_video_track.borrow_mut().take();
                 _onended_handler = None;
 
-                // Build getDisplayMedia constraints requesting high-resolution capture.
-                let width_constraint = js_sys::Object::new();
-                let _ = Reflect::set(
-                    &width_constraint,
-                    &JsValue::from_str("ideal"),
-                    &JsValue::from_f64(1920.0),
-                );
-                let height_constraint = js_sys::Object::new();
-                let _ = Reflect::set(
-                    &height_constraint,
-                    &JsValue::from_str("ideal"),
-                    &JsValue::from_f64(1080.0),
-                );
-                let framerate_constraint = js_sys::Object::new();
-                let _ = Reflect::set(
-                    &framerate_constraint,
-                    &JsValue::from_str("ideal"),
-                    &JsValue::from_f64(10.0),
-                );
-                let video_constraints = js_sys::Object::new();
-                let _ = Reflect::set(
-                    &video_constraints,
-                    &JsValue::from_str("width"),
-                    &width_constraint.into(),
-                );
-                let _ = Reflect::set(
-                    &video_constraints,
-                    &JsValue::from_str("height"),
-                    &height_constraint.into(),
-                );
-                let _ = Reflect::set(
-                    &video_constraints,
-                    &JsValue::from_str("frameRate"),
-                    &framerate_constraint.into(),
-                );
-
-                let constraints = web_sys::DisplayMediaStreamConstraints::new();
-                constraints.set_video(&video_constraints.into());
-                constraints.set_audio(&JsValue::FALSE);
-
+                // Re-acquire with the same issue-1973 resolution ceiling as the
+                // initial share (max 1920x1080) — a missed ceiling here would
+                // reintroduce native-resolution frames on exactly the recovery
+                // path. The helper retries once without the ceiling on
+                // OverconstrainedError.
                 let acquired_stream: MediaStream =
-                    match media_devices.get_display_media_with_constraints(&constraints) {
-                        Ok(promise) => match JsFuture::from(promise).await {
-                            Ok(stream) => stream.unchecked_into::<MediaStream>(),
-                            Err(e) => {
-                                // Check if user cancelled (NotAllowedError = permission denied/cancelled)
-                                let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
-                                    .ok()
-                                    .and_then(|v| v.as_string())
-                                    .map(|name| name == "NotAllowedError")
-                                    .unwrap_or(false);
-
-                                if is_user_cancel {
-                                    log::info!("User cancelled screen sharing");
-                                    if let Some(ref callback) = on_state_change {
-                                        callback.emit(ScreenShareEvent::Cancelled);
-                                    }
-                                } else {
-                                    let error_msg = format!("{e:?}");
-                                    error!("Screen sharing error: {error_msg}");
-                                    if let Some(ref callback) = on_state_change {
-                                        callback.emit(ScreenShareEvent::Failed(error_msg));
-                                    }
-                                }
-                                enabled.store(false, Ordering::Release);
-                                // #1903: release the retained static-share frame before this give-up
-                                // return bypasses the encode loop's final cleanup (it survives `'restart`).
-                                close_retained_frame(&mut last_encoded_frame);
-                                return;
-                            }
-                        },
+                    match acquire_screen_capture_stream(&media_devices).await {
+                        Ok(stream) => stream,
                         Err(e) => {
-                            let error_msg = format!("{e:?}");
-                            error!("Failed to get display media: {error_msg}");
-                            if let Some(ref callback) = on_state_change {
-                                callback.emit(ScreenShareEvent::Failed(error_msg));
+                            // Check if user cancelled (NotAllowedError = permission denied/cancelled)
+                            let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
+                                .ok()
+                                .and_then(|v| v.as_string())
+                                .map(|name| name == "NotAllowedError")
+                                .unwrap_or(false);
+
+                            if is_user_cancel {
+                                log::info!("User cancelled screen sharing");
+                                if let Some(ref callback) = on_state_change {
+                                    callback.emit(ScreenShareEvent::Cancelled);
+                                }
+                            } else {
+                                let error_msg = format!("{e:?}");
+                                error!("Screen sharing error: {error_msg}");
+                                if let Some(ref callback) = on_state_change {
+                                    callback.emit(ScreenShareEvent::Failed(error_msg));
+                                }
                             }
                             enabled.store(false, Ordering::Release);
-                            // #1903: release the retained static-share frame before this give-up return
-                            // bypasses the encode loop's final cleanup (it survives `'restart`).
+                            // #1903: release the retained static-share frame before this give-up
+                            // return bypasses the encode loop's final cleanup (it survives `'restart`).
                             close_retained_frame(&mut last_encoded_frame);
                             return;
                         }
@@ -2857,13 +3573,21 @@ impl ScreenEncoder {
                 };
 
                 let track_settings = track.get_settings();
-                width = track_settings.get_width().expect("width is None") as u32;
-                height = track_settings.get_height().expect("height is None") as u32;
+                let settings_w = track_settings.get_width().map(f64::from);
+                let settings_h = track_settings.get_height().map(f64::from);
+                (width, height) = resolve_capture_dimensions(settings_w, settings_h, 0, 0);
 
-                // Publish the source dims to the per-chunk stamper. Read by
-                // the screen_output_handler closure on every encoded frame.
-                source_width_atomic.store(width, Ordering::Relaxed);
-                source_height_atomic.store(height, Ordering::Relaxed);
+                // Publish the source dims to the per-chunk stamper. Read by the
+                // screen_output_handler closure on every encoded frame.
+                // resolve_capture_dimensions returns a safe non-zero pair (the
+                // 640x480 fallback) so the encoder ladder can build, but the
+                // #1196 STAMP must not fabricate an aspect: publish 0 = "unknown"
+                // (proto3 default-skip) when getSettings() omits a complete pair.
+                // Screen seeds-only (no per-frame correction), so an honest 0
+                // beats a wrong constant a receiver would read as a real aspect.
+                let (stamp_w, stamp_h) = settings_source_stamp(settings_w, settings_h);
+                source_width_atomic.store(stamp_w, Ordering::Relaxed);
+                source_height_atomic.store(stamp_h, Ordering::Relaxed);
 
                 current_stream = Some(acquired_stream);
                 current_track = Some(track);
@@ -2915,13 +3639,16 @@ impl ScreenEncoder {
                 };
 
                 let track_settings = track.get_settings();
-                width = track_settings.get_width().expect("width is None") as u32;
-                height = track_settings.get_height().expect("height is None") as u32;
+                let settings_w = track_settings.get_width().map(f64::from);
+                let settings_h = track_settings.get_height().map(f64::from);
+                (width, height) = resolve_capture_dimensions(settings_w, settings_h, 0, 0);
 
                 // Publish the source dims to the per-chunk stamper (see the
-                // matching `.store()` in the restart-acquire branch above).
-                source_width_atomic.store(width, Ordering::Relaxed);
-                source_height_atomic.store(height, Ordering::Relaxed);
+                // matching `.store()` in the restart-acquire branch above). Stamp
+                // 0 = "unknown" when settings omit a complete pair (rationale there).
+                let (stamp_w, stamp_h) = settings_source_stamp(settings_w, settings_h);
+                source_width_atomic.store(stamp_w, Ordering::Relaxed);
+                source_height_atomic.store(stamp_h, Ordering::Relaxed);
 
                 current_track = Some(track);
             }
@@ -3013,10 +3740,11 @@ impl ScreenEncoder {
                 // (`tier_w`/`tier_h` recorded below) when the share's source
                 // aspect changes mid-share, exactly like the base screen
                 // layer's per-frame reconfigure and the camera's per-layer
-                // path. `width` / `height` are the real capture dims read
-                // from `getSettings()` above, so a non-16:9 display (16:10,
-                // ultrawide, portrait) is never per-axis-squashed into the
-                // 16:9 tier dims on rungs 1..n.
+                // path. `width` / `height` are the acquisition dims resolved
+                // from `getSettings()` above (or a safe default pair if the
+                // track had not reported them yet), so a non-16:9 display
+                // (16:10, ultrawide, portrait) is not per-axis-squashed into
+                // the 16:9 tier dims on rungs 1..n.
                 let (layer_w, layer_h) =
                     fit_within_preserving_aspect(width, height, tier.max_width, tier.max_height);
                 let init_bitrate_bps = tier.ideal_bitrate_kbps as f64 * 1000.0;
@@ -3046,20 +3774,43 @@ impl ScreenEncoder {
                             if buffer.len() < byte_length {
                                 buffer.resize(byte_length, 0);
                             }
-                            let packet: PacketWrapper = transform_screen_chunk(
-                                chunk,
-                                local_seq,
-                                buffer.as_mut_slice(),
-                                &userid,
-                                aes.clone(),
-                                source_w.load(Ordering::Relaxed),
-                                source_h.load(Ordering::Relaxed),
-                                target_bitrate.load(Ordering::Relaxed),
-                                adaptive_tier.borrow().clone(),
-                                cause_hint.borrow().clone(),
-                                layer_id,
-                            );
-                            client.send_media_packet(packet, MediaStreamKey::Screen);
+                            // Issue #1921: same WS send-side freshness gate as
+                            // the base layer. Read frame type before `chunk` is
+                            // moved; drop stale deltas on a backed-up WS socket
+                            // (keyframes always sent), advancing `local_seq`
+                            // either way so the receiver detects the gap.
+                            let target_bitrate_now = target_bitrate.load(Ordering::Relaxed);
+                            let is_keyframe =
+                                matches!(chunk.type_(), web_sys::EncodedVideoChunkType::Key);
+                            let ws_threshold =
+                                screen_ws_freshness_threshold_bytes(target_bitrate_now);
+                            let ws_buffered = client.send_queue_depth();
+                            match screen_ws_send_decision(ws_buffered, is_keyframe, ws_threshold) {
+                                ScreenWsSend::Send => {
+                                    let packet: PacketWrapper = transform_screen_chunk(
+                                        chunk,
+                                        local_seq,
+                                        buffer.as_mut_slice(),
+                                        &userid,
+                                        aes.clone(),
+                                        source_w.load(Ordering::Relaxed),
+                                        source_h.load(Ordering::Relaxed),
+                                        target_bitrate_now,
+                                        adaptive_tier.borrow().clone(),
+                                        cause_hint.borrow().clone(),
+                                        layer_id,
+                                    );
+                                    client.send_media_packet(packet, MediaStreamKey::Screen);
+                                }
+                                ScreenWsSend::DropStaleDelta => {
+                                    // Shared throttle with the base handler; `ws_buffered`
+                                    // is `Some` on the drop path.
+                                    record_screen_ws_stale_drop(
+                                        ws_buffered.unwrap_or(0),
+                                        ws_threshold,
+                                    );
+                                }
+                            }
                             local_seq += 1;
                             seq_out_inner.set(local_seq);
                         }) as Box<dyn FnMut(JsValue)>,
@@ -3240,6 +3991,17 @@ impl ScreenEncoder {
             // #1311 cooldown must start clean per restart); the floor deliberately does NOT reuse it.
             let mut current_encoder_width = width;
             let mut current_encoder_height = height;
+            // Issue #1922: per-encoder-session settle gate for source-dimension reconfigures. Declared
+            // INSIDE `'restart` (like `current_encoder_*`) so a restart / new share session starts it
+            // fresh and no stale pending-resize target from a dead track carries into the rebuilt
+            // encoder. Unlike `floor_account` (which MUST survive a restart), this is transient.
+            let mut dim_settle = DimensionSettle::new();
+            // discussion 1960 (issue 2): sender-side tick-starvation monitor. Declared INSIDE `'restart`
+            // (like `dim_settle`) so a restart resets the heartbeat — a restart is a deliberate encoder
+            // rebuild (whose own recovery keyframe already fires), not a JS-main-thread freeze, so its
+            // first post-restart tick must not read as a stall resume. Unlike `floor_account`, this is
+            // transient by design.
+            let mut stall_monitor = EncoderStallMonitor::new();
 
             // Cache tier-controlled values
             let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
@@ -3263,8 +4025,38 @@ impl ScreenEncoder {
             // Track whether the inner loop exited due to a fatal encode error
             // vs. a stream-read error or shutdown signal.
             let mut fatal_encode_exit = false;
+            // Set when the capture TRACK ends (reader.read() -> done). Routes the
+            // post-loop decision to a clean shutdown instead of an auto-restart:
+            // a dead track cannot be re-acquired without a user gesture, and
+            // restarting races the shared EncoderState with the user's next share
+            // (stop-then-share-again defect). See `post_encode_exit_action`.
+            let mut stream_ended = false;
 
             'encode: loop {
+                // discussion 1960 (issue 2): sender-side tick-starvation heartbeat. This runs EVERY
+                // `'encode` iteration. The loop's only blocking point is the `select` below, which
+                // resolves within SCREEN_STATIC_REENCODE_POLL_MS (timer arm) or sooner (frame arm)
+                // while the main thread is alive — so a gap above SCREEN_ENCODER_STALL_GAP_MS between
+                // two ticks means the main thread FROZE (the 3840×1600 compositor stall the field saw).
+                // On resume we record the episode + max gap and arm a one-shot fresh-keyframe latch that
+                // the next REAL captured frame consumes, so receivers recover on FRESH content instead
+                // of another re-encode of the minutes-old retained frame. The tick — not the gap since
+                // the last real captured frame — is the signal precisely because a static share
+                // legitimately delivers no real frames for minutes (see SCREEN_STATIC_REENCODE_POLL_MS)
+                // yet keeps ticking at 150ms, so only a true freeze crosses the threshold.
+                let tick_now = window()
+                    .performance()
+                    .expect("Performance API not available")
+                    .now();
+                if let Some(gap_ms) = stall_monitor.tick(tick_now, SCREEN_ENCODER_STALL_GAP_MS) {
+                    SCREEN_ENCODER_STALL_EPISODES.fetch_add(1, Ordering::Relaxed);
+                    SCREEN_ENCODER_MAX_STALL_GAP_MS
+                        .fetch_max(gap_ms.round() as u64, Ordering::Relaxed);
+                    log::warn!(
+                        "[SCREEN_ENCODER] stall: encoder tick starved {gap_ms:.0}ms — forcing a fresh capture keyframe on resume (discussion 1960)"
+                    );
+                }
+
                 // Check if we should stop encoding (user called stop() or
                 // onended fired). This exits the function entirely — no restart.
                 if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
@@ -3704,7 +4496,146 @@ impl ScreenEncoder {
                                 last_encoded_frame.is_some(),
                             );
                         }
-                        if pli_pending || floor_due {
+
+                        // Issue #1922: apply a SETTLED source-dimension reconfigure on a static share.
+                        // During a drag the frame-arrival gate deferred every per-delta reconfigure
+                        // (WebCodecs scaled the frames at the stale config). When the drag ends on
+                        // content that produces no further frame, NO real-frame arm runs to apply the
+                        // final dims — so the timer branch applies them here ONCE: reconfigure the base +
+                        // active rungs to the settled fit and re-encode the retained frame as a single
+                        // keyframe, so receivers reach the crisp resolution within ~SCREEN_DIM_SETTLE_MS +
+                        // one poll. Bounded to one emit — after it applies, `current_encoder_*` equals the
+                        // settled fit so the drift check is false until the source moves again.
+                        //
+                        // This path NEVER restarts the encoder on a `configure()` error (unlike the
+                        // frame-arm reconfigure): a restart would re-prompt getDisplayMedia (the #1922
+                        // share-drop), and a settled-resize re-key is a quality refinement, not a
+                        // correctness necessity. A transient error just aborts this tick's apply and is
+                        // retried next tick (dims still settled → still drift); a genuinely closed codec
+                        // is caught by the top-of-loop guard on the next `'encode` iteration.
+                        let mut settle_emitted = false;
+                        if let Some((settled_raw_w, settled_raw_h)) =
+                            dim_settle.settled_dims(now, SCREEN_DIM_SETTLE_MS)
+                        {
+                            let (fit_w, fit_h) = fit_within_preserving_aspect(
+                                settled_raw_w,
+                                settled_raw_h,
+                                local_tier_max_width,
+                                local_tier_max_height,
+                            );
+                            if fit_w > 0
+                                && fit_h > 0
+                                && (fit_w != current_encoder_width
+                                    || fit_h != current_encoder_height)
+                                && screen_encoder.state() != CodecState::Closed
+                            {
+                                if let Some(retained) = last_encoded_frame.as_ref() {
+                                    // Reconfigure the base encoder to the settled fit.
+                                    let new_config = VideoEncoderConfig::new(
+                                        get_video_codec_string(),
+                                        fit_h,
+                                        fit_w,
+                                    );
+                                    new_config.set_bitrate(local_bitrate as f64);
+                                    new_config.set_latency_mode(LatencyMode::Realtime);
+                                    set_vbr_mode(&new_config);
+                                    set_framerate_hint(
+                                        &new_config,
+                                        active_screen_tier_fps(
+                                            shared_screen_tier_index.load(Ordering::Relaxed),
+                                        ),
+                                    );
+                                    if let Err(e) = screen_encoder.configure(&new_config) {
+                                        SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        error!("ScreenEncoder: settled-resize base reconfigure failed (timer, #1922): {e:?}");
+                                    } else {
+                                        current_encoder_width = fit_w;
+                                        current_encoder_height = fit_h;
+                                        // Reconfigure each ACTIVE rung to its settled fit so the whole
+                                        // published set is keyframe-synchronized at the new dims. A
+                                        // settled resize is a genuine source-dim change on every rung, so
+                                        // (unlike the pure-insurance floor) it fans out to the FULL active
+                                        // set — a one-time burst per resize, matching what a real frame at
+                                        // the new dims would do.
+                                        for layer in extra_layers.iter_mut() {
+                                            if (layer.layer_id as usize) >= local_active_layers {
+                                                continue;
+                                            }
+                                            let d = simulcast_layer_target_dims(
+                                                settled_raw_w,
+                                                settled_raw_h,
+                                                layer.tier_w,
+                                                layer.tier_h,
+                                                layer.current_w,
+                                                layer.current_h,
+                                            );
+                                            if d.needs_reconfigure
+                                                && layer.encoder.state() != CodecState::Closed
+                                            {
+                                                layer.current_w = d.target_w;
+                                                layer.current_h = d.target_h;
+                                                layer.config = VideoEncoderConfig::new(
+                                                    get_video_codec_string(),
+                                                    layer.current_h,
+                                                    layer.current_w,
+                                                );
+                                                layer
+                                                    .config
+                                                    .set_bitrate(layer.local_bitrate as f64);
+                                                layer
+                                                    .config
+                                                    .set_latency_mode(LatencyMode::Realtime);
+                                                set_vbr_mode(&layer.config);
+                                                set_framerate_hint(&layer.config, layer.target_fps);
+                                                if let Err(e) =
+                                                    layer.encoder.configure(&layer.config)
+                                                {
+                                                    SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    error!("ScreenEncoder: settled-resize rung reconfigure failed (timer, layer {}, #1922): {e:?}", layer.layer_id);
+                                                }
+                                            }
+                                        }
+                                        // Re-encode the retained frame as ONE keyframe (implicit after
+                                        // the base `configure()`; set explicit too) on the base + active
+                                        // rungs so every receiver gets the crisp-resolution keyframe.
+                                        let opts = VideoEncoderEncodeOptions::new();
+                                        opts.set_key_frame(true);
+                                        if let Err(e) =
+                                            screen_encoder.encode_with_options(retained, &opts)
+                                        {
+                                            error!("ScreenEncoder: settled-resize re-encode failed (base, #1922): {e:?}");
+                                        }
+                                        for layer in extra_layers.iter_mut() {
+                                            if (layer.layer_id as usize) < local_active_layers {
+                                                if let Err(e) = layer
+                                                    .encoder
+                                                    .encode_with_options(retained, &opts)
+                                                {
+                                                    error!("ScreenEncoder: settled-resize re-encode failed (layer {}, #1922): {e:?}", layer.layer_id);
+                                                }
+                                            }
+                                        }
+                                        settle_emitted = true;
+                                        // A room-wide keyframe just went out: stamp the periodic + floor
+                                        // cadence clocks (so the next periodic/floor keyframe waits a full
+                                        // interval) and satisfy any pending PLI.
+                                        last_keyframe_emit_ms = Some(now);
+                                        floor_account.on_keyframe_emitted(now);
+                                        force_keyframe.store(false, Ordering::Release);
+                                        log::info!(
+                                            "ScreenEncoder: applied settled resize -> {fit_w}x{fit_h} and re-encoded retained frame as a keyframe (issue #1922)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // The settled-resize apply above already emitted a room-wide keyframe this tick,
+                        // so skip the PLI/floor re-encode (mutually exclusive) — the settle keyframe
+                        // satisfies any pending PLI and stamps the floor cadence.
+                        if !settle_emitted && (pli_pending || floor_due) {
                             if let Some(retained) = last_encoded_frame.as_ref() {
                                 // Consume the #1311 cooldown-reset edge ONLY when actually
                                 // servicing a PLI. On a static share the real-frame arm never
@@ -3737,6 +4668,34 @@ impl ScreenEncoder {
                                 });
                                 last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
                                 if decision.want_keyframe {
+                                    // discussion 1960 (issue 2): PLI-answer staleness honesty. If a
+                                    // receiver PLI is being answered by re-encoding the RETAINED frame
+                                    // and that frame is older than SCREEN_RETAINED_STALE_MS, the
+                                    // "fps > 0 but content minutes stale" freeze is happening —
+                                    // receivers get a keyframe of pre-stall content. Warn (rate-limited)
+                                    // so field analysis can attribute the symptom directly; do NOT
+                                    // refuse the re-encode (a stale frame beats a black frame — the
+                                    // receiver keeps the last good content), the fresh capture keyframe
+                                    // forced on stall resume is the real fix. Only PLI answers are
+                                    // checked; a pure floor emit re-encoding a genuinely-static (and
+                                    // therefore CORRECT) frame is not the stall symptom.
+                                    if pli_pending {
+                                        if let Some(captured_ms) = last_encoded_frame_ms {
+                                            let retained_age_ms = now - captured_ms;
+                                            if retained_stale_warn_due(
+                                                retained_age_ms,
+                                                SCREEN_RETAINED_STALE_MS,
+                                                now,
+                                                last_retained_stale_warn_ms,
+                                                SCREEN_RETAINED_STALE_LOG_THROTTLE_MS,
+                                            ) {
+                                                last_retained_stale_warn_ms = Some(now);
+                                                log::warn!(
+                                                    "[SCREEN_ENCODER] stall: PLI answered with retained frame age={retained_age_ms:.0}ms (discussion 1960)"
+                                                );
+                                            }
+                                        }
+                                    }
                                     let opts = VideoEncoderEncodeOptions::new();
                                     opts.set_key_frame(true);
                                     // Issue #1531 / #1903-perf: how many rungs this floor emit
@@ -3827,13 +4786,31 @@ impl ScreenEncoder {
                         };
 
                         if value.is_undefined() {
+                            // The capture TRACK ended (user stop, browser "Stop
+                            // sharing", or OS/source revoke). Flag it so the
+                            // post-loop decision shuts down cleanly instead of
+                            // entering the auto-restart path — a dead track is
+                            // unrecoverable without a user gesture and restarting
+                            // races the next share's shared state. See
+                            // `post_encode_exit_action`.
                             error!("Screen share stream ended");
+                            stream_ended = true;
                             break 'encode;
                         }
 
                         let video_frame = value.unchecked_into::<VideoFrame>();
                         let raw_frame_width = video_frame.display_width();
                         let raw_frame_height = video_frame.display_height();
+                        // Issue #1922: timestamp this frame ONCE (reused by the settle gate below and
+                        // the keyframe decision further down) and feed the RAW source dims to the settle
+                        // tracker. A window drag-resize changes these dims every frame; the tracker
+                        // arms/holds its settle timer so the two source-dimension reconfigure sites can
+                        // DEFER until the source stops moving instead of reconfiguring per delta.
+                        let now = window()
+                            .performance()
+                            .expect("Performance API not available")
+                            .now();
+                        dim_settle.observe(raw_frame_width, raw_frame_height, now);
                         // Constrain to tier max dimensions while preserving the
                         // capture's native aspect ratio (issue #1037).
                         // `display_width()` / `display_height()` are the raw
@@ -3854,12 +4831,21 @@ impl ScreenEncoder {
                                 (0, 0)
                             };
 
+                        // Issue #1922: gate the source-dimension reconfigure on the settle tracker. The
+                        // fitted-dim drift check alone fired once PER drag delta (~140 `configure()`
+                        // calls in one window drag — each an implicit keyframe bypassing the cooldown).
+                        // We reconfigure ONLY once the raw source dims have held steady for
+                        // SCREEN_DIM_SETTLE_MS; mid-drag this branch is skipped and the frame is encoded
+                        // at the current config (WebCodecs scales it, output stays valid). Skipping
+                        // leaves `current_encoder_*` untouched so the drift check still fires the single
+                        // time once the source settles.
                         if frame_width > 0
                             && frame_height > 0
                             && (frame_width != current_encoder_width
                                 || frame_height != current_encoder_height)
+                            && dim_settle.is_settled(now, SCREEN_DIM_SETTLE_MS)
                         {
-                            info!("Frame dimensions changed from {current_encoder_width}x{current_encoder_height} to {frame_width}x{frame_height}, reconfiguring encoder");
+                            info!("Frame dimensions changed from {current_encoder_width}x{current_encoder_height} to {frame_width}x{frame_height}, reconfiguring encoder (settled #1922)");
 
                             current_encoder_width = frame_width;
                             current_encoder_height = frame_height;
@@ -3909,17 +4895,28 @@ impl ScreenEncoder {
                         }
 
                         let opts = VideoEncoderEncodeOptions::new();
-                        let now = window()
-                            .performance()
-                            .expect("Performance API not available")
-                            .now();
+                        // `now` was captured at the top of this frame arm (issue #1922 settle gate) and
+                        // is reused here for the keyframe cadence decision.
+                        // discussion 1960 (issue 2): consume the one-shot stall-resume latch. When a
+                        // tick-starvation resume was just detected (top-of-loop), the FIRST real frame
+                        // after the freeze must be a keyframe so receivers recover on FRESH capture
+                        // content — not another re-encode of the minutes-old retained frame. We fold it
+                        // in as a periodic-keyframe input (ungated by the PLI cooldown, exactly like the
+                        // moving-content GOP) so it emits even when no PLI is pending and the cadence is
+                        // not otherwise due. One-shot: `take_resume_force` disarms after this frame.
+                        let stall_resume_keyframe = stall_monitor.take_resume_force();
                         let is_periodic_keyframe = periodic_keyframe_due(
                             screen_frame_counter,
                             local_keyframe_interval,
                             now,
                             last_keyframe_emit_ms,
                             SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
-                        );
+                        ) || stall_resume_keyframe;
+                        if stall_resume_keyframe {
+                            log::info!(
+                                "[SCREEN_ENCODER] stall: forcing a fresh capture-path keyframe on the first frame after a tick-starvation resume (discussion 1960)"
+                            );
+                        }
                         // Resolve the keyframe decision via the shared single source of
                         // truth (issue #1347 item 2: the screen AND camera loops call
                         // the same pure `keyframe_tick_decision`, which the host tests
@@ -4062,7 +5059,14 @@ impl ScreenEncoder {
                                 layer.current_w,
                                 layer.current_h,
                             );
-                            if decision.needs_reconfigure {
+                            // Issue #1922: gate the per-rung source-dimension reconfigure on the SAME
+                            // settle tracker as the base path, so a drag-resize does not storm the
+                            // rungs' `configure()` either (the field's "rung dimension change" bursts,
+                            // logged below). Mid-drag the rung encodes the frame at its current config
+                            // (WebCodecs scales); the rung's dims are applied once the source settles.
+                            if decision.needs_reconfigure
+                                && dim_settle.is_settled(now, SCREEN_DIM_SETTLE_MS)
+                            {
                                 // Guard: do not configure a closed encoder.
                                 if layer.encoder.state() == CodecState::Closed {
                                     log::warn!(
@@ -4159,6 +5163,10 @@ impl ScreenEncoder {
                         if let Some(prev) = last_encoded_frame.replace(video_frame) {
                             prev.close();
                         }
+                        // discussion 1960 (issue 2): stamp when this retained frame was captured, so a
+                        // later timer-arm PLI answer can measure its age for the staleness-honesty warn.
+                        // `now` is this frame's capture wall-clock (issue #1922 settle timestamp).
+                        last_encoded_frame_ms = Some(now);
 
                         // Sender encoder backpressure (issue #1108, Phase B).
                         // After submitting this frame to the base encoder and
@@ -4229,6 +5237,17 @@ impl ScreenEncoder {
             // Drop the higher layers (and their closures) before the next
             // 'restart iteration rebuilds them.
             drop(extra_layers);
+
+            // A track end short-circuits straight to clean shutdown: it can never
+            // be auto-recovered without a user gesture, and re-entering the
+            // restart loop would race the shared EncoderState (enabled flag +
+            // stream/track cells) with the user's NEXT share, clobbering it (the
+            // stop-then-share-again defect). Every OTHER exit (fatal codec fault
+            // or transient read error, track still alive) keeps the genuine
+            // auto-recovery path intact.
+            if post_encode_exit_action(stream_ended) == PostEncodeExit::Shutdown {
+                break 'restart;
+            }
 
             if fatal_encode_exit {
                 // Fatal encode error: the encoder died but the stream may be
@@ -4304,29 +5323,386 @@ mod tests {
     use super::floor_fanout_layer_count;
     use super::is_fatal_encoder_error_message;
     use super::keyframe_tick_decision;
+    use super::post_encode_exit_action;
     use super::record_screen_restart;
+    use super::retained_stale_warn_due;
+    use super::screen_capture_constraint_spec;
     use super::screen_encoder_restarts_closed_codec;
     use super::screen_encoder_restarts_configure;
     use super::screen_encoder_restarts_memory;
     use super::screen_encoder_restarts_other;
+    use super::screen_ws_freshness_threshold_bytes;
+    use super::screen_ws_send_decision;
+    use super::screen_ws_stale_drop_step_down_decision;
     use super::should_reacquire_screen_capture;
+    use super::should_retry_screen_capture_without_ceiling;
     use super::should_teardown_shed_layer;
     use super::static_keyframe_floor_due;
     use super::wt_drop_step_down_decision;
     use super::wt_saturation_step_down_decision;
+    use super::DimensionSettle;
+    use super::EncoderStallMonitor;
     use super::KeyframeTickInput;
+    use super::PostEncodeExit;
     use super::RestartReason;
     use super::ScreenEncoder;
     use super::ScreenFloorAccount;
+    use super::ScreenWsSend;
+    use super::SCREEN_DIM_SETTLE_MS;
+    use super::SCREEN_ENCODER_STALL_GAP_MS;
+    use super::SCREEN_RETAINED_STALE_LOG_THROTTLE_MS;
+    use super::SCREEN_RETAINED_STALE_MS;
     use super::SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS;
     use super::SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET;
+    use super::SCREEN_STATIC_REENCODE_POLL_MS;
+    use super::SCREEN_WS_DEFAULT_BITRATE_KBPS;
+    use super::SCREEN_WS_MIN_THRESHOLD_BYTES;
     use super::SHED_TEARDOWN_DWELL_MS;
+    use crate::adaptive_quality_constants::ENCODER_PLI_COOLDOWN_MS;
     use crate::adaptive_quality_constants::SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
     use crate::adaptive_quality_constants::{
+        SCREEN_WS_STALE_DROP_THRESHOLD, SCREEN_WS_STALE_DROP_WINDOW_MS,
         WS_SELF_CONGESTION_WINDOW_MS, WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS,
         WT_SELF_CONGESTION_DROP_THRESHOLD, WT_SELF_CONGESTION_WINDOW_MS,
     };
     use crate::{Callback, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
+
+    // ── Issue 1973: getDisplayMedia capture resolution ceiling ───────────────
+    // These pin the pure builder + retry policy that the wasm acquire path
+    // (`acquire_screen_capture_stream` via `build_screen_display_constraints`)
+    // writes onto the JS constraint object and consults on rejection — not a
+    // re-implemented copy — so mutating the ceiling or the retry rule fails here.
+
+    /// The normal request carries a `max` ceiling of exactly 1920x1080 on BOTH
+    /// width and height (matching the top screen tier), plus the `ideal` hint.
+    /// Dropping either `max` push in `screen_capture_constraint_spec` fails this.
+    #[test]
+    fn screen_capture_spec_requests_1920x1080_ceiling() {
+        let spec = screen_capture_constraint_spec(true);
+        let width_max = spec
+            .width
+            .iter()
+            .find(|&&(k, _)| k == "max")
+            .map(|&(_, v)| v as u32);
+        let height_max = spec
+            .height
+            .iter()
+            .find(|&&(k, _)| k == "max")
+            .map(|&(_, v)| v as u32);
+        assert_eq!(width_max, Some(1920), "width must request max: 1920");
+        assert_eq!(height_max, Some(1080), "height must request max: 1080");
+        // `ideal` is retained so at/under-ceiling sources capture at native size.
+        assert!(spec
+            .width
+            .iter()
+            .any(|&(k, v)| k == "ideal" && v as u32 == 1920));
+        assert!(spec
+            .height
+            .iter()
+            .any(|&(k, v)| k == "ideal" && v as u32 == 1080));
+        assert!(spec
+            .framerate
+            .iter()
+            .any(|&(k, v)| k == "ideal" && v as u32 == 10));
+    }
+
+    /// The OverconstrainedError fallback spec drops the ceiling (no `max`) while
+    /// keeping the `ideal` hint — the exact pre-issue-1973 request. Mutating the
+    /// `include_ceiling` guard so `false` still pushes `max` fails this.
+    #[test]
+    fn screen_capture_fallback_spec_drops_ceiling() {
+        let spec = screen_capture_constraint_spec(false);
+        assert!(
+            !spec.width.iter().any(|&(k, _)| k == "max"),
+            "fallback width must not carry a max ceiling"
+        );
+        assert!(
+            !spec.height.iter().any(|&(k, _)| k == "max"),
+            "fallback height must not carry a max ceiling"
+        );
+        assert!(spec
+            .width
+            .iter()
+            .any(|&(k, v)| k == "ideal" && v as u32 == 1920));
+        assert!(spec
+            .height
+            .iter()
+            .any(|&(k, v)| k == "ideal" && v as u32 == 1080));
+    }
+
+    /// Only the FIRST OverconstrainedError retries without the ceiling; a second
+    /// failure, a non-overconstrained error, and user-cancel all decline.
+    #[test]
+    fn retry_without_ceiling_only_on_first_overconstrained() {
+        assert!(should_retry_screen_capture_without_ceiling(
+            "OverconstrainedError",
+            false
+        ));
+        assert!(!should_retry_screen_capture_without_ceiling(
+            "OverconstrainedError",
+            true
+        ));
+        assert!(!should_retry_screen_capture_without_ceiling(
+            "NotAllowedError",
+            false
+        ));
+        assert!(!should_retry_screen_capture_without_ceiling(
+            "NotReadableError",
+            false
+        ));
+        assert!(!should_retry_screen_capture_without_ceiling("", false));
+    }
+
+    // ── Issue #1921: WS send-side screen freshness gate ──────────────────────
+    // These drive the REAL production decision (`screen_ws_send_decision`) and
+    // threshold (`screen_ws_freshness_threshold_bytes`) the encode output
+    // handler calls — not a re-implemented copy — so mutating either policy
+    // breaks an assertion here.
+
+    /// A KEYFRAME is ALWAYS sent, even when the WS backlog dwarfs the threshold.
+    /// Mutating the `is_keyframe ⇒ Send` arm to drop would fail this.
+    #[test]
+    fn screen_ws_keyframe_always_sent_even_when_backlog_huge() {
+        // buffered 10 MB, threshold a mere 100 B, but it's a keyframe.
+        assert_eq!(
+            screen_ws_send_decision(Some(10_000_000), true, 100),
+            ScreenWsSend::Send
+        );
+    }
+
+    /// A stale DELTA over the threshold is dropped. Mutating the comparison
+    /// away (or the arm to `Send`) would fail this.
+    #[test]
+    fn screen_ws_delta_dropped_when_backlog_over_threshold() {
+        assert_eq!(
+            screen_ws_send_decision(Some(200_000), false, 125_000),
+            ScreenWsSend::DropStaleDelta
+        );
+    }
+
+    /// The boundary is strict `>`: a DELTA at EXACTLY the threshold is sent, one
+    /// byte above is dropped, one below is sent. Pins `>` against a `>=`
+    /// mutation and an off-by-one.
+    #[test]
+    fn screen_ws_delta_threshold_boundary_is_strict_greater_than() {
+        assert_eq!(
+            screen_ws_send_decision(Some(125_000), false, 125_000),
+            ScreenWsSend::Send,
+            "at exactly the threshold the delta must still be sent"
+        );
+        assert_eq!(
+            screen_ws_send_decision(Some(125_001), false, 125_000),
+            ScreenWsSend::DropStaleDelta,
+            "one byte over the threshold must drop"
+        );
+        assert_eq!(
+            screen_ws_send_decision(Some(124_999), false, 125_000),
+            ScreenWsSend::Send,
+            "below the threshold must send"
+        );
+    }
+
+    /// On WebTransport (or before election) the depth is `None` — screen has its
+    /// own QUIC unistream, so nothing is ever dropped here even for a delta with
+    /// a threshold of 1. Mutating the `None ⇒ Send` arm would fail this and is
+    /// the guard that keeps the WT path byte-for-byte unchanged.
+    #[test]
+    fn screen_ws_none_depth_never_drops() {
+        assert_eq!(screen_ws_send_decision(None, false, 1), ScreenWsSend::Send);
+        assert_eq!(screen_ws_send_decision(None, true, 1), ScreenWsSend::Send);
+    }
+
+    /// The threshold is 500 ms of the current screen target bitrate. Exact
+    /// values pin the formula (`kbps * 125 * 500 / 1000`); mutating the delay
+    /// constant or the arithmetic shifts these.
+    #[test]
+    fn screen_ws_threshold_scales_with_bitrate() {
+        // 2500 kbps → 312.5 KB/s → 500 ms ≈ 156_250 bytes.
+        assert_eq!(screen_ws_freshness_threshold_bytes(2500), 156_250);
+        // 2000 kbps → 250 KB/s → 500 ms = 125_000 bytes.
+        assert_eq!(screen_ws_freshness_threshold_bytes(2000), 125_000);
+    }
+
+    /// A low tier's raw 500 ms figure falls below the floor and is clamped, so
+    /// the gate never fires on a trivially small backlog. Mutating away the
+    /// `.max(floor)` would fail this.
+    #[test]
+    fn screen_ws_threshold_floored_for_low_bitrate() {
+        // 100 kbps → raw 100*125*500/1000 = 6_250 bytes, below the 16 KB floor,
+        // so the production fn must clamp it up to exactly the floor.
+        assert_eq!(
+            screen_ws_freshness_threshold_bytes(100),
+            SCREEN_WS_MIN_THRESHOLD_BYTES
+        );
+    }
+
+    /// An unconstrained (`0` kbps) target uses the top-tier default rather than
+    /// collapsing to the floor. Mutating the `0 ⇒ default` fallback would fail
+    /// this (a raw 0 would floor to 16 KB, which this asserts it does NOT).
+    #[test]
+    fn screen_ws_threshold_zero_bitrate_uses_default() {
+        let expected = screen_ws_freshness_threshold_bytes(SCREEN_WS_DEFAULT_BITRATE_KBPS as u32);
+        assert_eq!(screen_ws_freshness_threshold_bytes(0), expected);
+        assert!(
+            expected > SCREEN_WS_MIN_THRESHOLD_BYTES,
+            "the default must resolve well above the floor"
+        );
+    }
+
+    /// Issue #1922: the source-dimension SETTLE gate. Drives the REAL production `DimensionSettle`
+    /// (the tracker the encode loop's two source-dim reconfigure sites gate on) through a window
+    /// drag-resize: a burst of dimension deltas at drag cadence, then the source holding steady.
+    ///
+    /// It models the loop's frame-arrival gate faithfully — `observe(raw)` then reconfigure iff the
+    /// (here unclamped) fitted dims drift from the applied dims AND `is_settled(now, SCREEN_DIM_SETTLE_MS)`
+    /// — and counts how many reconfigures fire. The pre-#1922 code had NO settle term, so it
+    /// reconfigured once per delta (a ~140-`configure()` storm, each an implicit keyframe). With the
+    /// gate, ZERO reconfigures fire during the drag and EXACTLY ONE fires once the source has held
+    /// steady for the settle window.
+    ///
+    /// MUTATION RECEIPT (verified by reverting): dropping the `&& is_settled(..)` term at the call
+    /// site — or making `settled_dims`/`is_settled` ignore the elapsed-time check (return settled on
+    /// the first observation), or making `observe` not re-stamp `changed_at_ms` on a change — makes the
+    /// gate fire once per delta, so `reconfigures` overruns 1 and the "exactly one" / "zero during
+    /// drag" assertions fail.
+    #[test]
+    fn dim_settle_defers_reconfigure_until_source_settles() {
+        let settle = SCREEN_DIM_SETTLE_MS;
+        let mut s = DimensionSettle::new();
+        // Applied encoder dims (mirror of `current_encoder_*`), seeded to the pre-drag size.
+        let mut applied = (1280u32, 720u32);
+        let mut reconfigures = 0u32;
+
+        // A drag emits deltas continuously at ~55ms (the field's peak 18/sec). Each frame carries
+        // DIFFERENT source dims. The settle window must exceed this gap so no delta reads as settled.
+        let delta_gap = 55.0f64;
+        let mut now = 1_000.0f64;
+        let mut w = 1280u32;
+        let deltas = 20u32; // ~1.1s of dragging; the field saw up to 18 deltas in ONE second
+        for _ in 0..deltas {
+            w += 8; // window growing as the user drags
+            let (raw_w, raw_h) = (w, 720u32);
+            s.observe(raw_w, raw_h, now);
+            // Loop gate (unclamped fit == raw here): drift AND settled.
+            if (raw_w != applied.0 || raw_h != applied.1) && s.is_settled(now, settle) {
+                applied = (raw_w, raw_h);
+                reconfigures += 1;
+            }
+            now += delta_gap;
+        }
+        assert_eq!(
+            reconfigures, 0,
+            "no reconfigure may fire WHILE the drag is still moving the source dims"
+        );
+
+        // Drag ends: the source holds at its final size. Advance to exactly the inclusive settle
+        // boundary since the LAST delta (whose `observe` was at `now - delta_gap`), then observe the
+        // final dims once more (live-content case). The first steady observation at/after the window
+        // reconfigures exactly once.
+        let final_dims = (w, 720u32);
+        now += settle - delta_gap;
+        s.observe(final_dims.0, final_dims.1, now);
+        if (final_dims.0 != applied.0 || final_dims.1 != applied.1) && s.is_settled(now, settle) {
+            applied = final_dims;
+            reconfigures += 1;
+        }
+        assert_eq!(
+            reconfigures, 1,
+            "exactly ONE reconfigure fires once the source has held steady for the settle window"
+        );
+        assert_eq!(
+            applied, final_dims,
+            "the applied dims are the SETTLED final size"
+        );
+
+        // Further steady observations do NOT re-fire (drift is now false).
+        for _ in 0..5 {
+            now += 200.0;
+            s.observe(final_dims.0, final_dims.1, now);
+            if (final_dims.0 != applied.0 || final_dims.1 != applied.1) && s.is_settled(now, settle)
+            {
+                reconfigures += 1;
+            }
+        }
+        assert_eq!(
+            reconfigures, 1,
+            "a stable source never re-triggers a reconfigure"
+        );
+    }
+
+    /// Issue #1922: a genuine ONE-SHOT resolution change (window snapped to a size, a display change)
+    /// must STILL reconfigure — after exactly one settle window, never wedged at the old dims. Drives
+    /// the production `settled_dims` at the inclusive boundary.
+    #[test]
+    fn dim_settle_applies_single_legit_resolution_change() {
+        let settle = SCREEN_DIM_SETTLE_MS;
+        let mut s = DimensionSettle::new();
+        let t0 = 5_000.0f64;
+        s.observe(1920, 1080, t0);
+        assert!(
+            s.settled_dims(t0 + settle - 1.0, settle).is_none(),
+            "inside the settle window a one-shot change is not yet applied"
+        );
+        assert_eq!(
+            s.settled_dims(t0 + settle, settle),
+            Some((1920, 1080)),
+            "a one-shot resolution change is applied after exactly one settle window"
+        );
+    }
+
+    /// Issue #1922: the settle state is per-encoder-session. A fresh tracker (new share session or an
+    /// encoder `'restart`, where the loop re-declares it via `DimensionSettle::new()`) carries NO
+    /// pending resize target from the prior session.
+    #[test]
+    fn dim_settle_resets_across_sessions() {
+        let settle = SCREEN_DIM_SETTLE_MS;
+        // Session A settles at one size.
+        let mut a = DimensionSettle::new();
+        a.observe(1600, 900, 0.0);
+        assert_eq!(a.settled_dims(settle, settle), Some((1600, 900)));
+
+        // A NEW session starts empty — nothing is settled until its own first frame, even long after
+        // wall-clock has advanced.
+        let b = DimensionSettle::new();
+        assert_eq!(
+            b,
+            DimensionSettle::new(),
+            "a new session's settle tracker is the cold state"
+        );
+        assert!(
+            b.settled_dims(1_000_000.0, settle).is_none(),
+            "a fresh session has no settled dims until it observes its own frame"
+        );
+    }
+
+    /// Issue #1922 req 4d: 0/invalid transient dims (a minimized/occluded capture) never produce a
+    /// reconfigure decision, and a transient invalid frame mid-hold must not disturb an already-settled
+    /// value — it must neither re-arm the settle clock nor overwrite the last valid dims.
+    #[test]
+    fn dim_settle_ignores_zero_and_invalid_transient_dims() {
+        let settle = SCREEN_DIM_SETTLE_MS;
+
+        // Zero/invalid dims alone never settle.
+        let mut z = DimensionSettle::new();
+        z.observe(0, 1080, 0.0);
+        z.observe(1920, 0, 10.0);
+        z.observe(0, 0, 20.0);
+        assert!(
+            z.settled_dims(1_000_000.0, settle).is_none(),
+            "invalid (0-axis) dims are never stored, so nothing ever settles"
+        );
+
+        // A valid value that then sees a transient 0x0 mid-hold stays settled at the valid value: the
+        // invalid frame neither re-arms the clock nor overwrites the dims.
+        let mut s = DimensionSettle::new();
+        s.observe(1920, 1080, 100.0);
+        s.observe(0, 0, 100.0 + settle / 2.0);
+        assert_eq!(
+            s.settled_dims(100.0 + settle, settle),
+            Some((1920, 1080)),
+            "a transient 0x0 mid-hold must not reset the settle clock or overwrite the last valid dims"
+        );
+    }
 
     /// Issue #1903: the static-share keyframe FLOOR gate. Drives the REAL production predicate
     /// (`static_keyframe_floor_due`, the fn the encode loop's timer branch calls) so a mutation to
@@ -4655,6 +6031,8 @@ mod tests {
         VideoCallClient::new(VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -4707,6 +6085,44 @@ mod tests {
         assert!(should_reacquire_screen_capture(false, 0));
         assert!(should_reacquire_screen_capture(true, 1));
         assert!(should_reacquire_screen_capture(true, 4));
+    }
+
+    /// Regression: a capture TRACK end (`reader.read()` -> done, i.e. the user
+    /// stopped the share, clicked the browser's "Stop sharing" button, or the OS
+    /// revoked capture) MUST terminate the encode task, NOT re-enter the restart
+    /// loop.
+    ///
+    /// The bug this pins: on a track end the loop used to fall through to the
+    /// auto-restart path (`continue 'restart`) unconditionally. Because a single
+    /// `ScreenEncoder` (and its shared `EncoderState.enabled` `Arc` +
+    /// `screen_stream` / `active_video_track` cells) is REUSED for the user's
+    /// next share, that zombie restart raced the next share: it clobbered the new
+    /// task's shared stream/track cells and its non-gesture `getDisplayMedia()`
+    /// rejected, storing `enabled = false` and killing the legitimate new encode
+    /// task. Symptom: after "stop share, immediately share again" the peer stayed
+    /// frozen on the last frame and the sharer saw "No peers received the shared
+    /// content within 10 seconds".
+    ///
+    /// Mutation sensitivity: reverting the fix — i.e. making the track-end case
+    /// restart like every other exit (`post_encode_exit_action` always returning
+    /// `Restart`, the pre-fix behavior) — flips the first assertion and FAILS.
+    /// The `false` arm pins that genuine auto-recovery (fatal codec fault /
+    /// transient read error, track still alive) is preserved, so the fix is a
+    /// true behavioral difference and not a blanket "never restart".
+    #[test]
+    fn track_end_shuts_down_and_never_auto_restarts() {
+        assert_eq!(
+            post_encode_exit_action(true),
+            PostEncodeExit::Shutdown,
+            "a capture-track end must shut the encode task down, never auto-restart \
+             (auto-restart races the reused ScreenEncoder's shared state with the next share)"
+        );
+        assert_eq!(
+            post_encode_exit_action(false),
+            PostEncodeExit::Restart,
+            "a non-track-end exit (fatal codec fault / transient read error, track still \
+             alive) must still re-enter the restart loop — genuine auto-recovery is preserved"
+        );
     }
 
     #[test]
@@ -4795,6 +6211,34 @@ mod tests {
         assert!(
             !encoder.congestion_step_down.load(Ordering::Acquire),
             "the screen congestion flag must be SEPARATE from the camera's"
+        );
+    }
+
+    /// #2060: `stop()` must reset the shared `current_fps` atomic to 0 so a
+    /// re-enable re-warms honestly (no stale-nonzero republish downstream). This
+    /// pins the stop()->`reset_output_fps` CALL-SITE — the pure helper itself is
+    /// unit-tested in `encode/mod.rs`; this guards that `stop()` actually calls
+    /// it. MUTATION: deleting `reset_output_fps(&self.current_fps)` from `stop()`
+    /// leaves `current_fps` at 30 and fails this assertion.
+    #[test]
+    fn stop_resets_current_fps_to_zero() {
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+            1, // max_layers (single layer)
+        );
+        // Simulate a live encoder that has produced layer-0 output.
+        encoder.current_fps.store(30, Ordering::Relaxed);
+        assert_eq!(encoder.get_current_fps(), 30);
+        encoder.stop();
+        assert_eq!(
+            encoder.get_current_fps(),
+            0,
+            "#2060: stop() must reset current_fps to 0"
         );
     }
 
@@ -5284,6 +6728,85 @@ mod tests {
         );
     }
 
+    // ── Issue #1921: WS freshness-gate self-congestion axis (#5) ─────────────
+    // The screen AQ loop is wasm-only, so axis #5's decision (the freshness-drop
+    // counter → `evaluate_self_congestion` → screen freshness constants) is
+    // extracted into `screen_ws_stale_drop_step_down_decision`, pinned here.
+    // These drive the REAL helper the loop calls (not a copy), so removing the
+    // axis or zeroing its threshold breaks an assertion.
+
+    /// A SUSTAINED cluster (delta ≥ threshold over a closed window) steps down.
+    /// Zeroing `SCREEN_WS_STALE_DROP_THRESHOLD` would make delta 0 also fire, but
+    /// this exact-threshold fire is the boundary the axis must keep.
+    #[test]
+    fn screen_ws_stale_axis_fires_on_sustained_drops() {
+        let decision = screen_ws_stale_drop_step_down_decision(
+            SCREEN_WS_STALE_DROP_THRESHOLD,
+            0,
+            SCREEN_WS_STALE_DROP_WINDOW_MS,
+        );
+        assert!(
+            decision.step_down,
+            "a freshness-drop delta == threshold over a closed window must step down"
+        );
+    }
+
+    /// A blip (delta below threshold) must NOT step down — this is the "sustained,
+    /// not a spike" guarantee. If the threshold were lowered to the WS axis's 3,
+    /// a `THRESHOLD - 1` blip could exceed it; pinning `THRESHOLD - 1` → no-fire
+    /// guards that the sustained bar is preserved.
+    #[test]
+    fn screen_ws_stale_axis_does_not_fire_on_a_blip() {
+        let decision = screen_ws_stale_drop_step_down_decision(
+            SCREEN_WS_STALE_DROP_THRESHOLD - 1,
+            0,
+            SCREEN_WS_STALE_DROP_WINDOW_MS,
+        );
+        assert!(
+            !decision.step_down,
+            "a freshness-drop delta below threshold (a transient gating blip) must NOT step down"
+        );
+    }
+
+    /// A flat-at-0 counter (WebTransport publisher, or healthy WS where the gate
+    /// never fires) must never step down, so the axis is a true no-op off the
+    /// congested-WS path. Mutating the signal to something non-flat would fail.
+    #[test]
+    fn screen_ws_stale_axis_never_fires_when_flat() {
+        let decision =
+            screen_ws_stale_drop_step_down_decision(0, 0, SCREEN_WS_STALE_DROP_WINDOW_MS);
+        assert!(
+            !decision.step_down,
+            "a flat-at-0 freshness-drop counter must never step down (WT / healthy WS)"
+        );
+    }
+
+    /// Anti-misweave + sustained-window pin: the axis must use its OWN 2s window,
+    /// not the WS overflow axis's 1s window. At an elapsed past the (narrower) WS
+    /// window but before the freshness window closes, the axis must still treat
+    /// the window as OPEN (no fire, no roll) even with a threshold-meeting delta.
+    /// The premise (freshness window wider than WS) is pinned at COMPILE TIME so
+    /// it is not a runtime `assert!` on constants.
+    #[test]
+    fn screen_ws_stale_axis_uses_its_own_wide_window_not_ws() {
+        const _: () = assert!(
+            SCREEN_WS_STALE_DROP_WINDOW_MS > WS_SELF_CONGESTION_WINDOW_MS,
+            "test premise: freshness-drop window must be wider than the WS overflow window"
+        );
+        let elapsed = WS_SELF_CONGESTION_WINDOW_MS + 1.0;
+        let decision =
+            screen_ws_stale_drop_step_down_decision(SCREEN_WS_STALE_DROP_THRESHOLD, 0, elapsed);
+        assert!(
+            !decision.step_down,
+            "freshness axis must treat its window as open at WS-window elapsed (proves the wider \
+             sustained window, not the WS window)"
+        );
+        assert!(
+            !decision.roll_window,
+            "an open freshness window must not roll"
+        );
+    }
+
     /// Issue #1311 (SCREEN half): after a reconnect/re-election the screen encode
     /// loop keeps running (it is NOT torn down — only the connection is rebuilt / the
     /// re-election atomic flips), so `last_keyframe_emit_ms` carries a STALE
@@ -5401,6 +6924,210 @@ mod tests {
             "Arc MUST be false after clear_screen_sharing_flags — stale-true would \
              wedge the audio-after-video detector. REGRESSION: if this fails, the \
              helper is missing the arc.store(false) line at screen_encoder.rs:~643"
+        );
+    }
+
+    // ── discussion 1960 (issue 2): sender-side encoder stall detection ────────────
+    // These drive the REAL production types the encode loop uses — `EncoderStallMonitor`,
+    // `retained_stale_warn_due`, and (for the forced-keyframe wiring) `keyframe_tick_decision` — not
+    // re-implemented copies, so a mutation to the detector, the one-shot latch, the age gate, or the
+    // rate limit breaks an assertion here.
+
+    /// The tick-starvation detector fires only on a gap ABOVE the threshold, ignores the cold-start /
+    /// first-tick case, and arms a ONE-SHOT fresh-keyframe latch (consumed exactly once).
+    ///
+    /// Mutation guards: flipping `tick`'s `>` to always-false, or dropping the arm, flips the resume
+    /// assertions; making `take_resume_force` sticky (not disarming) flips the one-shot assertion;
+    /// making it always-`false` flips the "armed" assertion.
+    #[test]
+    fn encoder_stall_monitor_detects_gap_and_arms_one_shot() {
+        let gap = SCREEN_ENCODER_STALL_GAP_MS;
+        let mut mon = EncoderStallMonitor::new();
+
+        // Cold start: no prior tick → never a stall, never armed.
+        assert!(
+            mon.tick(1_000.0, gap).is_none(),
+            "the first tick has no prior tick to measure a gap against"
+        );
+        assert!(
+            !mon.take_resume_force(),
+            "a cold-start tick must not arm the fresh-keyframe latch"
+        );
+
+        // A normal 150ms poll gap is under the threshold → no stall.
+        assert!(
+            mon.tick(1_150.0, gap).is_none(),
+            "a routine 150ms poll gap is far under the stall threshold"
+        );
+        assert!(!mon.take_resume_force());
+
+        // An 80s freeze then resume: gap far over threshold → stall detected, latch armed.
+        let resumed = mon.tick(1_150.0 + 80_000.0, gap);
+        assert!(
+            resumed.is_some(),
+            "an 80s tick gap must report as a stall resume"
+        );
+        assert!(
+            resumed.unwrap() >= 79_000.0,
+            "the reported gap is the full stall duration, not a truncated value"
+        );
+
+        // One-shot: the first consumer sees the arm, the second does not.
+        assert!(
+            mon.take_resume_force(),
+            "the resume arms exactly one fresh-keyframe request"
+        );
+        assert!(
+            !mon.take_resume_force(),
+            "the fresh-keyframe latch is one-shot — it disarms after one take"
+        );
+    }
+
+    /// LOAD-BEARING signal-choice test (discussion 1960, issue 2). A legitimately STATIC share delivers
+    /// NO real captured frames for minutes (a `getDisplayMedia` track emits only on visual change — see
+    /// SCREEN_STATIC_REENCODE_POLL_MS), yet the encode loop keeps TICKING at the 150ms poll cadence.
+    /// Driving `EncoderStallMonitor` at that TICK cadence must NEVER read as a stall.
+    ///
+    /// This pins WHY the signal is the loop tick and not the gap since the last real frame: at the tick
+    /// cadence no gap ever crosses the threshold (the loop below), whereas a monitor ticked only on real
+    /// frames would see minutes-long gaps and FALSE-POSITIVE on every static share (the contrast
+    /// assertion). If a future change re-based the detector on real-frame arrivals, a static share would
+    /// begin tripping it and this test's static-cadence loop would start returning `Some`.
+    #[test]
+    fn encoder_stall_monitor_no_false_positive_on_static_share_tick_cadence() {
+        let gap = SCREEN_ENCODER_STALL_GAP_MS;
+        let poll = SCREEN_STATIC_REENCODE_POLL_MS as f64;
+
+        let mut mon = EncoderStallMonitor::new();
+        let mut t = 1_000.0;
+        mon.tick(t, gap); // seed the anchor
+
+        // ~150s of a static share: the timer arm ticks every 150ms with NO real frames arriving.
+        for _ in 0..1_000 {
+            t += poll;
+            assert!(
+                mon.tick(t, gap).is_none(),
+                "a static-share poll tick (150ms apart) must never read as a stall"
+            );
+        }
+        assert!(
+            !mon.take_resume_force(),
+            "a static share (frequent ticks, no frames) must never arm the fresh-keyframe latch"
+        );
+
+        // CONTRAST: this is exactly what the WRONG signal (gap since the last real captured frame)
+        // would produce — on a static share real frames are minutes apart, so a monitor ticked only on
+        // real frames sees a huge gap and trips. Proving the tick cadence, not the frame cadence, is the
+        // correct signal.
+        let mut wrong = EncoderStallMonitor::new();
+        wrong.tick(1_000.0, gap);
+        assert!(
+            wrong.tick(1_000.0 + 120_000.0, gap).is_some(),
+            "a 120s gap (real-frame cadence on a static share) DOES trip — which is why the detector is \
+             driven by the 150ms loop tick, not by real-frame arrivals"
+        );
+    }
+
+    /// The retained-frame staleness warn fires only when the frame age exceeds the ceiling AND the
+    /// rate-limit window has elapsed. Drives the production `retained_stale_warn_due`.
+    ///
+    /// Mutation guards: flipping the age gate `<=` (returning false for an over-ceiling age) flips the
+    /// "stale ⇒ warn" assertion; dropping the `None ⇒ true` first-warn arm flips the "first warn fires"
+    /// assertion; weakening the throttle comparison flips the "within-window suppressed" /
+    /// "after-window re-fires" assertions.
+    #[test]
+    fn retained_stale_warn_due_gates_on_age_and_rate_limit() {
+        let stale = SCREEN_RETAINED_STALE_MS;
+        let throttle = SCREEN_RETAINED_STALE_LOG_THROTTLE_MS;
+        let now = 100_000.0;
+
+        // Fresh-enough retained frame: never warns, regardless of the rate-limit anchor.
+        assert!(
+            !retained_stale_warn_due(stale - 1.0, stale, now, None, throttle),
+            "an age under the staleness ceiling is not the stall symptom — no warn"
+        );
+        assert!(
+            !retained_stale_warn_due(stale, stale, now, None, throttle),
+            "an age exactly at the ceiling is not yet stale (strict > boundary)"
+        );
+
+        // Stale frame, never warned before: warn.
+        assert!(
+            retained_stale_warn_due(stale + 1.0, stale, now, None, throttle),
+            "a retained frame older than the ceiling, with no prior warn, must warn"
+        );
+
+        // Stale frame, but a warn fired within the throttle window: suppressed.
+        assert!(
+            !retained_stale_warn_due(60_000.0, stale, now, Some(now - (throttle - 1.0)), throttle),
+            "a second stale answer inside the rate-limit window is suppressed"
+        );
+
+        // Stale frame, throttle window elapsed: warn again (>= boundary inclusive).
+        assert!(
+            retained_stale_warn_due(60_000.0, stale, now, Some(now - throttle), throttle),
+            "once the rate-limit window has elapsed the warn re-fires"
+        );
+    }
+
+    /// The stall-resume path forces EXACTLY ONE fresh keyframe, ungated by the PLI cooldown, on the
+    /// first real frame after the freeze — and not on the next frame. Wires the real production types
+    /// together: `EncoderStallMonitor` arms the latch, and the loop folds `take_resume_force()` into
+    /// the `keyframe_tick_decision` `is_periodic` input exactly as the encode loop does.
+    ///
+    /// Mutation guards: if `take_resume_force` never armed / always returned false, frame 1 would not
+    /// force a keyframe (first assertion fails); if it were sticky, frame 2 would also force one (last
+    /// assertion fails). `last_keyframe_emit_ms` is set so a *PLI* would be cooldown-gated, proving the
+    /// resume force bypasses the cooldown via the periodic input, not via a PLI.
+    #[test]
+    fn stall_resume_forces_exactly_one_fresh_keyframe_via_decision() {
+        let gap = SCREEN_ENCODER_STALL_GAP_MS;
+        let mut mon = EncoderStallMonitor::new();
+        mon.tick(1_000.0, gap);
+        assert!(
+            mon.tick(1_000.0 + 90_000.0, gap).is_some(),
+            "a 90s tick gap is a stall resume that arms the latch"
+        );
+
+        // Frame 1 after resume: no periodic boundary, no PLI, and a keyframe went out 500ms ago (so a
+        // PLI would be cooldown-gated). The resume latch alone must still force a keyframe. `is_periodic`
+        // here models the production `periodic_keyframe_due(..) || stall_resume_keyframe` with the
+        // periodic term false.
+        let resume1 = mon.take_resume_force();
+        assert!(
+            resume1,
+            "the first real frame after a resume consumes the armed latch"
+        );
+        let d1 = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: 91_500.0,
+            pli_pending: false,
+            is_periodic: resume1,
+            cooldown_reset: false,
+            last_keyframe_emit_ms: Some(91_000.0),
+            cooldown_ms: ENCODER_PLI_COOLDOWN_MS,
+        });
+        assert!(
+            d1.want_keyframe,
+            "the stall-resume latch forces a fresh keyframe ungated by the PLI cooldown"
+        );
+
+        // Frame 2: the one-shot latch is spent → no periodic, no PLI ⇒ no keyframe.
+        let resume2 = mon.take_resume_force();
+        assert!(
+            !resume2,
+            "the resume latch is one-shot — the second frame does not re-force"
+        );
+        let d2 = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: 91_600.0,
+            pli_pending: false,
+            is_periodic: resume2,
+            cooldown_reset: false,
+            last_keyframe_emit_ms: Some(91_500.0),
+            cooldown_ms: ENCODER_PLI_COOLDOWN_MS,
+        });
+        assert!(
+            !d2.want_keyframe,
+            "with the one-shot latch spent, a non-periodic no-PLI frame emits no keyframe"
         );
     }
 }

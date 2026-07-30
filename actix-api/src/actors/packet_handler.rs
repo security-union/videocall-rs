@@ -38,7 +38,7 @@ use crate::constants::{
     KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN,
     KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN_CONGESTED,
     KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS, KEYFRAME_REQUEST_WINDOW_MS,
-    REACTION_MAX_PER_WINDOW, REACTION_WINDOW_MS,
+    REACTION_CUSTOM_EMOJI_MAX_BYTES, REACTION_MAX_PER_WINDOW, REACTION_WINDOW_MS,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -158,8 +158,17 @@ pub enum PacketKind {
     Rtt,
     /// Health diagnostics packet - should be processed for metrics
     Health,
-    /// Normal data packet - should be forwarded to ChatServer
+    /// Normal opaque data packet - should be forwarded to ChatServer
     Data,
+    /// Regular inbound MEDIA frame - should be forwarded to ChatServer.
+    ///
+    /// Carries only bounded relay-readable observation metadata. The cleartext
+    /// outer `media_kind` is available even under E2EE; `frame_kind` is `Unknown`
+    /// when the inner `MediaPacket` is sealed or otherwise unreadable.
+    Media {
+        media_kind: MediaKind,
+        frame_kind: InboundFrameKind,
+    },
     /// Packet that should be silently dropped (e.g., client-originated CONGESTION or MEETING)
     Dropped,
     /// KEYFRAME_REQUEST packet - subject to per-(receiver, target_sender,
@@ -206,6 +215,53 @@ pub enum PacketKind {
     /// classified [`PacketKind::Dropped`] and never reaches the limiter, and a
     /// flood of invalid reactions cannot consume a sender's valid budget.
     Reaction,
+}
+
+/// Bounded frame-kind label for publisher-leg inbound-arrival instrumentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundFrameKind {
+    Key,
+    Delta,
+    Unknown,
+}
+
+impl InboundFrameKind {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            InboundFrameKind::Key => "key",
+            InboundFrameKind::Delta => "delta",
+            InboundFrameKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// True iff `bytes` is a valid CUSTOM-reaction `custom_emoji` payload: a single
+/// standard Unicode emoji on the exact `emojis` allowlist, within the byte cap
+/// (issue 1884).
+///
+/// This is the RELAY half of the CUSTOM allowlist and MUST stay in lockstep with
+/// the client's `validate_custom_emoji` in
+/// `videocall-client/src/client/reactions.rs` — the SAME predicate
+/// (`len <= cap && emojis::get(s).is_some()`) over the SAME `emojis` 0.9 table.
+/// The relay adds exactly ONE term the client cannot need: a UTF-8
+/// well-formedness gate, because the client only ever validates a Rust `&str`
+/// (already valid UTF-8) whereas the relay validates RAW wire bytes a malicious
+/// or old sender may have left as invalid UTF-8. Empty rejects (the empty string
+/// is not a table entry — same as the client). `emojis::get` is an EXACT lookup,
+/// so a within-cap ZWJ sequence or flag validates, but two concatenated emoji or
+/// trailing markup do not; the `len <= cap` term independently rejects the
+/// 35-byte full-table skin-tone variants the picker never offers (see the
+/// `REACTION_CUSTOM_EMOJI_MAX_BYTES` doc for the byte budget).
+///
+/// Fail-closed by construction: any failed term returns `false` and the caller
+/// ([`classify_packet`]) drops the packet. The relay is the sole ingress
+/// enforcement point that protects OLD clients and non-conforming senders — the
+/// proto threat model puts the allowlist HERE.
+pub fn custom_emoji_is_valid(bytes: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    s.len() <= REACTION_CUSTOM_EMOJI_MAX_BYTES && emojis::get(s).is_some()
 }
 
 /// Classify a packet based on its contents.
@@ -278,7 +334,11 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
     // CLEARTEXT (never AES-sealed, even under E2EE — see the proto doc)
     // precisely so the relay can enforce the closed-enum allowlist HERE. Parse
     // it; a reaction that is UNSPECIFIED(0), an unknown/reserved value, or
-    // unparseable is dropped as Processed (no fan-out).
+    // unparseable is dropped as Processed (no fan-out). A CUSTOM(12) reaction
+    // additionally must carry a valid `custom_emoji` (the SAME exact-emoji
+    // allowlist the client enforces — see `custom_emoji_is_valid`), while a
+    // built-in glyph must NOT carry one; both are enforced in the match below so
+    // the invariant "custom_emoji is meaningful iff CUSTOM" holds room-wide.
     //
     // Validation runs HERE, BEFORE the per-sender `ReactionRateLimiter` in
     // `SessionLogic::handle_inbound`, so a flood of INVALID reactions is
@@ -293,9 +353,25 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
         };
         // `enum_value()` returns `Err(raw)` for an unknown/reserved wire value
         // (the closed-enum drop signal); `UNSPECIFIED(0)` is the proto3 default
-        // and is not a real reaction. Both drop; every defined 1..=7 forwards.
+        // and is not a real reaction. Both drop. Every OTHER defined value can
+        // forward, but CUSTOM(12) and the built-in glyphs have DIFFERENT
+        // `custom_emoji` contracts, enforced by the two arms below (issue 1884).
         return match reaction.reaction.enum_value() {
             Ok(ReactionType::REACTION_TYPE_UNSPECIFIED) | Err(_) => PacketKind::Dropped,
+            // CUSTOM carries a picker-selected emoji in `custom_emoji`. The relay
+            // enforces the SAME exact-emoji allowlist the client does, fail-closed
+            // for OLD/forged senders: empty, markup, multi-emoji, invalid UTF-8,
+            // or over-cap all drop here.
+            Ok(ReactionType::CUSTOM) if custom_emoji_is_valid(&reaction.custom_emoji) => {
+                PacketKind::Reaction
+            }
+            Ok(ReactionType::CUSTOM) => PacketKind::Dropped,
+            // A built-in glyph (1..=11) has NO legitimate `custom_emoji`. A
+            // non-empty field here is smuggling — drop to keep the invariant
+            // "custom_emoji is meaningful IFF CUSTOM" true for every downstream
+            // consumer (renderer, stamp path, future features). OLD clients never
+            // set field 3, so this cannot affect them.
+            Ok(_) if !reaction.custom_emoji.is_empty() => PacketKind::Dropped,
             Ok(_) => PacketKind::Reaction,
         };
     }
@@ -303,50 +379,71 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
     // Check if it's a MEDIA packet (RTT, keyframe request, or regular media).
     if packet_wrapper.packet_type == PacketType::MEDIA.into() {
         // Try to parse inner MediaPacket to distinguish control sub-types.
-        // For encrypted payloads this parse will fail, correctly falling
-        // through to PacketKind::Data.
-        if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-            if media_packet.media_type == MediaType::RTT.into() {
-                return PacketKind::Rtt;
-            }
-            if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
-                // The inner MediaPacket.user_id identifies the target peer
-                // (the sender whose video should produce a keyframe). The
-                // inner MediaPacket.target_session_id (#1124) identifies the
-                // specific target SESSION; the limiter keys on it when present
-                // so two concurrent sessions of one participant do not collide
-                // into a single rate-limit bucket. The outer wrapper's
-                // session_id is the SOURCE (the requester) and must not be
-                // reused for the target, so the target session travels in the
-                // inner packet, which is sent in cleartext for KEYFRAME_REQUEST
-                // (relay-readable even under E2EE). When `target_session_id` is
-                // 0 (older client), the limiter falls back to keying by
-                // `user_id` — stable across reconnects of the same participant,
-                // preserving the pre-#1124 behaviour for those clients.
-                //
-                // The cleartext outer `simulcast_layer_id` (#989, Phase 1b)
-                // identifies which simulcast layer the receiver wants a
-                // keyframe for. It is part of the limiter key (see
-                // `PacketKind::KeyframeRequest`) so switching layers is not
-                // throttled as a duplicate request.
-                //
-                // #1297: the requested media kind (VIDEO vs SCREEN) lives in
-                // the inner `MediaPacket.data` byte-string (the client sets
-                // `b"VIDEO"`/`b"SCREEN"` there — the OUTER `media_kind` is left
-                // UNSPECIFIED on requests). We classify it here so VIDEO and
-                // SCREEN keyframe requests do not share a rate-limit bucket.
-                // The inner MediaPacket is already parsed above (cleartext on
-                // a KEYFRAME_REQUEST even under E2EE), so this is free.
-                let kind = KeyframeMediaKind::from_request_data(&media_packet.data);
-                return PacketKind::KeyframeRequest {
-                    target_user_id: media_packet.user_id,
-                    target_session_id: media_packet.target_session_id,
-                    layer: packet_wrapper.simulcast_layer_id,
-                    kind,
-                };
-            }
-        }
-        return PacketKind::Data;
+        // When the inner bytes do not parse (as with ordinary encrypted
+        // payloads), the frame kind falls back to `Unknown`; the cleartext
+        // outer media kind still distinguishes video/screen from other data.
+        let frame_kind =
+            if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+                if media_packet.media_type == MediaType::RTT.into() {
+                    return PacketKind::Rtt;
+                }
+                if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
+                    // The inner MediaPacket.user_id identifies the target peer
+                    // (the sender whose video should produce a keyframe). The
+                    // inner MediaPacket.target_session_id (#1124) identifies the
+                    // specific target SESSION; the limiter keys on it when present
+                    // so two concurrent sessions of one participant do not collide
+                    // into a single rate-limit bucket. The outer wrapper's
+                    // session_id is the SOURCE (the requester) and must not be
+                    // reused for the target, so the target session travels in the
+                    // inner packet, which is sent in cleartext for KEYFRAME_REQUEST
+                    // (relay-readable even under E2EE). When `target_session_id` is
+                    // 0 (older client), the limiter falls back to keying by
+                    // `user_id` — stable across reconnects of the same participant,
+                    // preserving the pre-#1124 behaviour for those clients.
+                    //
+                    // The cleartext outer `simulcast_layer_id` (#989, Phase 1b)
+                    // identifies which simulcast layer the receiver wants a
+                    // keyframe for. It is part of the limiter key (see
+                    // `PacketKind::KeyframeRequest`) so switching layers is not
+                    // throttled as a duplicate request.
+                    //
+                    // #1297: the requested media kind (VIDEO vs SCREEN) lives in
+                    // the inner `MediaPacket.data` byte-string (the client sets
+                    // `b"VIDEO"`/`b"SCREEN"` there — the OUTER `media_kind` is left
+                    // UNSPECIFIED on requests). We classify it here so VIDEO and
+                    // SCREEN keyframe requests do not share a rate-limit bucket.
+                    // The inner MediaPacket is already parsed above (cleartext on
+                    // a KEYFRAME_REQUEST even under E2EE), so this is free.
+                    let kind = KeyframeMediaKind::from_request_data(&media_packet.data);
+                    return PacketKind::KeyframeRequest {
+                        target_user_id: media_packet.user_id,
+                        target_session_id: media_packet.target_session_id,
+                        layer: packet_wrapper.simulcast_layer_id,
+                        kind,
+                    };
+                }
+                // Map only the two relay-readable literals; an empty/unexpected
+                // `frame_type` (older/malformed publisher, or opaque bytes that
+                // happen to parse as a proto) is NOT a relay-readable kind and must
+                // fall to `Unknown` per the metric contract — mapping it to `Delta`
+                // would pollute the delta bucket with frames whose kind we don't
+                // actually know.
+                match media_packet.frame_type.as_str() {
+                    "key" => InboundFrameKind::Key,
+                    "delta" => InboundFrameKind::Delta,
+                    _ => InboundFrameKind::Unknown,
+                }
+            } else {
+                InboundFrameKind::Unknown
+            };
+        return match packet_wrapper.media_kind.enum_value() {
+            Ok(media_kind @ (MediaKind::VIDEO | MediaKind::SCREEN)) => PacketKind::Media {
+                media_kind,
+                frame_kind,
+            },
+            _ => PacketKind::Data,
+        };
     }
 
     // Check health packet.
@@ -1406,18 +1503,70 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_regular_media_as_data() {
+    fn test_classify_regular_video_media_as_media() {
         let media = MediaPacket {
             media_type: MediaType::VIDEO.into(),
+            frame_type: "delta".to_string(),
             ..Default::default()
         };
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
             data: media.write_to_bytes().unwrap(),
+            media_kind: MediaKind::VIDEO.into(),
             ..Default::default()
         };
         let bytes = wrapper.write_to_bytes().unwrap();
-        assert_eq!(classify_packet(&bytes), PacketKind::Data);
+        assert_eq!(
+            classify_packet(&bytes),
+            PacketKind::Media {
+                media_kind: MediaKind::VIDEO,
+                frame_kind: InboundFrameKind::Delta,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_unparseable_inner_video_and_screen_as_unknown_media() {
+        for media_kind in [MediaKind::VIDEO, MediaKind::SCREEN] {
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::MEDIA.into(),
+                data: vec![0x08, 0x80],
+                media_kind: media_kind.into(),
+                ..Default::default()
+            };
+            let bytes = wrapper.write_to_bytes().unwrap();
+            assert_eq!(
+                classify_packet(&bytes),
+                PacketKind::Media {
+                    media_kind,
+                    frame_kind: InboundFrameKind::Unknown,
+                },
+                "an unparseable inner frame must retain its outer {media_kind:?} classification"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_audio_and_unspecified_media_as_data() {
+        let media = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            frame_type: "delta".to_string(),
+            ..Default::default()
+        };
+        for media_kind in [MediaKind::AUDIO, MediaKind::MEDIA_KIND_UNSPECIFIED] {
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::MEDIA.into(),
+                data: media.write_to_bytes().unwrap(),
+                media_kind: media_kind.into(),
+                ..Default::default()
+            };
+            let bytes = wrapper.write_to_bytes().unwrap();
+            assert_eq!(
+                classify_packet(&bytes),
+                PacketKind::Data,
+                "outer {media_kind:?} media must not enter the video/screen gap metric"
+            );
+        }
     }
 
     #[test]
@@ -2903,6 +3052,141 @@ mod tests {
         );
     }
 
+    /// Build a `PacketWrapper{REACTION}` whose inner `ReactionPacket` carries a
+    /// `reaction` value AND a raw `custom_emoji` byte payload — the exact wire
+    /// shape `classify_packet` validates for CUSTOM (issue 1884).
+    fn reaction_wrapper_with_emoji(reaction: ReactionType, custom_emoji: Vec<u8>) -> Vec<u8> {
+        let inner = ReactionPacket {
+            reaction: reaction.into(),
+            custom_emoji,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::REACTION.into(),
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    #[test]
+    fn test_classify_new_vocabulary_reactions_forwardable() {
+        // The proto regen (issue 1884) added CRY(8), DISAGREE(9), SAD(10),
+        // HEART_BROKEN(11) as fixed built-in glyphs. Each with NO custom_emoji
+        // must classify as a forwardable Reaction — they take the `Ok(_)` tail
+        // arm exactly like the original 1..=7 vocabulary.
+        //
+        // ADVERSARIAL: before the regen these were unknown wire values
+        // (`Err(_) => Dropped`); this pins that they now forward. It also guards
+        // the smuggling arm — if `Ok(_) if !custom_emoji.is_empty()` wrongly
+        // matched an EMPTY field, these (empty) would drop and this fails.
+        for r in [
+            ReactionType::CRY,
+            ReactionType::DISAGREE,
+            ReactionType::SAD,
+            ReactionType::HEART_BROKEN,
+        ] {
+            let bytes = reaction_wrapper_with_emoji(r, Vec::new());
+            assert_eq!(
+                classify_packet(&bytes),
+                PacketKind::Reaction,
+                "a new built-in reaction {r:?} (no custom_emoji) must forward"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_custom_reaction_with_valid_emoji_forwardable() {
+        // CUSTOM(12) + a single standard emoji on the allowlist forwards. The
+        // cases span an emoji's structural range: a plain 4-byte emoji, an 8-byte
+        // regional-indicator flag, and an 18-byte ZWJ family sequence — the
+        // longest, which doubles as the byte-cap sensor.
+        //
+        // ADVERSARIAL: making CUSTOM unconditionally Dropped fails all three;
+        // SHRINKING REACTION_CUSTOM_EMOJI_MAX_BYTES below 18 rejects the family
+        // sequence and fails that case (the cap-mutation receipt — every valid
+        // emoji is <= 32 bytes, so only a shrink of the cap is observable).
+        for emoji in ["😭", "🇲🇽", "🧑‍🤝‍🧑"] {
+            let bytes =
+                reaction_wrapper_with_emoji(ReactionType::CUSTOM, emoji.as_bytes().to_vec());
+            assert_eq!(
+                classify_packet(&bytes),
+                PacketKind::Reaction,
+                "CUSTOM + valid emoji {emoji:?} must classify as a forwardable Reaction"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_custom_reaction_with_invalid_emoji_dropped() {
+        // CUSTOM(12) whose custom_emoji is NOT a single allowlisted emoji is
+        // dropped fail-closed. HEADLINE mutation receipt: delete the
+        // `custom_emoji_is_valid(..)` guard (CUSTOM always -> Reaction) and every
+        // case below flips to Reaction -> all fail. Each case isolates one term:
+        //   ""            -> empty (not a table entry)
+        //   "hello"       -> a word (not an emoji)
+        //   "<script>"    -> markup (XSS-shaped, not an emoji)
+        //   "👍👍"        -> two concatenated emoji (not a single table entry)
+        //   80-byte emoji -> over the byte cap
+        //   0xff 0xfe     -> invalid UTF-8 (guards the from_utf8 gate)
+        let invalid: [Vec<u8>; 6] = [
+            b"".to_vec(),
+            b"hello".to_vec(),
+            b"<script>".to_vec(),
+            "👍👍".as_bytes().to_vec(),
+            "👍".repeat(20).into_bytes(),
+            vec![0xff, 0xfe],
+        ];
+        for payload in invalid {
+            let bytes = reaction_wrapper_with_emoji(ReactionType::CUSTOM, payload.clone());
+            assert_eq!(
+                classify_packet(&bytes),
+                PacketKind::Dropped,
+                "CUSTOM + invalid custom_emoji {payload:?} must be dropped fail-closed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_non_custom_reaction_with_custom_emoji_dropped() {
+        // A built-in glyph must NOT carry a custom_emoji. Even a VALID emoji on a
+        // NON-CUSTOM reaction is field-smuggling and drops — isolating the
+        // smuggling guard (the emoji itself is valid, so the ONLY reason to drop
+        // is that the reaction is not CUSTOM).
+        //
+        // ADVERSARIAL: delete the `Ok(_) if !custom_emoji.is_empty()` arm and
+        // THUMBS_UP + "👍" would forward -> this fails.
+        for r in [
+            ReactionType::THUMBS_UP,
+            ReactionType::HEART,
+            ReactionType::CRY,
+        ] {
+            let bytes = reaction_wrapper_with_emoji(r, "👍".as_bytes().to_vec());
+            assert_eq!(
+                classify_packet(&bytes),
+                PacketKind::Dropped,
+                "a non-CUSTOM reaction {r:?} carrying a custom_emoji must be dropped (smuggling)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_custom_emoji_is_valid_unit() {
+        // Direct unit coverage of the pure validator that `classify_packet` and
+        // the client's `validate_custom_emoji` must agree on (lockstep). Accept: a
+        // plain emoji, a flag, a ZWJ family. Reject: empty, a word, markup, two
+        // emoji, over-cap, invalid UTF-8. Mirrors the client's reactions.rs tests.
+        assert!(custom_emoji_is_valid("😭".as_bytes()));
+        assert!(custom_emoji_is_valid("🇲🇽".as_bytes()));
+        assert!(custom_emoji_is_valid("🧑‍🤝‍🧑".as_bytes()));
+        assert!(!custom_emoji_is_valid(b""));
+        assert!(!custom_emoji_is_valid(b"hello"));
+        assert!(!custom_emoji_is_valid(b"<script>"));
+        assert!(!custom_emoji_is_valid("👍👍".as_bytes()));
+        assert!(!custom_emoji_is_valid(&"👍".repeat(20).into_bytes()));
+        assert!(!custom_emoji_is_valid(&[0xff, 0xfe]));
+    }
+
     #[test]
     fn test_reaction_limiter_admits_up_to_max_then_drops() {
         // Up to REACTION_MAX_PER_WINDOW reactions in one window are admitted; the
@@ -3117,6 +3401,91 @@ mod tests {
             out_inner.display_name,
             b"Bob".to_vec(),
             "a within-bound display_name must be preserved unchanged"
+        );
+    }
+
+    #[test]
+    fn test_stamp_reaction_preserves_custom_emoji_through_rewrite() {
+        // The stamp path re-serializes the inner packet ONLY when it truncates an
+        // overlong display_name. A CUSTOM reaction that hits that re-serialize
+        // MUST round-trip its custom_emoji byte-for-byte — otherwise the relay
+        // would fan out a CUSTOM reaction with a blanked-out glyph.
+        //
+        // ADVERSARIAL: if the stamp rebuilt a FRESH ReactionPacket (dropping
+        // field 3) instead of mutating the PARSED `inner`, custom_emoji would be
+        // lost on the truncation path -> this fails. The overlong display_name
+        // FORCES the re-serialize branch so preservation is actually exercised.
+        const AUTHENTICATED: u64 = 3;
+        let emoji = "🧑‍🤝‍🧑".as_bytes().to_vec();
+        let inner = ReactionPacket {
+            reaction: ReactionType::CUSTOM.into(),
+            display_name: "x".repeat(400).into_bytes(),
+            custom_emoji: emoji.clone(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::REACTION.into(),
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+
+        let cap = crate::constants::REACTION_DISPLAY_NAME_MAX_BYTES;
+        let stamped = stamp_reaction_for_broadcast(&bytes, AUTHENTICATED, cap).unwrap();
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        let out_inner = ReactionPacket::parse_from_bytes(&out.data).unwrap();
+        assert_eq!(
+            out_inner.custom_emoji, emoji,
+            "custom_emoji must survive the display_name-truncation re-serialize byte-for-byte"
+        );
+        assert!(
+            out_inner.display_name.len() <= cap,
+            "the overlong display_name must still be truncated (re-serialize path was taken)"
+        );
+        assert_eq!(
+            out_inner.reaction.enum_value(),
+            Ok(ReactionType::CUSTOM),
+            "the CUSTOM reaction value must survive the rewrite"
+        );
+        // And the stamped bytes still pass ingress re-classification as a
+        // forwardable Reaction (the stamp did not corrupt the packet).
+        assert_eq!(classify_packet(&stamped), PacketKind::Reaction);
+    }
+
+    #[test]
+    fn test_stamp_reaction_preserves_custom_emoji_common_path() {
+        // Common in-bound path: a within-cap display_name means the stamp does
+        // NOT re-serialize the inner packet — wrapper.data stays the ORIGINAL
+        // bytes, so custom_emoji is trivially preserved. Pins that the no-truncate
+        // fast path also keeps a CUSTOM reaction's glyph intact after the
+        // session_id stamp.
+        const AUTHENTICATED: u64 = 4;
+        let emoji = "😭".as_bytes().to_vec();
+        let inner = ReactionPacket {
+            reaction: ReactionType::CUSTOM.into(),
+            display_name: b"Ann".to_vec(),
+            custom_emoji: emoji.clone(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::REACTION.into(),
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+
+        let stamped = stamp_reaction_for_broadcast(
+            &bytes,
+            AUTHENTICATED,
+            crate::constants::REACTION_DISPLAY_NAME_MAX_BYTES,
+        )
+        .unwrap();
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(out.session_id, AUTHENTICATED);
+        let out_inner = ReactionPacket::parse_from_bytes(&out.data).unwrap();
+        assert_eq!(
+            out_inner.custom_emoji, emoji,
+            "custom_emoji must be preserved on the no-truncate fast path"
         );
     }
 }

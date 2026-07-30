@@ -220,6 +220,7 @@ pub async fn join_meeting(
         resp.end_on_host_leave = meeting.end_on_host_leave;
         resp.allow_guests = meeting.allow_guests;
         resp.recording_allowed_for_all = meeting.recording_allowed_for_all;
+        resp.chat_allowed_for_all = meeting.chat_allowed_for_all;
         // Prefer the freshly-persisted display_name from the host upsert as
         // the source of truth — same value the JWT was minted from above —
         // so the response and JWT can never disagree. The local `meeting`
@@ -346,6 +347,7 @@ async fn join_as_attendee(
             resp.end_on_host_leave = meeting.end_on_host_leave;
             resp.allow_guests = meeting.allow_guests;
             resp.recording_allowed_for_all = meeting.recording_allowed_for_all;
+            resp.chat_allowed_for_all = meeting.chat_allowed_for_all;
             resp.host_display_name = meeting.host_display_name;
             resp.host_user_id = meeting.creator_id;
             return Ok(Json(APIResponse::ok(resp)));
@@ -396,6 +398,7 @@ async fn join_as_attendee(
             host_user_id: meeting.creator_id,
             allow_guests: meeting.allow_guests,
             recording_allowed_for_all: meeting.recording_allowed_for_all,
+            chat_allowed_for_all: meeting.chat_allowed_for_all,
         };
         return Ok(Json(APIResponse::ok(resp)));
     }
@@ -494,6 +497,7 @@ async fn join_as_attendee(
     resp.end_on_host_leave = meeting.end_on_host_leave;
     resp.allow_guests = meeting.allow_guests;
     resp.recording_allowed_for_all = meeting.recording_allowed_for_all;
+    resp.chat_allowed_for_all = meeting.chat_allowed_for_all;
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -591,6 +595,7 @@ pub async fn get_my_status(
     resp.end_on_host_leave = meeting.end_on_host_leave;
     resp.allow_guests = meeting.allow_guests;
     resp.recording_allowed_for_all = meeting.recording_allowed_for_all;
+    resp.chat_allowed_for_all = meeting.chat_allowed_for_all;
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -650,6 +655,7 @@ pub async fn get_guest_status(
     resp.admitted_can_admit = meeting.admitted_can_admit;
     resp.allow_guests = meeting.allow_guests;
     resp.recording_allowed_for_all = meeting.recording_allowed_for_all;
+    resp.chat_allowed_for_all = meeting.chat_allowed_for_all;
     resp.host_display_name = meeting.host_display_name;
     resp.host_user_id = meeting.creator_id;
     Ok(Json(APIResponse::ok(resp)))
@@ -1097,6 +1103,8 @@ mod tests {
             jwt_secret: "test-secret".to_string(),
             token_ttl_secs: 600,
             session_ttl_secs: 3600,
+            session_refresh_threshold_secs: 7200,
+            session_absolute_max_secs: 604800,
             oauth: None,
             jwks_cache: None,
             cookie_domain: None,

@@ -20,6 +20,7 @@ const validSpec: SshPreviewSpec = {
   ttl: "5m",
   headless: true,
   network: "none",
+  videoMode: "costume",
   authBackend: "jwt",
 };
 
@@ -80,6 +81,31 @@ describe("<SshCommandPreview />", () => {
     });
     expect(screen.getByTestId("ssh-cmd-preview-display").textContent).toContain(
       "alice@my-host.lan",
+    );
+  });
+
+  it("includes videoMode in the SSH preview request", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      return new Response(
+        JSON.stringify({
+          argv: ["ssh", "alice@my-host.lan", "cmd"],
+          display: "ssh alice@my-host.lan 'cmd'",
+          remoteCommand: "cmd",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderWithClient(
+      <SshCommandPreview hostLabel="my-host" spec={{ ...validSpec, videoMode: "clock" }} />,
+    );
+    fireEvent.click(screen.getByTestId("ssh-cmd-preview-toggle"));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual(
+      expect.objectContaining({ videoMode: "clock" }),
     );
   });
 

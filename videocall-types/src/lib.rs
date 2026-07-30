@@ -220,7 +220,7 @@ mod reaction_packet_wire_tests {
     use crate::protos::reaction_packet::ReactionPacket;
     use protobuf::{Enum, EnumOrUnknown, Message};
 
-    /// Every defined reaction (1..=7) survives a wire round-trip as the same enum value.
+    /// Every defined reaction (1..=12) survives a wire round-trip as the same enum value.
     #[test]
     fn all_defined_reactions_survive_wire_round_trip() {
         let all = [
@@ -231,10 +231,15 @@ mod reaction_packet_wire_tests {
             ReactionType::HEART,
             ReactionType::THINKING,
             ReactionType::PARTY,
+            ReactionType::CRY,
+            ReactionType::DISAGREE,
+            ReactionType::SAD,
+            ReactionType::HEART_BROKEN,
+            ReactionType::CUSTOM,
         ];
         // Guard against a future enum edit silently shrinking the covered set: the design pins
-        // exactly 7 broadcastable reactions in v1.
-        assert_eq!(all.len(), 7, "expected exactly 7 defined reactions in v1");
+        // exactly 12 broadcastable reactions (7 originals + 4 negatives + CUSTOM).
+        assert_eq!(all.len(), 12, "expected exactly 12 defined reactions");
 
         for r in all {
             let mut pkt = ReactionPacket::new();
@@ -281,13 +286,41 @@ mod reaction_packet_wire_tests {
         );
     }
 
+    /// A CUSTOM reaction's `custom_emoji` bytes (field 3, tag 26) survive the wire alongside the
+    /// reaction. The wire preserves the raw bytes; the exact-emoji allowlist + <=32-byte cap is a
+    /// relay-ingress / client-validation concern, not a wire one, so an over-cap payload still
+    /// round-trips intact here (the validators reject it downstream, not the wire).
+    #[test]
+    fn custom_emoji_survives_wire_round_trip() {
+        let mut pkt = ReactionPacket::new();
+        pkt.reaction = EnumOrUnknown::new(ReactionType::CUSTOM);
+        let emoji = "😭".as_bytes().to_vec();
+        pkt.custom_emoji = emoji.clone();
+
+        let bytes = pkt
+            .write_to_bytes()
+            .expect("ReactionPacket must serialize to protobuf bytes");
+        let decoded = ReactionPacket::parse_from_bytes(&bytes)
+            .expect("serialized ReactionPacket must parse back");
+
+        assert_eq!(
+            decoded.reaction.enum_value(),
+            Ok(ReactionType::CUSTOM),
+            "CUSTOM reaction must survive alongside a custom_emoji"
+        );
+        assert_eq!(
+            decoded.custom_emoji, emoji,
+            "custom_emoji (field 3) must round-trip through the wire unchanged"
+        );
+    }
+
     /// A reaction the wire carries that is NOT in the closed enum (e.g. a newer client using a
     /// reserved value, or a forged value) decodes as `EnumOrUnknown::Unknown` — the exact
     /// signal the relay ingress and the client consume path key their "drop unknown" branch on.
     #[test]
     fn unknown_reaction_value_decodes_as_unknown() {
         let mut pkt = ReactionPacket::new();
-        // 99 is outside the defined 0..=7 range (and the reserved 8..=31 band).
+        // 99 is outside the defined 0..=12 range (and the reserved 13..=31 band).
         pkt.reaction = EnumOrUnknown::from_i32(99);
 
         let bytes = pkt
@@ -307,6 +340,14 @@ mod reaction_packet_wire_tests {
             ReactionType::from_i32(99),
             None,
             "99 is not a defined ReactionType"
+        );
+        // 13 is the first RESERVED value after CUSTOM (12): it must also decode as Unknown, pinning
+        // the closed-enum boundary so a future client can't accidentally define a value the relay
+        // still treats as drop-worthy.
+        assert_eq!(
+            ReactionType::from_i32(13),
+            None,
+            "13 is reserved (13..=31), not a defined ReactionType"
         );
     }
 

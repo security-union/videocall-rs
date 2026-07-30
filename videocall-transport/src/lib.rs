@@ -16,5 +16,6 @@
  * conditions.
  */
 
+pub mod read_loop_lag;
 pub mod websocket;
 pub mod webtransport;

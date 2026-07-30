@@ -73,13 +73,16 @@ use crate::constants::{
     MAX_FRAME_SIZE, WT_UNISTREAM_BACKPRESSURE_POLL, WT_UNISTREAM_BACKPRESSURE_SHED_RATIO,
     WT_UNISTREAM_WRITE_DEADLINE,
 };
-use crate::metrics::{RELAY_INBOUND_BRIDGE_DROPS_TOTAL, RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL};
+use crate::metrics::{
+    RELAY_INBOUND_BRIDGE_DROPS_TOTAL, RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL,
+    RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL,
+};
 use actix::Addr;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
-use web_transport_quinn::Session;
+use web_transport_quinn::{Session, SessionError};
 
 /// WebTransport/HTTP/3 application error code used when the relay RESETS a
 /// wedged persistent server→client uni stream (#1638).
@@ -482,16 +485,64 @@ impl WebTransportBridge {
     ) {
         join_set.spawn(async move {
             while let Some(data) = datagram_rx.recv().await {
-                if let Err(e) = session.send_datagram(data) {
-                    // Datagrams are unreliable: log and continue.
-                    debug!("Error sending datagram: {}", e);
-                } else if let Some(ref callback) = on_packet_sent {
-                    callback();
+                match session.send_datagram(data) {
+                    Ok(()) => {
+                        if let Some(ref callback) = on_packet_sent {
+                            callback();
+                        }
+                    }
+                    // Datagrams are unreliable: record the failure and continue
+                    // draining. `record_datagram_send_failure` increments the
+                    // outbound-bridge datagram counter (issue 2030) and logs.
+                    Err(e) => record_datagram_send_failure(&e),
                 }
             }
             info!("WebTransport Datagram writer ended");
         });
     }
+}
+
+/// Classify a datagram `send_datagram` failure into a BOUNDED `reason` label.
+///
+/// Maps each variant of `web_transport_quinn::SessionError` (which itself
+/// wraps the closed `quinn::SendDatagramError` set) to a fixed `&'static str`
+/// from a five-value closed set: `too_large`, `connection_lost`,
+/// `unsupported`, `disabled`, `webtransport`. The match is exhaustive over both
+/// enums, so a new upstream variant is a compile error here rather than an
+/// unbounded label at runtime — this is the guard that keeps
+/// [`RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL`] cardinality-safe. The
+/// error's Display string (which can carry an unbounded peer-supplied close
+/// reason) is deliberately NEVER used as a label value.
+fn datagram_send_failure_reason(err: &SessionError) -> &'static str {
+    use web_transport_quinn::quinn::SendDatagramError;
+    match err {
+        SessionError::SendDatagramError(SendDatagramError::TooLarge) => "too_large",
+        SessionError::SendDatagramError(SendDatagramError::ConnectionLost(_)) => "connection_lost",
+        SessionError::SendDatagramError(SendDatagramError::UnsupportedByPeer) => "unsupported",
+        SessionError::SendDatagramError(SendDatagramError::Disabled) => "disabled",
+        SessionError::ConnectionError(_) => "connection_lost",
+        SessionError::WebTransportError(_) => "webtransport",
+    }
+}
+
+/// Record a failed outbound WebTransport datagram send (issue 2030).
+///
+/// Called from [`WebTransportBridge::spawn_datagram_writer`] when
+/// `Session::send_datagram` returns `Err`. Classifies the error into a bounded
+/// `reason` (see [`datagram_send_failure_reason`]), increments
+/// [`RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL`], and emits the
+/// per-drop `debug!` log. The datagram path is high-rate, so the per-drop log
+/// stays at `debug` and the counter is the durable, alertable signal.
+///
+/// Extracted as a free function (rather than inlined in the writer task) so a
+/// native `#[test]` can drive the counter and assert `.get()` deltas without
+/// standing up a real QUIC session.
+fn record_datagram_send_failure(err: &SessionError) {
+    let reason = datagram_send_failure_reason(err);
+    RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL
+        .with_label_values(&["webtransport", reason])
+        .inc();
+    debug!("Error sending datagram (reason={}): {}", reason, err);
 }
 
 /// Pure backpressure predicate for the #1638 writer shed.
@@ -1634,5 +1685,133 @@ mod backpressure_predicate_tests {
         // WT_UNISTREAM_BACKPRESSURE_SHED_RATIO they must revisit this boundary
         // (and the shed-grace math in the doc comments).
         assert_eq!(WT_UNISTREAM_BACKPRESSURE_SHED_RATIO, 0.5);
+    }
+}
+
+#[cfg(test)]
+mod datagram_send_failure_tests {
+    //! Unit tests for the outbound WebTransport datagram send-failure counter
+    //! (issue 2030). These drive the real production
+    //! [`datagram_send_failure_reason`] and [`record_datagram_send_failure`] —
+    //! there is no re-implementation of the classification to drift out of sync.
+    //!
+    //! `RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL` is a process-global
+    //! prometheus counter and this is the ONLY test that touches it, so
+    //! before/after `.get()` deltas on a specific labeled series are exact even
+    //! under cargo's parallel test runner (no other test increments it, and the
+    //! increment side effect never fires in unit tests because it requires a
+    //! real QUIC `Session`).
+
+    use super::*;
+    use web_transport_quinn::quinn::SendDatagramError;
+
+    /// Every `reason` the classifier can emit maps to the exact string the
+    /// metric doc/help advertises. Covers all constructible `SessionError`
+    /// variants: the three unit `SendDatagramError` variants plus
+    /// `WebTransportError::UnknownSession`. `ConnectionLost`/`ConnectionError`
+    /// wrap a `quinn::ConnectionError`, which has no public constructor, so they
+    /// are not directly built here — but the exhaustive match in
+    /// `datagram_send_failure_reason` proves at compile time they are handled,
+    /// and both intentionally share the `connection_lost` string asserted below.
+    ///
+    /// MUTATION: change any arm's returned string (e.g. `TooLarge => "big"`) and
+    /// the matching assert fails.
+    #[test]
+    fn classifies_each_constructible_variant() {
+        use web_transport_quinn::WebTransportError;
+
+        assert_eq!(
+            datagram_send_failure_reason(&SessionError::SendDatagramError(
+                SendDatagramError::TooLarge
+            )),
+            "too_large"
+        );
+        assert_eq!(
+            datagram_send_failure_reason(&SessionError::SendDatagramError(
+                SendDatagramError::UnsupportedByPeer
+            )),
+            "unsupported"
+        );
+        assert_eq!(
+            datagram_send_failure_reason(&SessionError::SendDatagramError(
+                SendDatagramError::Disabled
+            )),
+            "disabled"
+        );
+        assert_eq!(
+            datagram_send_failure_reason(&SessionError::WebTransportError(
+                WebTransportError::UnknownSession
+            )),
+            "webtransport"
+        );
+    }
+
+    /// The classifier NEVER returns the error's Display string — only a value
+    /// from the fixed closed set — so the label stays cardinality-bounded even
+    /// when the underlying error carries an unbounded peer-supplied message.
+    ///
+    /// MUTATION: replace the classifier body with `err.to_string().leak()` (or
+    /// any Display-derived value) and this fails.
+    #[test]
+    fn reason_is_from_the_closed_set() {
+        const CLOSED_SET: &[&str] = &[
+            "too_large",
+            "connection_lost",
+            "unsupported",
+            "disabled",
+            "webtransport",
+        ];
+        for err in [
+            SessionError::SendDatagramError(SendDatagramError::TooLarge),
+            SessionError::SendDatagramError(SendDatagramError::UnsupportedByPeer),
+            SessionError::SendDatagramError(SendDatagramError::Disabled),
+        ] {
+            let reason = datagram_send_failure_reason(&err);
+            assert!(
+                CLOSED_SET.contains(&reason),
+                "reason {reason:?} escaped the bounded closed set"
+            );
+        }
+    }
+
+    /// `record_datagram_send_failure` increments exactly the
+    /// `{transport="webtransport", reason=<classified>}` series and nothing
+    /// else. Reads the specific labeled series before/after and asserts the
+    /// delta, so this exercises the real production increment path.
+    ///
+    /// MUTATION: remove the `.inc()` in `record_datagram_send_failure` and the
+    /// `too_large` delta drops to 0 → fail. Change the `reason` label passed to
+    /// `with_label_values` (or the classifier's `TooLarge` arm) and the
+    /// asserted `too_large` series stops moving → fail.
+    #[test]
+    fn record_increments_the_classified_series() {
+        let too_large_before = RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL
+            .with_label_values(&["webtransport", "too_large"])
+            .get();
+        let disabled_before = RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL
+            .with_label_values(&["webtransport", "disabled"])
+            .get();
+
+        record_datagram_send_failure(&SessionError::SendDatagramError(
+            SendDatagramError::TooLarge,
+        ));
+
+        let too_large_after = RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL
+            .with_label_values(&["webtransport", "too_large"])
+            .get();
+        let disabled_after = RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL
+            .with_label_values(&["webtransport", "disabled"])
+            .get();
+
+        assert_eq!(
+            too_large_after - too_large_before,
+            1.0,
+            "the classified series must advance by exactly one"
+        );
+        assert_eq!(
+            disabled_after - disabled_before,
+            0.0,
+            "an unrelated reason series must not move"
+        );
     }
 }

@@ -4,6 +4,7 @@ import { existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  type AuthBackend,
   defaultSsoStatePath,
   storageStatePath,
   DEFAULT_SSO_STATE_BASENAME,
@@ -128,7 +129,14 @@ export interface LaunchSpec {
   ttl: Ttl;
   headless: boolean;
   network: string;
-  authBackend: "jwt" | "storage-state" | "none";
+  // Widened to the shared `AuthBackend` so a `BotTask` originating from the
+  // CLI `run --auth form-login` path (issue 2035) type-checks when snapshotted
+  // into a profile. This is a TYPE widening only: the HTTP input validators
+  // (`handleLaunch`, `parseLaunchSpecForPreview`, the profile-save validator)
+  // still gate submitted specs to "jwt" | "storage-state" | "none", so the
+  // control-server / dashboard public contract is unchanged.
+  authBackend: AuthBackend;
+  videoMode?: "costume" | "file" | "clock" | null;
   storageStateFile?: string;
   /**
    * Absolute path to a captured SSO state file (typically
@@ -873,6 +881,7 @@ async function launchProfileRoute(opts: ControlServerOptions, name: string): Pro
       // after the extension carry the original host verbatim so an
       // SSH-hosted bot resumes on the same registered host.
       runLocation: bot.runLocation ?? { kind: "local" },
+      videoMode: bot.videoMode ?? null,
     };
     const id = await opts.surface.launchOne(spec);
     botIds.push(id);
@@ -900,6 +909,7 @@ function snapshotCurrentBotsForProfile(surface: OrchestratorControlSurface): Pro
       network: t.network ?? "none",
       authBackend: t.authBackend,
       storageStateFile: t.storageStateFile ?? undefined,
+      videoMode: t.videoMode ?? null,
       // Capture where this bot is currently running so the profile
       // replays each bot on the same host on the next launch. Bots
       // running locally serialize as `{ kind: "local" }`; SSH bots
@@ -932,9 +942,18 @@ function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
   }
   const auth = o.authBackend;
   if (auth !== "jwt" && auth !== "storage-state" && auth !== "none") {
+    // Reject at SAVE time (not just reload) so a form-login bot never gets
+    // written into a profile file that can never load back. form-login is a
+    // CLI/config-launch-time concern (it reads BOT_EMAIL/BOT_PASSWORD from the
+    // environment); a saved profile has no place to carry those, so it is
+    // deliberately not a persistable backend (see profiles.ts ProfileBotSpec).
+    const hint =
+      auth === "form-login"
+        ? ` — form-login bots cannot be saved to a profile (creds live in the environment, not the profile); relaunch with --auth form-login instead`
+        : "";
     throw new ControlServerError(
       400,
-      `${where}.authBackend must be "jwt", "storage-state", or "none"`,
+      `${where}.authBackend must be "jwt", "storage-state", or "none"${hint}`,
     );
   }
   const displayName =
@@ -958,6 +977,7 @@ function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
   // and pass `undefined` through silently when the caller's bot spec
   // predates the field — the launch route fills in a local default.
   const runLocation = parseRunLocationFromSaveBody(o.runLocation, `${where}.runLocation`);
+  const videoMode = parseVideoModeFromSaveBody(o.videoMode, `${where}.videoMode`);
   return {
     meetingURL: o.meetingURL,
     participant: o.participant,
@@ -968,6 +988,7 @@ function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
     authBackend: auth,
     storageStateFile,
     runLocation,
+    videoMode,
   };
 }
 
@@ -990,6 +1011,12 @@ function parseRunLocationFromSaveBody(raw: unknown, where: string): ProfileBotSp
     return { kind: "ssh", hostLabel: o.hostLabel };
   }
   throw new ControlServerError(400, `${where}.kind must be "local" or "ssh"`);
+}
+
+function parseVideoModeFromSaveBody(raw: unknown, where: string): ProfileBotSpec["videoMode"] {
+  if (raw === undefined || raw === null) return undefined;
+  if (raw === "costume" || raw === "file" || raw === "clock") return raw;
+  throw new ControlServerError(400, `${where} must be "costume", "file", or "clock"`);
 }
 
 function listBots(surface: OrchestratorControlSurface): RouteResult {
@@ -1219,6 +1246,7 @@ async function launchOne(
   if (authBackend !== "jwt" && authBackend !== "storage-state" && authBackend !== "none") {
     throw new ControlServerError(400, '"authBackend" must be "jwt", "storage-state", or "none"');
   }
+  const videoMode = parseVideoModeField(body.videoMode);
   const storageStateFile = body.storageStateFile;
   if (storageStateFile !== undefined && typeof storageStateFile !== "string") {
     throw new ControlServerError(400, '"storageStateFile" must be a string when provided');
@@ -1300,6 +1328,7 @@ async function launchOne(
     headless,
     network,
     authBackend,
+    videoMode,
     storageStateFile: storageStateFile as string | undefined,
     ssoStateFile: ssoStateFile as string | undefined,
     costume: costume as string | undefined,
@@ -1361,6 +1390,12 @@ export function parseRunLocationField(
     );
   }
   throw new ControlServerError(400, "runLocation must be a string or { kind, hostLabel }");
+}
+
+function parseVideoModeField(raw: unknown): "costume" | "file" | "clock" | null {
+  if (raw === undefined || raw === null) return null;
+  if (raw === "costume" || raw === "file" || raw === "clock") return raw;
+  throw new ControlServerError(400, '"videoMode" must be "costume", "file", or "clock"');
 }
 
 async function duplicate(
@@ -1829,6 +1864,7 @@ async function launchMultiRoute(
   if (authBackend !== "jwt" && authBackend !== "storage-state" && authBackend !== "none") {
     throw new ControlServerError(400, '"authBackend" must be "jwt", "storage-state", or "none"');
   }
+  const videoMode = parseVideoModeField(body.videoMode);
   const storageStateFile =
     body.storageStateFile !== undefined && body.storageStateFile !== null
       ? String(body.storageStateFile)
@@ -1917,6 +1953,7 @@ async function launchMultiRoute(
       headless,
       network,
       authBackend,
+      videoMode,
       storageStateFile,
       ssoStateFile,
       runLocation,
@@ -1942,6 +1979,35 @@ async function launchMultiRoute(
   };
 }
 
+/**
+ * Reject a `form-login` auth backend arriving through the control server's
+ * config surface. `parseMeetingConfigText` accepts `form-login` (so the CLI
+ * `bots-app run --config` path can opt in — the config's `meeting_url` fully
+ * specifies the target), but the control server / dashboard is deliberately
+ * NOT a form-login launch surface: its BOT_EMAIL/BOT_PASSWORD would come from
+ * the orchestrator's environment, and every other control-server launch route
+ * (`launchOne`, `launchMultiRoute`, `parseLaunchSpecForPreview`, the profile
+ * validators) already rejects it at runtime. Enforcing it here too keeps that
+ * contract consistent — and keeps the downstream `as "jwt"|"storage-state"
+ * |"none"` narrowing honest. See PR #2082 review.
+ */
+function rejectFormLoginConfig(config: MeetingConfig): void {
+  const offender =
+    config.auth === "form-login"
+      ? "meeting-level auth"
+      : config.bots.some((b) => b.auth === "form-login")
+        ? "a per-bot auth"
+        : null;
+  if (offender) {
+    throw new ControlServerError(
+      400,
+      `form-login is not launchable via the control server / dashboard (${offender} is "form-login"); ` +
+        `its credentials come from the environment, not the request. Run it from the CLI instead: ` +
+        "`bots-app run --config <file>` (which honors `auth: form-login`) or `bots-app run --auth form-login`.",
+    );
+  }
+}
+
 async function launchFromConfigRoute(
   opts: ControlServerOptions,
   body: Record<string, unknown>,
@@ -1957,6 +2023,7 @@ async function launchFromConfigRoute(
   } catch (e) {
     throw new ControlServerError(400, `meeting config parse failed: ${(e as Error).message}`);
   }
+  rejectFormLoginConfig(config);
 
   const headless = typeof body.headless === "boolean" ? body.headless : false;
   const overrideAuth = body.authBackend;
@@ -1980,6 +2047,8 @@ async function launchFromConfigRoute(
   const defaultTtl = config.ttl ?? "5m";
   // Default network: per-bot network wins, then meeting-level, then "none".
   const defaultNetwork = config.network ?? "none";
+  // Default video mode: per-bot mode wins, then meeting-level, then "costume".
+  const defaultVideoMode = config.videoMode ?? "costume";
   // Default auth backend: per-bot auth wins, then meeting-level, then
   // the override on the request body, then "jwt".
   const defaultAuth =
@@ -2004,6 +2073,7 @@ async function launchFromConfigRoute(
       continue;
     }
     const network = bot.network ?? defaultNetwork;
+    const videoMode = bot.videoMode ?? defaultVideoMode;
     const authBackend = (bot.auth ?? defaultAuth) as "jwt" | "storage-state" | "none";
     const spec: LaunchSpec = {
       meetingURL: config.meetingUrl,
@@ -2011,6 +2081,7 @@ async function launchFromConfigRoute(
       ttl,
       headless,
       network,
+      videoMode,
       authBackend,
       storageStateFile: overrideStorageStateFile,
       ssoStateFile: overrideSsoStateFile,
@@ -2049,12 +2120,16 @@ function previewFromConfigRoute(body: Record<string, unknown>): RouteResult {
   } catch (e) {
     throw new ControlServerError(400, `meeting config parse failed: ${(e as Error).message}`);
   }
+  // Preview mirrors the launch route's contract: a config the dashboard can't
+  // launch (form-login) must not preview as launchable either.
+  rejectFormLoginConfig(config);
   return {
     status: 200,
     body: {
       meetingUrl: config.meetingUrl,
       ttl: config.ttl ?? null,
       network: config.network ?? null,
+      videoMode: config.videoMode ?? null,
       auth: config.auth ?? null,
       botCount: config.bots.length,
       bots: config.bots,
@@ -2614,6 +2689,7 @@ async function previewLaunchRoute(
       ttl: formatDuration(spec.ttl),
       meetingURL: spec.meetingURL,
       participant: spec.participant,
+      videoMode: spec.videoMode,
       network: spec.network === "none" ? null : spec.network,
       authBackend: spec.authBackend,
       displayName: spec.displayName ?? null,
@@ -2696,6 +2772,7 @@ function previewHostRoute(opts: ControlServerOptions, body: Record<string, unkno
     launchOverride !== null && typeof launchOverride.displayName === "string"
       ? launchOverride.displayName
       : null;
+  const videoMode = launchOverride !== null ? parseVideoModeField(launchOverride.videoMode) : null;
   // Apply the same SSO-wrap decision the real launcher would: only
   // when the unsaved host has `forwardSsoState !== false`, the
   // override sets `authBackend === "jwt"`, AND a local SSO state file
@@ -2716,6 +2793,7 @@ function previewHostRoute(opts: ControlServerOptions, body: Record<string, unkno
       ttl,
       meetingURL,
       participant,
+      videoMode,
       network,
       authBackend,
       displayName,
@@ -2748,6 +2826,7 @@ function parseLaunchSpecForPreview(body: Record<string, unknown>): {
   headless: boolean;
   network: string;
   authBackend: "jwt" | "storage-state" | "none";
+  videoMode: "costume" | "file" | "clock" | null;
 } {
   const meetingURL = body.meetingURL;
   if (typeof meetingURL !== "string" || meetingURL === "") {
@@ -2800,6 +2879,7 @@ function parseLaunchSpecForPreview(body: Record<string, unknown>): {
   if (authBackend !== "jwt" && authBackend !== "storage-state" && authBackend !== "none") {
     throw new ControlServerError(400, '"authBackend" must be "jwt", "storage-state", or "none"');
   }
+  const videoMode = parseVideoModeField(body.videoMode);
   return {
     meetingURL,
     participant,
@@ -2808,6 +2888,7 @@ function parseLaunchSpecForPreview(body: Record<string, unknown>): {
     headless,
     network,
     authBackend,
+    videoMode,
   };
 }
 

@@ -31,6 +31,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use videocall_transport::webtransport::{FrameDropMeta, ReadyStallThresholdOwner};
 
 // ── Encoder error observability counters (cumulative, since page load) ───────
 // These use the same global-static pattern as `keyframe_requests_sent_count` in
@@ -154,6 +155,7 @@ use super::super::client::VideoCallClient;
 use super::classify_encode_error::{
     classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
 };
+use super::dimensions::{corrected_source_dims, resolve_capture_dimensions};
 use super::encoder_state::{
     keyframe_tick_decision, periodic_keyframe_due, EncoderState, KeyframeTickInput,
 };
@@ -421,6 +423,7 @@ pub struct CameraEncoder {
     state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
     current_fps: Arc<AtomicU32>,
+    last_layer0_chunk_ms: Arc<AtomicU64>,
     on_encoder_settings_update: Callback<String>,
     on_error: Option<Callback<String>>,
     /// Classified callback fired ONLY at the real `getUserMedia` rejection site,
@@ -639,23 +642,10 @@ pub struct CameraEncoder {
     /// mid-call (it is NOT latched at cold start). In simulcast mode
     /// (`effective_layers > 1`) this stays `false` and the gate is a no-op.
     single_layer_low_pin: Rc<AtomicBool>,
-    /// Per-encoder "currently holds a global uplink-saturation threshold raise"
-    /// flag (issue #1670). `true` when THIS encoder's AQ loop has raised the
-    /// process-global threshold above the floor for a dual-stream (screen-share)
-    /// session and has not yet released it.
-    ///
-    /// The AQ loop sets it `true` on the screen-RAISE edge (and calls
-    /// [`note_threshold_raised`](videocall_transport::webtransport::note_threshold_raised)),
-    /// and `false` on the screen-STOP edge (and calls
-    /// [`note_threshold_raise_released`](videocall_transport::webtransport::note_threshold_raise_released)).
-    /// The encoder's `Drop` decrements the global owner count IFF this flag is
-    /// still `true` — i.e. the loop was torn down (Host unmount) while raised, so
-    /// the STOP edge never ran. A single shared atomic consulted by BOTH the loop
-    /// edges and `Drop` (via `swap`) is the single source of truth, so they can
-    /// never both decrement the global count for one raise (no leaked/negative
-    /// count). `Rc` (single-threaded wasm); the loop holds a clone and the
-    /// encoder owns the strong ref + the `Drop`.
-    screen_threshold_raised: Rc<AtomicBool>,
+    /// Per-encoder live-screen threshold state shared by the AQ loop and `Drop`.
+    /// Its RAII owner updates the process-global threshold max and releases
+    /// immediately on screen stop or Host teardown.
+    screen_ready_stall_tracker: Rc<RefCell<ScreenReadyStallThresholdTracker>>,
     /// "Loop already running" canary (issue #1295). Mirrors the mic encoder's
     /// `codecs[0].is_instantiated()` canary, which the camera lacks. Set
     /// synchronously in `start()` right before `spawn_local`; cleared by the
@@ -1129,6 +1119,104 @@ fn wt_saturation_step_down_decision(
     )
 }
 
+const SCREEN_READY_STALL_INTERVAL_MULTIPLIER: f64 = 8.0;
+
+/// Return the dual-stream WT slow-`ready()` threshold update for this AQ tick.
+///
+/// The threshold must be refreshed both when sharing starts and whenever the
+/// live screen tier changes while sharing remains active. An invalid tier index
+/// resolves to the slowest tier, which is the conservative choice: a stale or
+/// malformed value must not shorten the threshold and create false saturation.
+#[inline]
+fn screen_ready_stall_threshold_update(
+    was_active: bool,
+    is_active: bool,
+    previous_tier_index: u32,
+    tier_index: u32,
+) -> Option<(f64, f64)> {
+    if !is_active || (was_active && previous_tier_index == tier_index) {
+        return None;
+    }
+
+    let tiers = crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
+    let resolved_index = (tier_index as usize).min(tiers.len().saturating_sub(1));
+    let screen_ifi_ms = 1000.0 / f64::from(tiers[resolved_index].target_fps);
+    Some((
+        SCREEN_READY_STALL_INTERVAL_MULTIPLIER * screen_ifi_ms,
+        screen_ifi_ms,
+    ))
+}
+
+struct ScreenReadyStallThresholdTracker {
+    was_active: bool,
+    previous_tier_index: u32,
+    owner: Option<ReadyStallThresholdOwner>,
+}
+
+impl ScreenReadyStallThresholdTracker {
+    fn new(initial_tier_index: u32) -> Self {
+        Self {
+            was_active: false,
+            previous_tier_index: initial_tier_index,
+            owner: None,
+        }
+    }
+
+    /// Apply one production AQ tick to the per-encoder threshold owner.
+    ///
+    /// Returning the arithmetic update lets the caller log the selected tier and
+    /// frame interval without duplicating the transition decision.
+    fn tick(&mut self, is_active: bool, tier_index: u32) -> Option<(f64, f64)> {
+        let update = screen_ready_stall_threshold_update(
+            self.was_active,
+            is_active,
+            self.previous_tier_index,
+            tier_index,
+        );
+
+        if let Some((threshold_ms, _)) = update {
+            if let Some(owner) = self.owner.as_ref() {
+                owner.set_threshold_ms(threshold_ms);
+            } else {
+                self.owner = Some(ReadyStallThresholdOwner::new(threshold_ms));
+            }
+        }
+        if !is_active {
+            self.owner.take();
+        }
+
+        self.was_active = is_active;
+        self.previous_tier_index = tier_index;
+        update
+    }
+
+    fn release(&mut self) {
+        self.owner.take();
+        self.was_active = false;
+    }
+}
+
+/// One AQ tick of the camera's WebTransport stale-DELTA self-congestion axis
+/// (#1737 Phase 1). The wasm loop calls this with
+/// `videocall_transport::webtransport::unistream_stale_delta_drop_count()`.
+#[inline]
+fn camera_wt_stale_drop_step_down_decision(
+    current_drops: u64,
+    snapshot_drops: u64,
+    elapsed_ms: f64,
+) -> videocall_aq::constants::SelfCongestionDecision {
+    use crate::adaptive_quality_constants::{
+        evaluate_self_congestion, CAMERA_WT_STALE_DROP_THRESHOLD, CAMERA_WT_STALE_DROP_WINDOW_MS,
+    };
+    evaluate_self_congestion(
+        current_drops,
+        snapshot_drops,
+        elapsed_ms,
+        CAMERA_WT_STALE_DROP_WINDOW_MS,
+        CAMERA_WT_STALE_DROP_THRESHOLD,
+    )
+}
+
 /// Compute the camera's `video_at_floor` flag value for one AQ tick.
 ///
 /// On the camera-ENABLE rising edge (`!prev_enabled && now_enabled`) this force-
@@ -1152,22 +1240,6 @@ fn video_at_floor_on_tick(prev_enabled: bool, now_enabled: bool, detector_at_flo
         false
     } else {
         detector_at_floor
-    }
-}
-
-/// Compute the delta to apply to the global raised-threshold owner count when a
-/// single encoder's per-encoder "currently raised" flag transitions. Rising
-/// (`!was_raised && now_raised`) registers one owner (+1); falling (`was_raised
-/// && !now_raised`) releases one (-1); no transition is a no-op (0). Tying the
-/// global count to per-encoder TRANSITIONS (not raw edges) makes double-counting
-/// impossible: an encoder that raised, stopped, then dropped has already returned
-/// to `was_raised == false`, so Drop applies no further delta (#1670 wedge-free).
-#[inline]
-fn apply_raise_transition(was_raised: bool, now_raised: bool) -> i32 {
-    match (was_raised, now_raised) {
-        (false, true) => 1,
-        (true, false) => -1,
-        _ => 0,
     }
 }
 
@@ -1234,10 +1306,10 @@ impl CameraEncoder {
         // token has not dropped yet) and still holding a raised threshold from an
         // active screen share; an UNCONDITIONAL reset here would clobber that live
         // raise back to the floor and make the still-running dual-stream loop
-        // shed video on spurious saturation. The screen-STOP edge and the
-        // encoder's `Drop` reset/release UNCONDITIONALLY (force floor), so a
-        // genuinely dropped-while-raised prior encoder still yields a clean floor
-        // for the next fresh single-stream construct — #1667's leak stays fixed.
+        // shed video on spurious saturation. The screen-STOP edge and encoder
+        // `Drop` release that encoder's registry entry; the registry preserves
+        // any surviving owner's maximum and floors after the final release, so a
+        // dropped-while-raised encoder cannot leak its threshold (#1667).
         videocall_transport::webtransport::reset_ready_stall_threshold_on_construction();
 
         let default_tier = &VIDEO_QUALITY_TIERS[0];
@@ -1248,6 +1320,7 @@ impl CameraEncoder {
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
             current_fps: Arc::new(AtomicU32::new(0)),
+            last_layer0_chunk_ms: Arc::new(AtomicU64::new(0)),
             on_encoder_settings_update,
             on_error: Some(on_error),
             on_permission_error: None,
@@ -1317,10 +1390,11 @@ impl CameraEncoder {
             // control loop sets it once it observes single-stream mode + >3
             // peers. No effect in simulcast mode.
             single_layer_low_pin: Rc::new(AtomicBool::new(false)),
-            // Issue #1670: a fresh encoder holds no global threshold raise. The AQ
-            // loop sets this on the screen-RAISE edge and clears it on STOP; Drop
-            // releases it if still set on teardown.
-            screen_threshold_raised: Rc::new(AtomicBool::new(false)),
+            screen_ready_stall_tracker: Rc::new(RefCell::new(
+                ScreenReadyStallThresholdTracker::new(
+                    crate::adaptive_quality_constants::DEFAULT_SCREEN_TIER_INDEX as u32,
+                ),
+            )),
             loop_running: Arc::new(AtomicBool::new(false)),
             loop_device_id: Rc::new(RefCell::new(None)),
             loop_epoch: Arc::new(AtomicU64::new(0)),
@@ -1345,9 +1419,15 @@ impl CameraEncoder {
     /// reading the sender's own encoder-queue backpressure (published by the
     /// encode loop into `shared_encoder_queue_depth`) plus the server-CONGESTION
     /// and WS-send-buffer signals, and applies tier/layer/bitrate decisions.
-    pub fn set_encoder_control(&mut self) {
+    ///
+    /// `shared_screen_tier_index` must be the live atom owned by the paired
+    /// `ScreenEncoder`. Requiring it here makes the threshold wiring part of loop
+    /// construction instead of a setter whose ordering could silently freeze the
+    /// loop on a stale default atom.
+    pub fn set_encoder_control(&mut self, shared_screen_tier_index: Rc<AtomicU32>) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         let tier_max_width = self.tier_max_width.clone();
@@ -1413,11 +1493,7 @@ impl CameraEncoder {
         // mid-tick — the `None` arm is a correctness fail-safe, not a hot path.
         let peer_count_client = self.client.clone();
         let single_layer_low_pin = self.single_layer_low_pin.clone();
-        // Issue #1670: per-encoder "currently holds a global threshold raise"
-        // flag, shared with `Drop`. The loop flips it on the screen RAISE/STOP
-        // edges (and adjusts the global owner count); `Drop` consults it to
-        // self-heal the count if the loop is torn down while still raised.
-        let screen_threshold_raised = self.screen_threshold_raised.clone();
+        let screen_ready_stall_tracker = self.screen_ready_stall_tracker.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -1481,6 +1557,9 @@ impl CameraEncoder {
             let mut last_wt_stall_snapshot: u64 =
                 videocall_transport::webtransport::unistream_ready_stall_count();
             let mut wt_stall_window_start_ms: f64 = js_sys::Date::now();
+            let mut last_wt_stale_drop_snapshot: u64 =
+                videocall_transport::webtransport::unistream_stale_delta_drop_count();
+            let mut wt_stale_drop_window_start_ms: f64 = js_sys::Date::now();
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
             // instead of waiting on receiver diagnostics. Runs for the lifetime
             // of the owning CameraEncoder: this `spawn_local` future is NOT bound
@@ -1505,6 +1584,24 @@ impl CameraEncoder {
                     break;
                 }
                 let now = js_sys::Date::now();
+                // #2060 idle-decay: `last_layer0_chunk_ms` is stamped in the layer-0 callback
+                // with performance().now() (monotonic), so the staleness check MUST use a fresh
+                // performance().now() here — NOT the loop's `now` above (js_sys::Date::now(),
+                // wall-clock, a DIFFERENT epoch). Do not "simplify" by reusing `now`: a
+                // cross-clock comparison silently breaks the decay and no unit test catches it
+                // (the wiring is native-untestable; only this contract guards it).
+                let perf_now = window()
+                    .performance()
+                    .expect("Performance API not available")
+                    .now();
+                if let Some(value) = crate::encode::fps_after_idle_decay(
+                    current_fps.load(Ordering::Relaxed),
+                    perf_now,
+                    last_layer0_chunk_ms.load(Ordering::Relaxed) as f64,
+                    crate::adaptive_quality_constants::ENCODER_FPS_IDLE_DECAY_MS,
+                ) {
+                    current_fps.store(value, Ordering::Relaxed);
+                }
 
                 // Single-layer low-rung pin gate (issue #1136 + #1156 hysteresis).
                 // ONLY meaningful in single-stream mode (n_layers == 1): a lone
@@ -1547,76 +1644,34 @@ impl CameraEncoder {
                 // Check for screen sharing state transitions and coordinate
                 // camera quality to avoid bandwidth contention.
                 let screen_active = screen_sharing_active.load(Ordering::Acquire);
+                let screen_tier_index = shared_screen_tier_index.load(Ordering::Acquire);
+                if let Some((threshold, screen_ifi_ms)) = screen_ready_stall_tracker
+                    .borrow_mut()
+                    .tick(screen_active, screen_tier_index)
+                {
+                    log::info!(
+                        "CameraEncoder: WT stall threshold set to {:.0}ms (dual-stream, \
+                         screen tier={}, IFI={:.0}ms)",
+                        threshold,
+                        screen_tier_index,
+                        screen_ifi_ms,
+                    );
+                }
                 if screen_active != prev_screen_active {
                     prev_screen_active = screen_active;
                     encoder_control.notify_screen_sharing(screen_active);
 
-                    // Frame-rate-aware WT uplink-saturation threshold (issue #1618).
-                    // When dual-streaming, the combined uplink burst density is higher
-                    // and the same writer.ready() stall catches more concurrent frames
-                    // (K-amplification). Raise the threshold to 8× the screen share's
-                    // TOP-TIER (best-case) frame interval so bursty-but-healthy links
-                    // do not false-positive. Reset to floor when the screen share stops.
-                    // The screen share top tier is 10fps (100ms IFI); 8 × 100 = 800ms.
-                    // This is a FIXED bound, not recomputed as the screen degrades (the
-                    // screen can degrade to 5fps/200ms under congestion). WS publishers
-                    // execute this write but never read the value (the WT stall counter
-                    // is held flat at 0 for WS — see block below at line ~1500).
-                    if screen_active {
-                        // Use the screen share top-tier fps (10) as the fixed bound.
-                        // SCREEN_QUALITY_TIERS[0] is "high" (top tier, 10fps, 100ms IFI).
-                        let screen_ifi_ms = 1000.0
-                            / f64::from(
-                                crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS[0]
-                                    .target_fps,
-                            );
-                        let threshold = 8.0 * screen_ifi_ms;
-                        videocall_transport::webtransport::set_ready_stall_threshold_ms(threshold);
-                        log::info!(
-                            "CameraEncoder: WT stall threshold raised to {:.0}ms (dual-stream, \
-                             screen IFI={:.0}ms)",
-                            threshold,
-                            screen_ifi_ms,
-                        );
-                    }
-                    // NOTE: the STOP edge does NOT floor the threshold here. Flooring
-                    // is the responsibility of the owner-count release below, which
-                    // floors ONLY when it releases the LAST owner (1 -> 0). An
-                    // unconditional floor on this STOP edge would be WRONG when two
-                    // encoders overlap during a Host remount while screen-sharing:
-                    // each owns its own `screen_sharing_active` flag, so one encoder
-                    // can see its flag fall to false (this STOP edge) while a SECOND
-                    // encoder still holds a raise (owner count 2 -> 1). An
-                    // unconditional floor would clobber the surviving dual-stream
-                    // encoder back to 250 ms and reintroduce spurious WT saturation
-                    // sheds (caught by Codex in pre-submit). Routing the floor through
-                    // the last-owner release is the single correct chokepoint.
-
-                    // Issue #1670: keep the GLOBAL raised-threshold owner count in
-                    // sync with THIS encoder's raise state so a remount's fresh
-                    // construct does not clobber a still-active raise (and so a
-                    // drop-while-raised self-heals via `Drop`). For threshold
-                    // purposes a raise is held iff screen share is active, so
-                    // `now_raised == screen_active`. We drive the GLOBAL count off
-                    // per-encoder TRANSITIONS (via `apply_raise_transition`) rather
-                    // than raw edges so it can never be double-counted: rising
-                    // registers one owner (+1), falling releases one (-1). The
-                    // release floors the threshold iff it released the LAST owner, so
-                    // the STOP edge floors only when no sibling encoder still holds a
-                    // raise. The per-encoder flag is the single source of truth shared
-                    // with `Drop`, so the STOP edge here and a teardown `Drop` cannot
-                    // both release the same raise.
-                    let was_raised = screen_threshold_raised.load(Ordering::Acquire);
-                    let now_raised = screen_active;
-                    let delta = apply_raise_transition(was_raised, now_raised);
-                    if delta != 0 {
-                        screen_threshold_raised.store(now_raised, Ordering::Release);
-                        if delta > 0 {
-                            videocall_transport::webtransport::note_threshold_raised();
-                        } else {
-                            videocall_transport::webtransport::note_threshold_raise_released();
-                        }
-                    }
+                    // Frame-rate-aware WT uplink-saturation threshold (issues
+                    // #1618 and #1669). The update above tracks both the sharing
+                    // start edge and live screen-tier changes. A lower screen fps
+                    // has a longer frame interval and therefore needs a higher
+                    // threshold to avoid K-amplification false positives. WS
+                    // publishers execute the write but never read the value (the
+                    // WT stall counter remains flat on WS).
+                    // The tracker owns one registry entry while this screen is
+                    // active. On stop it drops that owner and the transport
+                    // atomically republishes the maximum value still required by
+                    // any overlapping Host encoder, or the floor when none remain.
 
                     log::info!(
                         "CameraEncoder: screen sharing {} — camera tier coordination applied",
@@ -1783,6 +1838,37 @@ impl CameraEncoder {
                     if decision.roll_window {
                         last_wt_stall_snapshot = decision.new_snapshot;
                         wt_stall_window_start_ms = now;
+                    }
+                }
+
+                // Client-side WebTransport camera stale-DELTA detection
+                // (#1737 Phase 1). The WT send path deliberately skips old
+                // camera deltas after `writer.ready()` resolves, while always
+                // sending keyframes. A sustained cluster means the encoder is
+                // still producing above what the uplink can deliver, so this
+                // independent axis steps the camera down instead of silently
+                // eating frames at full encode rate.
+                {
+                    let current_wt_stale_drops =
+                        videocall_transport::webtransport::unistream_stale_delta_drop_count();
+                    let elapsed_ms = now - wt_stale_drop_window_start_ms;
+                    let decision = camera_wt_stale_drop_step_down_decision(
+                        current_wt_stale_drops,
+                        last_wt_stale_drop_snapshot,
+                        elapsed_ms,
+                    );
+                    if decision.step_down {
+                        log::warn!(
+                            "CameraEncoder: client WT stale-delta backpressure detected ({} \
+                             camera deltas dropped in {:.0}ms), forcing video step-down",
+                            current_wt_stale_drops.saturating_sub(last_wt_stale_drop_snapshot),
+                            elapsed_ms,
+                        );
+                        encoder_control.force_video_step_down();
+                    }
+                    if decision.roll_window {
+                        last_wt_stale_drop_snapshot = decision.new_snapshot;
+                        wt_stale_drop_window_start_ms = now;
                     }
                 }
 
@@ -2393,6 +2479,7 @@ impl CameraEncoder {
 
     /// Stops encoding after it has been started.
     pub fn stop(&mut self) {
+        crate::encode::reset_output_fps(&self.current_fps);
         self.state.stop()
     }
 
@@ -2413,6 +2500,7 @@ impl CameraEncoder {
         } = self.state.clone();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
@@ -2500,6 +2588,7 @@ impl CameraEncoder {
             self.stop();
             self.state.set_enabled(true);
         }
+        crate::encode::reset_output_fps(&self.current_fps);
         let on_error = self.on_error.clone();
         let on_permission_error = self.on_permission_error.clone();
 
@@ -2818,6 +2907,7 @@ impl CameraEncoder {
                     }
                 }
 
+                // Each restart extracts a track from its newly acquired stream; no track is cached.
                 let video_track = Box::new(
                     device
                         .get_video_tracks()
@@ -2834,17 +2924,26 @@ impl CameraEncoder {
                     .unchecked_into::<MediaStreamTrack>();
                 let track_settings = media_track.get_settings();
 
-                let width = track_settings.get_width().expect("width is None");
-                let height = track_settings.get_height().expect("height is None");
+                let (width, height) = resolve_capture_dimensions(
+                    track_settings.get_width().map(f64::from),
+                    track_settings.get_height().map(f64::from),
+                    video_element.video_width(),
+                    video_element.video_height(),
+                );
 
-                // Native capture dims (the true source aspect), stamped onto
-                // every emitted camera packet so receiver diagnostics can detect
-                // aspect distortion at the source (issue #1196). Mirrors the
-                // screen encoder's `source_width_atomic` / `source_height_atomic`
-                // stamping; the camera dims are fixed for the encoder's lifetime
-                // here, so plain captured `u32`s suffice (no atomic needed).
-                let source_width = width as u32;
-                let source_height = height as u32;
+                // Seed the #1196 source-aspect atomics at acquisition from the
+                // resolved dims (settings -> preview -> 640x480 fallback). The
+                // camera CORRECTS these shared atomics from the first valid
+                // decoded frame (and any later size change) below, so a fallback
+                // seed self-heals within a frame and the stamp reflects the true
+                // source aspect. This is why the camera can seed a non-zero
+                // fallback safely; the screen encoder, which does NOT
+                // per-frame-correct, instead seeds 0="unknown" when settings are
+                // absent so it never stamps a fabricated aspect (see
+                // settings_source_stamp). So the seeds intentionally DIVERGE in
+                // the settings-absent case.
+                let source_width_atomic = Arc::new(AtomicU32::new(width));
+                let source_height_atomic = Arc::new(AtomicU32::new(height));
 
                 // --- Setup video encoders (LAZY per-layer construction, #1204) ─
                 // The output and error handler closures must be re-created on
@@ -2903,12 +3002,15 @@ impl CameraEncoder {
                                    initial_seq: u64|
                  -> Result<LayerEncoder, LayerBuildError> {
                     let layer_id = layer_idx as u32;
+                    let source_width_for_handler = source_width_atomic.clone();
+                    let source_height_for_handler = source_height_atomic.clone();
 
                     let (video_output_box, seq_out) = {
                         let client = client.clone();
                         let userid = userid.clone();
                         let aes = aes.clone();
                         let current_fps = current_fps.clone();
+                        let last_layer0_chunk_ms = last_layer0_chunk_ms.clone();
                         let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
                         // Capture this layer's current sequence by value; we read
                         // the updated value back after the encode loop exits.
@@ -2922,6 +3024,8 @@ impl CameraEncoder {
                             Box::new(move |chunk: JsValue| {
                                 let now = window().performance().unwrap().now();
                                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                                let is_keyframe =
+                                    matches!(chunk.type_(), web_sys::EncodedVideoChunkType::Key);
 
                                 // FPS calculation: ONLY layer 0 updates the
                                 // shared `current_fps`. That atomic is the AQ
@@ -2931,6 +3035,7 @@ impl CameraEncoder {
                                 // still encode and send, they just don't touch
                                 // the setpoint.
                                 if layer_id == 0 {
+                                    last_layer0_chunk_ms.store(now as u64, Ordering::Relaxed);
                                     chunks_in_last_second += 1;
                                     if now - last_chunk_time >= 1000.0 {
                                         let fps = chunks_in_last_second;
@@ -2957,14 +3062,34 @@ impl CameraEncoder {
                                     buffer.as_mut_slice(),
                                     &userid,
                                     aes.clone(),
-                                    source_width,
-                                    source_height,
+                                    source_width_for_handler.load(Ordering::Relaxed),
+                                    source_height_for_handler.load(Ordering::Relaxed),
                                     layer_id,
                                 );
                                 // Phase 2 of WT freeze fix: route camera video on
                                 // its dedicated persistent QUIC stream so a stall
                                 // on a video keyframe never blocks audio.
-                                client.send_media_packet(packet, MediaStreamKey::Video);
+                                //
+                                // #1737 SCOPE (camera-only, deliberate): only the
+                                // camera attaches `FrameDropMeta` to opt into
+                                // sender-side age-drop. Screen share rides its own
+                                // WT persistent unistream and suffers the SAME
+                                // minutes-behind pile-up unmitigated — but it is
+                                // deferred on purpose: screen needs its own, more
+                                // generous age budget (longer GOP / static content
+                                // tolerates more latency than the 200ms camera
+                                // budget), so reusing the camera value would be a
+                                // regression. The screen encoder passes `None`
+                                // (see screen_encoder.rs) pending screen-specific
+                                // budget tuning. Do NOT unify the two.
+                                client.send_media_packet_with_drop_meta(
+                                    packet,
+                                    MediaStreamKey::Video,
+                                    Some(FrameDropMeta {
+                                        enqueue_ms: now,
+                                        is_keyframe,
+                                    }),
+                                );
                                 local_seq += 1;
                                 seq_out_inner.set(local_seq);
                             }) as Box<dyn FnMut(JsValue)>,
@@ -3022,8 +3147,8 @@ impl CameraEncoder {
                             // raw 16:9 tier dims. `width`/`height` are the native
                             // track dims read up front (the true source aspect).
                             let (fit_w, fit_h) = fit_within_preserving_aspect(
-                                width as u32,
-                                height as u32,
+                                width,
+                                height,
                                 tier.max_width,
                                 tier.max_height,
                             );
@@ -3042,10 +3167,10 @@ impl CameraEncoder {
                             // layer dims to keep them well-defined. No per-layer fps
                             // cap — the stream follows the capture/adaptive cadence.
                             (
-                                width as u32,
-                                height as u32,
-                                width as u32,
-                                height as u32,
+                                width,
+                                height,
+                                width,
+                                height,
                                 current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0,
                                 None,
                             )
@@ -3782,6 +3907,21 @@ impl CameraEncoder {
                             // clamps to its own current dims + the shared tier max.
                             let frame_width = video_frame.display_width();
                             let frame_height = video_frame.display_height();
+                            // #1196: correct the source-aspect stamp from the
+                            // first real frame (and later size changes). The
+                            // decision lives in the unit-tested pure
+                            // `corrected_source_dims`; steady-state frames store
+                            // nothing, and a blank (0x0) frame never clobbers a
+                            // known stamp.
+                            if let Some((corrected_w, corrected_h)) = corrected_source_dims(
+                                frame_width,
+                                frame_height,
+                                source_width_atomic.load(Ordering::Relaxed),
+                                source_height_atomic.load(Ordering::Relaxed),
+                            ) {
+                                source_width_atomic.store(corrected_w, Ordering::Relaxed);
+                                source_height_atomic.store(corrected_h, Ordering::Relaxed);
+                            }
 
                             // Restart reason captured from a fatal per-frame
                             // encode/reconfigure cause (issue #527). `None` while
@@ -4157,46 +4297,213 @@ impl CameraEncoder {
 
 impl Drop for CameraEncoder {
     fn drop(&mut self) {
-        // Issue #1670: if this encoder's AQ loop was torn down (Host unmount)
-        // while it still held a raised uplink-saturation threshold — i.e. the
-        // screen-STOP edge never ran to release it — release the global owner
-        // count here so a dropped-while-raised loop self-heals and cannot pin
-        // the threshold raised forever (the #1667 bug in reverse). The
-        // per-encoder flag is the single source of truth shared with the loop:
-        // if the loop already released on a STOP edge, the flag is false and
-        // this is a no-op (no double-decrement). `note_threshold_raise_released`
-        // ALSO floors the threshold when this is the LAST live owner (count
-        // 1 -> 0), so a drop-while-raised with no surviving raiser leaves the
-        // threshold at the floor — not merely the count at 0. (A surviving
-        // replacement that constructed while count > 0 skipped its own guarded
-        // reset, so the floor must come from here, not a later constructor.)
-        if self.screen_threshold_raised.swap(false, Ordering::AcqRel) {
-            videocall_transport::webtransport::note_threshold_raise_released();
-        }
+        // Release immediately on Host teardown. The AQ future also owns this Rc,
+        // so relying on the tracker's eventual Drop would retain the registry
+        // entry until the sleeping loop observed its liveness token.
+        self.screen_ready_stall_tracker.borrow_mut().release();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::CameraEncoder;
     use super::RestartReason;
     use super::{
-        apply_raise_transition, build_simulcast_layers, camera_encoder_restarts_closed_codec,
+        build_simulcast_layers, camera_encoder_restarts_closed_codec,
         camera_encoder_restarts_configure, camera_encoder_restarts_memory,
-        camera_encoder_restarts_other, clamp_layer_count, clear_video_at_floor_on_enable_edge,
-        encoders_to_build, format_layer_transition, frame_is_healthy, initial_active_layer_count,
-        is_fatal_encoder_error_message, keyframe_tick_decision, layer_ceiling_to_count,
-        loop_is_superseded, next_single_layer_pin, periodic_keyframe_due, record_camera_restart,
-        shed_reason, should_encode_layer_frame, should_pin_single_layer_low,
-        should_teardown_shed_layer, video_at_floor_on_tick, wt_drop_step_down_decision,
-        wt_saturation_step_down_decision, KeyframeTickInput, LayerView, SimulcastLayerInfo,
-        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        camera_encoder_restarts_other, camera_wt_stale_drop_step_down_decision, clamp_layer_count,
+        clear_video_at_floor_on_enable_edge, encoders_to_build, format_layer_transition,
+        frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
+        keyframe_tick_decision, layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin,
+        periodic_keyframe_due, record_camera_restart, resolve_capture_dimensions,
+        screen_ready_stall_threshold_update, shed_reason, should_encode_layer_frame,
+        should_pin_single_layer_low, should_teardown_shed_layer, video_at_floor_on_tick,
+        wt_drop_step_down_decision, wt_saturation_step_down_decision, KeyframeTickInput, LayerView,
+        ScreenReadyStallThresholdTracker, SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS,
+        SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
         SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use crate::adaptive_quality_constants::{
+        CAMERA_WT_STALE_DROP_THRESHOLD, CAMERA_WT_STALE_DROP_WINDOW_MS,
         WS_SELF_CONGESTION_DROP_THRESHOLD, WS_SELF_CONGESTION_WINDOW_MS,
         WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS, WT_SELF_CONGESTION_DROP_THRESHOLD,
         WT_SELF_CONGESTION_WINDOW_MS,
     };
+    use crate::{Callback, VideoCallClient, VideoCallClientOptions};
+    use std::sync::atomic::Ordering;
+
+    fn build_test_client() -> VideoCallClient {
+        VideoCallClient::new(VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
+            on_peer_added: Callback::noop(),
+            on_peer_first_frame: Callback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: Callback::from(|id| id),
+            get_peer_screen_canvas_id: Callback::from(|id| id),
+            user_id: "test-user".to_string(),
+            display_name: "test".to_string(),
+            meeting_id: "test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_connected: Callback::noop(),
+            on_connection_lost: Callback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_reaction: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            on_participant_kicked: None,
+            on_host_granted: None,
+            on_host_revoked: None,
+            on_peer_event: None,
+            decode_media: true,
+            is_guest: false,
+            allow_post_rebase_retry: true,
+        })
+    }
+
+    /// #2060 (PR #2077 review): `CameraEncoder::stop()` must reset the shared
+    /// `current_fps` atomic to 0 so a re-enable re-warms honestly. Camera is the
+    /// path wired to `window.__videocall_encoder_fps` and the bots
+    /// RESOURCE_STARVED rule, so this call-site is the highest-stakes one (its
+    /// `ScreenEncoder` sibling is pinned by `stop_resets_current_fps_to_zero`).
+    /// MUTATION: delete `reset_output_fps(&self.current_fps)` from `stop()` and
+    /// this assertion fails (current_fps stays 30).
+    #[test]
+    fn stop_resets_current_fps_to_zero() {
+        let client = build_test_client();
+        let mut encoder = CameraEncoder::new(
+            client,
+            "test-video-elem",
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: String| {}),
+            1, // max_layers (single layer)
+        );
+        // Simulate a live encoder that has produced layer-0 output.
+        encoder.current_fps.store(30, Ordering::Relaxed);
+        assert_eq!(encoder.get_current_fps(), 30);
+        encoder.stop();
+        assert_eq!(
+            encoder.get_current_fps(),
+            0,
+            "#2060: CameraEncoder::stop() must reset current_fps to 0"
+        );
+    }
+
+    // These regression tests guard issue #2034's width-less capture track path.
+    #[test]
+    fn resolve_capture_dimensions_uses_video_element_when_settings_are_absent() {
+        assert_eq!(
+            resolve_capture_dimensions(None, None, 1280, 720),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn resolve_capture_dimensions_uses_video_element_when_settings_are_zero() {
+        assert_eq!(
+            resolve_capture_dimensions(Some(0.0), Some(0.0), 1280, 720),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn resolve_capture_dimensions_prefers_valid_settings() {
+        assert_eq!(
+            resolve_capture_dimensions(Some(800.0), Some(600.0), 1280, 720),
+            (800, 600)
+        );
+    }
+
+    #[test]
+    fn resolve_capture_dimensions_keeps_partial_settings_pair_coherent() {
+        assert_eq!(
+            resolve_capture_dimensions(Some(1280.0), None, 0, 0),
+            (640, 480)
+        );
+    }
+
+    #[test]
+    fn resolve_capture_dimensions_uses_safe_default_without_dimensions() {
+        assert_eq!(resolve_capture_dimensions(None, None, 0, 0), (640, 480));
+    }
+
+    #[test]
+    fn screen_ready_stall_threshold_tracks_live_tier_changes() {
+        // Share start uses the live high tier: 8 * (1000 / 10) = 800ms.
+        assert_eq!(
+            screen_ready_stall_threshold_update(false, true, 0, 0),
+            Some((800.0, 100.0))
+        );
+        // A live degradation to medium and low must lengthen the threshold.
+        assert_eq!(
+            screen_ready_stall_threshold_update(true, true, 0, 1),
+            Some((1000.0, 125.0))
+        );
+        assert_eq!(
+            screen_ready_stall_threshold_update(true, true, 1, 2),
+            Some((1600.0, 200.0))
+        );
+        // Recovery must shorten it again; unchanged and stopped states do no write.
+        assert_eq!(
+            screen_ready_stall_threshold_update(true, true, 2, 0),
+            Some((800.0, 100.0))
+        );
+        assert_eq!(screen_ready_stall_threshold_update(true, true, 0, 0), None);
+        assert_eq!(screen_ready_stall_threshold_update(true, false, 0, 2), None);
+        // Invalid input fails conservatively to the slowest (low/5fps) tier.
+        assert_eq!(
+            screen_ready_stall_threshold_update(true, true, 0, u32::MAX),
+            Some((1600.0, 200.0))
+        );
+    }
+
+    #[test]
+    fn screen_ready_stall_tracker_drives_production_transport_threshold() {
+        use videocall_transport::webtransport::{
+            raised_threshold_owner_count, ready_stall_threshold_ms,
+            reset_ready_stall_threshold_on_construction, set_uplink_rtt_baseline_ms,
+        };
+
+        set_uplink_rtt_baseline_ms(None);
+        reset_ready_stall_threshold_on_construction();
+        let mut tracker = ScreenReadyStallThresholdTracker::new(0);
+
+        assert_eq!(tracker.tick(true, 0), Some((800.0, 100.0)));
+        assert_eq!(ready_stall_threshold_ms(), 800.0);
+        assert_eq!(raised_threshold_owner_count(), 1);
+
+        assert_eq!(tracker.tick(true, 2), Some((1600.0, 200.0)));
+        assert_eq!(ready_stall_threshold_ms(), 1600.0);
+
+        assert_eq!(tracker.tick(false, 2), None);
+        assert_eq!(raised_threshold_owner_count(), 0);
+        assert_eq!(ready_stall_threshold_ms(), 250.0);
+    }
     use videocall_aq::constants::simulcast_layers;
 
     #[test]
@@ -5127,6 +5434,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn camera_wt_stale_drop_axis_fires_on_sustained_drops() {
+        let decision = camera_wt_stale_drop_step_down_decision(
+            CAMERA_WT_STALE_DROP_THRESHOLD,
+            0,
+            CAMERA_WT_STALE_DROP_WINDOW_MS,
+        );
+        assert!(
+            decision.step_down,
+            "a stale-delta drop delta == threshold over a closed window must step down"
+        );
+    }
+
+    #[test]
+    fn camera_wt_stale_drop_axis_does_not_fire_below_threshold() {
+        let decision = camera_wt_stale_drop_step_down_decision(
+            CAMERA_WT_STALE_DROP_THRESHOLD - 1,
+            0,
+            CAMERA_WT_STALE_DROP_WINDOW_MS,
+        );
+        assert!(
+            !decision.step_down,
+            "a stale-delta drop delta below threshold must NOT step down"
+        );
+    }
+
+    #[test]
+    fn camera_wt_stale_drop_axis_never_fires_when_flat() {
+        let decision =
+            camera_wt_stale_drop_step_down_decision(0, 0, CAMERA_WT_STALE_DROP_WINDOW_MS);
+        assert!(
+            !decision.step_down,
+            "a flat-at-0 stale-delta drop counter must never step down"
+        );
+    }
+
+    #[test]
+    fn camera_wt_stale_drop_axis_uses_its_own_window_not_ws() {
+        const _: () = assert!(
+            CAMERA_WT_STALE_DROP_WINDOW_MS > WS_SELF_CONGESTION_WINDOW_MS,
+            "test premise: camera stale-drop window must be wider than WS window"
+        );
+        let elapsed = WS_SELF_CONGESTION_WINDOW_MS + 1.0;
+        let delta = WS_SELF_CONGESTION_DROP_THRESHOLD.max(CAMERA_WT_STALE_DROP_THRESHOLD);
+        let decision = camera_wt_stale_drop_step_down_decision(delta, 0, elapsed);
+        assert!(
+            !decision.step_down,
+            "the camera stale-drop axis must treat its own window as still open at WS-window elapsed"
+        );
+        assert!(
+            !decision.roll_window,
+            "an open camera stale-drop window must not roll"
+        );
+    }
+
     /// Issue #1510: the wall-clock periodic keyframe ceiling fires when elapsed
     /// time since the last keyframe exceeds the cap, even when the frame-count
     /// modulo has not triggered. Calls the PRODUCTION `periodic_keyframe_due`
@@ -5324,37 +5686,6 @@ mod tests {
         assert!(
             flag.load(Ordering::Acquire),
             "set_enabled(false) must NOT clear video_at_floor (only the enable edge does)",
-        );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Issue #1670: `apply_raise_transition` maps a per-encoder raise-flag
-    // TRANSITION to the global owner-count delta. Driving the count off
-    // transitions (not raw edges) makes double-counting impossible — an encoder
-    // that raised, stopped, then dropped is already back at `was_raised == false`
-    // so `Drop` applies no further delta.
-    // ─────────────────────────────────────────────────────────────────────
-    #[test]
-    fn apply_raise_transition_counts_only_real_transitions() {
-        assert_eq!(
-            apply_raise_transition(false, true),
-            1,
-            "rising (not-raised -> raised) must register one owner (+1)",
-        );
-        assert_eq!(
-            apply_raise_transition(true, false),
-            -1,
-            "falling (raised -> not-raised) must release one owner (-1)",
-        );
-        assert_eq!(
-            apply_raise_transition(false, false),
-            0,
-            "no transition (stays not-raised) must be a no-op (0)",
-        );
-        assert_eq!(
-            apply_raise_transition(true, true),
-            0,
-            "no transition (stays raised) must be a no-op (0)",
         );
     }
 }

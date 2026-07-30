@@ -91,7 +91,8 @@ const INNER_ALPHA_STRENGTH_RANGE: f32 = 0.75;
 const BORDER_ALPHA_BASE: f32 = 0.50;
 /// Border alpha increase per unit of audio intensity.
 const BORDER_ALPHA_INTENSITY: f32 = 0.42;
-pub(crate) const DEFAULT_TILE_BORDER_COLOR: &str = "rgba(100, 100, 100, 0.30)";
+pub(crate) const DEFAULT_TILE_BORDER_COLOR: &str =
+    "var(--appearance-preview-tile-border-color, var(--tile-border-color-fallback))";
 const SILENT_BORDER_RESET_SECONDS: f32 = 0.30;
 const GLOW_FADE_IN_SECONDS_DEFAULT: f32 = 0.15;
 /// Fixed fade-out duration (the visual fade after the hold period expires).
@@ -323,7 +324,7 @@ fn remap_brightness_slider(b: f32) -> f32 {
 /// - 1% decay  → no hold (fade starts immediately)
 /// - 50% decay → 1.0s hold before fade begins
 /// - 100% decay → 5.0s hold before fade begins
-fn glow_transition_seconds(decay: f32) -> (f32, f32, f32) {
+pub(crate) fn glow_transition_seconds(decay: f32) -> (f32, f32, f32) {
     let d = decay.clamp(0.0, 1.0);
     if d <= f32::EPSILON {
         return (0.0, 0.0, 0.0);

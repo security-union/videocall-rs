@@ -26,6 +26,10 @@ service:
   type: ClusterIP
   port: 80
 
+csp:
+  enabled: true
+  enforce: false # Report-Only. Flip to true only after browser validation (issue #1248 follow-up).
+
 autoscaling:
   enabled: false
   minReplicas: 1
@@ -56,9 +60,6 @@ runtimeConfig:
   firefoxEnabled: "false"
   usersAllowedToStream: ""
   serverElectionPeriodMs: 2000
-  audioBitrateKbps: 65
-  videoBitrateKbps: 1000
-  screenBitrateKbps: 1000
   vadThreshold: 0.02
   consoleLogUploadEnabled: "false"
   # Independent operator control for client hardware/network/battery telemetry.

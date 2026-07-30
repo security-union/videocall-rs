@@ -23,6 +23,7 @@
 //
 use log::debug;
 use videocall_transport::websocket::WebSocketTask;
+use videocall_transport::webtransport::FrameDropMeta;
 use videocall_transport::webtransport::WebTransportTask;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -91,9 +92,18 @@ impl Task {
     /// `stream_key`.  WebSocket ignores the key (single TCP stream);
     /// WebTransport routes to the matching persistent QUIC stream.
     pub fn send_packet(&self, packet: PacketWrapper, stream_key: MediaStreamKey) {
+        self.send_packet_with_drop_meta(packet, stream_key, None);
+    }
+
+    pub fn send_packet_with_drop_meta(
+        &self,
+        packet: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) {
         match self {
             Task::WebSocket(ws) => ws.send_packet(packet, stream_key),
-            Task::WebTransport(wt) => wt.send_packet(packet, stream_key),
+            Task::WebTransport(wt) => wt.send_packet_with_drop_meta(packet, stream_key, meta),
             #[cfg(test)]
             Task::Stub(stub) => {
                 let _ = packet;

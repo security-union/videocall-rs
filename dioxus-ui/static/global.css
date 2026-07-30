@@ -1203,6 +1203,23 @@ html[data-theme="dark"] {
 
   /* Speaker Highlight preview tile — calm surface, not bright (dark). */
   --appearance-preview-tile-bg: rgba(255, 255, 255, 0.03);
+  --appearance-preview-tile-border-color: rgba(100, 100, 100, 0.30);
+  --preview-glow-speaking-box-shadow:
+    0 0 calc(var(--preview-glow-outer-blur) * 1px)
+      calc(var(--preview-glow-outer-spread) * 1px)
+      rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-outer-alpha)),
+    inset 0 0 calc(var(--preview-glow-inner-blur) * 1px)
+      calc(var(--preview-glow-inner-spread) * 1px)
+      rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-inner-alpha));
+  --preview-glow-speaking-border-color:
+    rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-border-alpha));
+  --preview-glow-speaking-transition:
+    border-color var(--preview-glow-fade-in) ease-in,
+    box-shadow var(--preview-glow-fade-in) ease-in;
+  --preview-glow-silent-border-color: var(--appearance-preview-tile-border-color);
+  --preview-glow-silent-transition:
+    border-color var(--preview-glow-fade-out) ease-out var(--preview-glow-hold-delay),
+    box-shadow var(--preview-glow-fade-out) ease-out var(--preview-glow-hold-delay);
 }
 
 /* Settings-specific tokens — light theme */
@@ -1382,6 +1399,23 @@ html[data-theme="light"] {
 
   /* Speaker Highlight preview tile — muted slate, not near-white (light). */
   --appearance-preview-tile-bg: rgba(40, 55, 80, 0.06);
+  --appearance-preview-tile-border-color: rgba(100, 100, 100, 0.30);
+  --preview-glow-speaking-box-shadow:
+    0 0 calc(var(--preview-glow-outer-blur) * 1px)
+      calc(var(--preview-glow-outer-spread) * 1px)
+      rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-outer-alpha)),
+    inset 0 0 calc(var(--preview-glow-inner-blur) * 1px)
+      calc(var(--preview-glow-inner-spread) * 1px)
+      rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-inner-alpha));
+  --preview-glow-speaking-border-color:
+    rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-border-alpha));
+  --preview-glow-speaking-transition:
+    border-color var(--preview-glow-fade-in) ease-in,
+    box-shadow var(--preview-glow-fade-in) ease-in;
+  --preview-glow-silent-border-color: var(--appearance-preview-tile-border-color);
+  --preview-glow-silent-transition:
+    border-color var(--preview-glow-fade-out) ease-out var(--preview-glow-hold-delay),
+    box-shadow var(--preview-glow-fade-out) ease-out var(--preview-glow-hold-delay);
 }
 
 /* Light theme invite window text — override for dark text readability */
@@ -1391,6 +1425,10 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 :root {
+    /* Fallback tile border color used as a defensive var() fallback by
+      preview-tile styles if the primary token chain is unavailable. */
+  --tile-border-color-fallback: rgba(100, 100, 100, 0.30);
+
   --glass-blur: 20px;
   --glass-saturate: 180%;
 
@@ -2130,6 +2168,17 @@ html[data-theme="light"] #invite-overlay p {
   display: inline-flex;
 }
 
+/* Slots the JS overflow detector can't fit at the current width are hidden
+   here. The state is carried on a CLASS (toggled by attendants.rs), NOT an
+   inline style: Dioxus did not reliably clear an inline `display:none
+   !important` when it diffed back to empty, so a slot that overflowed at a
+   narrow width stayed stuck-hidden after the window widened again even though
+   the overflow set had emptied. `!important` beats the `.controls-expanded` /
+   `:hover` reveal rules above. */
+.action-bar-slot-wrapper.is-overflow-hidden {
+  display: none !important;
+}
+
 /* Overflow "more" trigger — hidden by default, shown at narrow viewports */
 .action-bar-overflow-trigger {
   display: none;
@@ -2157,6 +2206,13 @@ html[data-theme="light"] #invite-overlay p {
   box-shadow: var(--glass-popover-shadow);
   z-index: 9001;
   animation: overflow-popover-fade-in 0.12s ease-out;
+  /* Cap the height so the upward-opening list can't clip off the top of a
+     short / landscape viewport now that up to 5-7 items can land here. The
+     popover's bottom edge sits ~120px above the viewport bottom (20px bar
+     offset + ~79px bar height + 12px gap); leave that plus a small top margin,
+     and scroll anything taller. */
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
 }
 
 @keyframes overflow-popover-fade-in {
@@ -4192,8 +4248,18 @@ html[data-theme="light"] #invite-overlay p {
   flex-shrink: 0;
 }
 
+/* `animation` is not inherited, so each element carrying the infinite
+   rec-pulse must opt out of motion individually. */
+@media (prefers-reduced-motion: reduce) {
+  .rec-dot,
+  .video-control-button.record-active {
+    animation: none;
+  }
+}
+
 .recording-status-banner,
-.recording-saved-banner {
+.recording-saved-banner,
+.recording-error-banner {
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -4213,6 +4279,13 @@ html[data-theme="light"] #invite-overlay p {
 /* Brief confirmation shown to the recorder when recording has been saved */
 .recording-saved-banner {
   border: 1px solid rgba(255, 69, 58, 0.5);
+}
+
+/* Brief error shown to the local user when a Record click could not hand off
+   to the JS recorder (recording.js missing / stale / 404). Amber border to
+   distinguish it from the red recording-active/saved banners. */
+.recording-error-banner {
+  border: 1px solid rgba(255, 159, 10, 0.6);
 }
 
 /* ---------------------------------------------------------------

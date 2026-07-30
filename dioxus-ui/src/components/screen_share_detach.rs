@@ -53,7 +53,8 @@ use web_sys::{
 };
 
 use super::screen_share_detach_sizing::{
-    detached_window_inner_dims, DETACHED_BAR_H_PX, DETACHED_MIN_H, DETACHED_MIN_W,
+    detached_window_inner_dims, maximize_action_for, maximize_button_spec,
+    maximized_popup_features, MaximizeAction, DETACHED_BAR_H_PX, DETACHED_MIN_H, DETACHED_MIN_W,
 };
 use super::screen_share_zoom as zoom;
 use crate::context::ScreenZoomState;
@@ -123,18 +124,23 @@ struct DetachState {
     close_poll_id: Option<i32>,
     /// Issue 1821: how the window was opened (Document PiP vs `window.open`
     /// popup). Recorded per the design contract; the Maximize affordance is
-    /// actually selected at BUILD time from the `via_pip` argument to
-    /// `finish_open` / `wire_maximize` (Document PiP is spec-forbidden from
-    /// `requestFullscreen`, so PiP gets resize-to-available and popups get a
-    /// fullscreen toggle), so this stored copy is not read back — hence
-    /// `dead_code`. Kept so the detached state is self-describing for any future
-    /// runtime branch.
+    /// selected from the `via_pip` argument threaded into `wire_maximize` at build
+    /// time (Document PiP one-shot-migrates to a maximized popup; a popup toggles
+    /// fullscreen), so this stored copy is not read back — hence `dead_code`. Kept
+    /// so the detached state is self-describing for any future runtime branch.
     #[allow(dead_code)]
     via_pip: bool,
     /// Issue 1821: `setInterval` id for the ~1 Hz detached stats-overlay fps
     /// sampler (present only when the media-metrics checkbox was on at open).
     /// Cleared on teardown alongside `close_poll_id`.
     metrics_poll_id: Option<i32>,
+    /// Issue #1821: monotonic session id, distinguishing successive detached
+    /// windows for the SAME peer. A Maximize→popup migration closes the PiP and
+    /// installs a fresh popup session; the retiring PiP's parked `pagehide`/poll
+    /// closures carry the OLD session, so [`teardown_if_session`] can ignore them
+    /// and NOT tear down the live popup. Session-agnostic paths (main-window
+    /// [`reattach`], tile unmount) use [`teardown`] and skip this check.
+    session: u64,
 }
 
 /// Owns a parked event `Closure` so it outlives `finish_open` and is dropped on
@@ -160,10 +166,27 @@ thread_local! {
     /// Set by [`reattach`] while an open is still `PENDING`, so the async
     /// resolution self-closes instead of stranding a cancelled window.
     static CANCEL_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// Issue #1821: monotonic detached-session counter (see `DetachState::session`).
+    static SESSION_SEQ: Cell<u64> = const { Cell::new(0) };
+    /// Issue #1821: the just-closed PiP window during a Maximize→popup migration,
+    /// parked so its event closures outlive a late `pagehide` (a dropped closure
+    /// invoked by JS would throw). Its window is already closed and its mirror
+    /// stopped; it is dropped on the next migration or on [`teardown`]. Holds at
+    /// most one entry (one-at-a-time detach).
+    static RETIRED: RefCell<Vec<DetachState>> = const { RefCell::new(Vec::new()) };
 }
 
 fn is_busy() -> bool {
     DETACH.with(|d| d.borrow().is_some()) || PENDING.with(|p| p.get())
+}
+
+/// Next monotonic detached-session id.
+fn next_session() -> u64 {
+    SESSION_SEQ.with(|s| {
+        let v = s.get().wrapping_add(1);
+        s.set(v);
+        v
+    })
 }
 
 /// Reinterpret a value that belongs to the DETACHED window's JS realm as a typed
@@ -191,16 +214,35 @@ fn cross_realm_cast<T: JsCast>(value: impl JsCast) -> T {
     value.unchecked_into::<T>()
 }
 
-/// Defer [`teardown`] to a microtask. Called from the PARKED event closures
-/// (pagehide, poll, Escape, reattach button), which live inside [`DetachState`]:
-/// `teardown` drops that state — and with it the running closure — so it must not
-/// run while such a closure is still on the stack. Direct callers that are NOT
-/// parked closures (main-window [`reattach`], tile unmount, peer-removed) call
-/// `teardown` synchronously.
-fn schedule_teardown(peer: String) {
+/// Defer a session-guarded [`teardown`] to a microtask. Called from the PARKED
+/// event closures (pagehide, poll, Escape, reattach button), which live inside
+/// [`DetachState`]: `teardown` drops that state — and with it the running closure —
+/// so it must not run while such a closure is still on the stack. The `session`
+/// guard (see [`teardown_if_session`]) makes a stale window's late close events
+/// (e.g. the PiP retired during a Maximize→popup migration) a no-op instead of
+/// tearing down the live popup. Direct callers that are NOT parked closures
+/// (main-window [`reattach`], tile unmount, peer-removed) call the session-agnostic
+/// [`teardown`] synchronously.
+fn schedule_teardown(peer: String, session: u64) {
     wasm_bindgen_futures::spawn_local(async move {
-        teardown(&peer);
+        teardown_if_session(&peer, session);
     });
+}
+
+/// Tear down only if the CURRENT detached window is `session` for `peer`. A
+/// Maximize→popup migration (issue #1821) closes the PiP and installs a fresh
+/// popup session for the same peer; the retiring PiP's `pagehide`/poll closures
+/// carry the OLD session, so this guard drops them without disturbing the popup.
+fn teardown_if_session(peer: &str, session: u64) {
+    let is_current = DETACH.with(|d| {
+        d.borrow()
+            .as_ref()
+            .map(|s| s.peer == peer && s.session == session)
+            .unwrap_or(false)
+    });
+    if is_current {
+        teardown(peer);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -544,8 +586,10 @@ fn open_popup(
     finish_open(popup, peer, display_name, source, false, on_reattach);
 }
 
-/// Shared tail: build the detached document (mirror video + zoom controls),
-/// start the mirror, wire every close path + the zoom/pan controls.
+/// Build the detached document (mirror video + zoom controls), start the mirror,
+/// then wire every close path + the zoom/pan/maximize controls via
+/// [`install_detached`]. On a build/mirror failure the fresh window is closed and
+/// the share snaps back to the main window (reattach).
 fn finish_open(
     detached_win: Window,
     peer: &str,
@@ -554,17 +598,44 @@ fn finish_open(
     via_pip: bool,
     on_reattach: Box<dyn Fn()>,
 ) {
-    let doc = match detached_win.document() {
-        Some(d) => d,
+    match build_and_start_mirror(&detached_win, display_name, source, via_pip) {
+        Some((doc, video, mirror, show_metrics)) => {
+            install_detached(
+                detached_win,
+                doc,
+                video,
+                mirror,
+                peer,
+                display_name,
+                via_pip,
+                show_metrics,
+                on_reattach,
+            );
+        }
         None => {
             // Silent-abort guard (issue 1829): every detach bail-out logs so a
             // field failure is diagnosable instead of a blank window + snap-back.
-            log::warn!("issue 1175: detached window has no document; aborting detach");
+            log::warn!("issue 1175: could not build the detached window; aborting detach");
             let _ = detached_win.close();
             on_reattach();
-            return;
         }
-    };
+    }
+}
+
+/// Build the detached DOM + start the mirror in `detached_win`, returning
+/// `(document, mirror <video>, mirror, show_metrics)`. `None` if the window has no
+/// document, the DOM could not be built, or the mirror could not start (a tainted
+/// canvas — never expected here). The caller decides how to recover: a fresh open
+/// reattaches to the main window; a Maximize→popup migration keeps the PiP window
+/// intact (issue #1821), so the split lets the migration commit only once the
+/// popup is proven good.
+fn build_and_start_mirror(
+    detached_win: &Window,
+    display_name: &str,
+    source: &HtmlCanvasElement,
+    via_pip: bool,
+) -> Option<(Document, HtmlVideoElement, Mirror, bool)> {
+    let doc = detached_win.document()?;
     // Issue 1821: mirror the main window's media-metrics checkbox once at open.
     // A later toggle does NOT reactively update the detached overlay (documented
     // limitation) — the detached document is plain DOM, not a Dioxus subscriber.
@@ -572,24 +643,30 @@ fn finish_open(
         super::media_metrics_overlay::MEDIA_METRICS_OVERLAY_KEY,
         false,
     );
-    let video = match build_detached_dom(&doc, display_name, via_pip, show_metrics) {
-        Some(v) => v,
-        None => {
-            log::warn!("issue 1175: could not build the detached-window DOM; aborting detach");
-            let _ = detached_win.close();
-            on_reattach();
-            return;
-        }
-    };
-    let mirror = match Mirror::start(source, &video) {
-        Some(m) => m,
-        None => {
-            log::warn!("issue 1175: could not start the mirror stream; aborting detach");
-            let _ = detached_win.close();
-            on_reattach();
-            return;
-        }
-    };
+    let video = build_detached_dom(&doc, display_name, via_pip, show_metrics)?;
+    let mirror = Mirror::start(source, &video)?;
+    Some((doc, video, mirror, show_metrics))
+}
+
+/// Store the detached [`DetachState`] (fresh session) and wire every close path +
+/// the zoom/pan/maximize/metrics controls. Shared by [`finish_open`] (fresh open)
+/// and [`migrate_pip_to_maximized_popup`] (issue #1821). The DOM + mirror are built
+/// by the caller via [`build_and_start_mirror`].
+#[allow(clippy::too_many_arguments)]
+fn install_detached(
+    detached_win: Window,
+    doc: Document,
+    video: HtmlVideoElement,
+    mirror: Mirror,
+    peer: &str,
+    display_name: &str,
+    via_pip: bool,
+    show_metrics: bool,
+    on_reattach: Box<dyn Fn()>,
+) {
+    // A fresh session id: the parked close/poll closures below capture it so a
+    // retired window (e.g. a migrated-away PiP) cannot tear this one down.
+    let session = next_session();
 
     let zoom_state = Rc::new(RefCell::new(ScreenZoomState::default()));
     // Issue 1821: the detached-window 1:1 INTENT (mirrors the tile's
@@ -609,6 +686,7 @@ fn finish_open(
             close_poll_id: None,
             via_pip,
             metrics_poll_id: None,
+            session,
         });
     });
 
@@ -616,7 +694,8 @@ fn finish_open(
 
     // Close listener: `pagehide` fires for Document PiP on every close path.
     let peer_close = peer.to_string();
-    let close_cb = Closure::<dyn FnMut()>::new(move || schedule_teardown(peer_close.clone()));
+    let close_cb =
+        Closure::<dyn FnMut()>::new(move || schedule_teardown(peer_close.clone(), session));
     let _ = detached_win
         .add_event_listener_with_callback("pagehide", close_cb.as_ref().unchecked_ref());
     listeners.push(ListenerHandle {
@@ -628,7 +707,7 @@ fn finish_open(
     let win_poll = detached_win.clone();
     let poll_cb = Closure::<dyn FnMut()>::new(move || {
         if win_poll.closed().unwrap_or(false) {
-            schedule_teardown(peer_poll.clone());
+            schedule_teardown(peer_poll.clone(), session);
         }
     });
     let poll_id = detached_win
@@ -643,7 +722,8 @@ fn finish_open(
 
     // Reattach button (plain listener in the doc we own).
     let peer_btn = peer.to_string();
-    let reattach_cb = Closure::<dyn FnMut()>::new(move || schedule_teardown(peer_btn.clone()));
+    let reattach_cb =
+        Closure::<dyn FnMut()>::new(move || schedule_teardown(peer_btn.clone(), session));
     if let Some(btn) = doc.get_element_by_id(REATTACH_BTN_ID) {
         let _ = btn.add_event_listener_with_callback("click", reattach_cb.as_ref().unchecked_ref());
     }
@@ -662,7 +742,7 @@ fn finish_open(
             if doc_esc.fullscreen_element().is_some() {
                 return;
             }
-            schedule_teardown(peer_esc.clone());
+            schedule_teardown(peer_esc.clone(), session);
         }
     });
     let _ = doc.add_event_listener_with_callback("keydown", esc_cb.as_ref().unchecked_ref());
@@ -670,9 +750,10 @@ fn finish_open(
         _closure: ClosureKind::Key(esc_cb),
     });
 
-    // Issue 1821: Maximize control + fullscreenchange sync (popups) / resize-to-
-    // available (Document PiP).
-    wire_maximize(&doc, via_pip, &mut listeners);
+    // Issue 1821: Maximize control. Popup → fullscreen toggle (+ fullscreenchange
+    // sync); Document PiP → migrate the mirror to a maximized popup (a PiP window
+    // can't fill the display in place).
+    wire_maximize(&doc, peer, display_name, via_pip, &mut listeners);
 
     // Issue 1821: detached stats overlay — resolution on the video `resize` event,
     // fps sampled ~1 Hz via getVideoPlaybackQuality. Only when the checkbox was on
@@ -706,9 +787,9 @@ fn finish_open(
 /// Build the detached document DOM: title bar (name + zoom controls + maximize +
 /// reattach) and a zoom viewport wrapping the mirror `<video>` (plus the optional
 /// stats overlay). Returns the `<video>`. `via_pip` selects the Maximize
-/// affordance (fullscreen toggle for popups, resize-to-available for Document
-/// PiP, which is spec-forbidden from `requestFullscreen`); `show_metrics` adds the
-/// stats overlay element.
+/// affordance (fullscreen toggle for popups; a one-shot migrate-to-maximized-popup
+/// for Document PiP, which is spec-forbidden from `requestFullscreen`);
+/// `show_metrics` adds the stats overlay element.
 fn build_detached_dom(
     doc: &Document,
     display_name: &str,
@@ -759,22 +840,17 @@ fn build_detached_dom(
     let _ = controls.append_child(&zoom_actual_btn);
     let _ = bar.append_child(&controls);
 
-    // Issue 1821: Maximize. Popups can go fullscreen (aria-pressed toggle synced
-    // by `fullscreenchange`); Document PiP is spec-forbidden from
-    // `requestFullscreen`, so there it is a momentary resize-to-available action
-    // (no aria-pressed).
-    let maximize = if via_pip {
-        make_btn(doc, MAXIMIZE_BTN_ID, "Maximize window", "\u{2922}")? // U+2922 ⤢
-    } else {
-        let b = make_btn(
-            doc,
-            MAXIMIZE_BTN_ID,
-            "Enter full screen (Escape to exit)",
-            "\u{26F6}", // U+26F6 ⛶
-        )?;
-        let _ = b.set_attribute("aria-pressed", "false");
-        b
-    };
+    // Issue 1821: Maximize. Presentation is chosen by open mode via the pure
+    // `maximize_button_spec` (host-tested): a popup toggles fullscreen (two-state →
+    // aria-pressed, synced by `fullscreenchange`); a Document PiP is a ONE-SHOT
+    // migrate-to-maximized-popup (no aria-pressed), because a PiP window is
+    // UA-clamped + spec-forbidden from `requestFullscreen` and so can't fill the
+    // display in place. See `wire_maximize`.
+    let spec = maximize_button_spec(via_pip);
+    let maximize = make_btn(doc, MAXIMIZE_BTN_ID, spec.label, spec.glyph)?;
+    if spec.toggle {
+        let _ = maximize.set_attribute("aria-pressed", "false");
+    }
     let _ = maximize.set_attribute("class", "ss-detached-zoom-btn ss-detached-maximize");
     let _ = bar.append_child(&maximize);
 
@@ -874,67 +950,274 @@ fn detached_actual_target(doc: &Document) -> Option<f64> {
     Some(zoom::actual_size_target(bw, bh, hw * 2.0, hh * 2.0, dpr))
 }
 
-/// Wire the Maximize control. Popup → toggle `requestFullscreen()` on the
-/// viewport, syncing aria-pressed + label via `fullscreenchange` (which also
-/// fires on native Escape exit). Document PiP → best-effort `moveTo(0,0)` +
-/// `resizeTo(avail)` momentary action (PiP is spec-forbidden from
-/// `requestFullscreen`; the UA may clamp the resize).
-fn wire_maximize(doc: &Document, via_pip: bool, listeners: &mut Vec<ListenerHandle>) {
-    if via_pip {
-        let doc_cb = doc.clone();
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            if let Some(win) = doc_cb.default_view() {
-                let (aw, ah) = available_screen(&win);
-                let _ = win.move_to(0, 0);
-                let _ = win.resize_to(aw, ah);
+/// `screen.availLeft`/`availTop` — the top-left of the available display area
+/// (non-zero on multi-monitor setups or a left/top taskbar), defaulting to 0 when
+/// the (non-standard) getters are absent. Paired with [`available_screen`] to
+/// place a maximized popup over the whole available display box (issue #1821).
+fn available_origin(win: &Window) -> (i32, i32) {
+    match win.screen() {
+        Ok(s) => (s.avail_left().unwrap_or(0), s.avail_top().unwrap_or(0)),
+        Err(_) => (0, 0),
+    }
+}
+
+/// Wire the Maximize control, choosing the behaviour from the open mode via the
+/// pure `maximize_action_for` (host-tested):
+///
+/// - **Popup** (`ToggleFullscreen`) → toggle `requestFullscreen()` on the viewport,
+///   syncing aria-pressed + label via `fullscreenchange` (which also fires on the
+///   native Escape exit).
+/// - **Document PiP** (`MigrateToMaximizedPopup`) → a PiP window is UA-clamped and
+///   spec-forbidden from `requestFullscreen`, so it can NEVER fill the display in
+///   place (issue #1821). Migrate the mirror into a script-opened popup sized to the
+///   full available display box (= OS-maximized-window geometry), then close the
+///   PiP. In that popup the Maximize button is a real fullscreen toggle — a
+///   two-stage semantic: PiP-Maximize → maximized popup → popup-Maximize →
+///   fullscreen.
+fn wire_maximize(
+    doc: &Document,
+    peer: &str,
+    display_name: &str,
+    via_pip: bool,
+    listeners: &mut Vec<ListenerHandle>,
+) {
+    match maximize_action_for(via_pip) {
+        MaximizeAction::MigrateToMaximizedPopup => {
+            let doc_cb = doc.clone();
+            let peer = peer.to_string();
+            let name = display_name.to_string();
+            let cb = Closure::<dyn FnMut()>::new(move || {
+                migrate_pip_to_maximized_popup(&doc_cb, &peer, &name);
+            });
+            if let Some(btn) = doc.get_element_by_id(MAXIMIZE_BTN_ID) {
+                let _ = btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref());
             }
-        });
-        if let Some(btn) = doc.get_element_by_id(MAXIMIZE_BTN_ID) {
-            let _ = btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref());
+            listeners.push(ListenerHandle {
+                _closure: ClosureKind::Plain(cb),
+            });
         }
-        listeners.push(ListenerHandle {
-            _closure: ClosureKind::Plain(cb),
-        });
-        return;
+        MaximizeAction::ToggleFullscreen => {
+            // Popup: toggle fullscreen on the viewport element.
+            let doc_click = doc.clone();
+            let click_cb = Closure::<dyn FnMut()>::new(move || {
+                if doc_click.fullscreen_element().is_some() {
+                    let _ = doc_click.exit_fullscreen();
+                } else if let Some(vp) = doc_click.get_element_by_id(VIEWPORT_ID) {
+                    let _ = vp.request_fullscreen();
+                }
+            });
+            if let Some(btn) = doc.get_element_by_id(MAXIMIZE_BTN_ID) {
+                let _ = btn
+                    .add_event_listener_with_callback("click", click_cb.as_ref().unchecked_ref());
+            }
+            listeners.push(ListenerHandle {
+                _closure: ClosureKind::Plain(click_cb),
+            });
+
+            // Sync aria-pressed + label whenever fullscreen changes (button click OR
+            // the native Escape exit), so the control's state never drifts.
+            let doc_fs = doc.clone();
+            let fs_cb = Closure::<dyn FnMut()>::new(move || {
+                let is_fs = doc_fs.fullscreen_element().is_some();
+                if let Some(btn) = doc_fs.get_element_by_id(MAXIMIZE_BTN_ID) {
+                    let _ = btn.set_attribute("aria-pressed", if is_fs { "true" } else { "false" });
+                    let label = if is_fs {
+                        "Exit full screen (Escape)"
+                    } else {
+                        "Enter full screen (Escape to exit)"
+                    };
+                    let _ = btn.set_attribute("aria-label", label);
+                    let _ = btn.set_attribute("title", label);
+                }
+            });
+            let _ = doc.add_event_listener_with_callback(
+                "fullscreenchange",
+                fs_cb.as_ref().unchecked_ref(),
+            );
+            listeners.push(ListenerHandle {
+                _closure: ClosureKind::Plain(fs_cb),
+            });
+        }
+    }
+}
+
+/// Issue #1821 (UX A1): user-visible feedback in the PiP document when the maximize
+/// popup is blocked. Because a blocked popup only silently resizes the PiP (looks
+/// like a no-op), surface a transient plain-DOM toast (auto-removed after ~4s) AND
+/// temporarily relabel the Maximize button, both telling the user to allow pop-ups.
+///
+/// Plain DOM only — no Dioxus signal — so the deferred removal/restore is panic-safe
+/// even if the PiP is closed within the window: `Element::remove` on a detached node
+/// and `set_attribute` on an orphaned element are harmless no-ops (contrast the
+/// `try_write().unwrap()` hazard of a forgotten timer that writes a `use_signal`).
+fn signal_popup_blocked(doc: &Document) {
+    const MSG: &str = "Pop-up blocked — allow pop-ups for this site to maximize";
+
+    // Transient toast in the PiP body.
+    if let Some(body) = doc.body() {
+        if let Ok(toast) = doc.create_element("div") {
+            let _ = toast.set_attribute("class", "ss-detached-toast");
+            let _ = toast.set_attribute("role", "status");
+            toast.set_text_content(Some(MSG));
+            let _ = body.append_child(&toast);
+            let toast_remove = toast.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(4000).await;
+                toast_remove.remove();
+            });
+        }
     }
 
-    // Popup: toggle fullscreen on the viewport element.
-    let doc_click = doc.clone();
-    let click_cb = Closure::<dyn FnMut()>::new(move || {
-        if doc_click.fullscreen_element().is_some() {
-            let _ = doc_click.exit_fullscreen();
-        } else if let Some(vp) = doc_click.get_element_by_id(VIEWPORT_ID) {
-            let _ = vp.request_fullscreen();
-        }
-    });
+    // Temporarily relabel the Maximize button (for a screen-reader user focused on
+    // it), restoring the PiP label after the same interval.
     if let Some(btn) = doc.get_element_by_id(MAXIMIZE_BTN_ID) {
-        let _ = btn.add_event_listener_with_callback("click", click_cb.as_ref().unchecked_ref());
+        let _ = btn.set_attribute("aria-label", MSG);
+        let _ = btn.set_attribute("title", MSG);
+        let btn_restore = btn.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(4000).await;
+            let restore = maximize_button_spec(true).label;
+            let _ = btn_restore.set_attribute("aria-label", restore);
+            let _ = btn_restore.set_attribute("title", restore);
+        });
     }
-    listeners.push(ListenerHandle {
-        _closure: ClosureKind::Plain(click_cb),
+}
+
+/// Issue #1821: Maximize on a Document PiP detached window. A PiP window is
+/// UA-clamped and spec-forbidden from `requestFullscreen`, so it can never fill the
+/// display in place (the user's exact complaint). Migrate the mirror into a
+/// script-opened popup requested at the FULL available display box (OS-maximized
+/// geometry, taskbar/dock-respecting), then close the PiP.
+///
+/// ## Transient activation (spec-guaranteed)
+/// The popup is opened on the PiP WINDOW (`doc.default_view()`), NOT the main
+/// window. The Maximize click's transient activation lives in the PiP window's
+/// browsing context, and `window.open` consumes the activation of the window it is
+/// invoked on; calling it on the main window (which never received the gesture)
+/// would be popup-blocked. `doc` here is the PiP document, so `default_view()` is
+/// the PiP window (the same handle the pre-#1821 resize path used).
+///
+/// ## Popup survives the PiP close (spec-guaranteed)
+/// A popup is a top-level browsing context; closing its opener never closes it
+/// (HTML spec). So opening the popup and then closing the PiP leaves the popup
+/// alive. We never read `window.opener`, so the severed opener is irrelevant.
+///
+/// ## Pending live verification
+/// Two behaviours are spec-REASONED but not yet empirically confirmed on real
+/// Chrome Document PiP (the e2e stage will attempt the receipt): that `window.open`
+/// invoked on a Document PiP window opens a normal top-level popup at all, and that
+/// the UA applies the requested maximized geometry rather than clamping it. If
+/// either does not hold in the field, the failure-soft paths below keep the PiP up;
+/// the share is never lost.
+///
+/// ## Failure-soft (never both windows dead / share torn down)
+/// - Popup blocked (`open` → null): keep the PiP and best-effort resize it to the
+///   available box (the pre-#1821 behaviour) + a warn.
+/// - Popup opens but its DOM/mirror can't be built (unreachable for a fresh
+///   same-origin blank popup): close the popup, keep the PiP.
+/// - Source canvas gone: close the popup, keep the PiP.
+fn migrate_pip_to_maximized_popup(doc: &Document, peer: &str, display_name: &str) {
+    // The PiP window holds the click's transient activation (see doc).
+    let Some(pip_win) = doc.default_view() else {
+        return;
+    };
+
+    // Maximized-window geometry = the full available display box.
+    let (avail_w, avail_h) = available_screen(&pip_win);
+    let (avail_left, avail_top) = available_origin(&pip_win);
+    let features = maximized_popup_features(avail_left, avail_top, avail_w, avail_h);
+
+    let popup = match pip_win.open_with_url_and_target_and_features("", "_blank", &features) {
+        Ok(Some(p)) => p,
+        _ => {
+            // Popup blocked → keep the PiP; best-effort resize-to-available (the
+            // pre-#1821 behaviour) so Maximize still does something. The UA may
+            // clamp this, which is exactly why the popup migration exists.
+            let _ = pip_win.move_to(avail_left, avail_top);
+            let _ = pip_win.resize_to(avail_w, avail_h);
+            // Issue #1821 (UX A1): tell the user WHY nothing new opened — a silent
+            // resize looks like a no-op. The PiP stays up, so the feedback lives in
+            // its document.
+            signal_popup_blocked(doc);
+            log::warn!(
+                "issue 1821: maximize popup was blocked; kept the PiP window and resized it \
+                 to the available display"
+            );
+            return;
+        }
+    };
+    // Issue #1821 (UX A2): explicitly foreground the popup (best-effort) — the PiP
+    // that currently holds focus is about to close, so nudge the OS to raise the
+    // new maximized window.
+    let _ = popup.focus();
+
+    // Re-fetch the source canvas from the MAIN window: it stays mounted + painting
+    // there (the detached windows only ever MIRROR it), so its fresh
+    // `capture_stream()` is independent of the retiring PiP's mirror. Do this BEFORE
+    // touching the current state so a missing source aborts with the PiP still up.
+    let source = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(&zoom::screen_canvas_id(peer)))
+        .and_then(|e| e.dyn_into::<HtmlCanvasElement>().ok());
+    let Some(source) = source else {
+        let _ = popup.close();
+        log::warn!(
+            "issue 1821: source canvas gone; cannot migrate to a maximized popup, keeping the \
+             PiP window"
+        );
+        return;
+    };
+
+    // Build the popup's DOM + mirror FIRST (via_pip=false → its Maximize becomes a
+    // real fullscreen toggle). If this fails, keep the PiP intact.
+    let Some((pdoc, pvideo, pmirror, show_metrics)) =
+        build_and_start_mirror(&popup, display_name, &source, false)
+    else {
+        let _ = popup.close();
+        log::warn!("issue 1821: could not build the maximized popup DOM; keeping the PiP window");
+        return;
+    };
+
+    // Commit. Take the current (PiP) state, move its reattach callback to the popup
+    // (leaving a no-op so the retired state can't reattach), close the PiP, and park
+    // it in RETIRED. Its parked `pagehide`/poll closures carry the OLD session, so
+    // the session guard makes any teardown they schedule a no-op against the fresh
+    // popup session installed below.
+    let Some(mut old) = DETACH.with(|d| d.borrow_mut().take()) else {
+        // No current state (shouldn't happen from inside its own handler): the popup
+        // we just built has no owner → stop its freshly-captured track and close it
+        // so nothing strands.
+        pmirror.stop();
+        let _ = popup.close();
+        return;
+    };
+    let on_reattach = std::mem::replace(&mut old.on_reattach, Box::new(|| {}));
+    if let Some(id) = old.close_poll_id.take() {
+        old.win.clear_interval_with_handle(id);
+    }
+    if let Some(id) = old.metrics_poll_id.take() {
+        old.win.clear_interval_with_handle(id);
+    }
+    let _ = old.win.close();
+    old.mirror.stop();
+    RETIRED.with(|r| {
+        let mut v = r.borrow_mut();
+        v.clear();
+        v.push(old);
     });
 
-    // Sync aria-pressed + label whenever fullscreen changes (button click OR the
-    // native Escape exit), so the control's state never drifts from reality.
-    let doc_fs = doc.clone();
-    let fs_cb = Closure::<dyn FnMut()>::new(move || {
-        let is_fs = doc_fs.fullscreen_element().is_some();
-        if let Some(btn) = doc_fs.get_element_by_id(MAXIMIZE_BTN_ID) {
-            let _ = btn.set_attribute("aria-pressed", if is_fs { "true" } else { "false" });
-            let label = if is_fs {
-                "Exit full screen (Escape)"
-            } else {
-                "Enter full screen (Escape to exit)"
-            };
-            let _ = btn.set_attribute("aria-label", label);
-            let _ = btn.set_attribute("title", label);
-        }
-    });
-    let _ =
-        doc.add_event_listener_with_callback("fullscreenchange", fs_cb.as_ref().unchecked_ref());
-    listeners.push(ListenerHandle {
-        _closure: ClosureKind::Plain(fs_cb),
-    });
+    install_detached(
+        popup,
+        pdoc,
+        pvideo,
+        pmirror,
+        peer,
+        display_name,
+        false,
+        show_metrics,
+        on_reattach,
+    );
+    log::info!("detached content migrated to maximized popup (issue 1821)");
 }
 
 /// Wire the detached stats overlay: resolution from the video `resize` event
@@ -1511,6 +1794,10 @@ pub fn teardown(peer: &str) {
     let Some(mut state) = state else {
         return;
     };
+    // Issue #1821: drop any PiP retired during a Maximize→popup migration. By now
+    // it is long closed (its mirror stopped, intervals cleared), so dropping its
+    // parked listeners is safe.
+    RETIRED.with(|r| r.borrow_mut().clear());
     if let Some(id) = state.close_poll_id.take() {
         state.win.clear_interval_with_handle(id);
     }
@@ -1577,4 +1864,11 @@ detached popup is a separate document; app :root tokens unavailable. */\
 .ss-detached-metrics{position:absolute;left:8px;bottom:8px;z-index:3;\
 pointer-events:none;font:11px ui-monospace,Menlo,Consolas,monospace;\
 font-variant-numeric:tabular-nums;color:#e8eaed;background:rgba(0,0,0,0.55);\
-padding:2px 6px;border-radius:4px;}";
+padding:2px 6px;border-radius:4px;}\
+/* issue 1821 (UX A1): transient popup-blocked toast, bottom-center. @token-exempt: \
+detached popup is a separate document; app :root tokens unavailable. */\
+.ss-detached-toast{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);\
+z-index:10;max-width:90%;box-sizing:border-box;background:rgba(20,22,26,0.95);\
+color:#e8eaed;border:1px solid rgba(255,255,255,0.18);border-radius:8px;\
+padding:8px 14px;font-size:13px;line-height:1.3;text-align:center;\
+box-shadow:0 4px 16px rgba(0,0,0,0.4);pointer-events:none;}";

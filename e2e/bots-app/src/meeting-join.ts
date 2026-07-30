@@ -38,7 +38,7 @@ export type JoinMode = "start" | "join" | "unknown";
  * Chrome.
  */
 export async function detectJoinMode(joinButton: Locator): Promise<JoinMode> {
-  const text = await joinButton.innerText().catch(() => "");
+  const text = await joinButton.innerText({ timeout: 5_000 }).catch(() => "");
   return classifyJoinModeText(text);
 }
 
@@ -179,6 +179,10 @@ export async function joinMeetingAndEnableMedia(args: {
   // duration of the join flow.
   const meetingPathPrefix = `/meeting/${meetingId}`;
   let navigatedAway = false;
+  let resolveNavigatedAway!: () => void;
+  const navigatedAwayPromise = new Promise<void>((resolve) => {
+    resolveNavigatedAway = resolve;
+  });
   const onFrameNavigated = (frame: { parentFrame: () => unknown; url: () => string }): void => {
     // Top frame only.
     if (frame.parentFrame() !== null) return;
@@ -192,108 +196,23 @@ export async function joinMeetingAndEnableMedia(args: {
     // meeting path altogether.
     if (!pathname.startsWith(meetingPathPrefix)) {
       navigatedAway = true;
+      resolveNavigatedAway();
     }
   };
   page.on("framenavigated", onFrameNavigated);
 
   try {
-    const landed = await Promise.race([
-      homepageMeetingInput
-        .waitFor({ timeout: 15_000 })
-        .then(() => "homepage-form" as const)
-        .catch(() => null),
-      meetingPageDisplayNameInput
-        .waitFor({ timeout: 15_000 })
-        .then(() => "meeting-name-prompt" as const)
-        .catch(() => null),
-      joinButton
-        .waitFor({ timeout: 15_000 })
-        .then(() => "join-button" as const)
-        .catch(() => null),
-      grid
-        .waitFor({ timeout: 15_000 })
-        .then(() => "in-meeting" as const)
-        .catch(() => null),
-    ]);
-
-    throwIfNavigatedAway(navigatedAway, participant);
-
-    if (landed === "homepage-form") {
-      console.log(`[${participant}] homepage form detected — filling`);
-      const homepageUsernameInput = page.locator("#username");
-      await homepageMeetingInput.click();
-      await homepageMeetingInput.pressSequentially(meetingId, { delay: 30 });
-      await homepageUsernameInput.click();
-      await homepageUsernameInput.fill("");
-      await homepageUsernameInput.pressSequentially(displayName, { delay: 30 });
-      await page.waitForTimeout(300);
-      await homepageUsernameInput.press("Enter");
-    } else if (landed === "meeting-name-prompt") {
-      console.log(`[${participant}] meeting-page display-name prompt detected — filling`);
-      await meetingPageDisplayNameInput.click();
-      await meetingPageDisplayNameInput.fill("");
-      await meetingPageDisplayNameInput.pressSequentially(displayName, { delay: 30 });
-      await page.waitForTimeout(300);
-    }
-
-    throwIfNavigatedAway(navigatedAway, participant);
-
-    // Detect whether the bot is about to click "Start Meeting" (bot is
-    // the meeting owner — Waiting Room toggle is visible and defaults
-    // ON) or "Join Meeting" (joining an existing meeting — no toggle).
-    // The detection is done once here, BEFORE the click, so the log
-    // explicitly records which path the bot took. In Start mode we
-    // also verify (and if necessary flip) the Waiting Room toggle to
-    // OFF — leaving it ON would strand every subsequent peer (human or
-    // bot) because the bot has no admit logic.
-    //
-    // `mode` is "unknown" when the matched button's label doesn't
-    // match either canonical string — almost certainly a future
-    // relabel. The bot still clicks the button (legacy behaviour) so
-    // a label rename doesn't immediately strand the bot; it just
-    // skips the Waiting Room verification because the toggle's
-    // presence is correlated with the Start label.
-    let mode: JoinMode = "unknown";
-    if (await joinButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
-      mode = await detectJoinMode(joinButton);
-      if (mode === "start") {
-        console.log(
-          `[${participant}] detected mode: Start Meeting (bot is meeting owner — verifying Waiting Room is OFF before starting)`,
-        );
-        await ensureWaitingRoomOff(page, participant);
-      } else if (mode === "join") {
-        console.log(`[${participant}] detected mode: Join Meeting (joining existing meeting)`);
-      } else {
-        console.log(
-          `[${participant}] detected mode: unknown — falling back to clicking the matched button as-is`,
-        );
-      }
-    }
-
-    throwIfNavigatedAway(navigatedAway, participant);
-
-    // Either we just filled a display name (which arms the Join button)
-    // or we landed straight on a Join button. Click it if present, then
-    // race the grid against a re-appearance of the (enabled) Join
-    // button — if the button comes back, the previous click was a
-    // no-op (the button was still disabled, the click landed off-target,
-    // or the connection failed mid-attempt). Cap retries at 3.
-    //
-    // The race also includes the three non-grid terminal states surfaced
-    // by `dioxus-ui/src/pages/meeting.rs`:
-    //   - `[data-testid="meeting-waiting-room"]`     (Waiting — Waiting Room ON)
-    //   - `[data-testid="meeting-waiting-for-host"]` (WaitingForMeeting — host hasn't started)
-    //   - `[data-testid="meeting-rejected"]`         (Rejected — host denied)
-    //   - `[data-testid="meeting-error"]`            (Error — server-side join failure)
-    // Detection short-circuits the retry loop with a typed error so the
-    // orchestrator can report the right thing.
-    await joinWithRetries({
+    await driveJoinStateMachine({
       page,
       participant,
+      displayName,
+      meetingId,
+      homepageMeetingInput,
+      meetingPageDisplayNameInput,
       joinButton,
       grid,
-      mode,
       isNavigatedAway: () => navigatedAway,
+      navigatedAwayPromise,
     });
 
     throwIfNavigatedAway(navigatedAway, participant);
@@ -325,7 +244,7 @@ export async function joinMeetingAndEnableMedia(args: {
     // The action bar auto-hides by default; hover it so the buttons are
     // visible to Playwright's isVisible check.
     const controlsContainer = page.locator(".video-controls-container").first();
-    await controlsContainer.hover().catch(() => {
+    await controlsContainer.hover({ timeout: 5_000 }).catch(() => {
       // Fine — some layouts may not need the hover.
     });
     await page.waitForTimeout(200);
@@ -406,7 +325,7 @@ export async function ensureWaitingRoomOff(page: Page, participant: string): Pro
   }
 
   try {
-    const current = await toggle.getAttribute("aria-checked");
+    const current = await toggle.getAttribute("aria-checked", { timeout: 2_000 });
     if (current === "false") {
       console.log(`[${participant}] Waiting Room is already OFF`);
       return;
@@ -449,49 +368,6 @@ export const MEETING_STATE_SELECTORS = {
 } as const;
 
 type RaceOutcome = "grid" | "waiting-room" | "waiting-for-host" | "rejected" | "error";
-
-/**
- * Build a `Promise.race` that resolves with the first of the five
- * post-join terminal-or-success screens to become visible. Resolves
- * `null` if none appear before `timeout`.
- *
- * Note: each child `.waitFor` swallows its own timeout via `.catch`. The
- * outer race resolves with the first non-null value; if all four
- * children resolve to `null` the race itself resolves to `null`
- * (Promise.race + uniformly-resolving promises ⇒ first-to-resolve wins).
- */
-async function raceJoinOutcome(args: {
-  grid: Locator;
-  waitingRoom: Locator;
-  waitingForHost: Locator;
-  rejected: Locator;
-  errorScreen: Locator;
-  timeout: number;
-}): Promise<RaceOutcome | null> {
-  const { grid, waitingRoom, waitingForHost, rejected, errorScreen, timeout } = args;
-  return await Promise.race<RaceOutcome | null>([
-    grid
-      .waitFor({ timeout })
-      .then(() => "grid" as const)
-      .catch(() => null),
-    waitingRoom
-      .waitFor({ timeout })
-      .then(() => "waiting-room" as const)
-      .catch(() => null),
-    waitingForHost
-      .waitFor({ timeout })
-      .then(() => "waiting-for-host" as const)
-      .catch(() => null),
-    rejected
-      .waitFor({ timeout })
-      .then(() => "rejected" as const)
-      .catch(() => null),
-    errorScreen
-      .waitFor({ timeout })
-      .then(() => "error" as const)
-      .catch(() => null),
-  ]);
-}
 
 /**
  * Read the visible error text from the `[data-testid="meeting-error"]`
@@ -554,7 +430,7 @@ const CLICK_DIAGNOSTICS_CAP = 20;
 
 /**
  * Per-attempt diagnostic bag, filled by `installClickDiagnostics` for
- * the duration of a single click + wait iteration in `joinWithRetries`.
+ * the duration of a single click + wait iteration in the join state machine.
  * Emitted via `logPostClickDiagnostics` only when the attempt fails
  * (button reappeared) — successful joins stay quiet.
  */
@@ -655,8 +531,8 @@ export function installClickDiagnostics(page: Page): {
  * rejected the join" pattern operators need to pivot away from "the
  * bot is broken" debugging.
  *
- * Exported for the unit tests; in production this is called from
- * `joinWithRetries` after a `button-reappeared` outcome.
+ * Exported for the unit tests; in production this is called after a
+ * timed-out attempt or a real hide-then-reappear button transition.
  */
 export function logPostClickDiagnostics(
   participant: string,
@@ -704,365 +580,327 @@ export function logPostClickDiagnostics(
 }
 
 /**
- * Phase-A race outcome: either the click was *not* consumed (button
- * stayed visible the full timeout — caller retries) or it was consumed
- * (`button-hidden`), in which case the caller runs Phase B. The four
- * non-grid terminal screens + `grid` short-circuit the loop entirely.
+ * One bounded state machine drives every pre-grid state. Each attempt
+ * gets the existing 45-second budget; a consumed click arms the button
+ * branch only for a real hide-then-reappear transition.
  */
-type PhaseAOutcome = RaceOutcome | "button-hidden";
+type JoinState =
+  | RaceOutcome
+  | "homepage-form"
+  | "display-name-prompt"
+  | "join-button"
+  | "navigated-away";
+
+const JOIN_ACTION_TIMEOUT_MS = 5_000;
+const JOIN_ATTEMPTS = 3;
+const JOIN_ATTEMPT_TIMEOUT_MS = 45_000;
+
+// Exported for unit testing the #865 gate (see meeting-join.test.ts).
+export async function waitForJoinButton(
+  joinButton: Locator,
+  homepageMeetingInput: Locator,
+  displayNameInput: Locator,
+  timeout: number,
+  requireReappearance: boolean,
+  blockWhileFormsPresent: boolean,
+): Promise<void> {
+  const startedAt = Date.now();
+  if (blockWhileFormsPresent) {
+    await homepageMeetingInput.waitFor({ state: "hidden", timeout });
+    const afterHomepage = Math.max(1, timeout - (Date.now() - startedAt));
+    await displayNameInput.waitFor({ state: "hidden", timeout: afterHomepage });
+  }
+  const remaining = Math.max(1, timeout - (Date.now() - startedAt));
+  if (!requireReappearance) {
+    await joinButton.waitFor({ state: "visible", timeout: remaining });
+    return;
+  }
+
+  await joinButton.waitFor({ state: "hidden", timeout: remaining });
+  const afterHidden = Math.max(1, timeout - (Date.now() - startedAt));
+  await joinButton.waitFor({ state: "visible", timeout: afterHidden });
+}
 
 /**
- * Phase-B race outcome: the click WAS consumed in Phase A; we now wait
- * for one of the five post-join screens or for the button to reappear
- * (genuine retry signal — UI rolled back the click).
+ * Race every mutually-exclusive page state that can advance or finish
+ * the join flow. The prompt arm is listed before the button arm because
+ * the prompt's submit button also matches the enabled Join locator.
  */
-type PhaseBOutcome = RaceOutcome | "button-reappeared";
-
-/**
- * Race Phase A: wait for any post-join terminal/success screen, OR for
- * the click to be visibly consumed by the page (the join button goes
- * from visible to hidden / detached). Resolves to `null` if NONE of the
- * conditions resolve within `timeout` — that's the "click did not
- * transition the page" signal which used to be silently mis-detected as
- * "button-reappeared" before this fix.
- *
- * IMPORTANT: this races `joinButton.waitFor({state: "hidden"})`, not
- * `state: "visible"`. The previous implementation raced
- * `state: "visible"` against a locator that was *already* visible (the
- * just-clicked button); Playwright resolves "already in target state"
- * immediately, which collapsed the entire 45s budget to ~80ms.
- *
- * Exported so the unit tests can drive it with mocked locators.
- */
-export async function racePhaseAClickConsumed(args: {
+async function raceJoinState(args: {
+  homepageMeetingInput: Locator;
+  displayNameInput: Locator;
   joinButton: Locator;
   grid: Locator;
   waitingRoom: Locator;
   waitingForHost: Locator;
   rejected: Locator;
   errorScreen: Locator;
+  navigatedAwayPromise: Promise<void>;
+  includePrompt: boolean;
+  requireButtonReappearance: boolean;
   timeout: number;
-}): Promise<PhaseAOutcome | null> {
-  const { joinButton, grid, waitingRoom, waitingForHost, rejected, errorScreen, timeout } = args;
-  return await Promise.race<PhaseAOutcome | null>([
+}): Promise<JoinState | null> {
+  const {
+    homepageMeetingInput,
+    displayNameInput,
+    joinButton,
+    grid,
+    waitingRoom,
+    waitingForHost,
+    rejected,
+    errorScreen,
+    navigatedAwayPromise,
+    includePrompt,
+    requireButtonReappearance,
+    timeout,
+  } = args;
+  const waits: Array<Promise<JoinState | null>> = [
     grid
-      .waitFor({ timeout })
+      .waitFor({ state: "visible", timeout })
       .then(() => "grid" as const)
       .catch(() => null),
     waitingRoom
-      .waitFor({ timeout })
+      .waitFor({ state: "visible", timeout })
       .then(() => "waiting-room" as const)
       .catch(() => null),
     waitingForHost
-      .waitFor({ timeout })
+      .waitFor({ state: "visible", timeout })
       .then(() => "waiting-for-host" as const)
       .catch(() => null),
     rejected
-      .waitFor({ timeout })
+      .waitFor({ state: "visible", timeout })
       .then(() => "rejected" as const)
       .catch(() => null),
     errorScreen
-      .waitFor({ timeout })
+      .waitFor({ state: "visible", timeout })
       .then(() => "error" as const)
       .catch(() => null),
-    // CORRECT: wait for the button to go HIDDEN / detached, not for it
-    // to "still be visible". The latter form (`state: "visible"`) was
-    // the bug we're fixing — Playwright treats an already-visible
-    // locator as success and resolves immediately, defeating the whole
-    // race.
-    joinButton
-      .waitFor({ timeout, state: "hidden" })
-      .then(() => "button-hidden" as const)
+    homepageMeetingInput
+      .waitFor({ state: "visible", timeout })
+      .then(() => "homepage-form" as const)
       .catch(() => null),
-  ]);
+    navigatedAwayPromise.then(() => "navigated-away" as const),
+  ];
+  if (includePrompt) {
+    waits.push(
+      displayNameInput
+        .waitFor({ state: "visible", timeout })
+        .then(() => "display-name-prompt" as const)
+        .catch(() => null),
+    );
+  }
+  waits.push(
+    waitForJoinButton(
+      joinButton,
+      homepageMeetingInput,
+      displayNameInput,
+      timeout,
+      requireButtonReappearance,
+      includePrompt,
+    )
+      .then(() => "join-button" as const)
+      .catch(() => null),
+  );
+  return await Promise.race(waits);
 }
 
-/**
- * Race Phase B: the click was already consumed (Phase A saw the button
- * go hidden). We now wait for one of the five post-join screens OR for
- * the button to *reappear* — the UI rolled back the click (e.g. a
- * transient connection error flipped the pre-join card back on).
- *
- * Resolves to `null` if nothing resolves within `timeout` — "click was
- * consumed but no grid/waiting/error state followed", which is the
- * unusual-but-distinct failure mode caller surfaces with a dedicated
- * error message.
- *
- * Exported so the unit tests can drive it with mocked locators.
- */
-export async function racePhaseBPostClick(args: {
-  joinButton: Locator;
-  grid: Locator;
-  waitingRoom: Locator;
-  waitingForHost: Locator;
-  rejected: Locator;
-  errorScreen: Locator;
-  timeout: number;
-}): Promise<PhaseBOutcome | null> {
-  const { joinButton, grid, waitingRoom, waitingForHost, rejected, errorScreen, timeout } = args;
-  return await Promise.race<PhaseBOutcome | null>([
-    grid
-      .waitFor({ timeout })
-      .then(() => "grid" as const)
-      .catch(() => null),
-    waitingRoom
-      .waitFor({ timeout })
-      .then(() => "waiting-room" as const)
-      .catch(() => null),
-    waitingForHost
-      .waitFor({ timeout })
-      .then(() => "waiting-for-host" as const)
-      .catch(() => null),
-    rejected
-      .waitFor({ timeout })
-      .then(() => "rejected" as const)
-      .catch(() => null),
-    errorScreen
-      .waitFor({ timeout })
-      .then(() => "error" as const)
-      .catch(() => null),
-    joinButton
-      .waitFor({ timeout, state: "visible" })
-      .then(() => "button-reappeared" as const)
-      .catch(() => null),
-  ]);
+function isTransientJoinActionError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.name === "TimeoutError" ||
+    /timeout|timed out|detached|not attached|element is not attached/i.test(error.message)
+  );
 }
 
-/**
- * Click the (enabled) Join button up to `maxAttempts` times. Per
- * attempt, run a two-phase wait so the helper can correctly distinguish
- * "click did nothing" from "click went through but the UI rolled back".
- *
- * **Phase A (click-consumption check).** After the click, race for:
- *   - one of the five post-join terminal/success screens
- *     (`grid`, `waiting-room`, `waiting-for-host`, `rejected`, `error`),
- *     OR
- *   - the join button going hidden / detached.
- * Times out at `perAttemptGridTimeout` (45s). If Phase A times out with
- * the button still visible, the click was a no-op — we retry.
- *
- * **Phase B (button-reappearance check).** Only runs when Phase A
- * resolved with `button-hidden` (the click DID transition the page).
- * Race for the same five post-join screens against a re-appearance of
- * the (enabled) join button. Reappearance ⇒ the UI rolled back the
- * click; we retry. Any of the four non-grid terminal screens short-
- * circuits with a typed error.
- *
- * The grid wait per-attempt is 45s — the netsim'd `lossy_mobile`
- * profile regularly takes 20-35s to bring the WebTransport stream up.
- *
- * On retry-trigger outcomes (`button-reappeared` and the
- * `click-not-consumed` Phase-A timeout) the per-attempt diagnostic
- * recorder (`installClickDiagnostics` / `logPostClickDiagnostics`) emits
- * a structured block of captured console errors, failed requests, and
- * the URL diff so operators can see WHY the click didn't transition
- * (commonly: a meeting-api 4xx response). Diagnostics fire ONLY on
- * retry triggers; successful joins stay quiet.
- *
- * Background: the v1.7.2 implementation raced
- * `joinButton.waitFor({state: "visible"})` against a locator that was
- * already visible (the just-clicked button). Playwright resolves
- * "already in target state" immediately, so the race collapsed to
- * ~80ms per attempt and the helper triple-retried in under 250ms total.
- * The two-phase wait above fixes that by checking for the button going
- * HIDDEN as the click-consumption signal, then separately watching for
- * a hide→reappear cycle as the genuine retry signal.
- */
-async function joinWithRetries(args: {
+async function fillHomepageForm(args: {
+  page: Page;
+  meetingInput: Locator;
+  meetingId: string;
+  displayName: string;
+}): Promise<void> {
+  const { page, meetingInput, meetingId, displayName } = args;
+  const usernameInput = page.locator("#username");
+  await meetingInput.click({ timeout: JOIN_ACTION_TIMEOUT_MS });
+  await meetingInput.pressSequentially(meetingId, {
+    delay: 30,
+    timeout: JOIN_ACTION_TIMEOUT_MS,
+  });
+  await usernameInput.click({ timeout: JOIN_ACTION_TIMEOUT_MS });
+  await usernameInput.fill("", { timeout: JOIN_ACTION_TIMEOUT_MS });
+  await usernameInput.pressSequentially(displayName, {
+    delay: 30,
+    timeout: JOIN_ACTION_TIMEOUT_MS,
+  });
+  await page.waitForTimeout(300);
+  await usernameInput.press("Enter", { timeout: JOIN_ACTION_TIMEOUT_MS });
+}
+
+async function fillMeetingDisplayName(input: Locator, displayName: string): Promise<void> {
+  await input.click({ timeout: JOIN_ACTION_TIMEOUT_MS });
+  await input.fill("", { timeout: JOIN_ACTION_TIMEOUT_MS });
+  await input.pressSequentially(displayName, {
+    delay: 30,
+    timeout: JOIN_ACTION_TIMEOUT_MS,
+  });
+}
+
+async function driveJoinStateMachine(args: {
   page: Page;
   participant: string;
+  displayName: string;
+  meetingId: string;
+  homepageMeetingInput: Locator;
+  meetingPageDisplayNameInput: Locator;
   joinButton: Locator;
   grid: Locator;
-  mode: JoinMode;
   isNavigatedAway: () => boolean;
+  navigatedAwayPromise: Promise<void>;
 }): Promise<void> {
-  const { page, participant, joinButton, grid, mode, isNavigatedAway } = args;
-  const maxAttempts = 3;
-  const perAttemptGridTimeout = 45_000;
-
+  const {
+    page,
+    participant,
+    displayName,
+    meetingId,
+    homepageMeetingInput,
+    meetingPageDisplayNameInput,
+    joinButton,
+    grid,
+    isNavigatedAway,
+    navigatedAwayPromise,
+  } = args;
   const waitingRoom = page.locator(MEETING_STATE_SELECTORS.waitingRoom).first();
   const waitingForHost = page.locator(MEETING_STATE_SELECTORS.waitingForHost).first();
   const rejected = page.locator(MEETING_STATE_SELECTORS.rejected).first();
   const errorScreen = page.locator(MEETING_STATE_SELECTORS.error).first();
+  let waitingRoomVerified = false;
+  let lastFailure = "grid did not become visible";
 
-  // The Waiting Room toggle is verified once, BEFORE this loop (see
-  // the caller in `joinMeetingAndEnableMedia`). On retries 2 + 3 the
-  // bot is still in the Start Meeting flow, but the meeting page may
-  // already have transitioned past the pre-join card — re-checking
-  // the toggle would either no-op silently or hit the disabled
-  // post-card state. Track the flag here so future refactors that
-  // move verification inside the loop short-circuit cleanly and so
-  // the log makes the skip explicit for "start" mode.
-  const waitingRoomVerified = mode === "start";
+  for (let attempt = 1; attempt <= JOIN_ATTEMPTS; attempt++) {
+    const deadline = Date.now() + JOIN_ATTEMPT_TIMEOUT_MS;
+    let includePrompt = true;
+    let requireButtonReappearance = false;
+    let diagnostics: ReturnType<typeof installClickDiagnostics> | null = null;
+    let logDiagnostics = false;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (isNavigatedAway()) return; // surfaced by caller's throwIfNavigatedAway
-
-    // Fast-path: if any of the five post-join screens is already up,
-    // resolve immediately without burning the per-attempt budget.
-    const earlyOutcome = await raceJoinOutcome({
-      grid,
-      waitingRoom,
-      waitingForHost,
-      rejected,
-      errorScreen,
-      timeout: 200,
-    });
-    if (earlyOutcome === "grid") return;
-    if (earlyOutcome !== null) {
-      await throwForOutcome(earlyOutcome, participant, page);
-    }
-
-    const sawEnabledButton = await joinButton.isVisible({ timeout: 5_000 }).catch(() => false);
-    if (!sawEnabledButton) {
-      // No enabled join button on screen. Could mean: (a) the click
-      // already consumed the form and we're waiting for the grid, or
-      // (b) only the disabled variant is showing. Log + fall through
-      // to the multi-state race — if no screen shows, throw the
-      // pre-existing "grid did not become visible" error so the
-      // outer behaviour is preserved.
-      if (attempt === 1) {
-        console.log(`[${participant}] join button not enabled yet, waiting for grid`);
-      } else {
-        console.log(
-          `[${participant}] retrying join click (attempt ${attempt}) — no enabled button visible`,
-        );
-      }
-      const noClickOutcome = await raceJoinOutcome({
-        grid,
-        waitingRoom,
-        waitingForHost,
-        rejected,
-        errorScreen,
-        timeout: perAttemptGridTimeout,
-      });
-      if (noClickOutcome === "grid") return;
-      if (noClickOutcome !== null) {
-        await throwForOutcome(noClickOutcome, participant, page);
-      }
-      if (attempt === maxAttempts) throw new Error("grid did not become visible after join click");
-      continue;
-    }
-
-    if (attempt === 1) {
-      // Log the button label that's actually being clicked so the
-      // operator can tell from the log which mode the bot saw. Falls
-      // back to "Join Meeting" when the detection was inconclusive
-      // (preserves the legacy log shape for the unknown-label path).
-      const label =
-        mode === "start" ? "Start Meeting" : mode === "join" ? "Join Meeting" : "Join Meeting";
-      console.log(`[${participant}] clicking ${label}`);
-    } else {
-      if (mode === "start" && waitingRoomVerified) {
-        console.log(`[${participant}] Waiting Room already verified — skipping on retry`);
-      }
-      console.log(`[${participant}] retrying join click (attempt ${attempt})`);
-    }
-    // Install the per-attempt diagnostic recorder BEFORE the click so
-    // any `console.error` / `requestfailed` / >=400 response between
-    // here and the race outcome is captured. Teardown in `finally` so
-    // listeners never leak across attempts.
-    const { diag, teardown } = installClickDiagnostics(page);
     try {
-      // Playwright's auto-waiting + actionability checks effectively
-      // cover "stable" — the locator already has `:not([disabled])` and
-      // Playwright waits for the element to be stable before clicking.
-      try {
-        await joinButton.click({ timeout: 5_000 });
-      } catch (e) {
-        console.warn(`[${participant}] join-click warning:`, (e as Error).message);
-      }
+      while (Date.now() < deadline) {
+        throwIfNavigatedAway(isNavigatedAway(), participant);
+        const state = await raceJoinState({
+          homepageMeetingInput,
+          displayNameInput: meetingPageDisplayNameInput,
+          joinButton,
+          grid,
+          waitingRoom,
+          waitingForHost,
+          rejected,
+          errorScreen,
+          navigatedAwayPromise,
+          includePrompt,
+          requireButtonReappearance,
+          timeout: Math.max(1, deadline - Date.now()),
+        });
 
-      // ── Phase A: click-consumption check ────────────────────────────
-      // Race the five post-join screens against the button going
-      // HIDDEN. If Phase A times out with the button still visible the
-      // click was a no-op — diagnostics + retry.
-      const phaseA = await racePhaseAClickConsumed({
-        joinButton,
-        grid,
-        waitingRoom,
-        waitingForHost,
-        rejected,
-        errorScreen,
-        timeout: perAttemptGridTimeout,
-      });
+        if (state === "grid") return;
+        if (state === "navigated-away") {
+          throwIfNavigatedAway(true, participant);
+        }
+        if (
+          state === "waiting-room" ||
+          state === "waiting-for-host" ||
+          state === "rejected" ||
+          state === "error"
+        ) {
+          await throwForOutcome(state, participant, page);
+        }
+        if (state === null) {
+          lastFailure = `no join state reached within ${JOIN_ATTEMPT_TIMEOUT_MS}ms`;
+          logDiagnostics = diagnostics !== null;
+          break;
+        }
 
-      if (phaseA === null) {
-        // 45s elapsed, button still visible, no terminal state
-        // reached. Click did nothing. This is the bug-fix path: the
-        // v1.7.2 implementation would have resolved in ~80ms here via
-        // the broken `state: "visible"` race and triple-retried in
-        // under 250ms total. Now we genuinely waited the full budget.
-        logPostClickDiagnostics(participant, attempt, diag, page.url());
-        if (attempt === maxAttempts) {
-          throw new Error(
-            `click did not transition the page after ${maxAttempts} attempts of ${perAttemptGridTimeout}ms each — see captured diagnostics`,
+        if (state === "homepage-form") {
+          console.log(`[${participant}] homepage form detected — filling`);
+          try {
+            await fillHomepageForm({
+              page,
+              meetingInput: homepageMeetingInput,
+              meetingId,
+              displayName,
+            });
+          } catch (error) {
+            if (!isTransientJoinActionError(error)) throw error;
+            console.warn(
+              `[${participant}] homepage form advanced during input; re-checking join state`,
+            );
+          }
+          continue;
+        }
+
+        if (state === "display-name-prompt") {
+          console.log(`[${participant}] meeting-page display-name prompt detected — filling`);
+          try {
+            await fillMeetingDisplayName(meetingPageDisplayNameInput, displayName);
+            includePrompt = false;
+          } catch (error) {
+            if (!isTransientJoinActionError(error)) throw error;
+            console.warn(
+              `[${participant}] display-name prompt advanced during input; re-checking join state`,
+            );
+          }
+          continue;
+        }
+
+        if (requireButtonReappearance) {
+          lastFailure = "join button reappeared after the click";
+          logDiagnostics = diagnostics !== null;
+          break;
+        }
+
+        const mode = await detectJoinMode(joinButton);
+        if (mode === "start" && !waitingRoomVerified) {
+          console.log(
+            `[${participant}] detected mode: Start Meeting (bot is meeting owner — verifying Waiting Room is OFF before starting)`,
+          );
+          await ensureWaitingRoomOff(page, participant);
+          waitingRoomVerified = true;
+        } else if (mode === "join") {
+          console.log(`[${participant}] detected mode: Join Meeting (joining existing meeting)`);
+        } else if (mode === "unknown") {
+          console.log(
+            `[${participant}] detected mode: unknown — falling back to clicking the matched button as-is`,
           );
         }
-        continue;
-      }
-      if (phaseA === "grid") {
-        console.log(`[${participant}] join click consumed`);
-        return;
-      }
-      if (phaseA !== "button-hidden") {
-        // Non-grid terminal outcome (waiting-room / waiting-for-host /
-        // rejected / error) — short-circuit with a typed error.
-        await throwForOutcome(phaseA, participant, page);
-      }
 
-      // ── Phase B: button-reappearance check ──────────────────────────
-      // Phase A saw the button go hidden. The click WAS consumed by the
-      // UI. Now race the five post-join screens against a re-appearance
-      // of the (enabled) join button. Reappearance ⇒ the UI rolled
-      // back — genuine retry signal.
-      const phaseB = await racePhaseBPostClick({
-        joinButton,
-        grid,
-        waitingRoom,
-        waitingForHost,
-        rejected,
-        errorScreen,
-        timeout: perAttemptGridTimeout,
-      });
-
-      if (phaseB === null) {
-        // Click was consumed but the page settled in a state that
-        // isn't any of the five screens we expect. Unusual; surface
-        // diagnostics + a dedicated error message so the operator
-        // can tell this apart from the "click did nothing" path.
-        logPostClickDiagnostics(participant, attempt, diag, page.url());
-        if (attempt === maxAttempts) {
-          throw new Error(
-            `click consumed but no grid/waiting/error state reached within ${perAttemptGridTimeout}ms — see diagnostics`,
+        console.log(
+          `[${participant}] ${attempt === 1 ? "clicking" : `attempt ${attempt}: clicking`} ${
+            mode === "start" ? "Start Meeting" : "Join Meeting"
+          }`,
+        );
+        diagnostics ??= installClickDiagnostics(page);
+        try {
+          await joinButton.click({ timeout: JOIN_ACTION_TIMEOUT_MS });
+          requireButtonReappearance = true;
+          includePrompt = false;
+        } catch (error) {
+          if (!isTransientJoinActionError(error)) throw error;
+          console.warn(
+            `[${participant}] join button advanced during click; re-checking join state`,
           );
         }
-        continue;
       }
-      if (phaseB === "grid") {
-        console.log(`[${participant}] join click consumed`);
-        return;
-      }
-      if (phaseB === "button-reappeared") {
-        // The actual scenario the v1.7.2 "button-reappeared" branch
-        // was trying to detect: a real hide-then-reappear cycle. Now
-        // it only fires when there's an actual transition + rollback.
-        logPostClickDiagnostics(participant, attempt, diag, page.url());
-        if (attempt === maxAttempts) {
-          throw new Error(
-            `join button reappeared after ${maxAttempts} click attempts — grid never became visible (see logs for captured console + network errors)`,
-          );
-        }
-        // Loop and retry. The retry log line fires at the top of the
-        // next iteration so the attempt number is consistent.
-        continue;
-      }
-      // Non-grid terminal outcome.
-      await throwForOutcome(phaseB, participant, page);
     } finally {
-      teardown();
+      if (diagnostics !== null) {
+        if (logDiagnostics) {
+          logPostClickDiagnostics(participant, attempt, diagnostics.diag, page.url());
+        }
+        diagnostics.teardown();
+      }
     }
   }
+
+  throw new Error(
+    `${lastFailure} after ${JOIN_ATTEMPTS} attempts of ${JOIN_ATTEMPT_TIMEOUT_MS}ms each`,
+  );
 }
 
 /**
@@ -1200,7 +1038,7 @@ export async function ensureDisplayNameInMeeting(args: {
   const rawText =
     (await selfRow
       .first()
-      .textContent()
+      .textContent({ timeout: 5_000 })
       .catch(() => null)) ?? "";
   // Strip indicator suffixes the row template appends — "(You)",
   // "(Host)", "(You/Host)", and "Guest" — so the comparison is on the
@@ -1241,11 +1079,11 @@ export async function ensureDisplayNameInMeeting(args: {
 
   try {
     await nameInput.waitFor({ state: "visible", timeout: 5_000 });
-    await nameInput.fill("");
-    await nameInput.pressSequentially(displayName, { delay: 30 });
+    await nameInput.fill("", { timeout: 5_000 });
+    await nameInput.pressSequentially(displayName, { delay: 30, timeout: 5_000 });
 
     await saveBtn.waitFor({ state: "visible", timeout: 5_000 });
-    await saveBtn.click();
+    await saveBtn.click({ timeout: 5_000 });
 
     // Verify the modal closed — the onsubmit handler in
     // `update_display_name_modal.rs:86-125` keeps the modal open and

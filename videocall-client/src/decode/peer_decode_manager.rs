@@ -601,16 +601,22 @@ const AUDIO_SEQ_RESET_REANCHOR_GAP: u64 = 1024;
 ///
 /// ## Known limitations
 ///
-/// 1. **Burst severity is under-reported; treat this as a PRESENCE signal, not a
-///    precise magnitude.** Loss is only declared when a skipped position shifts
-///    off the 64-slot reorder window, so a single contiguous forward gap can
-///    contribute at most ~64 to the count regardless of how many hundreds of
-///    consecutive datagrams were actually lost. A multi-second burst therefore
-///    reads as "nonzero, sustained" rather than its true magnitude. This is
-///    inherited verbatim from the video [`SequenceTracker`] window and is
-///    consistent by design — the goal is to make the previously-invisible
-///    datagram loss OBSERVABLE (nonzero when audio is dropping, ~0 otherwise),
-///    which the window delivers.
+/// 1. **Burst severity is under-reported by the CAPPED count; treat
+///    [`Self::loss_per_sec`] as a PRESENCE signal, not a precise magnitude.**
+///    Loss is only declared when a skipped position shifts off the 64-slot
+///    reorder window, so a single contiguous forward gap can contribute at most
+///    ~64 to the count regardless of how many hundreds of consecutive datagrams
+///    were actually lost. A multi-second burst therefore reads as "nonzero,
+///    sustained" rather than its true magnitude. This is inherited verbatim from
+///    the video [`SequenceTracker`] window and is consistent by design — the goal
+///    is to make the previously-invisible datagram loss OBSERVABLE (nonzero when
+///    audio is dropping, ~0 otherwise), which the window delivers. Issue 2031
+///    adds the MAGNITUDE companion [`Self::raw_loss_per_sec`], which sums the
+///    uncapped forward-gap sizes so the true burst size (e.g. 200) is recoverable
+///    alongside the presence signal; a large raw/capped ratio is the burst
+///    severity. The raw sum does NOT credit back later in-window reordering, so
+///    it can slightly over-report under genuine reordering — acceptable for a
+///    single-path datagram burst-loss magnitude.
 /// 2. **Audio simulcast (non-default `max_layers > 1`) can blind the tracker
 ///    across a layer switch.** Each simulcast layer carries its own dense
 ///    sequence, so a receive switch to a LAGGING audio layer is a BACKWARD jump.
@@ -641,11 +647,20 @@ struct AudioDatagramLossTracker {
     seen_bits: u64,
     /// Start of the current ~1s rate window (ms). 0 = not yet started.
     window_start_ms: u64,
-    /// Lost packets accumulated in the current window.
+    /// Lost packets accumulated in the current window (CAPPED at ~64 per
+    /// contiguous gap by the reorder window — a PRESENCE signal).
     window_lost: u32,
+    /// Issue 2031: RAW (uncapped) skipped-sequence sum accumulated in the current
+    /// window. Unlike [`Self::window_lost`], a single contiguous forward gap of N
+    /// missing sequence numbers contributes the full N here, so this carries the
+    /// burst MAGNITUDE the capped count saturates away.
+    window_raw_lost: u64,
     /// Most recently computed windowed loss rate (lost packets/sec). Stable
     /// between window rollovers.
     loss_per_sec: f64,
+    /// Issue 2031: most recently computed windowed RAW (uncapped) loss rate
+    /// (skipped sequences/sec). The magnitude companion to [`Self::loss_per_sec`].
+    raw_loss_per_sec: f64,
 }
 
 impl AudioDatagramLossTracker {
@@ -655,7 +670,9 @@ impl AudioDatagramLossTracker {
             seen_bits: 0,
             window_start_ms: 0,
             window_lost: 0,
+            window_raw_lost: 0,
             loss_per_sec: 0.0,
+            raw_loss_per_sec: 0.0,
         }
     }
 
@@ -674,16 +691,35 @@ impl AudioDatagramLossTracker {
                 self.seen_bits = 0;
             }
         }
+        // Issue 2031: accumulate the RAW (uncapped) forward gap for magnitude,
+        // BEFORE the shared reorder-window call advances `high_seq`. A forward
+        // jump from `high` to `seq` skipped `seq - high - 1` sequence numbers;
+        // summed un-truncated this reads the true burst size (e.g. 200) that the
+        // 64-slot window caps `window_lost` at. Only counted on a forward jump
+        // past the current high-water mark; after a re-anchor `high_seq` is None
+        // (fresh baseline) so this contributes 0, exactly like the capped count.
+        // Reordering within the window is NOT credited back here (see the
+        // "Burst severity" limitation note on the struct), so under genuine
+        // reordering this over-reports slightly — acceptable for a burst-loss
+        // magnitude signal on a single-path datagram flow.
+        if let Some(high) = self.high_seq {
+            if seq > high {
+                self.window_raw_lost = self.window_raw_lost.saturating_add(seq - high - 1);
+            }
+        }
         record_seq_into_reorder_window(&mut self.high_seq, &mut self.seen_bits, seq)
     }
 
-    /// Feed this window's newly-lost count and roll the ~1s rate window when it
-    /// expires. Returns `Some(loss_per_sec)` exactly on rollover (so the caller
-    /// throttles bus emission to ~1 Hz per peer), else `None`. Mirrors
+    /// Feed this window's newly-lost (capped) count and roll the ~1s rate window
+    /// when it expires. Returns `Some((loss_per_sec, raw_loss_per_sec))` exactly
+    /// on rollover (so the caller throttles bus emission to ~1 Hz per peer), else
+    /// `None`. The raw component (issue 2031) is normalised from the uncapped
+    /// `window_raw_lost` accumulated in [`Self::record_seq`], over the SAME
+    /// elapsed window, so the two rates are directly comparable. Mirrors
     /// [`SequenceTracker::observe_window`] (same 1000 ms window, same
     /// elapsed-normalised rate) minus the keyframe-request accounting audio
     /// does not have.
-    fn observe_window(&mut self, now: u64, new_lost: u32) -> Option<f64> {
+    fn observe_window(&mut self, now: u64, new_lost: u32) -> Option<(f64, f64)> {
         if self.window_start_ms == 0 {
             self.window_start_ms = now;
         }
@@ -697,17 +733,25 @@ impl AudioDatagramLossTracker {
             // `denom` is never zero.
             let denom = elapsed as f64;
             self.loss_per_sec = self.window_lost as f64 * 1000.0 / denom;
+            self.raw_loss_per_sec = self.window_raw_lost as f64 * 1000.0 / denom;
             self.window_lost = 0;
+            self.window_raw_lost = 0;
             self.window_start_ms = now;
-            return Some(self.loss_per_sec);
+            return Some((self.loss_per_sec, self.raw_loss_per_sec));
         }
         None
     }
 
-    /// Most recently computed windowed loss rate (lost audio packets/sec).
+    /// Most recently computed windowed loss rate (lost audio packets/sec, capped).
     #[cfg(test)]
     fn loss_per_sec(&self) -> f64 {
         self.loss_per_sec
+    }
+
+    /// Most recently computed windowed RAW (uncapped) loss rate (issue 2031).
+    #[cfg(test)]
+    fn raw_loss_per_sec(&self) -> f64 {
+        self.raw_loss_per_sec
     }
 }
 
@@ -822,6 +866,8 @@ pub struct Peer {
     /// is always decoded regardless so off-screen participants can still be
     /// heard.
     pub visible: bool,
+    /// Preserve the operator decode-and-drop choice when decoder workers reset.
+    skip_canvas_paint: bool,
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
@@ -1198,6 +1244,10 @@ impl Debug for Peer {
 }
 
 impl Peer {
+    // 8 args (was 7): #2068 threads `skip_canvas_paint` through to the decoders.
+    // Private constructor with all-distinct positional fields; a params struct
+    // would add indirection without clarity.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         video_canvas_id: String,
         screen_canvas_id: String,
@@ -1206,10 +1256,16 @@ impl Peer {
         aes: Option<Aes128State>,
         vad_threshold: Option<f32>,
         is_guest: bool,
+        skip_canvas_paint: bool,
     ) -> Result<Self, JsValue> {
         let sid_str = session_id.to_string();
-        let (mut audio, video, screen) =
-            Self::new_decoders(&video_canvas_id, &screen_canvas_id, &sid_str, vad_threshold)?;
+        let (mut audio, video, screen) = Self::new_decoders(
+            &video_canvas_id,
+            &screen_canvas_id,
+            &sid_str,
+            vad_threshold,
+            skip_canvas_paint,
+        )?;
 
         audio.set_muted(true);
         debug!("Initialized peer {user_id} (session_id: {session_id}) with audio muted");
@@ -1236,6 +1292,7 @@ impl Peer {
             device_info: PeerDeviceInfo::default(),
             is_guest,
             visible: false,
+            skip_canvas_paint,
             context_initialized: false,
             vad_threshold,
             has_received_heartbeat: false,
@@ -1293,6 +1350,7 @@ impl Peer {
         screen_canvas_id: &str,
         peer_id: &str,
         vad_threshold: Option<f32>,
+        skip_canvas_paint: bool,
     ) -> Result<
         (
             Box<dyn AudioPeerDecoderTrait>,
@@ -1303,8 +1361,8 @@ impl Peer {
     > {
         // Create decoders without canvas (will be set later via set_canvas)
         // We still keep the canvas IDs for backward compatibility with existing code
-        let video_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA)?;
-        let screen_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN)?;
+        let video_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA, skip_canvas_paint)?;
+        let screen_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN, skip_canvas_paint)?;
 
         // Attempt to set canvas immediately if available in DOM
         if let Some(document) = web_sys::window().and_then(|w| w.document()) {
@@ -1334,6 +1392,7 @@ impl Peer {
             &self.screen_canvas_id,
             &sid_str,
             self.vad_threshold,
+            self.skip_canvas_paint,
         )?;
 
         // Preserve the current mute state after reset
@@ -2135,7 +2194,12 @@ impl Peer {
     ///
     /// `local_user_id` is the reporting (local) client — the `from_peer`;
     /// `self.sid_str` is the observed remote peer — the `to_peer`.
-    fn emit_audio_datagram_loss(&self, local_user_id: &str, loss_per_sec: f64) {
+    fn emit_audio_datagram_loss(
+        &self,
+        local_user_id: &str,
+        loss_per_sec: f64,
+        raw_loss_per_sec: f64,
+    ) {
         let evt = DiagEvent {
             subsystem: "neteq",
             stream_id: None,
@@ -2144,6 +2208,9 @@ impl Peer {
                 metric!("from_peer", local_user_id.to_string()),
                 metric!("to_peer", self.sid_str.clone()),
                 metric!("wt_datagram_audio_loss_per_sec", loss_per_sec),
+                // Issue 2031: uncapped magnitude companion, emitted on the same
+                // event/cadence so the health reporter folds both per-peer rates.
+                metric!("wt_datagram_audio_raw_loss_per_sec", raw_loss_per_sec),
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -2436,10 +2503,14 @@ impl Peer {
                 if self.receiver_on_webtransport {
                     if let Some(seq) = packet.audio_metadata.as_ref().map(|am| am.sequence) {
                         let new_lost = self.audio_datagram_loss.record_seq(seq);
-                        if let Some(loss_per_sec) =
+                        if let Some((loss_per_sec, raw_loss_per_sec)) =
                             self.audio_datagram_loss.observe_window(now, new_lost)
                         {
-                            self.emit_audio_datagram_loss(local_user_id, loss_per_sec);
+                            self.emit_audio_datagram_loss(
+                                local_user_id,
+                                loss_per_sec,
+                                raw_loss_per_sec,
+                            );
                         }
                     }
                 }
@@ -2688,12 +2759,21 @@ impl Peer {
                     // Flush screen decoder when screen sharing is turned off
                     if screen_turned_off {
                         self.screen.flush();
+                        // HCL #893 re-share: the screen decoder is reused across
+                        // stop→restart (only flushed, never recreated), so its
+                        // once-per-lifetime first-render ack latch survives. Re-arm
+                        // it here so the NEXT share re-fires
+                        // PEER_EVENT(screen_decode_started); otherwise every share
+                        // after the first in this page session never acks and the
+                        // publisher falsely toasts "No peers received the shared
+                        // content within 10 seconds".
+                        self.screen.rearm_first_render_ack();
                         // A stopped share is a source-state transition, not a
                         // visibility shed. Wipe the decoder canvas so the
                         // recording compositor cannot retain a frozen frame.
                         self.screen.force_clear_canvas();
                         debug!(
-                            "Flushed screen decoder for peer {} (screen turned off)",
+                            "Flushed + re-armed screen decoder ack + cleared canvas for peer {} (screen turned off)",
                             self.session_id
                         );
                     }
@@ -2961,6 +3041,8 @@ pub struct PeerDecodeManager {
     /// before decode so the per-peer audio-datagram-loss tracker runs only when
     /// audio can actually ride datagrams. Defaults to `false` (pre-connect).
     receiver_on_webtransport: bool,
+    /// Applied to every camera/screen decoder created now or after a reset.
+    skip_canvas_paint: bool,
     /// Test-only count of how many times `log_peer_leave_decode_snapshot`
     /// actually emitted, so #1399 coalescing can be asserted directly
     /// (O(N) -> constant under a within-window cascade). `Cell` because the
@@ -2998,6 +3080,7 @@ impl PeerDecodeManager {
             pli_budget: Rc::new(RefCell::new(PliBudget::new())),
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
+            skip_canvas_paint: false,
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -3025,6 +3108,7 @@ impl PeerDecodeManager {
             pli_budget: Rc::new(RefCell::new(PliBudget::new())),
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
+            skip_canvas_paint: false,
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -3141,6 +3225,24 @@ impl PeerDecodeManager {
 
     pub fn set_vad_threshold(&mut self, threshold: Option<f32>) {
         self.vad_threshold = threshold;
+    }
+
+    pub fn set_skip_canvas_paint(&mut self, skip_canvas_paint: bool) {
+        self.skip_canvas_paint = skip_canvas_paint;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_video_layer_for_test(&self, session_id: u64) -> Option<u32> {
+        self.connected_peers
+            .get(&session_id)
+            .map(Peer::selected_video_layer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_screen_layer_for_test(&self, session_id: u64) -> Option<u32> {
+        self.connected_peers
+            .get(&session_id)
+            .map(Peer::selected_screen_layer)
     }
 
     /// Update which peers are eligible for video/screen decode.
@@ -3757,6 +3859,7 @@ impl PeerDecodeManager {
         last_sent: Option<
             &std::collections::BTreeMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
         >,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
         now_ms: u64,
     ) -> Vec<(String, u64, MediaType)> {
         use crate::decode::layer_chooser::PrefMediaKind;
@@ -3796,6 +3899,7 @@ impl PeerDecodeManager {
                 let v_target = last_sent
                     .and_then(|m| m.get(&(session_id, PrefMediaKind::Video)).copied())
                     .unwrap_or_else(|| peer.video_layer_availability.highest_available(now_ms));
+                let v_target = bounds.for_kind(PrefMediaKind::Video).clamp(v_target);
                 let v_old = peer.selected_video_layer();
                 if v_target != v_old {
                     peer.set_selected_video_layer(v_target);
@@ -3808,6 +3912,7 @@ impl PeerDecodeManager {
                 let s_target = last_sent
                     .and_then(|m| m.get(&(session_id, PrefMediaKind::Screen)).copied())
                     .unwrap_or_else(|| peer.screen_layer_availability.highest_available(now_ms));
+                let s_target = bounds.for_kind(PrefMediaKind::Screen).clamp(s_target);
                 let s_old = peer.selected_screen_layer();
                 if s_target != s_old {
                     peer.set_selected_screen_layer(s_target);
@@ -3827,6 +3932,12 @@ impl PeerDecodeManager {
                 let a_target = last_sent
                     .and_then(|m| m.get(&(session_id, PrefMediaKind::Audio)).copied())
                     .unwrap_or_else(|| peer.audio_layer_availability.highest_available(now_ms));
+                let a_target = bounds.for_kind(PrefMediaKind::Audio).clamp(a_target);
+                // Defensive symmetry: the operator `maxReceivedLayer` ceiling never
+                // caps AUDIO (audio bounds stay open), so this clamp is an identity
+                // no-op for that feature — a latent improvement only if a user sets
+                // audio receive bounds. Hence there is no dedicated audio mutation
+                // test for this line (the fresh-session ceiling test covers video+screen).
                 let a_old = peer.selected_audio_layer();
                 if a_target != a_old {
                     peer.set_selected_audio_layer(a_target);
@@ -4252,6 +4363,36 @@ impl PeerDecodeManager {
                     );
                 }
                 peer.context_initialized = true;
+            } else if send_packet_for_route.is_some() && !peer.video.has_keyframe_request_route() {
+                // Issue 1899 / discussion 1960 — self-healing route re-install. The proactive
+                // keyframe-request route is installed exactly once above (the one-time
+                // `context_initialized` latch), but it is DESTROYED later in the peer lifecycle:
+                // `Peer::reset` (decode-error path) rebuilds the video+screen decoders with empty
+                // route slots, and `clear_send_packet_callback` nulls them on teardown. Because the
+                // latch never re-runs, a reset leaves the route `None` FOREVER — the worker's
+                // keyframe-less eviction PLIs (issue #1025) then post to a no-op main-thread route,
+                // so a keyframe-starved tile can never recover (field: minutes-long screen freeze
+                // after a reset while PLIs fired into the void). Here media is flowing again AND the
+                // transport is wired (`send_packet` set — so this cannot fire during a disconnect
+                // teardown, where it is intentionally `None`), so re-install the route on the fresh
+                // decoders. Transport-agnostic: the same route serves WebTransport and WebSocket.
+                // The `has_keyframe_request_route` probe is a RefCell-borrow `Option` check that runs
+                // on EVERY packet while the transport is wired (the probe itself never stops); only the
+                // install BODY below is skipped once the route is present, so on the common healthy path
+                // this costs just that one borrow-and-check per packet. Probing VIDEO alone is valid
+                // because routes are only ever dropped in PAIRS — both `Peer::reset` and
+                // `clear_send_packet_callback` drop the VIDEO and SCREEN routes together — so a missing
+                // screen route always implies a missing video route. (A future change that dropped the
+                // SCREEN route alone would evade this VIDEO-keyed probe; keep the pair-drop invariant
+                // or probe both.)
+                if let Some(send_packet) = &send_packet_for_route {
+                    install_keyframe_request_routes(
+                        peer,
+                        send_packet,
+                        &local_user_id_for_route,
+                        &pli_budget_for_route,
+                    );
+                }
             }
             // Issue #1878: stamp the live active transport onto the peer so the
             // AUDIO arm's datagram-loss tracker runs only when this receiver is
@@ -4495,6 +4636,7 @@ impl PeerDecodeManager {
             aes,
             self.vad_threshold,
             cached_is_guest,
+            self.skip_canvas_paint,
         )?;
         // Issue #1640: send SetContext to the worker immediately at peer creation
         // so the publisher session_id (`to_peer`) is populated from the first frame.
@@ -5179,6 +5321,7 @@ fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
         device_info: PeerDeviceInfo::default(),
         is_guest: false,
         visible: false,
+        skip_canvas_paint: false,
         context_initialized: false,
         has_received_heartbeat: false,
         is_speaking: false,
@@ -5310,7 +5453,8 @@ mod tests {
     }
 
     /// The ~1s window normalises accumulated loss into a per-second rate on
-    /// rollover, and only on rollover.
+    /// rollover, and only on rollover. The raw component is 0 here because no
+    /// forward-gap sequences were recorded (only a synthetic capped count).
     #[test]
     fn audio_datagram_loss_windowed_rate() {
         let mut t = AudioDatagramLossTracker::new();
@@ -5321,10 +5465,99 @@ mod tests {
         );
         assert_eq!(t.observe_window(10_500, 2), None);
         // Exactly 1000ms elapsed (10_000 -> 11_000) with 2 lost => 2.0/sec.
-        assert_eq!(t.observe_window(11_000, 0), Some(2.0));
+        assert_eq!(t.observe_window(11_000, 0), Some((2.0, 0.0)));
         assert_eq!(t.loss_per_sec(), 2.0);
         // A fresh window has started; no immediate second rollover.
         assert_eq!(t.observe_window(11_500, 0), None);
+    }
+
+    /// Issue 2031: a single contiguous burst of ~200 lost audio datagrams must
+    /// surface its TRUE magnitude in the RAW rate while the reorder-window CAPPED
+    /// rate saturates at ~64. This is the fails-on-unfixed discriminator: on the
+    /// pre-2031 tracker the raw sum does not exist, so the divergence this asserts
+    /// cannot be produced. Mutating the `seq - high - 1` arithmetic in
+    /// `record_seq` (e.g. dropping the `- 1`, or the `.saturating_add`) shifts the
+    /// raw total off ~200 and fails the assertion.
+    #[test]
+    fn audio_datagram_raw_sum_diverges_from_capped_on_large_burst() {
+        let mut t = AudioDatagramLossTracker::new();
+        let mut total_capped = 0u32;
+        // A clean run first fills the 64-slot reorder window with received
+        // positions (so the burst below is measured against a full window, as in
+        // the field — a stall follows normal audio flow).
+        for seq in 0..=100u64 {
+            total_capped += t.record_seq(seq);
+        }
+        // The burst: sequences 101..=300 (200 contiguous audio datagrams) are
+        // dropped by a main-thread stall; the next datagram received is 301.
+        total_capped += t.record_seq(301);
+        // Audio then resumes cleanly. These consecutive arrivals drain the
+        // now-unseen tail of the reorder window, letting the CAPPED counter climb
+        // toward — but never past — its 64-slot ceiling.
+        for seq in 302..=365u64 {
+            total_capped += t.record_seq(seq);
+        }
+
+        // Establish the window baseline at t=10_000, then roll at +1000ms with
+        // the accumulated capped count; the raw sum was accumulated inside
+        // record_seq. (Nonzero timestamps: window_start_ms == 0 is the
+        // "not-yet-started" sentinel, so a real clock is never 0.)
+        assert_eq!(
+            t.observe_window(10_000, 0),
+            None,
+            "first tick sets the baseline"
+        );
+        let (capped_rate, raw_rate) = t
+            .observe_window(11_000, total_capped)
+            .expect("window must roll at +1000ms");
+
+        // The capped rate is bounded by the 64-slot reorder window, so it CANNOT
+        // convey the 200-datagram magnitude — it saturates as a PRESENCE signal.
+        assert!(
+            capped_rate <= 64.0,
+            "capped rate must stay <= 64 (reorder-window cap); got {capped_rate}"
+        );
+        assert!(
+            capped_rate > 0.0,
+            "the burst must still register as PRESENCE on the capped signal; got {capped_rate}"
+        );
+        // The raw rate carries the true burst magnitude, uncapped: 200 skipped
+        // sequence numbers over the 1s window.
+        assert!(
+            (raw_rate - 200.0).abs() < f64::EPSILON,
+            "raw rate must read the true ~200 burst magnitude; got {raw_rate}"
+        );
+        // The whole point of issue 2031: the two DIVERGE — raw dwarfs capped, so
+        // 1% loss and 80% loss are finally distinguishable.
+        assert!(
+            raw_rate > capped_rate * 2.0,
+            "raw magnitude ({raw_rate}) must dwarf the capped presence signal ({capped_rate})"
+        );
+        assert_eq!(t.raw_loss_per_sec(), raw_rate);
+    }
+
+    /// Issue 2031: a clean stream (no gaps) yields raw == 0, and mild reordering
+    /// within the window does not by itself fabricate raw loss on a forward-only
+    /// arrival order. Guards against the raw accumulator counting normal advances.
+    #[test]
+    fn audio_datagram_raw_sum_zero_on_clean_stream() {
+        let mut t = AudioDatagramLossTracker::new();
+        for seq in 0..=200u64 {
+            t.record_seq(seq);
+        }
+        // Establish the window baseline, then roll a full 1000ms window with zero
+        // capped loss fed in. (Nonzero timestamps: 0 is the not-yet-started
+        // sentinel for window_start_ms.)
+        assert_eq!(
+            t.observe_window(10_000, 0),
+            None,
+            "first tick sets the baseline"
+        );
+        let (capped_rate, raw_rate) = t
+            .observe_window(11_000, 0)
+            .expect("window rolls at +1000ms from the baseline");
+        assert_eq!(capped_rate, 0.0, "a gapless stream has no capped loss");
+        assert_eq!(raw_rate, 0.0, "a gapless stream has no raw loss");
     }
 
     /// A large BACKWARD jump (mic-encoder restart resets `sequence` to 0)
@@ -5483,6 +5716,71 @@ mod tests {
         assert!(
             !peer.screen.has_keyframe_request_route(),
             "screen keyframe-request route must be cleared on teardown (#1025 leak guard)"
+        );
+    }
+
+    /// Issue 1899 / discussion 1960 — self-healing keyframe-request route. The route is installed
+    /// once (the `context_initialized` latch), but `Peer::reset` (decode-error path) rebuilds the
+    /// video+screen decoders with EMPTY route slots and the latch never re-runs — so without
+    /// self-healing the route stays `None` forever after a reset and the worker's keyframe-less
+    /// eviction PLIs (issue #1025) become permanent no-ops, freezing a keyframe-starved tile for
+    /// minutes (the field symptom). `decode()` must re-install a dropped route on the next media
+    /// packet whenever the transport is wired.
+    ///
+    /// Noop decoders stand in for the fresh (route-less) decoders `Peer::reset` mints — their route
+    /// slot supports `set`/`has`/`clear` exactly like the real `VideoPeerDecoder` — so the invariant
+    /// is exercised through the REAL `decode()` path without a browser worker (which the harness
+    /// cannot construct).
+    ///
+    /// Mutation coverage: deleting the `else if send_packet.is_some() && !has_keyframe_request_route`
+    /// re-install branch leaves BOTH routes `None` after decode → both asserts fail. The outer
+    /// `send_packet.is_some()` in the condition is only a cheap short-circuit; the LOAD-BEARING
+    /// teardown guard is the inner `if let Some(send_packet)` inside the branch body — during a
+    /// disconnect teardown `send_packet` is `None`, so even if the branch is entered the install body
+    /// is skipped and no route is (re)installed against a dead transport.
+    #[wasm_bindgen_test]
+    fn decode_reinstalls_dropped_keyframe_request_route() {
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(
+            Callback::from(|_p: PacketWrapper| {}),
+            "me@test.com".to_string(),
+        );
+
+        let (mut peer, _muted) = make_test_peer(42);
+        // Past the one-time install latch, with the route dropped exactly as Peer::reset() leaves it.
+        peer.context_initialized = true;
+        peer.has_received_heartbeat = true;
+        peer.video.clear_keyframe_request_route();
+        peer.screen.clear_keyframe_request_route();
+        assert!(!peer.video.has_keyframe_request_route());
+        assert!(!peer.screen.has_keyframe_request_route());
+        manager.connected_peers.insert(42, peer);
+
+        // Any media packet on the already-initialized peer must trigger the self-healing re-install.
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: b"test@test.com".to_vec(),
+            heartbeat_metadata: Some(HeartbeatMetadata {
+                video_enabled: true,
+                audio_enabled: true,
+                screen_enabled: false,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        manager
+            .decode(packet_wrapper(&media, 42), "test@test.com")
+            .expect("heartbeat should decode");
+
+        let peer = manager.connected_peers.get(&42).expect("peer present");
+        assert!(
+            peer.video.has_keyframe_request_route(),
+            "decode must re-install a dropped VIDEO keyframe-request route (issue 1899 / discussion 1960)"
+        );
+        assert!(
+            peer.screen.has_keyframe_request_route(),
+            "decode must re-install a dropped SCREEN keyframe-request route (issue 1899 / discussion 1960)"
         );
     }
 
@@ -7750,6 +8048,38 @@ mod tests {
         assert!(!status0.rendered, "non-selected base layer must be dropped");
     }
 
+    /// The configured receive ceiling clamps both the advertised preference and
+    /// the camera/screen decode guards through the production manager tick.
+    ///
+    /// MUTATION: replacing either `bounds.clamp(raw)` with `raw` leaves that
+    /// guard at L2 and omits its required L0 preference.
+    #[test]
+    fn receive_ceiling_clamps_wire_preferences_and_decode_guards() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(904);
+        let now = 1500;
+
+        let open = manager.tick_layer_choosers(now, &ReceiveLayerBounds::default());
+        assert_eq!(manager.selected_video_layer_for_test(904), Some(2));
+        assert_eq!(manager.selected_screen_layer_for_test(904), Some(2));
+        assert!(
+            !open.contains_key(&(904, PrefMediaKind::Video)),
+            "an uncapped top selection is intentionally omitted from the wire map"
+        );
+
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(0));
+        capped.set_kind(PrefMediaKind::Screen, None, Some(0));
+        let desired = manager.tick_layer_choosers(now, &capped);
+
+        assert_eq!(desired.get(&(904, PrefMediaKind::Video)), Some(&0));
+        assert_eq!(desired.get(&(904, PrefMediaKind::Screen)), Some(&0));
+        assert_eq!(manager.selected_video_layer_for_test(904), Some(0));
+        assert_eq!(manager.selected_screen_layer_for_test(904), Some(0));
+    }
+
     /// Phase 2/3 (#989): the manager's per-peer tick returns an independent
     /// desired-layer entry for every connected peer AND every media kind
     /// (VIDEO/SCREEN/AUDIO), keyed by (session_id, PrefMediaKind).
@@ -8246,7 +8576,11 @@ mod tests {
         let mut wire: BTreeMap<(u64, PrefMediaKind), u32> = BTreeMap::new();
         wire.insert((900, PrefMediaKind::Video), 0);
         wire.insert((900, PrefMediaKind::Audio), 0);
-        let _ups = manager.reconcile_decode_guards_to_wire(Some(&wire), now);
+        let _ups = manager.reconcile_decode_guards_to_wire(
+            Some(&wire),
+            &crate::decode::layer_chooser::ReceiveLayerBounds::default(),
+            now,
+        );
         // Guard must now EQUAL the wire (L0) — the relay forwards only L0, so the
         // exact-match guard must accept L0, not reject it at L2.
         assert_eq!(
@@ -8288,7 +8622,11 @@ mod tests {
             .unwrap()
             .set_selected_audio_layer(0);
         // No last_sent map at all → relay fails open → forwards ALL layers (the top).
-        let _ups2 = manager2.reconcile_decode_guards_to_wire(None, now);
+        let _ups2 = manager2.reconcile_decode_guards_to_wire(
+            None,
+            &crate::decode::layer_chooser::ReceiveLayerBounds::default(),
+            now,
+        );
         let top = 2u32; // highest_available for the 3-layer fixture ladder
         assert_eq!(
             manager2
@@ -8313,6 +8651,27 @@ mod tests {
             "#1695: with no recorded audio entry the audio guard must match \
              highest_available (L2), not stay at L0"
         );
+    }
+
+    /// A fresh relay session has no recorded preferences, but an operator
+    /// receive ceiling still limits the persisted peer's decode guards.
+    ///
+    /// MUTATION: removing the post-`highest_available` bounds clamps raises
+    /// both guards from L0 to the learned top L2 and fails these assertions.
+    #[test]
+    fn reconcile_decode_guards_to_wire_respects_ceiling_on_fresh_session() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(902);
+        let mut bounds = ReceiveLayerBounds::default();
+        bounds.set_kind(PrefMediaKind::Video, None, Some(0));
+        bounds.set_kind(PrefMediaKind::Screen, None, Some(0));
+
+        let _ = manager.reconcile_decode_guards_to_wire(None, &bounds, 2000);
+
+        assert_eq!(manager.selected_video_layer_for_test(902), Some(0));
+        assert_eq!(manager.selected_screen_layer_for_test(902), Some(0));
     }
 
     /// #1256 (resize cadence): applying the size lid N times within ONE sample
@@ -10167,6 +10526,7 @@ mod tests {
                 device_info: PeerDeviceInfo::default(),
                 is_guest: false,
                 visible: false,
+                skip_canvas_paint: false,
                 context_initialized: false,
                 has_received_heartbeat: false,
                 is_speaking: false,
@@ -10278,6 +10638,7 @@ mod tests {
             device_info: PeerDeviceInfo::default(),
             is_guest: false,
             visible: false,
+            skip_canvas_paint: false,
             context_initialized: false,
             has_received_heartbeat: false,
             is_speaking: false,
@@ -10360,6 +10721,7 @@ mod tests {
             device_info: PeerDeviceInfo::default(),
             is_guest: false,
             visible: false,
+            skip_canvas_paint: false,
             context_initialized: false,
             has_received_heartbeat: false,
             is_speaking: false,

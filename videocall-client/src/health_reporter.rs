@@ -56,6 +56,24 @@ use videocall_types::Callback;
 use wasm_bindgen_futures::spawn_local;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+/// Per-client WebTransport receive-health telemetry (issue 2031), assembled in
+/// the report loop from the `videocall-transport` statics and threaded into
+/// `create_health_packet`. Every field is a per-CLIENT (receiver) property, not
+/// per-peer. `Default` yields the "no WT activity" shape the tests and the
+/// WebSocket path use.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WtReceiveTelemetry {
+    /// Max gap (ms) between successive incoming-datagram `.read()` resolutions
+    /// since the last health packet (read-and-reset window). 0.0 on WebSocket
+    /// (the WT read loop never feeds it). High => main-thread reader starvation.
+    pub read_loop_max_gap_ms: f64,
+    /// Observed post-set incoming-datagram queue parameters
+    /// `(high_water_mark, max_age_ms)` from `configure_incoming_datagram_queue`,
+    /// or `None` before the WT queue has been configured. `max_age_ms` is `NaN`
+    /// when the browser reports the queue as unbounded (spec `null` default).
+    pub incoming_queue_readback: Option<(f64, f64)>,
+}
+
 /// Health data cached for a specific peer
 #[derive(Debug, Clone)]
 pub struct PeerHealthData {
@@ -84,7 +102,16 @@ pub struct PeerHealthData {
     /// (e.g. the browser's incoming-datagram queue overflowing during a
     /// main-thread stall) — the pathology was previously invisible in every
     /// dashboard. ~0 on WebSocket and on E2EE-on WebTransport (reliable paths).
+    ///
+    /// PRESENCE signal — capped at ~64 lost per contiguous gap by the reorder
+    /// window. Read alongside [`Self::wt_datagram_audio_raw_loss_per_sec`].
     pub wt_datagram_audio_loss_per_sec: f64,
+    /// Issue 2031: windowed RAW (uncapped) receive-side audio DATAGRAM loss
+    /// (skipped sequences/sec) for this peer. The magnitude companion to
+    /// [`Self::wt_datagram_audio_loss_per_sec`]: it sums the sequence-gap sizes
+    /// un-truncated, so a heavy burst reads its true size instead of saturating
+    /// at ~64. Same WebTransport gate and cadence.
+    pub wt_datagram_audio_raw_loss_per_sec: f64,
 }
 
 impl PeerHealthData {
@@ -102,6 +129,7 @@ impl PeerHealthData {
             last_screen_update_ms: 0,
             decode_errors_total: 0,
             wt_datagram_audio_loss_per_sec: 0.0,
+            wt_datagram_audio_raw_loss_per_sec: 0.0,
         }
     }
 
@@ -319,6 +347,70 @@ fn compute_cpu_throttled(capability_score: u32, cores: u32) -> Option<bool> {
     }
 }
 
+/// Decide the value to publish to `window.__videocall_encoder_fps` for the
+/// bots-app RESOURCE_STARVED fps rule (#2057/#2032). Returns:
+///   - `None` -> publish NOTHING (clear the global): camera off, OR camera on
+///     but the encoder has not produced a real sample yet (warmup). The bot
+///     reads "absent" as "no data" - NOT as 0 fps - so a cold-start/idle client
+///     never false-flags as starved.
+///   - `Some(fps)` -> the current camera layer-0 output fps, published once the
+///     encoder is active AND has produced at least one real sample. Since #2060
+///     the producer resets `current_fps` to 0 on stop/start and decays it to 0
+///     after a sustained layer-0 output gap, so `Some(0)` is a REACHABLE runtime
+///     value here: "camera on, latch set, but currently emitting no layer-0
+///     output" (a total stall, or the sub-1s window right after a re-enable).
+///     This captures partial starvation (for example, 1-4 fps), which the
+///     RESOURCE_STARVED rule targets. A total stall now publishes `Some(0)`; the
+///     bots consumer (`fps.ts` `coerceEncoderFps`) maps 0 -> "no data", so a total
+///     stall surfaces downstream as no-data (the verdict's CPU rule is the
+///     backstop). Flagging a total stall AS `RESOURCE_STARVED` (accepting 0 as a
+///     stall reading) is the remaining follow-up: revisit the `fps.ts` `> 0` gate.
+fn encoder_fps_publish_value(
+    video_enabled: bool,
+    output_fps: u32,
+    has_encoded_real: bool,
+) -> Option<u32> {
+    if !video_enabled {
+        None
+    } else if has_encoded_real {
+        Some(output_fps)
+    } else {
+        None
+    }
+}
+
+/// Advance the "encoder has produced a real sample" latch (#2057). The latch
+/// resets on camera-off and sets once a nonzero fps is observed while the camera
+/// is on; otherwise it carries the previous value. Since #2060 the source atomic
+/// IS reset to 0 on stop/start, so a re-enable that passes through camera-off
+/// re-warms from 0 with the latch cleared (no stale-nonzero republish). One edge
+/// remains: a synchronous stop()->re-enable device switch never lets the health
+/// loop observe camera-off, so the latch stays set and a transient `Some(0)` can
+/// publish during the ~1s re-warmup (absorbed by the #2064 sustain window). Kept
+/// here (not inline in the health loop) so the transition is unit-testable.
+fn next_has_encoded_real(prev: bool, video_enabled: bool, output_fps: u32) -> bool {
+    if !video_enabled {
+        false
+    } else if output_fps > 0 {
+        true
+    } else {
+        prev
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn publish_encoder_fps(value: Option<u32>) {
+    use wasm_bindgen::JsValue;
+
+    if let Some(win) = web_sys::window() {
+        let value = value.map_or(JsValue::UNDEFINED, |fps| JsValue::from_f64(fps as f64));
+        let _ = js_sys::Reflect::set(&win, &JsValue::from_str("__videocall_encoder_fps"), &value);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_encoder_fps(_value: Option<u32>) {}
+
 fn audio_layer_telemetry(
     effective_layers: u32,
     congestion_ceiling_raw: u32,
@@ -336,6 +428,153 @@ fn audio_layer_telemetry(
         .min(user_count)
         .max(1) as u32;
     (congestion_ceiling, active_layers)
+}
+
+// ── issue 1853: receiver-side audio-scale instrumentation (log-only) ──────────
+//
+// Diagnostics to discriminate the multi-source audio-breakup pathology (a
+// receiver hearing MANY concurrent sources concealed, independent of CPU class)
+// from the low-core decode-starvation of issue 1389 and from a receiver-downlink
+// fault. INSTRUMENTATION ONLY — no runtime behavior changes. The report loop
+// emits one greppable AUDIO_SCALE line every ~5s summarizing the receiver's
+// audio-scale posture so scripts/meeting_quality_xref.py can correlate audio
+// concealment against concurrent source count, downlink estimate, and per-source
+// buffer depth before any behavioral fix is designed.
+
+/// Audio-source activity gate, in packets/sec. At or above this rate a source is
+/// actively delivering audio and its windowed expand/packets concealment ratio
+/// is meaningful; below it the sender is likely in DTX silence and the ratio is
+/// unreliable. Shared by the per-stream `PeerStats::audio_concealment_pct`
+/// computation and the AUDIO_SCALE aggregate (both go through
+/// [`audio_source_sample_from_neteq`]) so the two can never drift apart.
+const AUDIO_ACTIVE_PPS_GATE: f64 = 2.0;
+
+/// Minimum spacing between AUDIO_SCALE diagnostic lines, in ms. The line is
+/// emitted from the existing health-report loop (whose interval is
+/// `health_reporting_interval_ms`, default 5000ms — see
+/// `VideoCallClient`), gated by a wall-clock delta rather than a new timer. This
+/// caps the aggregate at one line per ~5s regardless of the configured report
+/// interval: at the 5s default it emits ~every report tick, and if the interval
+/// is ever set faster it rate-limits to ~5s.
+const AUDIO_SCALE_LOG_INTERVAL_MS: u64 = 5_000;
+
+/// Concealment percentage above which a source is counted in the AUDIO_SCALE
+/// `concealed=` field. Chosen clearly above the low ambient concealment of
+/// healthy Opus/NetEQ playout (a well-fed jitter buffer conceals only
+/// occasionally) and below R5's 15% "audible breakup" threshold in
+/// scripts/meeting_quality_xref.py, so `concealed` is an early, sensitive count
+/// of how many sources are degrading — not a restatement of the breakup rule.
+const AUDIO_SCALE_CONCEAL_THRESHOLD_PCT: f64 = 10.0;
+
+/// True when a source delivering `packets_per_sec` audio packets is active
+/// enough for its concealment ratio to be meaningful
+/// (>= [`AUDIO_ACTIVE_PPS_GATE`]).
+fn audio_source_active(packets_per_sec: f64) -> bool {
+    packets_per_sec >= AUDIO_ACTIVE_PPS_GATE
+}
+
+/// One receiver-side audio source sampled during a single health-report tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AudioSourceSample {
+    /// Windowed audio concealment for this source, in percent (0–100). Mirrors
+    /// `PeerStats::audio_concealment_pct`; 0.0 for inactive sources.
+    concealment_pct: f64,
+    /// NetEQ current jitter-buffer depth for this source, in ms
+    /// (`current_buffer_size_ms`, 0.0 when absent).
+    buffer_ms: f64,
+    /// True when the source is actively delivering audio this tick (its
+    /// `packets_per_sec` passes [`audio_source_active`]). Only active sources
+    /// contribute to the AUDIO_SCALE aggregates.
+    active: bool,
+}
+
+/// Derive an [`AudioSourceSample`] from a peer's raw NetEQ stats JSON, using the
+/// SAME windowed rates, gate, and clamp as the per-stream
+/// `PeerStats::audio_concealment_pct` mapping in `create_health_packet` (which
+/// also calls this helper). Missing fields default to 0.0 / inactive.
+fn audio_source_sample_from_neteq(neteq: &Value) -> AudioSourceSample {
+    let expand_per_sec = neteq
+        .get("network")
+        .and_then(|n| n.get("operation_counters"))
+        .and_then(|oc| oc.get("expand_per_sec"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let packets_per_sec = neteq
+        .get("packets_per_sec")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let buffer_ms = neteq
+        .get("current_buffer_size_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let active = audio_source_active(packets_per_sec);
+    // Clamp to 0–100: concealment cannot exceed 100% by definition, and
+    // unsynchronised window rollovers can momentarily inflate the ratio.
+    let concealment_pct = if active {
+        ((expand_per_sec / packets_per_sec) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    AudioSourceSample {
+        concealment_pct,
+        buffer_ms,
+        active,
+    }
+}
+
+/// Format the periodic AUDIO_SCALE diagnostic line (issue 1853), or `None` when
+/// the receiver has no ACTIVE audio source this tick.
+///
+/// A `sources=0` line (empty room, everyone muted, or all senders in DTX
+/// silence) is pure noise for the meeting-log analyzer, so it is suppressed: the
+/// line is emitted only when at least one source is actively delivering audio.
+/// Every field is a machine-parseable `key=value` token in the same style
+/// scripts/meeting_quality_xref.py already parses (e.g. the prejoin
+/// `cores=`/`network=` preamble):
+///
+/// - `sources`       number of ACTIVE audio sources this tick (the concurrent
+///   source load the receiver is decoding; silent/DTX peers are excluded, so
+///   this shares its denominator with every field below).
+/// - `concealed`     how many active sources exceed
+///   [`AUDIO_SCALE_CONCEAL_THRESHOLD_PCT`].
+/// - `worst_pct`     max concealment over active sources (1 decimal).
+/// - `mean_pct`      mean concealment over active sources (1 decimal).
+/// - `downlink_mbps` receiver downlink estimate, or `-1.0` when unknown (`<= 0`,
+///   matching the health packet's `> 0` known-gate).
+/// - `min_buf_ms`    min NetEQ buffer depth over active sources (1 decimal).
+/// - `mean_buf_ms`   mean NetEQ buffer depth over active sources (1 decimal).
+/// - `cores`         `navigator.hardwareConcurrency`, or `-1` when unknown (0).
+fn format_audio_scale_line(
+    samples: &[AudioSourceSample],
+    downlink_mbps: f64,
+    cores: u32,
+) -> Option<String> {
+    let active: Vec<&AudioSourceSample> = samples.iter().filter(|s| s.active).collect();
+    if active.is_empty() {
+        return None;
+    }
+    let n = active.len() as f64;
+    let concealed = active
+        .iter()
+        .filter(|s| s.concealment_pct > AUDIO_SCALE_CONCEAL_THRESHOLD_PCT)
+        .count();
+    let worst_pct = active
+        .iter()
+        .map(|s| s.concealment_pct)
+        .fold(f64::MIN, f64::max);
+    let mean_pct = active.iter().map(|s| s.concealment_pct).sum::<f64>() / n;
+    let min_buf_ms = active.iter().map(|s| s.buffer_ms).fold(f64::MAX, f64::min);
+    let mean_buf_ms = active.iter().map(|s| s.buffer_ms).sum::<f64>() / n;
+    let downlink = if downlink_mbps > 0.0 {
+        downlink_mbps
+    } else {
+        -1.0
+    };
+    let cores = if cores > 0 { i64::from(cores) } else { -1 };
+    Some(format!(
+        "[AUDIO_SCALE] sources={} concealed={} worst_pct={:.1} mean_pct={:.1} downlink_mbps={:.1} min_buf_ms={:.1} mean_buf_ms={:.1} cores={}",
+        active.len(), concealed, worst_pct, mean_pct, downlink, min_buf_ms, mean_buf_ms, cores,
+    ))
 }
 
 fn populate_received_layers(
@@ -723,6 +962,10 @@ impl HealthReporter {
         let longtask_ever_observed = Rc::downgrade(&self.longtask_ever_observed);
         let render_fps_state = Rc::downgrade(&self.render_fps);
         let decode_budget_state = Rc::downgrade(&self.decode_budget);
+        // Issue 2029: forward per-peer WT audio-datagram loss samples into the
+        // connection layer's WT→WS fallback detector. Weak so this subscription
+        // never keeps the controller (or the client) alive past teardown.
+        let connection_controller = Rc::downgrade(&self.connection_controller);
 
         spawn_local(async move {
             debug!("Started health diagnostics subscription");
@@ -847,7 +1090,26 @@ impl HealthReporter {
                             }
                         }
                     }
-                    Self::process_diagnostics_event(event, &peer_health_data);
+                    let audio_loss = Self::process_diagnostics_event(event, &peer_health_data);
+
+                    // Issue 2029: hand each per-peer WT audio-datagram loss
+                    // sample (peer id + pkt/s, ~1 Hz per audio-active WT peer,
+                    // incl. 0.0) to the connection manager's fallback detector.
+                    // Best-effort: a momentarily-borrowed manager just drops one
+                    // ~1 Hz sample. On WebSocket no sample is produced (the
+                    // emitter is gated on receiver_on_webtransport); on E2EE-on
+                    // WebTransport the reliable audio unistream has no datagram
+                    // gaps, so the fed value is a steady 0.0 the detector treats
+                    // as not-lossy — neither can trip the fallback.
+                    if let Some((peer_id, loss_per_sec)) = audio_loss {
+                        if let Some(cc_rc) = Weak::upgrade(&connection_controller) {
+                            if let Ok(cc_opt) = cc_rc.try_borrow() {
+                                if let Some(cc) = cc_opt.as_ref() {
+                                    cc.observe_peer_audio_datagram_loss(&peer_id, loss_per_sec);
+                                }
+                            }
+                        }
+                    }
                 } else {
                     debug!("HealthReporter dropped, stopping diagnostics subscription");
                     break;
@@ -856,14 +1118,25 @@ impl HealthReporter {
         });
     }
 
-    /// Process a diagnostics event and update peer health data
+    /// Process a diagnostics event and update peer health data.
+    ///
+    /// Returns `Some((peer_id, loss_per_sec))` when the event carried a
+    /// `wt_datagram_audio_loss_per_sec` sample (issue 2029), so the caller can
+    /// forward it into the connection layer's WT→WS audio-fallback detector.
+    /// `None` for every other event. Every such sample is returned, INCLUDING
+    /// loss 0.0 — a healthy WT audio peer's zero sample is what keeps it in the
+    /// detector's uniformity denominator (so one lossy sender among healthy
+    /// peers reads as path loss, not a uniform receive-queue drop).
     fn process_diagnostics_event(
         event: DiagEvent,
         peer_health_data: &Rc<RefCell<HashMap<String, PeerHealthData>>>,
-    ) {
+    ) -> Option<(String, f64)> {
         // Prefer structured from/to fields if present; fall back to stream_id if set
         let mut reporting_peer: Option<String> = None;
         let mut target_peer: Option<String> = None;
+        // Issue 2029: set when this event carries the WT audio-datagram loss
+        // gauge, forwarded to the connection layer by the caller.
+        let mut audio_loss_forward: Option<(String, f64)> = None;
         for metric in &event.metrics {
             match metric.name {
                 "from_peer" => {
@@ -953,11 +1226,24 @@ impl HealthReporter {
                         "wt_datagram_audio_loss_per_sec" => {
                             if let MetricValue::F64(loss) = &metric.value {
                                 peer_data.wt_datagram_audio_loss_per_sec = *loss;
+                                // Issue 2029: forward EVERY sample (including 0.0)
+                                // to the connection-layer fallback detector.
+                                audio_loss_forward = Some((target_peer.to_string(), *loss));
                                 if *loss > 0.0 {
                                     warn!(
                                         "WT datagram audio loss {loss:.1} pkt/s for peer: {target_peer} (from {reporting_peer})"
                                     );
                                 }
+                            }
+                        }
+                        // Issue 2031: uncapped magnitude companion to the capped
+                        // rate above, emitted on the same ~1 Hz neteq event. Stored
+                        // per-peer for the create_health_packet fold; not logged
+                        // separately (the capped warn! above already flags the
+                        // presence — this is the magnitude the dashboard reads).
+                        "wt_datagram_audio_raw_loss_per_sec" => {
+                            if let MetricValue::F64(raw_loss) = &metric.value {
+                                peer_data.wt_datagram_audio_raw_loss_per_sec = *raw_loss;
                             }
                         }
                         _ => {}
@@ -1138,6 +1424,8 @@ impl HealthReporter {
                 }
             }
         }
+
+        audio_loss_forward
     }
 
     /// #1032: Start the background total-process memory sampler.
@@ -1319,6 +1607,13 @@ impl HealthReporter {
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
 
+            // issue 1853: last-emit clock (ms since epoch) for the ~5s-paced
+            // AUDIO_SCALE diagnostic. A loop-local (not a struct field) because it
+            // only needs to persist across iterations of this single spawned task;
+            // the modulo lives inline below off the shared health-report clock.
+            let mut last_audio_scale_log_ms: u64 = 0;
+            let mut has_encoded_real = false;
+
             loop {
                 // Wait for the interval
                 gloo_timers::future::TimeoutFuture::new(interval_ms as u32).await;
@@ -1405,6 +1700,21 @@ impl HealthReporter {
                         let screen_active_val =
                             screen_sharing_active.borrow().load(Ordering::Relaxed);
                         let output_fps_val = encoder_output_fps.borrow().load(Ordering::Relaxed);
+                        has_encoded_real = next_has_encoded_real(
+                            has_encoded_real,
+                            self_video_enabled,
+                            output_fps_val,
+                        );
+                        // A window global keeps this independent of runtime log level and off
+                        // the console-upload path. Gate on camera-active + first real sample so
+                        // cold-start/idle never publishes a misleading 0.
+                        // Since #2060 the producer resets/decays current_fps to 0, so a total
+                        // stall publishes Some(0) (consumer maps 0 -> no-data), not a frozen nonzero.
+                        publish_encoder_fps(encoder_fps_publish_value(
+                            self_video_enabled,
+                            output_fps_val,
+                            has_encoded_real,
+                        ));
                         // #1143: live send-side simulcast layer counts.
                         let effective_layers_val =
                             effective_video_layers.borrow().load(Ordering::Relaxed);
@@ -1509,6 +1819,22 @@ impl HealthReporter {
                         client_meta.cpu_throttled =
                             compute_cpu_throttled(client_meta.capability_score, client_meta.cores);
 
+                        // issue 1853: decide whether this tick emits the ~5s-paced
+                        // AUDIO_SCALE line, and snapshot the two receiver scalars it
+                        // needs BEFORE `client_meta` is moved into create_health_packet.
+                        let audio_scale_now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let emit_audio_scale = audio_scale_now_ms
+                            .saturating_sub(last_audio_scale_log_ms)
+                            >= AUDIO_SCALE_LOG_INTERVAL_MS;
+                        if emit_audio_scale {
+                            last_audio_scale_log_ms = audio_scale_now_ms;
+                        }
+                        let audio_scale_downlink_mbps = client_meta.network_downlink;
+                        let audio_scale_cores = client_meta.cores;
+
                         let health_packet = Self::create_health_packet(
                             &session_id_val,
                             &meeting_id,
@@ -1526,6 +1852,9 @@ impl HealthReporter {
                             adaptive_video_tier.borrow().load(Ordering::Relaxed),
                             adaptive_audio_tier.borrow().load(Ordering::Relaxed),
                             videocall_transport::webtransport::datagram_drop_count(),
+                            videocall_transport::webtransport::unistream_bytes_offered_total(),
+                            videocall_transport::webtransport::unistream_bytes_drained_total(),
+                            videocall_transport::webtransport::unistream_stale_delta_drop_count(),
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
                             queue_depth_report_val,
@@ -1561,6 +1890,16 @@ impl HealthReporter {
                             audio_congestion_ceiling_val,
                             active_audio_layers_val,
                             received_layers_snapshot,
+                            // Issue 2031: per-client WT receive-health telemetry,
+                            // read from the transport statics. read_loop drains
+                            // its window here (~once per health interval); the
+                            // queue read-back is a one-shot per-browser constant.
+                            WtReceiveTelemetry {
+                                read_loop_max_gap_ms:
+                                    videocall_transport::webtransport::take_datagram_read_loop_max_gap_ms(),
+                                incoming_queue_readback:
+                                    videocall_transport::webtransport::incoming_datagram_queue_readback(),
+                            },
                         );
 
                         if let Some(packet) = health_packet {
@@ -1572,12 +1911,43 @@ impl HealthReporter {
                             // keep-list.
                             trace!("Sent health packet for session: {session_id_val}");
                         }
+
+                        // issue 1853 (instrumentation-only): once per
+                        // AUDIO_SCALE_LOG_INTERVAL_MS, summarize this receiver's
+                        // audio-scale posture in one greppable line so the meeting
+                        // analyzer can correlate concealment against concurrent
+                        // source count, downlink estimate, and per-source buffer
+                        // depth. Samples are built from the SAME `health_map`
+                        // snapshot create_health_packet just read (same tick, no
+                        // stale mixing) via the SAME helper, so the aggregate and the
+                        // per-stream audio_concealment_pct stay in lockstep. Emitted
+                        // at debug! like its sibling "audio health (buffer:)" sample.
+                        if emit_audio_scale {
+                            let audio_samples: Vec<AudioSourceSample> = health_map
+                                .values()
+                                .filter_map(|hd| {
+                                    hd.last_neteq_stats
+                                        .as_ref()
+                                        .map(audio_source_sample_from_neteq)
+                                })
+                                .collect();
+                            if let Some(line) = format_audio_scale_line(
+                                &audio_samples,
+                                audio_scale_downlink_mbps,
+                                audio_scale_cores,
+                            ) {
+                                debug!("{line}");
+                            }
+                        }
                     }
                 } else {
                     debug!("HealthReporter dropped, stopping health reporting");
                     break;
                 }
             }
+
+            // Clear the page-level signal after meeting teardown stops the report loop.
+            publish_encoder_fps(None);
         });
     }
 
@@ -1600,6 +1970,9 @@ impl HealthReporter {
         adaptive_video_tier: u32,
         adaptive_audio_tier: u32,
         datagram_drops_total: u64,
+        unistream_bytes_offered_total: u64,
+        unistream_bytes_drained_total: u64,
+        unistream_stale_delta_drops_total: u64,
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
         encoder_queue_depth_report: f64,
@@ -1640,6 +2013,9 @@ impl HealthReporter {
         audio_congestion_ceiling: u32,
         active_audio_layers: u32,
         received_layers: HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
+        // Issue 2031: per-client WebTransport receive-health telemetry, read from
+        // the transport statics in the report loop. `Default` on WebSocket.
+        wt_telemetry: WtReceiveTelemetry,
     ) -> Option<PacketWrapper> {
         // Keep client-wide telemetry flowing even before any peer stats have
         // been observed (solo sessions / warm-up).
@@ -1700,6 +2076,9 @@ impl HealthReporter {
         pb.adaptive_video_tier = Some(adaptive_video_tier);
         pb.adaptive_audio_tier = Some(adaptive_audio_tier);
         pb.datagram_drops_total = Some(datagram_drops_total);
+        pb.unistream_bytes_offered_total = Some(unistream_bytes_offered_total);
+        pb.unistream_bytes_drained_total = Some(unistream_bytes_drained_total);
+        pb.unistream_stale_delta_drops_total = Some(unistream_stale_delta_drops_total);
         pb.websocket_drops_total = Some(websocket_drops_total);
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
@@ -2043,11 +2422,35 @@ impl HealthReporter {
             pb.agent_memory_bytes = Some(agent_mem);
         }
 
+        // Issue 2031: per-client WebTransport receive-health telemetry.
+        //
+        // read_loop_max_gap_ms is folded UNCONDITIONALLY (like datagram_drops):
+        // 0.0 on WebSocket is the correct "no reader starvation" value and lets
+        // the server gauge recover to 0 instead of latching the last WT reading.
+        pb.wt_datagram_read_loop_max_gap_ms = Some(wt_telemetry.read_loop_max_gap_ms);
+        // Queue read-back is a one-shot per-browser constant captured when the WT
+        // queue was configured. Folded only when present (a WS-only client never
+        // configured a queue, so nothing to report). NaN maxAge (spec-unbounded /
+        // setter not honored) maps to the -1.0 wire sentinel so the gauge stays
+        // finite; any finite value near our 3000ms target confirms the setter took.
+        if let Some((hwm, max_age)) = wt_telemetry.incoming_queue_readback {
+            pb.wt_incoming_datagram_high_water_mark = Some(hwm);
+            pb.wt_incoming_datagram_max_age_ms =
+                Some(if max_age.is_nan() { -1.0 } else { max_age });
+        }
+
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         const STATS_STALE_MS: u64 = 5_000;
+
+        // Issue 2031: accumulate the per-client mean audio concealment over ACTIVE
+        // sources this tick (the same active-source mean the [AUDIO_SCALE] line
+        // reports). Folded into a per-client field the server splits by transport,
+        // giving the WS-vs-WT concealment severity gap as a single labeled gauge.
+        let mut concealment_sum = 0.0_f64;
+        let mut concealment_active_sources = 0_u32;
 
         for (peer_id, health_data) in health_map.iter() {
             // Freshness gate: stats older than 5s are stale (FPS/NetEQ trackers stop
@@ -2097,28 +2500,21 @@ impl HealthReporter {
                     ns.playout_latency_ms = v;
                 }
 
-                // Calculate audio packet loss percentage from WINDOWED rates (not lifetime)
-                // Use expand_per_sec (concealment events/sec) and packets_per_sec (packets/sec)
-                let expand_per_sec = neteq
-                    .get("network")
-                    .and_then(|n| n.get("operation_counters"))
-                    .and_then(|oc| oc.get("expand_per_sec"))
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-
-                let packets_per_sec = neteq
-                    .get("packets_per_sec")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-
-                // Calculate loss % from windowed rates (resets every ~1 second).
-                // Gate on >= 2.0 pps (matches quality-score gate): below that the
-                // speaker is likely in DTX silence and the ratio is unreliable.
-                // Clamp to 0–100: packet loss cannot exceed 100% by definition,
-                // and unsynchronised window rollovers can momentarily inflate it.
-                if packets_per_sec >= 2.0 {
-                    ps.audio_concealment_pct =
-                        ((expand_per_sec / packets_per_sec) * 100.0).clamp(0.0, 100.0);
+                // Windowed receive-side audio concealment for this source, from
+                // WINDOWED rates (not lifetime): expand_per_sec / packets_per_sec.
+                // issue 1853: computed via the shared `audio_source_sample_from_neteq`
+                // helper (same >= AUDIO_ACTIVE_PPS_GATE pps gate — below that the
+                // speaker is likely in DTX silence and the ratio is unreliable — and
+                // same 0–100 clamp) so the per-stream `audio_concealment_pct`
+                // published here and the aggregate AUDIO_SCALE line emitted by the
+                // report loop can never drift. Only set when active; otherwise the
+                // proto field stays at its 0.0 default.
+                let audio_sample = audio_source_sample_from_neteq(neteq);
+                if audio_sample.active {
+                    ps.audio_concealment_pct = audio_sample.concealment_pct;
+                    // Issue 2031: feed the per-client active-source mean.
+                    concealment_sum += audio_sample.concealment_pct;
+                    concealment_active_sources += 1;
                 }
 
                 if let Some(network) = neteq.get("network") {
@@ -2330,6 +2726,14 @@ impl HealthReporter {
             } else {
                 0.0
             });
+            // Issue 2031: the uncapped magnitude companion, folded on the SAME
+            // WebTransport gate as the capped rate above — definitional 0.0 on
+            // WebSocket so it un-latches on a WT->WS fallback identically.
+            ps.audio_datagram_raw_loss_per_sec = Some(if reporter_on_webtransport {
+                health_data.wt_datagram_audio_raw_loss_per_sec
+            } else {
+                0.0
+            });
 
             // ── Quality scores ─────────────────────────────────────────────
             // Only set when the stream is active; absent = Grafana shows a gap,
@@ -2397,6 +2801,16 @@ impl HealthReporter {
             ps.call_quality_score = call_score;
 
             pb.peer_stats.insert(peer_id.clone(), ps);
+        }
+
+        // Issue 2031: per-client mean audio concealment over active sources. Set
+        // only when at least one source is actively delivering audio, so absent
+        // means "no audio flowing", NOT "0% concealment" (mirrors the per-peer
+        // audio_concealment_pct, which is likewise only set when active). The
+        // server exports it split by the reporter's active transport.
+        if concealment_active_sources > 0 {
+            pb.client_audio_concealment_pct =
+                Some(concealment_sum / concealment_active_sources as f64);
         }
 
         let bytes = pb.write_to_bytes().unwrap_or_default();
@@ -2502,8 +2916,280 @@ fn video_quality_score(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_fps_publish_value_gates_correctly() {
+        // Camera off -> never publish (clear).
+        assert_eq!(encoder_fps_publish_value(false, 8, true), None);
+        assert_eq!(encoder_fps_publish_value(false, 0, false), None);
+        // Camera on but not yet produced a real sample (warmup) -> no data, NOT 0.
+        assert_eq!(encoder_fps_publish_value(true, 0, false), None);
+        // Camera on + produced -> publish the live value. Low positive readings
+        // (1-4) are the partial-starvation signal the bots' fps rule targets.
+        // Since #2060 the `Some(0)` arm below is REACHABLE in production: the
+        // producer resets current_fps to 0 on stop/start and decays it to 0 on a
+        // sustained layer-0 gap, so a total stall (or the sub-1s re-enable window)
+        // publishes Some(0). The bots consumer maps 0 -> no-data.
+        assert_eq!(encoder_fps_publish_value(true, 4, true), Some(4));
+        assert_eq!(encoder_fps_publish_value(true, 0, true), Some(0));
+        assert_eq!(encoder_fps_publish_value(true, 30, true), Some(30));
+    }
+
+    #[test]
+    fn has_encoded_real_latch_transitions() {
+        // Camera off resets the latch (so a re-enable re-warms).
+        assert!(!next_has_encoded_real(true, false, 8));
+        // First nonzero fps while camera-on latches it.
+        assert!(next_has_encoded_real(false, true, 4));
+        // Camera-on but still zero before any real sample -> stays un-latched.
+        assert!(!next_has_encoded_real(false, true, 0));
+        // Once latched, a zero reading stays latched (a genuine active-stall 0).
+        assert!(next_has_encoded_real(true, true, 0));
+    }
     use protobuf::Message;
     use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
+
+    // ── issue 1853: AUDIO_SCALE instrumentation ──────────────────────────────
+
+    /// One ACTIVE `AudioSourceSample` with the given concealment% and buffer
+    /// depth (test convenience).
+    fn active_sample(concealment_pct: f64, buffer_ms: f64) -> AudioSourceSample {
+        AudioSourceSample {
+            concealment_pct,
+            buffer_ms,
+            active: true,
+        }
+    }
+
+    /// Full byte-exact pin of the AUDIO_SCALE line. The meeting analyzer greps
+    /// individual `key=value` tokens, so ANY format drift (a renamed key, a lost
+    /// token, a changed decimal count) silently breaks field analysis — this
+    /// asserts the ENTIRE line. Dropping any token from the format string fails
+    /// here. Arithmetic: concealment [20,40,60] => mean 40.0 / worst 60.0;
+    /// buffers [100,200,300] => min 100.0 / mean 200.0 (all distinct, so a
+    /// min↔mean or mean↔worst swap also fails).
+    #[test]
+    fn audio_scale_line_byte_exact_format() {
+        let samples = [
+            active_sample(20.0, 100.0),
+            active_sample(40.0, 200.0),
+            active_sample(60.0, 300.0),
+        ];
+        let line = format_audio_scale_line(&samples, 5.5, 8)
+            .expect(">=1 active source must produce a line");
+        assert_eq!(
+            line,
+            "[AUDIO_SCALE] sources=3 concealed=3 worst_pct=60.0 mean_pct=40.0 downlink_mbps=5.5 min_buf_ms=100.0 mean_buf_ms=200.0 cores=8"
+        );
+    }
+
+    /// Unknown downlink (`<= 0`) and unknown cores (`0`) render as the `-1.0` and
+    /// `-1` sentinels — never a fabricated zero. Fails if either sentinel branch
+    /// is dropped.
+    #[test]
+    fn audio_scale_line_unknown_downlink_and_cores_sentinels() {
+        let samples = [active_sample(50.0, 150.0)];
+        let line = format_audio_scale_line(&samples, 0.0, 0)
+            .expect(">=1 active source must produce a line");
+        assert_eq!(
+            line,
+            "[AUDIO_SCALE] sources=1 concealed=1 worst_pct=50.0 mean_pct=50.0 downlink_mbps=-1.0 min_buf_ms=150.0 mean_buf_ms=150.0 cores=-1"
+        );
+    }
+
+    /// The `concealed` count uses a STRICT `>` at exactly 10.0%
+    /// (AUDIO_SCALE_CONCEAL_THRESHOLD_PCT): a source sitting on the threshold is
+    /// NOT counted, one just above it is. Fails if the comparison flips to `>=`
+    /// (both would count => concealed=2) or the constant moves off 10.0.
+    #[test]
+    fn audio_scale_conceal_threshold_is_strict_at_10() {
+        let samples = [active_sample(10.0, 120.0), active_sample(10.1, 120.0)];
+        let line = format_audio_scale_line(&samples, 3.0, 4)
+            .expect(">=1 active source must produce a line");
+        assert!(
+            line.contains(" concealed=1 "),
+            "exactly-10.0% must not count, only 10.1%; got: {line}"
+        );
+    }
+
+    /// No ACTIVE source this tick (empty room / everyone muted / all DTX) => no
+    /// line at all. A `sources=0` line is pure analyzer noise, so it is
+    /// suppressed rather than emitted.
+    #[test]
+    fn audio_scale_line_none_when_no_active_sources() {
+        assert_eq!(format_audio_scale_line(&[], 5.0, 8), None);
+        let inactive = [AudioSourceSample {
+            concealment_pct: 0.0,
+            buffer_ms: 0.0,
+            active: false,
+        }];
+        assert_eq!(format_audio_scale_line(&inactive, 5.0, 8), None);
+    }
+
+    /// Inactive sources are excluded from EVERY aggregate. A muted peer showing a
+    /// stale 100% concealment / 0ms buffer must not pollute sources, worst_pct,
+    /// mean_pct, or min_buf_ms. The expected line is identical to the all-active
+    /// case above precisely because the outlier is dropped.
+    #[test]
+    fn audio_scale_aggregates_only_active_sources() {
+        let samples = [
+            active_sample(20.0, 100.0),
+            active_sample(40.0, 200.0),
+            active_sample(60.0, 300.0),
+            AudioSourceSample {
+                concealment_pct: 100.0,
+                buffer_ms: 0.0,
+                active: false,
+            },
+        ];
+        let line = format_audio_scale_line(&samples, 5.5, 8)
+            .expect(">=1 active source must produce a line");
+        assert_eq!(
+            line,
+            "[AUDIO_SCALE] sources=3 concealed=3 worst_pct=60.0 mean_pct=40.0 downlink_mbps=5.5 min_buf_ms=100.0 mean_buf_ms=200.0 cores=8"
+        );
+    }
+
+    /// The active gate is exactly `packets_per_sec >= AUDIO_ACTIVE_PPS_GATE`
+    /// (2.0): 2.0 is active, anything below is not. This is the SAME gate the
+    /// per-stream audio_concealment_pct uses, so the two cannot diverge. Fails if
+    /// the constant moves off 2.0 or the comparison loosens.
+    #[test]
+    fn audio_source_active_gate_pinned_at_2_pps() {
+        assert!(audio_source_active(2.0), "2.0 pps must be active");
+        assert!(audio_source_active(50.0));
+        assert!(
+            !audio_source_active(1.999),
+            "just below 2.0 must be inactive"
+        );
+        assert!(!audio_source_active(0.0));
+    }
+
+    /// Build a HealthPacket through the production `create_health_packet` path
+    /// from a NetEQ JSON, and return the on-the-wire
+    /// `(PeerStats.audio_concealment_pct, NetEqStats.current_buffer_size_ms)`.
+    fn health_packet_audio_stats(neteq: Value) -> (f64, f64) {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.update_audio_stats(neteq);
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
+            0.0, // encoder_queue_depth_report
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
+            None,
+            None,
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf");
+        let ps = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present");
+        let buf = ps
+            .neteq_stats
+            .as_ref()
+            .map(|n| n.current_buffer_size_ms)
+            .unwrap_or(0.0);
+        (ps.audio_concealment_pct, buf)
+    }
+
+    /// LOCKSTEP: the AUDIO_SCALE sample's concealment% and buffer depth must
+    /// equal what the production `create_health_packet` path puts on the wire for
+    /// the same NetEQ JSON (both go through `audio_source_sample_from_neteq`). If
+    /// the shared helper and the per-stream mapping ever diverge (different gate,
+    /// clamp, or field), the `concealed`/`worst`/`mean` counts in AUDIO_SCALE
+    /// would stop matching the per-stream audio_concealment_pct the analyzer ALSO
+    /// reads — this test breaks first.
+    #[test]
+    fn audio_scale_sample_matches_health_packet_concealment() {
+        // 2 expand/s over 10 pkt/s => 20% concealment; 200ms buffer.
+        let neteq = json!({
+            "current_buffer_size_ms": 200.0,
+            "packets_per_sec": 10.0,
+            "network": { "operation_counters": { "expand_per_sec": 2.0 } },
+        });
+        let sample = audio_source_sample_from_neteq(&neteq);
+        assert!(sample.active);
+        let (proto_pct, proto_buf) = health_packet_audio_stats(neteq);
+        assert!(
+            (sample.concealment_pct - proto_pct).abs() < 1e-9,
+            "helper {} vs proto {}",
+            sample.concealment_pct,
+            proto_pct
+        );
+        assert!((sample.concealment_pct - 20.0).abs() < 1e-9);
+        assert!((sample.buffer_ms - proto_buf).abs() < 1e-9);
+        assert!((sample.buffer_ms - 200.0).abs() < 1e-9);
+    }
+
+    /// Below the pps gate the production path leaves audio_concealment_pct at 0.0
+    /// AND the helper reports inactive with 0.0 — verified in lockstep so a
+    /// DTX-silent source never inflates the AUDIO_SCALE aggregates.
+    #[test]
+    fn audio_scale_sample_inactive_below_gate_matches_health_packet() {
+        // 1.0 pkt/s is below the 2.0 gate: concealment must NOT be computed.
+        let neteq = json!({
+            "current_buffer_size_ms": 120.0,
+            "packets_per_sec": 1.0,
+            "network": { "operation_counters": { "expand_per_sec": 5.0 } },
+        });
+        let sample = audio_source_sample_from_neteq(&neteq);
+        assert!(!sample.active, "1.0 pps is below the gate");
+        assert_eq!(sample.concealment_pct, 0.0);
+        let (proto_pct, _) = health_packet_audio_stats(neteq);
+        assert_eq!(
+            proto_pct, 0.0,
+            "production path must leave concealment at 0.0 below the gate"
+        );
+    }
 
     #[test]
     fn cpu_throttled_boundary_and_missing_inputs() {
@@ -2639,6 +3325,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -2660,12 +3349,13 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
-            0,              // effective_screen_layers (#1561)
-            0,              // active_screen_layers (#1561)
-            0,              // effective_audio_layers (#1561)
-            0,              // audio_congestion_ceiling (#1561)
-            0,              // active_audio_layers (#1561)
-            HashMap::new(), // received_layers (#1561)
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2726,6 +3416,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -2747,12 +3440,13 @@ mod tests {
             None, // #1482: client_main_thread_load
             decode_budget,
             None,
-            0,              // effective_screen_layers (#1561)
-            0,              // active_screen_layers (#1561)
-            0,              // effective_audio_layers (#1561)
-            0,              // audio_congestion_ceiling (#1561)
-            0,              // active_audio_layers (#1561)
-            HashMap::new(), // received_layers (#1561)
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2796,6 +3490,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -2817,12 +3514,13 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
-            0,              // effective_screen_layers (#1561)
-            0,              // active_screen_layers (#1561)
-            0,              // effective_audio_layers (#1561)
-            0,              // audio_congestion_ceiling (#1561)
-            0,              // active_audio_layers (#1561)
-            HashMap::new(), // received_layers (#1561)
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2881,6 +3579,10 @@ mod tests {
     ) -> PbHealthPacket {
         let mut peer = PeerHealthData::new("peer-1".to_string());
         peer.wt_datagram_audio_loss_per_sec = loss;
+        // Issue 2031: seed a DISTINCT raw magnitude (10x the capped value) so the
+        // raw-fold tests can prove the raw path folds its own field, not the
+        // capped one.
+        peer.wt_datagram_audio_raw_loss_per_sec = loss * 10.0;
 
         let mut health_map = HashMap::new();
         health_map.insert("peer-1".to_string(), peer);
@@ -2904,6 +3606,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -2925,12 +3630,13 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
-            0,              // effective_screen_layers (#1561)
-            0,              // active_screen_layers (#1561)
-            0,              // effective_audio_layers (#1561)
-            0,              // audio_congestion_ceiling (#1561)
-            0,              // active_audio_layers (#1561)
-            HashMap::new(), // received_layers (#1561)
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -2982,6 +3688,256 @@ mod tests {
         );
     }
 
+    /// Issue 2031: on WebTransport the per-peer RAW audio-datagram-loss magnitude
+    /// must fold into PeerStats.audio_datagram_raw_loss_per_sec as its OWN value
+    /// (the helper seeds raw = 10x the capped value), proving the raw path is not
+    /// a duplicate of the capped one.
+    ///
+    /// MUTATION: removing the `ps.audio_datagram_raw_loss_per_sec = Some(...)`
+    /// fold makes this decode as `None`; folding the capped value instead makes it
+    /// `Some(9.0)` — both fail the `Some(90.0)` assertion.
+    #[test]
+    fn create_health_packet_folds_raw_audio_datagram_loss_on_webtransport() {
+        let pb = health_packet_with_audio_datagram_loss(9.0, "webtransport");
+        let ps = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer-1 must have a PeerStats entry");
+        assert_eq!(
+            ps.audio_datagram_raw_loss_per_sec,
+            Some(90.0),
+            "WT reporter must fold the uncapped raw magnitude (10x the capped 9.0)"
+        );
+        // And it must be DISTINCT from the capped rate — the whole point of 2031.
+        assert_ne!(
+            ps.audio_datagram_raw_loss_per_sec, ps.audio_datagram_loss_per_sec,
+            "raw magnitude must not equal the capped presence signal"
+        );
+    }
+
+    /// Issue 2031: on WebSocket the raw field folds definitional 0.0 (audio rides
+    /// ordered TCP), un-latching the gauge on a WT->WS fallback exactly like the
+    /// capped sibling. The helper seeds raw = 70.0 (10x the 7.0 stale capped
+    /// value); the WS leg must OVERRIDE it with 0.0.
+    ///
+    /// MUTATION: removing the `reporter_on_webtransport` gate folds the stale
+    /// tracker value, decoding as `Some(70.0)` and failing this.
+    #[test]
+    fn create_health_packet_folds_zero_raw_audio_datagram_loss_on_websocket() {
+        let pb = health_packet_with_audio_datagram_loss(7.0, "websocket");
+        let ps = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer-1 must have a PeerStats entry");
+        assert_eq!(
+            ps.audio_datagram_raw_loss_per_sec,
+            Some(0.0),
+            "WebSocket reporter must fold definitional 0.0 for the raw magnitude too"
+        );
+    }
+
+    /// Issue 2031: build a HealthPacket through the production path with the given
+    /// per-client WT receive telemetry and (optionally) active audio sources for
+    /// the concealment mean, then round-trip through protobuf.
+    fn health_packet_with_wt_telemetry(
+        telemetry: WtReceiveTelemetry,
+        active_server_type: &str,
+        neteq_stats: &[serde_json::Value],
+    ) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        // Always include at least one peer so the packet is built.
+        for (i, neteq) in neteq_stats.iter().enumerate() {
+            let pid = format!("peer-{i}");
+            let mut peer = PeerHealthData::new(pid.clone());
+            peer.last_neteq_stats = Some(neteq.clone());
+            health_map.insert(pid, peer);
+        }
+        if health_map.is_empty() {
+            health_map.insert(
+                "peer-0".to_string(),
+                PeerHealthData::new("peer-0".to_string()),
+            );
+        }
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some(active_server_type.to_string()),
+            Some(42.0),
+            None,       // send_queue_bytes
+            None,       // packets_received_per_sec
+            None,       // packets_sent_per_sec
+            0,          // adaptive_video_tier
+            0,          // adaptive_audio_tier
+            0,          // datagram_drops_total
+            0,          // unistream_bytes_offered_total
+            0,          // unistream_bytes_drained_total
+            0,          // websocket_drops_total
+            0,          // keyframe_requests_sent_total
+            0,          // unistream_stale_delta_drops_total
+            0.0,        // encoder_queue_depth_report
+            0.0,        // encoder_target_bitrate_kbps
+            0,          // adaptive_screen_tier
+            false,      // screen_sharing_active
+            0,          // encoder_output_fps
+            0,          // effective_video_layers
+            0,          // active_video_layers
+            Vec::new(), // tier_transitions
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),   // dwell_samples
+            0,            // handshake_failures_total
+            0,            // session_drops_total
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
+            [0, 0, 0, 0], // reelection_totals
+            Vec::new(),   // longtask_durations
+            None,         // render_fps
+            ClientMetadata::default(),
+            None,           // client_main_thread_load
+            None,           // decode_budget
+            None,           // agent_memory_bytes
+            0,              // effective_screen_layers
+            0,              // active_screen_layers
+            0,              // effective_audio_layers
+            0,              // audio_congestion_ceiling
+            0,              // active_audio_layers
+            HashMap::new(), // received_layers
+            telemetry,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// Issue 2031: the per-client read-loop max gap must fold UNCONDITIONALLY as
+    /// Some (recover-to-0 semantics), and the observed queue read-back must fold
+    /// its two finite values.
+    ///
+    /// MUTATION: removing the `pb.wt_datagram_read_loop_max_gap_ms = Some(...)`
+    /// fold decodes as `None`; removing the queue-read-back fold decodes both
+    /// queue fields as `None`.
+    #[test]
+    fn create_health_packet_folds_wt_receive_telemetry() {
+        let telemetry = WtReceiveTelemetry {
+            read_loop_max_gap_ms: 350.0,
+            incoming_queue_readback: Some((2048.0, 3000.0)),
+        };
+        let pb = health_packet_with_wt_telemetry(telemetry, "webtransport", &[]);
+        assert_eq!(
+            pb.wt_datagram_read_loop_max_gap_ms,
+            Some(350.0),
+            "read-loop max gap must fold through as Some(350.0)"
+        );
+        assert_eq!(
+            pb.wt_incoming_datagram_high_water_mark,
+            Some(2048.0),
+            "observed incomingHighWaterMark must fold through"
+        );
+        assert_eq!(
+            pb.wt_incoming_datagram_max_age_ms,
+            Some(3000.0),
+            "observed incomingMaxAge must fold through"
+        );
+    }
+
+    /// Issue 2031: a NaN observed max-age (spec `null` = unbounded, or setter not
+    /// honored) must fold as the -1.0 wire sentinel so the gauge stays finite —
+    /// NOT as NaN, and NOT omitted.
+    ///
+    /// MUTATION: replacing the `if max_age.is_nan() { -1.0 }` mapping with a plain
+    /// `max_age` fold makes this decode as NaN, and `Some(NaN) == Some(-1.0)` is
+    /// false, failing the assertion.
+    #[test]
+    fn create_health_packet_maps_unbounded_max_age_to_sentinel() {
+        let telemetry = WtReceiveTelemetry {
+            read_loop_max_gap_ms: 0.0,
+            incoming_queue_readback: Some((4096.0, f64::NAN)),
+        };
+        let pb = health_packet_with_wt_telemetry(telemetry, "webtransport", &[]);
+        assert_eq!(
+            pb.wt_incoming_datagram_max_age_ms,
+            Some(-1.0),
+            "unbounded (NaN) max-age must map to the -1.0 sentinel, not NaN"
+        );
+        assert_eq!(
+            pb.wt_incoming_datagram_high_water_mark,
+            Some(4096.0),
+            "the hwm read-back is unaffected by the max-age sentinel mapping"
+        );
+    }
+
+    /// Issue 2031: a WebSocket-only client (no WT queue ever configured) omits the
+    /// queue read-back fields entirely (proto3 absent), costing nothing on the
+    /// wire. read_loop_max_gap_ms still folds (as the 0.0 default here).
+    #[test]
+    fn create_health_packet_omits_queue_readback_without_wt() {
+        let pb = health_packet_with_wt_telemetry(WtReceiveTelemetry::default(), "websocket", &[]);
+        assert_eq!(
+            pb.wt_incoming_datagram_high_water_mark, None,
+            "queue read-back must be omitted when the WT queue was never configured"
+        );
+        assert_eq!(pb.wt_incoming_datagram_max_age_ms, None);
+        assert_eq!(
+            pb.wt_datagram_read_loop_max_gap_ms,
+            Some(0.0),
+            "read-loop gap still folds as the 0.0 default (recover-to-0 semantics)"
+        );
+    }
+
+    /// Issue 2031: the per-client audio-concealment field must fold the MEAN over
+    /// ACTIVE sources — peer A at 50% and peer B at 20% => 35%.
+    ///
+    /// MUTATION: dividing by a hardcoded 1 instead of `concealment_active_sources`
+    /// (or summing without averaging) yields 70.0, failing the ~35.0 assertion.
+    #[test]
+    fn create_health_packet_folds_mean_concealment_over_active_sources() {
+        // 50 pps (>= the 2.0 active gate). expand/packets*100 => concealment%.
+        let peer_a = json!({
+            "packets_per_sec": 50.0,
+            "network": { "operation_counters": { "expand_per_sec": 25.0 } } // 50%
+        });
+        let peer_b = json!({
+            "packets_per_sec": 50.0,
+            "network": { "operation_counters": { "expand_per_sec": 10.0 } } // 20%
+        });
+        let pb = health_packet_with_wt_telemetry(
+            WtReceiveTelemetry::default(),
+            "webtransport",
+            &[peer_a, peer_b],
+        );
+        let mean = pb
+            .client_audio_concealment_pct
+            .expect("client concealment must be Some when a source is active");
+        assert!(
+            (mean - 35.0).abs() < 1e-9,
+            "mean concealment over active sources must be (50 + 20) / 2 = 35.0; got {mean}"
+        );
+    }
+
+    /// Issue 2031: with no active audio source, the per-client concealment field
+    /// is ABSENT (None) — absent means "no audio flowing", not "0% concealment".
+    #[test]
+    fn create_health_packet_omits_concealment_when_no_active_source() {
+        // 1 pps is below the 2.0 active gate => inactive, contributes nothing.
+        let idle = json!({
+            "packets_per_sec": 1.0,
+            "network": { "operation_counters": { "expand_per_sec": 0.0 } }
+        });
+        let pb =
+            health_packet_with_wt_telemetry(WtReceiveTelemetry::default(), "webtransport", &[idle]);
+        assert_eq!(
+            pb.client_audio_concealment_pct, None,
+            "no active source => concealment field omitted (absent != 0%)"
+        );
+    }
+
     /// #1032: build a HealthPacket through the production path with the given
     /// cached agent-memory value, then round-trip it through protobuf so the
     /// assertions are on exactly what goes on the wire.
@@ -3011,6 +3967,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3032,17 +3991,124 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             agent_memory_bytes,
-            0,              // effective_screen_layers (#1561)
-            0,              // active_screen_layers (#1561)
-            0,              // effective_audio_layers (#1561)
-            0,              // audio_congestion_ceiling (#1561)
-            0,              // active_audio_layers (#1561)
-            HashMap::new(), // received_layers (#1561)
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #1737 Phase 0: build a HealthPacket through the production path with the
+    /// given unistream offered/drained byte totals, then round-trip it through
+    /// protobuf so the assertion is on exactly what goes on the wire.
+    fn health_packet_with_unistream_bytes(
+        offered_bytes: u64,
+        drained_bytes: u64,
+        stale_delta_drops: u64,
+    ) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,                 // datagram_drops_total
+            offered_bytes,     // unistream_bytes_offered_total (#1737)
+            drained_bytes,     // unistream_bytes_drained_total (#1737)
+            stale_delta_drops, // unistream_stale_delta_drops_total (#1737 Phase 1)
+            0,                 // websocket_drops_total
+            0,                 // keyframe_requests_sent_total
+            0.0,               // encoder_queue_depth_report
+            0.0,               // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
+            None,
+            None,                          // agent_memory_bytes
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #1737 Phase 0: the two new unistream byte totals must survive the encode
+    /// -> wire -> decode round-trip on the correct wire tags and in the correct
+    /// argument slots. DISTINCT non-zero values (offered != drained) are used so
+    /// a tag collision, a generated-code mistake, or an offered/drained argument
+    /// transposition in `create_health_packet` all fail this test — the zero-only
+    /// coverage in the sibling builder tests cannot catch any of those.
+    ///
+    /// MUTATION: swapping the offered/drained/stale-drop arguments (or dropping any
+    /// `pb.unistream_*_total = Some(..)` assignment) makes the decoded value wrong
+    /// or `None`, failing the corresponding assertion. The #1737 Phase-1
+    /// `unistream_stale_delta_drops_total` (field 104) is covered with a third
+    /// distinct value so a tag collision or arg transposition against the two
+    /// Phase-0 byte totals is also caught.
+    #[test]
+    fn create_health_packet_roundtrips_unistream_byte_totals() {
+        let pb = health_packet_with_unistream_bytes(5000, 1200, 37);
+        assert_eq!(
+            pb.unistream_bytes_offered_total,
+            Some(5000),
+            "offered byte total must round-trip as Some(5000) on its own wire tag"
+        );
+        assert_eq!(
+            pb.unistream_bytes_drained_total,
+            Some(1200),
+            "drained byte total must round-trip as Some(1200) — distinct from offered, \
+             so an offered/drained transposition is caught"
+        );
+        assert_eq!(
+            pb.unistream_stale_delta_drops_total,
+            Some(37),
+            "stale-delta-drops total must round-trip as Some(37) on field 104 — distinct \
+             from the byte totals so a tag collision or arg transposition is caught"
+        );
     }
 
     fn health_packet_with_camera_playout_stats(fps_received: f64) -> PbHealthPacket {
@@ -3080,6 +4146,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3101,12 +4170,13 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
-            0,              // effective_screen_layers (#1561)
-            0,              // active_screen_layers (#1561)
-            0,              // effective_audio_layers (#1561)
-            0,              // audio_congestion_ceiling (#1561)
-            0,              // active_audio_layers (#1561)
-            HashMap::new(), // received_layers (#1561)
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -3314,6 +4384,77 @@ mod tests {
         );
     }
 
+    /// Issue 2029: `process_diagnostics_event` must surface the per-peer WT
+    /// audio-datagram loss sample (peer id + pkt/s) so the subscription loop can
+    /// forward it into the connection layer's fallback detector — INCLUDING a
+    /// 0.0 sample (a healthy WT audio peer must stay in the uniformity
+    /// denominator). Unrelated events must return None so nothing else is fed.
+    #[test]
+    fn process_diagnostics_event_surfaces_wt_audio_loss_sample() {
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let loss_event = |to_peer: &'static str, loss: f64| DiagEvent {
+            subsystem: "neteq",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "from_peer",
+                    value: MetricValue::Text(Cow::Borrowed("self")),
+                },
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed(to_peer)),
+                },
+                Metric {
+                    name: "wt_datagram_audio_loss_per_sec",
+                    value: MetricValue::F64(loss),
+                },
+            ],
+        };
+
+        // A nonzero loss sample is surfaced with its peer id and rate.
+        assert_eq!(
+            HealthReporter::process_diagnostics_event(
+                loss_event("peer-1", 22.0),
+                &peer_health_data
+            ),
+            Some(("peer-1".to_string(), 22.0)),
+            "a nonzero WT audio-loss sample must be forwarded"
+        );
+        // A ZERO sample is still surfaced (healthy peer stays in the denominator).
+        assert_eq!(
+            HealthReporter::process_diagnostics_event(loss_event("peer-2", 0.0), &peer_health_data),
+            Some(("peer-2".to_string(), 0.0)),
+            "a 0.0 WT audio-loss sample must also be forwarded"
+        );
+        // An unrelated event carries no loss sample.
+        let unrelated = DiagEvent {
+            subsystem: "neteq",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-3")),
+                },
+                Metric {
+                    name: "audio_buffer_ms",
+                    value: MetricValue::U64(120),
+                },
+            ],
+        };
+        assert_eq!(
+            HealthReporter::process_diagnostics_event(unrelated, &peer_health_data),
+            None,
+            "an event without the loss gauge must not be forwarded"
+        );
+    }
+
     /// #1252 resync governor counter folds at fps > 0 — like every other field. The DISTINCT
     /// behavior (folds even at fps == 0) is pinned by the sibling test below; this one guards the
     /// ordinary case so a regression that drops the field entirely is also caught.
@@ -3394,6 +4535,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3415,12 +4559,13 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
-            0,              // effective_screen_layers (#1561)
-            0,              // active_screen_layers (#1561)
-            0,              // effective_audio_layers (#1561)
-            0,              // audio_congestion_ceiling (#1561)
-            0,              // active_audio_layers (#1561)
-            HashMap::new(), // received_layers (#1561)
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -3523,6 +4668,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3544,12 +4692,13 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             None,
-            0,              // effective_screen_layers (#1561)
-            0,              // active_screen_layers (#1561)
-            0,              // effective_audio_layers (#1561)
-            0,              // audio_congestion_ceiling (#1561)
-            0,              // active_audio_layers (#1561)
-            HashMap::new(), // received_layers (#1561)
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -3635,6 +4784,9 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
+            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
             0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
@@ -3656,12 +4808,13 @@ mod tests {
             None, // #1482: client_main_thread_load
             None,
             Some(512),
-            0,              // effective_screen_layers (#1561)
-            0,              // active_screen_layers (#1561)
-            0,              // effective_audio_layers (#1561)
-            0,              // audio_congestion_ceiling (#1561)
-            0,              // active_audio_layers (#1561)
-            HashMap::new(), // received_layers (#1561)
+            0,                             // effective_screen_layers (#1561)
+            0,                             // active_screen_layers (#1561)
+            0,                             // effective_audio_layers (#1561)
+            0,                             // audio_congestion_ceiling (#1561)
+            0,                             // active_audio_layers (#1561)
+            HashMap::new(),                // received_layers (#1561)
+            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
         )
         .expect("empty peer map must still produce a packet");
 

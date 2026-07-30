@@ -178,6 +178,19 @@ async function clickReaction(page: Page, slug: string): Promise<void> {
   await page.locator(`[data-testid="reaction-option-${slug}"]`).click();
 }
 
+/**
+ * Open the palette (if needed) and reveal the standard-emoji picker (CUSTOM
+ * reaction, issue 1884). Idempotent: the "More emoji" toggle reflects its state
+ * in aria-expanded, so we only click it when the picker is not already shown.
+ */
+async function openEmojiPicker(page: Page): Promise<void> {
+  await ensureReactionsPaletteOpen(page);
+  const picker = page.locator('[data-testid="emoji-picker"]');
+  if (await picker.isVisible().catch(() => false)) return;
+  await page.locator('[data-testid="emoji-picker-open"]').click();
+  await expect(picker).toBeVisible({ timeout: 5000 });
+}
+
 /** Join a meeting as the sole host (grid visible) — enough for palette-only
  * specs that need no peer. Returns the host page; the caller closes `browser`. */
 async function hostInMeeting(
@@ -191,6 +204,64 @@ async function hostInMeeting(
   await page.waitForTimeout(1500);
   expect(await joinMeetingFromPage(page)).toBe("in-meeting");
   return page;
+}
+
+/**
+ * Switch the meeting page to LIGHT theme via the real Appearance toggle, then
+ * close the settings modal. Copied from the proven idiom in
+ * peer-toast-light-contrast.spec.ts (which is itself @bvt1): the "Light" icon
+ * button sets `html[data-theme]="light"` synchronously.
+ *
+ * Call this BEFORE opening the reactions palette — the settings modal's clicks
+ * bubble to #main-container's onclick, which sets `reactions_open` false.
+ */
+async function setLightThemeFromMeeting(page: Page): Promise<void> {
+  await page.locator(".video-controls-container").hover();
+  await page.locator('[data-testid="open-settings"]').click();
+  await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+
+  await page.getByRole("tab", { name: "Appearance" }).click();
+  await expect(page.locator("#settings-panel-appearance")).toBeVisible({ timeout: 5_000 });
+  await page.getByRole("button", { name: "Light", exact: true }).click();
+
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
+      timeout: 3_000,
+    })
+    .toBe("light");
+
+  await page.locator('button[aria-label="Close settings"]').click();
+  await expect(page.locator(".device-settings-modal")).not.toBeVisible({ timeout: 5_000 });
+}
+
+/**
+ * Rec.709 relative luminance of a computed `color`. Alpha is ignored on purpose:
+ * `getComputedStyle().color` is NOT composited against the background, so the raw
+ * channels are exactly the fixed-white vs theme-flipped near-black we want to
+ * discriminate. Same helper pair as peer-toast-light-contrast.spec.ts.
+ */
+function parseRgb(value: string): { r: number; g: number; b: number } {
+  const match = value.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+  if (!match) {
+    throw new Error(`Unsupported color format: ${value}`);
+  }
+  return { r: Number(match[1]), g: Number(match[2]), b: Number(match[3]) };
+}
+
+function luminance(value: string): number {
+  const { r, g, b } = parseRgb(value);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+// Theme-flipped tokens resolve near-black under light theme (--text-secondary
+// #636366 → ~99, --text-primary #1a1a1a → ~26); the fixed --on-dark-* values are
+// white (255). 180 sits between the two with no overlap.
+const LIGHT_LUMINANCE_FLOOR = 180;
+
+/** `data-testid` of the currently focused element, or null. Used to pin the
+ * palette's documented Tab order and the post-reset focus handoff. */
+async function activeTestId(page: Page): Promise<string | null> {
+  return page.evaluate(() => document.activeElement?.getAttribute("data-testid") ?? null);
 }
 
 test.describe("Two users in a meeting", () => {
@@ -481,11 +552,11 @@ test.describe("Two users in a meeting", () => {
     }
   });
 
-  test("rapid same-emoji reactions coalesce into a count badge within the concurrency cap", async ({
+  test("repeated same-emoji reactions each render as their own float (no count badge)", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:80";
-    const meetingId = `e2e_reaction_burst_${Date.now()}`;
+    const meetingId = `e2e_reaction_repeat_${Date.now()}`;
     const browser1 = await chromium.launch({ args: BROWSER_ARGS });
     const browser2 = await chromium.launch({ args: BROWSER_ARGS });
     try {
@@ -505,44 +576,327 @@ test.describe("Two users in a meeting", () => {
       const guestPage = await guestCtx.newPage();
       await enterTwoUserMeeting(hostPage, guestPage, meetingId);
 
-      // Case 6 + 7: a burst of the SAME emoji from one sender. The client
-      // self-throttle keeps sends within the relay budget, and the receiver
-      // coalesces repeats of the same (sender, emoji) into ONE float with a
-      // "×N" count badge instead of spawning a float per click. The palette
-      // stays open (persistence), so we open it once and click the same option
-      // repeatedly — re-opening would toggle it closed.
+      // Issue 1884 tweak: repeats of the SAME emoji are NO LONGER coalesced —
+      // each round-tripped reaction is its own float with its own animation, and
+      // there is NO "×N" count badge. The palette stays open (persistence), so we
+      // open it once and click the same option repeatedly.
       await ensureReactionsPaletteOpen(hostPage);
       const burstOption = hostPage.locator('[data-testid="reaction-option-thumbs_up"]');
-      const BURST = 8;
-      for (let i = 0; i < BURST; i++) {
+      const REPEATS = 3;
+      for (let i = 0; i < REPEATS; i++) {
         await burstOption.click();
-        // ~200ms between clicks. Back-to-back clicks can complete under the
-        // client's 350ms send min-interval on a fast runner, so the throttle
-        // would admit only ONE send and no ×N badge would appear. 200ms also
-        // clears the ~150ms local press gate (so each click is not coalesced
-        // away) while several still get through (coalescing within the 2s
-        // window).
-        await hostPage.waitForTimeout(200);
+        // ~400ms between clicks: clears the client's 350ms send min-interval so
+        // EVERY click sends (a tighter spacing would let the self-throttle drop
+        // some, weakening the "3 separate floats" assertion). Also clears the
+        // ~150ms local press gate.
+        await hostPage.waitForTimeout(400);
       }
 
-      // The count badge appears (coalescing happened) — assert DOM, never pixels.
-      const guestCount = guestPage.locator('[data-testid="reaction-float-count"]');
-      await expect(guestCount.first()).toBeVisible({ timeout: 10_000 });
-      const badgeText = (await guestCount.first().textContent()) || "";
-      const n = parseInt(badgeText.replace(/[^0-9]/g, ""), 10);
-      // Received count is bounded: >=2 (multiple round-tripped) and never more
-      // than the clicks issued (no phantom amplification / double-echo).
-      expect(n).toBeGreaterThanOrEqual(2);
-      expect(n).toBeLessThanOrEqual(BURST);
+      // The guest sees a SEPARATE float per received reaction — assert DOM, never
+      // pixels. >=2 proves the repeats did not merge into one; the exact count
+      // can vary with round-trip timing, so we assert the lower bound + the cap.
+      const guestFloats = guestPage.locator('[data-testid="reaction-float"]');
+      await expect
+        .poll(async () => await guestFloats.count(), { timeout: 10_000 })
+        .toBeGreaterThanOrEqual(2);
 
-      // The hard concurrency cap (MAX_CONCURRENT_REACTIONS = 12) is never
-      // exceeded. The exact drop-newest math is pinned by the host test
-      // integrate_drops_newest_at_the_hard_cap; here we assert the DOM bound.
-      const floatCount = await guestPage.locator('[data-testid="reaction-float"]').count();
-      expect(floatCount).toBeLessThanOrEqual(12);
+      // No count badge exists ANYWHERE — the ×N coalescing UI was removed. This
+      // is the assertion that FAILS on the old coalescing build (which merged
+      // repeats into one float carrying a reaction-float-count badge).
+      await expect(guestPage.locator('[data-testid="reaction-float-count"]')).toHaveCount(0);
+
+      // The hard concurrency cap (MAX_CONCURRENT_REACTIONS = 24) is never
+      // exceeded. The exact drop-oldest math is pinned by the host test
+      // integrate_drops_oldest_at_the_hard_cap; here we assert the DOM bound.
+      const floatCount = await guestFloats.count();
+      expect(floatCount).toBeLessThanOrEqual(24);
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+
+  test("custom emoji picker: guest sees the picked emoji as a float", async ({ baseURL }) => {
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_reaction_custom_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest@videocall.rs",
+        "GuestUser",
+        uiURL,
+      );
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+      await enterTwoUserMeeting(hostPage, guestPage, meetingId);
+
+      // Issue 1884: open the standard-emoji picker and pick a specific emoji.
+      // The grid's first cell in the default category (Smileys & Emotion) is a
+      // stable target; we read its glyph rather than hard-coding one so the test
+      // does not depend on the emoji-table ordering.
+      await openEmojiPicker(hostPage);
+      const firstEmoji = hostPage.locator('[data-testid="emoji-option-0"]');
+      await expect(firstEmoji).toBeVisible({ timeout: 5000 });
+      const glyph = (
+        (await firstEmoji.locator(".reaction-option__emoji").textContent()) || ""
+      ).trim();
+      expect(glyph.length).toBeGreaterThan(0);
+
+      await firstEmoji.click();
+
+      // The sender renders its own local "You" echo (relay self-skips the sender).
+      const hostEcho = hostPage
+        .locator('[data-testid="reaction-float"]')
+        .filter({ hasText: glyph })
+        .first();
+      await expect(hostEcho).toBeVisible({ timeout: 10_000 });
+
+      // The guest receives a float whose emoji text is exactly the picked glyph
+      // (rendered from the validated custom_emoji string, escaped by Dioxus).
+      const guestGlyphFloats = guestPage
+        .locator('[data-testid="reaction-float"] .reaction-float__emoji')
+        .filter({ hasText: glyph });
+      await expect(guestGlyphFloats.first()).toBeVisible({ timeout: 10_000 });
+
+      // Issue 1884 (recents): the picked emoji is now a palette quick-pick
+      // "recent" on the sender. It carries the same glyph and sits at index 0.
+      const recent0 = hostPage.locator('[data-testid="reaction-recent-0"]');
+      await expect(recent0).toBeVisible({ timeout: 5000 });
+      await expect(recent0.locator(".reaction-option__emoji")).toHaveText(glyph);
+
+      // Clicking the recent re-sends it as a CUSTOM reaction — the guest gets
+      // ANOTHER float of that glyph (count strictly increases). Space the click
+      // past the client's 350ms send min-interval so it definitely sends.
+      const before = await guestGlyphFloats.count();
+      await hostPage.waitForTimeout(500);
+      await recent0.click();
+      await expect
+        .poll(async () => await guestGlyphFloats.count(), { timeout: 10_000 })
+        .toBeGreaterThan(before);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  test("recent custom emojis: valid localStorage seed renders a quick-pick, invalid seed does not", async ({
+    baseURL,
+  }) => {
+    // Palette-only (recents render regardless of peers), so a single host is
+    // enough. Two contexts in one browser: one seeded with a VALID recent, one
+    // with a TAMPERED (non-emoji) recent. localStorage is seeded BEFORE nav (the
+    // app loads + sanitizes it at mount), per the repo's addInitScript precedent.
+    const uiURL = baseURL || "http://localhost:80";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      // VALID seed: 🚀 (a standard emoji NOT in the fixed row) must appear as
+      // reaction-recent-0 with its glyph.
+      const goodCtx = await createAuthenticatedContext(
+        browser1,
+        "host@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
+      await goodCtx.addInitScript(
+        `localStorage.setItem("reactions.recent_custom", ${JSON.stringify(JSON.stringify(["🚀"]))});`,
+      );
+      const goodPage = await goodCtx.newPage();
+      await fillAndSubmitJoinForm(goodPage, `e2e_recent_ok_${Date.now()}`, "HostUser");
+      await goodPage.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(goodPage)).toBe("in-meeting");
+      await ensureReactionsPaletteOpen(goodPage);
+      const recent0 = goodPage.locator('[data-testid="reaction-recent-0"]');
+      await expect(recent0).toBeVisible({ timeout: 5000 });
+      await expect(recent0.locator(".reaction-option__emoji")).toHaveText("🚀");
+      await goodPage.close();
+
+      // TAMPERED seed: "hello" is not an emoji — sanitize-on-load drops it, so the
+      // palette opens with NO recent quick-pick (validation on load; the
+      // assertion FAILS if load-validation is removed and "hello" is injected).
+      const badCtx = await createAuthenticatedContext(
+        browser1,
+        "guest@videocall.rs",
+        "GuestUser",
+        uiURL,
+      );
+      await badCtx.addInitScript(
+        `localStorage.setItem("reactions.recent_custom", ${JSON.stringify(JSON.stringify(["hello"]))});`,
+      );
+      const badPage = await badCtx.newPage();
+      await fillAndSubmitJoinForm(badPage, `e2e_recent_bad_${Date.now()}`, "GuestUser");
+      await badPage.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(badPage)).toBe("in-meeting");
+      await ensureReactionsPaletteOpen(badPage);
+      await expect(badPage.locator('[data-testid="reactions-palette"]')).toBeVisible();
+      await expect(badPage.locator('[data-testid="reaction-recent-0"]')).toHaveCount(0);
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  // TAGGED @bvt1 (unlike the untagged two-browser reaction specs above): this one
+  // is single-browser, single-join and palette-only, so it is cheap enough for the
+  // per-PR smoke superset — which is also how it gets a real run receipt.
+  test("reset control clears the custom-reaction quick-picks and the persisted key @bvt1", async ({
+    baseURL,
+  }) => {
+    // Issue 2086. Palette-only (recents render regardless of peers), so a single
+    // host is enough.
+    //
+    // FAILS ON UN-FIXED CODE: without the reset control the
+    // `reactions-reset-recents` locator never becomes visible and the test stops
+    // at that expect, before it ever presses Enter.
+    //
+    // Runs in LIGHT theme throughout. The palette paints --glass-popover-bg, which
+    // global.css defines only under html[data-theme="dark"], so the theme system
+    // never gives this surface a light background — light theme is exactly where a
+    // theme-flipping colour token would wash the reset glyph out. Setting the theme
+    // first (before the palette opens) means every leg below exercises the risky
+    // theme, and the luminance assertions catch a regression to
+    // --text-secondary/--text-primary (~99 / ~26) against the fixed white (255).
+    //
+    // The seed is written by an init script guarded on a one-shot marker: init
+    // scripts re-run on EVERY navigation in the context, so an unguarded seed
+    // would silently re-populate the key on the second page and turn the
+    // persistence half of this test vacuous (it would assert "still empty" against
+    // a list the harness had just re-seeded).
+    const uiURL = baseURL || "http://localhost:80";
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser1,
+        "host@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
+      await ctx.addInitScript(
+        `if (!localStorage.getItem("e2e.recents_seeded")) {
+           localStorage.setItem("e2e.recents_seeded", "1");
+           localStorage.setItem("reactions.recent_custom", ${JSON.stringify(
+             JSON.stringify(["🚀", "🎉"]),
+           )});
+         }`,
+      );
+
+      const page = await ctx.newPage();
+      await fillAndSubmitJoinForm(page, `e2e_recents_reset_${Date.now()}`, "HostUser");
+      await page.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(page)).toBe("in-meeting");
+
+      // Light theme BEFORE the palette opens (the modal's clicks would close it).
+      await setLightThemeFromMeeting(page);
+      await ensureReactionsPaletteOpen(page);
+
+      // The reset control and the quick-picks are SIBLINGS inside the palette
+      // (both direct children of .reactions-palette), so both anchor on the
+      // palette — never one on the other.
+      const palette = page.locator('[data-testid="reactions-palette"]');
+      const recent0 = palette.locator('[data-testid="reaction-recent-0"]');
+      const recent1 = palette.locator('[data-testid="reaction-recent-1"]');
+      const reset = palette.locator('[data-testid="reactions-reset-recents"]');
+
+      // PRESENCE FIRST: both seeded quick-picks and the reset control are really
+      // there, so the disappearance assertions below cannot pass vacuously.
+      await expect(recent0).toBeVisible({ timeout: 5000 });
+      await expect(recent0.locator(".reaction-option__emoji")).toHaveText("🚀");
+      await expect(recent1).toBeVisible();
+      await expect(reset).toBeVisible();
+      await expect(reset).toHaveAttribute("aria-label", "Clear recent emoji");
+      await expect(palette.locator(".reactions-recent-sep")).toHaveCount(1);
+
+      // LIGHT-THEME CONTRAST: the glyph stays light-on-dark in BOTH the rest and
+      // hover states. Reverting the CSS to --text-secondary/--text-primary drops
+      // these to ~99 / ~26, well under the floor — hover is the worse of the two,
+      // near-black on a dark surface, so it is asserted explicitly.
+      const restColor = await reset.evaluate((el) => getComputedStyle(el).color);
+      expect(luminance(restColor)).toBeGreaterThan(LIGHT_LUMINANCE_FLOOR);
+      await reset.hover();
+      const hoverColor = await reset.evaluate((el) => getComputedStyle(el).color);
+      expect(luminance(hoverColor)).toBeGreaterThan(LIGHT_LUMINANCE_FLOOR);
+
+      // KEYBOARD LEG: the documented Tab order (attendants.rs) runs
+      // highlighted-reaction -> recents -> reset -> More emoji. The ten
+      // non-highlighted reactions carry tabindex=-1, so Tab skips them. This is
+      // the only test behind those Tab-order comments.
+      await page.locator('[data-testid="reaction-option-thumbs_up"]').focus();
+      await page.keyboard.press("Tab");
+      expect(await activeTestId(page)).toBe("reaction-recent-0");
+      await page.keyboard.press("Tab");
+      expect(await activeTestId(page)).toBe("reaction-recent-1");
+      await page.keyboard.press("Tab");
+      expect(await activeTestId(page)).toBe("reactions-reset-recents");
+
+      // Activate from the keyboard — which is what makes the focus handoff below
+      // load-bearing, since this is the path that leaves focus on a button that is
+      // about to unmount.
+      await page.keyboard.press("Enter");
+
+      // The whole recents GROUP goes at once — quick-picks, divider, and the
+      // reset control itself (they share one emptiness condition in the RSX).
+      await expect(recent0).toHaveCount(0);
+      await expect(recent1).toHaveCount(0);
+      await expect(reset).toHaveCount(0);
+      await expect(palette.locator(".reactions-recent-sep")).toHaveCount(0);
+
+      // The palette STAYS OPEN — #main-container's onclick (which sets
+      // reactions_open false) never sees this activation, because the palette's own
+      // onclick stops propagation for every child. The fixed standard reactions are
+      // untouched: reset only removes the custom quick-picks.
+      await expect(palette).toBeVisible();
+      await expect(palette.locator('[data-testid="reaction-option-thumbs_up"]')).toBeVisible();
+
+      // Focus was on the button that just unmounted; it must have moved to the
+      // surviving "More emoji" sibling rather than dropping to <body>. Checked
+      // after the disappearance assertions so the re-render has certainly landed.
+      expect(await activeTestId(page)).toBe("emoji-picker-open");
+
+      // The persisted key is REMOVED, not left holding the old list.
+      const stored = await page.evaluate(() => localStorage.getItem("reactions.recent_custom"));
+      expect(stored).toBeNull();
+
+      // A fresh app mount (new page, same context/origin → same localStorage, and
+      // the guarded init script does NOT re-seed) still shows no quick-picks: the
+      // reset survived the reload, it did not just clear an in-memory signal.
+      await page.close();
+      const page2 = await ctx.newPage();
+      await fillAndSubmitJoinForm(page2, `e2e_recents_reset2_${Date.now()}`, "HostUser");
+      await page2.waitForTimeout(1500);
+      expect(await joinMeetingFromPage(page2)).toBe("in-meeting");
+      await ensureReactionsPaletteOpen(page2);
+      const palette2 = page2.locator('[data-testid="reactions-palette"]');
+      await expect(palette2).toBeVisible();
+      // Sanity: the palette really rendered its fixed row, so the empty-recents
+      // assertions below are about the recents and not about a palette that
+      // failed to mount.
+      await expect(palette2.locator('[data-testid="reaction-option-thumbs_up"]')).toBeVisible();
+      await expect(palette2.locator('[data-testid="reaction-recent-0"]')).toHaveCount(0);
+      await expect(palette2.locator('[data-testid="reactions-reset-recents"]')).toHaveCount(0);
+
+      // Reset is not a one-way door: the next custom send repopulates the row
+      // (and brings the reset control back with it), so the feature cannot wedge
+      // recents off permanently.
+      await openEmojiPicker(page2);
+      const firstEmoji = page2.locator('[data-testid="emoji-option-0"]');
+      await expect(firstEmoji).toBeVisible({ timeout: 5000 });
+      const glyph = (
+        (await firstEmoji.locator(".reaction-option__emoji").textContent()) || ""
+      ).trim();
+      expect(glyph.length).toBeGreaterThan(0);
+      await firstEmoji.click();
+      const newRecent0 = palette2.locator('[data-testid="reaction-recent-0"]');
+      await expect(newRecent0).toBeVisible({ timeout: 5000 });
+      await expect(newRecent0.locator(".reaction-option__emoji")).toHaveText(glyph);
+      await expect(palette2.locator('[data-testid="reactions-reset-recents"]')).toBeVisible();
+    } finally {
+      await browser1.close();
     }
   });
 

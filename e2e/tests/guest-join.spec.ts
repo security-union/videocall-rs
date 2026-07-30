@@ -230,6 +230,58 @@ test.describe("Guest join flow", () => {
     }
   });
 
+  test("guest observer logs the sticky websocket preference source", async ({ baseURL }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_guest_pref_log_${Date.now()}`;
+    const hostEmail = "host-guest-pref-log@videocall.rs";
+    const hostName = "HostGuestPrefLog";
+
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      await createMeetingViaApi(hostEmail, hostName, meetingId, {
+        allowGuests: true,
+        waitingRoomEnabled: true,
+      });
+
+      const { hostPage } = await hostStartsMeeting(browser, hostEmail, hostName, meetingId, uiURL);
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      const guestCtx = await createGuestContext(browser, uiURL);
+      const guestPage = await guestCtx.newPage();
+      const consoleLines: string[] = [];
+      guestPage.on("console", (message) => {
+        consoleLines.push(message.text());
+      });
+
+      await guestPage.goto("/");
+      await guestPage.evaluate(() => {
+        localStorage.setItem("vc_transport_preference", "websocket");
+        localStorage.setItem("vc_transport_sticky", "true");
+      });
+      await guestPage.reload();
+      await guestPage.goto(`/meeting/${meetingId}/guest`);
+
+      await guestPage.locator("#guest-name").fill("PreferenceGuest");
+      await guestPage.locator("#guest-name").press("Enter");
+      await expect(guestPage.getByText("Waiting to be admitted")).toBeVisible({ timeout: 20_000 });
+
+      await expect
+        .poll(
+          () =>
+            consoleLines.some(
+              (line) =>
+                line.includes("Transport preference applied:") &&
+                line.includes("pref=websocket") &&
+                line.includes("source=sticky"),
+            ),
+          { timeout: 15_000 },
+        )
+        .toBe(true);
+    } finally {
+      await browser.close();
+    }
+  });
+
   test("guest enters waiting room, host admits, guest transitions to admitted", async ({
     baseURL,
   }) => {

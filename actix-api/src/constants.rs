@@ -838,6 +838,28 @@ pub const REACTION_WINDOW_MS: u64 = 1000;
 /// would be user-hostile. The client re-sanitizes and re-caps on consume.
 pub const REACTION_DISPLAY_NAME_MAX_BYTES: usize = 256;
 
+/// Maximum number of BYTES of a CUSTOM reaction's `custom_emoji` field the relay
+/// will accept at ingress (issue #1884).
+///
+/// A CUSTOM reaction carries exactly ONE standard Unicode emoji in
+/// `ReactionPacket.custom_emoji`. This cap mirrors the client's
+/// `REACTION_CUSTOM_EMOJI_MAX_BYTES` (videocall-client's
+/// `client/reactions.rs`); the two MUST stay in lockstep because both enforce
+/// the SAME allowlist over the SAME `emojis` table.
+///
+/// 32 bytes admits every DEFAULT-skin-tone emoji the client picker offers — the
+/// longest of those is 28 bytes (a tag-sequence flag, e.g. 🏴󠁧󠁢󠁳󠁣󠁴󠁿), leaving 4
+/// bytes of headroom — while bounding a forged sender's decoded payload
+/// independent of table contents. It does NOT admit the whole `emojis` table:
+/// the 95 full-table skin-tone kiss-couple sequences are 35 bytes and are
+/// DELIBERATELY rejected (fail-closed). That is not a coverage gap — the picker
+/// never offers those variants, so a well-behaved client cannot send one, and a
+/// crafted 35-byte payload is exactly what the cap is meant to reject. UNLIKE
+/// `display_name`, an over-cap `custom_emoji` is DROPPED, not truncated: a
+/// truncated emoji is not a valid emoji, so the whole reaction is invalid.
+/// See [`crate::actors::packet_handler::custom_emoji_is_valid`].
+pub const REACTION_CUSTOM_EMOJI_MAX_BYTES: usize = 32;
+
 /// Maximum number of `session_ids` the relay will accept from a single
 /// VIEWPORT control packet (HCL issue #988).
 ///
@@ -1071,18 +1093,30 @@ pub const PARTICIPANT_REBROADCAST_COALESCE_MS: u64 = 300;
 /// it off every LAYER_PREFERENCE update / join / leave would couple a metric to
 /// the hot control path and add work to the O(n) reconnection storms the
 /// [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] debounce already exists to absorb. A
-/// gauge that lags real demand by at most one sweep is correct for dashboards.
+/// gauge that lags real demand by roughly one cycle plus the bounded
+/// continuation time is correct for dashboards.
 ///
 /// ## Why 10 s
 ///
-/// 10 s is twice the typical Prometheus scrape interval (so every scrape sees a
-/// fresh value with margin) yet an order of magnitude below the ~5 s receiver
-/// chooser / AQ adaptation loop's settling time at the dashboard timescale —
-/// demand shifts are visible within one sweep without the sweep itself being
-/// chatty. Each tick is O(rooms × min(sessions, 256)) of `RwLock::read()`-only
-/// work in the single-threaded actor (no `.write()`, no mailbox blocking), so a
-/// 10 s cadence keeps its amortized cost negligible even with many rooms.
+/// 10 s remains appropriate at dashboard timescales without making the sweep
+/// chatty. Demand shifts become visible after the next completed cycle. A cycle
+/// is split into bounded mailbox messages (see
+/// [`LAYER_PREFERENCE_SESSIONS_SWEEP_ROOMS_PER_MESSAGE`]), so the cadence controls
+/// snapshot freshness without making any single actor turn O(rooms).
 pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum live rooms refreshed by one layer-preference gauge sweep mailbox
+/// message (#1284).
+///
+/// A room scan is itself bounded by [`LAYER_HINT_MAX_RECEIVERS_SCANNED`]. Capping
+/// this second dimension prevents thousands of otherwise-small rooms from
+/// monopolizing the single-threaded chat-server actor in one turn. Continuation
+/// messages are appended to the mailbox, allowing connection and media-control
+/// work already queued there to run between chunks. The timer attempts a new
+/// round-robin cycle every [`LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL`]; if an
+/// unusually large prior cycle is still draining, that start is skipped rather
+/// than duplicating work.
+pub const LAYER_PREFERENCE_SESSIONS_SWEEP_ROOMS_PER_MESSAGE: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Receiver Downlink Congestion (#1219 Half 2)
@@ -1100,10 +1134,12 @@ pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_se
 /// epoch into a shared atomic on EVERY drop unconditionally (#1481), and the
 /// per-receiver fan-out closure reads it against THIS window. While the most
 /// recent drop is within the window, the closure (a) discards non-base-layer
-/// VIDEO/SCREEN BEFORE `try_send`, giving the downlink headroom to drain, and
+/// camera VIDEO BEFORE `try_send`, giving the downlink headroom to drain, and
 /// (b) emits one DOWNLINK_CONGESTION control packet so the client's
-/// LayerChooser steps its own receive layers down. AUDIO and base layer are
-/// NEVER shed.
+/// LayerChooser steps its own receive layers down. SCREEN is protected here per
+/// issue 1977 (the shared content outranks cameras; its relief is the
+/// priority_drop 90% fill backstop, one rung above camera VIDEO's 80%). AUDIO
+/// and base layer are NEVER shed.
 ///
 /// This is DELIBERATELY NOT keyed off the relay's actor-mailbox `Full` (which an
 /// earlier draft used): the mailbox sits in front of `outbound_tx` and overflows

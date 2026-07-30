@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
+use videocall_transport::webtransport::FrameDropMeta;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -254,6 +255,581 @@ fn should_drop_probe(in_flight_len: usize) -> bool {
 /// wording on [`MAX_SUSTAINED_SUPPRESSION_MS`].
 fn suppression_escalation_action(total_ms: f64, max_ms: f64) -> bool {
     total_ms > max_ms
+}
+
+/// Format an optional RTT as a one-decimal value or a stable null marker.
+fn fmt_opt_rtt(v: Option<f64>) -> String {
+    v.map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// Pure decision for the WT saturation governor's RTT baseline feed (issue 1976):
+/// the RTT to hand [`videocall_transport::webtransport::set_uplink_rtt_baseline_ms`]
+/// this tick.
+///
+/// Returns the Elected connection's average RTT only when it exists AND the
+/// RTT-probe pipeline is not stale; otherwise `None`, which RESETS the transport
+/// baseline to its floor. `elected_avg_rtt` is already `None` whenever we are not
+/// in `Elected` state (the caller only reads it there), so a re-election (Testing)
+/// re-anchors on the new path, and a stale-probe window (elevated/garbage RTT)
+/// falls back to the absolute floor rather than pinning a bogus high baseline that
+/// would desensitize saturation detection. Mirrors the exact suppression logic of
+/// the `active_server_rtt` metric so the governor and the dashboards agree.
+///
+/// Split out as a pure fn so the "reset on stale / re-election" lifecycle is
+/// host-testable without the wasm diagnostics machinery.
+fn uplink_rtt_baseline_feed(elected_avg_rtt: Option<f64>, rtt_probe_stale: bool) -> Option<f64> {
+    if rtt_probe_stale {
+        return None;
+    }
+    elected_avg_rtt
+}
+
+// ---------------------------------------------------------------------------
+// Issue 2029: automatic WebSocket fallback on sustained, cross-sender-uniform
+// WebTransport audio-datagram loss.
+//
+// A receiver measures per-peer audio-datagram loss (issue 1878, the
+// `wt_datagram_audio_loss_per_sec` gauge) but nothing acted on it, and the one
+// watchdog that could — `check_rtt_degradation` — is suppressed by the exact
+// condition that produces the loss (a constrained receiver keeps trickling
+// audio, so `recent_inbound` stays true, and sets `cpu_overloaded`). The
+// detector below runs on the same 1 Hz tick but INDEPENDENTLY of that
+// suppression, and on a sustained + uniform loss signal forces this session
+// onto WebSocket for the rest of its life. Uniform loss across every
+// audio-active sender is a receive-queue drop (WS fixes it); per-sender-only
+// loss is network-path loss (WS would NOT fix it — do not fire).
+// ---------------------------------------------------------------------------
+
+/// Loss rate (lost audio packets/sec) at or above which one WebTransport audio
+/// peer counts as "lossy" in a single 1 Hz sample.
+///
+/// Audio rides roughly 50 packets/sec (Opus 20 ms frames), so 5 pkt/s is about
+/// 10% loss — already concealment-audible, well below the field incident
+/// (2026-07-28: 20–44 pkt/s uniform, 80% concealment, unusable) yet comfortably
+/// above benign single-datagram jitter (1–2 pkt/s). Deliberately NOT tuned to
+/// the exact field magnitude; it is a presence threshold, not a severity gauge
+/// (the source window under-reports burst magnitude by design — see
+/// `AudioDatagramLossTracker` in `peer_decode_manager`).
+const WT_AUDIO_LOSS_THRESHOLD_PER_SEC: f64 = 5.0;
+
+/// Rolling detector window length, in 1 Hz samples (≈ seconds). Long enough
+/// that a transient burst (a GC pause, a momentary main-thread hitch) cannot
+/// trip it; short enough to switch within a reasonable time of a genuine
+/// sustained stall.
+const WT_AUDIO_LOSS_WINDOW_SAMPLES: usize = 12;
+
+/// K-of-M minimum lossy samples when at least one sample in the window saw ≥ 2
+/// audio-active WT peers (uniformity is cross-checkable). Windowed, NOT
+/// strictly-consecutive, per the repo hysteresis rule: a couple of good seconds
+/// do not reset progress, so ongoing contention cannot wedge the detector short
+/// of firing. 8 of 12 ≈ two-thirds of the last ~12 s uniformly lossy.
+const WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI: usize = 8;
+
+/// K-of-M minimum lossy samples for a single-remote-peer call. Uniformity is
+/// undefined with one sender (we cannot distinguish a receive-queue drop from
+/// that one path's loss), so we compensate by demanding a stronger sustained
+/// signal — 10 of 12 ≈ 83% of the window — before acting. A 1:1 call on a
+/// throttled laptop is exactly the field-case class, so we still fire; a merely
+/// flaky single path must be persistently bad.
+const WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE: usize = 10;
+
+/// A peer whose most recent loss sample is older than this (ms) is aged out of
+/// the uniformity denominator. Loss emits ~1 Hz per audio-active WT peer, so
+/// three missed samples means the peer muted or left — it must no longer count
+/// against (or toward) uniformity.
+const WT_AUDIO_LOSS_PEER_STALE_MS: f64 = 3_000.0;
+
+/// Uniformity ratio (numerator / denominator): a sample is "uniformly lossy"
+/// only when ≥ 80% of the audio-active WT peers are lossy. Integer-compared to
+/// avoid float rounding at the boundary.
+const WT_AUDIO_LOSS_UNIFORMITY_NUM: usize = 4;
+const WT_AUDIO_LOSS_UNIFORMITY_DEN: usize = 5;
+
+/// One 1 Hz classification of the WT audio-loss detector: how many audio-active
+/// WT peers were observed this tick, and whether their loss was UNIFORM (see
+/// [`wt_audio_tick_classify`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WtAudioLossSample {
+    active_peers: usize,
+    uniform_lossy: bool,
+}
+
+/// Pure: classify one tick's per-peer loss vector. `losses` holds the current
+/// windowed loss rate (pkt/s) of every audio-active WT peer this tick.
+///
+/// - 0 peers → not lossy (nothing to fall back for).
+/// - 1 peer → lossy iff that peer is at/over `threshold` (single-peer rule; the
+///   stronger sustained bar in [`wt_audio_fallback_should_fire`] compensates for
+///   the missing cross-check).
+/// - ≥ 2 peers → lossy iff ≥ 80% of them are at/over `threshold` (uniform
+///   receive-queue drop). One lossy sender among healthy peers is path loss and
+///   is deliberately classified NOT uniform.
+fn wt_audio_tick_classify(losses: &[f64], threshold: f64) -> WtAudioLossSample {
+    let active_peers = losses.len();
+    if active_peers == 0 {
+        return WtAudioLossSample {
+            active_peers: 0,
+            uniform_lossy: false,
+        };
+    }
+    let lossy = losses.iter().filter(|l| **l >= threshold).count();
+    let uniform_lossy = if active_peers == 1 {
+        lossy == 1
+    } else {
+        lossy * WT_AUDIO_LOSS_UNIFORMITY_DEN >= active_peers * WT_AUDIO_LOSS_UNIFORMITY_NUM
+    };
+    WtAudioLossSample {
+        active_peers,
+        uniform_lossy,
+    }
+}
+
+/// Pure: decide whether the sustained-uniform-loss predicate fires over the
+/// rolling window. Windowed (K-of-M), not strictly-consecutive. The multi-peer
+/// bar applies when the window ever saw ≥ 2 peers (cross-check available);
+/// otherwise the stricter single-peer bar applies. Both bars inherently gate
+/// warmup — needing K lossy samples requires at least K ticks of history — so a
+/// cold start (short window) cannot fire.
+fn wt_audio_fallback_should_fire(window: &[WtAudioLossSample]) -> bool {
+    let lossy = window.iter().filter(|s| s.uniform_lossy).count();
+    let multi_peer_seen = window.iter().any(|s| s.active_peers >= 2);
+    let needed = if multi_peer_seen {
+        WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI
+    } else {
+        WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE
+    };
+    lossy >= needed
+}
+
+/// Pure: whether an election may spawn WebTransport candidates. Empty once the
+/// issue-2029 WS-only latch is engaged — a session-scoped exclusion applied on
+/// top of whatever WT URLs the server offered, WITHOUT rewriting the user's
+/// stored transport preference.
+fn wt_election_includes_wt(ws_only_latched: bool) -> bool {
+    !ws_only_latched
+}
+
+/// One election candidate: which transport, its index within that transport's
+/// configured URL list (for the `ws_N` / `wt_N` connection id), and the base
+/// URL to dial.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ElectionCandidate {
+    is_webtransport: bool,
+    index: usize,
+    base_url: String,
+}
+
+/// Pure: build the ordered election candidate set that `create_all_connections`
+/// spawns 1:1. WebSocket candidates come first (in configured order), then
+/// WebTransport (in configured order) — UNLESS the issue-2029 WS-only latch is
+/// engaged, in which case every WebTransport candidate is excluded regardless of
+/// how many WT URLs the server offered.
+///
+/// Extracted as a side-effect-free function so the latch's WT-exclusion is
+/// natively unit-testable: `create_all_connections` calls `Connection::connect`,
+/// which is wasm-only, so the guard could not otherwise be exercised in the host
+/// `#[test]` suite. Driving this helper pins BOTH directions (latched => no WT;
+/// unlatched => WT present, in order), so deleting or reordering the guard is
+/// red on host.
+fn build_election_candidates(
+    websocket_urls: &[String],
+    webtransport_urls: &[String],
+    ws_only_latched: bool,
+) -> Vec<ElectionCandidate> {
+    let mut candidates: Vec<ElectionCandidate> = websocket_urls
+        .iter()
+        .enumerate()
+        .map(|(index, base_url)| ElectionCandidate {
+            is_webtransport: false,
+            index,
+            base_url: base_url.clone(),
+        })
+        .collect();
+
+    if wt_election_includes_wt(ws_only_latched) {
+        candidates.extend(
+            webtransport_urls
+                .iter()
+                .enumerate()
+                .map(|(index, base_url)| ElectionCandidate {
+                    is_webtransport: true,
+                    index,
+                    base_url: base_url.clone(),
+                }),
+        );
+    }
+
+    candidates
+}
+
+/// Stateful accumulator behind the issue-2029 WT→WS audio fallback.
+///
+/// `latest` holds each audio-active WT peer's most recent loss sample and the
+/// manager-clock timestamp it arrived; `window` holds the last
+/// [`WT_AUDIO_LOSS_WINDOW_SAMPLES`] 1 Hz classifications. Fed per-peer by
+/// [`ConnectionManager::observe_peer_audio_datagram_loss`]; advanced once per
+/// second by [`ConnectionManager::check_audio_datagram_fallback`].
+#[derive(Debug, Default)]
+struct WtAudioLossTracker {
+    /// peer_id -> (loss_per_sec, last_sample_ms on the manager clock).
+    latest: HashMap<String, (f64, f64)>,
+    window: VecDeque<WtAudioLossSample>,
+}
+
+impl WtAudioLossTracker {
+    /// Record one per-peer loss observation (pure bookkeeping; no decision).
+    ///
+    /// Borrow-first update: the steady state is the SAME set of peers reporting
+    /// ~1 Hz forever, so overwrite the existing slot in place and only allocate a
+    /// `String` key when a genuinely new peer appears. This keeps the per-sample
+    /// hot path allocation-free on exactly the throttled devices this feature
+    /// exists to rescue.
+    fn observe(&mut self, peer_id: &str, loss_per_sec: f64, now_ms: f64) {
+        if let Some(slot) = self.latest.get_mut(peer_id) {
+            *slot = (loss_per_sec, now_ms);
+        } else {
+            self.latest
+                .insert(peer_id.to_string(), (loss_per_sec, now_ms));
+        }
+    }
+
+    /// Advance the 1 Hz window by one sample and return whether the fallback
+    /// should fire. Ages out peers whose last sample is stale first, so a
+    /// departed/muted peer leaves the uniformity denominator.
+    fn tick(&mut self, now_ms: f64) -> bool {
+        self.latest
+            .retain(|_, (_, last_ms)| now_ms - *last_ms <= WT_AUDIO_LOSS_PEER_STALE_MS);
+        let losses: Vec<f64> = self.latest.values().map(|(loss, _)| *loss).collect();
+        let sample = wt_audio_tick_classify(&losses, WT_AUDIO_LOSS_THRESHOLD_PER_SEC);
+        self.window.push_back(sample);
+        while self.window.len() > WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            self.window.pop_front();
+        }
+        wt_audio_fallback_should_fire(self.window.make_contiguous())
+    }
+
+    /// Drop all transient window + per-peer state. Called on every fresh
+    /// election (so stale entries never cross a transport change) and when the
+    /// fallback latches (so the detector goes quiescent). Does NOT touch the
+    /// session latch — that lives on `ConnectionManager` and is one-way.
+    fn clear(&mut self) {
+        self.latest.clear();
+        self.window.clear();
+    }
+
+    /// Count of uniformly-lossy samples currently in the window (for the fire
+    /// log / diagnostic event).
+    fn window_lossy_count(&self) -> usize {
+        self.window.iter().filter(|s| s.uniform_lossy).count()
+    }
+
+    /// Current window length (for the fire log / diagnostic event).
+    fn window_len(&self) -> usize {
+        self.window.len()
+    }
+
+    /// Count of currently-tracked (non-aged-out) audio-active WT peers (for the
+    /// fire log / diagnostic event).
+    fn active_peer_count(&self) -> usize {
+        self.latest.len()
+    }
+}
+
+/// One candidate's structured election line. Pure so the exact log text is
+/// host-testable without a tracing/log capture seam.
+fn format_election_candidate(
+    transport_is_wt: bool,
+    id: &str,
+    redacted_url: &str,
+    is_connected: bool,
+    rtt_samples: usize,
+    avg_rtt_ms: Option<f64>,
+    qualifies_for_best: bool,
+) -> String {
+    let transport = if transport_is_wt { "wt" } else { "ws" };
+    format!(
+        "Election candidate: transport={transport} id={id} url={redacted_url} \
+         is_connected={is_connected} rtt_samples={rtt_samples} \
+         avg_rtt_ms={} qualifies_for_best={qualifies_for_best}",
+        fmt_opt_rtt(avg_rtt_ms),
+    )
+}
+
+/// Test observation seam for the `Election decision:` emission. `log_election_decision`
+/// records the (reason, outcome, elected, active) it actually emitted here, so a
+/// production-path test that drives `complete_election` can assert the decision
+/// data — closing the gap where the earlier tests only exercised the pure
+/// formatter/classifier and would pass on the un-fixed wiring (issue #1745
+/// review, codex + frontend both flagged).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct RecordedElectionDecision {
+    reason: &'static str,
+    outcome: ElectionOutcome,
+    elected: Option<String>,
+    active: Option<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_ELECTION_DECISION: std::cell::RefCell<Option<RecordedElectionDecision>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_election_decision(
+    reason: &'static str,
+    outcome: ElectionOutcome,
+    elected: Option<&str>,
+    active: Option<&str>,
+) {
+    LAST_ELECTION_DECISION.with(|slot| {
+        *slot.borrow_mut() = Some(RecordedElectionDecision {
+            reason,
+            outcome,
+            elected: elected.map(str::to_string),
+            active: active.map(str::to_string),
+        });
+    });
+}
+
+#[cfg(test)]
+fn take_last_election_decision() -> Option<RecordedElectionDecision> {
+    LAST_ELECTION_DECISION.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set true when `schedule_preservation_retry` would have spawned the retry
+    /// task (host tests can't spawn_local). Lets a preserve-path test confirm
+    /// the retry was scheduled without a real timer.
+    static RETRY_SCHEDULED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn take_retry_scheduled() -> bool {
+    RETRY_SCHEDULED.with(|flag| flag.replace(false))
+}
+
+/// Pre-decision snapshot of the election reason and per-transport sample/RTT
+/// columns, captured while the candidate maps still reflect the election that
+/// ran (before abort/preserve restore old state).
+struct ElectionDecisionSnapshot {
+    reason: &'static str,
+    wt_samples: usize,
+    ws_samples: usize,
+    wt_avg_rtt_ms: Option<f64>,
+    ws_avg_rtt_ms: Option<f64>,
+}
+
+/// The terminal outcome of an election, distinct from which candidate won the
+/// RTT race. On a re-election the RTT winner (`elected=`) is NOT necessarily the
+/// connection the client ends up using (`active=`): hysteresis can keep the old
+/// connection (`aborted_kept_old`), or a total candidate failure can preserve it
+/// (`preserved_old`). Reporting only the RTT winner made the log miscount
+/// switches that never happened (issue #1745 review).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ElectionOutcome {
+    /// The RTT winner became the active connection (initial election or an
+    /// accepted re-election switch).
+    Elected,
+    /// Re-election ran but the winner was not meaningfully better; the old
+    /// connection was kept.
+    AbortedKeptOld,
+    /// All candidates failed before producing RTT; the old connection was
+    /// preserved rather than disconnecting.
+    PreservedOld,
+    /// No usable connection and nothing to preserve — the session failed.
+    Failed,
+}
+
+impl ElectionOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            ElectionOutcome::Elected => "elected",
+            ElectionOutcome::AbortedKeptOld => "aborted_kept_old",
+            ElectionOutcome::PreservedOld => "preserved_old",
+            ElectionOutcome::Failed => "failed",
+        }
+    }
+}
+
+/// The structured election decision summary line.
+///
+/// `elected` = the RTT-race winner from `find_best_connection` (what would be
+/// switched to). `active` = the connection the client is ACTUALLY using after
+/// the outcome resolved (equals `elected` on `Elected`, the old connection on
+/// `aborted_kept_old`/`preserved_old`, `none` on `failed`). `outcome`
+/// disambiguates the two so a reader never mistakes an aborted re-election for a
+/// real switch.
+#[allow(clippy::too_many_arguments)]
+fn format_election_decision(
+    reason: &'static str,
+    outcome: ElectionOutcome,
+    elected: Option<&str>,
+    active: Option<&str>,
+    wt_samples: usize,
+    ws_samples: usize,
+    wt_avg_rtt_ms: Option<f64>,
+    ws_avg_rtt_ms: Option<f64>,
+    election_duration_ms: Option<u64>,
+) -> String {
+    format!(
+        "Election decision: reason={reason} outcome={} elected={} active={} \
+         wt_samples={wt_samples} ws_samples={ws_samples} wt_avg_rtt_ms={} \
+         ws_avg_rtt_ms={} election_duration_ms={}",
+        outcome.as_str(),
+        elected.unwrap_or("none"),
+        active.unwrap_or("none"),
+        fmt_opt_rtt(wt_avg_rtt_ms),
+        fmt_opt_rtt(ws_avg_rtt_ms),
+        election_duration_ms
+            .map(|duration| duration.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+    )
+}
+
+#[derive(Default)]
+struct ElectionScan {
+    best_wt: Option<(String, ServerRttMeasurement)>,
+    best_wt_rtt: f64,
+    best_ws: Option<(String, ServerRttMeasurement)>,
+    best_ws_rtt: f64,
+    fallback_wt: Option<(String, ServerRttMeasurement)>,
+    fallback_wt_rtt: f64,
+    fallback_ws: Option<(String, ServerRttMeasurement)>,
+    fallback_ws_rtt: f64,
+    live_wt_exists: bool,
+    wt_with_measurements_exists: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElectionCandidateTier {
+    BestWt,
+    BestWs,
+    FallbackWt,
+    FallbackWs,
+}
+
+impl ElectionScan {
+    fn new() -> Self {
+        Self {
+            best_wt_rtt: f64::INFINITY,
+            best_ws_rtt: f64::INFINITY,
+            fallback_wt_rtt: f64::INFINITY,
+            fallback_ws_rtt: f64::INFINITY,
+            ..Default::default()
+        }
+    }
+
+    fn selected(&self) -> Option<(ElectionCandidateTier, &(String, ServerRttMeasurement))> {
+        if let Some(candidate) = self.best_wt.as_ref() {
+            Some((ElectionCandidateTier::BestWt, candidate))
+        } else if let Some(candidate) = self.best_ws.as_ref() {
+            Some((ElectionCandidateTier::BestWs, candidate))
+        } else if let Some(candidate) = self.fallback_wt.as_ref() {
+            Some((ElectionCandidateTier::FallbackWt, candidate))
+        } else {
+            self.fallback_ws
+                .as_ref()
+                .map(|candidate| (ElectionCandidateTier::FallbackWs, candidate))
+        }
+    }
+}
+
+fn scan_election_candidates(
+    rtt_measurements: &HashMap<String, ServerRttMeasurement>,
+    connections: &HashMap<String, Connection>,
+) -> ElectionScan {
+    let mut scan = ElectionScan::new();
+
+    for (connection_id, measurement) in rtt_measurements {
+        if let Some(conn) = connections.get(connection_id) {
+            if !conn.is_connected() {
+                continue;
+            }
+        }
+
+        if measurement.is_webtransport {
+            scan.live_wt_exists = true;
+            if measurement.average_rtt.is_some() {
+                scan.wt_with_measurements_exists = true;
+            }
+        }
+
+        if let Some(avg_rtt) = measurement.average_rtt {
+            if measurement.measurements.is_empty() {
+                continue;
+            }
+
+            let has_enough = measurement.measurements.len() >= ELECTION_MIN_RTT_SAMPLES;
+
+            if measurement.is_webtransport {
+                if has_enough && avg_rtt < scan.best_wt_rtt {
+                    scan.best_wt_rtt = avg_rtt;
+                    scan.best_wt = Some((connection_id.clone(), measurement.clone()));
+                } else if !has_enough && avg_rtt < scan.fallback_wt_rtt {
+                    scan.fallback_wt_rtt = avg_rtt;
+                    scan.fallback_wt = Some((connection_id.clone(), measurement.clone()));
+                }
+            } else if has_enough && avg_rtt < scan.best_ws_rtt {
+                scan.best_ws_rtt = avg_rtt;
+                scan.best_ws = Some((connection_id.clone(), measurement.clone()));
+            } else if !has_enough && avg_rtt < scan.fallback_ws_rtt {
+                scan.fallback_ws_rtt = avg_rtt;
+                scan.fallback_ws = Some((connection_id.clone(), measurement.clone()));
+            }
+        }
+    }
+
+    scan
+}
+
+/// Classify the election outcome using the same candidate predicate and
+/// transport preference order as `find_best_connection`.
+///
+/// Test-only convenience wrapper: production emits the reason via
+/// `classify_election_reason_from_scan` on an already-computed scan (see
+/// `log_election_decision`), so this raw-inputs form is used only by the
+/// classifier unit tests. Gated `#[cfg(test)]` to avoid a dead-code lint in the
+/// non-test lib build (CI runs `cargo clippy --all -- -D warnings`).
+#[cfg(test)]
+fn classify_election_reason(
+    rtt_measurements: &HashMap<String, ServerRttMeasurement>,
+    connections: &HashMap<String, Connection>,
+) -> &'static str {
+    let scan = scan_election_candidates(rtt_measurements, connections);
+    classify_election_reason_from_scan(&scan)
+}
+
+/// Classify from an already-computed scan, so the decision-logging path does not
+/// re-scan `rtt_measurements` a second time.
+fn classify_election_reason_from_scan(scan: &ElectionScan) -> &'static str {
+    let ws_forced_by_silent_wt = scan.live_wt_exists && !scan.wt_with_measurements_exists;
+
+    match scan.selected().map(|(tier, _)| tier) {
+        Some(ElectionCandidateTier::BestWt) => "best_wt_min_samples",
+        Some(ElectionCandidateTier::BestWs) if ws_forced_by_silent_wt => {
+            "no_wt_measurements_forced_ws"
+        }
+        Some(ElectionCandidateTier::BestWs) => "best_ws_min_samples",
+        Some(ElectionCandidateTier::FallbackWt) => "fallback_wt_any_samples",
+        Some(ElectionCandidateTier::FallbackWs) if ws_forced_by_silent_wt => {
+            "no_wt_measurements_forced_ws"
+        }
+        Some(ElectionCandidateTier::FallbackWs) => "fallback_ws_any_samples",
+        None => "election_failed_no_candidates",
+    }
+}
+
+fn best_transport_measurement_for_log(
+    best: Option<&ServerRttMeasurement>,
+    fallback: Option<&ServerRttMeasurement>,
+) -> (usize, Option<f64>) {
+    best.or(fallback)
+        .map(|measurement| (measurement.measurements.len(), measurement.average_rtt))
+        .unwrap_or((0, None))
 }
 
 /// Returns a monotonic, high-resolution timestamp in milliseconds using
@@ -831,6 +1407,26 @@ pub struct ConnectionManager {
     /// [`total_suppression_duration_ms`] accumulator is cleared. Single-threaded
     /// access — no atomic needed.
     last_suppression_release_at_ms: Option<f64>,
+
+    /// Issue 2029: rolling detector for sustained, cross-sender-uniform
+    /// WebTransport audio-datagram loss. Fed per-peer at ~1 Hz from the
+    /// diagnostics pipeline via [`Self::observe_peer_audio_datagram_loss`];
+    /// sampled on the 1 Hz tick by [`Self::check_audio_datagram_fallback`].
+    /// Never fires on WebSocket (the loss emitter is gated on
+    /// `receiver_on_webtransport`, so no sample is ever fed) nor on E2EE-on
+    /// WebTransport sessions (there audio rides the reliable audio unistream, so
+    /// it has NO datagram sequence gaps — the gauge feeds a steady 0.0, which the
+    /// detector classifies as not-lossy).
+    audio_loss_tracker: WtAudioLossTracker,
+
+    /// Issue 2029: one-way, session-scoped WebSocket-only latch. Once the
+    /// detector fires, this client stays WebSocket-only for the rest of the
+    /// session — [`Self::create_all_connections`] skips every WebTransport
+    /// candidate and the detector goes quiescent (no probe-back, no flap). NOT
+    /// persisted to the user's stored transport preference (that lives in the
+    /// UI layer / localStorage): an automatic quality decision must never
+    /// rewrite an explicit user setting.
+    wt_audio_fallback_latched: bool,
 }
 
 fn should_filter_self_packet(packet: &PacketWrapper, own_session_id: Option<u64>) -> bool {
@@ -919,6 +1515,8 @@ impl ConnectionManager {
             suppression_started_at_ms: None,
             total_suppression_duration_ms: 0.0,
             last_suppression_release_at_ms: None,
+            audio_loss_tracker: WtAudioLossTracker::default(),
+            wt_audio_fallback_latched: false,
         };
 
         Ok(manager)
@@ -1011,6 +1609,14 @@ impl ConnectionManager {
             map.clear();
         }
 
+        // Issue 2029: drop the WT audio-loss detector's transient window and
+        // per-peer samples so no stale entry survives a transport change /
+        // reconnect. The one-way `wt_audio_fallback_latched` flag is
+        // deliberately NOT cleared here — it must outlive every reconnect for
+        // the session (that is what keeps a WS-latched client on WebSocket, and
+        // the loss gauge is ~0 on WS so the detector stays quiescent anyway).
+        self.audio_loss_tracker.clear();
+
         // Cancel any lingering timers from the previous election.
         if let ElectionState::Testing { probe_timer, .. } = &mut self.election_state {
             if let Some(timer) = probe_timer.take() {
@@ -1089,80 +1695,58 @@ impl ConnectionManager {
 
     /// Create connections to all configured servers
     fn create_all_connections(&mut self) -> Result<()> {
-        // Create WebSocket connections
-        for (i, base_url) in self.options.websocket_urls.iter().enumerate() {
-            let conn_id = self.make_connection_id("ws", i);
-            let url = self.append_instance_id(base_url);
-            let connect_options = ConnectOptions {
-                websocket_url: url.clone(),
-                webtransport_url: String::new(), // Not used for WebSocket
-                on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
-                on_connected: self.create_connected_callback(conn_id.clone()),
-                on_connection_lost: self.create_connection_lost_callback(
-                    conn_id.clone(),
-                    url.clone(),
-                    false, // WebSocket
-                ),
-                peer_monitor: self.options.peer_monitor.clone(),
-            };
+        // Build the ordered candidate set (WS first, then WT) with the pure,
+        // natively-tested [`build_election_candidates`] — which is also where the
+        // issue-2029 WS-only latch excludes every WebTransport candidate. This
+        // loop then dials the set 1:1, so the guard is exercised by whatever the
+        // helper returns (no separate, untested inline branch).
+        let candidates = build_election_candidates(
+            &self.options.websocket_urls,
+            &self.options.webtransport_urls,
+            self.wt_audio_fallback_latched,
+        );
 
-            match Connection::connect(false, connect_options, self.aes.clone()) {
-                Ok(connection) => {
-                    self.connections.insert(conn_id.clone(), connection);
-                    self.rtt_measurements.insert(
-                        conn_id.clone(),
-                        ServerRttMeasurement {
-                            url: url.clone(),
-                            is_webtransport: false,
-                            measurements: VecDeque::new(),
-                            average_rtt: None,
-                            connection_id: conn_id.clone(),
-                            active: false,
-                            connected: false,
-                            consecutive_implausible_discards: 0,
-                            in_flight_probes: VecDeque::new(),
-                            consecutive_probe_timeouts: 0,
-                        },
-                    );
-                    debug!(
-                        "Created WebSocket connection {conn_id}: {}",
-                        strip_query_for_log(&url)
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to create WebSocket connection to {}: {e}",
-                        strip_query_for_log(&url)
-                    );
-                }
-            }
+        // Session-scoped skip notice: the configured URLs are left untouched (a
+        // later token refresh may repopulate them) and the user's stored
+        // transport preference is never rewritten; the latch alone excludes WT.
+        if self.wt_audio_fallback_latched && !self.options.webtransport_urls.is_empty() {
+            info!(
+                "[WT_AUDIO_FALLBACK] WebSocket-only latch engaged — skipping {} \
+                 WebTransport candidate(s) this election",
+                self.options.webtransport_urls.len()
+            );
         }
 
-        // Create WebTransport connections
-        for (i, base_url) in self.options.webtransport_urls.iter().enumerate() {
-            let conn_id = self.make_connection_id("wt", i);
-            let url = self.append_instance_id(base_url);
+        for candidate in &candidates {
+            let is_wt = candidate.is_webtransport;
+            let (prefix, transport_label) = if is_wt {
+                ("wt", "WebTransport")
+            } else {
+                ("ws", "WebSocket")
+            };
+            let conn_id = self.make_connection_id(prefix, candidate.index);
+            let url = self.append_instance_id(&candidate.base_url);
             let connect_options = ConnectOptions {
-                websocket_url: String::new(), // Not used for WebTransport
-                webtransport_url: url.clone(),
+                websocket_url: if is_wt { String::new() } else { url.clone() },
+                webtransport_url: if is_wt { url.clone() } else { String::new() },
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
                 on_connection_lost: self.create_connection_lost_callback(
                     conn_id.clone(),
                     url.clone(),
-                    true, // WebTransport
+                    is_wt,
                 ),
                 peer_monitor: self.options.peer_monitor.clone(),
             };
 
-            match Connection::connect(true, connect_options, self.aes.clone()) {
+            match Connection::connect(is_wt, connect_options, self.aes.clone()) {
                 Ok(connection) => {
                     self.connections.insert(conn_id.clone(), connection);
                     self.rtt_measurements.insert(
                         conn_id.clone(),
                         ServerRttMeasurement {
                             url: url.clone(),
-                            is_webtransport: true,
+                            is_webtransport: is_wt,
                             measurements: VecDeque::new(),
                             average_rtt: None,
                             connection_id: conn_id.clone(),
@@ -1174,13 +1758,13 @@ impl ConnectionManager {
                         },
                     );
                     debug!(
-                        "Created WebTransport connection {conn_id}: {}",
+                        "Created {transport_label} connection {conn_id}: {}",
                         strip_query_for_log(&url)
                     );
                 }
                 Err(e) => {
                     error!(
-                        "Failed to create WebTransport connection to {}: {e}",
+                        "Failed to create {transport_label} connection to {}: {e}",
                         strip_query_for_log(&url)
                     );
                 }
@@ -1203,7 +1787,11 @@ impl ConnectionManager {
             wt_count,
             self.connections.len()
         );
-        if !self.options.webtransport_urls.is_empty() && wt_count == 0 {
+        if self.wt_audio_fallback_latched {
+            // wt_count == 0 here is INTENTIONAL (issue 2029 WS-only latch), not a
+            // connect failure — do not emit the "all WT failed" warning.
+            info!("WebSocket only -- issue 2029 audio-datagram-loss fallback latch engaged");
+        } else if !self.options.webtransport_urls.is_empty() && wt_count == 0 {
             warn!(
                 "All {} WebTransport connections failed -- falling back to WebSocket only",
                 self.options.webtransport_urls.len()
@@ -1660,9 +2248,121 @@ impl ConnectionManager {
         }
     }
 
+    /// Emit one `Election candidate:` line per RTT-measured candidate. These are
+    /// honest pre-decision snapshots, so this is called early in
+    /// `complete_election` (before the RTT winner is even known). The
+    /// `is_connected` here matches the election predicate's connected-check:
+    /// a candidate whose connection entry is ABSENT is treated as connected
+    /// (eligible), the same as `scan_election_candidates` / `find_best_connection`.
+    fn log_election_candidates(&self) {
+        for (connection_id, measurement) in &self.rtt_measurements {
+            // Match the election predicate: only a PRESENT-and-disconnected
+            // connection is ineligible; an absent entry is eligible.
+            let is_connected = self
+                .connections
+                .get(connection_id)
+                .map(|c| c.is_connected())
+                .unwrap_or(true);
+            let qualifies_for_best = measurement.average_rtt.is_some()
+                && measurement.measurements.len() >= ELECTION_MIN_RTT_SAMPLES
+                && is_connected;
+
+            info!(
+                "{}",
+                format_election_candidate(
+                    measurement.is_webtransport,
+                    &measurement.connection_id,
+                    &strip_query_for_log(&measurement.url),
+                    is_connected,
+                    measurement.measurements.len(),
+                    measurement.average_rtt,
+                    qualifies_for_best,
+                )
+            );
+        }
+    }
+
+    /// Snapshot the election `reason` and per-transport sample/RTT columns from
+    /// the candidate set AS IT WAS when the election ran. This MUST be captured
+    /// BEFORE any terminal path mutates `rtt_measurements` / `connections` — the
+    /// abort and preserve paths restore the old connection into those maps, so a
+    /// re-scan at the log site would describe the post-restore state and report
+    /// the wrong `reason=` for the very outcome being logged (codex review).
+    fn snapshot_election_decision(scan: &ElectionScan) -> ElectionDecisionSnapshot {
+        let reason = classify_election_reason_from_scan(scan);
+        let (wt_samples, wt_avg_rtt_ms) = best_transport_measurement_for_log(
+            scan.best_wt.as_ref().map(|(_, measurement)| measurement),
+            scan.fallback_wt
+                .as_ref()
+                .map(|(_, measurement)| measurement),
+        );
+        let (ws_samples, ws_avg_rtt_ms) = best_transport_measurement_for_log(
+            scan.best_ws.as_ref().map(|(_, measurement)| measurement),
+            scan.fallback_ws
+                .as_ref()
+                .map(|(_, measurement)| measurement),
+        );
+        ElectionDecisionSnapshot {
+            reason,
+            wt_samples,
+            ws_samples,
+            wt_avg_rtt_ms,
+            ws_avg_rtt_ms,
+        }
+    }
+
+    /// Emit the `Election decision:` summary once the terminal outcome is known.
+    /// `elected` is the RTT-race winner (may differ from the connection actually
+    /// used); `active` is the connection the client ends up on; `outcome`
+    /// disambiguates the two (issue #1745). `snapshot` carries the reason +
+    /// sample columns captured pre-mutation (see `snapshot_election_decision`).
+    fn log_election_decision(
+        &self,
+        snapshot: &ElectionDecisionSnapshot,
+        outcome: ElectionOutcome,
+        elected_connection_id: Option<&str>,
+        active_connection_id: Option<&str>,
+        election_duration_ms: Option<u64>,
+    ) {
+        // Test observation seam: record exactly what the production path emitted
+        // (reason from the snapshot, plus outcome/elected/active) so a
+        // production-path test can assert the decision reflects the election —
+        // NOT a re-scan of the post-restore maps, and NOT the RTT winner on an
+        // abort/preserve. See `election_decision_*` production-path tests.
+        #[cfg(test)]
+        record_election_decision(
+            snapshot.reason,
+            outcome,
+            elected_connection_id,
+            active_connection_id,
+        );
+
+        info!(
+            "{}",
+            format_election_decision(
+                snapshot.reason,
+                outcome,
+                elected_connection_id,
+                active_connection_id,
+                snapshot.wt_samples,
+                snapshot.ws_samples,
+                snapshot.wt_avg_rtt_ms,
+                snapshot.ws_avg_rtt_ms,
+                election_duration_ms,
+            )
+        );
+    }
+
     /// Complete the election and select the best connection
     fn complete_election(&mut self) {
         info!("Completing connection election");
+
+        let election_duration_ms = match &self.election_state {
+            ElectionState::Testing { start_time, .. } => {
+                Some((monotonic_now_ms() - *start_time).max(0.0) as u64)
+            }
+            _ => None,
+        };
 
         // Stop probing
         if let ElectionState::Testing { probe_timer, .. } = &mut self.election_state {
@@ -1671,8 +2371,27 @@ impl ConnectionManager {
             }
         }
 
-        // Find the best connection
-        match self.find_best_connection() {
+        // Scan once so winner selection and reason attribution cannot drift.
+        let election_scan = scan_election_candidates(&self.rtt_measurements, &self.connections);
+        let election_result = Self::find_best_connection(&election_scan);
+
+        // Emit the per-candidate snapshot lines now (pre-decision, honest).
+        // The decision summary is emitted at each terminal outcome below, so it
+        // can report the ACTUAL active connection (which, on a re-election
+        // abort/preserve, is NOT the RTT winner) rather than find_best's raw
+        // winner. See issue #1745 review.
+        self.log_election_candidates();
+        // Capture reason + sample columns NOW, before the abort/preserve paths
+        // mutate the candidate maps by restoring the old connection — otherwise
+        // the decision line would report a reason for the post-restore state
+        // instead of the election that just ran (codex review).
+        let decision_snapshot = Self::snapshot_election_decision(&election_scan);
+        let elected_winner_id = election_result
+            .as_ref()
+            .ok()
+            .map(|(connection_id, _)| connection_id.clone());
+
+        match election_result {
             Ok((connection_id, measurement)) => {
                 // find_best_connection() only returns winners with measured RTT
                 // (it skips entries where average_rtt is None), so this should
@@ -1840,6 +2559,15 @@ impl ConnectionManager {
                                  monitoring resumes on existing connection",
                                 comparison_rtt,
                             );
+                            // Outcome: RTT winner discarded, old connection kept.
+                            let active_id = self.active_connection_id.borrow().clone();
+                            self.log_election_decision(
+                                &decision_snapshot,
+                                ElectionOutcome::AbortedKeptOld,
+                                elected_winner_id.as_deref(),
+                                active_id.as_deref(),
+                                election_duration_ms,
+                            );
                             self.report_state();
                             return;
                         }
@@ -1984,6 +2712,15 @@ impl ConnectionManager {
                     map.retain(|k, _| self.connections.contains_key(k));
                 }
 
+                // Outcome: the RTT winner became the active connection.
+                self.log_election_decision(
+                    &decision_snapshot,
+                    ElectionOutcome::Elected,
+                    Some(connection_id.as_str()),
+                    Some(connection_id.as_str()),
+                    election_duration_ms,
+                );
+
                 // Report state
                 self.report_state();
             }
@@ -2012,6 +2749,15 @@ impl ConnectionManager {
                     // was still fresh, so it was preserved (the call has NOT
                     // dropped — distinct from the `failed` outcome below).
                     REELECTION_PRESERVED.fetch_add(1, Ordering::Relaxed);
+                    // Outcome: no RTT winner; old connection preserved active.
+                    let active_id = self.active_connection_id.borrow().clone();
+                    self.log_election_decision(
+                        &decision_snapshot,
+                        ElectionOutcome::PreservedOld,
+                        None,
+                        active_id.as_deref(),
+                        election_duration_ms,
+                    );
                     return;
                 }
 
@@ -2039,6 +2785,14 @@ impl ConnectionManager {
                 self.old_active_rtt = None;
                 self.old_active_rtt_measurement = None;
                 self.reelection_preserved_once = false;
+                // Outcome: no usable connection and nothing to preserve.
+                self.log_election_decision(
+                    &decision_snapshot,
+                    ElectionOutcome::Failed,
+                    None,
+                    None,
+                    election_duration_ms,
+                );
                 self.report_state();
             }
         }
@@ -2201,135 +2955,94 @@ impl ConnectionManager {
         // Report Connected state so the UI does NOT show "Connection lost".
         self.report_state();
 
-        // Schedule the 30 s retry. The async task observes
-        // `reelection_retry_pending` and bails out early on cancellation
-        // (intentional disconnect or fresh re-election).
+        // Schedule the 30 s retry. Extracted to a seam so the preserve path is
+        // drivable in host `cargo test` — the async body uses
+        // `wasm_bindgen_futures::spawn_local`, which is unavailable off-wasm.
         *self.reelection_retry_pending.borrow_mut() = true;
-        let manager_ref = self.manager_ref.clone();
-        let intentionally_disconnected = self.intentionally_disconnected.clone();
-        let retry_pending = self.reelection_retry_pending.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            gloo_timers::future::sleep(std::time::Duration::from_millis(
-                REELECTION_PRESERVATION_RETRY_MS,
-            ))
-            .await;
-
-            if *intentionally_disconnected.borrow() {
-                info!("Preservation retry: cancelled — user disconnected before retry fired");
-                *retry_pending.borrow_mut() = false;
-                return;
-            }
-            if !*retry_pending.borrow() {
-                info!("Preservation retry: cancelled — flag cleared before retry fired");
-                return;
-            }
-            *retry_pending.borrow_mut() = false;
-
-            let manager_rc = match manager_ref.upgrade() {
-                Some(rc) => rc,
-                None => {
-                    warn!("Preservation retry: manager dropped before retry fired");
-                    return;
-                }
-            };
-            let result = manager_rc.try_borrow_mut();
-            match result {
-                Ok(mut mgr) => {
-                    info!("Preservation retry: 30s elapsed, re-attempting re-election");
-                    if let Err(e) = mgr.start_reelection() {
-                        warn!("Preservation retry: start_reelection failed: {e}");
-                    }
-                }
-                Err(_) => {
-                    warn!(
-                        "Preservation retry: manager busy when retry fired — \
-                         skipping (next degradation event will retry)"
-                    );
-                }
-            }
-        });
+        self.schedule_preservation_retry();
 
         true
     }
 
-    /// Find the connection with the best (lowest) average RTT
-    fn find_best_connection(&self) -> Result<(String, ServerRttMeasurement)> {
-        // We run two passes: first look exclusively at WebTransport connections.
-        // Only if none of them are usable do we fall back to WebSocket.
-        //
-        // Connections must have at least `ELECTION_MIN_RTT_SAMPLES` measurements
-        // to be considered. If no connection meets the minimum, we fall back to
-        // accepting any connection with at least 1 measurement so the election
-        // does not fail entirely on marginal networks.
+    /// Spawn the 30 s preservation-retry task. The async task observes
+    /// `reelection_retry_pending` and bails out early on cancellation
+    /// (intentional disconnect or fresh re-election).
+    ///
+    /// This is a thin seam over `wasm_bindgen_futures::spawn_local` so the
+    /// preserve path in `try_preserve_old_connection_on_candidate_failure` can
+    /// be exercised by host unit tests (`spawn_local` panics off-wasm). The
+    /// non-test build is byte-for-byte the original inline scheduling; the test
+    /// build records that a retry WOULD have been scheduled instead of spawning.
+    fn schedule_preservation_retry(&self) {
+        #[cfg(test)]
+        {
+            RETRY_SCHEDULED.with(|flag| flag.set(true));
+        }
+        #[cfg(not(test))]
+        {
+            let manager_ref = self.manager_ref.clone();
+            let intentionally_disconnected = self.intentionally_disconnected.clone();
+            let retry_pending = self.reelection_retry_pending.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                gloo_timers::future::sleep(std::time::Duration::from_millis(
+                    REELECTION_PRESERVATION_RETRY_MS,
+                ))
+                .await;
 
-        let mut best_wt: Option<(String, ServerRttMeasurement)> = None;
-        let mut best_wt_rtt = f64::INFINITY;
-
-        let mut best_ws: Option<(String, ServerRttMeasurement)> = None;
-        let mut best_ws_rtt = f64::INFINITY;
-
-        // Fallbacks for connections with <MIN_RTT_SAMPLES but >0 measurements
-        let mut fallback_wt: Option<(String, ServerRttMeasurement)> = None;
-        let mut fallback_wt_rtt = f64::INFINITY;
-
-        let mut fallback_ws: Option<(String, ServerRttMeasurement)> = None;
-        let mut fallback_ws_rtt = f64::INFINITY;
-
-        for (connection_id, measurement) in &self.rtt_measurements {
-            // Skip connections that are not yet fully established
-            if let Some(conn) = self.connections.get(connection_id) {
-                if !conn.is_connected() {
-                    continue;
+                if *intentionally_disconnected.borrow() {
+                    info!("Preservation retry: cancelled — user disconnected before retry fired");
+                    *retry_pending.borrow_mut() = false;
+                    return;
                 }
-            }
-
-            if let Some(avg_rtt) = measurement.average_rtt {
-                if measurement.measurements.is_empty() {
-                    continue;
+                if !*retry_pending.borrow() {
+                    info!("Preservation retry: cancelled — flag cleared before retry fired");
+                    return;
                 }
+                *retry_pending.borrow_mut() = false;
 
-                let has_enough = measurement.measurements.len() >= ELECTION_MIN_RTT_SAMPLES;
-
-                if measurement.is_webtransport {
-                    if has_enough && avg_rtt < best_wt_rtt {
-                        best_wt_rtt = avg_rtt;
-                        best_wt = Some((connection_id.clone(), measurement.clone()));
-                    } else if !has_enough && avg_rtt < fallback_wt_rtt {
-                        fallback_wt_rtt = avg_rtt;
-                        fallback_wt = Some((connection_id.clone(), measurement.clone()));
+                let manager_rc = match manager_ref.upgrade() {
+                    Some(rc) => rc,
+                    None => {
+                        warn!("Preservation retry: manager dropped before retry fired");
+                        return;
                     }
-                } else if has_enough && avg_rtt < best_ws_rtt {
-                    best_ws_rtt = avg_rtt;
-                    best_ws = Some((connection_id.clone(), measurement.clone()));
-                } else if !has_enough && avg_rtt < fallback_ws_rtt {
-                    fallback_ws_rtt = avg_rtt;
-                    fallback_ws = Some((connection_id.clone(), measurement.clone()));
+                };
+                let result = manager_rc.try_borrow_mut();
+                match result {
+                    Ok(mut mgr) => {
+                        info!("Preservation retry: 30s elapsed, re-attempting re-election");
+                        if let Err(e) = mgr.start_reelection() {
+                            warn!("Preservation retry: start_reelection failed: {e}");
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Preservation retry: manager busy when retry fired — \
+                             skipping (next degradation event will retry)"
+                        );
+                    }
                 }
-            }
+            });
         }
+    }
 
-        // Prefer connections meeting the minimum sample count.
-        // Within each tier, WebTransport is preferred over WebSocket.
-        if let Some(best) = best_wt {
-            return Ok(best);
-        }
-        if let Some(best) = best_ws {
-            return Ok(best);
-        }
+    /// Return the connection selected by the shared election scan.
+    fn find_best_connection(scan: &ElectionScan) -> Result<(String, ServerRttMeasurement)> {
+        let Some((tier, candidate)) = scan.selected() else {
+            return Err(anyhow!("No valid connections with RTT measurements found"));
+        };
 
-        // Fall back to connections with fewer samples rather than failing.
-        // Preserves the WT > WS preference order within fallbacks.
-        if fallback_wt.is_some() || fallback_ws.is_some() {
+        if matches!(
+            tier,
+            ElectionCandidateTier::FallbackWt | ElectionCandidateTier::FallbackWs
+        ) {
             warn!(
                 "No connection has {} RTT samples; falling back to best available measurement",
                 ELECTION_MIN_RTT_SAMPLES,
             );
         }
-        if let Some(fb) = fallback_wt {
-            return Ok(fb);
-        }
 
-        fallback_ws.ok_or_else(|| anyhow!("No valid connections with RTT measurements found"))
+        Ok(candidate.clone())
     }
 
     /// Close all unused connections after election
@@ -3791,6 +4504,135 @@ impl ConnectionManager {
         metrics
     }
 
+    /// Feed the active uplink's RTT baseline into the WT slow-`ready()`
+    /// saturation governor (issue 1976, discussion 1960) so its threshold scales
+    /// with the path's own RTT. Without this, the fixed 250 ms floor treats a
+    /// high-RTT path's normal ~1-RTT flow-control pacing as uplink saturation and
+    /// sheds a video layer every cycle (Alena, 255 ms baseline — 65 shed / 67
+    /// restore in 31 min), whose repeated keyframe-reconfigure bursts steal
+    /// connection-level congestion-window credit from her audio stream, so the
+    /// whole room hears choppy audio.
+    ///
+    /// Feeds the Elected connection's average RTT, or `None` when not Elected or
+    /// the RTT-probe pipeline is stale — see [`uplink_rtt_baseline_feed`] for the
+    /// (host-tested) reset-on-stale/re-election lifecycle. Additive/observational:
+    /// no connection control flow depends on this call. On WebSocket the WT
+    /// slow-`ready()` counter never advances, so the fed baseline is inert there.
+    fn feed_uplink_rtt_baseline(&self, rtt_probe_stale: bool) {
+        let elected_avg_rtt = match &self.election_state {
+            ElectionState::Elected { connection_id, .. } => self
+                .rtt_measurements
+                .get(connection_id)
+                .and_then(|m| m.average_rtt),
+            _ => None,
+        };
+        let feed = uplink_rtt_baseline_feed(elected_avg_rtt, rtt_probe_stale);
+        videocall_transport::webtransport::set_uplink_rtt_baseline_ms(feed);
+    }
+
+    /// Issue 2029: record one per-peer WebTransport audio-datagram loss
+    /// observation (peer id + windowed loss rate in pkt/s), fed at ~1 Hz per
+    /// audio-active WT peer from the diagnostics-bus subscription in
+    /// `health_reporter` (where the `wt_datagram_audio_loss_per_sec` gauge is
+    /// already ingested). Pure bookkeeping — the 1 Hz
+    /// [`Self::check_audio_datagram_fallback`] tick does the windowing and the
+    /// decision. `now_ms` is the manager clock ([`monotonic_now_ms`]) so the
+    /// detector's per-peer staleness aging is clock-consistent with the tick.
+    ///
+    /// No-op once WS-latched: the detector is quiescent and any late WT sample
+    /// (e.g. an in-flight bus event straddling the switch) is ignored.
+    pub fn observe_peer_audio_datagram_loss(
+        &mut self,
+        peer_id: &str,
+        loss_per_sec: f64,
+        now_ms: f64,
+    ) {
+        if self.wt_audio_fallback_latched {
+            return;
+        }
+        self.audio_loss_tracker
+            .observe(peer_id, loss_per_sec, now_ms);
+    }
+
+    /// Issue 2029: 1 Hz evaluation of the WebTransport→WebSocket audio fallback.
+    /// On SUSTAINED, cross-sender-UNIFORM audio-datagram loss it latches the
+    /// session WebSocket-only and re-elects through the unified reconnect path
+    /// ([`Self::reset_and_start_election`]) — mirroring what the manual
+    /// diagnostics WebSocket toggle produces (election with no WT candidates),
+    /// but session-scoped and WITHOUT persisting to the user's stored transport
+    /// preference.
+    ///
+    /// SUPPRESSION BYPASS: unlike [`Self::check_rtt_degradation`], this
+    /// deliberately does NOT consult `cpu_overloaded` / `recent_inbound`. A
+    /// constrained-receiver CPU stall is exactly what produces the uniform
+    /// datagram loss AND what suppresses RTT-based re-election, so the two must
+    /// not share a gate — the stall is the reason to switch, not a reason to
+    /// wait. This does not weaken that RTT suppression for its own purpose; it
+    /// is an independent detector on the same tick.
+    ///
+    /// Returns whether the fallback fired THIS tick — the caller then re-elects
+    /// via [`Self::reset_and_start_election`] (the unified full-election path),
+    /// mirroring how [`Self::check_rtt_degradation`] returns a decision the 1 Hz
+    /// timer acts on. The decision is separated from the (wasm-only) election so
+    /// it is host-unit-testable. One way: the latch short-circuits every
+    /// subsequent call, so it fires at most once per session — no probe-back, no
+    /// flap. Latching here (before the caller re-elects) is what makes the
+    /// ensuing `create_all_connections` skip every WebTransport candidate.
+    pub fn check_audio_datagram_fallback(&mut self, now_ms: f64) -> bool {
+        if self.wt_audio_fallback_latched {
+            return false;
+        }
+        if !self.audio_loss_tracker.tick(now_ms) {
+            return false;
+        }
+
+        let lossy = self.audio_loss_tracker.window_lossy_count();
+        let window = self.audio_loss_tracker.window_len();
+        let peers = self.audio_loss_tracker.active_peer_count();
+        warn!(
+            "[WT_AUDIO_FALLBACK] sustained uniform WebTransport audio-datagram \
+             loss detected ({lossy}/{window} recent 1s samples uniformly lossy \
+             across {peers} audio-active peer(s), threshold \
+             {WT_AUDIO_LOSS_THRESHOLD_PER_SEC:.0} pkt/s) — forcing this session \
+             to WebSocket-only and re-electing"
+        );
+
+        // Latch + go quiescent. The caller re-elects immediately, but even if
+        // that fails the latch alone keeps every future election WebSocket-only,
+        // and observe_* ignores any in-flight WT sample from here on.
+        self.wt_audio_fallback_latched = true;
+        self.audio_loss_tracker.clear();
+        self.emit_audio_fallback_diagnostic(lossy, window, peers);
+        true
+    }
+
+    /// Issue 2029: emit a one-shot diagnostics-bus event when the WT→WS audio
+    /// fallback fires, so the switch is correlatable in the same pipeline that
+    /// surfaced the loss (the `connection_manager` subsystem the health reporter
+    /// already consumes). Observability-only; no control flow depends on it.
+    fn emit_audio_fallback_diagnostic(
+        &self,
+        lossy_samples: usize,
+        window_samples: usize,
+        audio_active_peers: usize,
+    ) {
+        let event = DiagEvent {
+            subsystem: "connection_manager",
+            stream_id: None,
+            ts_ms: now_ms(),
+            metrics: vec![
+                metric!("wt_audio_fallback_fired", 1_u64),
+                metric!("wt_audio_fallback_lossy_samples", lossy_samples as u64),
+                metric!("wt_audio_fallback_window_samples", window_samples as u64),
+                metric!(
+                    "wt_audio_fallback_audio_active_peers",
+                    audio_active_peers as u64
+                ),
+            ],
+        };
+        let _ = global_sender().try_broadcast(event);
+    }
+
     /// Report RTT metrics to diagnostics system
     fn report_diagnostics(&self) {
         // PER-TICK hot path: fires on every 1 Hz diagnostics report. Demoted
@@ -3814,13 +4656,21 @@ impl ConnectionManager {
         // snapshot and the builder's snapshot taken on the very next line, so
         // the counted event always matches the suppression decision the builder
         // makes for the same tick.
-        if self.rtt_probe_stale() {
+        let rtt_probe_stale = self.rtt_probe_stale();
+        if rtt_probe_stale {
             self.rtt_probe_stale_suppressions_total.set(
                 self.rtt_probe_stale_suppressions_total
                     .get()
                     .saturating_add(1),
             );
         }
+
+        // issue 1976: feed the active uplink's RTT baseline to the WT slow-`ready()`
+        // saturation governor so its threshold scales with the path's own RTT. Uses
+        // the SAME stale snapshot as the suppression counter above (nothing mutates
+        // the inputs between here and the builder's own snapshot), so the baseline
+        // and the emitted `active_server_rtt` metric agree.
+        self.feed_uplink_rtt_baseline(rtt_probe_stale);
 
         let metrics = self.build_main_diagnostic_metrics();
 
@@ -4006,6 +4856,34 @@ impl ConnectionManager {
             if let Some((ref old_id, ref old_conn)) = self.old_active_connection {
                 if old_id == active_id {
                     old_conn.send_packet(packet, stream_key);
+                    // Increment packets sent counter
+                    self.packets_sent.set(self.packets_sent.get() + 1);
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(anyhow!("No active connection available"))
+    }
+
+    pub fn send_packet_with_drop_meta(
+        &self,
+        packet: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) -> Result<()> {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            // Try the main connections HashMap first.
+            if let Some(connection) = self.connections.get(active_id) {
+                connection.send_packet_with_drop_meta(packet, stream_key, meta);
+                // Increment packets sent counter
+                self.packets_sent.set(self.packets_sent.get() + 1);
+                return Ok(());
+            }
+            // During re-election, the old connection lives in old_active_connection.
+            if let Some((ref old_id, ref old_conn)) = self.old_active_connection {
+                if old_id == active_id {
+                    old_conn.send_packet_with_drop_meta(packet, stream_key, meta);
                     // Increment packets sent counter
                     self.packets_sent.set(self.packets_sent.get() + 1);
                     return Ok(());
@@ -4569,6 +5447,8 @@ mod tests {
             suppression_started_at_ms: None,
             total_suppression_duration_ms: 0.0,
             last_suppression_release_at_ms: None,
+            audio_loss_tracker: WtAudioLossTracker::default(),
+            wt_audio_fallback_latched: false,
         }
     }
 
@@ -4664,6 +5544,491 @@ mod tests {
             "expected ElectionState::Failed after a no-candidate election"
         );
         after - before
+    }
+
+    #[test]
+    fn fmt_opt_rtt_formats_value_and_null() {
+        assert_eq!(fmt_opt_rtt(Some(42.74)), "42.7");
+        assert_eq!(fmt_opt_rtt(None), "null");
+    }
+
+    #[test]
+    fn format_election_candidate_matches_canonical_connected_wt() {
+        assert_eq!(
+            format_election_candidate(
+                true,
+                "wt_0",
+                "https://relay.example/lobby",
+                true,
+                3,
+                Some(42.74),
+                true,
+            ),
+            "Election candidate: transport=wt id=wt_0 url=https://relay.example/lobby \
+             is_connected=true rtt_samples=3 avg_rtt_ms=42.7 qualifies_for_best=true"
+        );
+    }
+
+    #[test]
+    fn format_election_candidate_renders_null_and_unqualified_ws() {
+        assert_eq!(
+            format_election_candidate(
+                false,
+                "ws_0",
+                "wss://relay.example/lobby",
+                false,
+                0,
+                None,
+                false,
+            ),
+            "Election candidate: transport=ws id=ws_0 url=wss://relay.example/lobby \
+             is_connected=false rtt_samples=0 avg_rtt_ms=null qualifies_for_best=false"
+        );
+    }
+
+    #[test]
+    fn format_election_decision_matches_canonical_best_wt() {
+        assert_eq!(
+            format_election_decision(
+                "best_wt_min_samples",
+                ElectionOutcome::Elected,
+                Some("wt_0"),
+                Some("wt_0"),
+                3,
+                2,
+                Some(42.74),
+                Some(58.14),
+                Some(1500),
+            ),
+            "Election decision: reason=best_wt_min_samples outcome=elected elected=wt_0 \
+             active=wt_0 wt_samples=3 ws_samples=2 wt_avg_rtt_ms=42.7 ws_avg_rtt_ms=58.1 \
+             election_duration_ms=1500"
+        );
+    }
+
+    #[test]
+    fn format_election_decision_renders_none_and_nulls() {
+        assert_eq!(
+            format_election_decision(
+                "election_failed_no_candidates",
+                ElectionOutcome::Failed,
+                None,
+                None,
+                0,
+                0,
+                None,
+                None,
+                None,
+            ),
+            "Election decision: reason=election_failed_no_candidates outcome=failed \
+             elected=none active=none wt_samples=0 ws_samples=0 wt_avg_rtt_ms=null \
+             ws_avg_rtt_ms=null election_duration_ms=null"
+        );
+    }
+
+    /// The re-election-abort case: RTT winner and actual active DIFFER. The
+    /// decision line must report the discarded winner as `elected=` and the
+    /// kept-old connection as `active=`, tagged `outcome=aborted_kept_old`.
+    /// This is the #1745-review bug the outcome field fixes: reverting to a
+    /// single `elected=` (winner) field makes this indistinguishable from a
+    /// real switch.
+    #[test]
+    fn format_election_decision_abort_reports_winner_and_kept_old_distinctly() {
+        let line = format_election_decision(
+            "best_wt_min_samples",
+            ElectionOutcome::AbortedKeptOld,
+            Some("wt_1"),
+            Some("ws_0"),
+            2,
+            2,
+            Some(40.0),
+            Some(41.0),
+            Some(900),
+        );
+        assert!(
+            line.contains("outcome=aborted_kept_old"),
+            "must tag the abort outcome: {line}"
+        );
+        assert!(
+            line.contains("elected=wt_1") && line.contains("active=ws_0"),
+            "winner (wt_1) and actual active (ws_0) must differ and both appear: {line}"
+        );
+    }
+
+    fn assert_election_selection(
+        mgr: &ConnectionManager,
+        expected_id: &str,
+        expected_reason: &'static str,
+    ) {
+        let scan = scan_election_candidates(&mgr.rtt_measurements, &mgr.connections);
+        let (selected_id, _) = ConnectionManager::find_best_connection(&scan)
+            .expect("scenario must contain an eligible candidate");
+        assert_eq!(selected_id, expected_id);
+        assert_eq!(classify_election_reason_from_scan(&scan), expected_reason);
+    }
+
+    #[test]
+    fn election_winner_and_reason_share_candidate_selection() {
+        let mut best_wt = make_test_manager();
+        insert_measurement(&mut best_wt, "wt_best", true, Some(80.0), vec![80.0, 80.0]);
+        insert_measurement(&mut best_wt, "ws_best", false, Some(20.0), vec![20.0, 20.0]);
+        assert_election_selection(&best_wt, "wt_best", "best_wt_min_samples");
+
+        let mut best_ws = make_test_manager();
+        insert_measurement(&mut best_ws, "wt_fallback", true, Some(10.0), vec![10.0]);
+        insert_measurement(&mut best_ws, "ws_best", false, Some(60.0), vec![60.0, 60.0]);
+        assert_election_selection(&best_ws, "ws_best", "best_ws_min_samples");
+
+        let mut fallback_wt = make_test_manager();
+        insert_measurement(
+            &mut fallback_wt,
+            "wt_fallback",
+            true,
+            Some(80.0),
+            vec![80.0],
+        );
+        insert_measurement(
+            &mut fallback_wt,
+            "ws_fallback",
+            false,
+            Some(20.0),
+            vec![20.0],
+        );
+        assert_election_selection(&fallback_wt, "wt_fallback", "fallback_wt_any_samples");
+
+        let mut disconnected_wt = make_test_manager();
+        insert_measurement(
+            &mut disconnected_wt,
+            "wt_disconnected",
+            true,
+            Some(10.0),
+            vec![10.0, 10.0],
+        );
+        insert_measurement(
+            &mut disconnected_wt,
+            "ws_best",
+            false,
+            Some(70.0),
+            vec![70.0, 70.0],
+        );
+        disconnected_wt.connections.insert(
+            "wt_disconnected".to_string(),
+            Connection::new_for_test_disconnected(true),
+        );
+        assert_election_selection(&disconnected_wt, "ws_best", "best_ws_min_samples");
+
+        let empty = make_test_manager();
+        let scan = scan_election_candidates(&empty.rtt_measurements, &empty.connections);
+        assert!(ConnectionManager::find_best_connection(&scan).is_err());
+        assert_eq!(
+            classify_election_reason_from_scan(&scan),
+            "election_failed_no_candidates"
+        );
+    }
+
+    #[test]
+    fn classify_election_reason_best_wt_min_samples() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, Some(42.0), vec![42.0, 42.0]);
+        insert_measurement(&mut mgr, "ws_0", false, Some(25.0), vec![25.0, 25.0]);
+
+        assert_eq!(
+            classify_election_reason(&mgr.rtt_measurements, &mgr.connections),
+            "best_wt_min_samples"
+        );
+    }
+
+    #[test]
+    fn classify_election_reason_best_ws_min_samples() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "ws_0", false, Some(58.0), vec![58.0, 58.0]);
+
+        assert_eq!(
+            classify_election_reason(&mgr.rtt_measurements, &mgr.connections),
+            "best_ws_min_samples"
+        );
+    }
+
+    #[test]
+    fn classify_election_reason_fallback_wt_any_samples() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, Some(42.0), vec![42.0]);
+        insert_measurement(&mut mgr, "ws_0", false, Some(58.0), vec![58.0]);
+
+        assert_eq!(
+            classify_election_reason(&mgr.rtt_measurements, &mgr.connections),
+            "fallback_wt_any_samples"
+        );
+    }
+
+    #[test]
+    fn classify_election_reason_fallback_ws_any_samples() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "ws_0", false, Some(58.0), vec![58.0]);
+
+        assert_eq!(
+            classify_election_reason(&mgr.rtt_measurements, &mgr.connections),
+            "fallback_ws_any_samples"
+        );
+    }
+
+    #[test]
+    fn classify_election_reason_no_wt_measurements_forced_ws() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        insert_measurement(&mut mgr, "ws_0", false, Some(58.0), vec![58.0, 58.0]);
+
+        assert_eq!(
+            classify_election_reason(&mgr.rtt_measurements, &mgr.connections),
+            "no_wt_measurements_forced_ws"
+        );
+    }
+
+    #[test]
+    fn classify_election_reason_election_failed_no_candidates() {
+        let mgr = make_test_manager();
+
+        assert_eq!(
+            classify_election_reason(&mgr.rtt_measurements, &mgr.connections),
+            "election_failed_no_candidates"
+        );
+    }
+
+    /// MUTATION CHECK for the `is_connected` skip in the scan predicate. A WT
+    /// candidate with enough samples but a PRESENT, DISCONNECTED connection must
+    /// be skipped (matching `find_best_connection`), so the WS candidate wins.
+    /// Deleting the `if !conn.is_connected() { continue }` branch from
+    /// `scan_election_candidates` would make WT qualify and flip this to
+    /// `best_wt_min_samples`, failing this test. (Prior tests left `connections`
+    /// empty, so the skip was never exercised — #1745 review gap.)
+    #[test]
+    fn classify_election_reason_skips_disconnected_connection() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, Some(20.0), vec![20.0, 20.0]);
+        insert_measurement(&mut mgr, "ws_0", false, Some(58.0), vec![58.0, 58.0]);
+        // wt_0 has a present-but-disconnected connection => ineligible.
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_disconnected(true),
+        );
+        // ws_0 present and connected.
+        mgr.connections.insert(
+            "ws_0".to_string(),
+            Connection::new_for_test_with_transport(false),
+        );
+
+        assert_eq!(
+            classify_election_reason(&mgr.rtt_measurements, &mgr.connections),
+            "best_ws_min_samples",
+            "a disconnected WT candidate must be skipped, leaving WS the winner"
+        );
+    }
+
+    /// PRODUCTION-PATH regression for BOTH #1745 review findings, driven through
+    /// the real `complete_election` re-election ABORT branch (host-runnable — the
+    /// pre-existing `complete_election_aborts_*` tests are `#[cfg(target_arch =
+    /// "wasm32")]` and never actually execute under `wasm-pack test --node`,
+    /// which only collects `#[wasm_bindgen_test]`; this one runs in the host
+    /// `cargo test` job).
+    ///
+    /// Scenario: a re-election where the OLD connection (`wt_old`, healthy WT)
+    /// was moved into `old_active_connection`, and the only live candidate is a
+    /// WORSE WS (`ws_0`, 200ms). `find_best_connection` elects `ws_0`
+    /// (`best_ws_min_samples` at election time), but hysteresis aborts (200ms is
+    /// not 20ms better than the old 20ms), restoring `wt_old` — which re-inserts
+    /// a qualifying WT measurement, so a POST-restore re-scan would classify
+    /// `best_wt_min_samples`.
+    ///
+    /// The emitted decision (captured via the production seam) must therefore be:
+    ///   reason  = best_ws_min_samples   (election-time; NOT best_wt from re-scan → guards the snapshot fix)
+    ///   outcome = aborted_kept_old
+    ///   elected = ws_0                  (the discarded RTT winner)
+    ///   active  = wt_old                (the connection actually kept → guards the wiring fix)
+    ///
+    /// MUTATION CHECKS (verified by revert):
+    ///  - if `log_election_decision` re-scanned instead of using the snapshot,
+    ///    `reason` would be `best_wt_min_samples` → FAILS here.
+    ///  - if the abort site passed the winner as `active`, `active` would be
+    ///    `ws_0` → FAILS here.
+    #[test]
+    fn complete_election_abort_emits_election_time_reason_and_kept_old_active() {
+        let mut mgr = make_test_manager();
+
+        // Old active connection preserved during re-election: healthy WT at 20ms,
+        // moved out of `connections` into `old_active_connection`, with
+        // `active_connection_id` still pointing at it.
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(20.0);
+        mgr.old_active_rtt_measurement = Some(ServerRttMeasurement {
+            url: "https://test/wt_old".to_string(),
+            is_webtransport: true,
+            measurements: VecDeque::from(vec![20.0, 20.0]),
+            average_rtt: Some(20.0),
+            connection_id: "wt_old".to_string(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
+        });
+        mgr.old_active_connection = Some((
+            "wt_old".to_string(),
+            Connection::new_for_test_with_transport(true),
+        ));
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+
+        // The only live candidate is a WORSE WebSocket connection. It is absent
+        // from `mgr.connections`, so find_best evaluates it purely on RTT (the
+        // same bypass the sibling abort tests use).
+        insert_measurement(&mut mgr, "ws_0", false, Some(200.0), vec![200.0, 200.0]);
+
+        let _ = take_last_election_decision(); // clear any prior capture
+        mgr.complete_election();
+
+        // The re-election must have aborted, keeping the old connection.
+        assert!(
+            !mgr.reelection_in_progress,
+            "abort must clear reelection_in_progress"
+        );
+        assert_eq!(
+            *mgr.active_connection_id.borrow(),
+            Some("wt_old".to_string()),
+            "abort must keep the OLD connection active"
+        );
+
+        let decision =
+            take_last_election_decision().expect("complete_election must emit a decision line");
+        assert_eq!(
+            decision.outcome,
+            ElectionOutcome::AbortedKeptOld,
+            "outcome must reflect the abort, not a switch"
+        );
+        assert_eq!(
+            decision.reason, "best_ws_min_samples",
+            "reason must be the ELECTION-TIME classification (ws_0 won the race); \
+             a re-scan after wt_old is restored would wrongly say best_wt_min_samples"
+        );
+        assert_eq!(
+            decision.elected.as_deref(),
+            Some("ws_0"),
+            "elected must name the discarded RTT winner"
+        );
+        assert_eq!(
+            decision.active.as_deref(),
+            Some("wt_old"),
+            "active must name the connection actually kept, NOT the winner"
+        );
+    }
+
+    /// PRODUCTION-PATH regression for the PreservedOld terminal outcome, driven
+    /// through the real `complete_election` → `try_preserve_old_connection_on_candidate_failure`
+    /// success branch (host-runnable via the `schedule_preservation_retry` seam —
+    /// the underlying `spawn_local` is unavailable off-wasm).
+    ///
+    /// Scenario: a re-election where ALL candidates failed (no rtt_measurements),
+    /// but the old connection (`wt_old`) is still fresh, so preservation fires.
+    /// The preserve path RESTORES `wt_old` into the candidate maps before the
+    /// decision logs — so a POST-restore re-scan would classify
+    /// `best_wt_min_samples`, while the election-time reason was
+    /// `election_failed_no_candidates` (no candidate existed).
+    ///
+    /// Emitted decision must be:
+    ///   reason  = election_failed_no_candidates  (election-time; NOT best_wt from re-scan)
+    ///   outcome = preserved_old
+    ///   elected = none                           (no RTT winner existed)
+    ///   active  = wt_old                         (the connection preserved)
+    ///
+    /// MUTATION CHECK: if `log_election_decision` re-scanned, `reason` would be
+    /// `best_wt_min_samples` → FAILS.
+    #[test]
+    fn complete_election_preserve_emits_election_time_reason_and_kept_old_active() {
+        let mut mgr = make_test_manager();
+
+        // Re-election with a fresh old connection and NO candidates.
+        mgr.reelection_in_progress = true;
+        mgr.old_active_rtt = Some(20.0);
+        mgr.old_active_rtt_measurement = Some(ServerRttMeasurement {
+            url: "https://test/wt_old".to_string(),
+            is_webtransport: true,
+            measurements: VecDeque::from(vec![20.0, 20.0]),
+            average_rtt: Some(20.0),
+            connection_id: "wt_old".to_string(),
+            active: true,
+            connected: true,
+            consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
+        });
+        mgr.old_active_connection = Some((
+            "wt_old".to_string(),
+            Connection::new_for_test_with_transport(true),
+        ));
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+        // Fresh inbound (well within the 5s freshness window) so preservation fires.
+        mgr.last_inbound_at_ms
+            .borrow_mut()
+            .insert("wt_old".to_string(), monotonic_now_ms() - 100.0);
+        // No rtt_measurements inserted => find_best_connection returns Err.
+
+        let _ = take_last_election_decision();
+        let _ = take_retry_scheduled();
+        mgr.complete_election();
+
+        // Preservation must have fired (not fallen through to Failed).
+        assert!(
+            matches!(mgr.election_state, ElectionState::Elected { .. }),
+            "preserve path must restore Elected state on the old connection"
+        );
+        assert!(
+            mgr.reelection_preserved_once,
+            "preserve path must set reelection_preserved_once"
+        );
+        assert!(
+            take_retry_scheduled(),
+            "preserve path must schedule the retry (via the host seam)"
+        );
+
+        let decision =
+            take_last_election_decision().expect("preserve path must emit a decision line");
+        assert_eq!(
+            decision.outcome,
+            ElectionOutcome::PreservedOld,
+            "outcome must be preserved_old"
+        );
+        assert_eq!(
+            decision.reason, "election_failed_no_candidates",
+            "reason must be the ELECTION-TIME classification (no candidates); \
+             a re-scan after wt_old is restored would wrongly say best_wt_min_samples"
+        );
+        assert_eq!(
+            decision.elected.as_deref(),
+            None,
+            "no RTT winner existed on the preserve path"
+        );
+        assert_eq!(
+            decision.active.as_deref(),
+            Some("wt_old"),
+            "active must name the preserved old connection"
+        );
+    }
+
+    /// MUTATION CHECK for the SECOND emission site of `no_wt_measurements_forced_ws`
+    /// (the `fallback_ws` branch, not the `best_ws` branch). A silent WT
+    /// (avg_rtt=None) plus a SINGLE-sample WS (a fallback, not a `best`) must
+    /// still classify as forced-WS. The existing forced-WS test used 2 WS
+    /// samples, hitting only the `best_ws` branch — this covers the fallback
+    /// branch that was previously mutation-insensitive (#1745 review gap).
+    #[test]
+    fn classify_election_reason_forced_ws_via_fallback_branch() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]); // live but probe-silent
+        insert_measurement(&mut mgr, "ws_0", false, Some(58.0), vec![58.0]); // 1 sample => fallback
+
+        assert_eq!(
+            classify_election_reason(&mgr.rtt_measurements, &mgr.connections),
+            "no_wt_measurements_forced_ws",
+            "a silent WT + single-sample WS must be forced-WS via the fallback branch"
+        );
     }
 
     #[test]
@@ -6570,6 +7935,368 @@ mod tests {
     }
 
     #[test]
+    fn uplink_rtt_baseline_feed_passes_elected_rtt_when_fresh() {
+        // Steady state: Elected with a measured RTT and a healthy probe pipeline
+        // feeds that RTT to the WT saturation governor.
+        assert_eq!(
+            uplink_rtt_baseline_feed(Some(255.0), false),
+            Some(255.0),
+            "a fresh Elected RTT must be fed as the baseline",
+        );
+    }
+
+    #[test]
+    fn uplink_rtt_baseline_feed_resets_when_probe_stale() {
+        // Stale RTT-probe pipeline (CPU stall / starvation): the average may be a
+        // garbage/elevated value, so we must RESET (feed None) rather than pin a
+        // bogus high baseline that would desensitize saturation detection. If the
+        // stale guard is removed, this returns Some(700.0) and fails.
+        assert_eq!(
+            uplink_rtt_baseline_feed(Some(700.0), true),
+            None,
+            "a stale RTT-probe pipeline must reset the baseline to the floor",
+        );
+    }
+
+    #[test]
+    fn uplink_rtt_baseline_feed_resets_when_not_elected() {
+        // Not Elected (e.g. mid re-election / Testing): the caller passes None for
+        // `elected_avg_rtt`, so the feed resets — a re-elected transport re-anchors
+        // on its OWN RTT instead of inheriting the prior path's baseline.
+        assert_eq!(
+            uplink_rtt_baseline_feed(None, false),
+            None,
+            "no Elected RTT must reset the baseline (re-anchor on re-election)",
+        );
+        // Stale AND not elected still resets.
+        assert_eq!(uplink_rtt_baseline_feed(None, true), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 2029: WT→WS audio-datagram-loss fallback.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wt_audio_tick_classify_uniformity_rules() {
+        let thr = WT_AUDIO_LOSS_THRESHOLD_PER_SEC;
+        // No audio-active peers this tick: nothing to fall back for.
+        assert_eq!(
+            wt_audio_tick_classify(&[], thr),
+            WtAudioLossSample {
+                active_peers: 0,
+                uniform_lossy: false
+            }
+        );
+        // Single peer: lossy at/over the threshold, not below.
+        assert!(wt_audio_tick_classify(&[thr], thr).uniform_lossy);
+        assert!(!wt_audio_tick_classify(&[thr - 0.1], thr).uniform_lossy);
+        // Two peers both lossy => uniform receive-queue drop.
+        assert!(wt_audio_tick_classify(&[30.0, 30.0], thr).uniform_lossy);
+        // Two peers, only one lossy => path loss, NOT uniform (WS would not fix
+        // it) — this is the core gate against firing on per-sender loss.
+        assert!(!wt_audio_tick_classify(&[30.0, 0.0], thr).uniform_lossy);
+        // Five peers: 4/5 = 80% lossy => uniform; 3/5 = 60% => not.
+        assert!(wt_audio_tick_classify(&[30.0, 30.0, 30.0, 30.0, 0.0], thr).uniform_lossy);
+        assert!(!wt_audio_tick_classify(&[30.0, 30.0, 30.0, 0.0, 0.0], thr).uniform_lossy);
+    }
+
+    #[test]
+    fn wt_audio_fallback_should_fire_k_of_m_rules() {
+        let multi_lossy = WtAudioLossSample {
+            active_peers: 2,
+            uniform_lossy: true,
+        };
+        let multi_clean = WtAudioLossSample {
+            active_peers: 2,
+            uniform_lossy: false,
+        };
+        let single_lossy = WtAudioLossSample {
+            active_peers: 1,
+            uniform_lossy: true,
+        };
+
+        // Empty / cold-start window never fires.
+        assert!(!wt_audio_fallback_should_fire(&[]));
+
+        // Multi-peer: exactly K_MULTI lossy fires; one fewer does not.
+        assert!(wt_audio_fallback_should_fire(
+            &[multi_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI]
+        ));
+        assert!(!wt_audio_fallback_should_fire(
+            &[multi_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1]
+        ));
+
+        // Intermittent / decayed: (K_MULTI - 1) lossy diluted by clean samples
+        // stays below the bar (windowed, not consecutive — clean samples do not
+        // "reset" progress, but they also don't count toward it).
+        let mut intermittent = vec![multi_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1];
+        intermittent.resize(WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1 + 5, multi_clean);
+        assert!(!wt_audio_fallback_should_fire(&intermittent));
+
+        // Single remote peer: the multi bar (8) is NOT enough — the stricter
+        // single-peer bar (10) applies because uniformity is uncheckable.
+        assert!(!wt_audio_fallback_should_fire(
+            &[single_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI]
+        ));
+        assert!(wt_audio_fallback_should_fire(
+            &[single_lossy; WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE]
+        ));
+    }
+
+    #[test]
+    fn wt_election_excludes_wt_only_when_latched() {
+        assert!(
+            wt_election_includes_wt(false),
+            "no latch: WebTransport candidates are allowed"
+        );
+        assert!(
+            !wt_election_includes_wt(true),
+            "WS-only latch: the election must exclude every WebTransport candidate"
+        );
+    }
+
+    // These two pin the WS-fallback ACTION natively: `create_all_connections`
+    // dials `build_election_candidates(...)` 1:1, and `Connection::connect` is
+    // wasm-only, so this pure helper is the only host-reachable seam for the
+    // WT-exclusion guard. Deleting the latch check (WT never excluded) reddens
+    // the latched test; reordering to put WT before WS reddens the unlatched
+    // test — so the guard is red-on-mutation in both directions.
+    #[test]
+    fn build_election_candidates_unlatched_ws_then_wt_in_order() {
+        let ws = vec!["ws://a".to_string(), "ws://b".to_string()];
+        let wt = vec![
+            "https://x".to_string(),
+            "https://y".to_string(),
+            "https://z".to_string(),
+        ];
+        let candidates = build_election_candidates(&ws, &wt, false);
+        assert_eq!(
+            candidates,
+            vec![
+                ElectionCandidate {
+                    is_webtransport: false,
+                    index: 0,
+                    base_url: "ws://a".to_string()
+                },
+                ElectionCandidate {
+                    is_webtransport: false,
+                    index: 1,
+                    base_url: "ws://b".to_string()
+                },
+                ElectionCandidate {
+                    is_webtransport: true,
+                    index: 0,
+                    base_url: "https://x".to_string()
+                },
+                ElectionCandidate {
+                    is_webtransport: true,
+                    index: 1,
+                    base_url: "https://y".to_string()
+                },
+                ElectionCandidate {
+                    is_webtransport: true,
+                    index: 2,
+                    base_url: "https://z".to_string()
+                },
+            ],
+            "unlatched: every WS candidate first (in order), then every WT candidate (in order)"
+        );
+    }
+
+    #[test]
+    fn build_election_candidates_latched_excludes_all_wt() {
+        let ws = vec!["ws://a".to_string()];
+        let wt = vec!["https://x".to_string(), "https://y".to_string()];
+        let candidates = build_election_candidates(&ws, &wt, true);
+        assert!(
+            candidates.iter().all(|c| !c.is_webtransport),
+            "WS-only latch must exclude every WebTransport candidate regardless of configured WT URLs"
+        );
+        assert_eq!(
+            candidates,
+            vec![ElectionCandidate {
+                is_webtransport: false,
+                index: 0,
+                base_url: "ws://a".to_string()
+            }],
+            "latched: WS candidates only, unchanged"
+        );
+    }
+
+    #[test]
+    fn wt_audio_tracker_fires_on_sustained_uniform_two_peer_loss() {
+        let mut tracker = WtAudioLossTracker::default();
+        let mut fired_at = None;
+        for i in 0..WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            let now = i as f64 * 1000.0;
+            tracker.observe("peer-a", 30.0, now);
+            tracker.observe("peer-b", 30.0, now);
+            if tracker.tick(now) && fired_at.is_none() {
+                fired_at = Some(i);
+            }
+        }
+        assert_eq!(
+            fired_at,
+            Some(WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI - 1),
+            "two uniformly-lossy peers must fire on the {}th (K_MULTI-th) 1s sample",
+            WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI
+        );
+    }
+
+    #[test]
+    fn wt_audio_tracker_does_not_fire_on_per_sender_only_loss() {
+        // One lossy sender, one healthy sender, every second for two full
+        // windows: never uniform, so WS (which cannot fix a single path's loss)
+        // is never forced.
+        let mut tracker = WtAudioLossTracker::default();
+        for i in 0..(WT_AUDIO_LOSS_WINDOW_SAMPLES * 2) {
+            let now = i as f64 * 1000.0;
+            tracker.observe("peer-a", 30.0, now);
+            tracker.observe("peer-b", 0.0, now);
+            assert!(
+                !tracker.tick(now),
+                "one lossy sender among healthy peers is path loss, not a \
+                 uniform receive-queue drop — must not fire"
+            );
+        }
+    }
+
+    #[test]
+    fn wt_audio_tracker_does_not_fire_on_short_burst() {
+        // A 4-second burst then clean: the window can never reach K-of-M.
+        let mut tracker = WtAudioLossTracker::default();
+        for i in 0..WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            let now = i as f64 * 1000.0;
+            let loss = if i < 4 { 30.0 } else { 0.0 };
+            tracker.observe("peer-a", loss, now);
+            tracker.observe("peer-b", loss, now);
+            assert!(
+                !tracker.tick(now),
+                "a 4s burst must never reach the {}-of-{} bar",
+                WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_MULTI,
+                WT_AUDIO_LOSS_WINDOW_SAMPLES
+            );
+        }
+    }
+
+    #[test]
+    fn wt_audio_tracker_single_peer_requires_full_strength() {
+        // A single continuously-lossy remote sender must hold out for the
+        // stricter single-peer bar (10), NOT the multi-peer bar (8): asserting
+        // it fires exactly at SINGLE-1 proves the multi bar did not fire it
+        // early.
+        let mut tracker = WtAudioLossTracker::default();
+        let mut fired_at = None;
+        for i in 0..WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            let now = i as f64 * 1000.0;
+            tracker.observe("solo-peer", 30.0, now);
+            if tracker.tick(now) && fired_at.is_none() {
+                fired_at = Some(i);
+            }
+        }
+        assert_eq!(
+            fired_at,
+            Some(WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE - 1),
+            "a single lossy sender must require the full-strength ({}-of-{}) window",
+            WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE,
+            WT_AUDIO_LOSS_WINDOW_SAMPLES
+        );
+    }
+
+    #[test]
+    fn wt_audio_tracker_ages_out_departed_peer() {
+        let mut tracker = WtAudioLossTracker::default();
+        tracker.observe("peer-a", 30.0, 0.0);
+        tracker.observe("peer-b", 30.0, 0.0);
+        tracker.tick(0.0);
+        assert_eq!(tracker.active_peer_count(), 2, "both peers seen this tick");
+
+        // Only peer-a keeps emitting; advance past the stale window.
+        let after = WT_AUDIO_LOSS_PEER_STALE_MS + 1000.0;
+        tracker.observe("peer-a", 30.0, after);
+        tracker.tick(after);
+        assert_eq!(
+            tracker.active_peer_count(),
+            1,
+            "a peer with no fresh sample within the stale window must leave the \
+             uniformity denominator"
+        );
+    }
+
+    // Regression (issue 2029): on the UN-fixed code neither
+    // `observe_peer_audio_datagram_loss` nor `check_audio_datagram_fallback`
+    // exists and nothing consumes the per-peer WT audio-loss gauge, so the
+    // WS-fallback action asserted below cannot occur. Concretely: reverting the
+    // decision (making the detector never return `true`) breaks `assert!(fired)`,
+    // and reverting the action (not setting `wt_audio_fallback_latched`) breaks
+    // the latch assertion. Drives the PRODUCTION feed + tick methods — it does
+    // not re-implement the predicate.
+    #[test]
+    fn check_audio_datagram_fallback_fires_latches_and_is_one_way() {
+        let mut mgr = make_test_manager();
+        assert!(!mgr.wt_audio_fallback_latched, "cold start: not latched");
+
+        // Cold start (no observations) must not fire.
+        assert!(
+            !mgr.check_audio_datagram_fallback(0.0),
+            "no peers / no loss must not fire"
+        );
+
+        // Sustained, cross-sender-uniform loss across two audio-active WT peers.
+        let mut fired = false;
+        for i in 1..=WT_AUDIO_LOSS_WINDOW_SAMPLES {
+            let now = i as f64 * 1000.0;
+            mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, now);
+            mgr.observe_peer_audio_datagram_loss("peer-b", 30.0, now);
+            if mgr.check_audio_datagram_fallback(now) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(
+            fired,
+            "sustained uniform WT audio loss must trigger the WS fallback"
+        );
+        assert!(
+            mgr.wt_audio_fallback_latched,
+            "firing must latch the session WebSocket-only"
+        );
+
+        // One-way latch: no re-fire, and post-latch observations are ignored so
+        // the detector is quiescent (the WS switch makes the source gauge ~0).
+        mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, 99_000.0);
+        assert!(
+            !mgr.check_audio_datagram_fallback(100_000.0),
+            "latch is one-way — must not re-fire"
+        );
+        assert_eq!(
+            mgr.audio_loss_tracker.active_peer_count(),
+            0,
+            "post-latch observations must be ignored (detector quiescent)"
+        );
+    }
+
+    #[test]
+    fn check_audio_datagram_fallback_does_not_fire_on_per_sender_loss() {
+        // Manager-level mirror of the per-sender case: two WT peers, only one
+        // lossy, for two full windows — never fires, never latches.
+        let mut mgr = make_test_manager();
+        for i in 1..=(WT_AUDIO_LOSS_WINDOW_SAMPLES * 2) {
+            let now = i as f64 * 1000.0;
+            mgr.observe_peer_audio_datagram_loss("peer-a", 30.0, now);
+            mgr.observe_peer_audio_datagram_loss("peer-b", 0.0, now);
+            assert!(
+                !mgr.check_audio_datagram_fallback(now),
+                "per-sender-only loss must not force WebSocket"
+            );
+        }
+        assert!(
+            !mgr.wt_audio_fallback_latched,
+            "per-sender-only loss must never latch"
+        );
+    }
+
+    #[test]
     fn sustained_suppression_escalates_with_connection_failed_state() {
         // Directly seed the cumulative accumulator past budget, then drive ONE
         // suppressed tick. The live-cumulative check inside the suppressed
@@ -6801,22 +8528,22 @@ mod tests {
     // ===================================================================
     // 6. find_best_connection — election logic
     // ===================================================================
-    // Note: find_best_connection checks `conn.is_connected()` on each connection.
-    // Since we have no live Connection objects in test, we cannot fully exercise
-    // the "skip non-connected" path. We test the RTT comparison logic by
-    // verifying the preference for WebTransport over WebSocket.
+    // Candidate eligibility is centralized in `scan_election_candidates`;
+    // the classifier tests above cover connected and disconnected entries.
 
     #[test]
     fn find_best_connection_fails_with_no_measurements() {
         let mgr = make_test_manager();
-        assert!(mgr.find_best_connection().is_err());
+        let scan = scan_election_candidates(&mgr.rtt_measurements, &mgr.connections);
+        assert!(ConnectionManager::find_best_connection(&scan).is_err());
     }
 
     #[test]
     fn find_best_connection_fails_with_no_average_rtt() {
         let mut mgr = make_test_manager();
         insert_measurement(&mut mgr, "ws_0", false, None, vec![]);
-        assert!(mgr.find_best_connection().is_err());
+        let scan = scan_election_candidates(&mgr.rtt_measurements, &mgr.connections);
+        assert!(ConnectionManager::find_best_connection(&scan).is_err());
     }
 
     // ===================================================================

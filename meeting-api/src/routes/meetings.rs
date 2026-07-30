@@ -117,6 +117,7 @@ pub async fn create_meeting(
     let end_on_host_leave = body.end_on_host_leave.unwrap_or(true);
     let allow_guests = body.allow_guests.unwrap_or(false);
     let recording_allowed_for_all = body.recording_allowed_for_all.unwrap_or(false);
+    let chat_allowed_for_all = body.chat_allowed_for_all.unwrap_or(true);
 
     let row = db_meetings::create_with_options(
         &state.db,
@@ -129,6 +130,7 @@ pub async fn create_meeting(
         end_on_host_leave,
         allow_guests,
         recording_allowed_for_all,
+        chat_allowed_for_all,
     )
     .await
     .map_err(|e| match e {
@@ -165,6 +167,7 @@ pub async fn create_meeting(
         end_on_host_leave: row.end_on_host_leave,
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
+        chat_allowed_for_all: row.chat_allowed_for_all,
     };
 
     Ok((StatusCode::CREATED, Json(APIResponse::ok(response))))
@@ -220,6 +223,7 @@ pub async fn list_meetings(
             end_on_host_leave: row.end_on_host_leave,
             allow_guests: row.allow_guests,
             recording_allowed_for_all: row.recording_allowed_for_all,
+            chat_allowed_for_all: row.chat_allowed_for_all,
         });
     }
 
@@ -355,6 +359,7 @@ pub async fn list_feed(
                 has_password: row.password_hash.is_some(),
                 allow_guests: row.allow_guests,
                 recording_allowed_for_all: row.recording_allowed_for_all,
+                chat_allowed_for_all: row.chat_allowed_for_all,
                 waiting_room_enabled: row.waiting_room_enabled,
                 admitted_can_admit: row.admitted_can_admit,
                 end_on_host_leave: row.end_on_host_leave,
@@ -404,6 +409,7 @@ pub async fn get_meeting(
         your_status,
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
+        chat_allowed_for_all: row.chat_allowed_for_all,
     })))
 }
 
@@ -477,6 +483,7 @@ pub async fn end_meeting_handler(
             your_status,
             allow_guests: meeting.allow_guests,
             recording_allowed_for_all: meeting.recording_allowed_for_all,
+            chat_allowed_for_all: meeting.chat_allowed_for_all,
         })));
     }
 
@@ -526,6 +533,7 @@ pub async fn end_meeting_handler(
         your_status,
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
+        chat_allowed_for_all: row.chat_allowed_for_all,
     })))
 }
 
@@ -540,7 +548,8 @@ pub async fn update_meeting(
         || body.admitted_can_admit.is_some()
         || body.end_on_host_leave.is_some()
         || body.allow_guests.is_some()
-        || body.recording_allowed_for_all.is_some();
+        || body.recording_allowed_for_all.is_some()
+        || body.chat_allowed_for_all.is_some();
 
     let row = if settings_updated {
         // Atomically update both settings within a single transaction.
@@ -555,6 +564,7 @@ pub async fn update_meeting(
             body.end_on_host_leave,
             body.allow_guests,
             body.recording_allowed_for_all,
+            body.chat_allowed_for_all,
         )
         .await?
         {
@@ -641,6 +651,7 @@ pub async fn update_meeting(
         your_status,
         allow_guests: row.allow_guests,
         recording_allowed_for_all: row.recording_allowed_for_all,
+        chat_allowed_for_all: row.chat_allowed_for_all,
     })))
 }
 

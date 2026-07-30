@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
+import type { AuthBackend } from "../auth/storage-state";
 import type { LaunchSpec } from "./server";
 
 /**
@@ -40,7 +41,13 @@ export interface ProfileBotSpec {
   ttl: string;
   headless: boolean;
   network: string;
-  authBackend: "jwt" | "storage-state" | "none";
+  // Widened to the shared `AuthBackend` (issue 2035) so a CLI-originated
+  // `form-login` bot type-checks when snapshotted. The profile-save validator
+  // (`validateBotSpec`) still only ACCEPTS "jwt" | "storage-state" | "none" on
+  // reload, so form-login profiles are not a supported round-trip yet — the
+  // widening only lets an in-memory snapshot represent the value faithfully.
+  authBackend: AuthBackend;
+  videoMode?: "costume" | "file" | "clock" | null;
   storageStateFile?: string;
   /**
    * Where this bot's Chrome ran when the profile was captured. Re-used
@@ -227,8 +234,16 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
   const network = expectString(o.network, `${where}.network`);
   const auth = o.authBackend;
   if (auth !== "jwt" && auth !== "storage-state" && auth !== "none") {
+    // form-login is intentionally not persistable (creds live in the
+    // environment, not the profile) — name it explicitly so a hand-edited or
+    // legacy file that carries it gets an actionable message rather than a
+    // bare "must be one of the three legacy values".
+    const hint =
+      auth === "form-login"
+        ? ` — form-login bots are not persistable (creds come from BOT_EMAIL/BOT_PASSWORD at launch); relaunch with --auth form-login instead of saving a profile`
+        : "";
     throw new ProfileValidationError(
-      `${where}.authBackend must be "jwt", "storage-state", or "none"`,
+      `${where}.authBackend must be "jwt", "storage-state", or "none"${hint}`,
     );
   }
   if (typeof o.headless !== "boolean") {
@@ -248,6 +263,7 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
   // it now. Absence is treated as "this profile predates the field"
   // and is filled in with `{ kind: "local" }` by the launch route.
   const runLocation = parseRunLocationField(o.runLocation, `${where}.runLocation`);
+  const videoMode = parseVideoModeField(o.videoMode, `${where}.videoMode`);
   return {
     meetingURL,
     participant,
@@ -258,6 +274,7 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
     authBackend: auth,
     storageStateFile,
     runLocation,
+    videoMode,
   };
 }
 
@@ -279,6 +296,12 @@ function parseRunLocationField(raw: unknown, where: string): ProfileBotSpec["run
     return { kind: "ssh", hostLabel: o.hostLabel };
   }
   throw new ProfileValidationError(`${where}.kind must be "local" or "ssh"`);
+}
+
+function parseVideoModeField(raw: unknown, where: string): ProfileBotSpec["videoMode"] {
+  if (raw === undefined || raw === null) return undefined;
+  if (raw === "costume" || raw === "file" || raw === "clock") return raw;
+  throw new ProfileValidationError(`${where} must be "costume", "file", or "clock"`);
 }
 
 function expectString(v: unknown, where: string): string {
@@ -412,5 +435,6 @@ export function launchSpecToProfileBot(spec: LaunchSpec): ProfileBotSpec {
     authBackend: spec.authBackend,
     storageStateFile: spec.storageStateFile,
     runLocation: spec.runLocation,
+    videoMode: spec.videoMode,
   };
 }

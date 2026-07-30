@@ -25,7 +25,19 @@ import {
   loadMeetingConfig,
   NETSIM_PRESETS,
 } from "./meeting-config";
-import { runBotsToCompletion, type BotTask } from "./orchestrator";
+import { runBotsToCompletion, type BotTask, type RunOptions } from "./orchestrator";
+import { type VideoMode } from "./bot";
+import { FpsTracker } from "./resource/fps";
+import { RemoteResourceManager, ResourceCaptureSession } from "./resource/session";
+import { RESOURCE_FPS_BASE_RUNG } from "./resource/verdict";
+
+/**
+ * Orphan-safety hard cap (s) for every remote resource sampler (issue 2032).
+ * The normal stop path (finalizeAll → kill the SSH session) ends a sampler well
+ * before this; the cap only matters if the local orchestrator dies without
+ * finalizing, so it is generous (6h) to avoid truncating a long-lived run.
+ */
+const REMOTE_SAMPLER_MAX_SECONDS = 6 * 3600;
 import { prepareParticipantAudio } from "./stitcher";
 import { parseDuration, Ttl } from "./ttl";
 
@@ -65,6 +77,11 @@ program
   .option("--display-name <name>", "Display name shown in the meeting", undefined)
   .option("--headless", "Run Chrome headless (default: headed)", false)
   .option(
+    "--video-mode <costume|file|clock>",
+    "Camera source: existing manifest/override fake-file behavior (costume or file), or a synchronized wall-clock canvas (clock).",
+    "costume",
+  )
+  .option(
     "--ttl <duration>",
     'Bot lifespan — "<int>s|m|h" or "infinite". On expiry the bot leaves the meeting and exits. Shared across all bots in --users mode.',
     "5m",
@@ -81,7 +98,7 @@ program
   )
   .option(
     "--auth <backend>",
-    'Auth backend override: "jwt" (cookie injection; for local + HCL + previews), "storage-state" (replay a captured Google OAuth session from `bots-app login`; for app.videocall.rs), or "none" (skip auth entirely; for meetings that allow guest joining). When omitted, picks automatically by hostname.',
+    'Auth backend override: "jwt" (cookie injection; for local + HCL + previews), "storage-state" (replay a captured Google OAuth session from `bots-app login`; for app.videocall.rs), "form-login" (drive the identity provider\'s username/password login form using the BOT_EMAIL + BOT_PASSWORD env vars; for the labsworkspace videocall identity-service), or "none" (skip auth entirely; for meetings that allow guest joining). When omitted, picks automatically by hostname: "jwt" for local/HCL/preview hosts, otherwise "storage-state". "form-login" is NEVER auto-selected — request it explicitly (here or via a config `auth: form-login`) so ambient BOT_EMAIL/BOT_PASSWORD can never be routed into a third-party login form.',
   )
   .option(
     "--storage-state-file <path>",
@@ -110,6 +127,12 @@ program
       console.error("bots-app: one of --participant, --users, or --config is required");
       process.exit(2);
     }
+    if (!["costume", "file", "clock"].includes(opts.videoMode)) {
+      console.error(
+        `bots-app: --video-mode must be "costume", "file", or "clock", got "${opts.videoMode}"`,
+      );
+      process.exit(2);
+    }
 
     // Validate --network up-front (before reading the config file)
     // so a typo on the CLI fails fast with the same error a bad config
@@ -124,9 +147,16 @@ program
     // Load the config file first (if any) — it can supply meeting_url
     // + per-bot list + a default ttl that --ttl can override.
     let configMeetingUrl: string | null = null;
-    let configBots: { participant: string; ttl?: string; network?: string; auth?: string }[] = [];
+    let configBots: {
+      participant: string;
+      ttl?: string;
+      network?: string;
+      videoMode?: VideoMode;
+      auth?: string;
+    }[] = [];
     let configTtl: string | null = null;
     let configNetwork: string | null = null;
+    let configVideoMode: VideoMode | null = null;
     let configAuth: string | null = null;
     if (opts.config) {
       try {
@@ -135,6 +165,7 @@ program
         configBots = cfg.bots;
         configTtl = cfg.ttl ?? null;
         configNetwork = cfg.network ?? null;
+        configVideoMode = cfg.videoMode ?? null;
         configAuth = cfg.auth ?? null;
         console.log(
           `bots-app: loaded meeting config from ${opts.config} (${cfg.bots.length} bot(s)` +
@@ -218,9 +249,14 @@ program
 
     let authOverride: AuthBackend | undefined;
     if (opts.auth) {
-      if (opts.auth !== "jwt" && opts.auth !== "storage-state" && opts.auth !== "none") {
+      if (
+        opts.auth !== "jwt" &&
+        opts.auth !== "storage-state" &&
+        opts.auth !== "none" &&
+        opts.auth !== "form-login"
+      ) {
         console.error(
-          `bots-app: --auth must be "jwt", "storage-state", or "none", got "${opts.auth}"`,
+          `bots-app: --auth must be "jwt", "storage-state", "none", or "form-login", got "${opts.auth}"`,
         );
         process.exit(2);
       }
@@ -233,6 +269,12 @@ program
     const effectiveAuthOverride: AuthBackend | undefined =
       authOverride ?? (configAuth ? (configAuth as AuthBackend) : undefined);
     const hostname = new URL(meetingUrl).hostname;
+    // form-login is never auto-selected — it only comes from an explicit
+    // `--auth form-login` / config `auth: form-login` override (see
+    // `chooseAuthBackend`). This is deliberate: ambient BOT_EMAIL /
+    // BOT_PASSWORD must not silently route real credentials into a
+    // third-party login form (PR #2082 blocker). The creds themselves are
+    // read at launch time by `bot.ts` only when form-login is in effect.
     const authBackend = chooseAuthBackend(hostname, effectiveAuthOverride);
     const ssoStateFile =
       authBackend === "jwt" ? (opts.ssoStateFile ?? defaultSsoStatePath(opts.assetsDir)) : null;
@@ -273,12 +315,14 @@ program
       // re-check needed here. The CLI flag was validated up-front
       // before the config was loaded.
       const network = configEntry?.network ?? configNetwork ?? opts.network ?? undefined;
+      const videoMode = configEntry?.videoMode ?? configVideoMode ?? (opts.videoMode as VideoMode);
       return {
         botId: generateBotId(),
         meetingURL: meetingUrl,
         participant,
         displayName,
         headless: opts.headless,
+        videoMode,
         authBackend: effectiveAuthBackend,
         storageStateFile,
         ssoStateFile: effectiveSsoStateFile,
@@ -309,31 +353,52 @@ program
       }
     }
 
-    if (ctlPort === null) {
-      await runBotsToCompletion(tasks);
-    } else {
+    // Issue 2032: fork a host resource sampler for the run's duration and
+    // capture per-bot encoder FPS, so a self-starved run is flagged with a
+    // RESOURCE_STARVED verdict instead of being mistaken for a product
+    // regression. Best-effort — a sampler failure never blocks the bots.
+    const fpsTracker = new FpsTracker(RESOURCE_FPS_BASE_RUNG);
+    const capture = new ResourceCaptureSession({ runDir: opts.assetsDir });
+    capture.startLocal();
+    const onEncoderFps = (botId: string, fps: number | null): void => fpsTracker.record(botId, fps);
+    // A ctl-enabled run can launch SSH bots on remote boxes; give those a
+    // per-host remote sampler too. Plain local runs never call ensureForHost,
+    // so this is inert unless SSH bots appear.
+    const remoteResource =
+      ctlPort !== null
+        ? new RemoteResourceManager({
+            runDir: opts.assetsDir,
+            label: capture.label,
+            maxSeconds: REMOTE_SAMPLER_MAX_SECONDS,
+          })
+        : undefined;
+
+    let control: RunOptions["control"];
+    if (ctlPort !== null) {
       const token = generateToken();
       const tokenFilePath = defaultTokenFilePath(opts.assetsDir);
-      await runBotsToCompletion({
-        tasks,
-        control: {
-          port: ctlPort,
-          token,
-          tokenFilePath,
-          runDir: opts.assetsDir,
-          onListen: async ({ port, token: t }) => {
-            await writeTokenFile(tokenFilePath, {
-              port,
-              token: t,
-              startedAt: new Date().toISOString(),
-              pid: process.pid,
-            });
-            console.log(
-              `bots-app: ctl token written to ${tokenFilePath} (mode 0600) — port ${port}`,
-            );
-          },
+      control = {
+        port: ctlPort,
+        token,
+        tokenFilePath,
+        runDir: opts.assetsDir,
+        onListen: async ({ port, token: t }) => {
+          await writeTokenFile(tokenFilePath, {
+            port,
+            token: t,
+            startedAt: new Date().toISOString(),
+            pid: process.pid,
+          });
+          console.log(`bots-app: ctl token written to ${tokenFilePath} (mode 0600) — port ${port}`);
         },
-      });
+      };
+    }
+
+    try {
+      await runBotsToCompletion({ tasks, control, onEncoderFps, remoteResource });
+    } finally {
+      const result = await capture.finalize(fpsTracker.snapshot());
+      if (result) console.log(result.reportText);
     }
     process.exit(0);
   });
@@ -346,6 +411,7 @@ interface RunCommandOptions {
   config?: string;
   displayName?: string;
   headless: boolean;
+  videoMode: string;
   ttl: string;
   manifest: string;
   assetsDir: string;
@@ -739,6 +805,12 @@ program
     let ctl: { port: number; token: string };
     let daemonMode: "self-hosted" | "attached";
     let orchestratorTask: Promise<void> | null = null;
+    // Issue 2032: resource capture for the self-hosted orchestrator. Local
+    // sampler for dashboard-launched local bots; per-host remote samplers for
+    // SSH-launched ones. Only used in self-hosted mode (attach-mode's
+    // orchestrator is out of our process). Finalized in `cleanup` below.
+    let dashCapture: ResourceCaptureSession | null = null;
+    const dashFps = new FpsTracker(RESOURCE_FPS_BASE_RUNG);
 
     if (attachRequested) {
       try {
@@ -766,9 +838,18 @@ program
       // before resolving — our cleanup hook below awaits that.
       const token = generateToken();
       const tokenFilePath = defaultTokenFilePath(opts.runDir);
+      dashCapture = new ResourceCaptureSession({ runDir: opts.runDir, label: "dashboard" });
+      dashCapture.startLocal();
+      const dashRemote = new RemoteResourceManager({
+        runDir: opts.runDir,
+        label: "dashboard",
+        maxSeconds: REMOTE_SAMPLER_MAX_SECONDS,
+      });
       const ctlReady = new Promise<{ port: number; token: string }>((resolveReady) => {
         orchestratorTask = runBotsToCompletion({
           tasks: [],
+          onEncoderFps: (botId, fps) => dashFps.record(botId, fps),
+          remoteResource: dashRemote,
           control: {
             port: 0,
             token,
@@ -849,6 +930,12 @@ program
       await handle.close().catch(() => {});
       if (orchestratorTask) {
         await orchestratorTask.catch(() => {});
+      }
+      // Issue 2032: derive + print the local host's resource verdict once the
+      // orchestrator (and its remote finalize) has wound down.
+      if (dashCapture) {
+        const result = await dashCapture.finalize(dashFps.snapshot()).catch(() => null);
+        if (result) console.log(result.reportText);
       }
       process.exit(0);
     };

@@ -100,14 +100,24 @@ services:
       - LISTEN_ADDR=0.0.0.0:8081
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
-      # TOKEN_TTL_SECS=60 is hostile to local development: the cookie persists
-      # for SESSION_TTL_SECS (10 years) but the JWT inside expires in 1 minute,
-      # so any UI navigation after the first minute hits 401 with a
-      # still-attached but stale cookie. Default bumped to 24h for local dev,
-      # matching what the daily-deploy workflows ship (env[16].value=86400).
-      # Production callers can still override via the env-var path.
+      # TOKEN_TTL_SECS=60 is hostile to local development: the JWT inside the
+      # session cookie would expire in 1 minute, so any UI navigation after the
+      # first minute hits 401 with a still-attached but stale cookie. Default
+      # bumped to 24h for local dev, matching what the daily-deploy workflows
+      # ship (env[16].value=86400). Production callers can still override via
+      # the env-var path.
+      #
+      # SESSION_TTL_SECS is the sliding-refresh increment (#1966): each mint
+      # issues a cookie living 7d, and meeting-api re-mints it near expiry (when
+      # under SESSION_REFRESH_THRESHOLD_SECS remaining) up to the
+      # SESSION_ABSOLUTE_MAX_SECS (30d) cap from the original auth time. So a
+      # local dev session stays alive while active without the deprecated
+      # 10-year cookie (#1750). The validator requires
+      # threshold < ttl < absolute_max, so keep these three in that order.
       - TOKEN_TTL_SECS=${TOKEN_TTL_SECS:-86400}
-      - SESSION_TTL_SECS=${SESSION_TTL_SECS:-315360000}
+      - SESSION_TTL_SECS=${SESSION_TTL_SECS:-604800}
+      - SESSION_REFRESH_THRESHOLD_SECS=${SESSION_REFRESH_THRESHOLD_SECS:-7200}
+      - SESSION_ABSOLUTE_MAX_SECS=${SESSION_ABSOLUTE_MAX_SECS:-2592000}
       # LOCAL DEV: cookies ride https://meet.localhost (same-origin edge) → Secure.
       - COOKIE_SECURE=${COOKIE_SECURE:-false}
       - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}
@@ -201,9 +211,10 @@ services:
       - FEATURE_MEETING_MANAGEMENT=${FEATURE_MEETING_MANAGEMENT:-false}
       - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
     ports:
-      # Host 8086 → container 8080 (container listens on ACTIX_PORT). Published on
-      # host 8086 to avoid colliding with other local services on :8080.
-      - "8086:${ACTIX_PORT:-8080}"
+      # Host 8096 -> container 8080 (container listens on ACTIX_PORT). Published
+      # on host 8096 to avoid colliding with other local services on :8080/:8086.
+      # The meet.localhost Caddy /lobby route proxies to 127.0.0.1:8096.
+      - "8096:${ACTIX_PORT:-8080}"
     volumes:
       - type: bind
         source: ../

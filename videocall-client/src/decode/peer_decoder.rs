@@ -329,6 +329,18 @@ pub struct VideoPeerDecoder {
     /// this signal the screen-share visibility toast on the publisher
     /// would time out at 10s on every share, even on the happy path.
     first_render_pending_ack: Rc<RefCell<bool>>,
+    /// HCL #893 companion latch: the "have we ever fired the first-render ack
+    /// for THIS decoder" guard that `mark_first_render` checks so the
+    /// `PEER_EVENT(screen_decode_started)` ack is emitted at most once per real
+    /// render burst. The screen `VideoPeerDecoder` is created once per peer and
+    /// only `flush()`ed (not recreated) when a share stops, so this latch
+    /// survives a stop→restart of screen sharing. `rearm_first_render_ack()`
+    /// clears it on the screen-turned-off edge so the NEXT share re-arms and
+    /// re-acks — without that reset every share after the first (within a
+    /// receiver's page session) never acks, and the publisher falsely reports
+    /// "No peers received the shared content within 10 seconds" even though the
+    /// receiver is decoding and painting the share.
+    first_render_fired: Rc<RefCell<bool>>,
     /// Issue #1183 (late-frame race): gate for the async paint callback.
     ///
     /// `clear_canvas()` (called synchronously on the decode-stop edge) sets
@@ -344,6 +356,13 @@ pub struct VideoPeerDecoder {
     /// Shared (`Rc`) with the paint closure captured in [`Self::new`]; the
     /// `Cell` is sufficient because every access is on the single render thread.
     paint_enabled: Rc<Cell<bool>>,
+    /// Operator decode-and-drop mode. Separate from `paint_enabled` because
+    /// `decode()` deliberately re-enables the visibility gate on every frame.
+    /// The production read happens via the paint closure's own `Rc` clone
+    /// (`should_paint` at the rAF gate in `new`); this stored handle exists only
+    /// for the `#[cfg(test)]` accessor, hence the non-test dead-code allow.
+    #[cfg_attr(not(test), allow(dead_code))]
+    skip_canvas_paint: Rc<Cell<bool>>,
     /// Issue #1025: proactive keyframe-request route. The underlying `WasmDecoder`'s
     /// worker-message closure (captured in [`Self::new`]) holds a clone of this `Rc` and,
     /// when the worker posts a `RequestKeyframeMessage`, invokes the inner closure if set.
@@ -436,6 +455,10 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
 pub const MEDIA_TYPE_CAMERA: &str = "VIDEO";
 pub const MEDIA_TYPE_SCREEN: &str = "SCREEN";
 
+pub(crate) fn should_paint(paint_enabled: bool, skip_canvas_paint: bool) -> bool {
+    paint_enabled && !skip_canvas_paint
+}
+
 /// Decide what `(from_peer, to_peer)` to stamp on a freshly-constructed
 /// [`CanvasRenderer`] inside [`VideoPeerDecoder::set_canvas`].
 ///
@@ -482,6 +505,7 @@ impl VideoPeerDecoder {
     pub fn new(
         canvas: Option<HtmlCanvasElement>,
         media_type: &'static str,
+        skip_canvas_paint: bool,
     ) -> Result<Self, JsValue> {
         let canvas_renderer = Rc::new(RefCell::new(None));
 
@@ -511,6 +535,7 @@ impl VideoPeerDecoder {
         // decoder belongs to a visible tile), gated off by `clear_canvas()`,
         // back on by the next `decode()`.
         let paint_enabled = Rc::new(Cell::new(true));
+        let skip_canvas_paint = Rc::new(Cell::new(skip_canvas_paint));
 
         // Issue #1783 realtime-first playout: the latest-wins presentation mailbox and its
         // rAF-scheduled paint. The offer closure below hands every decoded frame here and schedules
@@ -540,6 +565,7 @@ impl VideoPeerDecoder {
             let mailbox = latest_frame.clone();
             let canvas_ref = canvas_renderer.clone();
             let paint_flag = paint_enabled.clone();
+            let skip_flag = skip_canvas_paint.clone();
             let first_render_flag = first_render_pending_ack.clone();
             let first_render_fired = first_render_fired.clone();
             let raf_scheduled_for_paint = raf_scheduled.clone();
@@ -557,7 +583,7 @@ impl VideoPeerDecoder {
                     // frame WITHOUT painting — still close it to release GPU memory — so it cannot
                     // repaint the wiped tile. Checking here (not only at offer) closes the window
                     // fully, since the actual draw now happens later than the offer.
-                    if !paint_flag.get() {
+                    if !should_paint(paint_flag.get(), skip_flag.get()) {
                         video_frame.close();
                         return;
                     }
@@ -704,7 +730,9 @@ impl VideoPeerDecoder {
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context,
             first_render_pending_ack,
+            first_render_fired,
             paint_enabled,
+            skip_canvas_paint,
             keyframe_request_route,
             latest_frame,
             raf_scheduled,
@@ -1020,6 +1048,30 @@ impl VideoPeerDecoder {
         self.decoder.flush()
     }
 
+    /// HCL #893 re-share fix: re-arm the once-per-lifetime first-render ack so
+    /// the NEXT screen share from this peer re-fires
+    /// `PEER_EVENT(screen_decode_started)`.
+    ///
+    /// The screen `VideoPeerDecoder` is created once per peer and only
+    /// `flush()`ed (jitter buffer cleared) — never recreated — when a share
+    /// stops. `first_render_fired` therefore stays `true` across a stop→restart,
+    /// so `mark_first_render` no-ops on the second share's first render and the
+    /// synchronous `decode()` never returns `first_frame: true` again. Without
+    /// this reset, `peer_decode_manager` never publishes the decode-started ack
+    /// for the second (and every subsequent) share of a receiver's page
+    /// session, and the publisher's visibility timer falsely fires
+    /// "No peers received the shared content within 10 seconds" even though the
+    /// receiver is decoding and painting the share.
+    ///
+    /// Called on the screen-turned-off edge (paired with `flush()`), so the
+    /// latch is clean before the next share's first keyframe renders. Resetting
+    /// the pending-ack flag too prevents a stale un-consumed ack from a prior
+    /// share from acking the new share before its content has actually
+    /// rendered.
+    pub fn rearm_first_render_ack(&self) {
+        rearm_first_render(&self.first_render_fired, &self.first_render_pending_ack);
+    }
+
     /// Install the proactive keyframe-request route (issue #1025).
     ///
     /// `route` is invoked on the main thread when the worker signals that it evicted a stale
@@ -1076,7 +1128,9 @@ impl VideoPeerDecoder {
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: Rc::new(RefCell::new(None)),
             first_render_pending_ack: Rc::new(RefCell::new(false)),
+            first_render_fired: Rc::new(RefCell::new(false)),
             paint_enabled: Rc::new(Cell::new(true)),
+            skip_canvas_paint: Rc::new(Cell::new(false)),
             keyframe_request_route: Rc::new(RefCell::new(None)),
             latest_frame: Rc::new(RefCell::new(LatestFrameMailbox::new())),
             raf_scheduled: Rc::new(Cell::new(false)),
@@ -1094,6 +1148,11 @@ impl VideoPeerDecoder {
     #[cfg(test)]
     pub(crate) fn paint_enabled_for_test(&self) -> bool {
         self.paint_enabled.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn skip_canvas_paint_for_test(&self) -> bool {
+        self.skip_canvas_paint.get()
     }
 
     /// issue 508: test seam — overwrite the renderer's cached dimensions so a
@@ -1269,6 +1328,19 @@ impl PeerDecode for VideoPeerDecoder {
         // flag we return `first_frame: true` exactly once, which lets
         // `peer_decode_manager` fire the `PEER_EVENT(screen_decode_started)`
         // ack to the publisher.
+        //
+        // HCL #893 E2E hook: if a test armed a synthetic "screen frame painted"
+        // (only reachable under `MOCK_PEERS_ENABLED`; see
+        // `crate::screen_first_render_inject`), apply it here through the SAME
+        // `mark_first_render` the real rAF paint closure uses, so the `consume`
+        // below returns `first_frame: true` exactly once and the manager's real
+        // ack path fires. This is a no-op in production (the pending flag is
+        // never set) and only fires for the SCREEN decoder.
+        apply_screen_first_render_inject(
+            self.media_type,
+            &self.first_render_fired,
+            &self.first_render_pending_ack,
+        );
         let first_frame = consume_first_render_flag(&self.first_render_pending_ack);
 
         Ok(DecodeStatus {
@@ -1371,6 +1443,49 @@ fn mark_first_render(fired: &Rc<RefCell<bool>>, ack: &Rc<RefCell<bool>>) {
         *fired.borrow_mut() = true;
         *ack.borrow_mut() = true;
     }
+}
+
+/// HCL #893 E2E hook consume-side. If a test armed a synthetic
+/// "screen frame painted" via [`crate::screen_first_render_inject`] AND this is
+/// the SCREEN decoder, apply it through the real [`mark_first_render`] so the
+/// caller's subsequent [`consume_first_render_flag`] returns `first_frame: true`
+/// exactly once — driving the byte-for-byte manager ack path a real paint
+/// drives.
+///
+/// The SCREEN gate short-circuits BEFORE taking the pending flag, so a CAMERA
+/// decoder's `decode()` can never consume an injection meant for the screen
+/// decoder (the flag stays armed for the screen decoder's next `decode()`).
+/// Because it routes through `mark_first_render`, the once-per-share latch
+/// (`fired`) is respected: if a real paint already acked this share, the
+/// injection is a harmless no-op; after a re-share `rearm_first_render_ack`
+/// resets the latch so a fresh injection re-arms the ack.
+///
+/// Inert in production: the pending flag's only setter is the
+/// `MOCK_PEERS_ENABLED`-gated `window.__videocall_inject_screen_first_render`
+/// global, which is never attached in a production build.
+fn apply_screen_first_render_inject(
+    media_type: &'static str,
+    fired: &Rc<RefCell<bool>>,
+    ack: &Rc<RefCell<bool>>,
+) {
+    if media_type == MEDIA_TYPE_SCREEN
+        && crate::screen_first_render_inject::take_screen_first_render_inject_pending()
+    {
+        mark_first_render(fired, ack);
+    }
+}
+
+/// HCL #893 re-share fix: reset the `first_render_fired` guard (and any pending
+/// ack) so the next `mark_first_render` re-arms the once-per-share
+/// `PEER_EVENT(screen_decode_started)` ack. See
+/// [`VideoPeerDecoder::rearm_first_render_ack`] for the lifecycle rationale.
+///
+/// Extracted as a free function (mirroring `mark_first_render` /
+/// `consume_first_render_flag`) so the re-arm semantics can be unit-tested
+/// without a real `WasmDecoder`.
+fn rearm_first_render(fired: &Rc<RefCell<bool>>, ack: &Rc<RefCell<bool>>) {
+    *fired.borrow_mut() = false;
+    *ack.borrow_mut() = false;
 }
 
 ///
@@ -1699,6 +1814,113 @@ mod tests {
         );
     }
 
+    /// HCL #893 re-share regression: the screen `VideoPeerDecoder` is reused
+    /// (only `flush()`ed, never recreated) across a share stop→restart, so the
+    /// `first_render_fired` latch survives. `rearm_first_render` (invoked by
+    /// `rearm_first_render_ack` on the screen-turned-off edge) must reset that
+    /// latch so the SECOND share's first render re-acks the publisher.
+    ///
+    /// Mutation sensitivity: reverting `rearm_first_render` to a no-op (or
+    /// dropping the screen-off `rearm_first_render_ack()` call it backs) leaves
+    /// `fired == true`, so the second `mark_first_render` no-ops, the final
+    /// `consume` returns `false`, and this test fails — which is exactly the
+    /// production symptom: no ack, and the publisher falsely toasts
+    /// "No peers received the shared content within 10 seconds".
+    #[test]
+    fn rearm_allows_second_share_to_reack() {
+        let fired = Rc::new(RefCell::new(false));
+        let ack = Rc::new(RefCell::new(false));
+
+        // --- First share: render, then the ack is consumed exactly once. ---
+        mark_first_render(&fired, &ack);
+        assert!(
+            consume_first_render_flag(&ack),
+            "first share: the first render must ack once"
+        );
+        assert!(
+            !consume_first_render_flag(&ack),
+            "first share: no second ack within the same share"
+        );
+
+        // --- Share stops: the screen-turned-off edge re-arms the latch. ---
+        rearm_first_render(&fired, &ack);
+        assert!(
+            !*fired.borrow(),
+            "re-arm must clear the fired guard so the next render can re-arm"
+        );
+
+        // --- Second share (same decoder lifetime): render must re-ack. ---
+        mark_first_render(&fired, &ack);
+        assert!(
+            consume_first_render_flag(&ack),
+            "after re-arm, the second share's first render must re-ack — \
+             otherwise the publisher falsely reports no receivers on every \
+             share after the first in a page session"
+        );
+    }
+
+    /// HCL #893 E2E hook: `apply_screen_first_render_inject` must route a
+    /// test-armed "screen frame painted" through the REAL `mark_first_render`
+    /// so a subsequent `consume_first_render_flag` returns `first_frame: true`
+    /// exactly once — but ONLY for the SCREEN decoder, one-shot per request, and
+    /// re-armable for the re-share flow.
+    ///
+    /// Mutation sensitivity:
+    ///   - Drop the `media_type == MEDIA_TYPE_SCREEN` gate → the camera call
+    ///     consumes the pending flag, so the later screen `ack` assertion fails.
+    ///   - Drop the `mark_first_render` call → `ack` never set → screen assert
+    ///     fails.
+    ///   - Make `take_screen_first_render_inject_pending` non-consuming → the
+    ///     one-shot assertion fails.
+    #[test]
+    fn screen_first_render_inject_only_acks_screen_and_is_rearmable() {
+        use crate::screen_first_render_inject::{
+            request_screen_first_render_inject, take_screen_first_render_inject_pending,
+        };
+
+        // Clean slate — the pending flag is a thread-local shared within this
+        // test thread.
+        let _ = take_screen_first_render_inject_pending();
+
+        let fired = Rc::new(RefCell::new(false));
+        let ack = Rc::new(RefCell::new(false));
+
+        request_screen_first_render_inject();
+
+        // A CAMERA decoder must NOT consume the screen injection (the `&&`
+        // short-circuits before `take`, leaving the flag armed for SCREEN).
+        apply_screen_first_render_inject(MEDIA_TYPE_CAMERA, &fired, &ack);
+        assert!(
+            !*ack.borrow(),
+            "camera decode must ignore the screen-decode injection"
+        );
+
+        // The SCREEN decoder applies it through the real `mark_first_render`.
+        apply_screen_first_render_inject(MEDIA_TYPE_SCREEN, &fired, &ack);
+        assert!(*ack.borrow(), "screen decode must apply the injection");
+        assert!(
+            consume_first_render_flag(&ack),
+            "screen injection must make consume return first_frame:true once"
+        );
+
+        // One-shot: a second SCREEN decode without a new request does not re-ack.
+        apply_screen_first_render_inject(MEDIA_TYPE_SCREEN, &fired, &ack);
+        assert!(
+            !consume_first_render_flag(&ack),
+            "the injection is one-shot per request"
+        );
+
+        // Re-share: after `rearm_first_render`, a fresh injection re-acks — the
+        // exact re-share path the E2E spec exercises.
+        rearm_first_render(&fired, &ack);
+        request_screen_first_render_inject();
+        apply_screen_first_render_inject(MEDIA_TYPE_SCREEN, &fired, &ack);
+        assert!(
+            consume_first_render_flag(&ack),
+            "after re-arm, a fresh injection must re-ack the second share"
+        );
+    }
+
     /// End-to-end: simulate the decoder loop. Decode N packets,
     /// have the async callback fire once between packet 2 and 3,
     /// confirm exactly one `decode()` returns `first_frame: true`.
@@ -1769,6 +1991,36 @@ mod tests {
         .into();
         pkt.frame_type = "key".to_string();
         Arc::new(pkt)
+    }
+
+    #[test]
+    fn paint_decision_requires_enabled_and_not_skipped() {
+        assert!(should_paint(true, false));
+        assert!(!should_paint(true, true));
+        assert!(!should_paint(false, false));
+        assert!(!should_paint(false, true));
+    }
+
+    /// Decode re-arms the visibility gate without clearing the independent
+    /// operator decode-and-drop choice.
+    ///
+    /// MUTATION: implementing skip via `paint_enabled` makes one of these two
+    /// states false after `decode()` and fails the test.
+    #[test]
+    fn decode_reenables_visibility_paint_gate_without_clearing_skip_flag() {
+        let mut d = VideoPeerDecoder::noop();
+        d.skip_canvas_paint.set(true);
+        d.clear_canvas();
+
+        d.decode(&minimal_video_packet())
+            .expect("noop decode of a VP8 packet succeeds on host");
+
+        assert!(d.paint_enabled_for_test());
+        assert!(d.skip_canvas_paint_for_test());
+        assert!(!should_paint(
+            d.paint_enabled_for_test(),
+            d.skip_canvas_paint_for_test()
+        ));
     }
 
     #[test]

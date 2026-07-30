@@ -7,7 +7,9 @@ import { defineConfig } from "vitest/config";
  * (pure-function tests, e.g. `frame-liveness.test.ts`). The dashboard
  * subtree has its own self-contained Vitest setup (jsdom + React Testing
  * Library) under `bots-app/dashboard/` and pulls in dependencies the parent
- * package.json deliberately does NOT carry, so it stays excluded here.
+ * package.json deliberately does NOT carry, so it stays excluded here. Browser
+ * specs (`*.spec.ts`) run under Playwright, not Vitest, and are intentionally
+ * excluded.
  *
  * Run the dashboard's tests from inside `bots-app/dashboard/` with
  * `npm run test`.
@@ -15,6 +17,6 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: ["bots-app/src/**/*.test.ts", "helpers/**/*.test.ts"],
-    exclude: ["node_modules/**", "bots-app/dashboard/**"],
+    exclude: ["node_modules/**", "bots-app/dashboard/**", "**/*.spec.ts"],
   },
 });

@@ -1199,28 +1199,44 @@ fn has_zlib_magic(hex: &str) -> bool {
 ///
 /// **Semantics:**
 ///
-/// - `WebTransport` (default): attempt WebTransport first; if WebTransport is
+/// - `WebSocket` (default): use WebSocket only — no WebTransport attempt is
+///   made. WebSocket has proven the more reliable transport in field use
+///   across constrained and varied networks, so it is the proactive default
+///   for every user who has not explicitly opted into WebTransport.
+/// - `WebTransport`: attempt WebTransport first; if WebTransport is
 ///   unavailable, blocked by a firewall, or fails its handshake, automatically
-///   fall back to WebSocket. This is what the legacy `Auto` variant did and is
-///   the recommended setting for nearly all users.
-/// - `WebSocket`: use WebSocket only — no WebTransport attempt is made.
+///   fall back to WebSocket. This is what the legacy `Auto` variant did.
+///   WebTransport is still **experimental** — the settings UI surfaces a
+///   warning when it is selected (see `device_settings_modal.rs`).
 ///
-/// **Migration**: a persisted value of `"auto"` (the legacy default) is
-/// transparently coerced to `WebTransport` by [`FromStr`]. The first time
-/// [`load_transport_preference`] sees such a value it logs the migration so
-/// operators can verify the upgrade path. The migration is one-shot — on the
-/// next storage write the value is canonical.
+/// **Default flip**: the default was `WebTransport` (and `Auto` before that);
+/// it is now `WebSocket`. A user who never touched the Network setting has no
+/// stored preference and therefore flips to the WebSocket default on the next
+/// load — that IS the intended product change. A user who explicitly chose a
+/// protocol keeps that choice: an explicit stored `"webtransport"` still
+/// resolves to WebTransport exactly as before (see [`resolve_transport_config`]).
+///
+/// **Migration**: a persisted value of `"auto"` (the pre-simplification
+/// default) is transparently coerced to `WebTransport` by [`FromStr`] — an old
+/// explicit Auto choice meant "prefer WebTransport with WS fallback", so it is
+/// honoured as an explicit WebTransport selection rather than reset to the new
+/// WebSocket default. The first time [`load_transport_preference`] sees such a
+/// value it logs the migration so operators can verify the upgrade path. The
+/// migration is one-shot — on the next storage write the value is canonical.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TransportPreference {
-    /// Attempt WebTransport with automatic WebSocket fallback.
+    /// Attempt WebTransport with automatic WebSocket fallback (experimental).
     ///
     /// Both URL lists are advertised to the connection manager, which runs
     /// an election preferring WebTransport candidates. When WebTransport is
     /// unavailable (browser support, UDP blocked, server returns non-2xx,
     /// handshake timeout) the manager falls back to the WebSocket candidates.
-    #[default]
+    /// Opt-in only, and flagged experimental in the settings UI.
     WebTransport,
-    /// Use WebSocket exclusively — no WebTransport attempt.
+    /// Use WebSocket exclusively — no WebTransport attempt. The default: the
+    /// more reliable transport in field use, applied to every user without an
+    /// explicit stored preference.
+    #[default]
     WebSocket,
 }
 
@@ -1270,15 +1286,50 @@ const TRANSPORT_SESSION_KEY: &str = "vc_transport_session";
 ///    session value is set when the user changes the protocol without ticking
 ///    "remember", so the change survives the page reload triggered by the
 ///    select but is forgotten on tab close.
-/// 3. Otherwise: `WebTransport` (the new default — was `Auto` before the
-///    protocol-settings simplification).
+/// 3. Otherwise: `WebSocket` (the default — was `WebTransport`, and `Auto`
+///    before the protocol-settings simplification).
 ///
 /// **Legacy "auto" migration**: when this function reads `"auto"` from
-/// storage (the previous default value), it logs the migration once and
-/// canonicalises the stored value to `"webtransport"`. The new
-/// `WebTransport` variant carries the WT-with-WS-fallback semantics that
-/// `Auto` used to mean, so user behaviour is unchanged.
+/// storage (a pre-simplification default value), it logs the migration once
+/// and canonicalises the stored value to `"webtransport"`. `Auto` meant
+/// "prefer WebTransport with WS fallback", so it is honoured as an explicit
+/// WebTransport choice — NOT reset to the new WebSocket default.
 pub fn load_transport_preference() -> TransportPreference {
+    // Single source of truth: delegate to the source-aware variant and drop the
+    // provenance tag. This keeps the storage-resolution logic (sticky vs.
+    // session vs. default, plus the legacy "auto" migration and stale-pref
+    // cleanup) in exactly one place so the two functions cannot drift.
+    load_transport_preference_with_source().0
+}
+
+/// Like [`load_transport_preference`], but also returns *where* the resolved
+/// preference came from, as a stable tag for observability logging:
+///
+/// - `"sticky"`  — a value was read from `vc_transport_preference` in
+///   `localStorage` while the persistent pin was set (`vc_transport_sticky ==
+///   "true"`). This is the explicit "remember my choice" path.
+/// - `"session"` — a value was read from the per-session `vc_transport_session`
+///   in `sessionStorage`, written when the user changes the protocol without
+///   ticking "remember".
+/// - `"default"` — no stored value applied, so the implicit default
+///   (`WebSocket`) is returned. This covers BOTH the fall-through with no
+///   storage at all AND the defensive case where the sticky flag is set but no
+///   `vc_transport_preference` value is present: in each the *value* originates
+///   from the default, not from storage, so the provenance tag reflects that.
+///
+/// This function is the single source of truth for transport-preference
+/// resolution — [`load_transport_preference`] delegates to it. The dioxus-ui
+/// call sites that build a `VideoCallClient` use the tag to log how the user's
+/// preference filtered the WebTransport/WebSocket candidate lists, so a triager
+/// can distinguish "WT list empty because the server disabled it" from "WT list
+/// empty because the user pinned WebSocket" (issue #1745 PR2). It is
+/// LOGGING/OBSERVABILITY only — it does not change which transport is selected.
+///
+/// The legacy `"auto"` migration and the non-sticky stale-pref cleanup are
+/// preserved exactly as in the original single-return implementation; both are
+/// idempotent, so calling this at multiple sites after app boot has no
+/// additional side effect.
+pub fn load_transport_preference_with_source() -> (TransportPreference, &'static str) {
     let local_storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
     let session_storage = web_sys::window().and_then(|w| w.session_storage().ok().flatten());
 
@@ -1303,10 +1354,13 @@ pub fn load_transport_preference() -> TransportPreference {
                     );
                     let _ = storage.set_item(TRANSPORT_PREF_KEY, &parsed.to_string());
                 }
-                return parsed;
+                return (parsed, "sticky");
             }
         }
-        return TransportPreference::default();
+        // Sticky flag set but no persisted value: the effective preference is
+        // the default, so report "default" — the tag tracks value provenance,
+        // not which branch was entered.
+        return (TransportPreference::default(), "default");
     }
 
     // Backward-compat: silently drop a stale persistent preference left over
@@ -1327,10 +1381,10 @@ pub fn load_transport_preference() -> TransportPreference {
                 );
                 let _ = storage.set_item(TRANSPORT_SESSION_KEY, &parsed.to_string());
             }
-            return parsed;
+            return (parsed, "session");
         }
     }
-    TransportPreference::default()
+    (TransportPreference::default(), "default")
 }
 
 /// Persist the transport preference to `localStorage` (the sticky path).
@@ -1369,7 +1423,7 @@ pub fn save_transport_sticky(sticky: bool) {
 
 /// Reset all transport-preference storage entries — both the persistent
 /// (`localStorage`) keys and the per-session (`sessionStorage`) value — so
-/// the next page load resolves to the default (`WebTransport`).
+/// the next page load resolves to the default (`WebSocket`).
 ///
 /// This is the single source of truth for "go back to default" so callers
 /// don't have to know about the three keys involved.
@@ -1388,9 +1442,15 @@ pub fn clear_transport_sticky_and_pref() {
 ///
 /// Returns `(enable_webtransport, websocket_urls, webtransport_urls)`.
 ///
-/// **WebTransport-with-WS-fallback**: when the user has selected
-/// `WebTransport` (the default), BOTH URL lists are returned. The
-/// connection manager creates candidates for every URL and runs an election
+/// **Default (`WebSocket`)**: a user with no stored preference resolves to
+/// `TransportPreference::default()` == `WebSocket`, so this returns a
+/// WebSocket-only configuration (`enable_webtransport = false`, WT list
+/// emptied). WebSocket is the proactive default; WebTransport is opt-in.
+///
+/// **WebTransport-with-WS-fallback**: when the user has explicitly selected
+/// `WebTransport` (the opt-in, experimental choice), BOTH URL lists are
+/// returned. The connection manager creates candidates for every URL and runs
+/// an election
 /// — if any WebTransport candidate completes its handshake it wins, but if
 /// every WT candidate fails (browser support missing, UDP blocked, server
 /// rejected the handshake) the WS candidates become the only ones that can
@@ -1426,11 +1486,11 @@ pub fn resolve_transport_config(
 /// drift. It deliberately does NOT prompt (`window.confirm`) or reload — those
 /// stay in the callers.
 ///
-/// End-state per arm (`pref` is the chosen protocol, default is `WebTransport`):
+/// End-state per arm (`pref` is the chosen protocol, default is `WebSocket`):
 ///
 /// - **default + not sticky** (`(true, false)`): clear every key
 ///   (`vc_transport_sticky`, `vc_transport_preference`, `vc_transport_session`)
-///   so the next load resolves to the implicit default (`WebTransport`).
+///   so the next load resolves to the implicit default (`WebSocket`).
 /// - **any value + sticky** (`(_, true)`): write `vc_transport_preference` +
 ///   `vc_transport_sticky=true` to `localStorage` so the choice persists across
 ///   browser sessions.
@@ -1476,7 +1536,7 @@ pub fn apply_transport_decision(pref: TransportPreference, sticky: bool) {
 ///
 /// Routing rules (delegated to [`apply_transport_decision`]):
 ///
-/// - The default (`WebTransport`) selected with `sticky == false`: clear every
+/// - The default (`WebSocket`) selected with `sticky == false`: clear every
 ///   transport-preference storage key so the next load resolves to the default
 ///   without needing a remembered choice.
 /// - Selecting any value with `sticky == true`: write to `localStorage` so the
@@ -1484,8 +1544,8 @@ pub fn apply_transport_decision(pref: TransportPreference, sticky: bool) {
 /// - Non-default selection with `sticky == false`: clear any prior
 ///   `localStorage` sticky pin, then write to `sessionStorage` so the choice
 ///   survives the imminent page reload but evaporates when the tab closes. The
-///   stale-sticky clear is what lets a session-scoped WebSocket choice win over
-///   a previously pinned WebTransport on the next load (issue #1291).
+///   stale-sticky clear is what lets a session-scoped WebTransport choice win
+///   over a previously pinned WebSocket on the next load (issue #1291).
 ///
 /// Custom controls (like the settings modal glass dropdown) are state-driven
 /// and naturally re-render with the current value when the user cancels.
@@ -1934,6 +1994,75 @@ mod tests {
     fn speaker_selection_supported_tracks_capability_flag() {
         assert!(speaker_selection_supported(true));
         assert!(!speaker_selection_supported(false));
+    }
+
+    // ── Transport-preference default & resolution (WS/WT default flip) ──────
+    //
+    // The product default flipped from WebTransport to WebSocket: a user with
+    // no stored preference must now elect WebSocket-only. These are PURE (no
+    // storage / no web_sys), so they run in the fast native `--lib` gate as
+    // well as the wasm gate, and they are the fails-on-unfixed discriminators
+    // for the flip — on the pre-flip code `TransportPreference::default()` is
+    // `WebTransport`, so the assertions below fail.
+
+    #[test]
+    fn transport_preference_default_is_websocket() {
+        // THE flip. On the un-flipped code this is `WebTransport` and fails.
+        assert_eq!(
+            TransportPreference::default(),
+            TransportPreference::WebSocket,
+            "WebSocket is now the proactive default; WebTransport is opt-in"
+        );
+    }
+
+    #[test]
+    fn resolve_transport_config_default_pref_is_websocket_only() {
+        // The load-bearing behavioural discriminator: a user with no stored
+        // preference resolves through `TransportPreference::default()`, which
+        // must yield a WebSocket-only configuration. On the pre-flip code the
+        // default is WebTransport, so this returns `(true, ws, wt)` — a
+        // non-empty WT list with enable_webtransport = true — and every
+        // assertion below fails.
+        let ws = vec!["ws://a:8080".to_string(), "ws://b:8080".to_string()];
+        let wt = vec!["https://a:4433".to_string()];
+        let (enable_wt, ws_out, wt_out) =
+            resolve_transport_config(TransportPreference::default(), true, ws.clone(), wt);
+        assert!(
+            !enable_wt,
+            "default (WebSocket) must disable WebTransport even when the server enables it"
+        );
+        assert_eq!(ws_out, ws, "default must keep the WebSocket URLs");
+        assert!(
+            wt_out.is_empty(),
+            "default (WebSocket) must surface an empty WebTransport candidate list"
+        );
+    }
+
+    #[test]
+    fn resolve_transport_config_explicit_webtransport_unchanged_by_flip() {
+        // Regression guard for existing users: an EXPLICIT WebTransport choice
+        // still surfaces BOTH URL lists (WT preferred, WS fallback) exactly as
+        // before the default flip — only the UNSET default changed.
+        let ws = vec!["ws://a:8080".to_string()];
+        let wt = vec!["https://a:4433".to_string(), "https://b:4433".to_string()];
+        let (enable_wt, ws_out, wt_out) = resolve_transport_config(
+            TransportPreference::WebTransport,
+            true,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(
+            enable_wt,
+            "explicit WebTransport keeps enable_webtransport = true"
+        );
+        assert_eq!(
+            ws_out, ws,
+            "explicit WebTransport keeps the WS fallback list"
+        );
+        assert_eq!(
+            wt_out, wt,
+            "explicit WebTransport keeps the WT list unchanged"
+        );
     }
 
     // ── GlowColor parser consolidation ──────────────────────────────────────

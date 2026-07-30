@@ -75,6 +75,36 @@ impl AudioDecoder for NativeOpusDecoder {
         buf.truncate(decoded_samples * self.channels as usize);
         Ok(buf)
     }
+
+    /// Native libopus packet-loss concealment (issue 620).
+    ///
+    /// Invokes `opus_decode_float(st, NULL, 0, pcm, frame_size, 0)`, libopus's
+    /// PLC entry point, which extrapolates the missing frame from prior decoder
+    /// state. The `opus` crate (v0.3.0) maps an **empty input slice to a NULL
+    /// packet pointer** — see `opus-0.3.0/src/lib.rs:446-449`
+    /// (`match input.len() { 0 => std::ptr::null(), _ => input.as_ptr() }`) — so
+    /// `decode_float(&[], out, false)` is exactly that PLC call, with the output
+    /// length (`len(output) / channels`) supplying `frame_size`.
+    ///
+    /// Returns `Some` interleaved PCM of exactly `num_samples_per_channel *
+    /// channels` samples on success, or `None` if libopus produced no samples
+    /// (e.g. an unsupported frame size), in which case the caller falls back to
+    /// the quiet-noise `Expand` path. Never panics on a cold decoder.
+    fn decode_plc(&mut self, num_samples_per_channel: usize) -> Option<Vec<f32>> {
+        let total = num_samples_per_channel * self.channels as usize;
+        if total == 0 {
+            return None;
+        }
+        let mut buf = vec![0.0f32; total];
+        // Empty input slice => NULL packet => libopus PLC (see doc comment above).
+        match self.inner.decode_float(&[], &mut buf, false) {
+            Ok(decoded_per_channel) if decoded_per_channel > 0 => {
+                buf.truncate(decoded_per_channel * self.channels as usize);
+                Some(buf)
+            }
+            _ => None,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

@@ -46,6 +46,14 @@
 //!   - `window.__videocall_freshness_skips` is a JS array this module appends to
 //!     from a diagnostics-bus subscriber every time a `freshness_skip` `DiagEvent`
 //!     arrives, so the spec can poll for the event and assert its shape.
+//!   - `window.__videocall_keyframe_requests` is a JS array this module appends to
+//!     from the test decoder's `on_request_keyframe` callback every time the worker's
+//!     jitter buffer fires its proactive `request_keyframe` hook (issue 1899 /
+//!     discussion 1960). It surfaces the stream-open one-shot PLI — the keyframe
+//!     request fix (a) fires at *insert time* the moment a never-decoded stream holds
+//!     delta-only frames with no keyframe — which arrives well before the
+//!     `MAX_PLAYOUT_AGE_MS` freshness deadline that the eviction path would otherwise
+//!     wait for. Each entry is `{ head_age_ms, ts_ms }`.
 //!
 //! The injected frames carry empty `data` and are *never decoded*: in the
 //! keyframe-less path the deltas are evicted by the deadline before any release,
@@ -79,6 +87,16 @@ thread_local! {
 #[cfg(target_arch = "wasm32")]
 const SKIPS_GLOBAL: &str = "__videocall_freshness_skips";
 
+/// JS global the spec polls for captured proactive keyframe requests (issue 1899 / discussion 1960).
+/// Each entry is a plain JS object `{ head_age_ms, ts_ms }`, pushed by the test decoder's
+/// `on_request_keyframe` callback every time the worker's jitter buffer fires its `request_keyframe`
+/// hook and the resulting `RequestKeyframeMessage` reaches the main thread — i.e. the stream-open
+/// one-shot PLI (fix (a): fired at insert time, `head_age_ms == 0`) OR the #1025 freshness-deadline
+/// eviction PLI (`head_age_ms >= MAX_PLAYOUT_AGE_MS`). `ts_ms` is the main-thread wall-clock capture
+/// time, so the spec can bound how quickly the request surfaced after injection.
+#[cfg(target_arch = "wasm32")]
+const KEYFRAME_REQUESTS_GLOBAL: &str = "__videocall_keyframe_requests";
+
 /// JS global the spec calls to inject a stale backlog.
 #[cfg(target_arch = "wasm32")]
 const INJECT_GLOBAL: &str = "__videocall_inject_stale_video_backlog";
@@ -107,6 +125,21 @@ pub fn register_freshness_inject_hooks() {
         let _ = js_sys::Reflect::set(
             &window,
             &JsValue::from_str(SKIPS_GLOBAL),
+            &js_sys::Array::new(),
+        );
+    }
+
+    // Seed the keyframe-request capture array (issue 1899 / discussion 1960) if absent, the same
+    // way and for the same reasons as SKIPS_GLOBAL: the array must exist before the first request
+    // fires (the recorder skips silently if it is missing), and a remount must not clobber prior
+    // captures. Seeded BEFORE `ensure_test_decoder` below so the pre-warm can never race it.
+    if js_sys::Reflect::get(&window, &JsValue::from_str(KEYFRAME_REQUESTS_GLOBAL))
+        .map(|v| !v.is_object())
+        .unwrap_or(true)
+    {
+        let _ = js_sys::Reflect::set(
+            &window,
+            &JsValue::from_str(KEYFRAME_REQUESTS_GLOBAL),
             &js_sys::Array::new(),
         );
     }
@@ -147,8 +180,9 @@ pub fn register_freshness_inject_hooks() {}
 /// Spawn a diagnostics-bus subscriber that pushes each `freshness_skip`
 /// `DiagEvent` (subsystem `video`; see issue #1045) onto
 /// `window.__videocall_freshness_skips` as a plain JS object the spec can read:
-/// `{ head_age_ms, keyframe_seq, dropped, ts_ms, escalated }` (`escalated` is the #1662
-/// keyframe-less hold-ceiling escalation flag, a real JS boolean).
+/// `{ head_age_ms, keyframe_seq, dropped, ts_ms, escalated, tick_gap_ms }` (`escalated` is the
+/// #1662 keyframe-less hold-ceiling escalation flag, a real JS boolean; `tick_gap_ms` is the #1851
+/// wall-clock gap in ms since the previous worker poll — an f64, mirroring `head_age_ms`).
 #[cfg(target_arch = "wasm32")]
 fn spawn_freshness_skip_collector() {
     use videocall_diagnostics::{subscribe, MetricValue};
@@ -175,6 +209,10 @@ fn spawn_freshness_skip_collector() {
             // #1662: the worker encodes `escalated` as i64 0/1 (mirroring keyframe_seq's i64). It is
             // absent on older events / never set false-vs-true confusion: default false.
             let mut escalated = false;
+            // #1851: wall-clock gap (ms) since the previous worker poll, an f64 metric mirroring
+            // head_age_ms. Absent on pre-#1851 events → stays NaN, which the e2e `>= 0` assertion
+            // rejects, so a missing metric surfaces as a failure rather than a spurious 0.
+            let mut tick_gap_ms = f64::NAN;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
                     ("head_age_ms", MetricValue::F64(v)) => head_age_ms = *v,
@@ -183,6 +221,8 @@ fn spawn_freshness_skip_collector() {
                     ("dropped", MetricValue::U64(v)) => dropped = *v,
                     // #1662 escalation flag: i64 0/1 → coerce to a real bool for the JS object.
                     ("escalated", MetricValue::I64(v)) => escalated = *v != 0,
+                    // #1851 tick-gap: f64 ms since the previous worker poll (mirrors head_age_ms).
+                    ("tick_gap_ms", MetricValue::F64(v)) => tick_gap_ms = *v,
                     _ => {}
                 }
             }
@@ -215,6 +255,14 @@ fn spawn_freshness_skip_collector() {
                 &JsValue::from_str("escalated"),
                 &JsValue::from_bool(escalated),
             );
+            // #1851: surface the tick-gap as a real JS number so an e2e spec can assert the
+            // collector entry carries a numeric tick_gap_ms (and, in the field-log analogue,
+            // distinguish a tick-starvation resume poll from a normal-cadence skip).
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("tick_gap_ms"),
+                &JsValue::from_f64(tick_gap_ms),
+            );
 
             if let Some(window) = web_sys::window() {
                 if let Ok(arr) = js_sys::Reflect::get(&window, &JsValue::from_str(SKIPS_GLOBAL)) {
@@ -225,6 +273,44 @@ fn spawn_freshness_skip_collector() {
             }
         }
     });
+}
+
+/// Push a captured proactive keyframe request onto [`KEYFRAME_REQUESTS_GLOBAL`] as a plain JS
+/// object `{ head_age_ms, ts_ms }` the spec can read (issue 1899 / discussion 1960).
+///
+/// Wired as the test decoder's `on_request_keyframe` callback (see [`ensure_test_decoder`]), so it
+/// runs on the MAIN thread each time the worker's jitter buffer fires its `request_keyframe` hook
+/// and the resulting `RequestKeyframeMessage` is handled by `WasmDecoder` — the SAME production
+/// worker→main path a real peer's PLI travels. `head_age_ms` is the backlog age the worker carried
+/// (`0.0` for the stream-open one-shot in fix (a); `>= MAX_PLAYOUT_AGE_MS` for the #1025 eviction
+/// path). `ts_ms` is `Date::now()` at capture, letting the spec bound how quickly the request
+/// surfaced after injection. Silent no-op if `window`/the array is absent (never true post-seed).
+#[cfg(target_arch = "wasm32")]
+fn record_keyframe_request(head_age_ms: f64) {
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+
+    let obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("head_age_ms"),
+        &JsValue::from_f64(head_age_ms),
+    );
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("ts_ms"),
+        &JsValue::from_f64(js_sys::Date::now()),
+    );
+
+    if let Ok(arr) = js_sys::Reflect::get(&window, &JsValue::from_str(KEYFRAME_REQUESTS_GLOBAL)) {
+        if let Ok(arr) = arr.dyn_into::<js_sys::Array>() {
+            arr.push(&obj);
+        }
+    }
 }
 
 /// Build (on first call) the self-contained test decoder and inject `num_frames`
@@ -289,13 +375,15 @@ fn ensure_test_decoder() {
         // Mirror the production peer-decode constructor (peer_decoder.rs): same
         // codec, same `new_with_video_frame_callback` path that wires
         // `handle_worker_diag_message` (which re-broadcasts the freshness_skip).
-        // The callbacks are no-ops: injected frames are never decoded (the
-        // keyframe-less deadline evicts them first), and the proactive
-        // keyframe-request signal (#1025) has nothing to do in the test harness.
+        // The frame callback is a no-op: injected frames are never decoded (the
+        // keyframe-less deadline evicts them first). The proactive keyframe-request
+        // callback records each request onto KEYFRAME_REQUESTS_GLOBAL (issue 1899 /
+        // discussion 1960) so an e2e spec can observe the stream-open one-shot PLI
+        // (fix (a)) firing at insert time, well before the freshness deadline.
         let decoder = WasmDecoder::new_with_video_frame_callback(
             VideoCodec::Vp9Profile0Level10Bit8,
             Box::new(|_frame| {}),
-            Box::new(|_head_age_ms| {}),
+            Box::new(record_keyframe_request),
             // Issue #1641: this #1022/#1045 inject harness exercises the camera freshness path,
             // so tag it as camera ("VIDEO" / MEDIA_TYPE_CAMERA) — the value health_reporter
             // treats as non-screen.

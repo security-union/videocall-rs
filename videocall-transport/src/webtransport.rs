@@ -9,7 +9,8 @@ use futures::channel::oneshot::channel;
 use futures::lock::Mutex as AsyncMutex;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use std::{fmt, rc::Rc};
 use thiserror::Error as ThisError;
 use videocall_types::Callback;
@@ -30,6 +31,60 @@ static DATAGRAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Returns the total number of datagrams dropped since process start.
 pub fn datagram_drop_count() -> u64 {
     DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Issue 2031: windowed max-gap summarizer for the incoming-datagram read loop,
+/// shared across every WT session's reader (the metric is a per-CLIENT receiver
+/// property, not per-connection). The reader records each `.read()` resolution
+/// timestamp; the health reporter drains the window ~once per health interval.
+/// wasm is single-threaded so this `Mutex` never actually contends.
+static READ_LOOP_LAG: StdMutex<crate::read_loop_lag::DatagramReadLoopLagTracker> =
+    StdMutex::new(crate::read_loop_lag::DatagramReadLoopLagTracker::new());
+
+/// Drain and return the max gap (ms) between successive incoming-datagram
+/// `.read()` resolutions since the previous call (read-and-reset window). A
+/// sustained high value is main-thread reader starvation — the direct causal
+/// signal for the issue-1878 audio-loss class. Returns 0.0 if the lock is
+/// poisoned (never in practice on single-threaded wasm).
+pub fn take_datagram_read_loop_max_gap_ms() -> f64 {
+    READ_LOOP_LAG
+        .lock()
+        .map(|mut t| t.take_max_gap_ms())
+        .unwrap_or(0.0)
+}
+
+/// Issue 2031: observed post-set incoming-datagram queue parameters
+/// `(incoming_high_water_mark, incoming_max_age_ms)`, captured once per WT
+/// session by [`configure_incoming_datagram_queue`]. `None` until the queue has
+/// been configured (a WebSocket-only client never sets it). `max_age_ms` is
+/// `NaN` when the browser reports the queue as unbounded (the spec `null`
+/// default) — the caller maps that to a sentinel before it goes on the wire.
+static INCOMING_QUEUE_READBACK: StdMutex<Option<(f64, f64)>> = StdMutex::new(None);
+
+/// Return the observed post-set incoming-datagram queue parameters
+/// `(high_water_mark, max_age_ms)`, or `None` if the queue has not been
+/// configured yet. Empirically answers, per browser, whether Chromium honored
+/// the issue-1878 `incomingHighWaterMark` / `incomingMaxAge` setters.
+pub fn incoming_datagram_queue_readback() -> Option<(f64, f64)> {
+    INCOMING_QUEUE_READBACK.lock().ok().and_then(|g| *g)
+}
+
+/// Resolve the `performance` object ONCE for the read-loop clock. Hoisted out of
+/// the per-datagram path (issue 2031 perf review): `window()` + `performance()`
+/// are two JS boundary crossings that never change over a session's lifetime, so
+/// the read loop resolves this before its `spawn_local` and reuses the handle.
+/// `None` where `performance` is unavailable (falls back to `Date.now()`).
+fn resolve_read_loop_clock() -> Option<web_sys::Performance> {
+    web_sys::window().and_then(|w| w.performance())
+}
+
+/// Read the monotonic clock (ms) from a pre-resolved `performance` handle for the
+/// read-loop gap measurement. Prefers `performance.now()` (monotonic — immune to
+/// NTP steps); falls back to `Date.now()` when the handle is `None`. Exactly ONE
+/// JS crossing per call (vs three when resolving `window`/`performance` inline).
+/// The gap summarizer clamps any backward step to 0 regardless.
+fn read_loop_now_ms(perf: Option<&web_sys::Performance>) -> f64 {
+    perf.map(|p| p.now()).unwrap_or_else(js_sys::Date::now)
 }
 
 /// Issue #1878 mitigation — INCOMING datagram queue CAPACITY (number of
@@ -102,13 +157,18 @@ fn configure_incoming_datagram_queue(datagrams: &WebTransportDatagramDuplexStrea
     if prev_age.is_nan() || prev_age < INCOMING_DATAGRAM_MAX_AGE_MS {
         datagrams.set_incoming_max_age(INCOMING_DATAGRAM_MAX_AGE_MS);
     }
+    // Read the values BACK after setting them — the browser may clamp or ignore
+    // the setters — and both log and stash for telemetry (issue 2031). The
+    // stashed pair lets the health reporter confirm on a given browser that the
+    // issue-1878 mitigation actually took effect.
+    let observed_hwm = datagrams.incoming_high_water_mark();
+    let observed_age = datagrams.incoming_max_age();
     log!(format!(
-        "WT incoming datagram queue tuned (issue #1878): highWaterMark {} -> {}, maxAge {} -> {} ms",
-        prev_hwm,
-        datagrams.incoming_high_water_mark(),
-        prev_age,
-        datagrams.incoming_max_age()
+        "WT incoming datagram queue tuned (issue #1878): highWaterMark {prev_hwm} -> {observed_hwm}, maxAge {prev_age} -> {observed_age} ms"
     ));
+    if let Ok(mut slot) = INCOMING_QUEUE_READBACK.lock() {
+        *slot = Some((observed_hwm, observed_age));
+    }
 }
 
 /// Cumulative count of frames dropped on the persistent unidirectional QUIC
@@ -139,10 +199,133 @@ fn configure_incoming_datagram_queue(datagrams: &WebTransportDatagramDuplexStrea
 /// (teardown vs. saturation) and are consumed by independent AQ windows.
 static UNISTREAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// Indexed by `MediaStreamKey::as_u8()` (0..=4; slot 0 unused, keys 1..=4).
+// Keep this hand-maintained size above the declared max in videocall-client;
+// unknown larger keys remain aggregate-only.
+const PERSISTENT_STREAM_COUNTER_SLOTS: usize = 5;
+
+static UNISTREAM_DROP_COUNT_BY_STREAM: [AtomicU64; PERSISTENT_STREAM_COUNTER_SLOTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn stream_counter(
+    counters: &[AtomicU64; PERSISTENT_STREAM_COUNTER_SLOTS],
+    stream_key: u8,
+) -> Option<&AtomicU64> {
+    match stream_key {
+        1..=4 => counters.get(usize::from(stream_key)),
+        _ => None,
+    }
+}
+
 /// Returns the total number of persistent-unistream frames dropped since
 /// process start. See [`UNISTREAM_DROP_COUNT`].
 pub fn unistream_drop_count() -> u64 {
     UNISTREAM_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Returns the number of persistent-unistream write drops attributed to one
+/// media stream key. Unknown keys return zero; the aggregate counter still
+/// records them for backward-compatible health reporting.
+pub fn unistream_drop_count_for_stream(stream_key: u8) -> u64 {
+    stream_counter(&UNISTREAM_DROP_COUNT_BY_STREAM, stream_key)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy)]
+pub struct FrameDropMeta {
+    pub enqueue_ms: f64,
+    pub is_keyframe: bool,
+}
+
+/// Sender-side camera age-drop budget FLOOR (#1737). Deliberately 200 ms, NOT
+/// the 250 ms `READY_STALL_THRESHOLD_MS_FLOOR` used by the ready-stall
+/// saturation signal — the two measure DIFFERENT quantities and must not be
+/// "unified": this is cumulative send-path RESIDENCE (enqueue → drain, the age a
+/// frame has accrued), aligned to the LibWebRTC pacer max-queue; the ready-stall
+/// floor bounds a SINGLE `writer.ready()` await. Both are floored at
+/// `2.0 × rtt_baseline` via `compose_stall_threshold_ms`, so high-RTT links get
+/// a proportionally larger tolerance and neither false-fires on healthy latency.
+const CAMERA_AGE_DROP_BUDGET_MS_FLOOR: f64 = 200.0;
+const STALE_DELTA_DROP_LOG_THROTTLE_MS: u64 = 1000;
+
+static UNISTREAM_STALE_DELTA_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+static STALE_DELTA_DROP_LOG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static STALE_DELTA_DROP_LOG_LAST_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn unistream_stale_delta_drop_count() -> u64 {
+    UNISTREAM_STALE_DELTA_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+fn camera_age_drop_budget_ms() -> f64 {
+    compose_stall_threshold_ms(CAMERA_AGE_DROP_BUDGET_MS_FLOOR, uplink_rtt_baseline_ms())
+}
+
+/// Whether this frame should be age-dropped on the WT send path (#1737 Phase 1).
+///
+/// Drops a DELTA whose send-path residence `now_ms - enqueue_ms` exceeds
+/// `budget_ms`. There is deliberately NO upper age ceiling: the #1737 pathology
+/// is MINUTES-behind video, so an arbitrarily old delta is exactly what must be
+/// dropped, not sent. Both timestamps come from the SAME monotonic
+/// `performance.now()` clock (single-clock, via [`perf_now_ms`]), so `age`
+/// cannot be skewed by a wall-clock jump — a large `age` is always a real,
+/// bounded elapsed wait, never a clock glitch. Fail-open cases:
+///   * keyframes are NEVER dropped (a dropped keyframe corrupts the GOP);
+///   * a non-finite `age` (only reachable if a clock read is non-finite) → send;
+///   * missing meta → send.
+///
+/// The absence-of-clock case is handled at the call site (the drop is gated on
+/// `perf_now_ms()` returning `Some`), so this predicate never fabricates an age.
+fn should_age_drop(meta: Option<FrameDropMeta>, now_ms: f64, budget_ms: f64) -> bool {
+    match meta {
+        Some(m) if !m.is_keyframe => {
+            let age = now_ms - m.enqueue_ms;
+            age.is_finite() && age > budget_ms
+        }
+        _ => false,
+    }
+}
+
+fn record_stale_delta_drop() {
+    let total = UNISTREAM_STALE_DELTA_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some(now_ms) = perf_now_ms().map(|now| now as u64) else {
+        return;
+    };
+    let last_ms = STALE_DELTA_DROP_LOG_LAST_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) >= STALE_DELTA_DROP_LOG_THROTTLE_MS {
+        STALE_DELTA_DROP_LOG_LAST_MS.store(now_ms, Ordering::Relaxed);
+        let prev_total = STALE_DELTA_DROP_LOG_LAST_TOTAL.swap(total, Ordering::Relaxed);
+        let dropped_in_window = total.saturating_sub(prev_total);
+        log::info!(
+            "WebTransport: dropping stale camera delta(s) after writer.ready() (issue #1737) — \
+             dropped={dropped_in_window} in last window"
+        );
+    }
+}
+
+static UNISTREAM_BYTES_OFFERED: AtomicU64 = AtomicU64::new(0);
+
+pub fn unistream_bytes_offered_total() -> u64 {
+    UNISTREAM_BYTES_OFFERED.load(Ordering::Relaxed)
+}
+
+fn record_bytes_offered(n: u64) {
+    UNISTREAM_BYTES_OFFERED.fetch_add(n, Ordering::Relaxed);
+}
+
+static UNISTREAM_BYTES_DRAINED: AtomicU64 = AtomicU64::new(0);
+
+pub fn unistream_bytes_drained_total() -> u64 {
+    UNISTREAM_BYTES_DRAINED.load(Ordering::Relaxed)
+}
+
+fn record_bytes_drained(n: u64) {
+    UNISTREAM_BYTES_DRAINED.fetch_add(n, Ordering::Relaxed);
 }
 
 /// Record one dropped persistent-unistream media frame: increment
@@ -164,8 +347,11 @@ pub fn unistream_drop_count() -> u64 {
 /// runtime state — only counting failures at the write stage, i.e. after a
 /// writer was acquired (`captured_token.is_some()`) — because that condition
 /// cannot be made pure. See the gating rationale at the call site.
-fn record_unistream_drop() {
+fn record_unistream_drop(stream_key: u8) {
     UNISTREAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+    if let Some(counter) = stream_counter(&UNISTREAM_DROP_COUNT_BY_STREAM, stream_key) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// NETSIM-ONLY: synthetically bump the WT write-drop counter by `n` (issue
@@ -173,14 +359,12 @@ fn record_unistream_drop() {
 /// `.await`-blocking media send path when an ESTABLISHED unistream write fails
 /// (a teardown-class drop), which an e2e test cannot reliably induce on a
 /// localhost loopback. This feature-gated bumper lets the netsim e2e harness
-/// drive the SAME [`UNISTREAM_DROP_COUNT`] the encoders consult via
-/// [`unistream_drop_count`], so the third axis of the mic-side single-layer
-/// audio uplink-distress detector (#1398) — WT write-drop, alongside the
-/// already-bumpable WT ready-stall and WS send-buffer-drop axes — can be
-/// exercised deterministically. It increments through the same
-/// [`record_unistream_drop`] write path the production send-error handler uses,
-/// so the counter the detector reads is the one the test drives. Zero
-/// production cost: compiled out unless the `netsim` feature is on (the
+/// record audio-attributed drops for the microphone detector while preserving
+/// [`UNISTREAM_DROP_COUNT`] for camera/screen AQ and health reporting. This lets
+/// the detector's third axis — WT write-drop, alongside WT ready-stall and WS
+/// send-buffer drop — run deterministically. It increments through the same
+/// [`record_unistream_drop`] write path the production send-error handler uses.
+/// Zero production cost: compiled out unless the `netsim` feature is on (the
 /// dioxus-ui e2e build enables it; the production build does not). Mirrors
 /// [`force_unistream_ready_stall`] in role — but, unlike that sibling's single
 /// `fetch_add(n)`, it loops the private [`record_unistream_drop`] write path so
@@ -196,9 +380,16 @@ fn record_unistream_drop() {
 /// test need while bounding the worst case.
 #[cfg(feature = "netsim")]
 pub fn force_unistream_drop(n: u64) {
+    force_unistream_drop_for_stream(1, n);
+}
+
+/// NETSIM-ONLY: synthetically record write drops for one persistent media
+/// stream. Used by regression tests that verify cross-stream isolation.
+#[cfg(feature = "netsim")]
+pub fn force_unistream_drop_for_stream(stream_key: u8, n: u64) {
     let n = n.min(MAX_NETSIM_DROP_BUMP);
     for _ in 0..n {
-        record_unistream_drop();
+        record_unistream_drop(stream_key);
     }
 }
 
@@ -208,6 +399,20 @@ pub fn force_unistream_drop(n: u64) {
 /// O(n) loop bounded against an `Infinity`/huge coerced argument.
 #[cfg(feature = "netsim")]
 const MAX_NETSIM_DROP_BUMP: u64 = 10_000;
+
+/// Netsim-only bumper for the #1737 Phase-1 camera stale-delta age-drop counter,
+/// so the Playwright/netsim harness can drive the camera stale-drop AQ step-down
+/// axis end-to-end (loop reads `unistream_stale_delta_drop_count()` → decision →
+/// `force_video_step_down`) the same way `force_unistream_drop` drives the
+/// ready-stall/self-shed axes. Bumps the SAME counter the detector reads, so the
+/// e2e exercises the real production seam, not a parallel copy.
+#[cfg(feature = "netsim")]
+pub fn force_unistream_stale_delta_drop(n: u64) {
+    let n = n.min(MAX_NETSIM_DROP_BUMP);
+    for _ in 0..n {
+        record_stale_delta_drop();
+    }
+}
 
 /// Cumulative count of "slow `writer.ready()`" events on the persistent
 /// unidirectional media streams (`send_on_persistent_stream`): each time a
@@ -243,6 +448,14 @@ const MAX_NETSIM_DROP_BUMP: u64 = 10_000;
 /// equivalent of the drop counter's "N frames failed to send."
 static UNISTREAM_READY_STALL_COUNT: AtomicU64 = AtomicU64::new(0);
 
+static UNISTREAM_READY_STALL_COUNT_BY_STREAM: [AtomicU64; PERSISTENT_STREAM_COUNTER_SLOTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
 /// Returns the total number of slow-`ready()` (uplink-saturation) events on the
 /// persistent media unistreams since process start. See
 /// [`UNISTREAM_READY_STALL_COUNT`]. Mirrors [`unistream_drop_count`]; consumed
@@ -251,23 +464,42 @@ pub fn unistream_ready_stall_count() -> u64 {
     UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed)
 }
 
+/// Returns the number of slow `writer.ready()` observations attributed to one
+/// media stream key. The aggregate accessor remains available to camera and
+/// screen AQ, which intentionally react to process-wide uplink pressure.
+pub fn unistream_ready_stall_count_for_stream(stream_key: u8) -> u64 {
+    stream_counter(&UNISTREAM_READY_STALL_COUNT_BY_STREAM, stream_key)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// NETSIM-ONLY: synthetically bump the WT uplink-saturation counter by `n`
 /// (issue #1398). The real increment happens deep inside the `.await`-blocking
 /// media send path on a slow `writer.ready()`, which an e2e test cannot reliably
 /// induce on a localhost loopback. This feature-gated bumper lets the netsim e2e
-/// harness drive the SAME counter the encoders consult, so the mic-side
-/// single-layer audio uplink-distress detector can be exercised deterministically.
-/// Zero production cost: compiled out unless the `netsim` feature is on (the
-/// dioxus-ui e2e build enables it; the production build does not).
+/// harness record audio-attributed stalls for the microphone detector while
+/// preserving the aggregate counter used by camera/screen AQ. Zero production
+/// cost: compiled out unless the `netsim` feature is on (the dioxus-ui e2e build
+/// enables it; the production build does not).
 #[cfg(feature = "netsim")]
 pub fn force_unistream_ready_stall(n: u64) {
+    force_unistream_ready_stall_for_stream(1, n);
+}
+
+/// NETSIM-ONLY: synthetically record ready stalls for one persistent media
+/// stream. Used by regression tests that verify cross-stream isolation.
+#[cfg(feature = "netsim")]
+pub fn force_unistream_ready_stall_for_stream(stream_key: u8, n: u64) {
     UNISTREAM_READY_STALL_COUNT.fetch_add(n, Ordering::Relaxed);
+    if let Some(counter) = stream_counter(&UNISTREAM_READY_STALL_COUNT_BY_STREAM, stream_key) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 /// Absolute floor for the uplink-saturation threshold (ms). The effective
-/// threshold may be raised above this via [`set_ready_stall_threshold_ms`] when
-/// the publisher is dual-streaming (camera + screen), but it can never go below
-/// this floor.
+/// threshold may be raised above this by [`ReadyStallThresholdOwner`] when the
+/// publisher is dual-streaming (camera + screen), but it can never go below this
+/// floor.
 ///
 /// Lives here (not in `videocall-aq`) because it parameterises the PRODUCER-side
 /// measurement, not the consumer's window/threshold decision. The consumer's
@@ -282,6 +514,11 @@ pub fn force_unistream_ready_stall(n: u64) {
 /// enough that a genuine bandwidth cliff — where `ready()` blocks for hundreds
 /// of ms to multiple seconds while the send buffer refuses to drain — crosses
 /// it on most frames.
+///
+/// The "sub-10 ms healthy `ready()`" figure is a FAST-LINK assumption — on a
+/// high-RTT path `ready()` legitimately blocks ~1 RTT under normal pacing. See
+/// [`READY_STALL_RTT_BASELINE_MULTIPLIER`] for the RTT-relative qualification
+/// that keeps this floor from misclassifying that pacing as saturation (issue 1976).
 const READY_STALL_THRESHOLD_MS_FLOOR: f64 = 250.0;
 
 /// Runtime-configurable uplink-saturation threshold (ms), stored as the bits of
@@ -291,13 +528,14 @@ const READY_STALL_THRESHOLD_MS_FLOOR: f64 = 250.0;
 /// combined uplink burst density is higher: the SAME `writer.ready()` stall
 /// catches more concurrent frames (higher K-factor), making the count-gate
 /// easier to trip. To compensate, the client raises this threshold to
-/// `max(FLOOR, 8 × screen_top_tier_frame_interval_ms)` — a fixed 800 ms bound
-/// (10 fps top tier × 8), NOT recomputed as either stream degrades. When the
-/// screen share stops, the client resets it back to the floor.
+/// `max(FLOOR, 8 × live_screen_tier_frame_interval_ms)`. This is 800 ms at the
+/// 10 fps high tier, 1000 ms at the 8 fps medium tier, and 1600 ms at the 5 fps
+/// low tier. The client recomputes the maximum across live screen-share owners
+/// as tiers change, returning to the floor after the final owner stops.
 ///
 /// Stored as `f64::to_bits()` because `AtomicF64` does not exist in std.
-/// [`effective_stall_threshold_ms`] reads it; [`set_ready_stall_threshold_ms`]
-/// writes it. The floor guarantee is enforced at write time.
+/// [`effective_stall_threshold_ms`] reads it; the owner registry publishes it.
+/// The floor guarantee is enforced at write time.
 ///
 /// Initial value: bit pattern of 250.0_f64 (IEEE 754). Pinned by unit test
 /// `threshold_static_initializer_matches_floor` to the floor constant. Using a
@@ -308,144 +546,181 @@ const READY_STALL_THRESHOLD_MS_INIT_BITS: u64 = 4_643_000_109_586_448_384;
 
 static READY_STALL_THRESHOLD_MS: AtomicU64 = AtomicU64::new(READY_STALL_THRESHOLD_MS_INIT_BITS);
 
-/// Live count of encoders that have RAISED the uplink-saturation threshold above
-/// the floor (dual-stream / screen-share sessions) and have not yet released it
-/// (issue #1670). Used ONLY to gate the construction-time reset
-/// ([`reset_ready_stall_threshold_on_construction`]): while any live encoder
-/// holds a raise, a freshly-constructed encoder must NOT clobber the still-active
-/// raised threshold back to the floor.
+/// Multiplier applied to the active uplink's RTT baseline to derive an
+/// RTT-relative floor for the slow-`ready()` saturation threshold (issue 1976).
 ///
-/// ## Why this gate exists (the #1670 race)
+/// ## Why the absolute floor alone is a fast-link assumption
 ///
-/// A `CameraEncoder` is constructed once per Dioxus `Host` mount inside a
-/// `use_hook` closure (`dioxus-ui/src/components/host.rs`, the
-/// `CameraEncoder::new` call), and a `Host` can re-mount without a stable key
-/// (`attendants.rs` conditional mount). The OLD encoder's AQ control-loop
-/// `spawn_local` future is bound to the old encoder's liveness token, so it can
-/// still be ALIVE — and still holding a raised threshold from an active screen
-/// share — at the instant the NEW encoder's `new()` runs its unconditional
-/// construction-time reset. Before this gate, that fresh-construct reset
-/// clobbered the live raise back to the floor (250 ms), so the still-running
-/// dual-stream loop saw spurious saturation events and shed video needlessly.
+/// [`READY_STALL_THRESHOLD_MS_FLOOR`] (250 ms) was chosen as "~8× a 30 fps frame
+/// interval" on the premise that a healthy `writer.ready()` resolves in well
+/// under a frame (sub-10 ms). That premise only holds when the path RTT is
+/// small. On a high-RTT link the QUIC send window drains at the pace of
+/// flow-control credit returning — roughly ONE RTT after the peer consumes — so
+/// whenever the send buffer is momentarily full (which is the common case for a
+/// bandwidth-heavy simulcast uplink) `ready()` legitimately blocks for ~1 RTT
+/// even though the link is perfectly healthy. On a 255 ms path (discussion 1960,
+/// Alena) that ~255 ms pacing crosses the fixed 250 ms floor on ordinary frames,
+/// so the [`unistream_ready_stall_count`] count-gate (the WT_SATURATION_* window /
+/// threshold in `videocall-aq`) trips continuously and the AQ loop sheds a video
+/// layer roughly every cycle — pure oscillation, not real saturation.
 ///
-/// ## Why it cannot wedge (RAII-tied, #1667 preserved)
+/// ## The relative floor
 ///
-/// The count is incremented on the screen-RAISE edge and decremented on the
-/// screen-STOP edge; additionally the owning encoder's `Drop` decrements it IFF
-/// the encoder is torn down while still holding a raise (the STOP edge never
-/// ran). The encoder always drops on `Host` unmount — its liveness token is the
-/// AQ loop's own exit condition — so a raise can never outlive its owner: once
-/// every raising encoder has either hit its STOP edge or dropped, the count
-/// returns to 0. The release that brings the count to 0 ALSO floors the
-/// threshold (see [`note_threshold_raise_released`]), so a dropped-while-raised
-/// encoder whose replacement already skipped its guarded construction reset
-/// still ends at the floor — closing the inverse of the #1667 leak (a
-/// dropped-while-raised encoder leaking a raised threshold) at its source rather
-/// than relying on a later fresh construct that may never come.
-static SCREEN_RAISED_THRESHOLD_OWNERS: AtomicU32 = AtomicU32::new(0);
+/// [`effective_stall_threshold_ms`] therefore takes the MAX of the absolute /
+/// dual-stream floor and `multiplier × rtt_baseline`. At 2.0 a 255 ms path only
+/// treats a `ready()` that blocks for >510 ms (2× its own normal pacing) as a
+/// stall, so ordinary flow-control pacing and mild jitter are ignored while a
+/// genuine cliff (many hundreds of ms to seconds, sustained across the count-gate
+/// window) still sheds. A 50 ms path yields `2×50 = 100 < 250`, so the floor wins
+/// and fast-path behaviour is BYTE-IDENTICAL to before this change — the fix only
+/// loosens detection on paths whose own RTT already approaches the old floor.
+const READY_STALL_RTT_BASELINE_MULTIPLIER: f64 = 2.0;
 
-/// Register that a live encoder has RAISED the uplink-saturation threshold above
-/// the floor for a dual-stream (screen-share) session. Paired with
-/// [`note_threshold_raise_released`]. The count gates the CONSTRUCTION-time reset
-/// only: while any live encoder holds a raise, a freshly-constructed encoder must
-/// NOT clobber the still-active raised threshold back to the floor (#1670).
-pub fn note_threshold_raised() {
-    SCREEN_RAISED_THRESHOLD_OWNERS.fetch_add(1, Ordering::AcqRel);
+/// Active uplink RTT baseline (ms) fed by the connection layer's RTT-probe
+/// pipeline (`ConnectionManager::report_diagnostics`), stored as the bits of an
+/// `f64`. `0.0` is the "unset" sentinel — it contributes `2.0 × 0.0 = 0.0` to the
+/// [`effective_stall_threshold_ms`] MAX, leaving the absolute/dual-stream floor
+/// authoritative. The baseline is RESET to `0.0` whenever there is no trustworthy
+/// active RTT (not Elected, or the RTT-probe pipeline is stale) so a re-elected or
+/// still-probing path re-anchors on its OWN RTT rather than inheriting the prior
+/// path's (issue 1976 lifecycle: a re-election gives the uplink a NEW baseline).
+static RTT_BASELINE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-encoder dual-stream thresholds keyed by a unique owner id.
+///
+/// A scalar owner count was sufficient while every screen share used the same
+/// fixed 800 ms threshold. Live tier tracking makes owners heterogeneous:
+/// overlapping Host mounts can legitimately need 800, 1000, or 1600 ms at the
+/// same time. The process-global threshold must therefore be the MAX of every
+/// live owner's value, not the last value written.
+///
+/// The mutex makes register/update/release plus max recomputation one atomic
+/// state transition. Runtime calls are infrequent (screen start/stop or a tier
+/// change), so this is not on the per-frame media path.
+static READY_STALL_THRESHOLD_OWNERS: OnceLock<StdMutex<HashMap<u64, u64>>> = OnceLock::new();
+static NEXT_READY_STALL_THRESHOLD_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn ready_stall_threshold_owners() -> StdMutexGuard<'static, HashMap<u64, u64>> {
+    READY_STALL_THRESHOLD_OWNERS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Release a raise previously registered via [`note_threshold_raised`]. Called on
-/// the screen-share STOP edge AND (defensively) from the owning encoder's `Drop`
-/// if it still holds a raise — so a loop that DROPS while raised self-heals the
-/// count and cannot pin the threshold raised forever (the #1667 bug in reverse).
-/// Saturating at 0 so a double-release can never underflow into a huge count.
+fn clamp_ready_stall_threshold_ms(ms: f64) -> f64 {
+    if ms.is_finite() {
+        ms.max(READY_STALL_THRESHOLD_MS_FLOOR)
+    } else {
+        READY_STALL_THRESHOLD_MS_FLOOR
+    }
+}
+
+fn publish_ready_stall_threshold_owner_max(owners: &HashMap<u64, u64>) {
+    let threshold = owners
+        .values()
+        .copied()
+        .map(f64::from_bits)
+        .fold(READY_STALL_THRESHOLD_MS_FLOOR, f64::max);
+    READY_STALL_THRESHOLD_MS.store(threshold.to_bits(), Ordering::Relaxed);
+}
+
+/// RAII ownership of one encoder's dual-stream slow-`ready()` threshold.
 ///
-/// When this release brings the count to 0 (the LAST live owner went away), it
-/// also floors the threshold via [`reset_ready_stall_threshold`]. This is the
-/// single chokepoint that makes a drop-while-raised encoder self-heal the
-/// THRESHOLD, not merely the count (issue #1670, originally caught in pre-submit):
-/// when an old encoder is torn down before its screen-STOP edge ran, its `Drop`
-/// calls this, and the replacement encoder has ALREADY skipped its guarded
-/// construction-time reset (count was > 0 when it constructed) — so there is no
-/// later constructor to floor the threshold. Without flooring here, a single-
-/// stream publisher would stay pinned at the raised (e.g. 800 ms) threshold
-/// indefinitely, desensitizing WT uplink-saturation detection. We floor ONLY on
-/// the 1 -> 0 transition so a second concurrent raising encoder (count 2 -> 1)
-/// does not get its raise floored out from under it. (The 2 -> 1 no-floor branch
-/// protects the COUNT; the threshold's raised *value* is (re)driven only on a
-/// screen-active transition at the camera-encoder edge, and the sole floor-to-250
-/// edge there runs only when screen is globally inactive — so a sibling release
-/// never strands a still-wanted raise at the floor.)
-pub fn note_threshold_raise_released() {
-    // Saturating decrement: never wrap below 0.
-    let mut cur = SCREEN_RAISED_THRESHOLD_OWNERS.load(Ordering::Acquire);
-    loop {
-        if cur == 0 {
-            return;
-        }
-        match SCREEN_RAISED_THRESHOLD_OWNERS.compare_exchange_weak(
-            cur,
-            cur - 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                // Last owner released (1 -> 0): floor the threshold so a
-                // dropped-while-raised encoder cannot leave it pinned raised.
-                if cur == 1 {
-                    reset_ready_stall_threshold();
-                }
-                return;
-            }
-            Err(actual) => cur = actual,
+/// Create this guard on the screen-start edge, update it when the live screen
+/// tier changes, and drop it on screen stop or encoder teardown. Every operation
+/// republishes the maximum threshold across all live guards. The guard is
+/// deliberately not `Clone`: one encoder registration has exactly one release.
+pub struct ReadyStallThresholdOwner {
+    id: u64,
+}
+
+impl ReadyStallThresholdOwner {
+    pub fn new(threshold_ms: f64) -> Self {
+        let id = NEXT_READY_STALL_THRESHOLD_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+        let mut owners = ready_stall_threshold_owners();
+        owners.insert(id, clamp_ready_stall_threshold_ms(threshold_ms).to_bits());
+        publish_ready_stall_threshold_owner_max(&owners);
+        Self { id }
+    }
+
+    pub fn set_threshold_ms(&self, threshold_ms: f64) {
+        let mut owners = ready_stall_threshold_owners();
+        if let Some(current) = owners.get_mut(&self.id) {
+            *current = clamp_ready_stall_threshold_ms(threshold_ms).to_bits();
+            publish_ready_stall_threshold_owner_max(&owners);
         }
     }
 }
 
-/// Live count of encoders currently holding a raised uplink-saturation threshold.
-/// Exposed for the construction-time guard and tests.
+impl Drop for ReadyStallThresholdOwner {
+    fn drop(&mut self) {
+        let mut owners = ready_stall_threshold_owners();
+        owners.remove(&self.id);
+        publish_ready_stall_threshold_owner_max(&owners);
+    }
+}
+
+/// Live count of encoders currently holding a dual-stream threshold owner.
 pub fn raised_threshold_owner_count() -> u32 {
-    SCREEN_RAISED_THRESHOLD_OWNERS.load(Ordering::Acquire)
+    ready_stall_threshold_owners().len().min(u32::MAX as usize) as u32
 }
 
 /// PURE predicate: may a newly-constructed encoder reset the uplink-saturation
-/// threshold to the floor? Only when NO live encoder currently holds a raise
-/// (`live_raised_owners == 0`). When a raise is live, the construction-time reset
-/// must be SKIPPED so a remount's fresh encoder cannot clobber a still-active
-/// dual-stream threshold (#1670). The floor is restored by the LAST owner's
-/// release (the screen-STOP edge or `Drop` via [`note_threshold_raise_released`]),
-/// not by this construction-time reset, so a genuinely-dropped-while-raised prior
-/// encoder yields a clean floor even when no fresh construct follows (#1667
-/// preserved).
+/// threshold to the floor? Only when NO live encoder currently holds a raise.
 #[inline]
 pub fn should_reset_threshold_on_construction(live_raised_owners: u32) -> bool {
     live_raised_owners == 0
 }
 
-/// Construction-time guarded variant of [`reset_ready_stall_threshold`]: resets to
-/// the floor ONLY when no live encoder holds a raise (see
-/// [`should_reset_threshold_on_construction`]). Use this from encoder
-/// constructors; use the unconditional [`reset_ready_stall_threshold`] on the
-/// screen-STOP edge and other force-floor sites.
+/// Reset to the floor only when no live encoder owns a raise.
+///
+/// The registry lock keeps the empty check and floor write atomic with owner
+/// registration, so a remount constructor cannot clobber a surviving encoder.
 pub fn reset_ready_stall_threshold_on_construction() {
-    if should_reset_threshold_on_construction(raised_threshold_owner_count()) {
-        reset_ready_stall_threshold();
+    let owners = ready_stall_threshold_owners();
+    if owners.is_empty() {
+        READY_STALL_THRESHOLD_MS.store(READY_STALL_THRESHOLD_MS_FLOOR.to_bits(), Ordering::Relaxed);
     }
 }
 
 /// Read the current effective stall threshold (ms). This is the runtime value
-/// used by [`is_ready_stall`], which may be higher than the floor when
-/// dual-streaming.
+/// used by [`is_ready_stall`]. It is the MAX of two independently-maintained
+/// floors:
+///
+/// * the absolute / dual-stream floor ([`READY_STALL_THRESHOLD_MS`], ≥ 250 ms,
+///   raised for dual-stream publishers via [`ReadyStallThresholdOwner`]); and
+/// * the RTT-relative floor `READY_STALL_RTT_BASELINE_MULTIPLIER × rtt_baseline`
+///   (issue 1976), which keeps a high-RTT path from reading its own normal
+///   flow-control pacing as uplink saturation.
+///
+/// When no RTT baseline is set (`RTT_BASELINE_MS == 0`) the second term is 0 and
+/// the absolute/dual-stream floor is authoritative — byte-identical to the
+/// pre-1976 behaviour.
 #[inline]
 fn effective_stall_threshold_ms() -> f64 {
-    f64::from_bits(READY_STALL_THRESHOLD_MS.load(Ordering::Relaxed))
+    let absolute = f64::from_bits(READY_STALL_THRESHOLD_MS.load(Ordering::Relaxed));
+    let rtt_baseline = f64::from_bits(RTT_BASELINE_MS.load(Ordering::Relaxed));
+    compose_stall_threshold_ms(absolute, rtt_baseline)
 }
 
-/// Set the uplink-saturation threshold (ms) for the WT slow-`ready()` signal.
+/// Pure composition of the effective slow-`ready()` stall threshold from the
+/// absolute/dual-stream floor and the active uplink RTT baseline (issue 1976).
+///
+/// Returns `max(absolute_floor_ms, READY_STALL_RTT_BASELINE_MULTIPLIER × rtt_baseline_ms)`.
+/// `rtt_baseline_ms == 0.0` (the unset sentinel) contributes 0, so the absolute
+/// floor wins and behaviour is unchanged. Split out of
+/// [`effective_stall_threshold_ms`] so the RTT-relative floor is host-testable
+/// without touching the process-global atomics.
+#[inline]
+fn compose_stall_threshold_ms(absolute_floor_ms: f64, rtt_baseline_ms: f64) -> f64 {
+    absolute_floor_ms.max(READY_STALL_RTT_BASELINE_MULTIPLIER * rtt_baseline_ms)
+}
+
+/// Test-only direct setter for threshold predicate and RTT composition tests.
 ///
 /// The effective threshold is `max(floor, ms)` — it can never go below
-/// [`READY_STALL_THRESHOLD_MS_FLOOR`] (250 ms). Call this when the active
-/// media-stream configuration changes (e.g. screen share starts/stops) so the
-/// threshold is frame-rate-aware for dual-stream publishers.
+/// [`READY_STALL_THRESHOLD_MS_FLOOR`] (250 ms). Production screen-share code
+/// must use [`ReadyStallThresholdOwner`] so overlapping encoders compose by MAX.
 ///
 /// # Recommended formula
 ///
@@ -454,34 +729,68 @@ fn effective_stall_threshold_ms() -> f64 {
 /// ```
 ///
 /// For a single camera at 30 fps: `max(250, 8×33) = 264 ≈ floor`.
-/// For camera (30 fps) + screen (10 fps): `max(250, 8×100) = 800 ms`.
+/// For camera (30 fps) + a 10 fps screen tier: `max(250, 8×100) = 800 ms`.
+/// If that screen degrades to 5 fps: `max(250, 8×200) = 1600 ms`.
 ///
 /// This prevents false-positive saturation events on a healthy link that is
 /// simply bursty under dual-stream load (issue #1618). The risk — delaying
 /// genuine shed detection by up to one extra 2 s window — is acceptable because
 /// the shed is a gentle single-rung `force_video_step_down` with the relay
 /// CONGESTION path as backstop.
-pub fn set_ready_stall_threshold_ms(ms: f64) {
-    let clamped = if ms < READY_STALL_THRESHOLD_MS_FLOOR {
-        READY_STALL_THRESHOLD_MS_FLOOR
-    } else {
-        ms
-    };
+#[cfg(test)]
+fn set_ready_stall_threshold_ms(ms: f64) {
+    let clamped = clamp_ready_stall_threshold_ms(ms);
     READY_STALL_THRESHOLD_MS.store(clamped.to_bits(), Ordering::Relaxed);
 }
 
-/// Reset the uplink-saturation threshold back to the floor (250 ms).
-///
-/// Call this when switching from dual-stream back to single-stream (e.g. screen
-/// share stops), or when initializing a fresh encoder to ensure a clean baseline.
-pub fn reset_ready_stall_threshold() {
-    set_ready_stall_threshold_ms(READY_STALL_THRESHOLD_MS_FLOOR);
-}
-
 /// Returns the current effective ready-stall threshold in milliseconds.
-/// Useful for diagnostics and testing. See [`set_ready_stall_threshold_ms`].
+/// Useful for diagnostics and testing.
 pub fn ready_stall_threshold_ms() -> f64 {
     effective_stall_threshold_ms()
+}
+
+/// Feed the active uplink's RTT baseline (ms) into the WT slow-`ready()`
+/// saturation governor (issue 1976). Called ~1 Hz by the connection layer's
+/// diagnostics tick with the Elected connection's average RTT, or `None` to
+/// RESET the baseline (not Elected / RTT-probe pipeline stale) so a re-elected or
+/// still-probing path re-anchors on its own RTT instead of the prior path's.
+///
+/// `None`, and non-finite or non-positive values, store the `0.0` unset sentinel
+/// so the absolute/dual-stream floor stays authoritative until a real baseline
+/// arrives. The stored value only ever RAISES the effective threshold (via the
+/// MAX in `effective_stall_threshold_ms`); it can never lower it below the
+/// 250 ms floor, so on a fast path (`2 × rtt < 250`) it is inert.
+///
+/// ## Self-desensitizing feedback loop (bounded, by design)
+///
+/// There is a mild feedback loop: a genuinely congesting path inflates its own
+/// RTT via queueing delay, which raises its `2 × baseline` threshold (e.g. RTT
+/// 255 → 450 ms lifts the floor 510 → 900 ms), making the slow-`ready()` signal
+/// progressively LESS sensitive exactly as the path degrades. This is deliberate
+/// (a slower path SHOULD tolerate slower `ready()` before calling it saturation),
+/// and three independent safety valves keep it from hiding a real cliff:
+///   * the fed baseline is a 10-sample moving average (`average_rtt`), so it lags
+///     a rising RTT by ~10 s — the threshold cannot chase a spike instantly;
+///   * a hard cliff (packets stop draining) trips 3 consecutive RTT-probe
+///     timeouts → `rtt_probe_stale`, on which the connection layer feeds `None`
+///     here and the threshold snaps back to the 250 ms floor — re-sensitizing the
+///     detector precisely when it matters most; and
+///   * the independent write-failure axis (`unistream_drop_count`, incremented on
+///     a stream reset / failed media write) is UNCHANGED by this baseline and
+///     still sheds on a torn-down uplink regardless of the RTT-relative floor.
+pub fn set_uplink_rtt_baseline_ms(rtt_ms: Option<f64>) {
+    let stored = match rtt_ms {
+        Some(rtt) if rtt.is_finite() && rtt > 0.0 => rtt,
+        _ => 0.0,
+    };
+    RTT_BASELINE_MS.store(stored.to_bits(), Ordering::Relaxed);
+}
+
+/// Returns the current active uplink RTT baseline (ms) driving the RTT-relative
+/// stall floor, or `0.0` when unset. Useful for diagnostics and testing.
+/// See [`set_uplink_rtt_baseline_ms`].
+pub fn uplink_rtt_baseline_ms() -> f64 {
+    f64::from_bits(RTT_BASELINE_MS.load(Ordering::Relaxed))
 }
 
 /// Pure threshold predicate for the uplink-saturation signal: returns `true`
@@ -502,7 +811,7 @@ pub fn ready_stall_threshold_ms() -> f64 {
 ///
 /// The threshold is DYNAMIC: it reads [`effective_stall_threshold_ms`] which
 /// defaults to 250 ms (single-stream) but is raised when dual-streaming via
-/// [`set_ready_stall_threshold_ms`] (issue #1618).
+/// [`ReadyStallThresholdOwner`] (issue #1618).
 #[inline]
 fn is_ready_stall(elapsed_ms: f64) -> bool {
     elapsed_ms > effective_stall_threshold_ms()
@@ -521,9 +830,12 @@ fn is_ready_stall(elapsed_ms: f64) -> bool {
 /// (`perf_now_ms()` returning `Some` at both ends). When both hold, the caller
 /// invokes this with the measured elapsed and the counter behaves identically
 /// to the original inline `fetch_add`.
-fn record_ready_stall(elapsed_ms: f64) -> bool {
+fn record_ready_stall(stream_key: u8, elapsed_ms: f64) -> bool {
     if is_ready_stall(elapsed_ms) {
         UNISTREAM_READY_STALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        if let Some(counter) = stream_counter(&UNISTREAM_READY_STALL_COUNT_BY_STREAM, stream_key) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         true
     } else {
         false
@@ -538,7 +850,14 @@ fn record_ready_stall(elapsed_ms: f64) -> bool {
 /// and is the standard high-resolution timer for measuring elapsed durations on
 /// the hot path. It is two clock reads per frame with no allocation.
 fn perf_now_ms() -> Option<f64> {
-    web_sys::window()?.performance().map(|p| p.now())
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()?.performance().map(|p| p.now())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
 }
 
 /// Name of the JS global that, when set to a non-empty array of base64
@@ -1048,11 +1367,33 @@ impl WebTransportService {
         // Issue #1878: widen the incoming datagram queue BEFORE taking the reader
         // so a main-thread stall does not overflow it and silently drop audio.
         configure_incoming_datagram_queue(&datagrams);
+        // Issue 2031: this read-loop-lag tracker is a process-global shared across
+        // WT sessions; forget the previous session's last-read anchor so the first
+        // `.read()` below is a fresh baseline, not a gap spanning reconnect downtime.
+        if let Ok(mut lag) = READ_LOOP_LAG.lock() {
+            lag.reset_anchor();
+        }
         let incoming_datagrams: ReadableStreamDefaultReader =
             datagrams.readable().get_reader().unchecked_into();
+        // Issue 2031 (perf): resolve the `performance` clock handle ONCE here, not
+        // per datagram — `window()`/`performance()` are session-invariant, so the
+        // hot path below spends a single JS crossing (`perf.now()`) per datagram.
+        let clock = resolve_read_loop_clock();
         wasm_bindgen_futures::spawn_local(async move {
             loop {
                 let read_result = JsFuture::from(incoming_datagrams.read()).await;
+                // Issue 2031: record the resolution instant BEFORE any further
+                // work, so the measured gap is the time the reader spent blocked
+                // between `.read()` resolutions (main-thread starvation), not the
+                // time it then spends processing. `.await` above is the only
+                // suspension point in the loop, so a large gap means the main
+                // thread was busy elsewhere and the browser was age-dropping the
+                // OLDEST queued datagrams meanwhile. Read the timestamp BEFORE
+                // taking the lock so the lock is held for the minimal span.
+                let now = read_loop_now_ms(clock.as_ref());
+                if let Ok(mut lag) = READ_LOOP_LAG.lock() {
+                    lag.record(now);
+                }
                 match read_result {
                     Err(_) => {
                         // Expected when the transport is closed (Drop or network
@@ -1299,6 +1640,7 @@ impl WebTransportTask {
         streams: PersistentStreamMap,
         stream_key: u8,
         data: Vec<u8>,
+        meta: Option<FrameDropMeta>,
     ) {
         // Frame-size and emptiness guards.  Mirrors the server-side
         // `read_length_prefixed_frame` contract: zero-length payloads are
@@ -1380,6 +1722,10 @@ impl WebTransportTask {
                 // browser cannot split the header off from its body.
                 let framed = frame_persistent_stream_payload(&data);
                 let chunk = Uint8Array::from(framed.as_slice());
+                let framed_len = framed.len() as u64;
+                if captured_token.is_some() {
+                    record_bytes_offered(framed_len);
+                }
 
                 // --- Write the frame ----------------------------------------
                 // writer.ready() resolves when there is backpressure room.
@@ -1420,19 +1766,91 @@ impl WebTransportTask {
                 JsFuture::from(writer.ready())
                     .await
                     .map_err(|e| anyhow!("writer.ready() failed: {:?}", e))?;
+                // Single `performance.now()` read taken once here, right after
+                // ready() resolves, and REUSED for both the ready-stall record
+                // below and the #1737 age-drop check further down (they are
+                // separated only by synchronous code — no `.await` — so the two
+                // uses observe the same instant). Saves one JS-boundary crossing
+                // per camera frame vs reading the clock twice (Tony's PR #1993
+                // micro-perf note).
+                let ready_resolved_ms = perf_now_ms();
                 // captured_token.is_some() is guaranteed true on this line, but
                 // assert the gate explicitly so the signal can never be polluted
                 // by a control/handshake stream if this code is later refactored.
                 if captured_token.is_some() {
-                    if let (Some(start), Some(end)) = (ready_wait_start_ms, perf_now_ms()) {
+                    if let (Some(start), Some(end)) = (ready_wait_start_ms, ready_resolved_ms) {
                         // Pure threshold + increment lives in `record_ready_stall`
                         // so the saturation decision is unit-testable natively.
-                        record_ready_stall(end - start);
+                        record_ready_stall(stream_key, end - start);
+                    }
+                }
+                // Short-circuit on `meta.is_some()` FIRST so non-camera media
+                // (audio, screen, control — all `None`) never pays the
+                // `perf_now_ms()` JS-boundary chain or the budget arithmetic: the
+                // age-drop only ever applies to camera frames that carry meta.
+                //
+                // RE-ELECTION NOTE: unlike `record_unistream_drop` (which gates on
+                // `captured_token.is_some()` to exclude pre-writer draining
+                // artifacts), the age-drop deliberately has NO re-election
+                // suppression. During a #1311 reconnect, camera deltas that were
+                // enqueued to the OLD (draining) connection and then wait on a slow
+                // `writer.ready()` are genuinely stale and SHOULD be dropped — the
+                // whole point is "don't paint pre-reconnect frames." The only side
+                // effect is that these drops feed the stale-drop AQ axis, which
+                // could nudge one gentle step-down right after a high-latency
+                // reconnect. That is acceptable-by-design: the axis is WINDOWED (12
+                // in 2s, not a consecutive counter, so it cannot wedge), recovery
+                // is keyframe-exempt (the forced post-reconnect keyframe always
+                // gets through), and `force_video_step_down` is capped to one rung
+                // per `MIN_TIER_TRANSITION_INTERVAL_MS`. A brief conservative dip
+                // after a reconnect on a bad link is the correct bias.
+                if meta.is_some() {
+                    // Reuse `ready_resolved_ms` (the clock read taken right after
+                    // ready() above) rather than reading `performance.now()` again
+                    // — no `.await` sits between, so it is the same instant.
+                    if let Some(now_ms) = ready_resolved_ms {
+                        if should_age_drop(meta, now_ms, camera_age_drop_budget_ms()) {
+                            record_stale_delta_drop();
+                            return Ok(());
+                        }
                     }
                 }
                 JsFuture::from(writer.write_with_chunk(&chunk))
                     .await
                     .map_err(|e| anyhow!("write_with_chunk failed: {:?}", e))?;
+                // "Drained" means accepted past the WritableStream backpressure
+                // gate and handed to QUIC, not wire-ACK; the JS API exposes no
+                // byte ACK.
+                //
+                // SIGNAL SEMANTICS (read before building a consumer): both
+                // counters are MONOTONIC process-lifetime totals, so the relay
+                // charts them with `rate()`/`increase()`. `offered` is bumped
+                // for every established-path frame (below/above); `drained` only
+                // when the write RESOLVES OK. A frame that FAILS at `ready()` /
+                // `write_with_chunk` (teardown, reset, re-election draining) was
+                // counted in `offered` but never in `drained` — so
+                // `offered - drained` = (bytes currently buried in the
+                // WritableStream + spawn_local fan-out) + (cumulative bytes of
+                // frames that ever failed to write) + (#1737 Phase 1: cumulative
+                // bytes of camera DELTA frames intentionally AGE-DROPPED before
+                // `write_with_chunk` — these were `offered` above, then skipped
+                // via `return Ok(())`, so they never reach `drained` and are NOT
+                // counted by `unistream_drop_count()`). The RATE of the gap is
+                // the buried-queue backpressure signal; the absolute gap has a
+                // growing floor equal to cumulative teardown drops PLUS cumulative
+                // age-drops. Those two dropped components are separately observable
+                // as FRAME counts (not bytes) via `unistream_drop_count()`
+                // (teardown/failed writes) and `unistream_stale_delta_drop_count()`
+                // (#1737 age-drops). We deliberately do NOT `fetch_sub` `offered`
+                // on either drop path: that would make the counter non-monotonic
+                // and `increase()` would read the decrease as a counter reset. If
+                // a future phase needs pure buried-backlog in BYTES, add monotonic
+                // `UNISTREAM_BYTES_{DROPPED,AGE_DROPPED}` counters and compute
+                // `offered - drained - dropped - age_dropped` — do not roll back
+                // `offered`.
+                if captured_token.is_some() {
+                    record_bytes_drained(framed_len);
+                }
                 Ok(())
             }
             .await;
@@ -1457,7 +1875,7 @@ impl WebTransportTask {
                 // Incremented before eviction so the count reflects the dropped
                 // frame regardless of the eviction race outcome below.
                 if captured_token.is_some() {
-                    record_unistream_drop();
+                    record_unistream_drop(stream_key);
                 }
                 // Stream is broken — remove it from the map so the next
                 // send for this key opens a fresh stream.  We compare
@@ -2019,9 +2437,16 @@ mod framing_tests {
     /// otherwise a parallel test that raised the threshold would corrupt them.
     static THRESHOLD_GUARD: Mutex<()> = Mutex::new(());
 
-    /// Reset the dynamic threshold to the floor (250 ms) for tests.
+    /// Reset the dynamic threshold to the floor (250 ms) for tests. Also clears
+    /// the RTT baseline (issue 1976) back to the unset sentinel so any test
+    /// holding `THRESHOLD_GUARD` starts from the pure absolute-floor behaviour and
+    /// is insulated from an RTT baseline a sibling test left behind.
     fn reset_threshold_to_floor() {
-        set_ready_stall_threshold_ms(READY_STALL_THRESHOLD_MS_FLOOR);
+        let mut owners = ready_stall_threshold_owners();
+        owners.clear();
+        publish_ready_stall_threshold_owner_max(&owners);
+        drop(owners);
+        set_uplink_rtt_baseline_ms(None);
     }
 
     // --- Pure threshold predicate: the mutation target ---------------------
@@ -2127,7 +2552,7 @@ mod framing_tests {
         reset_threshold_to_floor();
         let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
 
-        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR + 50.0);
+        let counted = record_ready_stall(1, READY_STALL_THRESHOLD_MS_FLOOR + 50.0);
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
         assert!(
@@ -2155,7 +2580,7 @@ mod framing_tests {
         reset_threshold_to_floor();
         let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
 
-        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR - 50.0);
+        let counted = record_ready_stall(1, READY_STALL_THRESHOLD_MS_FLOOR - 50.0);
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
         assert!(
@@ -2177,7 +2602,7 @@ mod framing_tests {
         reset_threshold_to_floor();
         let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
 
-        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR);
+        let counted = record_ready_stall(1, READY_STALL_THRESHOLD_MS_FLOOR);
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
         assert!(!counted, "exactly-at-threshold must not count");
@@ -2196,7 +2621,7 @@ mod framing_tests {
 
         const K: u64 = 5;
         for _ in 0..K {
-            assert!(record_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR + 10.0));
+            assert!(record_ready_stall(1, READY_STALL_THRESHOLD_MS_FLOOR + 10.0));
         }
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
@@ -2204,6 +2629,26 @@ mod framing_tests {
             after - before,
             K,
             "K above-threshold stalls must produce exactly K increments",
+        );
+    }
+
+    #[test]
+    fn screen_ready_stalls_do_not_increment_audio_counter() {
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+        let aggregate_before = unistream_ready_stall_count();
+        let audio_before = unistream_ready_stall_count_for_stream(1);
+        let screen_before = unistream_ready_stall_count_for_stream(3);
+
+        assert!(record_ready_stall(3, READY_STALL_THRESHOLD_MS_FLOOR + 50.0));
+
+        assert_eq!(unistream_ready_stall_count() - aggregate_before, 1);
+        assert_eq!(unistream_ready_stall_count_for_stream(3) - screen_before, 1);
+        assert_eq!(
+            unistream_ready_stall_count_for_stream(1),
+            audio_before,
+            "screen pressure must not enter the microphone's audio counter",
         );
     }
 
@@ -2262,6 +2707,150 @@ mod framing_tests {
         // Boundary restored.
         assert!(is_ready_stall(251.0));
         assert!(!is_ready_stall(250.0));
+        reset_threshold_to_floor();
+    }
+
+    // --- RTT-relative stall floor (baseline-relative governor, issue 1976) ---
+    //
+    // These pin the fix for Alena's WT uplink oscillation (discussion 1960): on a
+    // high-RTT path the fixed 250 ms floor treated normal ~1-RTT flow-control
+    // pacing as "saturation" and sheds a video layer every cycle. The threshold
+    // is now `max(absolute/dual-stream floor, 2 × rtt_baseline)`.
+
+    #[test]
+    fn compose_stall_threshold_pins_multiplier_and_max() {
+        // The multiplier is 2.0 and the composition is a MAX. A 255 ms baseline
+        // yields a 510 ms floor (mutating the multiplier to anything but 2.0, or
+        // the max to a min, breaks this).
+        assert_eq!(
+            compose_stall_threshold_ms(READY_STALL_THRESHOLD_MS_FLOOR, 255.0),
+            510.0,
+            "255ms baseline must lift the floor to 2 × 255 = 510ms",
+        );
+        // A fast path: 2 × 50 = 100 < 250, so the absolute floor wins unchanged.
+        assert_eq!(
+            compose_stall_threshold_ms(READY_STALL_THRESHOLD_MS_FLOOR, 50.0),
+            READY_STALL_THRESHOLD_MS_FLOOR,
+            "fast-path (50ms) baseline must leave the 250ms floor authoritative",
+        );
+        // The dual-stream raise still wins when it exceeds the RTT term.
+        assert_eq!(
+            compose_stall_threshold_ms(800.0, 255.0),
+            800.0,
+            "dual-stream 800ms floor must win over 2 × 255 = 510ms",
+        );
+        // Unset baseline (0.0 sentinel) contributes nothing: pure floor.
+        assert_eq!(
+            compose_stall_threshold_ms(READY_STALL_THRESHOLD_MS_FLOOR, 0.0),
+            READY_STALL_THRESHOLD_MS_FLOOR,
+            "unset baseline must not move the threshold",
+        );
+    }
+
+    #[test]
+    fn high_rtt_baseline_ignores_normal_pacing_but_sheds_on_genuine_cliff() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+        // Alena's path: 255 ms baseline.
+        set_uplink_rtt_baseline_ms(Some(255.0));
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            510.0,
+            "255ms baseline must raise the effective threshold to 510ms",
+        );
+        // Normal ~1-RTT pacing (300 ms) is a stall PRE-fix (300 > 250) but must
+        // NOT be a stall now (300 < 510). This is the assertion that FAILS on the
+        // un-fixed code.
+        assert!(
+            !is_ready_stall(300.0),
+            "on a 255ms path a 300ms ready() is normal pacing, NOT saturation",
+        );
+        // A genuine cliff (well past 2× baseline) must still shed.
+        assert!(
+            is_ready_stall(600.0),
+            "a 600ms ready() (> 2× baseline) is a genuine stall and must still count",
+        );
+        reset_threshold_to_floor();
+    }
+
+    #[test]
+    fn fast_path_stall_behaviour_is_unchanged_by_baseline() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+        // 50 ms baseline (fast path): 2 × 50 = 100 < 250 → floor authoritative.
+        set_uplink_rtt_baseline_ms(Some(50.0));
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            READY_STALL_THRESHOLD_MS_FLOOR,
+            "a 50ms baseline must leave the 250ms floor authoritative",
+        );
+        // The exact pre-fix boundary must hold for a fast path — the fix must not
+        // make healthy-path shedding LESS responsive.
+        assert!(
+            !is_ready_stall(250.0),
+            "250ms is exactly the floor and must NOT stall on a fast path",
+        );
+        assert!(
+            is_ready_stall(251.0),
+            "251ms must stall on a fast path exactly as before the fix",
+        );
+        reset_threshold_to_floor();
+    }
+
+    #[test]
+    fn baseline_reset_re_anchors_to_floor() {
+        // Lifecycle: a re-election / stale-probe feeds `None`, which must drop the
+        // raised threshold back to the floor so the new path re-anchors on its own
+        // RTT instead of inheriting the old path's raised floor.
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+        set_uplink_rtt_baseline_ms(Some(255.0));
+        assert!(
+            !is_ready_stall(300.0),
+            "with a 255ms baseline, 300ms is not a stall",
+        );
+        // Re-election / stale probe: reset.
+        set_uplink_rtt_baseline_ms(None);
+        assert_eq!(
+            uplink_rtt_baseline_ms(),
+            0.0,
+            "None must clear the baseline to the unset sentinel",
+        );
+        assert!(
+            is_ready_stall(300.0),
+            "after reset the floor is authoritative again (300 > 250)",
+        );
+        reset_threshold_to_floor();
+    }
+
+    #[test]
+    fn baseline_rejects_non_finite_and_non_positive() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+        // A bogus RTT (NaN / negative / zero) must be treated as unset so it never
+        // desensitizes saturation detection with a garbage floor.
+        set_uplink_rtt_baseline_ms(Some(f64::NAN));
+        assert_eq!(
+            uplink_rtt_baseline_ms(),
+            0.0,
+            "NaN baseline must be rejected"
+        );
+        set_uplink_rtt_baseline_ms(Some(-10.0));
+        assert_eq!(
+            uplink_rtt_baseline_ms(),
+            0.0,
+            "negative baseline must be rejected",
+        );
+        set_uplink_rtt_baseline_ms(Some(0.0));
+        assert_eq!(
+            uplink_rtt_baseline_ms(),
+            0.0,
+            "zero baseline is the unset sentinel",
+        );
+        // Threshold stays at the floor throughout.
+        assert!(is_ready_stall(251.0));
+        assert!(!is_ready_stall(250.0));
+        reset_threshold_to_floor();
     }
 
     #[test]
@@ -2273,7 +2862,7 @@ mod framing_tests {
         let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
 
         // A 400ms wait: above floor (250) but below raised threshold (800).
-        let counted = record_ready_stall(400.0);
+        let counted = record_ready_stall(1, 400.0);
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
         assert!(!counted, "a wait below the raised threshold must NOT count",);
@@ -2293,7 +2882,7 @@ mod framing_tests {
         let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
 
         // A 1500ms wait: a genuine bandwidth cliff exceeds even the raised threshold.
-        let counted = record_ready_stall(1500.0);
+        let counted = record_ready_stall(1, 1500.0);
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
         assert!(
@@ -2339,7 +2928,7 @@ mod framing_tests {
         let _guard = DROP_COUNTER_GUARD.lock().unwrap();
         let before = UNISTREAM_DROP_COUNT.load(Ordering::Relaxed);
 
-        record_unistream_drop();
+        record_unistream_drop(1);
 
         let after = UNISTREAM_DROP_COUNT.load(Ordering::Relaxed);
         assert_eq!(
@@ -2369,7 +2958,7 @@ mod framing_tests {
 
         const K: u64 = 7;
         for _ in 0..K {
-            record_unistream_drop();
+            record_unistream_drop(1);
         }
 
         let after = UNISTREAM_DROP_COUNT.load(Ordering::Relaxed);
@@ -2385,20 +2974,205 @@ mod framing_tests {
         );
     }
 
+    #[test]
+    fn screen_write_drops_do_not_increment_audio_counter() {
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let aggregate_before = unistream_drop_count();
+        let audio_before = unistream_drop_count_for_stream(1);
+        let screen_before = unistream_drop_count_for_stream(3);
+
+        record_unistream_drop(3);
+
+        assert_eq!(unistream_drop_count() - aggregate_before, 1);
+        assert_eq!(unistream_drop_count_for_stream(3) - screen_before, 1);
+        assert_eq!(
+            unistream_drop_count_for_stream(1),
+            audio_before,
+            "screen failures must not enter the microphone's audio counter",
+        );
+    }
+
+    #[test]
+    fn should_age_drop_is_keyframe_exempt_and_fail_open() {
+        let budget = 200.0;
+        let now = 1_000.0;
+        let delta = Some(FrameDropMeta {
+            enqueue_ms: now - budget - 1.0,
+            is_keyframe: false,
+        });
+        let keyframe = Some(FrameDropMeta {
+            enqueue_ms: now - 600_000.0, // ancient (10 min) — must still send
+            is_keyframe: true,
+        });
+
+        assert!(should_age_drop(delta, now, budget));
+        assert!(
+            !should_age_drop(keyframe, now, budget),
+            "keyframes must never be age-dropped, even when ancient",
+        );
+        assert!(
+            !should_age_drop(None, now, budget),
+            "missing metadata must fail open",
+        );
+        assert!(
+            !should_age_drop(
+                Some(FrameDropMeta {
+                    enqueue_ms: now - budget,
+                    is_keyframe: false,
+                }),
+                now,
+                budget,
+            ),
+            "age exactly at the budget must send (strict > boundary)",
+        );
+        assert!(
+            !should_age_drop(
+                Some(FrameDropMeta {
+                    enqueue_ms: now + 1.0,
+                    is_keyframe: false,
+                }),
+                now,
+                budget,
+            ),
+            "negative age must fail open",
+        );
+        assert!(
+            !should_age_drop(
+                Some(FrameDropMeta {
+                    enqueue_ms: f64::NAN,
+                    is_keyframe: false,
+                }),
+                now,
+                budget,
+            ),
+            "non-finite age must fail open",
+        );
+        // The #1737 headline case: a delta minutes old MUST drop. There is no
+        // upper age ceiling — an arbitrarily old delta is exactly what this path
+        // exists to discard. (This asserts the fix for the codex-flagged ceiling
+        // bug: a prior `age <= ABSURD_AGE_CEILING_MS` clause wrongly SENT frames
+        // older than 10s, which is the minutes-behind pathology itself.)
+        assert!(
+            should_age_drop(
+                Some(FrameDropMeta {
+                    enqueue_ms: now - 600_000.0, // 10 minutes old
+                    is_keyframe: false,
+                }),
+                now,
+                budget,
+            ),
+            "a minutes-old delta must drop — there is no upper age ceiling",
+        );
+        assert!(
+            !should_age_drop(
+                Some(FrameDropMeta {
+                    enqueue_ms: 0.0,
+                    is_keyframe: false,
+                }),
+                f64::INFINITY,
+                budget,
+            ),
+            "non-finite now must fail open through non-finite age",
+        );
+    }
+
+    #[test]
+    fn record_stale_delta_drop_increments_counter_once() {
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_STALE_DELTA_DROP_COUNT.load(Ordering::Relaxed);
+
+        record_stale_delta_drop();
+
+        let after = UNISTREAM_STALE_DELTA_DROP_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            1,
+            "one recorded stale-delta drop must increment the counter exactly once",
+        );
+        assert_eq!(
+            unistream_stale_delta_drop_count(),
+            after,
+            "public accessor must reflect the recorded stale-delta drop",
+        );
+    }
+
+    /// #1737 Phase 0: the offered/drained byte-counter seam must write the
+    /// counters the health-reporter accessors read, in the correct direction.
+    /// DISTINCT byte totals (offered > drained) are recorded so an offered/
+    /// drained TRANSPOSITION at the `record_*` call sites (the exact mutation
+    /// the wire-format round-trip test also guards) is caught here at the
+    /// counter seam: the invariant `drained <= offered` would invert.
+    ///
+    /// MUTATION: swapping `record_bytes_offered`/`record_bytes_drained`, or
+    /// pointing either at the wrong static, makes the accessor deltas wrong and
+    /// fails an assertion below.
+    #[test]
+    fn record_bytes_offered_and_drained_write_their_own_counters() {
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let offered_before = UNISTREAM_BYTES_OFFERED.load(Ordering::Relaxed);
+        let drained_before = UNISTREAM_BYTES_DRAINED.load(Ordering::Relaxed);
+
+        // Model one send that fully drains (2000 offered, 2000 drained) plus one
+        // frame that was offered but failed to write (1200 offered, 0 drained) —
+        // so offered advances more than drained, as on a real lossy uplink.
+        record_bytes_offered(2000);
+        record_bytes_drained(2000);
+        record_bytes_offered(1200);
+
+        assert_eq!(
+            unistream_bytes_offered_total() - offered_before,
+            3200,
+            "offered accessor must reflect exactly the bytes passed to record_bytes_offered",
+        );
+        assert_eq!(
+            unistream_bytes_drained_total() - drained_before,
+            2000,
+            "drained accessor must reflect only the drained bytes (the failed frame is not drained)",
+        );
+        assert!(
+            unistream_bytes_drained_total() - drained_before
+                <= unistream_bytes_offered_total() - offered_before,
+            "drained must never exceed offered — an offered/drained transposition inverts this",
+        );
+    }
+
     #[cfg(feature = "netsim")]
     #[test]
     fn force_unistream_drop_bumps_counter_by_n() {
-        // The netsim bumper must drive the SAME counter the detector reads, by
-        // exactly `n` for a sane `n` — this is what the #1616 e2e relies on.
+        // The default bumper targets audio while preserving the aggregate count.
         let _guard = DROP_COUNTER_GUARD.lock().unwrap();
-        let before = unistream_drop_count();
+        let aggregate_before = unistream_drop_count();
+        let audio_before = unistream_drop_count_for_stream(1);
 
         force_unistream_drop(10);
 
         assert_eq!(
-            unistream_drop_count() - before,
+            unistream_drop_count() - aggregate_before,
             10,
-            "force_unistream_drop(10) must add exactly 10 to the counter the detector reads",
+            "force_unistream_drop(10) must preserve aggregate telemetry",
+        );
+        assert_eq!(
+            unistream_drop_count_for_stream(1) - audio_before,
+            10,
+            "force_unistream_drop(10) must drive the microphone's audio slot",
+        );
+    }
+
+    #[cfg(feature = "netsim")]
+    #[test]
+    fn force_unistream_stale_delta_drop_bumps_counter_by_n() {
+        // #1737 Phase 1: the netsim bumper must drive the SAME counter the camera
+        // stale-drop AQ step-down axis reads, by exactly `n`, so the e2e exercises
+        // the real production seam.
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let before = unistream_stale_delta_drop_count();
+
+        force_unistream_stale_delta_drop(10);
+
+        assert_eq!(
+            unistream_stale_delta_drop_count() - before,
+            10,
+            "force_unistream_stale_delta_drop(10) must add exactly 10 to the counter the axis reads",
         );
     }
 
@@ -2530,207 +3304,88 @@ mod framing_tests {
         );
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Construction-time threshold-reset guard (#1670).
-    //
-    // The PURE predicate `should_reset_threshold_on_construction` decides
-    // whether a freshly-constructed encoder may floor the dynamic threshold:
-    // only when NO live encoder holds a raise. The integration leg drives the
-    // real owner-count + threshold statics through the public helpers to prove
-    // the guard SKIPS the reset while a raise is live and ALLOWS it once the
-    // raise is released — the #1670 race fix. Holds `THRESHOLD_GUARD` (shared
-    // with the other threshold tests) so the dynamic-threshold static is not
-    // corrupted by parallel test execution, and restores both the threshold
-    // and the owner count to a clean state at the end so siblings are
-    // unaffected.
-    // ─────────────────────────────────────────────────────────────────────
     #[test]
-    fn construction_reset_guarded_by_live_raise_owner() {
-        // Pure predicate: floor only when no raise is live.
-        assert!(
-            should_reset_threshold_on_construction(0),
-            "no live raise => construction may floor the threshold",
-        );
-        assert!(
-            !should_reset_threshold_on_construction(1),
-            "a live raise => construction must NOT floor the threshold",
-        );
+    fn construction_reset_is_guarded_by_live_owner() {
+        assert!(should_reset_threshold_on_construction(0));
+        assert!(!should_reset_threshold_on_construction(1));
 
         let _tguard = THRESHOLD_GUARD.lock().unwrap();
-        // Start from a known state: floor the threshold and drain any leaked
-        // owners (a prior test that panicked mid-flight could have left one).
         reset_threshold_to_floor();
-        while raised_threshold_owner_count() != 0 {
-            note_threshold_raise_released();
-        }
 
-        // A live encoder raises the threshold for a dual-stream session.
-        set_ready_stall_threshold_ms(800.0);
-        note_threshold_raised();
-        assert_eq!(
-            raised_threshold_owner_count(),
-            1,
-            "registering a raise must bump the owner count to 1",
-        );
+        let owner = ReadyStallThresholdOwner::new(800.0);
+        assert_eq!(raised_threshold_owner_count(), 1);
+        assert_eq!(ready_stall_threshold_ms(), 800.0);
 
-        // A fresh encoder is constructed WHILE the raise is live: its guarded
-        // construction-time reset must be SKIPPED so it cannot clobber the
-        // still-active 800 ms threshold back to the floor (the #1670 race).
         reset_ready_stall_threshold_on_construction();
         assert_eq!(
             ready_stall_threshold_ms(),
             800.0,
-            "construction-time reset must be SKIPPED while a raise is live (#1670)",
+            "a remount constructor must not clobber a live owner",
         );
 
-        // The raising encoder releases (STOP edge or Drop): count returns to 0.
-        note_threshold_raise_released();
-        assert_eq!(
-            raised_threshold_owner_count(),
-            0,
-            "releasing the raise must return the owner count to 0",
-        );
-
-        // Now a fresh single-stream construct floors cleanly (#1667 preserved).
-        reset_ready_stall_threshold_on_construction();
+        drop(owner);
+        assert_eq!(raised_threshold_owner_count(), 0);
         assert_eq!(
             ready_stall_threshold_ms(),
-            250.0,
-            "construction-time reset must floor once no raise is live",
+            READY_STALL_THRESHOLD_MS_FLOOR,
+            "dropping the final owner must restore the floor",
         );
-
-        // Restore clean state for sibling THRESHOLD_GUARD tests.
-        reset_threshold_to_floor();
-        while raised_threshold_owner_count() != 0 {
-            note_threshold_raise_released();
-        }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Issue #1670 (pre-submit follow-up): releasing the LAST owner must floor
-    // the threshold, so a drop-while-raised encoder whose replacement already
-    // skipped its guarded construction reset does not leave the threshold pinned
-    // raised forever. This pins the floor-on-1->0 behavior in
-    // `note_threshold_raise_released`; mutating it to a plain decrement (drop the
-    // `if cur == 1 { reset_ready_stall_threshold() }`) turns this test red.
-    // ─────────────────────────────────────────────────────────────────────
     #[test]
-    fn last_owner_release_floors_threshold() {
+    fn mixed_tier_owners_preserve_max_in_both_registration_and_release_orders() {
         let _tguard = THRESHOLD_GUARD.lock().unwrap();
         reset_threshold_to_floor();
-        while raised_threshold_owner_count() != 0 {
-            note_threshold_raise_released();
-        }
 
-        // Simulate the drop-while-raised race directly:
-        //   1. Old encoder raises (screen-share active), count 0 -> 1, 800 ms.
-        set_ready_stall_threshold_ms(800.0);
-        note_threshold_raised();
-        //   2. Replacement encoder constructs WHILE the raise is live: its
-        //      guarded reset is skipped (count > 0), so it leaves 800 ms in place
-        //      and does NOT register its own raise (single-stream camera).
-        reset_ready_stall_threshold_on_construction();
+        // Low then high catches the reviewed false-low last-writer regression.
+        let low = ReadyStallThresholdOwner::new(1600.0);
+        let high = ReadyStallThresholdOwner::new(800.0);
+        assert_eq!(ready_stall_threshold_ms(), 1600.0);
+        drop(high);
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            1600.0,
+            "releasing the lower owner must preserve the higher owner",
+        );
+        drop(low);
+        assert_eq!(ready_stall_threshold_ms(), READY_STALL_THRESHOLD_MS_FLOOR);
+
+        // High then low catches the reviewed stale-high release regression.
+        let high = ReadyStallThresholdOwner::new(800.0);
+        let low = ReadyStallThresholdOwner::new(1600.0);
+        assert_eq!(ready_stall_threshold_ms(), 1600.0);
+        drop(low);
         assert_eq!(
             ready_stall_threshold_ms(),
             800.0,
-            "replacement construct must not clobber the live raise (#1670)",
+            "releasing the higher owner must restore the surviving owner",
         );
-        //   3. Old encoder is dropped before its STOP edge: its `Drop` releases
-        //      the LAST owner (count 1 -> 0). There is NO later constructor to
-        //      floor the threshold, so this release itself must floor it.
-        note_threshold_raise_released();
-        assert_eq!(
-            raised_threshold_owner_count(),
-            0,
-            "last release returns the owner count to 0",
-        );
-        assert_eq!(
-            ready_stall_threshold_ms(),
-            250.0,
-            "releasing the LAST owner must floor the threshold so a \
-             dropped-while-raised encoder cannot pin it raised (#1670)",
-        );
-
-        // A non-final release (2 -> 1) must NOT floor: a second concurrent raising
-        // encoder still wants the raise held.
-        set_ready_stall_threshold_ms(800.0);
-        note_threshold_raised();
-        note_threshold_raised();
-        assert_eq!(raised_threshold_owner_count(), 2, "two live raisers");
-        note_threshold_raise_released();
-        assert_eq!(
-            raised_threshold_owner_count(),
-            1,
-            "one raiser remains after a 2 -> 1 release",
-        );
-        assert_eq!(
-            ready_stall_threshold_ms(),
-            800.0,
-            "a non-final release (2 -> 1) must NOT floor: the surviving raiser \
-             still holds the raise",
-        );
-
-        // Restore clean state for sibling THRESHOLD_GUARD tests.
-        reset_threshold_to_floor();
-        while raised_threshold_owner_count() != 0 {
-            note_threshold_raise_released();
-        }
+        drop(high);
+        assert_eq!(ready_stall_threshold_ms(), READY_STALL_THRESHOLD_MS_FLOOR);
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Issue #1670 (pre-submit follow-up, caught by Codex): when two camera
-    // encoders overlap during a Host remount while screen-sharing, each owns its
-    // own `screen_sharing_active` flag, so ONE encoder can hit its screen-STOP
-    // edge (releasing 2 -> 1) while the OTHER still holds a raise. The STOP edge
-    // therefore must NOT floor the threshold unconditionally — it must route the
-    // floor through the owner release, which floors ONLY on the last (1 -> 0)
-    // release. This test models that exact two-owner STOP sequence: the first
-    // STOP-release must leave the threshold RAISED (the surviving dual-stream
-    // encoder still needs it); only the second STOP-release floors. Reintroducing
-    // an unconditional `reset_ready_stall_threshold()` on the STOP edge (the
-    // original bug) is what `note_threshold_raise_released`'s 1->0 guard prevents,
-    // and this test pins the 2->1-stays-raised half specifically.
-    // ─────────────────────────────────────────────────────────────────────
     #[test]
-    fn overlapping_encoder_stop_does_not_floor_while_a_raise_remains() {
+    fn live_owner_updates_recompute_max_and_release_restores_survivor() {
         let _tguard = THRESHOLD_GUARD.lock().unwrap();
         reset_threshold_to_floor();
-        while raised_threshold_owner_count() != 0 {
-            note_threshold_raise_released();
-        }
 
-        // Two overlapping encoders are both screen-sharing: each registered its
-        // raise on its own rising edge. Count == 2, threshold raised to 800 ms.
-        set_ready_stall_threshold_ms(800.0);
-        note_threshold_raised();
-        note_threshold_raised();
-        assert_eq!(raised_threshold_owner_count(), 2, "two overlapping raisers");
+        let first = ReadyStallThresholdOwner::new(800.0);
+        let second = ReadyStallThresholdOwner::new(1600.0);
+        second.set_threshold_ms(1000.0);
+        assert_eq!(ready_stall_threshold_ms(), 1000.0);
 
-        // Encoder A hits its screen-STOP edge: it releases its raise (2 -> 1). The
-        // STOP edge routes the floor through this release, which must NOT floor
-        // because encoder B still holds a raise. (Before the fix, the STOP edge
-        // floored unconditionally here and clobbered B's live 800 ms threshold.)
-        note_threshold_raise_released();
+        first.set_threshold_ms(1600.0);
+        assert_eq!(ready_stall_threshold_ms(), 1600.0);
+        drop(first);
         assert_eq!(
             ready_stall_threshold_ms(),
-            800.0,
-            "encoder A's STOP-release (2 -> 1) must NOT floor while encoder B \
-             still holds a raise — the surviving dual-stream encoder needs 800 ms",
+            1000.0,
+            "release must recompute from the surviving owner's live value",
         );
 
-        // Encoder B then hits its own STOP edge (1 -> 0): now the last owner is
-        // gone and the threshold floors to 250 ms.
-        note_threshold_raise_released();
-        assert_eq!(
-            ready_stall_threshold_ms(),
-            250.0,
-            "the LAST STOP-release (1 -> 0) floors the threshold",
-        );
-
-        // Restore clean state for sibling THRESHOLD_GUARD tests.
-        reset_threshold_to_floor();
-        while raised_threshold_owner_count() != 0 {
-            note_threshold_raise_released();
-        }
+        second.set_threshold_ms(800.0);
+        assert_eq!(ready_stall_threshold_ms(), 800.0);
+        drop(second);
+        assert_eq!(ready_stall_threshold_ms(), READY_STALL_THRESHOLD_MS_FLOOR);
     }
 }

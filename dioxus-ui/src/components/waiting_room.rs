@@ -14,7 +14,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::constants::{actix_websocket_base, webtransport_enabled, webtransport_host_base};
-use crate::context::{resolve_transport_config, TransportPreferenceCtx};
+use crate::context::{
+    load_transport_preference_with_source, resolve_transport_config, TransportPreferenceCtx,
+};
 use crate::meeting_api::{fetch_participant_status, JoinMeetingResponse};
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
@@ -86,13 +88,26 @@ pub fn WaitingRoom(
 
             // Apply user's transport preference
             let server_wt_enabled = webtransport_enabled().unwrap_or(false);
+            let applied_pref = (transport_pref_ctx.0)();
             let (effective_wt_enabled, websocket_urls, webtransport_urls) =
                 resolve_transport_config(
-                    (transport_pref_ctx.0)(),
+                    applied_pref,
                     server_wt_enabled,
                     websocket_urls,
                     webtransport_urls,
                 );
+
+            // Issue #1745 PR2 (observability only): record the applied
+            // preference + its provenance for the waiting-room OBSERVER client,
+            // mirroring the in-call join sites.
+            let (_, pref_source) = load_transport_preference_with_source();
+            log::info!(
+                "Transport preference applied: pref={} source={} wt_urls={} ws_urls={}",
+                applied_pref,
+                pref_source,
+                webtransport_urls.len(),
+                websocket_urls.len()
+            );
 
             let meeting_id_for_fetch = meeting_id.clone();
             let meeting_id_for_post_connect = meeting_id.clone();
@@ -113,6 +128,8 @@ pub fn WaitingRoom(
                 webtransport_urls,
                 enable_e2ee: false,
                 enable_webtransport: effective_wt_enabled,
+                max_received_layer: crate::constants::max_received_layer(),
+                skip_canvas_paint: crate::constants::skip_canvas_paint(),
                 // Issue #1884: waiting-room OBSERVER client — no in-call reaction
                 // overlay, so no reaction callback.
                 on_reaction: None,

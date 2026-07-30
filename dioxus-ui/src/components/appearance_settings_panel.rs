@@ -3,7 +3,7 @@
  * Licensed under MIT OR Apache-2.0
  */
 
-use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BORDER_COLOR};
+use crate::components::canvas_generator::{calculate_glow_params, glow_transition_seconds};
 use crate::components::color_picker::HsvColorPicker;
 use crate::context::{
     apply_theme_to_dom, load_custom_colors_from_storage, save_custom_colors_to_storage,
@@ -17,17 +17,93 @@ use crate::theme_file::{
 };
 use crate::util::color_math::parse_hex;
 use dioxus::prelude::*;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
-fn focus_add_btn() {
-    if let Some(el) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("add-custom-color-btn"))
-    {
+/// Restore keyboard focus to a meaningful in-panel control after a color
+/// picker action (add, close, cancel, delete). Tries the add button first;
+/// when it is unmounted (custom_colors at MAX) falls back to the selected
+/// swatch, then the swatch container.
+fn focus_color_panel_fallback() {
+    let doc = match web_sys::window().and_then(|w| w.document()) {
+        Some(d) => d,
+        None => return,
+    };
+    // 1. Add button (present when < MAX_CUSTOM_COLORS)
+    if let Some(el) = doc.get_element_by_id("add-custom-color-btn") {
+        if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
+            let _ = html.focus();
+            return;
+        }
+    }
+    // 2. Currently selected swatch (aria-pressed="true")
+    if let Ok(Some(el)) = doc.query_selector(".color-swatch[aria-pressed=\"true\"]") {
+        if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
+            let _ = html.focus();
+            return;
+        }
+    }
+    // 3. Swatch container as final fallback
+    if let Some(el) = doc.get_element_by_id("color-swatches-container") {
         if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
             let _ = html.focus();
         }
     }
+}
+
+fn focus_custom_swatch_after_delete_deferred(removed_idx: usize) {
+    // Use a browser timeout so the list re-renders before we focus the next target.
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let callback = Closure::wrap(Box::new(move || {
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+
+        let Ok(nodes) = doc.query_selector_all("[aria-label^=\"Select custom highlight \"]") else {
+            focus_color_panel_fallback();
+            return;
+        };
+
+        let len = nodes.length() as usize;
+        if len == 0 {
+            focus_color_panel_fallback();
+            return;
+        }
+
+        // Focus the swatch that moved into the deleted slot, or the previous
+        // one when the deleted swatch was the last item.
+        let target_idx = removed_idx.min(len.saturating_sub(1));
+        if let Some(node) = nodes.item(target_idx as u32) {
+            if let Ok(html) = node.dyn_into::<web_sys::HtmlElement>() {
+                let _ = html.focus();
+                return;
+            }
+        }
+
+        focus_color_panel_fallback();
+    }) as Box<dyn FnMut()>);
+    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+        callback.as_ref().unchecked_ref(),
+        50,
+    );
+    callback.forget();
+}
+
+fn focus_color_panel_fallback_deferred() {
+    // Defer focus until after modal unmount / DOM updates to avoid races.
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let callback = Closure::wrap(Box::new(move || {
+        focus_color_panel_fallback();
+    }) as Box<dyn FnMut()>);
+    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+        callback.as_ref().unchecked_ref(),
+        50,
+    );
+    callback.forget();
 }
 
 /// Cycle keyboard focus within the color-picker modal on Tab / Shift+Tab.
@@ -104,6 +180,10 @@ fn trap_tab_in_color_modal(shift: bool) -> bool {
     false
 }
 
+fn is_keyboard_activation_key(key: &Key) -> bool {
+    *key == Key::Enter || matches!(key, Key::Character(s) if s == " ")
+}
+
 #[component]
 pub fn AppearanceSettingsPanel() -> Element {
     let mut theme_ctx = use_context::<ThemePreferenceCtx>();
@@ -114,7 +194,7 @@ pub fn AppearanceSettingsPanel() -> Element {
     // signals stay local to this component instance and do NOT propagate to
     // attendants.rs or any other reader. Production always provides the real context.
     let appearance = (appearance_ctx.0)();
-    let preview_style = preview_glow_style(&appearance);
+
     let brightness_slider_style = slider_fill_style(appearance.glow_brightness);
     let inner_slider_style = slider_fill_style(appearance.inner_glow_strength);
     let decay_slider_style = slider_fill_style(appearance.glow_decay);
@@ -498,7 +578,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                 class: "appearance-control-row glow-palette-section",
                                 span { class: "appearance-control-label", "Color" }
                                 div { class: "appearance-control-content",
-                                    div { class: "color-swatches",
+                                    div { id: "color-swatches-container", class: "color-swatches", tabindex: "-1", role: "group", "aria-label": "Speaker highlight colors",
                                         // Preset swatches
                                         for color in preset_colors {
                                             {
@@ -519,6 +599,19 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                                     glow_color: color,
                                                                     ..appearance_ctx.0()
                                                                 });
+                                                        },
+                                                        onkeydown: move |evt: KeyboardEvent| {
+                                                            let key = evt.key();
+                                                            if is_keyboard_activation_key(&key) {
+                                                                evt.prevent_default();
+                                                                evt.stop_propagation();
+                                                                appearance_ctx
+                                                                    .0
+                                                                    .set(AppearanceSettings {
+                                                                        glow_color: color,
+                                                                        ..appearance_ctx.0()
+                                                                    });
+                                                            }
                                                         },
                                                         title: color.label(),
                                                     }
@@ -552,10 +645,30 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                                     ..appearance_ctx.0()
                                                                 });
                                                         },
+                                                        onkeydown: move |evt: KeyboardEvent| {
+                                                            let key = evt.key();
+                                                            if is_keyboard_activation_key(&key) {
+                                                                evt.prevent_default();
+                                                                evt.stop_propagation();
+                                                                appearance_ctx
+                                                                    .0
+                                                                    .set(AppearanceSettings {
+                                                                        glow_color: color,
+                                                                        ..appearance_ctx.0()
+                                                                    });
+                                                            }
+                                                        },
                                                         button {
                                                             class: "color-swatch-delete-btn",
+                                                            "aria-label": format!("Delete custom highlight {}", color.to_hex()),
+                                                            onkeydown: move |evt: KeyboardEvent| {
+                                                                let key = evt.key();
+                                                                if is_keyboard_activation_key(&key) {
+                                                                    evt.stop_propagation();
+                                                                }
+                                                            },
                                                             onclick: move |evt: Event<MouseData>| {
-                                                                evt.stop_propagation(); // Restore keyboard focus to the add-custom-color
+                                                                evt.stop_propagation();
                                                                 let mut colors = custom_colors();
                                                                 colors.remove(idx);
                                                                 save_custom_colors_to_storage(&colors);
@@ -565,12 +678,12 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                                     appearance_ctx
                                                                         .0
                                                                         .set(AppearanceSettings {
-                                                                            glow_color: GlowColor::MintGreen, // Restore keyboard focus to the add-custom-color
+                                                                            glow_color: GlowColor::MintGreen,
                                                                             ..appearance_ctx.0()
                                                                         });
                                                                 }
                                                                 show_picker.set(false);
-                                                                focus_add_btn();
+                                                                focus_custom_swatch_after_delete_deferred(idx);
                                                             },
                                                             svg {
                                                                 xmlns: "http://www.w3.org/2000/svg",
@@ -608,6 +721,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                 title: "Add custom color",
                                                 onclick: move |evt: Event<MouseData>| {
                                                     evt.stop_propagation();
+                                                    // Keep the popover open/closed state local to this panel.
                                                     color_input.set(String::new());
                                                     input_error.set(false);
                                                     show_picker.set(!show_picker());
@@ -648,14 +762,14 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                 show_picker.set(false);
                                                 color_input.set(String::new());
                                                 input_error.set(false);
-                                                focus_add_btn();
+                                                focus_color_panel_fallback_deferred();
                                             },
                                             onkeydown: move |evt: KeyboardEvent| {
                                                 if evt.key() == Key::Escape {
                                                     show_picker.set(false);
                                                     color_input.set(String::new());
                                                     input_error.set(false);
-                                                    focus_add_btn();
+                                                    focus_color_panel_fallback_deferred();
                                                 }
                                             },
                                             div {
@@ -685,7 +799,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                             show_picker.set(false);
                                                             color_input.set(String::new());
                                                             input_error.set(false);
-                                                            focus_add_btn();
+                                                            focus_color_panel_fallback_deferred();
                                                         }
                                                         Key::Tab
                                                             if trap_tab_in_color_modal(
@@ -724,7 +838,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                                     show_picker.set(false);
                                                                     color_input.set(String::new());
                                                                     input_error.set(false);
-                                                                    focus_add_btn();
+                                                                    focus_color_panel_fallback_deferred();
                                                                 },
                                                                 svg {
                                                                     view_box: "0 0 24 24",
@@ -767,7 +881,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                                         show_picker.set(false);
                                                                         color_input.set(String::new());
                                                                         input_error.set(false);
-                                                                        focus_add_btn();
+                                                                        focus_color_panel_fallback_deferred();
                                                                     },
                                                                     "Cancel"
                                                                 }
@@ -802,7 +916,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                                             show_picker.set(false);
                                                                             color_input.set(String::new());
                                                                             input_error.set(false);
-                                                                            focus_add_btn();
+                                                                            focus_color_panel_fallback_deferred();
                                                                         } else {
                                                                             input_error.set(true);
                                                                         }
@@ -932,33 +1046,73 @@ pub fn AppearanceSettingsPanel() -> Element {
                         } // speaker-highlight-controls
 
                         div { class: "speaker-highlight-preview",
-                            div {
-                                class: "preview-tile preview-tile-pulsing",
-                                style: "{preview_style}",
-                                svg {
-                                    xmlns: "http://www.w3.org/2000/svg",
-                                    view_box: "0 0 120 120",
-                                    width: "100%",
-                                    height: "100%",
-                                    style: "pointer-events: none; display: block;",
-                                    // Head
-                                    circle {
-                                        cx: "60",
-                                        cy: "44",
-                                        r: "20",
-                                        fill: "{theme_color::PREVIEW_AVATAR_BG}",
-                                    }
-                                    // Shoulders / torso
-                                    path {
-                                        d: "M20 120 C20 86, 38 70, 60 70 C82 70, 100 86, 100 120 Z",
-                                        fill: "{theme_color::PREVIEW_AVATAR_BG}",
-                                    }
-                                }
-                            }
+                            SpeakerHighlightPreview { settings: appearance }
                             p { class: "speaker-highlight-preview-caption", "Active speaker preview" }
                         }
                     }
             }
+                }
+            }
+        }
+    }
+}
+
+/// Dedicated child component for the speaker-highlight preview tile.
+///
+/// Owns the speaking/silent animation timer so that timer-driven re-renders
+/// are scoped to the preview subtree and do not re-render the parent panel.
+#[component]
+fn SpeakerHighlightPreview(settings: AppearanceSettings) -> Element {
+    let mut preview_speaking = use_signal(|| true);
+    let mut decay_signal = use_signal(|| settings.glow_decay);
+    // Keep the signal in sync with the current slider value.
+    if (*decay_signal.peek() - settings.glow_decay).abs() > f32::EPSILON {
+        decay_signal.set(settings.glow_decay);
+    }
+    use_future(move || async move {
+        if prefers_reduced_motion() {
+            preview_speaking.set(true);
+            return;
+        }
+        loop {
+            // Speaking burst (fixed short duration).
+            preview_speaking.set(true);
+            gloo_timers::future::TimeoutFuture::new(PREVIEW_SPEAKING_MS).await;
+            // Silent phase — long enough to perceive the decay tail.
+            preview_speaking.set(false);
+            let silent_ms = preview_silent_duration_ms(*decay_signal.peek());
+            gloo_timers::future::TimeoutFuture::new(silent_ms).await;
+        }
+    });
+
+    let preview_style = preview_glow_style(&settings);
+    let preview_tile_class = if preview_speaking() {
+        "preview-tile preview-tile-pulsing preview-tile--speaking"
+    } else {
+        "preview-tile preview-tile-pulsing preview-tile--silent"
+    };
+
+    rsx! {
+        div {
+            class: "{preview_tile_class}",
+            style: "{preview_style}",
+            svg {
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 120 120",
+                width: "100%",
+                height: "100%",
+                style: "pointer-events: none; display: block;",
+                // Head
+                circle {
+                    cx: "60",
+                    cy: "44",
+                    r: "20",
+                    fill: "{theme_color::PREVIEW_AVATAR_BG}",
+                }
+                // Shoulders / torso
+                path {
+                    d: "M20 120 C20 86, 38 70, 60 70 C82 70, 100 86, 100 120 Z",
+                    fill: "{theme_color::PREVIEW_AVATAR_BG}",
                 }
             }
         }
@@ -970,48 +1124,81 @@ pub fn AppearanceSettingsPanel() -> Element {
 /// Used so the appearance preview can dampen its glow further on light
 /// surfaces, where the same alpha reads much brighter than on dark.
 fn is_light_theme() -> bool {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.document_element())
-        .and_then(|e| e.get_attribute("data-theme"))
-        .map(|t| t == "light")
-        .unwrap_or(false)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+            .and_then(|e| e.get_attribute("data-theme"))
+            .map(|t| t == "light")
+            .unwrap_or(false)
+    }
 }
 
-/// Compute a static glow style for the appearance preview tile.
+/// Detect whether the user has requested reduced motion.
+fn prefers_reduced_motion() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|window| window.match_media("(prefers-reduced-motion: reduce)").ok())
+            .flatten()
+            .map(|media_query| media_query.matches())
+            .unwrap_or(false)
+    }
+}
+
+/// Duration of the "speaking burst" phase in the preview animation (ms).
+const PREVIEW_SPEAKING_MS: u32 = 600;
+/// Minimum silent phase so the cycle doesn't spin too fast at 0% decay.
+const PREVIEW_SILENT_MIN_MS: u32 = 400;
+
+/// Compute the silent phase duration (ms) for the preview animation cycle.
 ///
-/// Calls [`calculate_glow_params`] with a fixed intensity of 0.55 so the
-/// preview is always visible regardless of microphone state. The CSS
-/// `preview-tile-pulsing` animation provides visual dynamism.
+/// Longer decay → longer visible tail → more silent time needed to perceive it.
+/// The silent phase is hold + fade + a small minimum baseline.
+fn preview_silent_duration_ms(decay: f32) -> u32 {
+    let (_fade_in, fade_out, hold) = glow_transition_seconds(decay);
+    let tail_ms = ((hold + fade_out) * 1000.0) as u32;
+    PREVIEW_SILENT_MIN_MS + tail_ms
+}
+
+/// Compute the inline CSS custom properties for the appearance preview tile.
+///
+/// The preview tile's actual glow rendering lives in CSS; this helper only
+/// publishes the live color channels, glow geometry, and decay-derived timing
+/// values so the stylesheet can render the same decay tail as the production
+/// speaker glow.
 ///
 /// The preview is intentionally a *quiet* supporting element next to the
 /// dominant controls, so the computed glow is scaled down from the
 /// production tile parameters (blur ~60%, spread ~70%, alpha ~60%; alpha
 /// further dampened on light theme so it doesn't flood the modal).
 fn preview_glow_style(settings: &AppearanceSettings) -> String {
-    if !settings.glow_enabled {
-        return format!(
-            "box-shadow: none; border-color: {};",
-            DEFAULT_TILE_BORDER_COLOR
-        );
-    }
-
-    let (r, g, b) = settings.glow_color.to_rgb();
     let p = calculate_glow_params(0.55, settings.glow_brightness, settings.inner_glow_strength);
-    if settings.inner_glow_strength <= f32::EPSILON {
-        // @token-exempt: dynamic rgba from settings.glow_color.to_rgb(), not a hardcoded color
-        return format!(
-            "box-shadow: none; border-color: rgba({r}, {g}, {b}, {:.2});",
-            p.border_alpha,
-        );
-    }
+    let (fade_in_seconds, fade_out_duration, hold_delay) =
+        glow_transition_seconds(settings.glow_decay);
+    let (r, g, b) = settings.glow_color.to_rgb();
     let blur_scale = 0.60_f32;
     let spread_scale = 0.70_f32;
     let alpha_scale = if is_light_theme() { 0.42_f32 } else { 0.60_f32 };
+
     format!(
-        "box-shadow: 0 0 {:.0}px {:.0}px rgba({r}, {g}, {b}, {:.2}), \
-         inset 0 0 {:.0}px {:.0}px rgba({r}, {g}, {b}, {:.2}); \
-         border-color: rgba({r}, {g}, {b}, {:.2});",
+        "--preview-glow-r: {r}; --preview-glow-g: {g}; --preview-glow-b: {b}; \
+         --preview-glow-outer-blur: {:.0}; --preview-glow-outer-spread: {:.0}; \
+         --preview-glow-outer-alpha: {:.2}; --preview-glow-inner-blur: {:.0}; \
+         --preview-glow-inner-spread: {:.0}; --preview-glow-inner-alpha: {:.2}; \
+         --preview-glow-border-alpha: {:.2}; --preview-glow-fade-in: {fade_in_seconds:.2}s; \
+         --preview-glow-fade-out: {fade_out_duration:.2}s; --preview-glow-hold-delay: {hold_delay:.2}s;",
         p.outer_blur * blur_scale,
         p.outer_spread * spread_scale,
         p.outer_alpha * alpha_scale,
@@ -1034,4 +1221,91 @@ fn preview_glow_style(settings: &AppearanceSettings) -> String {
 fn slider_fill_style(value_0_1: f32) -> String {
     let pct = (value_0_1.clamp(0.0, 1.0) * 100.0).round() as i32;
     format!("--fill: {pct}%;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_silent_duration_zero_decay_is_short() {
+        let ms = preview_silent_duration_ms(0.0);
+        // 0% decay → instant off, so silent phase is just the minimum baseline.
+        assert_eq!(ms, PREVIEW_SILENT_MIN_MS);
+    }
+
+    #[test]
+    fn preview_silent_duration_full_decay_is_longer() {
+        let ms_zero = preview_silent_duration_ms(0.0);
+        let ms_full = preview_silent_duration_ms(1.0);
+        // 100% decay yields a noticeably longer silent phase than 0%.
+        assert!(
+            ms_full > ms_zero + 3000,
+            "full decay silent ({ms_full}ms) should be >3s longer than zero ({ms_zero}ms)"
+        );
+    }
+
+    #[test]
+    fn preview_silent_duration_mid_decay_between_extremes() {
+        let ms_zero = preview_silent_duration_ms(0.0);
+        let ms_mid = preview_silent_duration_ms(0.5);
+        let ms_full = preview_silent_duration_ms(1.0);
+        assert!(ms_mid > ms_zero);
+        assert!(ms_mid < ms_full);
+    }
+
+    #[test]
+    fn preview_glow_style_off_state_includes_transition_delay_when_decay_positive() {
+        let settings = AppearanceSettings {
+            glow_enabled: true,
+            glow_decay: 0.5,
+            inner_glow_strength: 0.5,
+            ..AppearanceSettings::default()
+        };
+        let style = preview_glow_style(&settings);
+        // 50% decay → 1.0s hold delay; the off-style must contain a non-zero delay.
+        assert!(
+            style.contains("--preview-glow-hold-delay: 1.00s;"),
+            "preview vars should include hold delay: {style}"
+        );
+    }
+
+    #[test]
+    fn preview_glow_style_off_state_no_delay_at_zero_decay() {
+        let settings = AppearanceSettings {
+            glow_enabled: true,
+            glow_decay: 0.0,
+            inner_glow_strength: 0.5,
+            ..AppearanceSettings::default()
+        };
+        let style = preview_glow_style(&settings);
+        // 0% decay → all zeros: no transition, no delay.
+        assert!(
+            style.contains("--preview-glow-fade-out: 0.00s;"),
+            "zero-decay preview vars should have 0s fade-out: {style}"
+        );
+    }
+
+    #[test]
+    fn preview_glow_style_exports_preview_vars() {
+        let settings = AppearanceSettings {
+            glow_enabled: true,
+            glow_decay: 0.5,
+            // Use a deterministic strength value so this assertion only checks
+            // that the helper exports the CSS variables consumed by the preview.
+            inner_glow_strength: 0.0,
+            glow_brightness: 0.5,
+            ..AppearanceSettings::default()
+        };
+        let style = preview_glow_style(&settings);
+        // The helper should publish the CSS custom properties consumed by the
+        // preview tile, including the selected color and decay timing.
+        assert!(
+            style.contains("--preview-glow-r: "),
+            "preview vars should include the channel tokens: {style}"
+        );
+        assert!(style.contains("--preview-glow-fade-out: 1.50s;"));
+        assert!(style.contains("--preview-glow-hold-delay: 1.00s;"));
+        assert!(style.contains("--preview-glow-border-alpha:"));
+    }
 }

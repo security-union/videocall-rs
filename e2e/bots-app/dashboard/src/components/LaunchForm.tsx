@@ -17,9 +17,11 @@ import {
   NETSIM_PRESETS,
   RUN_LOCATIONS,
   TTL_SUGGESTIONS,
+  VIDEO_MODES,
   networkLabel,
   type AuthBackend,
   type RunLocation,
+  type VideoMode,
 } from "../lib/constants";
 import {
   recordLaunchedBot,
@@ -41,6 +43,7 @@ export interface LaunchFormInitial {
   displayName: string;
   ttl: string;
   network: string;
+  videoMode: VideoMode;
   headless: boolean;
   authBackend: AuthBackend;
   storageStateFile: string;
@@ -80,6 +83,7 @@ const DEFAULT_VALUES: LaunchFormInitial = {
   displayName: "",
   ttl: "5m",
   network: "none",
+  videoMode: "costume",
   headless: false,
   authBackend: "jwt",
   storageStateFile: "",
@@ -330,7 +334,7 @@ export function LaunchForm({ initialValues, onLaunched, onError, onToast }: Laun
    * after the load releases the guard).
    */
   const handleLoadPrevious = (entry: LaunchedBotHistoryEntry) => {
-    setValues(entry.spec);
+    setValues({ ...entry.spec, videoMode: entry.spec.videoMode ?? "costume" });
     setErrors({});
     setSubmitted(false);
     setManualTouched({ costume: false, audio: false });
@@ -407,6 +411,7 @@ export function LaunchForm({ initialValues, onLaunched, onError, onToast }: Laun
       displayName: values.displayName.trim() || undefined,
       ttl: values.ttl.trim(),
       network: values.network,
+      videoMode: values.videoMode,
       headless: values.headless,
       authBackend: values.authBackend,
       storageStateFile:
@@ -556,6 +561,7 @@ export function LaunchForm({ initialValues, onLaunched, onError, onToast }: Laun
                 ttl: values.ttl.trim(),
                 headless: values.headless,
                 network: values.network,
+                videoMode: values.videoMode,
                 authBackend: values.authBackend,
               }}
               testIdPrefix="ssh-cmd-preview"
@@ -807,6 +813,22 @@ export function LaunchForm({ initialValues, onLaunched, onError, onToast }: Laun
                 onValueChange={(v) => setField("network", v)}
                 options={NETSIM_PRESETS.map((p) => ({ value: p, label: networkLabel(p) }))}
                 testId="network"
+              />
+            </Field>
+
+            <Field
+              label="Video mode"
+              help={
+                <HelpPopover fieldLabel="Video mode" testId="help-video-mode">
+                  <p>Select the fake video source used by the bot.</p>
+                </HelpPopover>
+              }
+            >
+              <Select
+                value={values.videoMode}
+                onValueChange={(v) => setField("videoMode", v as VideoMode)}
+                options={[...VIDEO_MODES]}
+                testId="video-mode-select"
               />
             </Field>
           </div>

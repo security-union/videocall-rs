@@ -300,6 +300,16 @@ pub fn forget_session_drops(room: &str, transport: &str, session_id: &str) {
     }
 }
 
+const RELAY_OUTBOUND_QUEUE_DEPTH_CHANNELS: &[&str] = &["unistream", "datagram", "ws"];
+
+/// Remove a single session's per-channel outbound queue-depth series.
+pub fn forget_outbound_queue_depth_by_session(room: &str, transport: &str, session_id: &str) {
+    for channel in RELAY_OUTBOUND_QUEUE_DEPTH_CHANNELS {
+        let _ = RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
+            .remove_label_values(&[room, transport, session_id, channel]);
+    }
+}
+
 lazy_static! {
     /// Total number of health reports received
     pub static ref HEALTH_REPORTS_TOTAL: Counter = register_counter!(
@@ -312,7 +322,7 @@ lazy_static! {
     pub static ref PEER_CAN_LISTEN: GaugeVec = register_gauge_vec!(
         "videocall_peer_can_listen",
         "Indicates if a peer can receive audio from another peer (1=yes, 0=no)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create peer_can_listen metric");
 
@@ -320,7 +330,7 @@ lazy_static! {
     pub static ref PEER_CAN_SEE: GaugeVec = register_gauge_vec!(
         "videocall_peer_can_see",
         "Indicates if a peer can receive video from another peer (1=yes, 0=no)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create peer_can_see metric");
 
@@ -328,7 +338,7 @@ lazy_static! {
     pub static ref NETEQ_AUDIO_BUFFER_MS: GaugeVec = register_gauge_vec!(
         "videocall_neteq_audio_buffer_ms",
         "Audio data buffered for playback in milliseconds",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create neteq_audio_buffer_ms metric");
 
@@ -343,7 +353,7 @@ lazy_static! {
     pub static ref AUDIO_PLAYOUT_LATENCY_MS: GaugeVec = register_gauge_vec!(
         "videocall_audio_playout_latency_ms",
         "Per-peer audio playout latency in ms (how far behind live); NetEQ filtered playout buffer level. Sustained multi-second => #1299 lag",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create audio_playout_latency_ms metric");
 
@@ -351,7 +361,7 @@ lazy_static! {
     pub static ref NETEQ_PACKETS_AWAITING_DECODE: GaugeVec = register_gauge_vec!(
         "videocall_neteq_packets_awaiting_decode",
         "Number of encoded packets waiting to be decoded",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create neteq_packets_awaiting_decode metric");
 
@@ -359,7 +369,7 @@ lazy_static! {
     pub static ref NETEQ_PACKETS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_packets_per_sec",
         "Number of audio RTP packets received per second (rolling 1s window)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create neteq_packets_per_sec metric");
 
@@ -367,7 +377,7 @@ lazy_static! {
     pub static ref NETEQ_NORMAL_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_normal_ops_per_sec",
         "Normal decode operations per second",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create neteq_normal_ops_per_sec metric");
 
@@ -375,7 +385,7 @@ lazy_static! {
     pub static ref NETEQ_EXPAND_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_expand_ops_per_sec",
         "Expand operations per second (packet loss concealment)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create neteq_expand_ops_per_sec metric");
 
@@ -383,7 +393,7 @@ lazy_static! {
     pub static ref NETEQ_ACCELERATE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_accelerate_ops_per_sec",
         "Accelerate operations per second (time compression)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create neteq_accelerate_ops_per_sec metric");
 
@@ -419,7 +429,7 @@ lazy_static! {
     pub static ref VIDEO_FPS: GaugeVec = register_gauge_vec!(
         "videocall_video_fps",
         "Video frames per second observed by the receiver",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_fps metric");
 
@@ -427,7 +437,7 @@ lazy_static! {
     pub static ref PEER_AUDIO_ENABLED: GaugeVec = register_gauge_vec!(
         "videocall_peer_audio_enabled",
         "Indicates if sender's audio is enabled (1=yes, 0=no)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create peer_audio_enabled metric");
 
@@ -435,7 +445,7 @@ lazy_static! {
     pub static ref PEER_VIDEO_ENABLED: GaugeVec = register_gauge_vec!(
         "videocall_peer_video_enabled",
         "Indicates if sender's camera is enabled (1=yes, 0=no)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create peer_video_enabled metric");
 
@@ -443,7 +453,7 @@ lazy_static! {
     pub static ref SELF_AUDIO_ENABLED: GaugeVec = register_gauge_vec!(
         "videocall_self_audio_enabled",
         "Sender self-reported audio enabled (1=yes, 0=no)",
-        &["meeting_id", "peer_id", "display_name"]
+        &["meeting_id", "peer_id"]
     )
     .expect("Failed to create self_audio_enabled metric");
 
@@ -451,7 +461,7 @@ lazy_static! {
     pub static ref SELF_VIDEO_ENABLED: GaugeVec = register_gauge_vec!(
         "videocall_self_video_enabled",
         "Sender self-reported video enabled (1=yes, 0=no)",
-        &["meeting_id", "peer_id", "display_name"]
+        &["meeting_id", "peer_id"]
     )
     .expect("Failed to create self_video_enabled metric");
 
@@ -459,7 +469,7 @@ lazy_static! {
     pub static ref CLIENT_ACTIVE_SERVER_RTT_MS: GaugeVec = register_gauge_vec!(
         "videocall_client_active_server_rtt_ms",
         "Client-side measured RTT to the elected server (ms)",
-        &["meeting_id", "session_id", "peer_id", "server_url", "server_type", "display_name"]
+        &["meeting_id", "session_id", "peer_id", "server_url", "server_type"]
     )
     .expect("Failed to create client_active_server_rtt_ms metric");
 
@@ -467,9 +477,16 @@ lazy_static! {
     pub static ref CLIENT_ACTIVE_SERVER: GaugeVec = register_gauge_vec!(
         "videocall_client_active_server",
         "Indicates which server a client is connected to (1)",
-        &["meeting_id", "session_id", "peer_id", "server_url", "server_type", "display_name"]
+        &["meeting_id", "session_id", "peer_id", "server_url", "server_type"]
     )
     .expect("Failed to create client_active_server metric");
+
+    pub static ref VIDEOCALL_PEER_INFO: GaugeVec = register_gauge_vec!(
+        "videocall_peer_info",
+        "Maps a peer's stable ids to its (mutable, possibly-PII) display_name for dashboard/label joins. Value is always 1. display_name lives ONLY here, not on per-client metric series (issue #1580).",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create peer_info metric");
 
     // ===== SERVER-SIDE METRICS (via NATS) =====
 
@@ -534,7 +551,7 @@ lazy_static! {
     pub static ref CLIENT_TAB_VISIBLE: GaugeVec = register_gauge_vec!(
         "videocall_client_tab_visible",
         "Indicates if client browser tab is visible (1=visible, 0=hidden/throttled)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_tab_visible metric");
 
@@ -542,7 +559,7 @@ lazy_static! {
     pub static ref CLIENT_MEMORY_USED_BYTES: GaugeVec = register_gauge_vec!(
         "videocall_client_memory_used_bytes",
         "JS heap memory used by client in bytes (Chrome only)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_memory_used_bytes metric");
 
@@ -550,7 +567,7 @@ lazy_static! {
     pub static ref CLIENT_MEMORY_TOTAL_BYTES: GaugeVec = register_gauge_vec!(
         "videocall_client_memory_total_bytes",
         "JS heap memory limit for client in bytes (Chrome only)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_memory_total_bytes metric");
 
@@ -561,7 +578,7 @@ lazy_static! {
     pub static ref CLIENT_WASM_MEMORY_BYTES: GaugeVec = register_gauge_vec!(
         "videocall_client_wasm_memory_bytes",
         "WASM linear memory size of client in bytes (WebAssembly.Memory.buffer.byteLength)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_wasm_memory_bytes metric");
 
@@ -572,7 +589,7 @@ lazy_static! {
     pub static ref CLIENT_AGENT_MEMORY_BYTES: GaugeVec = register_gauge_vec!(
         "videocall_client_agent_memory_bytes",
         "Total agent memory of client in bytes (measureUserAgentSpecificMemory; Chrome + crossOriginIsolated only)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_agent_memory_bytes metric");
 
@@ -580,7 +597,7 @@ lazy_static! {
     pub static ref VIDEO_FRAMES_DROPPED: GaugeVec = register_gauge_vec!(
         "videocall_video_frames_dropped",
         "Number of video frames dropped by the receiver",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_frames_dropped metric");
 
@@ -588,7 +605,7 @@ lazy_static! {
     pub static ref AUDIO_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_audio_quality_score",
         "Audio quality score 0-100 (concealment + packet loss penalty)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create audio_quality_score metric");
 
@@ -596,7 +613,7 @@ lazy_static! {
     pub static ref VIDEO_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_video_quality_score",
         "Video quality score 0-100 (FPS health + decode error penalty)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_quality_score metric");
 
@@ -604,7 +621,7 @@ lazy_static! {
     pub static ref VIDEO_SEQ_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_video_seq_loss_per_sec",
         "Per-peer windowed video sequence packet-loss rate (lost packets/sec) observed by the receiver; freeze indicator",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_seq_loss_per_sec metric");
 
@@ -612,7 +629,7 @@ lazy_static! {
     pub static ref KEYFRAME_REQUESTS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_keyframe_requests_per_sec",
         "Per-peer windowed rate of keyframe (PLI) requests this client sent to the peer; sustained nonzero => stream cannot recover",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create keyframe_requests_per_sec metric");
 
@@ -627,9 +644,23 @@ lazy_static! {
     pub static ref AUDIO_DATAGRAM_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_audio_datagram_loss_per_sec",
         "Per-peer windowed receive-side audio datagram loss rate (lost audio packets/sec) observed by a WebTransport receiver; sustained nonzero => audio datagrams being dropped",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create audio_datagram_loss_per_sec metric");
+
+    /// Per-peer windowed receive-side audio datagram RAW (uncapped) loss rate
+    /// (issue 2031). The magnitude companion to
+    /// `videocall_audio_datagram_loss_per_sec`, which saturates at ~64/gap by the
+    /// 64-slot reorder window and so cannot distinguish 1% from 80% loss. This
+    /// sums the sequence-gap sizes un-truncated, so a heavy burst reads its true
+    /// magnitude; a large raw/capped ratio is the burst severity. Same recover-
+    /// to-0 semantics and WebTransport gate; 0.0 on WebSocket / E2EE-WT.
+    pub static ref AUDIO_DATAGRAM_RAW_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_audio_datagram_raw_loss_per_sec",
+        "Per-peer windowed receive-side audio datagram RAW (uncapped) loss rate (skipped sequences/sec) observed by a WebTransport receiver; the magnitude companion to videocall_audio_datagram_loss_per_sec",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create audio_datagram_raw_loss_per_sec metric");
 
     /// Per-peer buffered video playout latency in ms (#1252): how far behind live a receiver's
     /// decoded video is, spanning the jitter-buffer backlog (stage 1) + WebCodecs decoder queue
@@ -638,7 +669,7 @@ lazy_static! {
     pub static ref VIDEO_PLAYOUT_LATENCY_MS: GaugeVec = register_gauge_vec!(
         "videocall_video_playout_latency_ms",
         "Per-peer buffered video playout latency in ms (how far behind live); spans jitter-buffer backlog + decoder queue. Sustained >1800ms => #1252 lag",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_playout_latency_ms metric");
 
@@ -649,7 +680,7 @@ lazy_static! {
     pub static ref VIDEO_PLAYOUT_STAGE1_SPAN_MS: GaugeVec = register_gauge_vec!(
         "videocall_video_playout_stage1_span_ms",
         "Per-peer jitter-buffer backlog span in ms — stage-1 attribution of videocall_video_playout_latency_ms",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_playout_stage1_span_ms metric");
 
@@ -663,7 +694,7 @@ lazy_static! {
     pub static ref VIDEO_PLAYOUT_PAINT_LAG_MS: GaugeVec = register_gauge_vec!(
         "videocall_video_playout_paint_lag_ms",
         "Per-peer stage-3 paint lag in ms — decoded-but-unpainted backlog in the worker->main postMessage + paint queues (#1252)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_playout_paint_lag_ms metric");
 
@@ -679,7 +710,7 @@ lazy_static! {
     pub static ref VIDEO_CONTENT_STALENESS_MS: GaugeVec = register_gauge_vec!(
         "videocall_video_content_staleness_ms",
         "Per-peer content age in ms of the painted video — content-staleness (#1641); UNBOUNDED (unlike playout_latency_ms's 1800ms cap). A stream draining stale content keeps paint_lag ~0 while this climbs; surfaces the #1631 M2 minutes-of-lag",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_content_staleness_ms metric");
 
@@ -693,7 +724,7 @@ lazy_static! {
     pub static ref VIDEO_SKIP_TO_LIVE_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_video_skip_to_live_total",
         "Cumulative resync-to-live governor skips per receiver→source pair (#1252); a rising value proves the governor fired",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_skip_to_live_total metric");
 
@@ -701,7 +732,7 @@ lazy_static! {
     pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_call_quality_score",
         "Call quality score 0-100 — min(audio, video), primary alerting metric",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create call_quality_score metric");
 
@@ -709,7 +740,7 @@ lazy_static! {
     pub static ref NETEQ_TARGET_DELAY_MS: GaugeVec = register_gauge_vec!(
         "videocall_neteq_target_delay_ms",
         "NetEQ delay manager target delay (network jitter estimate) in ms",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create neteq_target_delay_ms metric");
 
@@ -717,7 +748,7 @@ lazy_static! {
     pub static ref VIDEO_BITRATE_KBPS: GaugeVec = register_gauge_vec!(
         "videocall_video_bitrate_kbps",
         "Video bitrate observed by the receiver in kbps",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_bitrate_kbps metric");
 
@@ -727,7 +758,7 @@ lazy_static! {
     pub static ref CLIENT_SEND_QUEUE_BYTES: GaugeVec = register_gauge_vec!(
         "videocall_client_send_queue_bytes",
         "Client-side send queue buffer size in bytes",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_send_queue_bytes metric");
 
@@ -735,7 +766,7 @@ lazy_static! {
     pub static ref CLIENT_PACKETS_RECEIVED_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_client_packets_received_per_sec",
         "Total packets received per second by client",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_packets_received_per_sec metric");
 
@@ -743,7 +774,7 @@ lazy_static! {
     pub static ref CLIENT_PACKETS_SENT_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_client_packets_sent_per_sec",
         "Total packets sent per second by client",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_packets_sent_per_sec metric");
 
@@ -751,7 +782,7 @@ lazy_static! {
     pub static ref CLIENT_TAB_THROTTLED: GaugeVec = register_gauge_vec!(
         "videocall_client_tab_throttled",
         "Indicates if client tab is throttled by browser (1=throttled, 0=normal)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_tab_throttled metric");
 
@@ -761,7 +792,7 @@ lazy_static! {
     pub static ref ADAPTIVE_VIDEO_TIER: GaugeVec = register_gauge_vec!(
         "videocall_adaptive_video_tier",
         "Adaptive video encoding tier index (0=best, 7=minimal)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create adaptive_video_tier metric");
 
@@ -769,7 +800,7 @@ lazy_static! {
     pub static ref ADAPTIVE_AUDIO_TIER: GaugeVec = register_gauge_vec!(
         "videocall_adaptive_audio_tier",
         "Adaptive audio encoding tier index (0=high, 3=emergency)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create adaptive_audio_tier metric");
 
@@ -777,15 +808,96 @@ lazy_static! {
     pub static ref DATAGRAM_DROPS: GaugeVec = register_gauge_vec!(
         "videocall_datagram_drops",
         "Cumulative datagrams dropped due to locked writable stream as of the latest client health snapshot",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create datagram_drops metric");
+
+    /// Per-client max gap (ms) between successive incoming-datagram `.read()`
+    /// resolutions on the main-thread reader, over the last health interval
+    /// (issue 2031). The direct causal signal for the issue-1878 audio-loss
+    /// class: a long task starves the reader, the browser age-drops the OLDEST
+    /// queued datagrams, and audio is silently lost. Sustained hundreds of ms =>
+    /// reader starvation; ~0 => healthy reader. WebTransport-only; 0 on WebSocket.
+    ///
+    /// CAVEAT — meaningful only while datagrams are actually flowing. `.read()`
+    /// legitimately blocks when there is nothing to read, so total audio silence
+    /// (all peers muted / in DTX) registers large BENIGN gaps, and a transport
+    /// teardown can register a one-shot gap on its final read. Interpret alongside
+    /// the inbound datagram rate (videocall_client_packets_received_per_sec /
+    /// videocall_neteq_packets_per_sec): a large gap with a live inbound rate is
+    /// real starvation; a large gap with ~0 inbound is just silence.
+    pub static ref CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS: GaugeVec = register_gauge_vec!(
+        "videocall_client_datagram_read_loop_max_gap_ms",
+        "Per-client max gap (ms) between successive incoming-datagram read resolutions over the last health interval; sustained high => main-thread reader starvation (issue 2031)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create client_datagram_read_loop_max_gap_ms metric");
+
+    /// Per-client mean audio concealment percentage (0-100) over active sources,
+    /// SPLIT BY the reporter's active transport (issue 2031). The ground-truth
+    /// WS-vs-WT concealment severity gap as a single labeled gauge: audio on
+    /// unreliable WT datagrams conceals far more than on ordered-TCP WebSocket
+    /// under the identical main-thread stall. Absent when no source is active.
+    pub static ref CLIENT_AUDIO_CONCEALMENT_PCT: GaugeVec = register_gauge_vec!(
+        "videocall_client_audio_concealment_pct",
+        "Per-client mean audio concealment percentage over active sources, split by active transport (issue 2031)",
+        &["meeting_id", "session_id", "peer_id", "transport"]
+    )
+    .expect("Failed to create client_audio_concealment_pct metric");
+
+    /// Per-client observed post-set incoming-datagram queue high-water mark
+    /// (issue 2031 read-back). Confirms, per browser, whether Chromium honored
+    /// the issue-1878 `incomingHighWaterMark` setter: a value at the requested
+    /// target (2048) means the capacity knob took effect. WebTransport-only.
+    pub static ref WT_INCOMING_DATAGRAM_HIGH_WATER_MARK: GaugeVec = register_gauge_vec!(
+        "videocall_wt_incoming_datagram_high_water_mark",
+        "Per-client observed post-set incoming-datagram queue high-water mark (issue 2031 read-back of the issue-1878 mitigation)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create wt_incoming_datagram_high_water_mark metric");
+
+    /// Per-client observed post-set incoming-datagram queue max age in ms
+    /// (issue 2031 read-back). A value near the requested cap (3000) confirms the
+    /// `incomingMaxAge` staleness knob took effect; -1.0 is the sentinel for
+    /// "unbounded" (spec `null`, or setter not honored). WebTransport-only.
+    pub static ref WT_INCOMING_DATAGRAM_MAX_AGE_MS: GaugeVec = register_gauge_vec!(
+        "videocall_wt_incoming_datagram_max_age_ms",
+        "Per-client observed post-set incoming-datagram queue max age in ms; -1.0 = unbounded/not-honored (issue 2031 read-back)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create wt_incoming_datagram_max_age_ms metric");
+
+    /// Cumulative WT persistent-unistream bytes offered by the publisher.
+    pub static ref UNISTREAM_BYTES_OFFERED_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_unistream_bytes_offered_total",
+        "Cumulative WT persistent-unistream bytes offered by the publisher as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create unistream_bytes_offered_total metric");
+
+    /// Cumulative WT persistent-unistream bytes drained past WritableStream backpressure.
+    pub static ref UNISTREAM_BYTES_DRAINED_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_unistream_bytes_drained_total",
+        "Cumulative WT persistent-unistream bytes accepted past the WritableStream backpressure gate as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create unistream_bytes_drained_total metric");
+
+    /// Cumulative WT persistent-unistream camera DELTA frames age-dropped by the
+    /// publisher (#1737 Phase 1) as of the latest client health snapshot. This is
+    /// the issue's `age_evicted_frames_total` acceptance criterion.
+    pub static ref UNISTREAM_STALE_DELTA_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_unistream_stale_delta_drops_total",
+        "Cumulative WT persistent-unistream camera delta frames age-dropped by the publisher (#1737) as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create unistream_stale_delta_drops_total metric");
 
     /// Cumulative WebSocket packet drops as of the latest client health snapshot.
     pub static ref WEBSOCKET_DROPS: GaugeVec = register_gauge_vec!(
         "videocall_websocket_drops",
         "Cumulative WebSocket packets dropped due to send buffer backpressure as of the latest client health snapshot",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create websocket_drops metric");
 
@@ -793,7 +905,7 @@ lazy_static! {
     pub static ref KEYFRAME_REQUESTS_SENT_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_keyframe_requests_sent_total",
         "Cumulative keyframe requests (PLI) sent by this client",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create keyframe_requests_sent_total metric");
 
@@ -805,7 +917,7 @@ lazy_static! {
     pub static ref RTT_PROBE_DROPPED_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_rtt_probe_dropped_total",
         "Cumulative RTT probes dropped at the client's in-flight queue cap (#522 backpressure) as of the latest client health snapshot",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create rtt_probe_dropped_total metric");
 
@@ -816,7 +928,7 @@ lazy_static! {
     pub static ref RTT_PROBE_STALE_SUPPRESSIONS_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_rtt_probe_stale_suppressions_total",
         "Cumulative client diagnostics ticks where the active link's RTT-probe pipeline was stale and active_server_rtt was suppressed (#522) as of the latest client health snapshot",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create rtt_probe_stale_suppressions_total metric");
 
@@ -878,7 +990,7 @@ lazy_static! {
     pub static ref ENCODER_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
         "videocall_encoder_queue_depth",
         "Encoder queue depth (sender-side backpressure signal driving adaptive quality decisions)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create encoder_queue_depth metric");
 
@@ -886,7 +998,7 @@ lazy_static! {
     pub static ref ADAPTIVE_SCREEN_TIER: GaugeVec = register_gauge_vec!(
         "videocall_adaptive_screen_tier",
         "Screen share adaptive quality tier index (0=high, 2=low)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create adaptive_screen_tier metric");
 
@@ -894,7 +1006,7 @@ lazy_static! {
     pub static ref SCREEN_SHARING_ACTIVE: GaugeVec = register_gauge_vec!(
         "videocall_screen_sharing_active",
         "Whether screen sharing is active (1=active, 0=inactive)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create screen_sharing_active metric");
 
@@ -902,15 +1014,23 @@ lazy_static! {
     pub static ref ENCODER_OUTPUT_FPS: GaugeVec = register_gauge_vec!(
         "videocall_encoder_output_fps",
         "Actual frames per second produced by the camera encoder",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create encoder_output_fps metric");
+
+    /// Per-receiver outbound channel depth keyed by session.
+    pub static ref RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION: GaugeVec = register_gauge_vec!(
+        "videocall_relay_outbound_queue_depth_by_session",
+        "Per-receiver outbound channel depth (slots occupied) keyed by session, split by channel",
+        &["room", "transport", "session_id", "channel"]
+    )
+    .expect("Failed to create relay_outbound_queue_depth_by_session metric");
 
     /// Encoder target bitrate (PID controller output)
     pub static ref ENCODER_TARGET_BITRATE_KBPS: GaugeVec = register_gauge_vec!(
         "videocall_encoder_target_bitrate_kbps",
         "PID controller computed target bitrate in kbps",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create encoder_target_bitrate_kbps metric");
 
@@ -920,7 +1040,7 @@ lazy_static! {
     pub static ref DECODE_BUDGET_EFFECTIVE_CAP: GaugeVec = register_gauge_vec!(
         "videocall_decode_budget_effective_cap",
         "Current effective decode-budget tile cap",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create decode_budget_effective_cap metric");
 
@@ -928,7 +1048,7 @@ lazy_static! {
     pub static ref DECODE_BUDGET_NATURAL: GaugeVec = register_gauge_vec!(
         "videocall_decode_budget_natural",
         "Natural (unconstrained) decode-budget tile count before capping",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create decode_budget_natural metric");
 
@@ -936,7 +1056,7 @@ lazy_static! {
     pub static ref DECODE_BUDGET_PRESSURED: GaugeVec = register_gauge_vec!(
         "videocall_decode_budget_pressured",
         "Decode-budget pressured latch (1=pressured, 0=not pressured)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create decode_budget_pressured metric");
 
@@ -944,7 +1064,7 @@ lazy_static! {
     pub static ref DECODE_BUDGET_OVERRIDE_MODE: GaugeVec = register_gauge_vec!(
         "videocall_decode_budget_override_mode",
         "Decode-budget override mode (0=unspecified, 1=auto, 2=fixed)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create decode_budget_override_mode metric");
 
@@ -952,7 +1072,7 @@ lazy_static! {
     pub static ref DECODE_BUDGET_OVERRIDE_FIXED_N: GaugeVec = register_gauge_vec!(
         "videocall_decode_budget_override_fixed_n",
         "Decode-budget user-configured fixed tile cap (override_mode=fixed)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create decode_budget_override_fixed_n metric");
 
@@ -965,7 +1085,7 @@ lazy_static! {
     pub static ref DECODE_ACTIVE_SET_SIZE: GaugeVec = register_gauge_vec!(
         "videocall_decode_active_set_size",
         "Tiles actually being decoded right now (min of decode-budget cap and natural layout count)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create decode_active_set_size metric");
 
@@ -981,7 +1101,7 @@ lazy_static! {
     pub static ref CAPABILITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_capability_score",
         "Client TELEM-6 capability-benchmark score as a numeric value (also a label on videocall_client_info; this form is queryable)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create capability_score metric");
 
@@ -997,7 +1117,7 @@ lazy_static! {
     pub static ref BATTERY_LEVEL: GaugeVec = register_gauge_vec!(
         "videocall_client_battery_level",
         "Client battery level as a numeric value in [0,1] (0.0 = empty, 1.0 = full); absent when the client did not report a battery level",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_battery_level metric");
 
@@ -1009,7 +1129,7 @@ lazy_static! {
     pub static ref ENCODER_EFFECTIVE_LAYERS: GaugeVec = register_gauge_vec!(
         "videocall_encoder_effective_layers",
         "Number of simulcast video layers the publisher is configured to encode/send (ladder depth); p90==1 over a meeting = inert simulcast",
-        &["meeting_id", "session_id", "peer_id", "display_name", "media_kind"]
+        &["meeting_id", "session_id", "peer_id", "media_kind"]
     )
     .expect("Failed to create encoder_effective_layers metric");
 
@@ -1020,7 +1140,7 @@ lazy_static! {
     pub static ref ENCODER_ACTIVE_LAYERS: GaugeVec = register_gauge_vec!(
         "videocall_encoder_active_layers",
         "Number of simulcast video layers currently active (encoded + sent); < effective_layers when the AQ controller has shed the top layer(s)",
-        &["meeting_id", "session_id", "peer_id", "display_name", "media_kind"]
+        &["meeting_id", "session_id", "peer_id", "media_kind"]
     )
     .expect("Failed to create encoder_active_layers metric");
 
@@ -1031,7 +1151,7 @@ lazy_static! {
     pub static ref AUDIO_CONGESTION_CEILING: GaugeVec = register_gauge_vec!(
         "videocall_audio_congestion_ceiling",
         "Audio congestion-driven layer ceiling; equals effective audio layers when uncapped and is lower while congestion shedding is active",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create audio_congestion_ceiling metric");
 
@@ -1040,7 +1160,7 @@ lazy_static! {
     pub static ref RECEIVED_LAYER: GaugeVec = register_gauge_vec!(
         "videocall_received_layer",
         "Simulcast layer index (0=base) this receiver has chosen for a given peer and media kind; absent when receiving the top layer (unconstrained)",
-        &["meeting_id", "session_id", "peer_id", "display_name", "from_peer", "media_kind"]
+        &["meeting_id", "session_id", "peer_id", "from_peer", "media_kind"]
     )
     .expect("Failed to create received_layer metric");
 
@@ -1048,7 +1168,7 @@ lazy_static! {
     pub static ref BATTERY_CHARGING: GaugeVec = register_gauge_vec!(
         "videocall_client_battery_charging",
         "Battery charging state (1=charging, 0=discharging); absent when battery API unavailable",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_battery_charging metric");
 
@@ -1057,7 +1177,7 @@ lazy_static! {
     pub static ref CLIENT_NETWORK_TYPE: GaugeVec = register_gauge_vec!(
         "videocall_client_network_type",
         "Connection medium indicator (value=1); network_type label carries the medium (wifi/ethernet/cellular)",
-        &["meeting_id", "session_id", "peer_id", "display_name", "network_type"]
+        &["meeting_id", "session_id", "peer_id", "network_type"]
     )
     .expect("Failed to create client_network_type metric");
 
@@ -1065,7 +1185,7 @@ lazy_static! {
     pub static ref CLIENT_NETWORK_DOWNLINK_MAX: GaugeVec = register_gauge_vec!(
         "videocall_client_network_downlink_max",
         "Max downlink speed of the connection medium in Mbps (e.g. wifi=54, ethernet=1000)",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_network_downlink_max metric");
 
@@ -1073,7 +1193,7 @@ lazy_static! {
     pub static ref CLIENT_CPU_THROTTLED: GaugeVec = register_gauge_vec!(
         "videocall_client_cpu_throttled",
         "CPU throttle indicator (1=throttled, 0=normal); based on capability_score/cores ratio < 150",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
+        &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create client_cpu_throttled metric");
 
@@ -1083,7 +1203,7 @@ lazy_static! {
     pub static ref AUDIO_CONCEALMENT_PCT: GaugeVec = register_gauge_vec!(
         "videocall_audio_concealment_pct",
         "Audio concealment percentage from NetEQ expand events (0.0-100.0)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create audio_concealment_pct metric");
 
@@ -1091,7 +1211,7 @@ lazy_static! {
     pub static ref DECODER_ERRORS_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_decoder_errors_total",
         "Cumulative decoder error count per peer pair",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create decoder_errors_total metric");
 
@@ -1101,7 +1221,7 @@ lazy_static! {
     pub static ref SCREEN_VIDEO_FPS: GaugeVec = register_gauge_vec!(
         "videocall_screen_video_fps",
         "Screen share frames per second observed by the receiver",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_fps metric");
 
@@ -1109,7 +1229,7 @@ lazy_static! {
     pub static ref SCREEN_VIDEO_BITRATE_KBPS: GaugeVec = register_gauge_vec!(
         "videocall_screen_video_bitrate_kbps",
         "Screen share bitrate observed by the receiver in kbps",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_bitrate_kbps metric");
 
@@ -1132,7 +1252,7 @@ lazy_static! {
     pub static ref SCREEN_VIDEO_PLAYOUT_LATENCY_MS: GaugeVec = register_gauge_vec!(
         "videocall_screen_video_playout_latency_ms",
         "Per-peer buffered screen-share playout latency in ms (how far behind live); screen sibling of videocall_video_playout_latency_ms",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_playout_latency_ms metric");
 
@@ -1142,7 +1262,7 @@ lazy_static! {
     pub static ref SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS: GaugeVec = register_gauge_vec!(
         "videocall_screen_video_playout_stage1_span_ms",
         "Per-peer jitter-buffer backlog span in ms — stage-1 attribution of videocall_screen_video_playout_latency_ms",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_playout_stage1_span_ms metric");
 
@@ -1152,7 +1272,7 @@ lazy_static! {
     pub static ref SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS: GaugeVec = register_gauge_vec!(
         "videocall_screen_video_playout_paint_lag_ms",
         "Per-peer stage-3 paint lag in ms for the screen stream — decoded-but-unpainted backlog in the worker->main postMessage + paint queues (#1660)",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_playout_paint_lag_ms metric");
 
@@ -1165,7 +1285,7 @@ lazy_static! {
     pub static ref SCREEN_VIDEO_CONTENT_STALENESS_MS: GaugeVec = register_gauge_vec!(
         "videocall_screen_video_content_staleness_ms",
         "Per-peer content age in ms of the painted screen video — screen content-staleness (#1660); UNBOUNDED (unlike playout_latency_ms's 1800ms cap). A screen stream draining stale content keeps paint_lag ~0 while this climbs",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_content_staleness_ms metric");
 
@@ -1178,7 +1298,7 @@ lazy_static! {
     pub static ref SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_screen_video_skip_to_live_total",
         "Cumulative resync-to-live governor skips per receiver→source pair for the screen stream (#1660); a rising value proves the governor fired",
-        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_skip_to_live_total metric");
 
@@ -1196,7 +1316,7 @@ lazy_static! {
     pub static ref TIER_TRANSITIONS_TOTAL: CounterVec = register_counter_vec!(
         "videocall_tier_transition_total",
         "Cumulative tier transitions by direction, stream, and trigger",
-        &["meeting_id", "session_id", "peer_id", "display_name",
+        &["meeting_id", "session_id", "peer_id",
           "direction", "stream", "from_tier", "to_tier", "trigger"]
     )
     .expect("Failed to create tier_transition_total metric");
@@ -1662,6 +1782,28 @@ lazy_static! {
     )
     .expect("Failed to create relay_nats_publish_latency_ms metric");
 
+    /// Publisher-to-relay inbound MEDIA frame inter-arrival gap (milliseconds).
+    ///
+    /// CARDINALITY: bounded — exactly transport (`websocket`/`webtransport`) ×
+    /// media_kind (`video`/`screen`) × frame_kind (`key`/`delta`/`unknown`).
+    /// NO room, session_id, user_id, or other per-session/unbounded label is
+    /// present. `unknown` covers inner `MediaPacket` bytes the relay cannot
+    /// parse, including ordinary E2EE ciphertext; the outer
+    /// `PacketWrapper.media_kind` remains cleartext and keeps the E2EE-safe
+    /// inter-frame gap signal alive. A future iteration may add a bounded
+    /// size-based keyframe proxy for E2EE, but Phase 1 deliberately records
+    /// keyframe-specific samples only when the inner bytes parse and
+    /// `frame_type` is `key` or `delta`. A relay-readable `frame_type` is
+    /// publisher-controlled, so a hostile or misbehaving publisher can skew its
+    /// own `key`/`delta` distribution; those buckets are not tamper-proof.
+    pub static ref RELAY_PUBLISHER_INBOUND_FRAME_GAP_MS: HistogramVec = register_histogram_vec!(
+        "relay_publisher_inbound_frame_gap_ms",
+        "Publisher-to-relay inbound MEDIA frame inter-arrival gap in ms, labeled by transport, cleartext media kind, and bounded frame kind. Key/delta samples require inner bytes that parse with the matching MediaPacket.frame_type; other frames use frame_kind=\"unknown\".",
+        &["transport", "media_kind", "frame_kind"],
+        vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0]
+    )
+    .expect("Failed to create relay_publisher_inbound_frame_gap_ms metric");
+
     /// Active sessions per room on this relay instance
     pub static ref RELAY_ACTIVE_SESSIONS_PER_ROOM: GaugeVec = register_gauge_vec!(
         "relay_active_sessions_per_room",
@@ -1856,6 +1998,65 @@ lazy_static! {
     )
     .expect("Failed to create relay_outbound_bridge_stream_resets_total metric");
 
+    /// Outbound (relay→client) WebTransport DATAGRAM send failures at the
+    /// outbound bridge writer (`webtransport/bridge.rs` `spawn_datagram_writer`),
+    /// by transport and `reason` (issue 2030).
+    ///
+    /// Fills the last quadrant of the bridge-drop counter family: inbound
+    /// datagram/unistream drops are `relay_inbound_bridge_drops_total`; outbound
+    /// unistream resets are `relay_outbound_bridge_stream_resets_total`. This
+    /// covers the OUTBOUND DATAGRAM writer, which previously logged send errors
+    /// at `debug!` and continued with no durable/alertable signal — the relay
+    /// had zero server-side visibility into datagram send loss. (Field case: a
+    /// receiver lost 20-44 audio pkts/s on WT, invisible from the server; only
+    /// the client-side gauge saw it, and that vanishes if the client wedges.)
+    ///
+    /// WHAT IS COUNTED: exactly the events where `Session::send_datagram`
+    /// returns `Err` — quinn REJECTED the datagram at enqueue time (too large
+    /// for the current max datagram size, the connection is gone, or the
+    /// peer/config does not support datagrams). Each such datagram is dropped;
+    /// datagrams are unreliable and are never retransmitted.
+    ///
+    /// WHAT IS NOT COUNTED: datagrams that quinn ACCEPTS at enqueue (returns
+    /// `Ok`) and then silently evicts from its bounded outgoing datagram queue.
+    /// That queue is sized by quinn's `datagram_send_buffer_size`; when a new
+    /// datagram would overflow it, quinn pops and drops the OLDEST queued
+    /// datagram and STILL returns `Ok` from `send_datagram` (pacing / the
+    /// congestion window only govern how fast that queue drains, so a slow
+    /// drain is what lets it fill and overflow). This call site therefore
+    /// cannot observe those send-buffer-overflow evictions. Surfacing that
+    /// class would need a quinn-level dropped-datagram hook and is deliberately
+    /// out of scope for issue 2030 (that is the territory of the relay->client
+    /// sequence-number idea, subsumed by the reliable-audio reframe).
+    ///
+    /// `transport` is always `webtransport` here (only the WT bridge sends QUIC
+    /// datagrams; the WS path has no datagram primitive), kept for label-shape
+    /// parity with the sibling bridge counters so a single query reads naturally
+    /// alongside them.
+    ///
+    /// `reason` is a BOUNDED classification of `web_transport_quinn::SessionError`
+    /// (NEVER the error's Display string — that carries an unbounded
+    /// peer-supplied close reason). Closed set: `too_large`, `connection_lost`,
+    /// `unsupported`, `disabled`, `webtransport`. See
+    /// `datagram_send_failure_reason` in the bridge for the exhaustive mapping.
+    /// This lets an operator tell benign teardown churn (`connection_lost`)
+    /// apart from an actionable MTU/config bug (`too_large`, `unsupported`,
+    /// `disabled`). Labeling nuance: a lost-connection failure may occasionally
+    /// classify as `reason="webtransport"` rather than `connection_lost` —
+    /// web-transport-quinn's `map_error` substitutes the cached session error
+    /// for a `ConnectionLost`, and a session torn down via a WebTransport CLOSE
+    /// lands in the `WebTransportError` arm; both are benign-teardown signals,
+    /// so read the two together.
+    ///
+    /// CARDINALITY BOUND: at most 5 series (`webtransport` x the 5 reasons
+    /// above). Safe for indefinite retention; no cleanup required.
+    pub static ref RELAY_OUTBOUND_BRIDGE_DATAGRAM_SEND_FAILURES_TOTAL: CounterVec = register_counter_vec!(
+        "relay_outbound_bridge_datagram_send_failures_total",
+        "Outbound relay->client WebTransport datagram send failures at the bridge writer, by transport and reason (too_large|connection_lost|unsupported|disabled|webtransport) (issue 2030)",
+        &["transport", "reason"]
+    )
+    .expect("Failed to create relay_outbound_bridge_datagram_send_failures_total metric");
+
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///
     /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
@@ -1924,7 +2125,7 @@ lazy_static! {
     pub static ref CLIENT_INFO: GaugeVec = register_gauge_vec!(
         "videocall_client_info",
         "Static per-session client metadata (value always 1, info in labels)",
-        &["meeting_id", "session_id", "display_name",
+        &["meeting_id", "session_id",
           "cores", "architecture", "gpu_family",
           "network_effective_type", "capability_score"]
     )
@@ -1934,7 +2135,7 @@ lazy_static! {
     pub static ref CLIENT_LONGTASK_DURATION_MS: HistogramVec = register_histogram_vec!(
         "videocall_client_longtask_duration_ms",
         "Main-thread long task durations observed by the client (ms)",
-        &["meeting_id", "session_id", "display_name"],
+        &["meeting_id", "session_id"],
         vec![50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 30000.0]
     )
     .expect("Failed to create videocall_client_longtask_duration_ms metric");
@@ -1943,7 +2144,7 @@ lazy_static! {
     pub static ref CLIENT_RENDER_FPS: GaugeVec = register_gauge_vec!(
         "videocall_client_render_fps",
         "Main-thread rAF cadence (fps)",
-        &["meeting_id", "session_id", "display_name"]
+        &["meeting_id", "session_id"]
     )
     .expect("Failed to create videocall_client_render_fps metric");
 
@@ -1995,9 +2196,12 @@ lazy_static! {
     /// Non-base-layer media packets shed by the downlink congestion pre-filter
     /// (#1219 Half 2).
     ///
-    /// Incremented each time a non-base (layer > 0) VIDEO/SCREEN packet is
+    /// Incremented each time a non-base (layer > 0) camera VIDEO packet is
     /// discarded for a receiver in shedding mode (its windowed downlink signal is
-    /// active) BEFORE reaching `try_send`. This is the volume of proactive
+    /// active) BEFORE reaching `try_send`. SCREEN is NOT counted here — it is
+    /// protected during downlink congestion per issue 1977 (the shared content
+    /// outranks cameras; its relief is the priority_drop 90% fill backstop). This
+    /// is the volume of proactive
     /// shedding the congestion relief performs — distinct from the
     /// `relay_packet_drops_total{drop_reason=mailbox_full}` counter (which counts
     /// packets lost at the mailbox itself). Together they tell the story:
@@ -3149,6 +3353,39 @@ mod tests {
             session_id,
             unrelated_kind,
         ]);
+    }
+
+    /// #1737 Phase 0: per-session outbound queue-depth gauges carry the same
+    /// unbounded session_id cardinality as per-session drops, so the GC helper
+    /// must sweep the full fixed channel set, not just channels observed by a
+    /// caller. Mutation sensitivity: removing any channel from
+    /// `forget_outbound_queue_depth_by_session` leaves a seeded series at 1.0.
+    #[test]
+    #[serial(outbound_queue_depth_by_session_gc)]
+    fn outbound_queue_depth_by_session_gc_iterates_full_channel_set() {
+        let room = "wiretest_outbound_queue_depth_gc_1737";
+        let transport = "webtransport";
+        let session_id = "999000222";
+
+        for channel in ["unistream", "datagram", "ws"] {
+            RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
+                .with_label_values(&[room, transport, session_id, channel])
+                .set(1.0);
+        }
+
+        forget_outbound_queue_depth_by_session(room, transport, session_id);
+
+        for channel in ["unistream", "datagram", "ws"] {
+            assert_eq!(
+                RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
+                    .with_label_values(&[room, transport, session_id, channel])
+                    .get(),
+                0.0,
+                "forget_outbound_queue_depth_by_session must remove channel {channel:?}"
+            );
+            let _ = RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
+                .remove_label_values(&[room, transport, session_id, channel]);
+        }
     }
 
     // =========================================================================

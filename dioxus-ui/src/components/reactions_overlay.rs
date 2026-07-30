@@ -47,13 +47,6 @@ pub fn ReactionsOverlay(
                     // translateX(-50%) so the float is centred on that point.
                     style: "left: calc(50% + {float.offset_pct}%)",
                     span { class: "reaction-float__emoji", "{float.emoji}" }
-                    if float.count > 1 {
-                        span {
-                            class: "reaction-float__count",
-                            "data-testid": "reaction-float-count",
-                            "×{float.count}"
-                        }
-                    }
                     span {
                         class: "reaction-float__name",
                         "data-testid": "reaction-float-name",

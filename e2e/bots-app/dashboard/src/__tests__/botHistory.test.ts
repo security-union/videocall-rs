@@ -25,6 +25,7 @@ function fixtureSpec(participant: string, overrides?: Partial<LaunchFormInitial>
     displayName: "",
     ttl: "5m",
     network: "none",
+    videoMode: "costume",
     headless: false,
     authBackend: "jwt",
     storageStateFile: "",

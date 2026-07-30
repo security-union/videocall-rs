@@ -1375,11 +1375,12 @@ pub fn Diagnostics(
                             onchange: move |evt: Event<FormData>| {
                                 // The diagnostics select has no "remember" checkbox, so it
                                 // expresses an explicit, NOT-remembered choice (#1291). Passing
-                                // `sticky = false` means: WebTransport clears all storage (load
-                                // resolves to the default); WebSocket writes a session-scoped
-                                // value AND clears any prior sticky pin, so WS wins this session
-                                // and is forgotten on tab close. Reading the stored sticky flag
-                                // here would re-pin against the user's intent.
+                                // `sticky = false` means: WebSocket (the default) clears all
+                                // storage (load resolves to the default); WebTransport (the
+                                // non-default) writes a session-scoped value AND clears any prior
+                                // sticky pin, so WT wins this session and is forgotten on tab
+                                // close. Reading the stored sticky flag here would re-pin against
+                                // the user's intent.
                                 confirm_transport_change(
                                     &evt.value(),
                                     (transport_pref_ctx.0)(),
@@ -1388,14 +1389,14 @@ pub fn Diagnostics(
                                 );
                             },
                             option {
-                                value: "webtransport",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::WebTransport,
-                                "WebTransport (default)"
-                            }
-                            option {
                                 value: "websocket",
                                 selected: (transport_pref_ctx.0)() == TransportPreference::WebSocket,
-                                "WebSocket"
+                                "WebSocket (default)"
+                            }
+                            option {
+                                value: "webtransport",
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebTransport,
+                                "WebTransport (experimental)"
                             }
                         }
                     }

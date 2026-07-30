@@ -112,6 +112,23 @@
   var _peerIds = [];
   /** Frame counter incremented every drawFrame() — used to throttle debug logs. */
   var _dbgFrameCount = 0;
+  /**
+   * Whether the periodic diagnostic snapshots in drawFrame() are emitted.  Off
+   * by default so production recordings pay nothing for them.  The
+   * `_recordingDebugEnabled()` guard itself is evaluated once per frame (a cheap
+   * boolean), but the blocks it gates are additionally throttled by frame count
+   * — `_dbgFrameCount % 30` (~1 Hz at 30 fps) and `% 150` (~0.2 Hz) — so they do
+   * NOT run 30×/sec.  Each time one DOES fire it does real work: getImageData
+   * readbacks (via canvasHasContent) plus building per-peer arrays and
+   * JSON.stringify.  They fire even during a fully static/idle meeting (they sit
+   * before the redraw-skip check).  Set `window.__vcRecordingDebug = true`
+   * (before or during a recording) to re-enable them for local debugging.
+   */
+  function _recordingDebugEnabled() {
+    return (
+      typeof window !== "undefined" && window.__vcRecordingDebug === true
+    );
+  }
   var _offCanvas = null;
   var _offCtx = null;
   var _state = "idle"; // idle | activating | recording | stopping
@@ -164,6 +181,18 @@
   var _localIsHost = false;
   /** Cached Path2D for the person-silhouette SVG icon (lazy-initialised). */
   var _peerIconPath = null;
+  /**
+   * Cache of Path2D objects keyed by SVG path-data string, shared by every
+   * per-frame icon draw (see getIconPath2D). Lazy-initialised on first use.
+   */
+  var _iconPathCache = null;
+  /**
+   * Cache of measured text widths keyed by "font\ntext", shared by the per-tile
+   * text draws (see measureTextWidthCached). Lazy-initialised on first use and
+   * reset in stop() so a new recording (with a possibly different participant
+   * set) starts clean.
+   */
+  var _textWidthCache = null;
   /**
    * Cached meeting background image (loaded from the body's --bg-image CSS
    * variable on first recording start).  null = not yet attempted; false =
@@ -282,6 +311,74 @@
       );
     }
     return _peerIconPath;
+  }
+
+  /**
+   * Return a cached Path2D for the SVG path-data string `d`, constructing and
+   * memoising it on first use.  Mirrors getPeerIconPath()'s lazy,
+   * Path2D-availability-guarded pattern but keyed by `d`, so the many per-frame
+   * icon draws — the mic indicator on every participant tile (drawControlIcon)
+   * and every action-bar button glyph (drawDomSvg) — reuse one Path2D per
+   * unique path string instead of allocating a fresh one each frame.
+   *
+   * `d` originates only from this app's own bundled icon set: fixed constant
+   * literals in drawControlIcon and the `d` attribute of the app's own
+   * action-bar <svg> children (never user-supplied / dynamic content), so the
+   * key space is small, finite, and safe to cache without an eviction cap.
+   * A previously-invalid `d` is cached as `null` so its failing construction
+   * is not retried every frame.  Returns null when Path2D is unavailable or
+   * the path data is invalid.
+   */
+  function getIconPath2D(d) {
+    if (typeof Path2D === "undefined") return null;
+    if (!_iconPathCache) _iconPathCache = new Map();
+    var cached = _iconPathCache.get(d);
+    // `undefined` = never seen; a stored `null` = seen-but-invalid (don't retry).
+    if (cached !== undefined) return cached;
+    var p = null;
+    try {
+      p = new Path2D(d);
+    } catch (_e) {
+      p = null;
+    }
+    // INVARIANT: the cache has no eviction cap, so it is only unbounded-safe
+    // while `d` comes from this app's fixed, bundled icon set. A future caller
+    // that passes participant-controlled or otherwise dynamic path data here
+    // would make the key space grow without bound — add an LRU/size cap first.
+    _iconPathCache.set(d, p);
+    return p;
+  }
+
+  /**
+   * Return the rendered width of `text` in `font` on `ctx`, memoising the result
+   * keyed by "font\ntext".
+   *
+   * drawFrame() calls measureText for TWO text elements on EVERY participant
+   * tile, EVERY frame: the floating-name chip (drawNameChip) and the WT/WS
+   * transport badge (drawTile). With N tiles at TARGET_FPS that is up to
+   * `2 × N × fps` measureText calls/second — each of which shapes the string
+   * and allocates a fresh TextMetrics object. The (font, text) key space is
+   * small and effectively fixed per session: `font` collapses to a handful of
+   * clamped sizes (name 10–13 px, badge 8–11 px) and `text` is a bounded set of
+   * participant display names plus the two literal badge strings ("WT"/"WS"),
+   * so the widths are stable frame-to-frame and safe to memoise — the same
+   * lazy, finite-key-space precedent as getIconPath2D.
+   *
+   * On a MISS this sets `ctx.font = font` before measuring so the cached width
+   * always corresponds to `font` regardless of the context's prior state. The
+   * caller still sets `ctx.font` itself for the subsequent fillText — this
+   * helper owns only the width measurement, not the draw.
+   */
+  function measureTextWidthCached(ctx, font, text) {
+    if (!_textWidthCache) _textWidthCache = new Map();
+    var key = font + "\n" + text;
+    var w = _textWidthCache.get(key);
+    if (w === undefined) {
+      ctx.font = font;
+      w = ctx.measureText(text).width;
+      _textWidthCache.set(key, w);
+    }
+    return w;
   }
 
   /**
@@ -565,16 +662,20 @@
   function drawNameChip(name, tx, ty, tw, th) {
     if (!name) return;
     var fontSize = Math.max(10, Math.min(13, Math.round(th * 0.065)));
-    _offCtx.save();
-    _offCtx.font =
+    var nameFont =
       "600 " + fontSize + "px -apple-system, BlinkMacSystemFont, sans-serif";
+    _offCtx.save();
+    _offCtx.font = nameFont;
     var PAD_H = Math.round(Math.min(10, tw * 0.03));
     var PAD_V = Math.round(Math.min(5, th * 0.025));
     var chipH = fontSize + PAD_V * 2;
     var r = chipH / 2;
     var maxTW = tw * 0.55 - PAD_H * 2;
-    // Measure and clamp text
-    var textW = Math.min(_offCtx.measureText(name).width, maxTW);
+    // Measure (cached — same name+font recurs every frame) and clamp text
+    var textW = Math.min(
+      measureTextWidthCached(_offCtx, nameFont, name),
+      maxTW,
+    );
     var chipW = textW + PAD_H * 2;
     var ox = tx + Math.round(Math.min(12, tw * 0.04));
     var oy = ty + Math.round(Math.min(10, th * 0.05));
@@ -701,10 +802,15 @@
         cy,
         size,
         function () {
-          _offCtx.stroke(
-            new Path2D("M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"),
+          // Cached constant paths — this branch runs once per participant tile
+          // per frame (drawTile → drawControlIcon("mic")), so allocating a fresh
+          // Path2D here was O(tiles × fps) GC churn.
+          var micBody = getIconPath2D(
+            "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z",
           );
-          _offCtx.stroke(new Path2D("M19 10v2a7 7 0 0 1-14 0v-2"));
+          if (micBody) _offCtx.stroke(micBody);
+          var micArc = getIconPath2D("M19 10v2a7 7 0 0 1-14 0v-2");
+          if (micArc) _offCtx.stroke(micArc);
           _offCtx.beginPath();
           _offCtx.moveTo(12, 19);
           _offCtx.lineTo(12, 22);
@@ -883,14 +989,19 @@
         var d = el.getAttribute("d");
         if (d) {
           try {
-            var p2d = new Path2D(d);
-            if (fillC) {
-              _offCtx.fillStyle = fillC;
-              _offCtx.fill(p2d);
-            }
-            if (strokeC) {
-              _offCtx.strokeStyle = strokeC;
-              _offCtx.stroke(p2d);
+            // Cached per unique `d` — drawDomSvg runs once per action-bar button
+            // per frame, so re-parsing each button's path string every frame was
+            // avoidable GC churn. `d` is always from the app's own bundled icons.
+            var p2d = getIconPath2D(d);
+            if (p2d) {
+              if (fillC) {
+                _offCtx.fillStyle = fillC;
+                _offCtx.fill(p2d);
+              }
+              if (strokeC) {
+                _offCtx.strokeStyle = strokeC;
+                _offCtx.stroke(p2d);
+              }
             }
           } catch (_e) {}
         }
@@ -1156,12 +1267,15 @@
         var badgeFontSz = Math.max(8, Math.min(11, Math.round(ICON_SZ * 0.65)));
         var badgePadH = Math.max(3, Math.round(badgeFontSz * 0.4));
         var badgePadV = Math.max(2, Math.round(badgeFontSz * 0.25));
-        _offCtx.save();
-        _offCtx.font =
+        var badgeFont =
           "600 " +
           badgeFontSz +
           "px -apple-system, BlinkMacSystemFont, sans-serif";
-        var badgeTxtW = _offCtx.measureText(badgeText).width;
+        _offCtx.save();
+        _offCtx.font = badgeFont;
+        // Cached — badgeText is always "WT"/"WS" and badgeFont collapses to a
+        // handful of clamped sizes, so this width recurs every frame.
+        var badgeTxtW = measureTextWidthCached(_offCtx, badgeFont, badgeText);
         var badgeW = badgeTxtW + badgePadH * 2;
         var badgeH = badgeFontSz + badgePadV * 2;
         var bdX = rx - badgeW;
@@ -2237,7 +2351,7 @@
     // exactly which of {scene change | live video | screen share} triggered
     // the redraw.  Also enumerates the screen decoder canvas map so it is
     // obvious when a remote screen share is (or isn't) reaching the recording.
-    if (_dbgFrameCount % 30 === 0) {
+    if (_recordingDebugEnabled() && _dbgFrameCount % 30 === 0) {
       var screenDecoderSummary = [];
       for (var sdsid in screenDecoderMap) {
         var sdc = screenDecoderMap[sdsid];
@@ -2268,7 +2382,7 @@
     // ── Per-second video-readiness log ──────────────────────────────────
     // Fires every 30 frames (~1 s at 30 fps) so it's easy to track whether
     // each remote peer's canvas has live content during a recording session.
-    if (_dbgFrameCount % 30 === 0) {
+    if (_recordingDebugEnabled() && _dbgFrameCount % 30 === 0) {
       var readiness = [];
       for (var ri = 0; ri < participants.length; ri++) {
         var rp = participants[ri];
@@ -2318,7 +2432,10 @@
     }
 
     // ── Debug snapshot (frame 1, then every ~5 s at 30 fps) ───────────
-    if (_dbgFrameCount === 1 || _dbgFrameCount % 150 === 0) {
+    if (
+      _recordingDebugEnabled() &&
+      (_dbgFrameCount === 1 || _dbgFrameCount % 150 === 0)
+    ) {
       // Decoder canvas map summary
       console.log(
         "[recording] frame #" +
@@ -3026,6 +3143,9 @@
         // Allow bg-image to be re-read next recording (theme may have changed).
         _bgImageAttempted = false;
         _bgImage = null;
+        // Drop cached text widths so the next recording (possibly a different
+        // participant set) starts with a clean, bounded cache.
+        _textWidthCache = null;
         // Reset A/V sync and scene-change tracking so the next recording starts clean.
         _peerAudioActivatedAt = {};
         _peerVideoActivatedAt = {};
@@ -3133,25 +3253,41 @@
             });
         } else if (capturedKey && window.crypto && window.crypto.subtle) {
           // In-memory E2EE fallback: decrypt all accumulated chunks and save.
-          Promise.all(capturedChunks)
-            .then(function (encChunks) {
-              return Promise.all(
-                encChunks.map(function (enc) {
-                  return window.crypto.subtle.decrypt(
-                    { name: "AES-GCM", iv: enc.iv },
-                    capturedKey,
-                    enc.ct,
-                  );
-                }),
-              );
-            })
-            .then(function (plainParts) {
+          //
+          // Peak-memory note: chunks were encrypted eagerly at capture time, so
+          // all ~N bytes of ciphertext are already resident (in the settled
+          // capturedChunks promises) before we start. The prior
+          // Promise.all(...).map(decrypt) version held ALL ciphertext AND ALL
+          // plaintext simultaneously (~2N), then copied into the Blob (~3N peak).
+          // Decrypting SEQUENTIALLY and dropping each ciphertext reference as
+          // soon as its plaintext exists keeps ciphertext + plaintext from ever
+          // fully coexisting: total stays ~N across the loop, peaking at ~2N only
+          // for the final Blob copy. On the weak devices that hit this fallback
+          // (iOS WKWebView / ~2 GB Android) that halves the transient peak from
+          // ~3N to ~2N. AES-GCM decrypt is hardware-accelerated (well under 1s
+          // for the 100 MiB fallback cap even one chunk at a time), and one
+          // decrypt in flight is gentler on a constrained CPU than N at once.
+          (async function () {
+            try {
+              var plainParts = new Array(capturedChunks.length);
+              for (var ci = 0; ci < capturedChunks.length; ci++) {
+                var enc = await capturedChunks[ci];
+                // Release the settled promise (and the {iv, ct} it retains) so
+                // this chunk's ciphertext becomes collectable immediately.
+                capturedChunks[ci] = null;
+                plainParts[ci] = await window.crypto.subtle.decrypt(
+                  { name: "AES-GCM", iv: enc.iv },
+                  capturedKey,
+                  enc.ct,
+                );
+                enc = null; // drop the ciphertext ArrayBuffer reference
+              }
               persistBlob(new Blob(plainParts, { type: _mimeType }), ext);
-            })
-            .catch(function (err) {
+            } catch (err) {
               console.error("[recording] E2EE chunk decryption failed:", err);
               setState("idle");
-            });
+            }
+          })();
         } else {
           // In-memory raw fallback (no file handle, no E2EE).
           persistBlob(new Blob(capturedChunks, { type: _mimeType }), ext);
@@ -3226,5 +3362,17 @@
       }
       return out;
     },
+
+    /**
+     * Test/diagnostic accessor: the exact production `measureTextWidthCached`
+     * used by drawNameChip() and the transport-badge draw in drawTile(). Exposed
+     * so a regression test can drive the real memoisation path against a caller-
+     * supplied context whose `measureText` it has instrumented, and assert that a
+     * repeated (font, text) pair is served from cache (only ONE underlying
+     * measureText call for two lookups). Reverting the cache makes that second
+     * lookup measure again, so the test fails — proving it guards the real
+     * behaviour, not a re-implementation.
+     */
+    _measureTextWidthCached: measureTextWidthCached,
   };
 })();

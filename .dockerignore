@@ -5,3 +5,7 @@ Dockerfile*
 result
 result-*
 .git
+# bots-app image (#2035): never bake captured auth storage-state / run
+# artifacts into the anonymous-pull shared-registry image. `run/auth/*.json`
+# holds real OAuth session cookies from `bots-app login`/`sso-login`.
+e2e/bots-app/run

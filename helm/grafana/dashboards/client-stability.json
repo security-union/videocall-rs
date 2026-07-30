@@ -111,7 +111,7 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"} / 1e6",
+          "expr": "videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"} / 1e6 * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "instant": false,
           "legendFormat": "{{display_name}} ({{meeting_id}})",
           "range": true,
@@ -210,7 +210,7 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"} / on(meeting_id, session_id, peer_id, display_name) first_over_time(videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"}[30m])",
+          "expr": "(videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"} / on(meeting_id, session_id, peer_id) first_over_time(videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"}[30m])) * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "instant": false,
           "legendFormat": "{{display_name}} ({{meeting_id}})",
           "range": true,
@@ -236,7 +236,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Per-session rate of client-upstream datagram drops. Any sustained value >0 for >10s is a problem — the client is dropping its own outbound datagrams because the WebTransport writable stream is locked or backpressured. Triggers ClientUpstreamDropsActive alert.",
+      "description": "Per-session rate of client-upstream datagram drops. Any sustained value >0 for >10s is a problem \u2014 the client is dropping its own outbound datagrams because the WebTransport writable stream is locked or backpressured. Triggers ClientUpstreamDropsActive alert.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -318,7 +318,7 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "deriv(videocall_datagram_drops_total{meeting_id=~\"$meeting\"}[1m]) > 0",
+          "expr": "(deriv(videocall_datagram_drops{meeting_id=~\"$meeting\"}[1m]) > 0) * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
           "instant": false,
           "legendFormat": "{{display_name}} ({{meeting_id}})",
           "range": true,
@@ -464,7 +464,7 @@
             "type": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (meeting_id, display_name) (deriv(videocall_datagram_drops_total{meeting_id=~\"$meeting\"}[1m]) > 0)",
+          "expr": "sum by (meeting_id, session_id) (deriv(videocall_datagram_drops{meeting_id=~\"$meeting\"}[1m]) > 0) * on(meeting_id, session_id) group_left(display_name) videocall_peer_info",
           "instant": false,
           "legendFormat": "client {{meeting_id}} {{display_name}}",
           "range": true,
@@ -607,6 +607,6 @@
     "to": "now"
   },
   "timezone": "browser",
-  "title": "Client Stability — Heap & Upstream Drops",
+  "title": "Client Stability \u2014 Heap & Upstream Drops",
   "uid": "videocall-client-stability"
 }

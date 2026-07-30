@@ -344,7 +344,7 @@ prometheus:
                 severity: critical
               annotations:
                 summary: "Peer cannot receive audio"
-                description: "{{ $labels.reporter_name }} cannot hear {{ $labels.peer_name }}"
+                description: "{{ $labels.from_peer }} cannot hear {{ $labels.to_peer }}"
 
         - name: videocall_resource_alerts
           rules:
@@ -378,30 +378,31 @@ prometheus:
           rules:
             # Client JS heap has at least doubled vs. its first-seen value in
             # the last 5 minutes. The cumulative gauge is per
-            # (meeting_id, session_id, peer_id, display_name) so each line
+            # (meeting_id, session_id, peer_id) so each line
             # is compared against its own meeting-preamble baseline.
             - alert: ClientHeapGrowthHigh
-              expr: videocall_client_memory_used_bytes / on(meeting_id, session_id, peer_id, display_name) first_over_time(videocall_client_memory_used_bytes[5m]) > 2
+              expr: videocall_client_memory_used_bytes / on(meeting_id, session_id, peer_id) first_over_time(videocall_client_memory_used_bytes[5m]) > 2
               for: 60s
               labels:
                 severity: critical
                 page: "true"
               annotations:
                 summary: "Client heap >2x preamble during active meeting"
-                description: "{{ $labels.display_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) heap is {{ $value | printf \"%.2f\" }}x its first-seen value. Likely leak or unbounded buffer."
+                description: "peer {{ $labels.peer_id }} (session {{ $labels.session_id }}) in meeting {{ $labels.meeting_id }} heap is {{ $value | printf \"%.2f\" }}x its first-seen value. Likely leak or unbounded buffer. Resolve name via videocall_peer_info{meeting_id=\"{{ $labels.meeting_id }}\",session_id=\"{{ $labels.session_id }}\"}."
 
             # Any client is dropping its own outbound datagrams (writable stream
-            # locked / backpressured). videocall_datagram_drops_total is a
+            # locked / backpressured). videocall_datagram_drops is a
             # cumulative gauge so we use deriv() to extract per-second rate.
+            # fix: metric is videocall_datagram_drops (no _total)
             - alert: ClientUpstreamDropsActive
-              expr: deriv(videocall_datagram_drops_total[1m]) > 0
+              expr: deriv(videocall_datagram_drops[1m]) > 0
               for: 30s
               labels:
                 severity: critical
                 page: "true"
               annotations:
                 summary: "Client dropping upstream datagrams"
-                description: "{{ $labels.display_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) is dropping {{ $value | printf \"%.1f\" }} datagrams/sec on its upstream — receiver-side audio/video will degrade."
+                description: "peer {{ $labels.peer_id }} (session {{ $labels.session_id }}) in meeting {{ $labels.meeting_id }} is dropping {{ $value | printf \"%.1f\" }} datagrams/sec on its upstream — receiver-side audio/video will degrade. Resolve name via videocall_peer_info."
 
             # Server-wide outbound channel saturating. This is the
             # protocol-wide counter (no session label by design — see
@@ -443,7 +444,7 @@ prometheus:
                 component: video-playout
               annotations:
                 summary: "Video playout latency elevated (600-1800ms)"
-                description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Approaching the #1252 lag threshold."
+                description: "{{ $labels.to_peer }} as seen by {{ $labels.from_peer }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Approaching the #1252 lag threshold."
 
             # CRITICAL: latency > 1800ms sustained for > 10s. This is the #1252
             # lag: audio plays live while video is seconds behind.
@@ -456,7 +457,7 @@ prometheus:
                 page: "true"
               annotations:
                 summary: "Video playout latency > 1800ms (#1252 lag)"
-                description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Audio-ahead-of-video lag (#1252) — video is seconds behind."
+                description: "{{ $labels.to_peer }} as seen by {{ $labels.from_peer }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Audio-ahead-of-video lag (#1252) — video is seconds behind."
 
             # AUDIO sibling. DEPENDS ON #1360 (videocall_audio_playout_latency_ms)
             # merging — this rule is inert until that gauge exists. The audio
@@ -472,4 +473,4 @@ prometheus:
                 component: audio-playout
               annotations:
                 summary: "Audio playout latency > 1800ms (threshold needs NetEQ tuning)"
-                description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) audio is {{ $value | printf \"%.0f\" }}ms behind live. Threshold inherited from video and pending field tuning against NetEQ target delay (#1360)."
+                description: "{{ $labels.to_peer }} as seen by {{ $labels.from_peer }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) audio is {{ $value | printf \"%.0f\" }}ms behind live. Threshold inherited from video and pending field tuning against NetEQ target delay (#1360)."

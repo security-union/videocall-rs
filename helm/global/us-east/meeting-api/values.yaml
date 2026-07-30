@@ -29,8 +29,14 @@ meeting-api:
           key: secret
     - name: TOKEN_TTL_SECS
       value: "86400"
+    # #1750/#1966: idle/re-mint increment (7d), not total session length —
+    # active sessions slide up to SESSION_ABSOLUTE_MAX_SECS.
     - name: SESSION_TTL_SECS
-      value: "315360000"
+      value: "604800"
+    # #1966: hard absolute cap (30d). MUST exceed SESSION_TTL_SECS or sliding
+    # refresh is a no-op.
+    - name: SESSION_ABSOLUTE_MAX_SECS
+      value: "2592000"
     - name: COOKIE_SECURE
       value: "true"
     - name: COOKIE_DOMAIN

@@ -52,6 +52,7 @@ function stubFetch(state: FetchState) {
             meetingUrl: "https://example.com/meeting/X",
             ttl: "5m",
             network: null,
+            videoMode: "clock",
             auth: null,
             botCount: 2,
             bots: [{ participant: "alice" }, { participant: "bob" }],
@@ -61,8 +62,9 @@ function stubFetch(state: FetchState) {
         );
       }
       if (url === "/api/launch/from-config" && init?.method === "POST") {
-        state.lastLaunchYaml = (JSON.parse(init.body as string) as { configYaml: string })
-          .configYaml;
+        state.lastLaunchYaml = (
+          JSON.parse(init.body as string) as { configYaml: string }
+        ).configYaml;
         return new Response(
           JSON.stringify({
             meetingUrl: "https://example.com/meeting/X",
@@ -132,12 +134,12 @@ describe("ToolsPage", () => {
     await waitFor(() => {
       expect(screen.getByTestId("config-import-preview-count")).toHaveTextContent("2");
     });
+    expect(screen.getByTestId("config-import-preview-video-mode")).toHaveTextContent("clock");
   });
 
   it("launch button posts the YAML to /api/launch/from-config", async () => {
     renderWithClient(<ToolsPage />);
-    const yaml =
-      "meeting_url: https://example.com/meeting/X\nbots:\n  - participant: alice\n";
+    const yaml = "meeting_url: https://example.com/meeting/X\nbots:\n  - participant: alice\n";
     fireEvent.change(screen.getByTestId("config-import-textarea"), { target: { value: yaml } });
     fireEvent.click(screen.getByTestId("config-import-launch-button"));
     await waitFor(() => {

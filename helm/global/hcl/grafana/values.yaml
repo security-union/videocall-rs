@@ -18,8 +18,21 @@ grafana:
     size: 1Gi
     storageClassName: "local-path"
 
-  adminUser: admin
-  adminPassword: password
+  # Admin credentials come from the pre-created `grafana-admin` Secret in the
+  # videocall namespace (keys admin-user / admin-password) — never plaintext git.
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+
+  # RBAC namespaced so the namespace-scoped videocall-ci CI ServiceAccount can
+  # deploy this chart. The default (rbac.namespaced: false) renders a cluster-
+  # scoped ClusterRole/ClusterRoleBinding that videocall-ci (a RoleBinding to
+  # cluster-admin, NOT a ClusterRoleBinding) cannot get/create at cluster scope.
+  # Dashboards are provisioned via a mounted ConfigMap (dashboardsConfigMaps),
+  # not the cluster-wide sidecar, so namespace-scoped RBAC is sufficient.
+  rbac:
+    namespaced: true
 
   service:
     type: ClusterIP
@@ -46,9 +59,6 @@ grafana:
       root_url: https://grafana.videocall.fnxlabs.com
     feature_toggles:
       publicDashboards: true
-    security:
-      admin_user: admin
-      admin_password: password
     users:
       allow_sign_up: false
     auth.anonymous:

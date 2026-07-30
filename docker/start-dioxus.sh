@@ -28,9 +28,6 @@ if (window.__APP_CONFIG) {
   firefoxEnabled: "${FIREFOX_ENABLED:-false}",
   usersAllowedToStream: "${USERS_ALLOWED_TO_STREAM:-}",
   serverElectionPeriodMs: ${SERVER_ELECTION_PERIOD_MS:-2000},
-  audioBitrateKbps: ${AUDIO_BITRATE_KBPS:-65},
-  videoBitrateKbps: ${VIDEO_BITRATE_KBPS:-100},
-  screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-1200},
   oauthProvider: "${OAUTH_PROVIDER:-}",
   vadThreshold: ${VAD_THRESHOLD:-0.02},
   oauthAuthUrl: "${OAUTH_AUTH_URL:-}",
@@ -59,6 +56,48 @@ cp -f /app/dioxus-ui/scripts/config.local.js /app/dioxus-ui/dist/config.local.js
 # ---------------------------------------------------------------------------
 DIOXUS_SERVE_MODE="${DIOXUS_SERVE_MODE:-dev}"
 
+# Extract scheme://host[:port] only. The host character class deliberately
+# EXCLUDES quote, space and semicolon so a stray value can never break out of
+# the header quoting or inject a directive (mirrors the Helm helper regex).
+csp_origin() {
+    printf '%s\n' "$1" | sed -nE 's#^([A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._:-]+).*$#\1#p'
+}
+
+csp_connect_src="'self'"
+for csp_url in \
+    "${API_BASE_URL:-http://localhost:${ACTIX_PORT:-8080}}" \
+    "${MEETING_API_BASE_URL:-}" \
+    "${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}" \
+    "${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}" \
+    "${SEARCH_API_BASE_URL:-}"
+do
+    OLD_IFS="$IFS"
+    IFS=","
+    set -- $csp_url
+    IFS="$OLD_IFS"
+    for csp_part in "$@"; do
+        csp_origin_value="$(csp_origin "$csp_part")"
+        if [ -n "$csp_origin_value" ] && ! printf '%s\n' " $csp_connect_src " | grep -Fq " $csp_origin_value "; then
+            csp_connect_src="$csp_connect_src $csp_origin_value"
+        fi
+    done
+done
+
+if [ "${ENABLE_OAUTH:-false}" = "true" ] && [ "${OAUTH_FLOW:-}" = "pkce" ]; then
+    csp_idp_url="${OAUTH_TOKEN_URL:-}"
+    if [ -z "$csp_idp_url" ] && [ "${OAUTH_PROVIDER:-}" = "google" ]; then
+        csp_idp_url="https://oauth2.googleapis.com/token"
+    elif [ -z "$csp_idp_url" ]; then
+        csp_idp_url="${OAUTH_ISSUER:-}"
+    fi
+    csp_origin_value="$(csp_origin "$csp_idp_url")"
+    if [ -n "$csp_origin_value" ] && ! printf '%s\n' " $csp_connect_src " | grep -Fq " $csp_origin_value "; then
+        csp_connect_src="$csp_connect_src $csp_origin_value"
+    fi
+fi
+
+CSP_REPORT_ONLY_HEADER="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; worker-src 'self' blob:; connect-src $csp_connect_src; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; upgrade-insecure-requests"
+
 if [ "$DIOXUS_SERVE_MODE" = "static" ]; then
     # One-shot tailwind build (no --watch)
     tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify
@@ -78,6 +117,7 @@ if [ "$DIOXUS_SERVE_MODE" = "static" ]; then
         --interfaces 0.0.0.0 \
         --index index.html \
         --spa \
+        --header "Content-Security-Policy-Report-Only: ${CSP_REPORT_ONLY_HEADER}" \
         /app/dioxus-ui/dist
 else
     # Development mode: hot-reload with trunk serve.

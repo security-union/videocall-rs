@@ -208,7 +208,7 @@ test.describe("Action bar customize mode", () => {
     const DEFAULT_LAYOUT = [
       "mic",
       "camera",
-      "reactions",
+      "chat",
       "screen",
       "participants",
       "density",
@@ -526,12 +526,12 @@ test.describe("Action bar customize mode", () => {
     // deliberately NOT focusable (see the "wrappers are not focusable"
     // test) — focus lives on the inner button so a11y users get exactly
     // one tab stop per slot.
-    const reactionsWrapper = page.locator(
-      '.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"]',
+    const chatWrapper = page.locator(
+      '.video-controls-container .action-bar-slot-wrapper[data-slot="chat"]',
     );
-    await expect(reactionsWrapper).toBeVisible({ timeout: 5_000 });
-    const reactionsInnerButton = reactionsWrapper.locator("> button.video-control-button").first();
-    await expect(reactionsInnerButton).toBeVisible({ timeout: 5_000 });
+    await expect(chatWrapper).toBeVisible({ timeout: 5_000 });
+    const chatInnerButton = chatWrapper.locator("> button.video-control-button").first();
+    await expect(chatInnerButton).toBeVisible({ timeout: 5_000 });
 
     // Capture the original slot order so the after-state is a real delta,
     // not just "some value was saved" (mutation-sensitivity).
@@ -550,32 +550,32 @@ test.describe("Action bar customize mode", () => {
     const before = await readOrder();
     expect(before.length).toBeGreaterThan(2);
 
-    // Focus Reactions's inner button and press Right arrow. The event bubbles to
+    // Focus Chat's inner button and press Right arrow. The event bubbles to
     // the nav's onkeydown, which resolves the slot via `.closest([data-slot])`.
-    await reactionsInnerButton.focus();
-    await expect(reactionsInnerButton).toBeFocused();
+    await chatInnerButton.focus();
+    await expect(chatInnerButton).toBeFocused();
     await page.keyboard.press("ArrowRight");
     await page.waitForTimeout(150);
 
     const after = await readOrder();
-    // The *order in which Reactions appears* must have moved by exactly one to
+    // The *order in which Chat appears* must have moved by exactly one to
     // the right (single-step per key — a live-tester report said arrows
     // could "jump to position 9 then walk back" when OS auto-repeat or
     // modifier keys were involved; the handler now blocks both, so a single
     // press moves by exactly one).
-    const beforeReactionsIdx = before.indexOf("reactions");
-    const afterReactionsIdx = after.indexOf("reactions");
+    const beforeChatIdx = before.indexOf("chat");
+    const afterChatIdx = after.indexOf("chat");
     expect(
-      afterReactionsIdx,
-      `Reactions did not move right by exactly one on a single ArrowRight (before=${beforeReactionsIdx}, after=${afterReactionsIdx})`,
-    ).toBe(beforeReactionsIdx + 1);
+      afterChatIdx,
+      `Chat did not move right by exactly one on a single ArrowRight (before=${beforeChatIdx}, after=${afterChatIdx})`,
+    ).toBe(beforeChatIdx + 1);
 
     // Focus must stay on the moved slot so Tab continues from that control
     // instead of restarting navigation from the beginning of the bar.
-    const movedReactionsButton = page
-      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"] > button')
+    const movedChatButton = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="chat"] > button')
       .first();
-    await expect(movedReactionsButton).toBeFocused({ timeout: 2_000 });
+    await expect(movedChatButton).toBeFocused({ timeout: 2_000 });
 
     // The keyboard move must persist without needing to press Done — every
     // arrow keystroke saves. Verifies the handler calls save_action_bar_layout.
@@ -596,9 +596,7 @@ test.describe("Action bar customize mode", () => {
     );
     const liveTexts = await liveRegions.allTextContents();
     const combined = liveTexts.join(" | ");
-    expect(combined).toMatch(
-      new RegExp(`Reactions moved to position ${afterReactionsIdx + 1} of `),
-    );
+    expect(combined).toMatch(new RegExp(`Chat moved to position ${afterChatIdx + 1} of `));
 
     // ArrowLeft at the leftmost slot must NOT overflow into a negative
     // index (clamp behaviour) — the announcement should say "already at
@@ -749,13 +747,13 @@ test.describe("Action bar customize mode", () => {
     await reloadToGrid(page);
     await enterCustomizeMode(page);
 
-    const reactionsInner = page
-      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"] > button')
+    const chatInner = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="chat"] > button')
       .first();
-    await reactionsInner.focus();
+    await chatInner.focus();
 
     // Try every reasonable modifier + ArrowRight combination. None must move
-    // Reactions and none must persist a layout change.
+    // Chat and none must persist a layout change.
     for (const mod of ["Meta", "Control", "Alt", "Shift"] as const) {
       await page.keyboard.press(`${mod}+ArrowRight`);
       await page.waitForTimeout(80);
@@ -772,13 +770,13 @@ test.describe("Action bar customize mode", () => {
           .sort((a, b) => a.order - b.order)
           .map((s) => s.slot),
       );
-    expect(order.indexOf("reactions")).toBe(2); // still at default position 3 (0-indexed 2)
+    expect(order.indexOf("chat")).toBe(2); // still at default position 3 (0-indexed 2)
 
     // Nothing was persisted (storage still absent or reflects default).
     const stored = await page.evaluate(() => localStorage.getItem("vc_action_bar_layout"));
     if (stored) {
       const layout = JSON.parse(stored);
-      expect(layout.slots?.[2]).toBe("reactions");
+      expect(layout.slots?.[2]).toBe("chat");
     }
   });
 
@@ -858,7 +856,7 @@ test.describe("Action bar customize mode", () => {
       // isn't available (see MicButton/CameraButton `disabled: !available`).
       // On the E2E stack the browser exposes fake devices so `available` is
       // true for both — but be resilient to a headless quirk by only pinning
-      // the non-hardware slots strictly. ScreenShare, Reactions, PeerList,
+      // the non-hardware slots strictly. ScreenShare, Chat, PeerList,
       // DensityMode, Diagnostics, DeviceSettings, MeetingOptions must never
       // be disabled in customize mode.
       const hardwareGated = slotName === "mic" || slotName === "camera";
@@ -912,17 +910,17 @@ test.describe("Action bar customize mode", () => {
         );
 
     const before = await readSlotOrder();
-    const reactionsBtn = page
-      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"] > button')
+    const chatBtn = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="chat"] > button')
       .first();
-    await expect(reactionsBtn).toBeVisible({ timeout: 5_000 });
-    await reactionsBtn.focus();
-    await expect(reactionsBtn).toBeFocused();
+    await expect(chatBtn).toBeVisible({ timeout: 5_000 });
+    await chatBtn.focus();
+    await expect(chatBtn).toBeFocused();
     await page.keyboard.press("ArrowRight");
     await page.waitForTimeout(150);
 
     const after = await readSlotOrder();
-    expect(after.indexOf("reactions")).toBe(before.indexOf("reactions") + 1);
+    expect(after.indexOf("chat")).toBe(before.indexOf("chat") + 1);
     expect(after).not.toEqual(before);
 
     // Gather (DOM index, visual order, tag) for every focusable button
@@ -1195,7 +1193,7 @@ test.describe("Action bar customize mode", () => {
         "vc_action_bar_layout",
         JSON.stringify({
           v: 2,
-          slots: ["camera", "mic", "reactions"], // reordered + missing several defaults
+          slots: ["camera", "mic", "chat"], // reordered + missing several defaults
           hidden: [
             "screen",
             "participants",
@@ -1375,12 +1373,12 @@ test.describe("Action bar customize mode", () => {
     // Focus a slot button inside the bar so the Escape event fires on a
     // realistic target (not on Done itself, which would also close the
     // menu via its own click semantics).
-    const reactionsBtn = page
-      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"] > button')
+    const chatBtn = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="chat"] > button')
       .first();
-    await expect(reactionsBtn).toBeVisible({ timeout: 5_000 });
-    await reactionsBtn.focus();
-    await expect(reactionsBtn).toBeFocused();
+    await expect(chatBtn).toBeVisible({ timeout: 5_000 });
+    await chatBtn.focus();
+    await expect(chatBtn).toBeFocused();
 
     await page.keyboard.press("Escape");
 

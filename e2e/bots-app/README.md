@@ -24,9 +24,10 @@ The bot:
 - authenticates via:
   - **JWT cookie injection** for local / HCL daily / preview targets,
   - **Captured Playwright storage state** (`bots-app login`) for `app.videocall.rs` and any other real-OAuth-protected target,
-  - **HCL SSO state** (`bots-app sso-login`) loaded _in addition to_ the JWT cookie for HCL-gated targets that sit behind the corporate SSO portal.
+  - **HCL SSO state** (`bots-app sso-login`) loaded _in addition to_ the JWT cookie for HCL-gated targets that sit behind the corporate SSO portal,
+  - **Form login** (`--auth form-login`) — drives the identity provider's own username/password form using the `BOT_EMAIL` / `BOT_PASSWORD` env vars, for a self-hosted identity-service target (the labsworkspace videocall deployment). No pre-captured state needed, but the target must run the identity app (NOT Google OAuth) and the login accounts must already exist.
 
-Backend is auto-picked by hostname unless `--auth` is set.
+Backend is auto-picked by hostname (JWT for local/HCL/preview, otherwise storage-state) unless `--auth` is set. **`form-login` is never auto-picked** — it must be requested explicitly (`--auth form-login`, or `auth: form-login` in a `--config` file) so ambient `BOT_EMAIL` / `BOT_PASSWORD` can't be typed into a third-party login form. As defense-in-depth it also refuses to submit credentials to a known public IdP (Google, Microsoft, …).
 
 ## Production-UI touchpoints (invariant)
 
@@ -58,6 +59,31 @@ npm run bot -- run \
 The bot opens a headed Chrome window, joins the meeting as `alice`, and holds the session for the configured TTL. On TTL expiry (or `Ctrl+C` / SIGTERM) the bot clicks the meeting's "Hang Up" button, waits briefly for the leave-meeting API call to settle, then exits.
 
 Set `--ttl infinite` for a session that only ends on signal.
+
+### Clock video mode
+
+Pass `--video-mode clock` to publish a live 1280x720 wall clock as the
+bot's camera with a silent audio track. The default, `--video-mode costume`,
+and the accepted `file` alias preserve the existing manifest/override-backed
+fake-device behavior.
+
+```bash
+npm run bot -- run \
+  --meeting-url https://app.videocall.fnxlabs.com/meeting/TonyBots \
+  --users 6 \
+  --video-mode clock \
+  --headless
+```
+
+Clock mode also applies to SSH-launched bots when `videoMode: "clock"` is
+included in the control-API launch request (`POST /launch` / `/launch/multi`),
+either from the CLI, the dashboard launch forms, or a direct API call. The
+dashboard supports selecting clock mode for single- and multi-bot launches.
+Freeze/sync checks
+should use a tolerance rather than exact equality because capture, encode,
+transport, and decode add real jitter near second and color boundaries. For SSH
+launches, keep the local and remote hosts NTP-synced so clock skew is not
+reported as false lag.
 
 ## Multi-bot mode (`--users N`)
 
@@ -213,6 +239,23 @@ Both `bots-app run` and `bots-app gen` accept `--network <profile>`, and meeting
 
 Valid profiles: `none`, `good_wifi`, `good_4g`, `congested_wifi`, `lossy_mobile`, `satellite`, `dialup`.
 
+## Resource capture + `RESOURCE_STARVED` verdict
+
+Every `bots-app run` (and the self-hosted `bots-app dashboard`) forks a background sampler for the run's duration that measures the box the bots actually run on — so a self-starved run (the host saturating its own CPU) is flagged instead of being mistaken for a product regression. There is nothing to enable; it is on by default and degrades to a no-op on a box without `/proc` (e.g. a macOS laptop).
+
+Every ~5s the sampler (`scripts/resource-sampler.sh`, POSIX bash + `/proc`, no dependencies) appends a block of **raw** `/proc` counters — CPU jiffies (overall, per-core, steal), load average, memory (used/available/swap), NIC rx/tx bytes, and per-Chrome/orchestrator process cpu-jiffies + RSS — to `<run-dir>/resource/<label>-raw.csv`. At run end the raw counters are diffed in TypeScript into a **derived**, Prometheus-overlay CSV (`<label>-derived.csv`, epoch-seconds first) and a summary (`<label>-summary.txt`). All the delta math, aggregation, and the verdict live in `src/resource/` and are unit-tested there.
+
+The run prints a prominent, greppable verdict banner:
+
+- `RESOURCE_STARVED` when **either** rule fires: peak overall CPU stayed above 85% for 3+ consecutive samples (~15s sustained), **or** any bot's reported encoder FPS dipped below the base rung (default 5 fps). A starved run's client-signal regressions (encoder fps, RTT, sheds) should be treated as confounded by box saturation, not a product change.
+- `RESOURCE_OK` otherwise.
+
+For SSH-launched bots the **same** shell sampler is piped over `ssh … bash -s` to each remote box (the box whose CPU matters), and its CSV is copied back to `<run-dir>/resource/<label>-<host>-raw.csv` at run end — mirroring how remote bot commands are shipped.
+
+**Per-bot encoder FPS is captured by polling the `window.__videocall_encoder_fps` global the client publishes (#2057).** Only positive readings are recorded; absent/`undefined` values — and a `0`, which the client treats as "encoder not started, not diagnostic" (matching `health_reporter.rs`'s `encoder_output_fps > 0` gate) — are skipped as no data, so a cold-start/idle bot is not mis-flagged as starved. The per-bot client console-log upload (`.log.gz`, gated by the `consoleLogUploadEnabled` runtime flag and served by `meeting-api`) is a separate, browser-side mechanism this feature does not touch.
+
+Not in scope (issue follow-ups): a `node_exporter` on the box for live Prometheus scraping, and any Prometheus/Grafana wiring.
+
 ## Authenticating against `app.videocall.rs`
 
 For local / HCL daily / preview targets the bot mints a JWT cookie automatically. For `app.videocall.rs` (or any host that uses real Google OAuth), you first capture a Playwright storage state via:
@@ -265,6 +308,62 @@ npm run bot -- run \
 
 The terminal will log `auth: jwt + SSO state from .../hcl-sso.json (...)` confirming both layers are active. When the SSO session expires (you'll see the bot's page redirect to the SSO portal on next launch), re-run `sso-login` and you're back.
 
+## Authenticating against labsworkspace (`--auth form-login`)
+
+The labsworkspace videocall deployment (`*.videocall.labsworkspace.fnxlabs.com`) runs its own **identity-service** login form (a standard PKCE auth-code flow), not Google OAuth. For that target the bot can log in programmatically with a pre-created test account — no captured storage state needed:
+
+```bash
+cd e2e
+export BOT_EMAIL='bot1@example.test'      # a pre-created labsworkspace account
+export BOT_PASSWORD='…'
+npm run bot -- run \
+  --meeting-url https://app.videocall.labsworkspace.fnxlabs.com/meeting/bottest \
+  --participant k8s-bot-1 \
+  --auth form-login \
+  --ttl 5m
+```
+
+Preconditions and guardrails:
+
+- **`--auth form-login` is required** (or `auth: form-login` in a `--config` file). It is **never** auto-selected from the mere presence of `BOT_EMAIL` / `BOT_PASSWORD`, so exporting those creds and pointing at a Google-OAuth host (e.g. `app.videocall.rs`) will **not** type them into Google — that host stays on `storage-state`. As defense-in-depth the flow also refuses to submit to a known public IdP host (Google, Microsoft, …).
+- The target must be running the **identity-service** app, and the **login accounts must already exist** (form-login does not register users).
+- Credentials come from the environment only; a form-login bot is intentionally **not persistable** to a dashboard run profile.
+
+## Running in Kubernetes (containerize + deploy, #2035)
+
+`bots-app` ships a headless clock-mode container image and a single-pod manifest for running bots on `qsk8s` (the fleet lands in the dedicated `bot-load` namespace).
+
+```bash
+cd e2e/bots-app
+
+# 1. Build (context is the repo root; image is pinned to linux/amd64).
+#    PODMAN_REMOTE=1 uses the shared qsk8s podman builder; otherwise a local
+#    docker/podman build runs. PUSH=1 publishes to Harbor (hclcr.io/hcllabs).
+REGISTRY_USER="$HARBOR_USERNAME" REGISTRY_PASS="$HARBOR_PASSWORD" \
+  PODMAN_REMOTE=1 PUSH=1 ./build.sh
+# build.sh prints the immutable dated tag (0.1.0-YYYYMMDD-<sha7>) it also pushed;
+# set k8s/bot-pod.yaml `image:` to that tag for a reproducible run.
+
+# 2. One-time namespace + quota (ResourceQuota sized for ~20 bots).
+kubectl apply -f k8s/namespace.yaml
+
+# 3. Create the login creds Secret (see k8s/bot-creds.example.yaml for the
+#    literal form). These are the form-login BOT_EMAIL/BOT_PASSWORD.
+kubectl -n bot-load create secret generic bot-creds \
+  --from-literal=BOT_EMAIL='bot1@example.test' \
+  --from-literal=BOT_PASSWORD='…'
+
+# 4. Copy the Harbor pull secret into the namespace (see the header comment in
+#    k8s/bot-pod.yaml for the jq one-liner), then launch the pod.
+kubectl apply -f k8s/bot-pod.yaml
+kubectl -n bot-load logs -f videocall-bot-bottest
+
+# Graceful leave: `kubectl -n bot-load delete pod videocall-bot-bottest` sends
+# SIGTERM, which the orchestrator turns into a clean meeting-leave before exit.
+```
+
+The pod sets `BOT_AUTH=form-login` explicitly, so it does not rely on host auto-selection at all. See `Dockerfile`, `docker-entrypoint.sh`, and `k8s/` for the details.
+
 ## Preparing assets (`prep-assets`)
 
 `prep-assets` builds the per-participant audio + video files Chrome's `--use-file-for-fake-{audio,video}-capture` flags need. Run it once before launching bots that should send realistic media:
@@ -315,7 +414,7 @@ bots-app run
   --ttl <duration>             Bot lifespan — "<int>s|m|h" or "infinite" (default: 5m)
   --manifest <path>            Path to bot/conversation/manifest.yaml; pass "" to skip fake-device wiring
   --assets-dir <dir>           Directory of audio/<name>.wav + costumes/<name>.y4m (default: e2e/bots-app/run)
-  --auth <backend>             Override auth backend: "jwt", "storage-state", or "none" (guest join). Default: auto by hostname.
+  --auth <backend>             Override auth backend: "jwt", "storage-state", "none" (guest join), or "form-login" (drive the identity-service login form via BOT_EMAIL/BOT_PASSWORD; explicit opt-in only, never auto-picked). Default: auto by hostname (jwt / storage-state).
   --storage-state-file <path>  Explicit storage-state JSON path (default: <assets-dir>/auth/<participant>.json)
   --sso-state-file <path>      HCL SSO state path (default: <assets-dir>/auth/hcl-sso.json; loaded only if present)
   --ctl-port <port|auto>       Bind a local HTTP control API. "auto" lets the kernel pick a free port. Token file written to run/ctl-<pid>.token (mode 0600).
@@ -357,6 +456,7 @@ bots-app gen
 cd e2e
 npm run ci:lint               # eslint + prettier + tsc
 npm run test:unit             # vitest unit tests for bots-app/
+npx playwright test --config bots-app/src/playwright.clock.config.ts # real-Chromium clock advancement test
 ```
 
 ## Remote hosts (SSH) — v1
@@ -369,7 +469,7 @@ How it works:
 - When SSH is selected, the orchestrator spawns the local `ssh` binary directly (`child_process.spawn("ssh", [...])`, no shell) and runs a single-line bash command on the remote host:
   ```
   ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new [-i <key>] user@host[:port] \
-    "<shell> -lc '[ -f <profileFile> ] && . <profileFile>; <preCommand>; cd '\''<reposPath>'\''/e2e && npm run bot -- run --headless --ttl '\''<ttl>'\'' --meeting-url '\''<url>'\'' --participant '\''<p>'\'' [--network '\''<net>'\''] [--auth '\''<auth>'\''] [--display-name '\''<name>'\'']'"
+    "<shell> -lc '[ -f <profileFile> ] && . <profileFile>; <preCommand>; cd '\''<reposPath>'\''/e2e && npm run bot -- run --headless --ttl '\''<ttl>'\'' --meeting-url '\''<url>'\'' --participant '\''<p>'\'' [--video-mode '\''<mode>'\''] [--network '\''<net>'\''] [--auth '\''<auth>'\''] [--display-name '\''<name>'\'']'"
   ```
   Every dynamic substring is shell-escaped via the `shellEscape` helper (POSIX single-quote wrap + `'\''` for embedded quotes).
 - The inner `cd … && npm run …` is wrapped in `<shell> -lc` so the remote shell runs as a **login shell** and sources the operator's profile. `<shell>` is the host's `shell` field (default `bash`); `bash -l` has a POSIX-defined login-shell init chain that always reads `~/.bash_profile`, so it's a safer default than `${SHELL:-/bin/bash}` (which expanded to `/bin/zsh` on zsh-default macOS hosts and missed operators whose nvm setup lived in `~/.bash_profile`).
@@ -378,6 +478,7 @@ How it works:
   - **`profileFile`** — profile sourced via `[ -f <profileFile> ] && . <profileFile>;` before the bot command runs. The `[ -f … ] &&` guard keeps the prefix safe on hosts that lack the file, and the trailing `;` (not `&&`) keeps the rest of the chain running even when the source command returns non-zero. Defaults inferred client-side from the shell: `bash` → `~/.bash_profile`, `zsh` → `~/.zshrc`, `sh` → no source line.
   - **`preCommand`** — free-form bash run AFTER sourcing the profile, BEFORE the `cd && npm run …` chain. Use this for `nvm` version pinning (`. ~/.nvm/nvm.sh && nvm use 22`), `PATH` exports, etc. Max 512 chars, no embedded newlines or NUL bytes. Terminated with `;` in the emitted prefix so a non-zero exit doesn't abort the bot launch.
 - The Add / Edit Host dialog includes a live **Sample command** preview backed by `POST /hosts/preview` (200ms debounce). The preview shows the exact `ssh` invocation that will run for the unsaved host config — operators see how their structured-field choices shape the wrapper payload before saving.
+- Clock video mode over SSH is only meaningful when the local and remote hosts are NTP-synced. The clock frames use a shared system clock, so host clock skew is measured as false lag when the hosts are not NTP-tight.
 - Stdout/stderr from the remote bot are tee'd into the registry entry's rolling log buffer (capped at 200 lines). The dashboard's per-bot "View logs" dialog polls `GET /api/bots/:id/log?since=<n>` every 2.5s.
 - **Leave** sends `SIGTERM` to the local `ssh` ChildProcess (which propagates to the remote bot via the SSH connection). **Force-kill** sends `SIGKILL`.
 

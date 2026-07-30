@@ -28,6 +28,7 @@ use log::{debug, info, warn};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use videocall_transport::webtransport::FrameDropMeta;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 #[derive(Debug)]
@@ -185,6 +186,31 @@ impl ConnectionController {
                                 log::error!("Failed to start re-election: {e}");
                             }
                         }
+
+                        // Issue 2029: evaluate the WebTransport→WebSocket
+                        // audio-datagram-loss fallback on this SAME 1 Hz tick,
+                        // but INDEPENDENTLY of `check_rtt_degradation` above.
+                        // That watchdog is suppressed by `cpu_overloaded` /
+                        // recent inbound — the exact conditions a constrained
+                        // receiver's uniform datagram loss creates — so the
+                        // fallback must not sit behind the same gate. The
+                        // detector latches WebSocket-only (at most once per
+                        // session); we then re-elect through the unified
+                        // full-election path, which now excludes every WT
+                        // candidate because the latch is set.
+                        if mgr.check_audio_datagram_fallback(monotonic_now_ms()) {
+                            info!(
+                                "[WT_AUDIO_FALLBACK] session switched to \
+                                 WebSocket-only after sustained uniform \
+                                 audio-datagram loss"
+                            );
+                            if let Err(e) = mgr.reset_and_start_election() {
+                                log::error!(
+                                    "[WT_AUDIO_FALLBACK] re-election after \
+                                     WebSocket fallback failed: {e}"
+                                );
+                            }
+                        }
                     }
                 } else {
                     warn!("1Hz diagnostics timer: skipped — ConnectionManager already borrowed");
@@ -240,6 +266,19 @@ impl ConnectionController {
             .try_borrow()
             .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
         mgr.send_packet(packet, stream_key)
+    }
+
+    pub fn send_packet_with_drop_meta(
+        &self,
+        packet: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) -> Result<()> {
+        let mgr = self
+            .manager
+            .try_borrow()
+            .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
+        mgr.send_packet_with_drop_meta(packet, stream_key, meta)
     }
 
     /// Send packet through active connection via datagram (unreliable, low-latency).
@@ -440,6 +479,19 @@ impl ConnectionController {
             mgr.rtt_probe_stale_suppressions_total()
         } else {
             0
+        }
+    }
+
+    /// Issue 2029: forward one per-peer WebTransport audio-datagram loss sample
+    /// into the manager's fallback detector. Called at ~1 Hz per audio-active WT
+    /// peer from the health-reporter diagnostics subscription. Stamps the
+    /// manager clock ([`monotonic_now_ms`]) so the detector's per-peer aging is
+    /// clock-consistent with its 1 Hz evaluation tick. Best-effort: if the
+    /// manager cell is momentarily borrowed the sample is dropped and the next
+    /// ~1 Hz sample refills it (the detector is windowed, not edge-triggered).
+    pub fn observe_peer_audio_datagram_loss(&self, peer_id: &str, loss_per_sec: f64) {
+        if let Ok(mut mgr) = self.manager.try_borrow_mut() {
+            mgr.observe_peer_audio_datagram_loss(peer_id, loss_per_sec, monotonic_now_ms());
         }
     }
 

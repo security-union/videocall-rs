@@ -28,8 +28,47 @@ pub struct Config {
     /// Must cover the longest expected meeting plus any connection re-election —
     /// see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
     pub token_ttl_secs: i64,
-    /// Session JWT time-to-live in seconds (default: 315360000 = ~10 years).
+    /// Session JWT time-to-live in seconds (default: 604800 = 7 days).
+    ///
+    /// Bounds the capture-replay window of the `videocall-session` cookie
+    /// (#1750). This gates the identity/HTTP-API path (`AuthUser`), which
+    /// includes the room-token refresh the client calls mid-call. Cookie-mode
+    /// responses slide near-expiry sessions up to `session_absolute_max_secs`.
+    ///
+    /// The cookie is minted ONLY on the legacy backend-callback OAuth flow
+    /// (`oauth.rs` non-`browser_pkce` branch). On that flow, expiry forces a
+    /// full `/login` → IdP → `/login/callback` re-login round-trip — NOT a
+    /// silent client-side refresh (the client's `with_refresh_retry` refreshes
+    /// PKCE Bearer tokens, a different credential, and is inert in cookie mode).
+    /// PKCE deploys (ascend, labsworkspace) authenticate with sessionStorage
+    /// Bearer tokens and never mint this cookie, so this value is defense-in-
+    /// depth there (effective only if a cluster is ever flipped to cookie mode).
+    ///
+    /// With sliding refresh (#1966), this is the **idle/re-mint increment**, NOT
+    /// the total session length: each mint (initial or slide) issues a cookie
+    /// living `session_ttl_secs`, and the middleware re-mints once a request
+    /// arrives within `session_refresh_threshold_secs` of expiry — up to the
+    /// `session_absolute_max_secs` ceiling. So an ACTIVE session survives
+    /// indefinitely (never expiring mid-call) until the absolute cap; an IDLE
+    /// session dies one `session_ttl_secs` after its last request.
+    /// **`session_ttl_secs` must be < `session_absolute_max_secs`** or sliding
+    /// is a no-op (a re-mint would land on the same fixed deadline).
+    ///
+    /// Deploys override per-cluster: hcl-daily runs TTL=2h idle / cap=8h; prod
+    /// runs TTL=7d idle / cap=30d. (PKCE clusters authenticate with
+    /// sessionStorage Bearer tokens and never mint this cookie, so these values
+    /// are defense-in-depth there — effective only if a cluster is ever flipped
+    /// to legacy cookie mode.)
     pub session_ttl_secs: i64,
+    /// Re-mint the session cookie when its remaining lifetime falls below this
+    /// threshold (default: 7200 = 120 minutes). Must be < `session_ttl_secs`.
+    pub session_refresh_threshold_secs: i64,
+    /// Absolute maximum session lifetime from the original authentication time
+    /// (default: 2592000 = 30 days). Every mint — initial login AND sliding
+    /// refresh — is clamped to this cap (`capped_session_ttl`), so no cookie can
+    /// outlive `auth_time + session_absolute_max_secs`. Set this GREATER than
+    /// `session_ttl_secs` per deploy, or sliding does nothing.
+    pub session_absolute_max_secs: i64,
     /// OAuth configuration. `None` if `OAUTH_CLIENT_ID` is unset or empty.
     pub oauth: Option<OAuthConfig>,
     /// Cookie domain (optional, e.g. ".example.com").
@@ -233,9 +272,17 @@ impl Config {
             .parse::<i64>()
             .map_err(|_| "TOKEN_TTL_SECS must be a valid integer")?;
         let session_ttl_secs = env::var("SESSION_TTL_SECS")
-            .unwrap_or_else(|_| "315360000".to_string()) // ~10 years
+            .unwrap_or_else(|_| "604800".to_string()) // 7 days (#1750: was ~10y)
             .parse::<i64>()
             .map_err(|_| "SESSION_TTL_SECS must be a valid integer")?;
+        let session_refresh_threshold_secs = env::var("SESSION_REFRESH_THRESHOLD_SECS")
+            .unwrap_or_else(|_| "7200".to_string())
+            .parse::<i64>()
+            .map_err(|_| "SESSION_REFRESH_THRESHOLD_SECS must be a valid integer")?;
+        let session_absolute_max_secs = env::var("SESSION_ABSOLUTE_MAX_SECS")
+            .unwrap_or_else(|_| "2592000".to_string()) // 30 days; must exceed session_ttl_secs (#1966)
+            .parse::<i64>()
+            .map_err(|_| "SESSION_ABSOLUTE_MAX_SECS must be a valid integer")?;
         let cookie_domain = env::var("COOKIE_DOMAIN").ok().filter(|s| !s.is_empty());
         let cookie_name = env::var("COOKIE_NAME")
             .ok()
@@ -244,10 +291,15 @@ impl Config {
         let cookie_secure = env::var("COOKIE_SECURE")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
-        let cors_allowed_origin = env::var("CORS_ALLOWED_ORIGIN")
+        let cors_allowed_origin: Vec<String> = env::var("CORS_ALLOWED_ORIGIN")
             .ok()
             .filter(|s| !s.is_empty())
-            .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|o| o.trim().to_string())
+                    .filter(|o| !o.is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
         let nats_url = env::var("NATS_URL").ok().filter(|s| !s.is_empty());
 
@@ -449,12 +501,46 @@ impl Config {
             );
         }
 
+        // Fail closed: an empty CORS_ALLOWED_ORIGIN would fall through to
+        // AllowOrigin::mirror_request() + allow_credentials(true) in main.rs =
+        // universal credentialed CORS. Refuse to start in production. DEV_USER
+        // (only Some when OAuth is disabled) is the explicit local-dev escape hatch.
+        if cors_allowed_origin.is_empty() && dev_user.is_none() {
+            return Err(
+                "CORS_ALLOWED_ORIGIN is required unless DEV_USER is set (refusing to start: an empty origin list yields universal credentialed CORS via mirror_request)".to_string()
+            );
+        }
+
+        // Fail closed on an invalid sliding-session TTL configuration (#1966).
+        // The sliding-refresh middleware requires
+        // `0 < threshold < ttl < absolute_max`:
+        // if `threshold >= ttl` every authed request re-mints from ~1s after the
+        // last mint (HMAC-sign + Set-Cookie storm); if `ttl >= absolute_max`
+        // sliding is inert because a re-mint lands on the same fixed deadline;
+        // and a non-positive `ttl` would mint an already-expired / ~1s cookie
+        // (self-DoS). Positivity of `absolute_max` follows transitively from
+        // `0 < ttl < absolute_max`. These constraints are documented on the
+        // fields but were previously unvalidated, so a misconfig degraded
+        // silently — refuse to start instead.
+        if session_refresh_threshold_secs <= 0
+            || session_ttl_secs <= 0
+            || session_refresh_threshold_secs >= session_ttl_secs
+            || session_ttl_secs >= session_absolute_max_secs
+        {
+            return Err(format!(
+                "session TTL config invalid: require 0 < threshold ({}) < ttl ({}) < absolute_max ({}) — see #1966",
+                session_refresh_threshold_secs, session_ttl_secs, session_absolute_max_secs
+            ));
+        }
+
         Ok(Self {
             listen_addr,
             database_url,
             jwt_secret,
             token_ttl_secs,
             session_ttl_secs,
+            session_refresh_threshold_secs,
+            session_absolute_max_secs,
             oauth,
             cookie_domain,
             cookie_name,
@@ -585,7 +671,9 @@ mod tests {
             database_url: "postgres://test/test".to_string(),
             jwt_secret: "secret".to_string(),
             token_ttl_secs: 86400,
-            session_ttl_secs: 315360000,
+            session_ttl_secs: 604800,
+            session_refresh_threshold_secs: 7200,
+            session_absolute_max_secs: 604800,
             oauth: None,
             cookie_domain: None,
             cookie_name: "session".to_string(),
@@ -608,9 +696,11 @@ mod tests {
         // after a client joined, expiring the cached token in the WT/WS URL.
         let prior_db = std::env::var("DATABASE_URL").ok();
         let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
 
         std::env::set_var("DATABASE_URL", "postgres://test/test");
         std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
 
         with_env_unset("TOKEN_TTL_SECS", || {
             let cfg = Config::from_env().expect("from_env with TOKEN_TTL_SECS unset must succeed");
@@ -628,6 +718,291 @@ mod tests {
         match prior_jwt {
             Some(v) => std::env::set_var("JWT_SECRET", v),
             None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn session_ttl_secs_defaults_to_7_days_when_env_unset() {
+        // #1750: the session cookie default was ~10 years (315360000), making a
+        // captured `videocall-session` an effectively decade-long, non-revocable
+        // bearer credential — amplified now that the cookie is apex-scoped and
+        // broadcast to sibling backends. The default is capped to 7 days.
+        // This test FAILS on the old default, so reverting the cap breaks it.
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+
+        with_env_unset("SESSION_TTL_SECS", || {
+            let cfg =
+                Config::from_env().expect("from_env with SESSION_TTL_SECS unset must succeed");
+            assert_eq!(
+                cfg.session_ttl_secs, 604800,
+                "default must be 7 days (604800s), not the old ~10-year value — see #1750"
+            );
+        });
+
+        // Restore surrounding env so we don't pollute sibling tests.
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn session_refresh_threshold_secs_defaults_to_120_minutes_when_env_unset() {
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+
+        with_env_unset("SESSION_REFRESH_THRESHOLD_SECS", || {
+            let cfg = Config::from_env()
+                .expect("from_env with SESSION_REFRESH_THRESHOLD_SECS unset must succeed");
+            assert_eq!(
+                cfg.session_refresh_threshold_secs, 7200,
+                "default refresh threshold must be 120 minutes (7200s)"
+            );
+        });
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn session_absolute_max_secs_defaults_to_30_days_when_env_unset() {
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+
+        with_env_unset("SESSION_ABSOLUTE_MAX_SECS", || {
+            let cfg = Config::from_env()
+                .expect("from_env with SESSION_ABSOLUTE_MAX_SECS unset must succeed");
+            assert_eq!(
+                cfg.session_absolute_max_secs, 2592000,
+                "default absolute session lifetime must be 30 days (2592000s)"
+            );
+        });
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_rejects_invalid_session_ttl_ordering() {
+        // #1966: the sliding-session middleware requires
+        // `threshold < ttl < absolute_max`. This was documented but unvalidated,
+        // so a misconfig (e.g. hcl-daily shipping threshold == ttl) degraded
+        // silently into a re-mint storm. `from_env` must now fail closed.
+        // Here we set threshold == ttl (7200 == 7200), which violates
+        // `threshold < ttl`, and assert startup is refused. This test FAILS if
+        // the validator is removed, so it guards the fail-closed behavior.
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+        let prior_threshold = std::env::var("SESSION_REFRESH_THRESHOLD_SECS").ok();
+        let prior_ttl = std::env::var("SESSION_TTL_SECS").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+        // threshold == ttl violates `threshold < ttl`.
+        std::env::set_var("SESSION_REFRESH_THRESHOLD_SECS", "7200");
+        std::env::set_var("SESSION_TTL_SECS", "7200");
+
+        let err = Config::from_env()
+            .expect_err("from_env with threshold == ttl must fail closed (#1966)");
+        assert!(
+            err.contains("threshold"),
+            "error must name the offending ordering: {err}"
+        );
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+        match prior_threshold {
+            Some(v) => std::env::set_var("SESSION_REFRESH_THRESHOLD_SECS", v),
+            None => std::env::remove_var("SESSION_REFRESH_THRESHOLD_SECS"),
+        }
+        match prior_ttl {
+            Some(v) => std::env::set_var("SESSION_TTL_SECS", v),
+            None => std::env::remove_var("SESSION_TTL_SECS"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_rejects_ttl_ge_absolute_max() {
+        // #1966: the OTHER half of the ordering — `ttl < absolute_max`. This is
+        // the exact branch the docker-compose stacks tripped: they shipped
+        // SESSION_TTL_SECS=315360000 (10y) with no SESSION_ABSOLUTE_MAX_SECS,
+        // so with the 30d (2592000) default `ttl >= absolute_max` and boot must
+        // be refused. Here we set ttl == absolute_max (2592000 == 2592000),
+        // which violates `ttl < absolute_max`, and assert startup fails closed.
+        // This test FAILS if the `ttl >= absolute_max` half of the validator is
+        // removed, so it guards that branch specifically.
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+        let prior_threshold = std::env::var("SESSION_REFRESH_THRESHOLD_SECS").ok();
+        let prior_ttl = std::env::var("SESSION_TTL_SECS").ok();
+        let prior_max = std::env::var("SESSION_ABSOLUTE_MAX_SECS").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+        // Valid threshold, but ttl == absolute_max violates `ttl < absolute_max`.
+        std::env::set_var("SESSION_REFRESH_THRESHOLD_SECS", "7200");
+        std::env::set_var("SESSION_TTL_SECS", "2592000");
+        std::env::set_var("SESSION_ABSOLUTE_MAX_SECS", "2592000");
+
+        let err = Config::from_env()
+            .expect_err("from_env with ttl == absolute_max must fail closed (#1966)");
+        assert!(
+            err.contains("absolute_max"),
+            "error must name the offending ordering: {err}"
+        );
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+        match prior_threshold {
+            Some(v) => std::env::set_var("SESSION_REFRESH_THRESHOLD_SECS", v),
+            None => std::env::remove_var("SESSION_REFRESH_THRESHOLD_SECS"),
+        }
+        match prior_ttl {
+            Some(v) => std::env::set_var("SESSION_TTL_SECS", v),
+            None => std::env::remove_var("SESSION_TTL_SECS"),
+        }
+        match prior_max {
+            Some(v) => std::env::set_var("SESSION_ABSOLUTE_MAX_SECS", v),
+            None => std::env::remove_var("SESSION_ABSOLUTE_MAX_SECS"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_rejects_non_positive_session_ttl_values() {
+        // #1966: the validator also rejects NON-POSITIVE threshold/ttl (a <=0 ttl
+        // would mint an already-expired / ~1s self-DoS cookie). This case isolates
+        // that clause: threshold=0 with ttl=604800 < absolute_max=2592000 passes
+        // BOTH ordering clauses (0 < 604800 < 2592000), so only the
+        // `session_refresh_threshold_secs <= 0` clause can reject it. This test
+        // FAILS if the non-positive guard is removed, so it guards that clause
+        // specifically (the ordering-branch tests above would stay green without it).
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+        let prior_threshold = std::env::var("SESSION_REFRESH_THRESHOLD_SECS").ok();
+        let prior_ttl = std::env::var("SESSION_TTL_SECS").ok();
+        let prior_max = std::env::var("SESSION_ABSOLUTE_MAX_SECS").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+        // threshold = 0 is non-positive; 0 < ttl < absolute_max holds, so ONLY the
+        // non-positive clause can reject this config.
+        std::env::set_var("SESSION_REFRESH_THRESHOLD_SECS", "0");
+        std::env::set_var("SESSION_TTL_SECS", "604800");
+        std::env::set_var("SESSION_ABSOLUTE_MAX_SECS", "2592000");
+
+        let err = Config::from_env()
+            .expect_err("from_env with a non-positive threshold must fail closed (#1966)");
+        assert!(
+            err.contains("threshold"),
+            "error must name the offending value: {err}"
+        );
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+        match prior_threshold {
+            Some(v) => std::env::set_var("SESSION_REFRESH_THRESHOLD_SECS", v),
+            None => std::env::remove_var("SESSION_REFRESH_THRESHOLD_SECS"),
+        }
+        match prior_ttl {
+            Some(v) => std::env::set_var("SESSION_TTL_SECS", v),
+            None => std::env::remove_var("SESSION_TTL_SECS"),
+        }
+        match prior_max {
+            Some(v) => std::env::set_var("SESSION_ABSOLUTE_MAX_SECS", v),
+            None => std::env::remove_var("SESSION_ABSOLUTE_MAX_SECS"),
         }
     }
 
@@ -717,9 +1092,11 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let prior_db = std::env::var("DATABASE_URL").ok();
         let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
 
         std::env::set_var("DATABASE_URL", "postgres://test/test");
         std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
 
         with_env_unset("OAUTH_ALLOW_UNVERIFIED", || {
             let cfg = Config::from_env().expect("from_env with OAUTH_ALLOW_UNVERIFIED unset");
@@ -735,6 +1112,114 @@ mod tests {
         match prior_jwt {
             Some(v) => std::env::set_var("JWT_SECRET", v),
             None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn cors_allowed_origin_empty_without_dev_user_fails_closed() {
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_dev_user = std::env::var("DEV_USER").ok();
+        let prior_oauth = std::env::var("OAUTH_CLIENT_ID").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::remove_var("DEV_USER");
+        std::env::remove_var("OAUTH_CLIENT_ID");
+
+        // Includes "effectively empty" values (whitespace, comma-only): these
+        // must normalize to an empty origin list and hit the fail-closed guard
+        // with a clear error, not silently build a deny-all CorsLayer of empty
+        // origins.
+        for cors_value in [None, Some(""), Some(" "), Some(","), Some(" , ")] {
+            match cors_value {
+                Some(value) => std::env::set_var("CORS_ALLOWED_ORIGIN", value),
+                None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+            }
+            let err = Config::from_env().expect_err(
+                "from_env with empty CORS_ALLOWED_ORIGIN and no DEV_USER must fail closed",
+            );
+            assert!(
+                err.contains("CORS_ALLOWED_ORIGIN"),
+                "error must identify the CORS misconfiguration: {err}"
+            );
+        }
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_dev_user {
+            Some(v) => std::env::set_var("DEV_USER", v),
+            None => std::env::remove_var("DEV_USER"),
+        }
+        match prior_oauth {
+            Some(v) => std::env::set_var("OAUTH_CLIENT_ID", v),
+            None => std::env::remove_var("OAUTH_CLIENT_ID"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn cors_allowed_origin_empty_with_dev_user_is_allowed() {
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_dev_user = std::env::var("DEV_USER").ok();
+        let prior_oauth = std::env::var("OAUTH_CLIENT_ID").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("DEV_USER", "dev@test.local:Dev User");
+        std::env::remove_var("OAUTH_CLIENT_ID");
+        std::env::remove_var("CORS_ALLOWED_ORIGIN");
+
+        let cfg =
+            Config::from_env().expect("from_env with DEV_USER may use the empty CORS dev fallback");
+        assert!(
+            cfg.cors_allowed_origin.is_empty(),
+            "DEV_USER local dev keeps the mirror_request fallback reachable"
+        );
+        assert!(
+            cfg.dev_user.is_some(),
+            "DEV_USER should be active when OAuth is disabled"
+        );
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_dev_user {
+            Some(v) => std::env::set_var("DEV_USER", v),
+            None => std::env::remove_var("DEV_USER"),
+        }
+        match prior_oauth {
+            Some(v) => std::env::set_var("OAUTH_CLIENT_ID", v),
+            None => std::env::remove_var("OAUTH_CLIENT_ID"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
         }
     }
 
@@ -798,10 +1283,12 @@ mod tests {
         let prior_db = std::env::var("DATABASE_URL").ok();
         let prior_jwt = std::env::var("JWT_SECRET").ok();
         let prior_dev_user = std::env::var("DEV_USER").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
 
         std::env::set_var("DATABASE_URL", "postgres://test/test");
         std::env::set_var("JWT_SECRET", "test-secret");
         std::env::remove_var("DEV_USER");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
 
         let cfg = Config::from_env().expect("from_env without DEV_USER must succeed");
         assert!(
@@ -824,6 +1311,10 @@ mod tests {
         match prior_dev_user {
             Some(v) => std::env::set_var("DEV_USER", v),
             None => std::env::remove_var("DEV_USER"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
         }
     }
 
@@ -886,9 +1377,11 @@ mod tests {
         let prior_db = std::env::var("DATABASE_URL").ok();
         let prior_jwt = std::env::var("JWT_SECRET").ok();
         let prior_val = std::env::var("OAUTH_ALLOW_UNVERIFIED").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
 
         std::env::set_var("DATABASE_URL", "postgres://test/test");
         std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
 
         for invalid_value in &["yes", "on", "YES", "ON", "Yes", "", "enabled"] {
             std::env::set_var("OAUTH_ALLOW_UNVERIFIED", invalid_value);
@@ -928,6 +1421,10 @@ mod tests {
         match prior_jwt {
             Some(v) => std::env::set_var("JWT_SECRET", v),
             None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
         }
     }
 }

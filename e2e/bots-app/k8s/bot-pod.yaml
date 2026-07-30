@@ -1,0 +1,104 @@
+# bot-pod.yaml — single headless clock-mode videocall bot (Increment 1, #2035/#2072).
+#
+# Runs ONE bot that logs into the labsworkspace `bottest` room and joins.
+# restartPolicy: Never — this is a run-to-TTL job-style pod, not a long-lived
+# Deployment. Namespace `bot-load` is the dedicated bot-fleet namespace on
+# qsk8s (quota-bounded, no restrictive PSA so NET_ADMIN is admitted).
+#
+# Prereq: the `bot-creds` Secret must exist in this namespace first
+#   (see k8s/bot-creds.example.yaml for the create command).
+#
+# Image: Harbor `hclcr.io/hcllabs/videocall-bots-app`, same registry as all
+# other videocall images. Pull uses the `hclcr-io` imagePullSecret (below),
+# reused from the existing hclcr-io dockerconfigjson secrets on the cluster —
+# copy one into this namespace (strip server-set metadata or `apply` rejects it):
+#   kubectl -n quickstart get secret hclcr-io -o json \
+#     | jq 'del(.metadata.resourceVersion,.metadata.uid,.metadata.creationTimestamp,.metadata.ownerReferences) | .metadata.namespace="bot-load"' \
+#     | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: videocall-bot-bottest
+  namespace: bot-load
+  labels:
+    app.kubernetes.io/name: videocall-bot
+    app.kubernetes.io/component: bot-fleet
+    app.kubernetes.io/part-of: videocall
+spec:
+  restartPolicy: Never
+  # This pod never calls the K8s API (it drives a browser against external
+  # sites) — don't hand a compromised Chrome the default ServiceAccount token.
+  automountServiceAccountToken: false
+  # Harbor pull secret (reused hclcr-io creds, copied into this namespace).
+  imagePullSecrets:
+    - name: hclcr-io
+  # Non-root at the pod level. Chromium runs WITHOUT --no-sandbox (see
+  # src/bot.ts CHROME_ARGS), so it uses the setuid chrome-sandbox, which
+  # requires a non-root caller. uid 1000 == the image's `pwuser`.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+  containers:
+    - name: bot
+      # Harbor (hclcr.io/hcllabs) — pulled via the pod-level `hclcr-io`
+      # imagePullSecret. `:latest` is what build.sh pushes for the iteration
+      # loop; for a reproducible/pinned run replace it with the dated tag
+      # build.sh also emits (0.1.0-YYYYMMDD-<sha7>).
+      image: hclcr.io/hcllabs/videocall-bots-app:latest
+      # Pinned placeholder tag; build.sh emits a dated immutable tag
+      # (0.1.0-YYYYMMDD-<sha7>). Replace on each build. Always-pull so a
+      # re-pushed dev tag is re-fetched during the iteration loop.
+      imagePullPolicy: Always
+      # No container securityContext: Chromium needs the setuid chrome-sandbox,
+      # so allowPrivilegeEscalation must stay at its default (NOT false, or
+      # no_new_privs breaks launch). NET_ADMIN is deliberately NOT granted here
+      # — it's added in the netem increment alongside the `tc` code that uses it
+      # (least privilege: no unused capability on a browser-running pod).
+      env:
+        - name: MEETING_URL
+          value: "https://app.videocall.labsworkspace.fnxlabs.com/meeting/bottest"
+        - name: BOT_PARTICIPANT
+          value: "k8s-bot-1"
+        - name: TTL
+          value: "infinite"
+        # Default auth mode. `--auth form-login` is implemented in this branch
+        # (src/auth/form-login.ts, wired in src/bot.ts) and reads BOT_EMAIL /
+        # BOT_PASSWORD from the env. Override to "none"/"jwt" for a smoke test
+        # (jwt additionally needs a server-known JWT_SECRET).
+        - name: BOT_AUTH
+          value: "form-login"
+        - name: BOT_EMAIL
+          valueFrom:
+            secretKeyRef:
+              name: bot-creds
+              key: BOT_EMAIL
+        - name: BOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: bot-creds
+              key: BOT_PASSWORD
+      resources:
+        requests:
+          cpu: "1500m"
+          memory: "1.5Gi"
+        limits:
+          # CPU limit set high (not 2) so CFS throttling of the bursty headless-
+          # Chrome encoder can't self-induce a false RESOURCE_STARVED fps verdict
+          # — the signal this tool exists to measure. The namespace ResourceQuota
+          # requires a limit, so it's set generous rather than omitted.
+          cpu: "4"
+          memory: "2Gi"
+      volumeMounts:
+        # Headless Chrome shared memory. Default container /dev/shm is 64Mi,
+        # a classic crash/OOM gotcha. Note: src/bot.ts also passes
+        # --disable-dev-shm-usage (so Chrome prefers /tmp), making this mount
+        # defense-in-depth. sizeLimit counts against the pod memory limit, so
+        # it is kept modest (512Mi) to preserve headroom under the 2Gi cap.
+        - name: dshm
+          mountPath: /dev/shm
+  volumes:
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 512Mi

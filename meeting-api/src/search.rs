@@ -428,6 +428,7 @@ mod tests {
             end_on_host_leave: true,
             allow_guests: false,
             recording_allowed_for_all: false,
+            chat_allowed_for_all: true,
         }
     }
 

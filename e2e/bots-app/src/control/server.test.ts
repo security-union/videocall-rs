@@ -126,17 +126,20 @@ describe("control server", () => {
     expect(res.status).toBe(401);
   });
 
-  it("GET /bots returns the registered bots", async () => {
-    const entry = newRegistryEntry(fakeTask({ participant: "bob" }));
+  it("GET /bots returns the registered bots with their video mode", async () => {
+    const entry = newRegistryEntry(fakeTask({ participant: "bob", videoMode: "clock" }));
     surface.registry.set(entry.botId, entry);
     const res = await fetchJson(handle.port, "/bots", {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
-    const body = res.body as { bots: { botId: string; participant: string }[] };
+    const body = res.body as {
+      bots: { botId: string; participant: string; videoMode: string | null }[];
+    };
     expect(body.bots).toHaveLength(1);
     expect(body.bots[0].participant).toBe("bob");
     expect(body.bots[0].botId).toBe(entry.botId);
+    expect(body.bots[0].videoMode).toBe("clock");
   });
 
   it("GET /bots/:id returns 404 for unknown id", async () => {
@@ -543,6 +546,43 @@ describe("control server", () => {
     expect(launch!).toContain(`"audio":"alice.wav"`);
   });
 
+  it("POST /launch validates and forwards clock video mode to surface.launchOne", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "clock-bot",
+        ttl: "5m",
+        headless: true,
+        network: "none",
+        authBackend: "jwt",
+        videoMode: "clock",
+      },
+    });
+    expect(res.status).toBe(201);
+    const launch = surface.callLog.find((l) => l.startsWith("launch:"));
+    expect(launch).toContain(`"videoMode":"clock"`);
+  });
+
+  it("POST /launch rejects an unknown video mode", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "clock-bot",
+        ttl: "5m",
+        headless: true,
+        network: "none",
+        authBackend: "jwt",
+        videoMode: "stopwatch",
+      },
+    });
+    expect(res.status).toBe(400);
+    expect(surface.callLog.filter((l) => l.startsWith("launch:"))).toHaveLength(0);
+  });
+
   it("POST /launch rejects costume containing directory traversal", async () => {
     const res = await fetchJson(handle.port, `/launch`, {
       method: "POST",
@@ -701,6 +741,21 @@ describe("control server: run profiles", () => {
     expect(profile.bots[0].participant).toBe("alice");
   });
 
+  it("POST /profiles with source=current captures videoMode from the task", async () => {
+    const entry = newRegistryEntry(fakeTask({ participant: "clock-bot", videoMode: "clock" }));
+    surface.registry.set(entry.botId, entry);
+    const res = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "clock-snapshot", source: "current" },
+    });
+    expect(res.status).toBe(201);
+    const profile = res.body as { bots: { participant: string; videoMode?: string | null }[] };
+    expect(profile.bots).toEqual([
+      expect.objectContaining({ participant: "clock-bot", videoMode: "clock" }),
+    ]);
+  });
+
   it("POST /profiles with source=current captures each bot's runLocation from the registry", async () => {
     // Snapshot must serialize the per-bot host so a later launch can
     // dispatch the bot back to the same place. Mix local + ssh
@@ -835,6 +890,83 @@ describe("control server: run profiles", () => {
     expect(launches).toHaveLength(2);
     expect(launches[0]).toContain('"runLocation":{"kind":"local"}');
     expect(launches[1]).toContain('"runLocation":{"kind":"ssh","hostLabel":"lab-mac-1"}');
+  });
+
+  it("POST /profiles/:name/launch preserves clock mode and defaults absent mode", async () => {
+    const bot = {
+      meetingURL: "https://example.com/meeting/X",
+      ttl: "5m",
+      headless: false,
+      network: "none",
+      authBackend: "jwt",
+    };
+    const saveRes = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        name: "video-modes",
+        source: {
+          bots: [
+            { ...bot, participant: "clock-bot", videoMode: "clock" },
+            { ...bot, participant: "costume-bot", videoMode: "costume" },
+            { ...bot, participant: "legacy-bot" },
+          ],
+        },
+      },
+    });
+    expect(saveRes.status).toBe(201);
+    expect(
+      (saveRes.body as { bots: { videoMode?: string }[] }).bots.map(
+        (savedBot) => savedBot.videoMode,
+      ),
+    ).toEqual(["clock", "costume", undefined]);
+
+    const launchRes = await fetchJson(handle.port, `/profiles/video-modes/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(launchRes.status).toBe(202);
+    const launches = surface.callLog
+      .filter((line) => line.startsWith("launch:"))
+      .map(
+        (line) =>
+          JSON.parse(line.slice(line.indexOf("{"))) as {
+            participant: string;
+            videoMode?: string | null;
+          },
+      );
+    expect(launches.map(({ participant, videoMode }) => ({ participant, videoMode }))).toEqual([
+      { participant: "clock-bot", videoMode: "clock" },
+      { participant: "costume-bot", videoMode: "costume" },
+      { participant: "legacy-bot", videoMode: null },
+    ]);
+  });
+
+  it("POST /profiles rejects an invalid videoMode in source.bots", async () => {
+    const res = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        name: "bad-video-mode",
+        source: {
+          bots: [
+            {
+              meetingURL: "https://example.com/meeting/X",
+              participant: "alice",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+              videoMode: "stopwatch",
+            },
+          ],
+        },
+      },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({
+      error: 'source.bots[0].videoMode must be "costume", "file", or "clock"',
+    });
   });
 
   it("POST /profiles/:name/launch defaults missing runLocation to local (legacy forward-compat)", async () => {

@@ -4,7 +4,20 @@
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": false,
+      "tags": [],
+      "targetBlank": true,
+      "title": "Latest failing E2E Actions runs",
+      "tooltip": "Open the E2E workflow filtered to failing runs",
+      "type": "link",
+      "url": "https://github01.hclpnp.com/labs-projects/videocall/actions/workflows/e2e-hcl.yaml?query=is%3Afailure"
+    }
+  ],
   "panels": [
     {
       "id": 1,

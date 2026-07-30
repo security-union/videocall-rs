@@ -34,13 +34,14 @@ videocall-ui:
     showBuildGitInfo: "false"
     usersAllowedToStream: ""
     serverElectionPeriodMs: 2000
-    audioBitrateKbps: 16
-    videoBitrateKbps: 160
-    screenBitrateKbps: 160
 
   service:
     type: ClusterIP
     port: 80
+
+  csp:
+    enabled: true
+    enforce: false # Report-Only. Flip to true only after browser validation (issue #1248 follow-up).
 
   ingress:
     enabled: true

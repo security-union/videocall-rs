@@ -31,6 +31,7 @@ use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
+use videocall_transport::webtransport::FrameDropMeta;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket, TransportType};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -266,8 +267,18 @@ impl Connection {
     /// on under WebTransport (one per media type to prevent head-of-line
     /// blocking).  Ignored by WebSocket.
     pub fn send_packet(&self, packet: PacketWrapper, stream_key: MediaStreamKey) {
+        self.send_packet_with_drop_meta(packet, stream_key, None);
+    }
+
+    pub fn send_packet_with_drop_meta(
+        &self,
+        packet: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) {
         if let Status::Connected = self.status.get() {
-            self.task.send_packet(packet, stream_key);
+            self.task
+                .send_packet_with_drop_meta(packet, stream_key, meta);
         }
     }
 
@@ -489,6 +500,15 @@ impl Connection {
         } else {
             TransportType::TRANSPORT_WEBSOCKET
         };
+        conn
+    }
+
+    /// Test-only: a connection whose status is NOT `Connected`, so
+    /// `is_connected()` returns false. Used to exercise the "skip
+    /// disconnected candidate" branch of the election predicate.
+    pub(crate) fn new_for_test_disconnected(webtransport: bool) -> Self {
+        let conn = Self::new_for_test_with_transport(webtransport);
+        conn.status.set(Status::Closed);
         conn
     }
 

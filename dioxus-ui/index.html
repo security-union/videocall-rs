@@ -345,7 +345,15 @@
             }
         </script>
         <link data-trunk rel="copy-file" href="./scripts/recording.js" />
-        <script src="/recording.js"></script>
+        <!-- `defer`: recording.js (~125 KB) is a parser-blocking <head> script on
+             every route, yet its top-level IIFE only *defines* functions and
+             assigns window.__vcRecording (no DOM work at load). Deferring removes
+             ~1s of first-paint critical-path blocking on slow links across all
+             pages. The only consumers (js_recording_start/js_recording_stop in
+             attendants.rs) run inside user-click handlers deep in the meeting
+             lifecycle, long after DOMContentLoaded, so synchronous availability
+             is never required. -->
+        <script defer src="/recording.js"></script>
     </head>
     <body class="bg-background">
         <div id="main"></div>

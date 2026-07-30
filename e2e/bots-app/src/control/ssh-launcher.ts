@@ -63,6 +63,14 @@ export interface SshLaunchSpec {
   ttl: string;
   meetingURL: string;
   participant: string;
+  /**
+   * Camera source forwarded to the remote CLI. The default `"costume"`
+   * mode is omitted to preserve the legacy command shape.
+   *
+   * Clock mode is only meaningful when local and remote hosts are
+   * NTP-synced; otherwise host clock skew is reported as false lag.
+   */
+  videoMode?: "costume" | "file" | "clock" | null;
   network?: string | null;
   authBackend?: string | null;
   displayName?: string | null;
@@ -157,6 +165,7 @@ export function buildSshCommand(
     ttl: spec.ttl,
     meetingURL: spec.meetingURL,
     participant: spec.participant,
+    videoMode: spec.videoMode ?? null,
     network: spec.network ?? null,
     authBackend: spec.authBackend ?? null,
     displayName: spec.displayName ?? null,

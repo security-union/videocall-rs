@@ -46,6 +46,8 @@
 //! let options = VideoCallClientOptions {
 //!     enable_e2ee: true,
 //!     enable_webtransport: true,
+//!     max_received_layer: None,
+//!     skip_canvas_paint: false,
 //!     on_peer_added: Callback::noop(),
 //!     on_peer_first_frame: Callback::noop(),
 //!     get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
@@ -78,7 +80,7 @@
 //!     on_meeting_settings_updated: None,
 //!     on_peer_left: None,    // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
 //!     on_peer_joined: None,  // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
-//!     on_reaction: None,     // Option<Callback<(u64, i32, String)>> -- (sender_session_id, reaction_enum, resolved_name)
+//!     on_reaction: None,     // Option<Callback<(u64, i32, String, Option<String>)>> -- (sender_session_id, reaction_enum, resolved_name, custom_emoji)
 //!     on_display_name_changed: None,
 //!     on_host_mute: None,
 //!     on_host_disable_video: None,
@@ -103,7 +105,8 @@
 //!
 //! # use videocall_client::VideoCallClientOptions;
 //! # let options = VideoCallClientOptions {
-//! #     enable_e2ee: false, enable_webtransport: false, on_peer_added: Callback::noop(),
+//! #     enable_e2ee: false, enable_webtransport: false, max_received_layer: None,
+//! #     skip_canvas_paint: false, on_peer_added: Callback::noop(),
 //! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
 //! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), user_id: "user".to_string(),
 //! #     display_name: "User".to_string(), meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],
@@ -233,6 +236,7 @@ pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;
 pub mod capability;
+pub mod capability_probe;
 mod client;
 mod connection;
 pub mod constants;
@@ -245,13 +249,15 @@ pub mod health_reporter;
 pub mod long_tasks;
 mod media_devices;
 pub mod render_fps;
+pub mod screen_first_render_inject;
 pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;
 pub use client::reactions::{
-    resolve_reaction_display_name, sanitize_reaction_display_name, ReactionSelfThrottle,
-    REACTION_DISPLAY_NAME_MAX_CHARS, REACTION_SELF_MAX_PER_WINDOW, REACTION_SELF_MIN_INTERVAL_MS,
-    REACTION_SELF_WINDOW_MS, REACTION_UNKNOWN_SENDER_NAME,
+    resolve_reaction_display_name, sanitize_reaction_display_name, validate_custom_emoji,
+    ReactionSelfThrottle, REACTION_CUSTOM_EMOJI_MAX_BYTES, REACTION_DISPLAY_NAME_MAX_CHARS,
+    REACTION_SELF_MAX_PER_WINDOW, REACTION_SELF_MIN_INTERVAL_MS, REACTION_SELF_WINDOW_MS,
+    REACTION_UNKNOWN_SENDER_NAME,
 };
 pub use client::{
     RefreshRoomTokenCallback, RefreshedTokens, VideoCallClient, VideoCallClientOptions,
@@ -268,9 +274,10 @@ pub use decode::{
     VideoPeerDecoder,
 };
 pub use encode::{
-    create_microphone_encoder, CameraEncoder, LiveQualitySnapshot, MicrophoneEncoderTrait,
-    QualityTierBounds, ScreenEncoder, ScreenQualitySnapshot, ScreenQualityTierBounds,
-    ScreenShareEvent, SimulcastLayerInfo, SimulcastSendSnapshot,
+    create_microphone_encoder, screen_capture_display_constraints,
+    should_retry_screen_capture_without_ceiling, CameraEncoder, LiveQualitySnapshot,
+    MicrophoneEncoderTrait, QualityTierBounds, ScreenEncoder, ScreenQualitySnapshot,
+    ScreenQualityTierBounds, ScreenShareEvent, SimulcastLayerInfo, SimulcastSendSnapshot,
 };
 pub use media_devices::{
     MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,

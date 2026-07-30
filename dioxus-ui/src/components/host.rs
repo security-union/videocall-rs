@@ -35,6 +35,10 @@ use crate::context::{
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use gloo_timers::callback::Timeout;
+use videocall_client::adaptive_quality_constants::{
+    AUDIO_QUALITY_TIERS, DEFAULT_SCREEN_TIER_INDEX, DEFAULT_VIDEO_TIER_INDEX, SCREEN_QUALITY_TIERS,
+    VIDEO_QUALITY_TIERS,
+};
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{
@@ -49,6 +53,28 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::MediaStream;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EncoderInitialBitrates {
+    camera_kbps: u32,
+    microphone_kbps: u32,
+    screen_kbps: u32,
+}
+
+/// Resolve constructor seeds from the centralized AQ tables (#1193).
+///
+/// Camera uses the default tier's ordinary (non-drain-hold) target so its first
+/// encoder configuration matches the first AQ tick. Microphone and screen are
+/// initialized from their default tiers; their live targets are subsequently
+/// owned by the audio/screen tier state machines. Simulcast rungs always use
+/// their own fixed ladder targets and do not consume these seeds.
+fn encoder_initial_bitrates() -> EncoderInitialBitrates {
+    EncoderInitialBitrates {
+        camera_kbps: VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX].max_bitrate_kbps,
+        microphone_kbps: AUDIO_QUALITY_TIERS[0].bitrate_kbps,
+        screen_kbps: SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].ideal_bitrate_kbps,
+    }
+}
 
 struct EncoderSettings {
     camera: Option<String>,
@@ -113,6 +139,8 @@ pub fn Host(
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let pre_acquired_stream = use_context::<PreAcquiredScreenStream>();
 
+    use_hook(videocall_client::capability_probe::spawn_capability_probe);
+
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
@@ -135,9 +163,7 @@ pub fn Host(
 
     // Use Rc<RefCell<>> to hold mutable encoder state that persists across renders
     let state = use_hook(|| {
-        let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
-        let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
-        let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
+        let initial_bitrates = encoder_initial_bitrates();
 
         // Simulcast layer ceiling (issue #989 / #1082): the lesser of the runtime
         // flag (`experimentalSimulcastMaxLayers`, defaults to 3 = ON) and what
@@ -196,7 +222,7 @@ pub fn Host(
         let mut camera = CameraEncoder::new(
             client.clone(),
             VIDEO_ELEMENT_ID,
-            video_bitrate,
+            initial_bitrates.camera_kbps,
             camera_settings_cb,
             camera_error_cb,
             effective_max_layers,
@@ -226,7 +252,7 @@ pub fn Host(
         // camera's audio tier atomics (avoiding a duplicate quality manager).
         let mut microphone = create_microphone_encoder(
             client.clone(),
-            audio_bitrate,
+            initial_bitrates.microphone_kbps,
             mic_settings_cb,
             mic_error_cb,
             vad_threshold().ok(),
@@ -274,7 +300,7 @@ pub fn Host(
         });
         let mut screen = ScreenEncoder::new(
             client.clone(),
-            screen_bitrate,
+            initial_bitrates.screen_kbps,
             screen_settings_cb,
             screen_state_cb,
             camera.screen_sharing_flag(),
@@ -405,7 +431,10 @@ pub fn Host(
         // longer subscribes to receiver-reported diagnostics, so there are no
         // diagnostics channels to wire here. (The microphone encoder still reads
         // audio tier settings from the camera encoder's shared atomics.)
-        camera.set_encoder_control();
+        // Issue #1669: loop construction requires the paired screen encoder's
+        // live tier atom, so the WT threshold cannot silently bind a stale
+        // camera-owned default through setter ordering.
+        camera.set_encoder_control(screen.shared_screen_tier_index());
         screen.set_encoder_control();
 
         // Apply the user's persisted performance (quality-bounds) preference
@@ -1362,5 +1391,24 @@ fn detach_screen_preview() {
     {
         let video: web_sys::HtmlVideoElement = el.unchecked_into();
         video.set_src_object(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1193: Dioxus constructor seeds resolve from the centralized AQ tier
+    /// tables instead of the retired runtime-config bitrate keys.
+    #[test]
+    fn initial_bitrate_resolver_follows_aq_tiers() {
+        assert_eq!(
+            encoder_initial_bitrates(),
+            EncoderInitialBitrates {
+                camera_kbps: VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX].max_bitrate_kbps,
+                microphone_kbps: AUDIO_QUALITY_TIERS[0].bitrate_kbps,
+                screen_kbps: SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].ideal_bitrate_kbps,
+            }
+        );
     }
 }

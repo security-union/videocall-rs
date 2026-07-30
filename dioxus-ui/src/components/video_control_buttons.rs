@@ -27,10 +27,18 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
         (false, false) => "video-control-button off error",
         (false, true) => "video-control-button off",
     };
+    let tooltip_title = if !available {
+        "Microphone unavailable — click to retry."
+    } else if enabled {
+        "Microphone — Mute"
+    } else {
+        "Microphone — Unmute"
+    };
 
     rsx! {
         button {
             class,
+            "aria-label": tooltip_title,
             // Stable hook for E2E (the in-meeting mic toggle). Mirrors the
             // camera button's `camera-toggle-button` testid so the
             // device-permission specs (media-device-permission.spec.ts) can drive
@@ -59,7 +67,7 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                     line { x1: "12", y1: "19", x2: "12", y2: "22" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Microphone — Mute" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Turn off your microphone so others can't hear you." }
                 }
             } else if available {
@@ -77,7 +85,7 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                     line { x1: "3", y1: "3", x2: "21", y2: "21" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Microphone — Unmute" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Turn your microphone back on so others can hear you." }
                 }
             } else {
@@ -95,7 +103,7 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                     line { x1: "12", y1: "19", x2: "12", y2: "22" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Microphone — Unmute" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Microphone unavailable — click to retry." }
                 }
                 span { class: "device-warning", "!" }
@@ -116,10 +124,18 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
         (false, false) => "video-control-button off error",
         (false, true) => "video-control-button off",
     };
+    let tooltip_title = if !available {
+        "Camera unavailable — click to retry."
+    } else if enabled {
+        "Camera — Stop Video"
+    } else {
+        "Camera — Start Video"
+    };
 
     rsx! {
         button {
             class,
+            "aria-label": tooltip_title,
             // Stable hook for E2E (the in-meeting camera toggle). Used by
             // performance-settings.spec.ts to drive the camera ON/OFF for the
             // send-diagnostics "Camera — off" regression guard (#1101) instead of
@@ -142,7 +158,7 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                     rect { x: "1", y: "5", width: "15", height: "14", rx: "2", ry: "2" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Camera — Stop Video" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Turn off your camera so others can't see you." }
                 }
             } else if available {
@@ -159,7 +175,7 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                     line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Camera — Start Video" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Turn on your camera so others can see you." }
                 }
             } else {
@@ -175,7 +191,7 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                     line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Camera — Start Video" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Camera unavailable — click to retry." }
                 }
                 span { class: "device-warning", "!" }
@@ -200,10 +216,16 @@ pub fn ScreenShareButton(
         (false, true) => "video-control-button disabled",
         (false, false) => "video-control-button",
     };
+    let tooltip_title = if active {
+        "Screen share — Stop Screen Share"
+    } else {
+        "Screen share — Share Screen"
+    };
 
     rsx! {
         button {
             class,
+            "aria-label": tooltip_title,
             disabled,
             onclick: move |evt| {
                 if !disabled {
@@ -224,12 +246,12 @@ pub fn ScreenShareButton(
             }
             if active {
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Screen share — Stop Screen Share" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Stop sharing your screen with everyone in the call." }
                 }
             } else {
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Screen share — Share Screen" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Show a window or your entire screen to everyone in the call." }
                 }
             }
@@ -256,11 +278,17 @@ pub fn PeerListButton(
     } else {
         "video-control-button"
     };
+    let tooltip_title = if open {
+        "Participants — Close Peers"
+    } else {
+        "Participants — Open Peers"
+    };
 
     rsx! {
         button {
             id: if id.is_empty() { None } else { Some(id.clone()) },
             class,
+            "aria-label": tooltip_title,
             onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
@@ -277,7 +305,7 @@ pub fn PeerListButton(
                     path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Participants — Close Peers" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Hide the participant list." }
                 }
             } else {
@@ -295,7 +323,7 @@ pub fn PeerListButton(
                     path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Participants — Open Peers" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "See who's in the call and per-peer host controls." }
                 }
             }
@@ -321,11 +349,17 @@ pub fn DiagnosticsButton(
     } else {
         "video-control-button"
     };
+    let tooltip_title = if open {
+        "Diagnostics — Close Diagnostics"
+    } else {
+        "Diagnostics — Open Diagnostics"
+    };
 
     rsx! {
         button {
             id: if id.is_empty() { None } else { Some(id.clone()) },
             class,
+            "aria-label": tooltip_title,
             onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
@@ -339,7 +373,7 @@ pub fn DiagnosticsButton(
                     path { d: "M2 12h2l3.5-7L12 19l2.5-5H20" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Diagnostics — Close Diagnostics" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "Hide the live connection-quality and stats panel." }
                 }
             } else {
@@ -354,7 +388,7 @@ pub fn DiagnosticsButton(
                     path { d: "M2 12h2l3.5-7L12 19l2.5-5H20" }
                 }
                 span { class: "tooltip",
-                    span { class: "tooltip-title", "Diagnostics — Open Diagnostics" }
+                    span { class: "tooltip-title", "{tooltip_title}" }
                     span { class: "tooltip-desc", "View live connection quality, bitrate, packet loss, and codec stats." }
                 }
             }
@@ -447,6 +481,7 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
         button {
             class,
             "data-testid": "open-settings",
+            "aria-label": tooltip_title,
             onclick: move |evt| onclick.call(evt),
 
             svg {
@@ -505,7 +540,7 @@ pub fn MeetingOptionsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
         button {
             class,
             "data-testid": "open-meeting-options",
-            "aria-label": "Meeting options",
+            "aria-label": tooltip_title,
             onclick: move |evt| onclick.call(evt),
 
             svg {
@@ -541,7 +576,7 @@ pub fn MockPeersButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element
     };
 
     rsx! {
-        button { id: "mock-peers-trigger", class, onclick: move |evt| onclick.call(evt),
+        button { id: "mock-peers-trigger", class, "aria-label": "Mock peers", onclick: move |evt| onclick.call(evt),
             svg {
                 xmlns: "http://www.w3.org/2000/svg",
                 view_box: "0 0 24 24",
@@ -611,6 +646,7 @@ pub fn HangUpButton(onclick: EventHandler<MouseEvent>) -> Element {
     rsx! {
         button {
             class: "video-control-button danger",
+            "aria-label": "Hang up",
             onclick: move |evt| onclick.call(evt),
             span { class: "tooltip",
                 span { class: "tooltip-title", "Hang up" }

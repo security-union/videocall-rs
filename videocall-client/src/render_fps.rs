@@ -47,21 +47,39 @@ pub fn emit_render_fps(fps: f64) -> bool {
     }
 }
 
-/// Gate condition for the 1-second interval emit: only emit a render-FPS metric
-/// when at least one rAF frame fired in the window.
+/// Gate condition for the 1-second interval emit: decide whether to broadcast a
+/// render-FPS metric for a window that painted `frames` rAF callbacks while the
+/// page's `document.hidden` was `page_hidden`.
 ///
-/// A count of 0 means the page was backgrounded (rAF paused) or the observer
-/// just started — NOT that rendering is under pressure.  Emitting `Some(0.0)`
-/// would be misread by the decode-budget controller as "FPS collapsed → step
-/// down", triggering a false down-step even when no video is being decoded.
-/// Skipping the event leaves the budget controller's sample window incomplete,
-/// so it returns `Hold` — the correct behaviour for an idle or hidden page.
+/// Emit when either:
+/// - `frames > 0` — a real rAF measurement, always worth reporting; or
+/// - the page is in the *foreground* (`!page_hidden`) — even a 0-frame window,
+///   because a foreground second with zero rAF callbacks is genuine rendering
+///   pressure (the main thread was blocked for ~1 s). Emitting `Some(0.0)`
+///   there is CORRECT: it lets the decode-budget controller see the collapse
+///   and, if it sustains, take a protective step-down (a median of 0 fps is
+///   `<= FPS_SEVERE`).
 ///
-/// Extracted (and NOT `#[cfg(target_arch = "wasm32")]`-gated) so the interval
-/// closure calls exactly this predicate and host unit tests can pin its
-/// behaviour directly.
-pub fn should_emit_render_fps(frames: u32) -> bool {
-    frames > 0
+/// Skip ONLY when `frames == 0` AND `page_hidden` is true: a backgrounded tab
+/// has its rAF loop paused by the browser, so 0 frames is expected there and is
+/// NOT a collapse. Reporting `Some(0.0)` for a hidden tab would be misread as
+/// "FPS collapsed → step down", a false down-step even though nothing is wrong.
+///
+/// Downstream effect of a skip: the Dioxus decode-budget control loop
+/// (`attendants.rs`) only closes a sample bucket when a `client_render_fps`
+/// event arrives — with no event it `continue`s without pushing a sample, so
+/// the sample window does not advance and no step decision runs. The cap is
+/// therefore held while the tab is hidden, which is the correct behaviour for a
+/// backgrounded page. (It is NOT that a `None`-fps sample enters the window;
+/// the loop simply does not advance.)
+///
+/// `page_hidden` is passed in (rather than read here) so this predicate stays
+/// pure and host-testable; the wasm interval closure reads `document.hidden()`
+/// each tick and forwards it. Extracted (and NOT `#[cfg(target_arch =
+/// "wasm32")]`-gated) so the closure calls exactly this predicate and host unit
+/// tests can pin its behaviour directly.
+pub fn should_emit_render_fps(frames: u32, page_hidden: bool) -> bool {
+    frames > 0 || !page_hidden
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -115,14 +133,27 @@ impl RenderFpsObserver {
 
         // 1-second interval: read frame count, emit metric, reset counter.
         let count_for_interval = frame_count.clone();
+        // Cache the Document handle once (stable for the page lifetime) so the
+        // interval closure can read live tab visibility each tick without
+        // re-walking window()->document(). `None` is impossible in a browser;
+        // if it ever were, the gate below treats the page as visible.
+        let document_for_interval = window.document();
         let interval_closure = Closure::<dyn FnMut()>::new(move || {
             let frames = count_for_interval.get();
             count_for_interval.set(0);
-            // Only emit when at least one rAF frame fired.  The gate condition
-            // lives in `should_emit_render_fps` so it is host-testable; see that
-            // function for why a 0-frame window must be skipped rather than
-            // emitted as Some(0.0).
-            if should_emit_render_fps(frames) {
+            // Read live page visibility each tick. A hidden tab pauses rAF, so a
+            // 0-frame window there is expected and must NOT be reported as a
+            // collapse; a foreground 0-frame window is genuine rendering
+            // pressure the decode-budget controller must see. `None` document
+            // defaults to "visible" (matches health_reporter's convention), so
+            // unknown visibility still surfaces the 0. The gate condition lives
+            // in `should_emit_render_fps` so it is host-testable; see that
+            // function for the full rationale.
+            let page_hidden = document_for_interval
+                .as_ref()
+                .map(|d| d.hidden())
+                .unwrap_or(false);
+            if should_emit_render_fps(frames, page_hidden) {
                 emit_render_fps(frames as f64);
             }
         });
@@ -206,40 +237,66 @@ mod tests {
         let _ = RenderFpsObserver::start().expect("native stub should start");
     }
 
-    // ── frames > 0 gate ───────────────────────────────────────────────────────
+    // ── visibility-aware emit gate ────────────────────────────────────────────
     //
-    // The 1-second interval closure only calls `emit_render_fps` when the rAF
-    // frame count is > 0.  Emitting Some(0.0) when the page is backgrounded
-    // would be misread by the decode-budget controller as "FPS collapsed →
-    // step down", triggering a false down-step with no video being decoded.
+    // The 1-second interval closure emits a render-FPS metric iff
+    // `should_emit_render_fps(frames, page_hidden)` is true, where `page_hidden`
+    // is the live `document.hidden()` read that tick. The predicate must:
+    //   - always emit when frames were painted (`frames > 0`), regardless of
+    //     visibility (a real measurement is always worth reporting);
+    //   - emit a 0-frame window when the page is in the FOREGROUND — a genuine
+    //     rendering-pressure event the decode-budget controller must see (a
+    //     sustained median of 0 fps is `<= FPS_SEVERE` → protective step-down);
+    //   - skip a 0-frame window ONLY when the page is HIDDEN — a backgrounded
+    //     tab pauses rAF, so 0 frames is expected and must NOT be reported as a
+    //     collapse (which would trigger a false down-step).
     //
-    // These tests pin the CONDITION that gates the emit by calling the exact
-    // production predicate (`should_emit_render_fps`) that the interval closure
-    // uses as its guard (`if should_emit_render_fps(frames) { emit_render_fps(..) }`).
-    // They fail if `should_emit_render_fps` is mutated to always return `true`
-    // or always `false` — i.e. if the gate stops discriminating zero from
-    // non-zero frame counts.
+    // These tests pin that CONDITION by calling the exact production predicate
+    // the interval closure uses as its guard
+    // (`if should_emit_render_fps(frames, page_hidden) { emit_render_fps(..) }`).
+    // The full 2x2 matrix below fails under every single-operator mutation of
+    // `frames > 0 || !page_hidden`: dropping the `frames` term breaks the
+    // hidden+nonzero case, dropping the visibility term breaks the
+    // foreground+zero case, flipping `||`→`&&` breaks the hidden+nonzero case,
+    // and always-true / always-false break the hidden-zero / foreground-zero
+    // cases respectively.
 
-    /// Zero frames must NOT satisfy the gate (`should_emit_render_fps(0)` is
-    /// false), so `emit_render_fps` is skipped.  A 0-fps metric cannot be
-    /// distinguished by the budget controller from a true FPS collapse.
+    /// Zero frames while the page is HIDDEN must NOT satisfy the gate: a
+    /// backgrounded tab pauses rAF, so 0 frames is expected, not a collapse.
+    /// A `Some(0.0)` here cannot be distinguished by the budget controller from
+    /// a true FPS collapse, so it must be skipped.
     #[test]
-    fn zero_frames_does_not_satisfy_gate() {
+    fn zero_frames_hidden_page_does_not_satisfy_gate() {
         assert!(
-            !should_emit_render_fps(0),
-            "gate must not fire for zero frames"
+            !should_emit_render_fps(0, true),
+            "gate must not fire for zero frames on a hidden tab"
         );
     }
 
-    /// One or more frames MUST satisfy the gate (`should_emit_render_fps` is
-    /// true), so `emit_render_fps` runs.
+    /// Zero frames while the page is in the FOREGROUND MUST satisfy the gate:
+    /// a foreground second with no rAF callbacks is genuine rendering pressure
+    /// (main thread blocked ~1 s), which the budget controller must see so it
+    /// can take a protective step-down if it sustains.
     #[test]
-    fn nonzero_frames_satisfies_gate() {
+    fn zero_frames_foreground_page_satisfies_gate() {
+        assert!(
+            should_emit_render_fps(0, false),
+            "gate MUST fire for a foreground 0-frame window (real rendering pressure)"
+        );
+    }
+
+    /// One or more frames MUST satisfy the gate regardless of visibility — a
+    /// real rAF measurement is always worth reporting.
+    #[test]
+    fn nonzero_frames_satisfies_gate_regardless_of_visibility() {
         for frames in [1u32, 30, 60, 120] {
-            assert!(
-                should_emit_render_fps(frames),
-                "frame count {frames} must pass the gate and trigger emit_render_fps"
-            );
+            for page_hidden in [false, true] {
+                assert!(
+                    should_emit_render_fps(frames, page_hidden),
+                    "frame count {frames} (page_hidden={page_hidden}) must pass the gate \
+                     and trigger emit_render_fps"
+                );
+            }
         }
     }
 

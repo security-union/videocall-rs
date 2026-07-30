@@ -3559,14 +3559,15 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
   // HOW THE TEST DRIVES IT (deterministic, no real network impairment):
   // the netsim build (TRUNK_BUILD_FEATURES=netsim, always-on in the e2e stack —
   // docker/docker-compose.e2e.yaml) exposes `window.__vcNetsim.bumpUplinkStall(n)`
-  // and `bumpWsDrop(n)`, which add `n` to the process-global transport counters
-  // the detector reads (`unistream_ready_stall_count` / `websocket_drop_count`).
-  // We bump BOTH axes so the test is transport-agnostic: the decision is an OR
-  // across the WT-saturation and WS-drop axes (`audio_uplink_step_down_decision`),
-  // and the bump functions increment the shared statics regardless of the elected
-  // transport. Audio thresholds (videocall-aq/src/constants.rs): per-axis delta
-  // ≥ 5 over a tumbling 4000 ms window, evaluated at the 1 Hz recovery tick. The
-  // window must CLOSE with delta ≥ threshold to fire, and the detector seeds its
+  // and `bumpWsDrop(n)`, which add `n` to the audio-attributed transport slots
+  // the detector reads (while preserving the aggregate counters used by camera
+  // and screen AQ). We bump BOTH axes so the test is transport-agnostic: the
+  // decision is an OR across the WT-saturation and WS-drop axes
+  // (`audio_uplink_step_down_decision`), and the bump functions update the audio
+  // slots regardless of the elected transport. Audio thresholds
+  // (videocall-aq/src/constants.rs): per-axis delta ≥ 5 over a tumbling 4000 ms
+  // window, evaluated at the 1 Hz recovery tick. The window must CLOSE with
+  // delta ≥ threshold to fire, and the detector seeds its
   // window snapshot from the CURRENT counter at start — so we bump generously
   // (+10 per tick) across several seconds and poll for up to ~20 s, guaranteeing a
   // window closes with a large delta. Recovery climbs the floor back up only one
@@ -3741,13 +3742,13 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 
   // #1616 — WT WRITE-DROP axis in ISOLATION (follow-up to #1398).
   //
-  // The #1398 detector ORs THREE publisher-uplink-distress axes: WT ready-stall
-  // (`unistream_ready_stall_count`), WS send-buffer drop (`websocket_drop_count`),
-  // and WT write-drop (`unistream_drop_count`). The test above drives the first
-  // two via bumpUplinkStall/bumpWsDrop; the third axis previously had a netsim
-  // bumper gap (#1616) and was host-unit-tested only. This test drives ONLY
-  // `bumpWtDrop` (no stall, no WS drop) and asserts the SAME worklet ACK, so the
-  // WT-drop axis has deterministic e2e coverage into the identical
+  // The #1398 detector ORs THREE audio-attributed publisher-uplink-distress
+  // axes: WT ready-stall, WS send-buffer drop, and WT write-drop. The test above
+  // drives the first two via bumpUplinkStall/bumpWsDrop; the third axis
+  // previously had a netsim bumper gap (#1616) and was host-unit-tested only.
+  // This test drives ONLY `bumpWtDrop` (no stall, no WS drop) and asserts the
+  // SAME worklet ACK, so the WT-drop axis has deterministic e2e coverage into
+  // the identical
   // floor → ctl-4002 → worklet → ACK pipeline.
   //
   // Mutation-coupled like the sibling: the ACK log fires ONLY when the worklet

@@ -21,6 +21,20 @@ import { waitForServices } from "../helpers/wait-for-services";
  * After running, the sentinel `vc_storage_migrated=1` is written so the
  * migration never fires again — preventing perpetual deletion of legitimate
  * all-hex display names.
+ *
+ * ─── Test approach: seed legacy keys BEFORE the first boot ───────────────────
+ * `migrate_legacy_storage()` runs exactly once, in `main()` during wasm boot,
+ * and then writes the sentinel. To exercise a transform (promote / drop) the
+ * legacy key must already be in localStorage when that first `main()` runs.
+ * Tests therefore seed via `page.addInitScript(...)` — which executes before any
+ * page script on every load — and then navigate ONCE. Setting the key with
+ * `page.evaluate()` AFTER `goto()` instead races the boot: if `main()` runs
+ * first it writes the sentinel on empty storage, and the later value is never
+ * migrated (the sentinel makes a subsequent reload a no-op). That race is what
+ * made these transform tests flake — passing only when the post-goto write
+ * happened to beat boot. Pre-boot seeding removes the race entirely. The
+ * preserve/sentinel tests below keep their value regardless of ordering, so
+ * they are left on the simpler goto→set→reload form.
  */
 
 // Real CBOR+zlib hex blob: zlib.compress(CBOR("Alice")).  Header 0x789c
@@ -51,12 +65,12 @@ test.describe("Legacy storage migration (migrate_legacy_storage)", () => {
   test("removes real CBOR+zlib hex blob from vc_display_name when no fallback keys exist", async ({
     page,
   }) => {
-    await page.goto("/");
-    await page.evaluate(
+    // Seed BEFORE boot so the one-time migration sees the blob on first load.
+    await page.addInitScript(
       (blob) => localStorage.setItem("vc_display_name", blob),
       REAL_CBOR_HEX_BLOB,
     );
-    await page.reload();
+    await page.goto("/");
 
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem("vc_display_name")), {
@@ -78,9 +92,9 @@ test.describe("Legacy storage migration (migrate_legacy_storage)", () => {
   // 2. vc_display_name_raw is promoted to vc_display_name when no current
   //    key exists.
   test("promotes vc_display_name_raw to vc_display_name", async ({ page }) => {
+    // Seed BEFORE boot so the one-time migration sees the raw key on first load.
+    await page.addInitScript(() => localStorage.setItem("vc_display_name_raw", "Alice"));
     await page.goto("/");
-    await page.evaluate(() => localStorage.setItem("vc_display_name_raw", "Alice"));
-    await page.reload();
 
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem("vc_display_name")), {
@@ -97,9 +111,9 @@ test.describe("Legacy storage migration (migrate_legacy_storage)", () => {
 
   // 3. vc_username is promoted to vc_display_name when no other keys exist.
   test("promotes vc_username to vc_display_name", async ({ page }) => {
+    // Seed BEFORE boot so the one-time migration sees the legacy key on first load.
+    await page.addInitScript(() => localStorage.setItem("vc_username", "Bob"));
     await page.goto("/");
-    await page.evaluate(() => localStorage.setItem("vc_username", "Bob"));
-    await page.reload();
 
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem("vc_display_name")), {
@@ -117,12 +131,13 @@ test.describe("Legacy storage migration (migrate_legacy_storage)", () => {
   // 4. When a CBOR hex blob exists alongside vc_display_name_raw, the blob
   //    is dropped and the raw fallback wins.
   test("drops CBOR hex blob and falls back to vc_display_name_raw", async ({ page }) => {
-    await page.goto("/");
-    await page.evaluate((blob) => {
+    // Seed BOTH keys BEFORE boot so the one-time migration drops the blob and
+    // falls back to the raw key on first load.
+    await page.addInitScript((blob) => {
       localStorage.setItem("vc_display_name", blob);
       localStorage.setItem("vc_display_name_raw", "Alice");
     }, REAL_CBOR_HEX_BLOB);
-    await page.reload();
+    await page.goto("/");
 
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem("vc_display_name")), {

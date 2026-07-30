@@ -370,6 +370,31 @@ struct AudioUplinkAxisInput {
     elapsed_ms: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AudioUplinkCounterValues {
+    saturation: u64,
+    websocket_drop: u64,
+    webtransport_drop: u64,
+}
+
+/// Read only transport distress attributed to attempted audio sends. Aggregate
+/// counters remain available to camera/screen AQ and health reporting, but are
+/// intentionally excluded from the microphone backstop (#1677).
+fn current_audio_uplink_counter_values() -> AudioUplinkCounterValues {
+    let audio_stream_key = MediaStreamKey::Audio.as_u8();
+    AudioUplinkCounterValues {
+        saturation: videocall_transport::webtransport::unistream_ready_stall_count_for_stream(
+            audio_stream_key,
+        ),
+        websocket_drop: videocall_transport::websocket::websocket_drop_count_for_stream(
+            audio_stream_key,
+        ),
+        webtransport_drop: videocall_transport::webtransport::unistream_drop_count_for_stream(
+            audio_stream_key,
+        ),
+    }
+}
+
 /// Outcome of one [`audio_uplink_step_down_decision`] tick. `step_down` fires if
 /// ANY axis crossed its threshold within its (closed) window; `roll_*` /
 /// `new_*_snapshot` are PER AXIS because the three windows are independent.
@@ -499,13 +524,10 @@ fn audio_uplink_step_down_decision(
 /// regardless of video state. Pure so the gate is host-testable; the closure
 /// passes the live atomic loads in.
 ///
-/// NOTE on per-stream attribution (Tony's #1615 review comment): the 3 uplink
-/// counters (unistream_ready_stall_count, unistream_drop_count,
-/// websocket_drop_count) are PROCESS-GLOBAL with NO per-stream attribution.
-/// When the screen is active and driving distress, this gate may fire an audio
-/// downshift. This is BOUNDED (audio floors at 8 kbps and never stops) and
-/// accepted as a known limitation. The root fix is per-stream counter
-/// attribution at the transport level — out of scope for this issue.
+/// The detector reads the audio-attributed variants of all three transport
+/// counters (#1677). Camera and screen sends still contribute to the aggregate
+/// counters used by their own AQ loops and health reporting, but cannot open
+/// this audio backstop by themselves.
 fn audio_detector_gate_open(
     single_layer: bool,
     camera_active: bool,
@@ -541,7 +563,7 @@ fn audio_detector_gate_open(
 ///     (mic stays enabled, `switching` stays false) — the detector keeps running
 ///     with `was_active == true`. This is the core camera-off path.
 ///
-/// In BOTH cases the global counters advanced while the detector was not measuring
+/// In BOTH cases the monotonic counters advanced while the detector was not measuring
 /// from a fresh anchor, so the first post-event delta over a too-long/stale
 /// `elapsed` would otherwise fire a SPURIOUS immediate cut. Re-seeding re-anchors
 /// all windows to "now" so distress is measured from now forward, never across the
@@ -1105,9 +1127,11 @@ pub struct MicrophoneEncoder {
     /// `u32::MAX` = fail-open ("no congestion cut"). DRIVEN DOWN by the mic-side
     /// uplink-distress detector (the congestion-recovery `Interval` in
     /// [`Self::start`], #1398), NOT by the client: each detector tick reads the
-    /// live process-global transport counters (`unistream_ready_stall_count` /
-    /// `websocket_drop_count`) and, on SUSTAINED distress while the camera is OFF
-    /// (audio-only or screen-only), stores
+    /// live audio-attributed transport counters
+    /// (`unistream_ready_stall_count_for_stream` /
+    /// `websocket_drop_count_for_stream` /
+    /// `unistream_drop_count_for_stream`) and, on SUSTAINED distress while the
+    /// camera is OFF (audio-only or screen-only), stores
     /// `audio_congestion_bitrate_step_down(floor)` here. (The original b127ee80
     /// trigger — a self-targeted `PacketType::CONGESTION` server packet — was
     /// retired: #1219 Half 1 removed that emission server-side, so it never fired
@@ -2289,8 +2313,8 @@ impl MicrophoneEncoder {
             let bitrate_last_seen: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
             // --- Mic-side uplink-distress DETECTOR state (issue #1398) ---
             // The DOWN trigger for the single-layer bitrate floor. Mic-OWNED
-            // tumbling-window state (NOT consume-once): the process-global
-            // transport counters are monotonic and read by multiple consumers, so
+            // tumbling-window state (NOT consume-once): the per-stream transport
+            // counters are monotonic and may be read by multiple consumers, so
             // each consumer keeps its OWN snapshot/window — exactly how the camera
             // AQ loop's WT-saturation / WS-drop / WT-drop blocks each keep
             // independent windows. THREE axes (WT slow-`ready()` saturation, WS
@@ -2314,20 +2338,18 @@ impl MicrophoneEncoder {
             // move closure. CONSUMED (swap-to-false) each tick the detector
             // evaluates, forcing a window re-seed once per reconnect.
             let detector_reconnect_reseed = detector_reconnect_reseed.clone();
-            let det_sat_snapshot: Rc<Cell<u64>> = Rc::new(Cell::new(
-                videocall_transport::webtransport::unistream_ready_stall_count(),
-            ));
+            let initial_audio_counters = current_audio_uplink_counter_values();
+            let det_sat_snapshot: Rc<Cell<u64>> =
+                Rc::new(Cell::new(initial_audio_counters.saturation));
             let det_sat_window_start: Rc<Cell<f64>> = Rc::new(Cell::new(js_sys::Date::now()));
-            let det_ws_snapshot: Rc<Cell<u64>> = Rc::new(Cell::new(
-                videocall_transport::websocket::websocket_drop_count(),
-            ));
+            let det_ws_snapshot: Rc<Cell<u64>> =
+                Rc::new(Cell::new(initial_audio_counters.websocket_drop));
             let det_ws_window_start: Rc<Cell<f64>> = Rc::new(Cell::new(js_sys::Date::now()));
             // Third axis (#1398): WT unistream DROP. Seeded from the live drop
             // counter so the first window measures from "now" — exactly like the
             // two axes above and the camera AQ's own WT-drop window.
-            let det_wtdrop_snapshot: Rc<Cell<u64>> = Rc::new(Cell::new(
-                videocall_transport::webtransport::unistream_drop_count(),
-            ));
+            let det_wtdrop_snapshot: Rc<Cell<u64>> =
+                Rc::new(Cell::new(initial_audio_counters.webtransport_drop));
             let det_wtdrop_window_start: Rc<Cell<f64>> = Rc::new(Cell::new(js_sys::Date::now()));
             // FIX 1: tracks whether the detector EVALUATED on the previous tick.
             // Starts `false` so the very first activation re-seeds (harmless — it
@@ -2417,7 +2439,7 @@ impl MicrophoneEncoder {
                 // early-return (mic muted, switching) — all leave
                 // `det_was_active == false` — re-anchor ALL THREE axes to `now` and
                 // SKIP the step-down this tick. The windows were NOT rolled while
-                // inactive but the global counters kept climbing, so the delta over
+                // inactive but the audio counters kept climbing, so the delta over
                 // a too-long `elapsed` would otherwise be a spurious immediate cut.
                 // Re-seeding measures distress from now forward. The windowed
                 // decision (steady-state path) is the pure, host-tested
@@ -2455,32 +2477,28 @@ impl MicrophoneEncoder {
                         // stale_snapshot` over a too-long `elapsed` and could cash a
                         // spurious cross-gap cut on the drop counter (which kept
                         // climbing while the detector was gated/early-returned).
-                        det_sat_snapshot
-                            .set(videocall_transport::webtransport::unistream_ready_stall_count());
+                        let counters = current_audio_uplink_counter_values();
+                        det_sat_snapshot.set(counters.saturation);
                         det_sat_window_start.set(now);
-                        det_ws_snapshot.set(videocall_transport::websocket::websocket_drop_count());
+                        det_ws_snapshot.set(counters.websocket_drop);
                         det_ws_window_start.set(now);
-                        det_wtdrop_snapshot
-                            .set(videocall_transport::webtransport::unistream_drop_count());
+                        det_wtdrop_snapshot.set(counters.webtransport_drop);
                         det_wtdrop_window_start.set(now);
                     } else {
-                        let sat_now =
-                            videocall_transport::webtransport::unistream_ready_stall_count();
-                        let ws_now = videocall_transport::websocket::websocket_drop_count();
-                        let wtdrop_now = videocall_transport::webtransport::unistream_drop_count();
+                        let counters = current_audio_uplink_counter_values();
                         let decision = audio_uplink_step_down_decision(
                             AudioUplinkAxisInput {
-                                current: sat_now,
+                                current: counters.saturation,
                                 snapshot: det_sat_snapshot.get(),
                                 elapsed_ms: now - det_sat_window_start.get(),
                             },
                             AudioUplinkAxisInput {
-                                current: ws_now,
+                                current: counters.websocket_drop,
                                 snapshot: det_ws_snapshot.get(),
                                 elapsed_ms: now - det_ws_window_start.get(),
                             },
                             AudioUplinkAxisInput {
-                                current: wtdrop_now,
+                                current: counters.webtransport_drop,
                                 snapshot: det_wtdrop_snapshot.get(),
                                 elapsed_ms: now - det_wtdrop_window_start.get(),
                             },
@@ -2763,8 +2781,8 @@ mod layer_count_tests {
         audio_congestion_recover, audio_congestion_tick, audio_detector_gate_open,
         audio_detector_should_reseed, audio_fec_reconfig_change, audio_layer_is_published,
         audio_reconfig_change, audio_uplink_step_down_decision, clamp_audio_layer_count,
-        effective_audio_bitrate, AudioUplinkAxisInput, AUDIO_SIMULCAST_LAYER_KBPS,
-        AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS,
+        current_audio_uplink_counter_values, effective_audio_bitrate, AudioUplinkAxisInput,
+        AUDIO_SIMULCAST_LAYER_KBPS, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS,
     };
     use crate::adaptive_quality_constants::{
         AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS, AUDIO_QUALITY_TIERS,
@@ -2774,6 +2792,7 @@ mod layer_count_tests {
         WS_SELF_CONGESTION_WINDOW_MS, WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS,
         WT_SELF_CONGESTION_DROP_THRESHOLD, WT_SELF_CONGESTION_WINDOW_MS,
     };
+    use crate::connection::MediaStreamKey;
 
     // Tier bitrates in bps, derived from the table (single source of truth) so
     // the tests reference the SAME values the production code does.
@@ -3658,6 +3677,68 @@ mod layer_count_tests {
             snapshot: 0,
             elapsed_ms: AUDIO_UPLINK_WS_WINDOW_MS, // >= all three audio windows
         }
+    }
+
+    #[test]
+    fn screen_transport_distress_alone_does_not_step_audio() {
+        let audio_before = current_audio_uplink_counter_values();
+        let aggregate_sat_before = videocall_transport::webtransport::unistream_ready_stall_count();
+        let aggregate_ws_before = videocall_transport::websocket::websocket_drop_count();
+        let aggregate_wtdrop_before = videocall_transport::webtransport::unistream_drop_count();
+        let screen_stream_key = MediaStreamKey::Screen.as_u8();
+
+        videocall_transport::webtransport::force_unistream_ready_stall_for_stream(
+            screen_stream_key,
+            AUDIO_UPLINK_SATURATION_STALL_THRESHOLD,
+        );
+        videocall_transport::websocket::force_websocket_drop_for_stream(
+            screen_stream_key,
+            AUDIO_UPLINK_WS_DROP_THRESHOLD,
+        );
+        videocall_transport::webtransport::force_unistream_drop_for_stream(
+            screen_stream_key,
+            AUDIO_UPLINK_WT_DROP_THRESHOLD,
+        );
+
+        assert!(
+            videocall_transport::webtransport::unistream_ready_stall_count() - aggregate_sat_before
+                >= AUDIO_UPLINK_SATURATION_STALL_THRESHOLD
+        );
+        assert!(
+            videocall_transport::websocket::websocket_drop_count() - aggregate_ws_before
+                >= AUDIO_UPLINK_WS_DROP_THRESHOLD
+        );
+        assert!(
+            videocall_transport::webtransport::unistream_drop_count() - aggregate_wtdrop_before
+                >= AUDIO_UPLINK_WT_DROP_THRESHOLD
+        );
+
+        let audio_after = current_audio_uplink_counter_values();
+        assert_eq!(
+            audio_after, audio_before,
+            "screen-only pressure must leave every audio-attributed signal flat"
+        );
+        let decision = audio_uplink_step_down_decision(
+            AudioUplinkAxisInput {
+                current: audio_after.saturation,
+                snapshot: audio_before.saturation,
+                elapsed_ms: AUDIO_UPLINK_SATURATION_WINDOW_MS,
+            },
+            AudioUplinkAxisInput {
+                current: audio_after.websocket_drop,
+                snapshot: audio_before.websocket_drop,
+                elapsed_ms: AUDIO_UPLINK_WS_WINDOW_MS,
+            },
+            AudioUplinkAxisInput {
+                current: audio_after.webtransport_drop,
+                snapshot: audio_before.webtransport_drop,
+                elapsed_ms: AUDIO_UPLINK_WT_DROP_WINDOW_MS,
+            },
+        );
+        assert!(
+            !decision.step_down,
+            "screen-only pressure must not trigger the microphone bitrate floor"
+        );
     }
 
     #[test]

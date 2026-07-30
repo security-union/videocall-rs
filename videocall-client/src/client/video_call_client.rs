@@ -48,6 +48,7 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use videocall_transport::webtransport::FrameDropMeta;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::health_packet::HealthPacket;
@@ -57,7 +58,9 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
 
-use super::reactions::{resolve_reaction_display_name, REACTION_DISPLAY_NAME_MAX_CHARS};
+use super::reactions::{
+    resolve_reaction_display_name, validate_custom_emoji, REACTION_DISPLAY_NAME_MAX_CHARS,
+};
 use videocall_types::protos::layer_hint_packet::{layer_hint_packet::MediaKind, LayerHintPacket};
 use videocall_types::protos::layer_preference_packet::{
     layer_preference_packet::Entry as LayerPreferenceEntry, LayerPreferencePacket,
@@ -200,6 +203,13 @@ impl std::fmt::Debug for RefreshRoomTokenCallback {
 }
 
 /// Configuration options for creating a [`VideoCallClient`].
+/// Callback payload for an inbound peer reaction (issue 1884):
+/// `(sender_session_id, reaction_enum_i32, resolved_name, custom_emoji)`.
+/// `custom_emoji` is `Some(validated_emoji)` ONLY for a CUSTOM (12) reaction and
+/// `None` for every 1..=11 reaction. Aliased so the nested-tuple callback type
+/// stays under clippy's `type_complexity` bar at every use site.
+pub type ReactionCallback = Callback<(u64, i32, String, Option<String>)>;
+
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
 /// initialise the client.  Pass an instance of this struct to
@@ -208,6 +218,11 @@ impl std::fmt::Debug for RefreshRoomTokenCallback {
 pub struct VideoCallClientOptions {
     pub enable_e2ee: bool,
     pub enable_webtransport: bool,
+    /// Operator ceiling for received camera and screen simulcast layers.
+    /// `Some(0)` means base only; `None` leaves receive selection uncapped.
+    pub max_received_layer: Option<u32>,
+    /// Keep receive/decode active but skip painting decoded video frames.
+    pub skip_canvas_paint: bool,
     pub on_peer_added: Callback<String>,
     pub on_peer_first_frame: Callback<(String, MediaType)>,
     pub on_peer_removed: Option<Callback<String>>,
@@ -333,15 +348,20 @@ pub struct VideoCallClientOptions {
     ///   and is otherwise client-forgeable — a REACTION's sender_session_id is a
     ///   trustworthy identity anchor: a peer cannot forge a reaction attributed
     ///   to someone else;
-    /// - `reaction_enum_i32` is a defined `ReactionType` value (1..=7) — the
+    /// - `reaction_enum_i32` is a defined `ReactionType` value (1..=12) — the
     ///   client already dropped `UNSPECIFIED`/unknown, so the UI can map it to
     ///   an emoji/label directly;
     /// - `resolved_name` is the display name resolved via the display-name
-    ///   cache, falling back to the sanitized in-packet name, then "Someone".
+    ///   cache, falling back to the sanitized in-packet name, then "Someone";
+    /// - `custom_emoji` is `Some(validated_emoji)` ONLY for a CUSTOM (12)
+    ///   reaction — the client has already validated it against the exact
+    ///   standard-emoji allowlist + byte cap ([`validate_custom_emoji`]) before
+    ///   firing, so an invalid custom emoji never reaches the callback (it is
+    ///   dropped on receive). `None` for every 1..=11 reaction.
     ///
     /// The client never fires this for the local user's OWN reaction (the relay
     /// self-skips the sender); the UI renders its own echo on click instead.
-    pub on_reaction: Option<Callback<(u64, i32, String)>>,
+    pub on_reaction: Option<ReactionCallback>,
 
     /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
     /// silently discarded and no peer decoder workers are created.  Only
@@ -395,6 +415,32 @@ pub struct VideoCallClientOptions {
     pub refresh_room_token_callback: Option<RefreshRoomTokenCallback>,
 }
 
+pub(crate) fn cap_receive_max(requested: Option<u32>, ceiling: Option<u32>) -> Option<u32> {
+    match (requested, ceiling) {
+        (Some(requested), Some(ceiling)) => Some(requested.min(ceiling)),
+        (requested, None) => requested,
+        (None, ceiling) => ceiling,
+    }
+}
+
+/// Apply the operator `maxReceivedLayer` ceiling to a `(min, max)` receive-bounds
+/// pair for a capped kind (video/screen), #2068. The ceiling bounds BOTH ends so
+/// the range can never invert: `max` is capped via [`cap_receive_max`], and an
+/// EXISTING `min` is clamped DOWN to the ceiling (a `None` min is never raised
+/// into a floor). Capping only `max` while a persisted user receive-`min` exceeds
+/// the ceiling would yield an inverted range (min>max) that
+/// `KindLayerBounds::clamp` normalizes by WIDENING back above the ceiling —
+/// defeating it. Pure so it is unit-testable without the wall clock in
+/// `set_receive_layer_bounds`.
+pub(crate) fn apply_receive_ceiling(
+    min: Option<u32>,
+    max: Option<u32>,
+    ceiling: Option<u32>,
+) -> (Option<u32>, Option<u32>) {
+    let min = ceiling.map_or(min, |c| min.map(|m| m.min(c)));
+    (min, cap_receive_max(max, ceiling))
+}
+
 #[derive(Debug)]
 struct InnerOptions {
     enable_e2ee: bool,
@@ -416,7 +462,7 @@ struct InnerOptions {
     on_peer_event: Option<Callback<(String, String, String)>>,
     on_peer_left: Option<Callback<(String, String, String)>>,
     on_peer_joined: Option<Callback<(String, String, String)>>,
-    on_reaction: Option<Callback<(u64, i32, String)>>,
+    on_reaction: Option<ReactionCallback>,
     on_display_name_changed: Option<Callback<(String, String, u64)>>,
     decode_media: bool,
 }
@@ -440,6 +486,10 @@ struct Inner {
     /// chooser's desired layer at the monitor tick, so the requested + decoded
     /// layer is bounded. Set via [`VideoCallClient::set_receive_layer_bounds`].
     receive_layer_bounds: ReceiveLayerBounds,
+    /// Immutable operator ceiling applied (to BOTH `min` and `max`) to later
+    /// user/UI bounds changes, so a persisted receive-floor can never raise the
+    /// effective cap back above the ceiling (#2068).
+    max_received_layer_ceiling: Option<u32>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
@@ -875,9 +925,11 @@ fn publish_and_reconcile(
     // snapshot-to-avoid-aliasing convention used for `bounds` at the monitor tick
     // (see the `inner.receive_layer_bounds` snapshot comment ~line 1725).
     let wire = inner.layer_preference_sender.last_sent().cloned();
-    let ups = inner
-        .peer_decode_manager
-        .reconcile_decode_guards_to_wire(wire.as_ref(), now_ms);
+    let bounds = inner.receive_layer_bounds;
+    let ups =
+        inner
+            .peer_decode_manager
+            .reconcile_decode_guards_to_wire(wire.as_ref(), &bounds, now_ms);
     // Drain keyframe requests AFTER the &mut reconcile loop returned owned tuples
     // (its &mut borrow ended); `send_keyframe_request` takes `&self`. An up-switch
     // whose publish was rate-limited may waste-then-re-request a keyframe; it
@@ -1312,9 +1364,10 @@ fn handle_connected_reconnect_resets(
             let current_session = inner.own_session_id;
             let fresh_session = current_session != inner.last_reconnect_reconciled_session;
             if fresh_session {
+                let bounds = inner.receive_layer_bounds;
                 let ups = inner
                     .peer_decode_manager
-                    .reconcile_decode_guards_to_wire(None, now_ms);
+                    .reconcile_decode_guards_to_wire(None, &bounds, now_ms);
                 for (user_id, sid, mt) in &ups {
                     inner
                         .peer_decode_manager
@@ -1712,7 +1765,22 @@ impl VideoCallClient {
                     diagnostics.clone(),
                 ),
                 layer_preference_sender: LayerPreferenceSender::new(),
-                receive_layer_bounds: ReceiveLayerBounds::default(),
+                receive_layer_bounds: {
+                    // #2068 cap. FREEZE-SAFETY rests on a cross-repo relay invariant
+                    // (actix-api `chat_server.rs`): layer 0 is forwarded
+                    // UNCONDITIONALLY, and a receiver with no recorded preference is
+                    // fail-open (all layers). So a guard clamped to base always has
+                    // matching packets on the wire and can never freeze. If the relay
+                    // ever made base filterable, or switched fail-open to
+                    // forward-top-only, this cap would need revisiting.
+                    let mut bounds = ReceiveLayerBounds::default();
+                    if let Some(cap) = options.max_received_layer {
+                        bounds.set_kind(PrefMediaKind::Video, None, Some(cap));
+                        bounds.set_kind(PrefMediaKind::Screen, None, Some(cap));
+                    }
+                    bounds
+                },
+                max_received_layer_ceiling: options.max_received_layer,
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
@@ -2199,6 +2267,7 @@ impl VideoCallClient {
             peer_decode_manager.on_peers_removed_batch = cb.clone();
         }
         peer_decode_manager.set_vad_threshold(opts.vad_threshold);
+        peer_decode_manager.set_skip_canvas_paint(opts.skip_canvas_paint);
         peer_decode_manager
     }
 
@@ -2221,18 +2290,36 @@ impl VideoCallClient {
     /// line blocking — an audio packet is never queued behind a stalled
     /// video frame.  WebSocket ignores `stream_key`.
     pub(crate) fn send_media_packet(&self, media: PacketWrapper, stream_key: MediaStreamKey) {
-        self.send_packet_on_stream(media, stream_key);
+        self.send_media_packet_with_drop_meta(media, stream_key, None);
+    }
+
+    pub(crate) fn send_media_packet_with_drop_meta(
+        &self,
+        media: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) {
+        self.send_packet_on_stream_with_drop_meta(media, stream_key, meta);
     }
 
     /// Internal helper: dispatch `media` through the active
     /// `ConnectionController` on the persistent stream identified by
     /// `stream_key`.
     fn send_packet_on_stream(&self, media: PacketWrapper, stream_key: MediaStreamKey) {
+        self.send_packet_on_stream_with_drop_meta(media, stream_key, None);
+    }
+
+    fn send_packet_on_stream_with_drop_meta(
+        &self,
+        media: PacketWrapper,
+        stream_key: MediaStreamKey,
+        meta: Option<FrameDropMeta>,
+    ) {
         let packet_type = media.packet_type.enum_value();
         match self.connection_controller.try_borrow() {
             Ok(cc) => {
                 if let Some(controller) = cc.as_ref() {
-                    if let Err(e) = controller.send_packet(media, stream_key) {
+                    if let Err(e) = controller.send_packet_with_drop_meta(media, stream_key, meta) {
                         debug!(
                             "Failed to send {packet_type:?} packet on stream {stream_key:?}: {e}"
                         );
@@ -2280,6 +2367,24 @@ impl VideoCallClient {
                         "websocket"
                     }
                 });
+            }
+        }
+        None
+    }
+
+    /// This client's active-connection WebSocket send-queue depth
+    /// (`bufferedAmount`, bytes), or `None` on WebTransport — which exposes no
+    /// such counter because screen rides its own reliable QUIC unistream with no
+    /// cross-media head-of-line queue — or when no connection is elected yet.
+    ///
+    /// Read once per screen frame by the issue #1921 WS send-side freshness
+    /// gate. A cheap synchronous getter forwarded to the currently-elected
+    /// connection, so it tracks election, reconnect, and WT↔WS fallback: a fresh
+    /// socket after a reconnect reports `Some(0)`, below any drop threshold.
+    pub(crate) fn send_queue_depth(&self) -> Option<u64> {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                return controller.get_send_queue_depth();
             }
         }
         None
@@ -2499,7 +2604,7 @@ impl VideoCallClient {
                 Some(present)
             }
             Err(_) => {
-                warn!("Failed to borrow inner in peer_user_id_present for user_id: {user_id}");
+                debug!("Failed to borrow inner in peer_user_id_present for user_id: {user_id}");
                 None
             }
         }
@@ -2640,6 +2745,15 @@ impl VideoCallClient {
         max: Option<u32>,
     ) {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            let (min, max) = match kind {
+                // #2068: the operator ceiling bounds BOTH ends (see
+                // `apply_receive_ceiling`) so a persisted user receive-`min` above
+                // the ceiling can't invert the range and defeat the cap.
+                PrefMediaKind::Video | PrefMediaKind::Screen => {
+                    apply_receive_ceiling(min, max, inner.max_received_layer_ceiling)
+                }
+                PrefMediaKind::Audio => (min, max),
+            };
             inner.receive_layer_bounds.set_kind(kind, min, max);
             // Immediate enforcement: re-tick (clamps + updates decode guards) and
             // re-send the (now-bounded) preference so the relay drops out-of-bounds
@@ -3493,6 +3607,54 @@ impl VideoCallClient {
             ..Default::default()
         };
         self.send_packet(wrapper);
+    }
+
+    /// Broadcast a CUSTOM reaction carrying a picker-selected standard Unicode
+    /// `emoji` (issue 1884). Returns `true` if the packet was sent, `false` if
+    /// the emoji failed validation and nothing was sent.
+    ///
+    /// Defense in depth (mirrors the proto `custom_emoji` threat model): this
+    /// re-validates `emoji` against the exact standard-emoji allowlist + byte
+    /// cap ([`validate_custom_emoji`]) at the wire boundary even though the UI
+    /// already validated before calling — an invalid string never reaches the
+    /// wire. Like [`send_reaction`](Self::send_reaction) it does NOT self-throttle;
+    /// the UI gates each click through `ReactionSelfThrottle` first.
+    pub fn send_custom_reaction(&self, emoji: &str) -> bool {
+        if !validate_custom_emoji(emoji) {
+            warn!("Refusing to send CUSTOM reaction with invalid emoji");
+            return false;
+        }
+        let display_name: Vec<u8> = self
+            .options
+            .display_name
+            .chars()
+            .take(REACTION_DISPLAY_NAME_MAX_CHARS)
+            .collect::<String>()
+            .into_bytes();
+        // `validate_custom_emoji` above already asserted `emoji.len() <=
+        // REACTION_CUSTOM_EMOJI_MAX_BYTES`, so the whole string fits the cap; send its
+        // exact bytes (truncating raw UTF-8 bytes here could split a codepoint).
+        let packet = ReactionPacket {
+            reaction: ReactionType::CUSTOM.into(),
+            display_name,
+            custom_emoji: emoji.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let data = match packet.write_to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize CUSTOM ReactionPacket: {e}");
+                return false;
+            }
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::REACTION.into(),
+            user_id: self.options.user_id.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+        self.send_packet(wrapper);
+        true
     }
 
     /// Ensure the `SharedAudioContext` is initialised and expose it together
@@ -5017,28 +5179,57 @@ impl Inner {
                         // Unknown/reserved (Err) or UNSPECIFIED: not a renderable
                         // reaction — ignore, matching the relay ingress allowlist.
                         Err(_) | Ok(ReactionType::REACTION_TYPE_UNSPECIFIED) => {}
-                        // Any defined 1..=7 reaction.
-                        Ok(_) => {
+                        // Any defined 1..=12 reaction.
+                        Ok(reaction_type) => {
                             if let Some(cb) = &self.options.on_reaction {
-                                // Attribution anchor: the envelope session_id,
-                                // resolved via the display-name cache. For
-                                // REACTION the relay stamps this UNCONDITIONALLY
-                                // with the sender's authenticated session before
-                                // fan-out (stamp_reaction_for_broadcast in
-                                // actix-api), so it is a TRUSTWORTHY identity
-                                // anchor here — a peer cannot forge a reaction
-                                // attributed to another participant (the general
-                                // "stamped only when the client sends 0" rule,
-                                // which leaves other cleartext types forgeable,
-                                // does not apply to REACTION). The in-packet
-                                // display_name remains a sanitized cosmetic
-                                // fallback ONLY, never identity.
-                                let cached = self
-                                    .peer_decode_manager
-                                    .get_peer_display_name(&response.session_id.to_string());
-                                let name =
-                                    resolve_reaction_display_name(cached, &reaction.display_name);
-                                cb.emit((response.session_id, reaction.reaction.value(), name));
+                                // For CUSTOM, validate the attacker-controlled
+                                // custom_emoji against the exact standard-emoji
+                                // allowlist + byte cap BEFORE render (defense in
+                                // depth; the relay should already have dropped an
+                                // invalid one at ingress). `Some(None)` => emit
+                                // with no custom string (1..=11); `Some(Some(s))`
+                                // => emit the validated CUSTOM emoji; `None` =>
+                                // drop this reaction (invalid CUSTOM emoji).
+                                let custom = if reaction_type == ReactionType::CUSTOM {
+                                    let candidate = String::from_utf8_lossy(&reaction.custom_emoji)
+                                        .into_owned();
+                                    if validate_custom_emoji(&candidate) {
+                                        Some(Some(candidate))
+                                    } else {
+                                        debug!("Dropping REACTION with invalid custom_emoji");
+                                        None
+                                    }
+                                } else {
+                                    Some(None)
+                                };
+                                if let Some(custom) = custom {
+                                    // Attribution anchor: the envelope session_id,
+                                    // resolved via the display-name cache. For
+                                    // REACTION the relay stamps this UNCONDITIONALLY
+                                    // with the sender's authenticated session before
+                                    // fan-out (stamp_reaction_for_broadcast in
+                                    // actix-api), so it is a TRUSTWORTHY identity
+                                    // anchor here — a peer cannot forge a reaction
+                                    // attributed to another participant (the general
+                                    // "stamped only when the client sends 0" rule,
+                                    // which leaves other cleartext types forgeable,
+                                    // does not apply to REACTION). The in-packet
+                                    // display_name remains a sanitized cosmetic
+                                    // fallback ONLY, never identity.
+                                    let cached = self
+                                        .peer_decode_manager
+                                        .get_peer_display_name(&response.session_id.to_string());
+                                    let name = resolve_reaction_display_name(
+                                        cached,
+                                        &reaction.display_name,
+                                    );
+                                    cb.emit((
+                                        response.session_id,
+                                        reaction.reaction.value(),
+                                        name,
+                                        custom,
+                                    ));
+                                }
                             }
                         }
                     },
@@ -5139,6 +5330,95 @@ fn parse_public_key(rsa_packet: RsaPacket) -> Result<RsaPublicKey> {
         .map_err(|e| anyhow!("Failed to parse rsa public key: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// Cross-crate test seams (feature = "testing")
+//
+// `inner` is a PRIVATE field, so an external crate (e.g. `videocall-ui`) cannot
+// reach it to reproduce the transient busy-borrow contention that
+// `peer_user_id_present` was designed to survive (issue #1172). These helpers
+// expose exactly that capability — build a minimal client, and run a closure
+// while `inner` is held mutably-borrowed — WITHOUT leaking the private `Inner`
+// type across the crate boundary (returning a `RefMut<'_, Inner>` would).
+//
+// Gated behind the `testing` feature, which `videocall-ui` enables only as a
+// dev-dependency, so production builds compile these out entirely. This is the
+// cross-crate analogue of the in-crate
+// `set_peer_tile_hints_returns_false_when_inner_borrowed` test, which can touch
+// `client.inner.borrow_mut()` directly only because it lives in the same crate.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "testing")]
+impl VideoCallClient {
+    /// Test-only: build a minimal, never-connected client suitable for
+    /// exercising presence/pin wiring from another crate. Diagnostics and
+    /// health reporting are OFF so no timers or reporting tasks are spawned;
+    /// the peer table starts empty (no connected peers).
+    pub fn new_for_test(user_id: &str) -> Self {
+        Self::new(VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
+            on_peer_added: Callback::noop(),
+            on_peer_first_frame: Callback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            get_peer_video_canvas_id: Callback::from(|id| id),
+            get_peer_screen_canvas_id: Callback::from(|id| id),
+            user_id: user_id.to_string(),
+            display_name: user_id.to_string(),
+            meeting_id: "test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_connected: Callback::noop(),
+            on_connection_lost: Callback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            on_participant_kicked: None,
+            on_host_granted: None,
+            on_host_revoked: None,
+            on_peer_event: None,
+            on_peer_left: None,
+            on_display_name_changed: None,
+            on_peer_joined: None,
+            on_reaction: None,
+            decode_media: true,
+            is_guest: false,
+            allow_post_rebase_retry: true,
+            refresh_room_token_callback: None,
+        })
+    }
+
+    /// Test-only: run `f` while this client's `inner` is held under a live
+    /// mutable borrow, forcing every `try_borrow()`-based reader on `inner`
+    /// (`peer_user_id_present`, `has_peer_with_user_id`, ...) to observe
+    /// contention (`Err`) for the duration of the call — the exact runtime
+    /// state a decode/audio mutable borrow produces mid-render (issue #1172).
+    ///
+    /// Returns whatever `f` returns; the mutable borrow is released on return.
+    /// Panics if `inner` is already borrowed (that would be a test bug).
+    pub fn with_inner_borrowed_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.inner.borrow_mut();
+        f()
+    }
+}
+
 #[cfg(all(test, target_arch = "wasm32"))]
 mod disconnect_tests {
     //! Regression tests for the cc7tp meeting incident on 2026-05-01
@@ -5161,6 +5441,8 @@ mod disconnect_tests {
         VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
             user_id: "drop_test_user".to_string(),
             display_name: "Drop Tester".to_string(),
             is_guest: false,
@@ -5368,6 +5650,8 @@ mod dedup_tests {
         VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
             user_id: "dedup_test_user".to_string(),
             display_name: "Dedup Tester".to_string(),
             is_guest: false,
@@ -5706,8 +5990,10 @@ mod dedup_tests {
 /// touches no browser API, so it runs unchanged on the host target.
 #[cfg(test)]
 mod cooldown_reset_hardening_tests {
+    use super::apply_receive_ceiling;
     use super::arm_camera_keyframe_cooldown_reset;
     use super::arm_keyframe_cooldown_reset_slot;
+    use super::cap_receive_max;
     use super::handle_connected_reconnect_resets;
     use super::publish_and_reconcile;
     use super::VideoCallClient;
@@ -5720,10 +6006,101 @@ mod cooldown_reset_hardening_tests {
     // `peer_decode_manager.rs` (e.g. `downlink_congestion_steps_down_with_zero_loss`).
     use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
 
+    #[test]
+    fn receive_ceiling_combines_with_requested_max() {
+        assert_eq!(cap_receive_max(Some(2), Some(0)), Some(0));
+        assert_eq!(cap_receive_max(None, Some(0)), Some(0));
+        assert_eq!(cap_receive_max(Some(2), None), Some(2));
+        assert_eq!(cap_receive_max(None, None), None);
+    }
+
+    /// #2068 P1-C: the `maxReceivedLayer` config knob (VideoCallClientOptions)
+    /// must actually SEED the receiver ceiling into `receive_layer_bounds`.
+    /// Reverting the options->seed/ceiling wiring at construction leaves the
+    /// bounds open and the capped assertions below fail (clamp(2) == 2).
+    #[test]
+    fn max_received_layer_option_seeds_receiver_ceiling() {
+        let capped = build_test_client_with(Some(0), false);
+        let b = capped.receive_layer_bounds();
+        assert_eq!(
+            b.for_kind(PrefMediaKind::Video).clamp(2),
+            0,
+            "cap seeds video base-only"
+        );
+        assert_eq!(
+            b.for_kind(PrefMediaKind::Screen).clamp(2),
+            0,
+            "cap seeds screen base-only"
+        );
+        // Audio is intentionally NOT capped by maxReceivedLayer.
+        assert_eq!(
+            b.for_kind(PrefMediaKind::Audio).clamp(2),
+            2,
+            "audio uncapped"
+        );
+
+        let open = build_test_client_with(None, false);
+        assert_eq!(
+            open.receive_layer_bounds()
+                .for_kind(PrefMediaKind::Video)
+                .clamp(2),
+            2,
+            "no cap = open (current auto behavior)"
+        );
+    }
+
+    /// #2068 P1-B: a persisted user receive-`min` ABOVE the operator ceiling must
+    /// not defeat the ceiling. `set_receive_layer_bounds` routes video/screen
+    /// through `apply_receive_ceiling`, which clamps `min` down so the range can't
+    /// invert. Tested via the pure helper because the live
+    /// `set_receive_layer_bounds` calls `js_sys::Date::now()` (panics natively).
+    /// MUTATION: revert the `min` clamp in `apply_receive_ceiling` and the first
+    /// assertion returns `(Some(2), Some(0))` and the functional clamp returns 2.
+    #[test]
+    fn operator_ceiling_clamps_a_user_min_above_it() {
+        // ceiling 0 clamps a user floor of L2 DOWN to 0 (never inverts).
+        assert_eq!(
+            apply_receive_ceiling(Some(2), None, Some(0)),
+            (Some(0), Some(0))
+        );
+        // A `None` min is never RAISED into a floor; max is capped to the ceiling.
+        assert_eq!(apply_receive_ceiling(None, None, Some(0)), (None, Some(0)));
+        // A user floor below the ceiling is preserved; max capped to the ceiling.
+        assert_eq!(
+            apply_receive_ceiling(Some(2), Some(5), Some(3)),
+            (Some(2), Some(3))
+        );
+        // No ceiling: passthrough.
+        assert_eq!(
+            apply_receive_ceiling(Some(2), Some(1), None),
+            (Some(2), Some(1))
+        );
+
+        // Functional: the clamped bounds do NOT invert, so KindLayerBounds::clamp
+        // keeps the ceiling authoritative even against a persisted user min=L2.
+        let (mn, mx) = apply_receive_ceiling(Some(2), None, Some(0));
+        let mut bounds = ReceiveLayerBounds::default();
+        bounds.set_kind(PrefMediaKind::Video, mn, mx);
+        assert_eq!(
+            bounds.for_kind(PrefMediaKind::Video).clamp(2),
+            0,
+            "ceiling 0 stays authoritative even with a persisted user min=2"
+        );
+    }
+
     fn build_test_client() -> VideoCallClient {
+        build_test_client_with(None, false)
+    }
+
+    fn build_test_client_with(
+        max_received_layer: Option<u32>,
+        skip_canvas_paint: bool,
+    ) -> VideoCallClient {
         VideoCallClient::new(VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
+            max_received_layer,
+            skip_canvas_paint,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,

@@ -21,8 +21,21 @@ import { join } from "node:path";
  *   on `/meeting/<id>`). Useful for testing guest-flow UX, and the
  *   default surface when the meeting URL is for a public/no-auth
  *   deployment.
+ *
+ * - `"form-login"` — drive the identity provider's username/password
+ *   login form at launch (issue 2035). Needs no pre-captured state:
+ *   the bot navigates to the meeting URL, the app kicks off its PKCE
+ *   redirect chain, and the bot fills `BOT_EMAIL` / `BOT_PASSWORD` into
+ *   the identity login form (see `src/auth/form-login.ts`). Works for
+ *   any target whose identity provider exposes a plain login form the
+ *   app drives (the labsworkspace videocall identity-service is the
+ *   reference target). This backend is **never auto-selected** — it must
+ *   be requested explicitly (`--auth form-login` or `auth: form-login`
+ *   in a meeting config) so ambient `BOT_EMAIL` / `BOT_PASSWORD` can
+ *   never silently route real credentials into a third-party login form
+ *   (e.g. Google on `app.videocall.rs`). See #2035 / PR #2082 review.
  */
-export type AuthBackend = "jwt" | "storage-state" | "none";
+export type AuthBackend = "jwt" | "storage-state" | "none" | "form-login";
 
 /**
  * Hostnames where we can authenticate via JWT-cookie injection (we control
@@ -39,8 +52,19 @@ const JWT_HOST_SUFFIXES: readonly string[] = [
 
 /**
  * Pick the auth backend for a given hostname. Honors an explicit override
- * (CLI `--auth`) when provided; otherwise auto-selects via the host list
- * above.
+ * (CLI `--auth` or a meeting-config `auth:`) when provided; otherwise
+ * auto-selects between `"jwt"` (host is in the JWT list) and
+ * `"storage-state"` (everything else).
+ *
+ * `"form-login"` is intentionally NOT part of the auto-selection: it is
+ * only ever reached via an explicit `override`. This is the fix for the
+ * PR #2082 blocker — an earlier revision auto-selected `"form-login"` for
+ * any non-JWT host whenever `BOT_EMAIL` + `BOT_PASSWORD` were present in
+ * the environment, which meant ambient credentials could be typed into a
+ * third-party login form (e.g. Google on `app.videocall.rs`) with no flag
+ * and no config change. Requiring an explicit opt-in removes that footgun;
+ * `src/auth/form-login.ts` adds a second, defense-in-depth guard that
+ * refuses to type into a known public IdP even when explicitly requested.
  */
 export function chooseAuthBackend(hostname: string, override?: AuthBackend): AuthBackend {
   if (override) return override;

@@ -192,7 +192,17 @@ test.describe("Meetings feed SSE feed-changed nudge (issue #1671)", () => {
       .toBe("idle");
 
     // O loads the home page (cookie-injected). The list mount-fetches once.
+    // Seed O's display name BEFORE the page boots. `injectSessionCookie` only
+    // sets the session cookie; with OAuth disabled in the e2e stack the home
+    // page's Display Name field is populated from `vc_display_name` in
+    // localStorage (there is no OAuth profile to derive it from), so without
+    // this seed the field is empty and ASSERTION 2's final "Start or Join
+    // Meeting" submit is blocked by `validate_display_name` and never navigates.
+    // Other home-driven specs establish the name by typing it; O navigates
+    // straight from a cookie, so it must pre-seed the name the same way the
+    // real-presence helpers do.
     await injectSessionCookie(context, { baseURL, email: observerEmail, name: observerName });
+    await page.addInitScript((n) => localStorage.setItem("vc_display_name", n), observerName);
     await page.goto("/");
 
     // The mount fetch settles (spinner gone) and B renders as an Idle row.

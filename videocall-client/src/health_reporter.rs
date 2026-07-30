@@ -347,6 +347,70 @@ fn compute_cpu_throttled(capability_score: u32, cores: u32) -> Option<bool> {
     }
 }
 
+/// Decide the value to publish to `window.__videocall_encoder_fps` for the
+/// bots-app RESOURCE_STARVED fps rule (#2057/#2032). Returns:
+///   - `None` -> publish NOTHING (clear the global): camera off, OR camera on
+///     but the encoder has not produced a real sample yet (warmup). The bot
+///     reads "absent" as "no data" - NOT as 0 fps - so a cold-start/idle client
+///     never false-flags as starved.
+///   - `Some(fps)` -> the current camera layer-0 output fps, published once the
+///     encoder is active AND has produced at least one real sample. Since #2060
+///     the producer resets `current_fps` to 0 on stop/start and decays it to 0
+///     after a sustained layer-0 output gap, so `Some(0)` is a REACHABLE runtime
+///     value here: "camera on, latch set, but currently emitting no layer-0
+///     output" (a total stall, or the sub-1s window right after a re-enable).
+///     This captures partial starvation (for example, 1-4 fps), which the
+///     RESOURCE_STARVED rule targets. A total stall now publishes `Some(0)`; the
+///     bots consumer (`fps.ts` `coerceEncoderFps`) maps 0 -> "no data", so a total
+///     stall surfaces downstream as no-data (the verdict's CPU rule is the
+///     backstop). Flagging a total stall AS `RESOURCE_STARVED` (accepting 0 as a
+///     stall reading) is the remaining follow-up: revisit the `fps.ts` `> 0` gate.
+fn encoder_fps_publish_value(
+    video_enabled: bool,
+    output_fps: u32,
+    has_encoded_real: bool,
+) -> Option<u32> {
+    if !video_enabled {
+        None
+    } else if has_encoded_real {
+        Some(output_fps)
+    } else {
+        None
+    }
+}
+
+/// Advance the "encoder has produced a real sample" latch (#2057). The latch
+/// resets on camera-off and sets once a nonzero fps is observed while the camera
+/// is on; otherwise it carries the previous value. Since #2060 the source atomic
+/// IS reset to 0 on stop/start, so a re-enable that passes through camera-off
+/// re-warms from 0 with the latch cleared (no stale-nonzero republish). One edge
+/// remains: a synchronous stop()->re-enable device switch never lets the health
+/// loop observe camera-off, so the latch stays set and a transient `Some(0)` can
+/// publish during the ~1s re-warmup (absorbed by the #2064 sustain window). Kept
+/// here (not inline in the health loop) so the transition is unit-testable.
+fn next_has_encoded_real(prev: bool, video_enabled: bool, output_fps: u32) -> bool {
+    if !video_enabled {
+        false
+    } else if output_fps > 0 {
+        true
+    } else {
+        prev
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn publish_encoder_fps(value: Option<u32>) {
+    use wasm_bindgen::JsValue;
+
+    if let Some(win) = web_sys::window() {
+        let value = value.map_or(JsValue::UNDEFINED, |fps| JsValue::from_f64(fps as f64));
+        let _ = js_sys::Reflect::set(&win, &JsValue::from_str("__videocall_encoder_fps"), &value);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_encoder_fps(_value: Option<u32>) {}
+
 fn audio_layer_telemetry(
     effective_layers: u32,
     congestion_ceiling_raw: u32,
@@ -1548,6 +1612,7 @@ impl HealthReporter {
             // only needs to persist across iterations of this single spawned task;
             // the modulo lives inline below off the shared health-report clock.
             let mut last_audio_scale_log_ms: u64 = 0;
+            let mut has_encoded_real = false;
 
             loop {
                 // Wait for the interval
@@ -1635,6 +1700,21 @@ impl HealthReporter {
                         let screen_active_val =
                             screen_sharing_active.borrow().load(Ordering::Relaxed);
                         let output_fps_val = encoder_output_fps.borrow().load(Ordering::Relaxed);
+                        has_encoded_real = next_has_encoded_real(
+                            has_encoded_real,
+                            self_video_enabled,
+                            output_fps_val,
+                        );
+                        // A window global keeps this independent of runtime log level and off
+                        // the console-upload path. Gate on camera-active + first real sample so
+                        // cold-start/idle never publishes a misleading 0.
+                        // Since #2060 the producer resets/decays current_fps to 0, so a total
+                        // stall publishes Some(0) (consumer maps 0 -> no-data), not a frozen nonzero.
+                        publish_encoder_fps(encoder_fps_publish_value(
+                            self_video_enabled,
+                            output_fps_val,
+                            has_encoded_real,
+                        ));
                         // #1143: live send-side simulcast layer counts.
                         let effective_layers_val =
                             effective_video_layers.borrow().load(Ordering::Relaxed);
@@ -1865,6 +1945,9 @@ impl HealthReporter {
                     break;
                 }
             }
+
+            // Clear the page-level signal after meeting teardown stops the report loop.
+            publish_encoder_fps(None);
         });
     }
 
@@ -2833,6 +2916,36 @@ fn video_quality_score(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_fps_publish_value_gates_correctly() {
+        // Camera off -> never publish (clear).
+        assert_eq!(encoder_fps_publish_value(false, 8, true), None);
+        assert_eq!(encoder_fps_publish_value(false, 0, false), None);
+        // Camera on but not yet produced a real sample (warmup) -> no data, NOT 0.
+        assert_eq!(encoder_fps_publish_value(true, 0, false), None);
+        // Camera on + produced -> publish the live value. Low positive readings
+        // (1-4) are the partial-starvation signal the bots' fps rule targets.
+        // Since #2060 the `Some(0)` arm below is REACHABLE in production: the
+        // producer resets current_fps to 0 on stop/start and decays it to 0 on a
+        // sustained layer-0 gap, so a total stall (or the sub-1s re-enable window)
+        // publishes Some(0). The bots consumer maps 0 -> no-data.
+        assert_eq!(encoder_fps_publish_value(true, 4, true), Some(4));
+        assert_eq!(encoder_fps_publish_value(true, 0, true), Some(0));
+        assert_eq!(encoder_fps_publish_value(true, 30, true), Some(30));
+    }
+
+    #[test]
+    fn has_encoded_real_latch_transitions() {
+        // Camera off resets the latch (so a re-enable re-warms).
+        assert!(!next_has_encoded_real(true, false, 8));
+        // First nonzero fps while camera-on latches it.
+        assert!(next_has_encoded_real(false, true, 4));
+        // Camera-on but still zero before any real sample -> stays un-latched.
+        assert!(!next_has_encoded_real(false, true, 0));
+        // Once latched, a zero reading stays latched (a genuine active-stall 0).
+        assert!(next_has_encoded_real(true, true, 0));
+    }
     use protobuf::Message;
     use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
 

@@ -104,3 +104,17 @@ pub fn save_f64(key: &str, value: f64) {
         let _ = storage.set_item(key, &value.to_string());
     }
 }
+
+/// Delete a preference from `localStorage`. Silently no-ops if storage is
+/// unavailable (Safari private mode, SSR, sandboxed iframes) or the key is
+/// already absent.
+///
+/// Every `load_*` helper in this module falls back to its `default` on a missing
+/// key (`get_item` yields `None` → `unwrap_or(default)`), so removing a key is
+/// the way to restore a preference to its factory value — as opposed to writing
+/// a sentinel that a later reader would have to recognise.
+pub fn remove_item(key: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(key);
+    }
+}

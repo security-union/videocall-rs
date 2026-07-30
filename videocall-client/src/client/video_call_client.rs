@@ -218,6 +218,11 @@ pub type ReactionCallback = Callback<(u64, i32, String, Option<String>)>;
 pub struct VideoCallClientOptions {
     pub enable_e2ee: bool,
     pub enable_webtransport: bool,
+    /// Operator ceiling for received camera and screen simulcast layers.
+    /// `Some(0)` means base only; `None` leaves receive selection uncapped.
+    pub max_received_layer: Option<u32>,
+    /// Keep receive/decode active but skip painting decoded video frames.
+    pub skip_canvas_paint: bool,
     pub on_peer_added: Callback<String>,
     pub on_peer_first_frame: Callback<(String, MediaType)>,
     pub on_peer_removed: Option<Callback<String>>,
@@ -410,6 +415,32 @@ pub struct VideoCallClientOptions {
     pub refresh_room_token_callback: Option<RefreshRoomTokenCallback>,
 }
 
+pub(crate) fn cap_receive_max(requested: Option<u32>, ceiling: Option<u32>) -> Option<u32> {
+    match (requested, ceiling) {
+        (Some(requested), Some(ceiling)) => Some(requested.min(ceiling)),
+        (requested, None) => requested,
+        (None, ceiling) => ceiling,
+    }
+}
+
+/// Apply the operator `maxReceivedLayer` ceiling to a `(min, max)` receive-bounds
+/// pair for a capped kind (video/screen), #2068. The ceiling bounds BOTH ends so
+/// the range can never invert: `max` is capped via [`cap_receive_max`], and an
+/// EXISTING `min` is clamped DOWN to the ceiling (a `None` min is never raised
+/// into a floor). Capping only `max` while a persisted user receive-`min` exceeds
+/// the ceiling would yield an inverted range (min>max) that
+/// `KindLayerBounds::clamp` normalizes by WIDENING back above the ceiling —
+/// defeating it. Pure so it is unit-testable without the wall clock in
+/// `set_receive_layer_bounds`.
+pub(crate) fn apply_receive_ceiling(
+    min: Option<u32>,
+    max: Option<u32>,
+    ceiling: Option<u32>,
+) -> (Option<u32>, Option<u32>) {
+    let min = ceiling.map_or(min, |c| min.map(|m| m.min(c)));
+    (min, cap_receive_max(max, ceiling))
+}
+
 #[derive(Debug)]
 struct InnerOptions {
     enable_e2ee: bool,
@@ -455,6 +486,10 @@ struct Inner {
     /// chooser's desired layer at the monitor tick, so the requested + decoded
     /// layer is bounded. Set via [`VideoCallClient::set_receive_layer_bounds`].
     receive_layer_bounds: ReceiveLayerBounds,
+    /// Immutable operator ceiling applied (to BOTH `min` and `max`) to later
+    /// user/UI bounds changes, so a persisted receive-floor can never raise the
+    /// effective cap back above the ceiling (#2068).
+    max_received_layer_ceiling: Option<u32>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
@@ -890,9 +925,11 @@ fn publish_and_reconcile(
     // snapshot-to-avoid-aliasing convention used for `bounds` at the monitor tick
     // (see the `inner.receive_layer_bounds` snapshot comment ~line 1725).
     let wire = inner.layer_preference_sender.last_sent().cloned();
-    let ups = inner
-        .peer_decode_manager
-        .reconcile_decode_guards_to_wire(wire.as_ref(), now_ms);
+    let bounds = inner.receive_layer_bounds;
+    let ups =
+        inner
+            .peer_decode_manager
+            .reconcile_decode_guards_to_wire(wire.as_ref(), &bounds, now_ms);
     // Drain keyframe requests AFTER the &mut reconcile loop returned owned tuples
     // (its &mut borrow ended); `send_keyframe_request` takes `&self`. An up-switch
     // whose publish was rate-limited may waste-then-re-request a keyframe; it
@@ -1327,9 +1364,10 @@ fn handle_connected_reconnect_resets(
             let current_session = inner.own_session_id;
             let fresh_session = current_session != inner.last_reconnect_reconciled_session;
             if fresh_session {
+                let bounds = inner.receive_layer_bounds;
                 let ups = inner
                     .peer_decode_manager
-                    .reconcile_decode_guards_to_wire(None, now_ms);
+                    .reconcile_decode_guards_to_wire(None, &bounds, now_ms);
                 for (user_id, sid, mt) in &ups {
                     inner
                         .peer_decode_manager
@@ -1727,7 +1765,22 @@ impl VideoCallClient {
                     diagnostics.clone(),
                 ),
                 layer_preference_sender: LayerPreferenceSender::new(),
-                receive_layer_bounds: ReceiveLayerBounds::default(),
+                receive_layer_bounds: {
+                    // #2068 cap. FREEZE-SAFETY rests on a cross-repo relay invariant
+                    // (actix-api `chat_server.rs`): layer 0 is forwarded
+                    // UNCONDITIONALLY, and a receiver with no recorded preference is
+                    // fail-open (all layers). So a guard clamped to base always has
+                    // matching packets on the wire and can never freeze. If the relay
+                    // ever made base filterable, or switched fail-open to
+                    // forward-top-only, this cap would need revisiting.
+                    let mut bounds = ReceiveLayerBounds::default();
+                    if let Some(cap) = options.max_received_layer {
+                        bounds.set_kind(PrefMediaKind::Video, None, Some(cap));
+                        bounds.set_kind(PrefMediaKind::Screen, None, Some(cap));
+                    }
+                    bounds
+                },
+                max_received_layer_ceiling: options.max_received_layer,
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
@@ -2214,6 +2267,7 @@ impl VideoCallClient {
             peer_decode_manager.on_peers_removed_batch = cb.clone();
         }
         peer_decode_manager.set_vad_threshold(opts.vad_threshold);
+        peer_decode_manager.set_skip_canvas_paint(opts.skip_canvas_paint);
         peer_decode_manager
     }
 
@@ -2691,6 +2745,15 @@ impl VideoCallClient {
         max: Option<u32>,
     ) {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            let (min, max) = match kind {
+                // #2068: the operator ceiling bounds BOTH ends (see
+                // `apply_receive_ceiling`) so a persisted user receive-`min` above
+                // the ceiling can't invert the range and defeat the cap.
+                PrefMediaKind::Video | PrefMediaKind::Screen => {
+                    apply_receive_ceiling(min, max, inner.max_received_layer_ceiling)
+                }
+                PrefMediaKind::Audio => (min, max),
+            };
             inner.receive_layer_bounds.set_kind(kind, min, max);
             // Immediate enforcement: re-tick (clamps + updates decode guards) and
             // re-send the (now-bounded) preference so the relay drops out-of-bounds
@@ -5293,6 +5356,8 @@ impl VideoCallClient {
         Self::new(VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -5376,6 +5441,8 @@ mod disconnect_tests {
         VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
             user_id: "drop_test_user".to_string(),
             display_name: "Drop Tester".to_string(),
             is_guest: false,
@@ -5583,6 +5650,8 @@ mod dedup_tests {
         VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
             user_id: "dedup_test_user".to_string(),
             display_name: "Dedup Tester".to_string(),
             is_guest: false,
@@ -5921,8 +5990,10 @@ mod dedup_tests {
 /// touches no browser API, so it runs unchanged on the host target.
 #[cfg(test)]
 mod cooldown_reset_hardening_tests {
+    use super::apply_receive_ceiling;
     use super::arm_camera_keyframe_cooldown_reset;
     use super::arm_keyframe_cooldown_reset_slot;
+    use super::cap_receive_max;
     use super::handle_connected_reconnect_resets;
     use super::publish_and_reconcile;
     use super::VideoCallClient;
@@ -5935,10 +6006,101 @@ mod cooldown_reset_hardening_tests {
     // `peer_decode_manager.rs` (e.g. `downlink_congestion_steps_down_with_zero_loss`).
     use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
 
+    #[test]
+    fn receive_ceiling_combines_with_requested_max() {
+        assert_eq!(cap_receive_max(Some(2), Some(0)), Some(0));
+        assert_eq!(cap_receive_max(None, Some(0)), Some(0));
+        assert_eq!(cap_receive_max(Some(2), None), Some(2));
+        assert_eq!(cap_receive_max(None, None), None);
+    }
+
+    /// #2068 P1-C: the `maxReceivedLayer` config knob (VideoCallClientOptions)
+    /// must actually SEED the receiver ceiling into `receive_layer_bounds`.
+    /// Reverting the options->seed/ceiling wiring at construction leaves the
+    /// bounds open and the capped assertions below fail (clamp(2) == 2).
+    #[test]
+    fn max_received_layer_option_seeds_receiver_ceiling() {
+        let capped = build_test_client_with(Some(0), false);
+        let b = capped.receive_layer_bounds();
+        assert_eq!(
+            b.for_kind(PrefMediaKind::Video).clamp(2),
+            0,
+            "cap seeds video base-only"
+        );
+        assert_eq!(
+            b.for_kind(PrefMediaKind::Screen).clamp(2),
+            0,
+            "cap seeds screen base-only"
+        );
+        // Audio is intentionally NOT capped by maxReceivedLayer.
+        assert_eq!(
+            b.for_kind(PrefMediaKind::Audio).clamp(2),
+            2,
+            "audio uncapped"
+        );
+
+        let open = build_test_client_with(None, false);
+        assert_eq!(
+            open.receive_layer_bounds()
+                .for_kind(PrefMediaKind::Video)
+                .clamp(2),
+            2,
+            "no cap = open (current auto behavior)"
+        );
+    }
+
+    /// #2068 P1-B: a persisted user receive-`min` ABOVE the operator ceiling must
+    /// not defeat the ceiling. `set_receive_layer_bounds` routes video/screen
+    /// through `apply_receive_ceiling`, which clamps `min` down so the range can't
+    /// invert. Tested via the pure helper because the live
+    /// `set_receive_layer_bounds` calls `js_sys::Date::now()` (panics natively).
+    /// MUTATION: revert the `min` clamp in `apply_receive_ceiling` and the first
+    /// assertion returns `(Some(2), Some(0))` and the functional clamp returns 2.
+    #[test]
+    fn operator_ceiling_clamps_a_user_min_above_it() {
+        // ceiling 0 clamps a user floor of L2 DOWN to 0 (never inverts).
+        assert_eq!(
+            apply_receive_ceiling(Some(2), None, Some(0)),
+            (Some(0), Some(0))
+        );
+        // A `None` min is never RAISED into a floor; max is capped to the ceiling.
+        assert_eq!(apply_receive_ceiling(None, None, Some(0)), (None, Some(0)));
+        // A user floor below the ceiling is preserved; max capped to the ceiling.
+        assert_eq!(
+            apply_receive_ceiling(Some(2), Some(5), Some(3)),
+            (Some(2), Some(3))
+        );
+        // No ceiling: passthrough.
+        assert_eq!(
+            apply_receive_ceiling(Some(2), Some(1), None),
+            (Some(2), Some(1))
+        );
+
+        // Functional: the clamped bounds do NOT invert, so KindLayerBounds::clamp
+        // keeps the ceiling authoritative even against a persisted user min=L2.
+        let (mn, mx) = apply_receive_ceiling(Some(2), None, Some(0));
+        let mut bounds = ReceiveLayerBounds::default();
+        bounds.set_kind(PrefMediaKind::Video, mn, mx);
+        assert_eq!(
+            bounds.for_kind(PrefMediaKind::Video).clamp(2),
+            0,
+            "ceiling 0 stays authoritative even with a persisted user min=2"
+        );
+    }
+
     fn build_test_client() -> VideoCallClient {
+        build_test_client_with(None, false)
+    }
+
+    fn build_test_client_with(
+        max_received_layer: Option<u32>,
+        skip_canvas_paint: bool,
+    ) -> VideoCallClient {
         VideoCallClient::new(VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
+            max_received_layer,
+            skip_canvas_paint,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,

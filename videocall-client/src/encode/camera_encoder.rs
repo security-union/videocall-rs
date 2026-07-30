@@ -423,6 +423,7 @@ pub struct CameraEncoder {
     state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
     current_fps: Arc<AtomicU32>,
+    last_layer0_chunk_ms: Arc<AtomicU64>,
     on_encoder_settings_update: Callback<String>,
     on_error: Option<Callback<String>>,
     /// Classified callback fired ONLY at the real `getUserMedia` rejection site,
@@ -1319,6 +1320,7 @@ impl CameraEncoder {
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
             current_fps: Arc::new(AtomicU32::new(0)),
+            last_layer0_chunk_ms: Arc::new(AtomicU64::new(0)),
             on_encoder_settings_update,
             on_error: Some(on_error),
             on_permission_error: None,
@@ -1425,6 +1427,7 @@ impl CameraEncoder {
     pub fn set_encoder_control(&mut self, shared_screen_tier_index: Rc<AtomicU32>) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         let tier_max_width = self.tier_max_width.clone();
@@ -1581,6 +1584,24 @@ impl CameraEncoder {
                     break;
                 }
                 let now = js_sys::Date::now();
+                // #2060 idle-decay: `last_layer0_chunk_ms` is stamped in the layer-0 callback
+                // with performance().now() (monotonic), so the staleness check MUST use a fresh
+                // performance().now() here — NOT the loop's `now` above (js_sys::Date::now(),
+                // wall-clock, a DIFFERENT epoch). Do not "simplify" by reusing `now`: a
+                // cross-clock comparison silently breaks the decay and no unit test catches it
+                // (the wiring is native-untestable; only this contract guards it).
+                let perf_now = window()
+                    .performance()
+                    .expect("Performance API not available")
+                    .now();
+                if let Some(value) = crate::encode::fps_after_idle_decay(
+                    current_fps.load(Ordering::Relaxed),
+                    perf_now,
+                    last_layer0_chunk_ms.load(Ordering::Relaxed) as f64,
+                    crate::adaptive_quality_constants::ENCODER_FPS_IDLE_DECAY_MS,
+                ) {
+                    current_fps.store(value, Ordering::Relaxed);
+                }
 
                 // Single-layer low-rung pin gate (issue #1136 + #1156 hysteresis).
                 // ONLY meaningful in single-stream mode (n_layers == 1): a lone
@@ -2458,6 +2479,7 @@ impl CameraEncoder {
 
     /// Stops encoding after it has been started.
     pub fn stop(&mut self) {
+        crate::encode::reset_output_fps(&self.current_fps);
         self.state.stop()
     }
 
@@ -2478,6 +2500,7 @@ impl CameraEncoder {
         } = self.state.clone();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
@@ -2565,6 +2588,7 @@ impl CameraEncoder {
             self.stop();
             self.state.set_enabled(true);
         }
+        crate::encode::reset_output_fps(&self.current_fps);
         let on_error = self.on_error.clone();
         let on_permission_error = self.on_permission_error.clone();
 
@@ -2986,6 +3010,7 @@ impl CameraEncoder {
                         let userid = userid.clone();
                         let aes = aes.clone();
                         let current_fps = current_fps.clone();
+                        let last_layer0_chunk_ms = last_layer0_chunk_ms.clone();
                         let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
                         // Capture this layer's current sequence by value; we read
                         // the updated value back after the encode loop exits.
@@ -3010,6 +3035,7 @@ impl CameraEncoder {
                                 // still encode and send, they just don't touch
                                 // the setpoint.
                                 if layer_id == 0 {
+                                    last_layer0_chunk_ms.store(now as u64, Ordering::Relaxed);
                                     chunks_in_last_second += 1;
                                     if now - last_chunk_time >= 1000.0 {
                                         let fps = chunks_in_last_second;
@@ -4280,6 +4306,7 @@ impl Drop for CameraEncoder {
 
 #[cfg(test)]
 mod tests {
+    use super::CameraEncoder;
     use super::RestartReason;
     use super::{
         build_simulcast_layers, camera_encoder_restarts_closed_codec,
@@ -4302,6 +4329,90 @@ mod tests {
         WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS, WT_SELF_CONGESTION_DROP_THRESHOLD,
         WT_SELF_CONGESTION_WINDOW_MS,
     };
+    use crate::{Callback, VideoCallClient, VideoCallClientOptions};
+    use std::sync::atomic::Ordering;
+
+    fn build_test_client() -> VideoCallClient {
+        VideoCallClient::new(VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
+            on_peer_added: Callback::noop(),
+            on_peer_first_frame: Callback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: Callback::from(|id| id),
+            get_peer_screen_canvas_id: Callback::from(|id| id),
+            user_id: "test-user".to_string(),
+            display_name: "test".to_string(),
+            meeting_id: "test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_connected: Callback::noop(),
+            on_connection_lost: Callback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_reaction: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            on_participant_kicked: None,
+            on_host_granted: None,
+            on_host_revoked: None,
+            on_peer_event: None,
+            decode_media: true,
+            is_guest: false,
+            allow_post_rebase_retry: true,
+        })
+    }
+
+    /// #2060 (PR #2077 review): `CameraEncoder::stop()` must reset the shared
+    /// `current_fps` atomic to 0 so a re-enable re-warms honestly. Camera is the
+    /// path wired to `window.__videocall_encoder_fps` and the bots
+    /// RESOURCE_STARVED rule, so this call-site is the highest-stakes one (its
+    /// `ScreenEncoder` sibling is pinned by `stop_resets_current_fps_to_zero`).
+    /// MUTATION: delete `reset_output_fps(&self.current_fps)` from `stop()` and
+    /// this assertion fails (current_fps stays 30).
+    #[test]
+    fn stop_resets_current_fps_to_zero() {
+        let client = build_test_client();
+        let mut encoder = CameraEncoder::new(
+            client,
+            "test-video-elem",
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: String| {}),
+            1, // max_layers (single layer)
+        );
+        // Simulate a live encoder that has produced layer-0 output.
+        encoder.current_fps.store(30, Ordering::Relaxed);
+        assert_eq!(encoder.get_current_fps(), 30);
+        encoder.stop();
+        assert_eq!(
+            encoder.get_current_fps(),
+            0,
+            "#2060: CameraEncoder::stop() must reset current_fps to 0"
+        );
+    }
 
     // These regression tests guard issue #2034's width-less capture track path.
     #[test]

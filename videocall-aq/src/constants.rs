@@ -1181,6 +1181,28 @@ pub const BITRATE_CHANGE_THRESHOLD: f64 = 0.10;
 /// match VP9 realtime's ability to adapt rate-control state smoothly.
 pub const MAX_BITRATE_SLEW_KBPS_PER_SEC: u32 = 500;
 
+/// Idle timeout before a nonzero camera encoder output FPS is decayed to zero.
+///
+/// The producer floor is one chunk per second (`fps = chunks_in_last_second`,
+/// which is always at least 1 while output is alive), so a live 1 fps stream can
+/// have roughly 1000ms plus scheduling jitter between chunks. 2000ms is a safe
+/// ~2x margin over that ~1000ms floor gap (plus jitter), chosen so a live 1 fps
+/// stream never false-decays.
+pub const ENCODER_FPS_IDLE_DECAY_MS: f64 = 2000.0;
+
+/// Idle timeout before a nonzero screen encoder output FPS is decayed to zero.
+///
+/// This deliberately differs from [`ENCODER_FPS_IDLE_DECAY_MS`]: a fully static
+/// screen track can emit no captured frames, while the retained-frame recovery
+/// path follows the longer ~3s screen GOP cadence. 5000ms avoids false-decaying
+/// a static but healthy screen share across those ~3s layer-0 keyframe chunks.
+/// Note: the static-keyframe floor is itself budget-bounded
+/// (`SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET`), so a share that stays fully static
+/// past ~12s stops emitting layer-0 chunks entirely and WILL then decay to 0 —
+/// which is honest (no new content is being produced). Screen fps is log-only,
+/// so this is cosmetic either way.
+pub const SCREEN_ENCODER_FPS_IDLE_DECAY_MS: f64 = 5000.0;
+
 // ---------------------------------------------------------------------------
 // Keyframe & Error Recovery
 // ---------------------------------------------------------------------------

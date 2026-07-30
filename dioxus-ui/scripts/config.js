@@ -61,5 +61,7 @@ window.__APP_CONFIG = ({
   // uplink/relay egress. KEEP AT 1 IN PRODUCTION; raise to 2/3 only in
   // controlled test meetings (and the load-test bot) until relay per-receiver
   // layer selection lands.
-  experimentalSimulcastMaxLayers: 1
+  experimentalSimulcastMaxLayers: 1,
+  // Receiver low-power knobs. Omit maxReceivedLayer for no receive cap.
+  skipCanvasPaint: "false"
 });

@@ -81,13 +81,14 @@ use crate::context::{
     RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState, SignalPopupStateMap,
     TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
 };
-use crate::local_storage::{load_bool, load_f64, load_json, save_f64, save_json};
+use crate::local_storage::{load_bool, load_f64, load_json, remove_item, save_f64, save_json};
 use crate::types::DeviceInfo;
 // Issue 1884: reaction enum, the closed wire vocabulary the palette + overlay use.
 use crate::components::reactions::{
-    compose_reaction_announcement, integrate_reaction, push_recent_custom_emoji, reaction_glyph,
-    reaction_glyph_from_i32, sanitize_recent_custom_emojis, step_reaction, FloatingReaction,
-    REACTIONS, REACTION_FLOAT_LIFETIME_MS, REACTION_PALETTE_AUTOHIDE_MS, REACTION_SR_THROTTLE_MS,
+    clear_recent_custom_emojis, compose_reaction_announcement, integrate_reaction,
+    push_recent_custom_emoji, reaction_glyph, reaction_glyph_from_i32,
+    sanitize_recent_custom_emojis, show_recents_group, step_reaction, FloatingReaction, REACTIONS,
+    REACTION_FLOAT_LIFETIME_MS, REACTION_PALETTE_AUTOHIDE_MS, REACTION_SR_THROTTLE_MS,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -726,6 +727,16 @@ fn load_recent_custom_emojis() -> Vec<String> {
 /// no-ops if `localStorage` is unavailable (private mode, quota).
 fn save_recent_custom_emojis(recents: &[String]) {
     save_json(RECENT_CUSTOM_EMOJIS_KEY, &recents.to_vec());
+}
+
+/// Forget the persisted recent CUSTOM emojis (issue 2086) — the storage half of
+/// the palette's reset control. Deletes the key outright rather than writing an
+/// empty array: `load_recent_custom_emojis` defaults to `Vec::new()` on a missing
+/// key, so a removed key and a stored `[]` load identically, and removal leaves
+/// no residue behind for a user who resets and never uses a custom reaction
+/// again. Silently no-ops if `localStorage` is unavailable.
+fn clear_saved_recent_custom_emojis() {
+    remove_item(RECENT_CUSTOM_EMOJIS_KEY);
 }
 
 /// Push one reaction float into `active` and schedule its lifetime-bounded
@@ -3053,6 +3064,8 @@ pub fn AttendantsComponent(
             webtransport_urls,
             enable_e2ee: e2ee_enabled,
             enable_webtransport: effective_wt_enabled,
+            max_received_layer: crate::constants::max_received_layer(),
+            skip_canvas_paint: crate::constants::skip_canvas_paint(),
             // Issue 1884: reaction receive callback. Fires ONLY for peers (the
             // relay self-skips the sender, so our own reaction never comes back
             // over the wire — the UI renders its own "You" echo on click). The
@@ -4006,11 +4019,12 @@ pub fn AttendantsComponent(
             decode_media: true,
             // Honour user transport preference: only allow the connection
             // manager's post-rebase re-election retry when the user is on
-            // the default `WebTransport` mode (which advertises BOTH URL
-            // lists to the manager). A manual `WebSocket` selection is a
-            // deliberate single-transport choice and the retry must not
-            // override it — the single-candidate state in that mode is
-            // intentional, not a recoverable system condition.
+            // `WebTransport` mode (which advertises BOTH URL lists to the
+            // manager, so a re-election among candidates is meaningful). A
+            // `WebSocket` selection — now the default — is a single-transport
+            // configuration where re-election is moot, so the retry stays off;
+            // the single-candidate state in that mode is intentional, not a
+            // recoverable system condition.
             allow_post_rebase_retry: transport_pref == TransportPreference::WebTransport,
             // Phase 3 / AUTH-2 — discussion 562: let the connection
             // manager preempt token expiry from inside its internal
@@ -11386,15 +11400,16 @@ pub fn AttendantsComponent(
 
                 // Issue 1884: reactions palette — a fixed, screen-centered
                 // TOOLBAR (UX B2). role=toolbar (not menu): the palette persists
-                // after activation and holds non-menuitem controls (recents, More
-                // emoji, close X) which SR menu mode would hide — toolbar semantics
-                // fit a persistent strip of controls. Arrow/Home/End move the
-                // roving highlight across the 11 fixed reaction buttons ONLY;
+                // after activation and holds non-menuitem controls (recents, reset,
+                // More emoji, close X) which SR menu mode would hide — toolbar
+                // semantics fit a persistent strip of controls. Arrow/Home/End move
+                // the roving highlight across the 11 fixed reaction buttons ONLY;
                 // Enter/Space is native <button> activation; Tab is NOT
-                // intercepted, so it flows highlighted-option -> recents -> More
-                // emoji -> X -> (picker grid, when open) -> out of the toolbar (the
-                // roving is keyed on ReactionType, so the recents/More/X sit
-                // outside it; the accepted fallback is to let Tab reach them).
+                // intercepted, so it flows highlighted-option -> recents -> reset
+                // (issue 2086) -> More emoji -> X -> (picker grid, when open) -> out
+                // of the toolbar (the roving is keyed on ReactionType, so the
+                // recents/reset/More/X sit outside it; the accepted fallback is to
+                // let Tab reach them).
                 // Escape bubbles to #main-container's popover-tier chain. NOT gated
                 // on `has_screen_share`: reacting must work while someone presents.
                 if reactions_open() {
@@ -11442,9 +11457,9 @@ pub fn AttendantsComponent(
                             }
                             // No Tab branch (UX B2): a toolbar does not trap Tab.
                             // Letting it through moves focus highlighted-option ->
-                            // recents -> More emoji -> X -> out, which is how those
-                            // non-roving controls become keyboard reachable. Escape
-                            // still closes (via #main-container).
+                            // recents -> reset -> More emoji -> X -> out, which is
+                            // how those non-roving controls become keyboard
+                            // reachable. Escape still closes (via #main-container).
                         },
                         for reaction in REACTIONS {
                             {
@@ -11494,7 +11509,7 @@ pub fn AttendantsComponent(
                         // an empty recents list renders nothing (no placeholders).
                         // Clicking one sends it as a CUSTOM reaction, identical to
                         // picking it from the picker (palette stays open).
-                        if !recent_custom_emojis().is_empty() {
+                        if show_recents_group(&recent_custom_emojis.read()) {
                             span {
                                 class: "reactions-recent-sep",
                                 "aria-hidden": "true",
@@ -11527,11 +11542,58 @@ pub fn AttendantsComponent(
                                 }
                             }
                         }
+                        // Issue 2086: reset the recent-CUSTOM quick-picks. Shares
+                        // `show_recents_group` with the divider above, so it appears
+                        // and disappears with the row it clears — there is never a
+                        // reset control with nothing to reset. Sits at the END of the
+                        // recents group (after the quick-picks, before "More emoji")
+                        // so Tab reaches it right after the buttons it acts on. Like
+                        // its siblings it is a plain toolbar button outside the
+                        // ReactionType roving (default tabindex 0) and stops click
+                        // propagation — the palette's own `stop_propagation` above
+                        // already shields every child from #main-container's onclick
+                        // (which sets `reactions_open` false), so this is the same
+                        // defence-in-depth its siblings carry, not the thing that
+                        // keeps the palette open.
+                        if show_recents_group(&recent_custom_emojis.read()) {
+                            button {
+                                class: "reaction-option reaction-option--reset",
+                                r#type: "button",
+                                "data-testid": "reactions-reset-recents",
+                                "aria-label": "Clear recent emoji",
+                                title: "Clear recent emoji",
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    // Focus FIRST: this button unmounts with the rest of
+                                    // the recents group on the render that follows, and a
+                                    // focused element removed from the DOM drops focus to
+                                    // <body>. "More emoji" is the nearest control that
+                                    // survives the reset, so a keyboard user lands beside
+                                    // where they were. Same synchronous-focus idiom the
+                                    // close (X) uses to return focus to its trigger.
+                                    focus_element_by_id("reaction-more-emoji");
+                                    clear_saved_recent_custom_emojis();
+                                    clear_recent_custom_emojis(&mut recent_custom_emojis.write());
+                                    // Deliberately does NOT call `arm_reaction_autohide`:
+                                    // that helper STARTS the 5s window when none is armed,
+                                    // so resetting on a freshly-opened palette would begin
+                                    // auto-hiding it. Reset is not a send — "More emoji"
+                                    // and the close X leave the timer alone too.
+                                },
+                                span {
+                                    "aria-hidden": "true",
+                                    "\u{21ba}"
+                                }
+                            }
+                        }
                         // Issue 1884: "More emoji" affordance — opens the standard
                         // emoji picker panel (CUSTOM reaction). A plain toolbar
                         // button after the quick row; Tab-reachable (default
                         // tabindex 0). `aria-expanded` reflects the picker state.
+                        // Carries an `id` (issue 2086) so the reset control can hand
+                        // focus to it as the recents group unmounts.
                         button {
+                            id: "reaction-more-emoji",
                             class: if emoji_picker_open() { "reaction-option reaction-option--more active" } else { "reaction-option reaction-option--more" },
                             r#type: "button",
                             "data-testid": "emoji-picker-open",

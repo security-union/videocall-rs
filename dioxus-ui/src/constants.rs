@@ -203,6 +203,19 @@ pub struct RuntimeConfig {
     #[serde(rename = "testCapabilityMaxLayersOverride")]
     #[serde(default)]
     pub test_capability_max_layers_override: Option<u32>,
+    /// Receiver-side simulcast ceiling. `0` means base layer only; absent means
+    /// no operator ceiling.
+    #[serde(rename = "maxReceivedLayer")]
+    #[serde(default)]
+    pub max_received_layer: Option<u32>,
+    /// Decode incoming video normally but skip painting frames to canvas when
+    /// truthy. Missing/empty remains the historical paint-enabled behavior.
+    /// NOTE: this saves per-tile paint/GPU cost only — decode still runs (the
+    /// frame is decoded, then dropped before `drawImage`). To cut decode CPU,
+    /// use `maxReceivedLayer`.
+    #[serde(rename = "skipCanvasPaint")]
+    #[serde(default)]
+    pub skip_canvas_paint: String,
     /// Operator dial for the WASM logger's max level (issue: console-log perf).
     /// Valid values (case-insensitive): `trace` / `debug` / `info` / `warn` /
     /// `error` (`off` is also accepted). When **absent** the logger initialises
@@ -371,6 +384,16 @@ pub fn test_capability_max_layers_override() -> Option<u32> {
     app_config()
         .ok()
         .and_then(|c| c.test_capability_max_layers_override)
+}
+
+pub fn max_received_layer() -> Option<u32> {
+    app_config().ok().and_then(|c| c.max_received_layer)
+}
+
+pub fn skip_canvas_paint() -> bool {
+    app_config()
+        .map(|c| truthy(Some(c.skip_canvas_paint.as_str())))
+        .unwrap_or(false)
 }
 
 /// Parse a `logLevel` string (case-insensitive `trace`/`debug`/`info`/`warn`/
@@ -948,6 +971,8 @@ mod runtime_config_tests {
         .expect("config without legacy bitrate keys must parse");
 
         assert_eq!(config.server_election_period_ms, 2000);
+        assert_eq!(config.max_received_layer, None);
+        assert_eq!(config.skip_canvas_paint, "");
     }
 }
 

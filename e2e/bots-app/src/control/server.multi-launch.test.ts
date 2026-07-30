@@ -467,10 +467,12 @@ describe("POST /launch/from-config", () => {
     const yaml =
       "meeting_url: https://example.com/meeting/X\n" +
       "ttl: 10m\n" +
+      "video_mode: clock\n" +
       "bots:\n" +
       "  - participant: alice\n" +
       "  - participant: bob\n" +
-      "    ttl: 30s\n";
+      "    ttl: 30s\n" +
+      "    video_mode: file\n";
     const res = await fetchJson(handle.port, "/launch/from-config", {
       method: "POST",
       headers: { authorization: `Bearer ${token}` },
@@ -482,8 +484,10 @@ describe("POST /launch/from-config", () => {
     expect(body.errors).toEqual([]);
     expect(surface.launchSpecs[0].participant).toBe("alice");
     expect(surface.launchSpecs[0].ttl).toBe(600_000);
+    expect(surface.launchSpecs[0].videoMode).toBe("clock");
     expect(surface.launchSpecs[1].participant).toBe("bob");
     expect(surface.launchSpecs[1].ttl).toBe(30_000);
+    expect(surface.launchSpecs[1].videoMode).toBe("file");
   });
 
   it("rejects malformed YAML with 400 and the parser error message", async () => {
@@ -518,6 +522,8 @@ describe("POST /launch/from-config", () => {
       meetingUrl: "https://example.com/meeting/X",
       ttl: "5m",
     });
+    cfg.videoMode = "clock";
+    cfg.bots[0].videoMode = "file";
     const yaml = emitMeetingConfigYaml(cfg);
     const res = await fetchJson(handle.port, "/launch/from-config/preview", {
       method: "POST",
@@ -525,10 +531,70 @@ describe("POST /launch/from-config", () => {
       body: { configYaml: yaml },
     });
     expect(res.status).toBe(200);
-    const body = res.body as { botCount: number; bots: unknown[] };
+    const body = res.body as {
+      botCount: number;
+      videoMode: string | null;
+      bots: Array<{ videoMode?: string }>;
+    };
     expect(body.botCount).toBe(3);
     expect(body.bots).toHaveLength(3);
+    expect(body.videoMode).toBe("clock");
+    expect(body.bots[0].videoMode).toBe("file");
     // The launch surface must not have been touched by preview.
+    expect(surface.launchSpecs).toHaveLength(0);
+  });
+
+  // PR #2082 blocker follow-up: form-login is a valid meeting-config auth value
+  // (so the CLI `bots-app run --config` path can opt in), but the control
+  // server / dashboard must NOT launch it — its creds come from the
+  // environment. Mutation guard: delete rejectFormLoginConfig and these flip
+  // (the route would launch a form-login bot instead of returning 400).
+  it("rejects a meeting-level auth: form-login config with 400 and does not launch", async () => {
+    const yaml =
+      "meeting_url: https://app.videocall.labsworkspace.fnxlabs.com/meeting/bottest\n" +
+      "auth: form-login\n" +
+      "bots:\n" +
+      "  - participant: alice\n";
+    const res = await fetchJson(handle.port, "/launch/from-config", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { configYaml: yaml },
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/form-login is not launchable/i);
+    expect(surface.launchSpecs).toHaveLength(0);
+  });
+
+  it("rejects a per-bot auth: form-login config with 400 and does not launch", async () => {
+    const yaml =
+      "meeting_url: https://app.videocall.labsworkspace.fnxlabs.com/meeting/bottest\n" +
+      "bots:\n" +
+      "  - participant: alice\n" +
+      "  - participant: bob\n" +
+      "    auth: form-login\n";
+    const res = await fetchJson(handle.port, "/launch/from-config", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { configYaml: yaml },
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/form-login is not launchable/i);
+    expect(surface.launchSpecs).toHaveLength(0);
+  });
+
+  it("preview also rejects an auth: form-login config with 400", async () => {
+    const yaml =
+      "meeting_url: https://app.videocall.labsworkspace.fnxlabs.com/meeting/bottest\n" +
+      "auth: form-login\n" +
+      "bots:\n" +
+      "  - participant: alice\n";
+    const res = await fetchJson(handle.port, "/launch/from-config/preview", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { configYaml: yaml },
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/form-login is not launchable/i);
     expect(surface.launchSpecs).toHaveLength(0);
   });
 });

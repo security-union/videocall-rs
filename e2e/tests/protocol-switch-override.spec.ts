@@ -13,9 +13,9 @@ import { waitForServices } from "../helpers/wait-for-services";
  *      localStorage sticky pin of the OTHER protocol, so the just-made choice
  *      wins on the next page load instead of being shadowed by the old pin.
  *   2. The "Remember protocol choice" toggle is shown for BOTH protocols (it
- *      used to be hidden for the default, WebTransport), and switching the
- *      protocol radio resets that toggle OFF so a previous protocol's pin
- *      cannot carry over.
+ *      used to be hidden for whichever protocol was the default — WebTransport
+ *      at the time; WebSocket now), and switching the protocol radio resets that
+ *      toggle OFF so a previous protocol's pin cannot carry over.
  *   3. (Post-review-blocker) The Remember toggle is IN-MEMORY ONLY: toggling it
  *      writes nothing to storage. "Apply" is the sole storage-commit point, and
  *      Apply now appears whenever the staged protocol OR the staged Remember
@@ -160,6 +160,25 @@ async function openNetworkTab(page: Page): Promise<void> {
 }
 
 /**
+ * Open the diagnostics drawer via the "Open Diagnostics" tooltip button and
+ * wait for it to render. Mirrors the `openDiagnosticsPanel` helper in
+ * protocol-selection.spec.ts: the diagnostics button has no data-testid, so it
+ * is located by the tooltip span text, and the panel is considered open once
+ * the "Transport Preference" section heading (which contains
+ * `#diagnostics-transport-select`) is visible. Required before touching the
+ * diagnostics transport select — the drawer is closed on join.
+ */
+async function openDiagnosticsPanel(page: Page): Promise<void> {
+  const diagButton = page.locator("button", {
+    has: page.locator("span.tooltip", { hasText: "Open Diagnostics" }),
+  });
+  await diagButton.click();
+  await expect(page.locator("h3", { hasText: "Transport Preference" })).toBeVisible({
+    timeout: 10_000,
+  });
+}
+
+/**
  * Seed a sticky (remembered) localStorage pin for the given protocol BEFORE the
  * app boots, then reload so `load_transport_preference` picks it up on mount.
  * This is the "the OTHER protocol is already pinned" precondition for #1291.
@@ -196,13 +215,21 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
   // WHY THIS FAILS IF THE FIX IS REVERTED:
   //   In the buggy code the "Remember" toggle was hidden for WebTransport AND
   //   the radio click did NOT reset `sticky_transport`, so it stayed `true`
-  //   (seeded from the WS pin). Apply therefore ran the `(is_default, sticky) =
-  //   (true, true)` arm -> `save_transport_preference(WebTransport)` +
+  //   (seeded from the WS pin). Apply therefore ran the `(_, sticky) =
+  //   (_, true)` arm -> `save_transport_preference(WebTransport)` +
   //   `save_transport_sticky(true)`, leaving BOTH localStorage keys present
   //   (pref="webtransport", sticky="true"). The fix resets the toggle OFF on
-  //   the radio switch, so Apply runs the `(true, false)` arm ->
-  //   `clear_transport_sticky_and_pref()`, leaving the keys ABSENT. The
-  //   `toBeNull()` assertions below pass only with the fix.
+  //   the radio switch, so Apply runs the not-remembered arm and the
+  //   localStorage pin is cleared. The `toBeNull()` assertions on pref/sticky
+  //   below pass only with the fix.
+  //
+  //   NOTE (post default-flip): WebTransport is now the NON-default choice, so a
+  //   not-remembered WebTransport Apply runs the `(false, false)` session arm:
+  //   it clears the stale localStorage WS pin AND writes
+  //   sessionStorage vc_transport_session="webtransport" (asserted below), which
+  //   is what makes WebTransport take hold on reload rather than the WebSocket
+  //   default. (Pre-flip, WebTransport was the default and this ran the
+  //   `(true, false)` clear-all arm, leaving the session key absent.)
   // -------------------------------------------------------------------------
   test("switching to WebTransport (not remembered) clears a stale WebSocket sticky pin", async ({
     page,
@@ -235,8 +262,9 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
     const storage = await readTransportStorage(page);
     expect(storage.pref).toBeNull();
     expect(storage.sticky).toBeNull();
-    // Choosing the default not-remembered clears the session key too.
-    expect(storage.session).toBeNull();
+    // WebTransport is now the NON-default choice, so not-remembered writes the
+    // session-scoped value (the `(false, false)` arm) rather than clearing it.
+    expect(storage.session).toBe("webtransport");
 
     // And the restored UI selection resolves to WebTransport — the deterministic
     // proxy for "WebTransport actually took hold on reload".
@@ -254,9 +282,9 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
   // WHY THIS FAILS IF THE FIX IS REVERTED:
   //   The buggy code gated the sticky row behind
   //   `pending_protocol() != TransportPreference::default()`, so the toggle was
-  //   absent whenever WebTransport (the default) was selected. The
-  //   `toBeVisible()` assertion for the WebTransport case below fails against
-  //   that code. The fix renders the row for both protocols.
+  //   absent whenever the DEFAULT protocol was selected (WebTransport pre-flip,
+  //   WebSocket now). The fix renders the row for both protocols, so both
+  //   `toBeVisible()` assertions below pass only with the fix.
   // -------------------------------------------------------------------------
   test("Remember toggle is visible for both WebTransport and WebSocket", async ({ page }) => {
     const meetingId = `e2e_1291_toggle_both_${Date.now()}`;
@@ -264,12 +292,12 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
 
     await openNetworkTab(page);
 
-    // WebSocket selected -> toggle visible (true even before the fix).
+    // WebSocket (the default) selected -> toggle visible. This is the half of
+    // #1291 that lets a user clear a stuck pin from the default protocol.
     await page.locator(SEL.radioWebSocket).click();
     await expect(page.locator(SEL.stickyCheckbox)).toBeVisible();
 
-    // WebTransport (the default) selected -> toggle MUST still be visible. This
-    // is the half of #1291 that lets a user clear a stuck pin from the default.
+    // WebTransport (non-default) selected -> toggle MUST also be visible.
     await page.locator(SEL.radioWebTransport).click();
     await expect(page.locator(SEL.stickyCheckbox)).toBeVisible();
 
@@ -314,38 +342,38 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
   });
 
   // -------------------------------------------------------------------------
-  // 4. Remember ON for WebTransport persists across a reload — committed via
-  //    Apply, NOT eagerly. The Remember checkbox is now in-memory only; Apply
-  //    is the sole storage-commit point, and Apply appears for a remember-only
-  //    change on the same protocol.
+  // 4. Remember ON for the default WebSocket persists across a reload —
+  //    committed via Apply, NOT eagerly. The Remember checkbox is in-memory
+  //    only; Apply is the sole storage-commit point, and Apply appears for a
+  //    remember-only change on the same protocol.
   //
-  //    Flow: WebTransport selected (the default, unchanged) -> toggle Remember
-  //    ON -> assert localStorage is STILL EMPTY (the toggle wrote nothing) ->
-  //    Apply (now visible because the sticky flag differs from its persisted
-  //    value) -> after reload the localStorage pin is present and the selection
-  //    + checkbox are restored.
+  //    Flow: WebSocket selected (the default, unchanged) -> toggle Remember ON
+  //    -> assert localStorage is STILL EMPTY (the toggle wrote nothing) -> Apply
+  //    (now visible because the sticky flag differs from its persisted value) ->
+  //    after reload the localStorage pin is present and the selection + checkbox
+  //    are restored.
   //
   // WHY THIS FAILS IF THE FIX IS REVERTED:
   //   The pre-blocker code wrote storage eagerly in the checkbox `onchange`
   //   (`save_transport_preference` + `save_transport_sticky`). Against that code
   //   the "localStorage STILL empty after toggling, before Apply" assertion
-  //   below fails — the keys would already be `webtransport` / `true`. It also
+  //   below fails — the keys would already be `websocket` / `true`. It also
   //   fails against the original (pre-#1291) code, where the toggle was not even
-  //   rendered for WebTransport so `check()` would throw on a hidden element.
-  //   This test now pins BOTH the #1291 toggle-visible-for-default fix AND the
-  //   blocker fix (no eager write).
+  //   rendered for the default protocol so `check()` would throw on a hidden
+  //   element. This test pins BOTH the #1291 toggle-visible-for-default fix AND
+  //   the blocker fix (no eager write).
   // -------------------------------------------------------------------------
-  test("Remember ON for WebTransport is committed via Apply (no eager write) and survives reload", async ({
+  test("Remember ON for the default WebSocket is committed via Apply (no eager write) and survives reload", async ({
     page,
   }) => {
-    const meetingId = `e2e_1291_wt_remember_${Date.now()}`;
+    const meetingId = `e2e_1291_ws_remember_${Date.now()}`;
     await joinMeeting(page, meetingId, "ovr-user-4");
 
     await openNetworkTab(page);
 
-    // WebTransport (the default) is the active selection; no pin is set, so the
+    // WebSocket (the default) is the active selection; no pin is set, so the
     // Remember toggle starts OFF and Apply is hidden (nothing differs yet).
-    await expect(page.locator(SEL.radioWebTransport)).toHaveAttribute("aria-checked", "true");
+    await expect(page.locator(SEL.radioWebSocket)).toHaveAttribute("aria-checked", "true");
     const sticky = page.locator(SEL.stickyCheckbox);
     await expect(sticky).toBeVisible();
     await expect(sticky).not.toBeChecked();
@@ -373,13 +401,13 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
 
     // Now (and only now) the localStorage pin is present.
     const afterReload = await readTransportStorage(page);
-    expect(afterReload.pref).toBe("webtransport");
+    expect(afterReload.pref).toBe("websocket");
     expect(afterReload.sticky).toBe("true");
 
-    // The restored UI reflects WebTransport selected with Remember ON.
+    // The restored UI reflects WebSocket selected with Remember ON.
     await joinMeeting(page, `${meetingId}_after`, "ovr-user-4b");
     await openNetworkTab(page);
-    await expect(page.locator(SEL.radioWebTransport)).toHaveAttribute("aria-checked", "true");
+    await expect(page.locator(SEL.radioWebSocket)).toHaveAttribute("aria-checked", "true");
     await expect(page.locator(SEL.stickyCheckbox)).toBeChecked();
 
     await clearTransportStorage(page);
@@ -390,26 +418,33 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
   //    protocol AND clears the stale pin (the diagnostics select is an explicit,
   //    NOT-remembered choice — it has no Remember checkbox).
   //
-  //    Precondition: WebTransport pinned (Remember ON). Diagnostics select ->
-  //    WebSocket. Accept the confirm() dialog (it reloads).
+  //    Precondition: WebSocket pinned (Remember ON). Diagnostics select ->
+  //    WebTransport (the non-default). Accept the confirm() dialog (it reloads).
   //
   // WHY THIS FAILS IF THE FIX IS REVERTED:
   //   The buggy diagnostics onchange passed `load_transport_sticky()` (== true,
-  //   because WT is pinned) to `confirm_transport_change`, so it ran the
-  //   `(_, true)` arm and wrote localStorage pref="websocket" + sticky="true"
+  //   because WS is pinned) to `confirm_transport_change`, so it ran the
+  //   `(_, true)` arm and wrote localStorage pref="webtransport" + sticky="true"
   //   (a NEW sticky pin against the user's intent), and never wrote the session
-  //   key. The fix passes `sticky = false`, so it runs the `(false, false)` arm:
-  //   clear the stale WT localStorage pin FIRST, then write
-  //   sessionStorage vc_transport_session="websocket". The assertions below
-  //   (session == "websocket" AND localStorage keys null) hold only with the fix.
+  //   key. The fix passes `sticky = false`, so — because WebTransport is now the
+  //   NON-default choice — it runs the `(false, false)` arm: clear the stale WS
+  //   localStorage pin FIRST, then write
+  //   sessionStorage vc_transport_session="webtransport". The assertions below
+  //   (session == "webtransport" AND localStorage keys null) hold only with the fix.
   // -------------------------------------------------------------------------
   test("diagnostics transport select makes a not-remembered choice that clears a stale pin", async ({
     page,
   }) => {
     const meetingId = `e2e_1291_diag_switch_${Date.now()}`;
 
-    await seedStickyPinAndReload(page, "webtransport");
+    await seedStickyPinAndReload(page, "websocket");
     await joinMeeting(page, meetingId, "ovr-user-5");
+
+    // The diagnostics drawer is closed on join — open it before touching the
+    // transport select (this test's original latent gap: it went straight to
+    // expecting `#diagnostics-transport-select`, which only exists once the
+    // drawer is open).
+    await openDiagnosticsPanel(page);
 
     // Confirm the protocol-change dialog so the change commits + reloads.
     page.on("dialog", async (dialog) => {
@@ -418,19 +453,19 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
 
     const diagSelect = page.locator(SEL.diagTransportSelect);
     await expect(diagSelect).toBeVisible({ timeout: 10_000 });
-    // Sanity: seeded WT pin is the current value.
-    await expect(diagSelect).toHaveValue("webtransport");
+    // Sanity: seeded WS pin is the current value.
+    await expect(diagSelect).toHaveValue("websocket");
 
-    await diagSelect.selectOption("websocket");
+    await diagSelect.selectOption("webtransport");
 
     // Accepting the dialog reloads the page; wait for it to settle.
     await page.waitForLoadState("domcontentloaded", { timeout: 15_000 });
     await page.waitForTimeout(2000);
 
     const storage = await readTransportStorage(page);
-    // Session-scoped WebSocket choice wins...
-    expect(storage.session).toBe("websocket");
-    // ...and the stale WebTransport localStorage sticky pin is cleared.
+    // Session-scoped WebTransport choice wins...
+    expect(storage.session).toBe("webtransport");
+    // ...and the stale WebSocket localStorage sticky pin is cleared.
     expect(storage.pref).toBeNull();
     expect(storage.sticky).toBeNull();
 
@@ -523,9 +558,10 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
   //
   // WHY THIS FAILS IF THE FIX IS REVERTED:
   //   Against the pre-blocker code, sub-case (a)'s "storage still empty"
-  //   assertion fails (the checkbox wrote pref="webtransport"/sticky="true" on
-  //   toggle), and sub-case (b)'s "pin intact" assertion fails (the checkbox
-  //   ran `clear_transport_sticky_and_pref()` on uncheck). The current
+  //   assertion fails (the checkbox wrote pref="websocket"/sticky="true" on
+  //   toggle — websocket being the now-default selected protocol), and sub-case
+  //   (b)'s "pin intact" assertion fails (the checkbox ran
+  //   `clear_transport_sticky_and_pref()` on uncheck). The current
   //   in-memory-only toggle leaves storage untouched until Apply.
   // -------------------------------------------------------------------------
   test("toggling Remember then closing without Apply writes nothing to storage", async ({
@@ -537,8 +573,8 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
 
     await openNetworkTab(page);
 
-    // Clean slate: WebTransport selected, Remember OFF, nothing persisted.
-    await expect(page.locator(SEL.radioWebTransport)).toHaveAttribute("aria-checked", "true");
+    // Clean slate: WebSocket (the default) selected, Remember OFF, nothing persisted.
+    await expect(page.locator(SEL.radioWebSocket)).toHaveAttribute("aria-checked", "true");
     const cleanBefore = await readTransportStorage(page);
     expect(cleanBefore).toEqual({ pref: null, sticky: null, session: null });
 
@@ -558,7 +594,7 @@ test.describe("Transport protocol switch overrides a remembered pin (#1291)", ()
     const cleanAfterClose = await readTransportStorage(page);
     expect(cleanAfterClose).toEqual({ pref: null, sticky: null, session: null });
 
-    // A reload still resolves to the default WebTransport with no pin.
+    // A reload still resolves to the default WebSocket with no pin.
     await page.reload();
     await page.waitForTimeout(1500);
     const cleanAfterReload = await readTransportStorage(page);

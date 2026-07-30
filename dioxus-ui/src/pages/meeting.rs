@@ -223,6 +223,8 @@ pub fn MeetingPage(id: String) -> Element {
                 webtransport_urls,
                 enable_e2ee: false,
                 enable_webtransport: effective_wt_enabled,
+                max_received_layer: crate::constants::max_received_layer(),
+                skip_canvas_paint: crate::constants::skip_canvas_paint(),
                 // Issue #1884: this is the pre-meeting OBSERVER client (waiting for
                 // the meeting to start) — it renders no in-call reaction overlay,
                 // so it takes no reaction callback.

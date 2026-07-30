@@ -507,7 +507,14 @@ export function defaultProfileFileForShell(shell: string | null): string | null 
   return null;
 }
 
-function buildBaseSshArgs(host: SshHost, opts: { connectTimeout: number }): string[] {
+/**
+ * Build the shared `ssh` argv prefix (connection options + `user@host`) for a
+ * host, WITHOUT any trailing remote command. Exported so the resource sampler
+ * (issue 2032) can run an arbitrary remote command (`bash -s -- …`) against the
+ * same host using the identical connection flags a bot launch/probe uses, with
+ * no risk of the two arg constructions drifting.
+ */
+export function buildBaseSshArgs(host: SshHost, opts: { connectTimeout: number }): string[] {
   const args: string[] = [
     "-o",
     `ConnectTimeout=${opts.connectTimeout}`,

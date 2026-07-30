@@ -213,6 +213,26 @@ pub fn sanitize_recent_custom_emojis(candidates: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Drop every recent CUSTOM quick-pick (issue 2086), leaving the palette with
+/// only its fixed standard reactions. Backs the palette's reset control; the
+/// caller is responsible for the persistence side (clearing the `localStorage`
+/// key) so this stays pure and host-testable.
+///
+/// Leaves the list REUSABLE rather than replacing it: a later
+/// [`push_recent_custom_emoji`] repopulates from empty exactly as it does on a
+/// first-ever send, so reset does not put the recents row into a special state.
+pub fn clear_recent_custom_emojis(recents: &mut Vec<String>) {
+    recents.clear();
+}
+
+/// Should the palette render the recents GROUP — the divider, the quick-pick
+/// buttons, and the reset control (issue 2086)? One predicate for all three so
+/// they can never disagree: a reset button surviving an empty recents row would
+/// offer to clear nothing, and a divider without buttons would dangle.
+pub fn show_recents_group(recents: &[String]) -> bool {
+    !recents.is_empty()
+}
+
 /// Compose the screen-reader announcement for a flushed batch of peer reactions
 /// (issue #1884). `items` is `(sender_name, reaction_label)` in arrival order:
 ///   * empty → `None` (nothing to announce);
@@ -505,6 +525,65 @@ mod tests {
         assert!(
             sanitize_recent_custom_emojis(vec!["nope".into(), "".into()]).is_empty(),
             "an all-invalid stored list sanitizes to empty"
+        );
+    }
+
+    // --- reset control (issue 2086) ----------------------------------------
+
+    #[test]
+    fn clear_recents_drops_every_quick_pick_and_send_repopulates() {
+        // The reset control's list semantics, end to end through the PRODUCTION
+        // helpers: a full recents list (as loaded from storage) clears to empty,
+        // and the very next custom send repopulates it from scratch — reset must
+        // not leave the row in a state where later sends are dropped or the
+        // cleared entries come back.
+        //
+        // ADVERSARIAL: weaken `clear_recent_custom_emojis` to a partial drop
+        // (e.g. `truncate(1)`) and the post-clear emptiness assertion fails; make
+        // it a no-op and both the emptiness and the single-entry repopulate
+        // assertions fail (the list would still hold the three seeded emoji).
+        let mut r = sanitize_recent_custom_emojis(vec![
+            "😭".to_string(),
+            "🎉".to_string(),
+            "🚀".to_string(),
+        ]);
+        assert_eq!(r.len(), 3, "precondition: three quick-picks to clear");
+
+        clear_recent_custom_emojis(&mut r);
+        assert!(r.is_empty(), "reset drops EVERY quick-pick, not just some");
+
+        push_recent_custom_emoji(&mut r, "🎉");
+        assert_eq!(
+            r,
+            vec!["🎉"],
+            "a send after reset repopulates from empty — the cleared 😭/🚀 stay gone"
+        );
+    }
+
+    #[test]
+    fn recents_group_visibility_follows_emptiness() {
+        // Divider, quick-picks and the reset control share this one predicate, so
+        // the reset button can never outlive the row it resets.
+        //
+        // ADVERSARIAL: invert the predicate and the empty case reports "show" —
+        // this fails.
+        assert!(
+            !show_recents_group(&[]),
+            "no recents → no divider, no quick-picks, no reset control"
+        );
+        assert!(
+            show_recents_group(&["🚀".to_string()]),
+            "one recent is enough to show the group"
+        );
+
+        // The predicate tracks the list through a real reset: shown before,
+        // hidden after.
+        let mut r = vec!["🚀".to_string(), "🎉".to_string()];
+        assert!(show_recents_group(&r));
+        clear_recent_custom_emojis(&mut r);
+        assert!(
+            !show_recents_group(&r),
+            "after reset the whole group hides, including the reset control itself"
         );
     }
 }

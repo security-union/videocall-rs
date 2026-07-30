@@ -866,6 +866,8 @@ pub struct Peer {
     /// is always decoded regardless so off-screen participants can still be
     /// heard.
     pub visible: bool,
+    /// Preserve the operator decode-and-drop choice when decoder workers reset.
+    skip_canvas_paint: bool,
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
@@ -1242,6 +1244,10 @@ impl Debug for Peer {
 }
 
 impl Peer {
+    // 8 args (was 7): #2068 threads `skip_canvas_paint` through to the decoders.
+    // Private constructor with all-distinct positional fields; a params struct
+    // would add indirection without clarity.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         video_canvas_id: String,
         screen_canvas_id: String,
@@ -1250,10 +1256,16 @@ impl Peer {
         aes: Option<Aes128State>,
         vad_threshold: Option<f32>,
         is_guest: bool,
+        skip_canvas_paint: bool,
     ) -> Result<Self, JsValue> {
         let sid_str = session_id.to_string();
-        let (mut audio, video, screen) =
-            Self::new_decoders(&video_canvas_id, &screen_canvas_id, &sid_str, vad_threshold)?;
+        let (mut audio, video, screen) = Self::new_decoders(
+            &video_canvas_id,
+            &screen_canvas_id,
+            &sid_str,
+            vad_threshold,
+            skip_canvas_paint,
+        )?;
 
         audio.set_muted(true);
         debug!("Initialized peer {user_id} (session_id: {session_id}) with audio muted");
@@ -1280,6 +1292,7 @@ impl Peer {
             device_info: PeerDeviceInfo::default(),
             is_guest,
             visible: false,
+            skip_canvas_paint,
             context_initialized: false,
             vad_threshold,
             has_received_heartbeat: false,
@@ -1337,6 +1350,7 @@ impl Peer {
         screen_canvas_id: &str,
         peer_id: &str,
         vad_threshold: Option<f32>,
+        skip_canvas_paint: bool,
     ) -> Result<
         (
             Box<dyn AudioPeerDecoderTrait>,
@@ -1347,8 +1361,8 @@ impl Peer {
     > {
         // Create decoders without canvas (will be set later via set_canvas)
         // We still keep the canvas IDs for backward compatibility with existing code
-        let video_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA)?;
-        let screen_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN)?;
+        let video_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA, skip_canvas_paint)?;
+        let screen_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN, skip_canvas_paint)?;
 
         // Attempt to set canvas immediately if available in DOM
         if let Some(document) = web_sys::window().and_then(|w| w.document()) {
@@ -1378,6 +1392,7 @@ impl Peer {
             &self.screen_canvas_id,
             &sid_str,
             self.vad_threshold,
+            self.skip_canvas_paint,
         )?;
 
         // Preserve the current mute state after reset
@@ -3026,6 +3041,8 @@ pub struct PeerDecodeManager {
     /// before decode so the per-peer audio-datagram-loss tracker runs only when
     /// audio can actually ride datagrams. Defaults to `false` (pre-connect).
     receiver_on_webtransport: bool,
+    /// Applied to every camera/screen decoder created now or after a reset.
+    skip_canvas_paint: bool,
     /// Test-only count of how many times `log_peer_leave_decode_snapshot`
     /// actually emitted, so #1399 coalescing can be asserted directly
     /// (O(N) -> constant under a within-window cascade). `Cell` because the
@@ -3063,6 +3080,7 @@ impl PeerDecodeManager {
             pli_budget: Rc::new(RefCell::new(PliBudget::new())),
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
+            skip_canvas_paint: false,
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -3090,6 +3108,7 @@ impl PeerDecodeManager {
             pli_budget: Rc::new(RefCell::new(PliBudget::new())),
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
+            skip_canvas_paint: false,
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -3206,6 +3225,24 @@ impl PeerDecodeManager {
 
     pub fn set_vad_threshold(&mut self, threshold: Option<f32>) {
         self.vad_threshold = threshold;
+    }
+
+    pub fn set_skip_canvas_paint(&mut self, skip_canvas_paint: bool) {
+        self.skip_canvas_paint = skip_canvas_paint;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_video_layer_for_test(&self, session_id: u64) -> Option<u32> {
+        self.connected_peers
+            .get(&session_id)
+            .map(Peer::selected_video_layer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_screen_layer_for_test(&self, session_id: u64) -> Option<u32> {
+        self.connected_peers
+            .get(&session_id)
+            .map(Peer::selected_screen_layer)
     }
 
     /// Update which peers are eligible for video/screen decode.
@@ -3822,6 +3859,7 @@ impl PeerDecodeManager {
         last_sent: Option<
             &std::collections::BTreeMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
         >,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
         now_ms: u64,
     ) -> Vec<(String, u64, MediaType)> {
         use crate::decode::layer_chooser::PrefMediaKind;
@@ -3861,6 +3899,7 @@ impl PeerDecodeManager {
                 let v_target = last_sent
                     .and_then(|m| m.get(&(session_id, PrefMediaKind::Video)).copied())
                     .unwrap_or_else(|| peer.video_layer_availability.highest_available(now_ms));
+                let v_target = bounds.for_kind(PrefMediaKind::Video).clamp(v_target);
                 let v_old = peer.selected_video_layer();
                 if v_target != v_old {
                     peer.set_selected_video_layer(v_target);
@@ -3873,6 +3912,7 @@ impl PeerDecodeManager {
                 let s_target = last_sent
                     .and_then(|m| m.get(&(session_id, PrefMediaKind::Screen)).copied())
                     .unwrap_or_else(|| peer.screen_layer_availability.highest_available(now_ms));
+                let s_target = bounds.for_kind(PrefMediaKind::Screen).clamp(s_target);
                 let s_old = peer.selected_screen_layer();
                 if s_target != s_old {
                     peer.set_selected_screen_layer(s_target);
@@ -3892,6 +3932,12 @@ impl PeerDecodeManager {
                 let a_target = last_sent
                     .and_then(|m| m.get(&(session_id, PrefMediaKind::Audio)).copied())
                     .unwrap_or_else(|| peer.audio_layer_availability.highest_available(now_ms));
+                let a_target = bounds.for_kind(PrefMediaKind::Audio).clamp(a_target);
+                // Defensive symmetry: the operator `maxReceivedLayer` ceiling never
+                // caps AUDIO (audio bounds stay open), so this clamp is an identity
+                // no-op for that feature — a latent improvement only if a user sets
+                // audio receive bounds. Hence there is no dedicated audio mutation
+                // test for this line (the fresh-session ceiling test covers video+screen).
                 let a_old = peer.selected_audio_layer();
                 if a_target != a_old {
                     peer.set_selected_audio_layer(a_target);
@@ -4590,6 +4636,7 @@ impl PeerDecodeManager {
             aes,
             self.vad_threshold,
             cached_is_guest,
+            self.skip_canvas_paint,
         )?;
         // Issue #1640: send SetContext to the worker immediately at peer creation
         // so the publisher session_id (`to_peer`) is populated from the first frame.
@@ -5274,6 +5321,7 @@ fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
         device_info: PeerDeviceInfo::default(),
         is_guest: false,
         visible: false,
+        skip_canvas_paint: false,
         context_initialized: false,
         has_received_heartbeat: false,
         is_speaking: false,
@@ -8000,6 +8048,38 @@ mod tests {
         assert!(!status0.rendered, "non-selected base layer must be dropped");
     }
 
+    /// The configured receive ceiling clamps both the advertised preference and
+    /// the camera/screen decode guards through the production manager tick.
+    ///
+    /// MUTATION: replacing either `bounds.clamp(raw)` with `raw` leaves that
+    /// guard at L2 and omits its required L0 preference.
+    #[test]
+    fn receive_ceiling_clamps_wire_preferences_and_decode_guards() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(904);
+        let now = 1500;
+
+        let open = manager.tick_layer_choosers(now, &ReceiveLayerBounds::default());
+        assert_eq!(manager.selected_video_layer_for_test(904), Some(2));
+        assert_eq!(manager.selected_screen_layer_for_test(904), Some(2));
+        assert!(
+            !open.contains_key(&(904, PrefMediaKind::Video)),
+            "an uncapped top selection is intentionally omitted from the wire map"
+        );
+
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(0));
+        capped.set_kind(PrefMediaKind::Screen, None, Some(0));
+        let desired = manager.tick_layer_choosers(now, &capped);
+
+        assert_eq!(desired.get(&(904, PrefMediaKind::Video)), Some(&0));
+        assert_eq!(desired.get(&(904, PrefMediaKind::Screen)), Some(&0));
+        assert_eq!(manager.selected_video_layer_for_test(904), Some(0));
+        assert_eq!(manager.selected_screen_layer_for_test(904), Some(0));
+    }
+
     /// Phase 2/3 (#989): the manager's per-peer tick returns an independent
     /// desired-layer entry for every connected peer AND every media kind
     /// (VIDEO/SCREEN/AUDIO), keyed by (session_id, PrefMediaKind).
@@ -8496,7 +8576,11 @@ mod tests {
         let mut wire: BTreeMap<(u64, PrefMediaKind), u32> = BTreeMap::new();
         wire.insert((900, PrefMediaKind::Video), 0);
         wire.insert((900, PrefMediaKind::Audio), 0);
-        let _ups = manager.reconcile_decode_guards_to_wire(Some(&wire), now);
+        let _ups = manager.reconcile_decode_guards_to_wire(
+            Some(&wire),
+            &crate::decode::layer_chooser::ReceiveLayerBounds::default(),
+            now,
+        );
         // Guard must now EQUAL the wire (L0) — the relay forwards only L0, so the
         // exact-match guard must accept L0, not reject it at L2.
         assert_eq!(
@@ -8538,7 +8622,11 @@ mod tests {
             .unwrap()
             .set_selected_audio_layer(0);
         // No last_sent map at all → relay fails open → forwards ALL layers (the top).
-        let _ups2 = manager2.reconcile_decode_guards_to_wire(None, now);
+        let _ups2 = manager2.reconcile_decode_guards_to_wire(
+            None,
+            &crate::decode::layer_chooser::ReceiveLayerBounds::default(),
+            now,
+        );
         let top = 2u32; // highest_available for the 3-layer fixture ladder
         assert_eq!(
             manager2
@@ -8563,6 +8651,27 @@ mod tests {
             "#1695: with no recorded audio entry the audio guard must match \
              highest_available (L2), not stay at L0"
         );
+    }
+
+    /// A fresh relay session has no recorded preferences, but an operator
+    /// receive ceiling still limits the persisted peer's decode guards.
+    ///
+    /// MUTATION: removing the post-`highest_available` bounds clamps raises
+    /// both guards from L0 to the learned top L2 and fails these assertions.
+    #[test]
+    fn reconcile_decode_guards_to_wire_respects_ceiling_on_fresh_session() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(902);
+        let mut bounds = ReceiveLayerBounds::default();
+        bounds.set_kind(PrefMediaKind::Video, None, Some(0));
+        bounds.set_kind(PrefMediaKind::Screen, None, Some(0));
+
+        let _ = manager.reconcile_decode_guards_to_wire(None, &bounds, 2000);
+
+        assert_eq!(manager.selected_video_layer_for_test(902), Some(0));
+        assert_eq!(manager.selected_screen_layer_for_test(902), Some(0));
     }
 
     /// #1256 (resize cadence): applying the size lid N times within ONE sample
@@ -10417,6 +10526,7 @@ mod tests {
                 device_info: PeerDeviceInfo::default(),
                 is_guest: false,
                 visible: false,
+                skip_canvas_paint: false,
                 context_initialized: false,
                 has_received_heartbeat: false,
                 is_speaking: false,
@@ -10528,6 +10638,7 @@ mod tests {
             device_info: PeerDeviceInfo::default(),
             is_guest: false,
             visible: false,
+            skip_canvas_paint: false,
             context_initialized: false,
             has_received_heartbeat: false,
             is_speaking: false,
@@ -10610,6 +10721,7 @@ mod tests {
             device_info: PeerDeviceInfo::default(),
             is_guest: false,
             visible: false,
+            skip_canvas_paint: false,
             context_initialized: false,
             has_received_heartbeat: false,
             is_speaking: false,

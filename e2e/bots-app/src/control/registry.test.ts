@@ -87,6 +87,10 @@ describe("snapshotEntry", () => {
     const e = newRegistryEntry(fakeTask({ ttl: "infinite" }));
     expect(snapshotEntry(e).ttlRemainingMs).toBeNull();
   });
+  it("emits the task's video mode", () => {
+    const e = newRegistryEntry(fakeTask({ videoMode: "clock" }));
+    expect(snapshotEntry(e).videoMode).toBe("clock");
+  });
   it("strips the live handle", () => {
     const e = newRegistryEntry(fakeTask());
     const snap = snapshotEntry(e);

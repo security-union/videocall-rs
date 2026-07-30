@@ -22,6 +22,7 @@ import { getHost, type SshHost } from "./control/ssh-hosts";
 import { spawnRemoteBot, type SshBotHandle, type SshLaunchSpec } from "./control/ssh-launcher";
 import { loadManifest, type Manifest } from "./manifest";
 import { JoinRejectedError, MeetingNavigatedAwayError, WaitingRoomError } from "./meeting-join";
+import { type RemoteResourceManager } from "./resource/session";
 import { formatDuration, parseDuration, type Ttl } from "./ttl";
 
 export interface BotTask extends BotRunOptions {
@@ -73,6 +74,23 @@ export interface RunOptions {
      */
     onListen?: (info: { port: number; token: string }) => Promise<void>;
   };
+  /**
+   * Optional per-bot FPS sink (issue 2032, rider b). When set, every bot's
+   * `launchBot` is given an `onEncoderFps` callback that forwards each parsed
+   * capture/encode FPS reading or no-data signal here, tagged with the bot's id,
+   * so the caller's {@link FpsTracker} can feed the RESOURCE_STARVED verdict.
+   * Local bots only — SSH-hosted bots run `launchBot` on the remote box, out of
+   * this process.
+   */
+  onEncoderFps?: (botId: string, fps: number | null) => void;
+  /**
+   * Optional remote-resource manager (issue 2032). When set, each SSH-hosted
+   * bot triggers `ensureForHost(host)` so the box that actually runs the bot is
+   * sampled, and `finalizeAll()` runs at the end of the run to retrieve + derive
+   * every remote host's CSV. Best-effort and fully guarded — a failure here
+   * never affects the bots themselves.
+   */
+  remoteResource?: RemoteResourceManager;
 }
 
 interface RegisterSshTaskDeps {
@@ -81,6 +99,8 @@ interface RegisterSshTaskDeps {
   inFlightWaiters: Array<() => void>;
   runDir?: string;
   spawnRemoteBot?: (spec: SshLaunchSpec) => SshBotHandle;
+  /** Remote-resource manager threaded from {@link RunOptions.remoteResource} (issue 2032). */
+  remoteResource?: RemoteResourceManager;
 }
 
 /**
@@ -136,6 +156,10 @@ export async function registerSshTask(
   });
   entry.sshHandle = sshHandle;
   entry.status = "in-meeting";
+  // Issue 2032: start (once) a resource sampler ON this remote box so its CPU
+  // is measured where it matters. Fire-and-forget + guarded — a sampler
+  // failure must never disturb the bot launch above.
+  void deps.remoteResource?.ensureForHost(host).catch(() => {});
   console.log(
     `[orchestrator] ssh-launch → ${task.participant}@${shortBotId(botId)} → ${host.user}@${host.host}`,
   );
@@ -378,6 +402,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
           inFlight,
           inFlightWaiters,
           runDir,
+          remoteResource: opts.remoteResource,
         });
         return botId;
       }
@@ -444,6 +469,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
           ttlTimers.delete(botId);
           ctlSignals.delete(botId);
         },
+        onEncoderFps: opts.onEncoderFps,
       }),
     );
     // Wake the wait loop if it was parked waiting for new work
@@ -514,6 +540,15 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   }
   console.log(`[orchestrator] all bot(s) finished`);
 
+  // Issue 2032: retrieve + derive every remote box's resource CSV and print its
+  // RESOURCE_STARVED verdict. Guarded so a remote-capture failure cannot mask a
+  // clean run's completion.
+  if (opts.remoteResource) {
+    await opts.remoteResource.finalizeAll().catch((e: unknown) => {
+      console.warn(`[orchestrator] remote resource finalize failed:`, (e as Error).message);
+    });
+  }
+
   if (controlHandle) {
     await controlHandle.close().catch((e: unknown) => {
       console.error(`[orchestrator] control server close failed:`, (e as Error).message);
@@ -530,6 +565,8 @@ interface SingleBotDeps {
   registerTtlTimer: (botId: string, ctl: { cancel: () => void; rearm: (ttl: Ttl) => void }) => void;
   registerCtlSignal: (botId: string, sig: { trigger: (reason: CtlReason) => void }) => void;
   clearMaps: (botId: string) => void;
+  /** Per-bot FPS sink threaded from {@link RunOptions.onEncoderFps} (issue 2032). */
+  onEncoderFps?: (botId: string, fps: number | null) => void;
 }
 
 async function runSingleBotTask(
@@ -570,6 +607,9 @@ async function runSingleBotTask(
     const launchOpts = {
       ...rest,
       botIdShort: shortBotId(task.botId),
+      onEncoderFps: deps.onEncoderFps
+        ? (fps: number | null): void => deps.onEncoderFps?.(task.botId, fps)
+        : null,
       onPrimeProgress: willAutoPrime
         ? (p: PrimeProgress): void => {
             // Mirror the CLI's prefix format so the dashboard log

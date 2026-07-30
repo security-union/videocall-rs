@@ -5,11 +5,13 @@ import { fileURLToPath } from "node:url";
 import { chromium, Browser, BrowserContext, Page } from "@playwright/test";
 
 import { applyJwtCookieAuth } from "./auth/jwt-cookie";
+import { performFormLogin, resolveFormLoginCredentials } from "./auth/form-login";
 import { type AuthBackend, requireStorageState } from "./auth/storage-state";
 import { resolveAssetsForParticipant } from "./assets";
 import { ensureAssetsPrimed, type PrimeProgress } from "./auto-prime";
 import { isDevServerNoise } from "./dev-noise";
 import { type Manifest } from "./manifest";
+import { coerceEncoderFps } from "./resource/fps";
 import {
   joinMeetingAndEnableMedia,
   JoinRejectedError,
@@ -23,6 +25,21 @@ const CHROME_ARGS = [
   "--use-fake-ui-for-media-stream",
   "--disable-dev-shm-usage",
 ];
+
+/**
+ * Delay (ms) between encoder-fps polls of `window.__videocall_encoder_fps`
+ * (#2062). The client republishes the value on its ~5s health tick. The global
+ * is a PERSISTED LEVEL, not an event, so any interval observes each published
+ * value at least once; polling a bit faster than the publish cadence is just
+ * beat-frequency safety (no phase alignment can skip a value), not a need to
+ * "catch" transient events. Oversampling is harmless: the starvation verdict
+ * keys off a TIME-based sustained sub-rung duration (#2064, see
+ * resource/verdict.ts), and re-reading a held value cannot inflate a wall-clock
+ * duration. This is the delay BETWEEN a poll settling and the next poll starting
+ * (a self-throttling setTimeout chain — see below), not a fixed-rate interval,
+ * so polls can never pile up in flight.
+ */
+export const ENCODER_FPS_POLL_MS = 2000;
 
 export type VideoMode = "costume" | "file" | "clock";
 
@@ -129,6 +146,16 @@ export interface BotRunOptions {
    * `--features netsim`. See discussion #793 phase 3.
    */
   network?: string | null;
+  /**
+   * Receives a capture/encode FPS reading from this bot. The orchestrator wires
+   * this to a per-bot {@link FpsTracker}. bot.ts feeds it by polling
+   * `window.__videocall_encoder_fps`, published by videocall-client #2057,
+   * every {@link ENCODER_FPS_POLL_MS}. Positive readings are forwarded as
+   * numbers. An absent/`undefined` value, or a `0` (which the client treats as
+   * "encoder not started, not diagnostic"), is forwarded as `null` so the
+   * tracker can reset a sustained-low run without recording a reading.
+   */
+  onEncoderFps?: ((fps: number | null) => void) | null;
 }
 
 /**
@@ -356,6 +383,14 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     console.log(
       `[${label}] auth: storage-state (reused captured session from ${opts.storageStateFile})`,
     );
+  } else if (opts.authBackend === "form-login") {
+    // The context launches with a clean cookie jar (like `"none"`); the
+    // session is established later by driving the identity provider's
+    // login form after the first navigation (see the form-login step
+    // below, after `page.goto`).
+    console.log(
+      `[${label}] auth: form-login (will drive the identity login form after navigation)`,
+    );
   } else {
     // `authBackend === "none"` — guest join. No cookie injection, no
     // storage-state replay. The browser context launches with a clean
@@ -390,12 +425,13 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     console.error(`[${label}] pageerror:`, err.message);
   });
   page.on("console", (msg) => {
+    const text = msg.text();
     if (msg.type() !== "error") return;
-    if (isDevServerNoise(msg.text(), { pageUrl: page.url() })) {
+    if (isDevServerNoise(text, { pageUrl: page.url() })) {
       suppressedNoise++;
       return;
     }
-    console.error(`[${label}] console.error:`, msg.text());
+    console.error(`[${label}] console.error:`, text);
   });
 
   const navigateUrl = target.toString();
@@ -404,8 +440,47 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
 
   // `meetingIdFromUrl` operates on the raw `opts.meetingURL` because
   // the meeting-id lives in the path, not the query — adding a
-  // `?netsim=` search param does not affect it.
+  // `?netsim=` search param does not affect it. Computed here (before the
+  // form-login step) because `performFormLogin` needs the `/meeting/<id>`
+  // path to know when the post-callback navigation has settled.
   const meetingId = meetingIdFromUrl(opts.meetingURL);
+
+  // Form-login runs HERE — after the first navigation but BEFORE the
+  // `/meeting/<id>` hang-up detector (installed just below) and the join
+  // flow. The identity provider's login page lives on a different origin
+  // (e.g. `id.labsworkspace.fnxlabs.com`); if the hang-up detector were
+  // already installed, that cross-origin navigation would be mistaken for
+  // a manual hang-up and abort the launch. `performFormLogin` returns only
+  // once the app has settled back on the `/meeting/<id>` path (past the
+  // intermediate `/auth/callback` hop and any bounce through `/`), so the
+  // detector installs cleanly afterward and the callback→meeting
+  // navigation is not misread as a hang-up.
+  if (opts.authBackend === "form-login") {
+    const creds = resolveFormLoginCredentials(process.env);
+    if (!creds) {
+      // Tear the browser down before surfacing the error so a
+      // mis-configured launch doesn't leak a Chrome process.
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+      throw new Error(
+        `[${label}] auth: form-login requires BOT_EMAIL and BOT_PASSWORD environment variables to be set`,
+      );
+    }
+    try {
+      await performFormLogin({
+        page,
+        email: creds.email,
+        password: creds.password,
+        appBaseUrl: baseURL,
+        meetingId,
+        label,
+      });
+    } catch (e) {
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+      throw e;
+    }
+  }
 
   // Detect manual hang-up at any point in the bot's lifetime. The same
   // signal is consumed by `joinMeetingAndEnableMedia` (to abort the
@@ -483,6 +558,61 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     );
   }
 
+  // #2062/#2057: poll the client's window global for encoder output fps and
+  // feed the per-bot FpsTracker. Once the publisher ships (#2057, not yet
+  // merged), videocall-client `health_reporter` sets `window.__videocall_encoder_fps`
+  // (a positive number when the camera encoder is active + has produced a real
+  // sample; cleared to `undefined` when the camera is off / warming up / on
+  // teardown) roughly once per ~5s health tick; until then the global is absent
+  // and every read is coerced to "no data" (the fps rule stays dormant). This
+  // replaces the earlier console-line parse: a global (not a log line) makes
+  // capture independent of the runtime log level and off the console-log-upload
+  // path. `undefined`/absent (and a non-positive `0`) is "no data" (skipped) —
+  // never recorded — so an idle/cold-start bot is not mis-flagged as starved.
+  //
+  // Scheduling: a SELF-THROTTLING setTimeout chain (next poll scheduled only
+  // AFTER the previous `page.evaluate` settles), NOT a fixed-rate setInterval.
+  // `page.evaluate` is a CDP round-trip that runs on the renderer's main JS
+  // thread; under CPU saturation — the exact condition this harness measures —
+  // a fixed-rate interval would fire again before the previous evaluate
+  // resolved, piling up in-flight work and adding load precisely when the box
+  // is most stressed. The chain applies at most one evaluate at a time.
+  let fpsPollStopped = false;
+  let fpsPollTimer: ReturnType<typeof setTimeout> | undefined;
+  if (opts.onEncoderFps) {
+    const onFps = opts.onEncoderFps;
+    const scheduleNextFpsPoll = (): void => {
+      if (fpsPollStopped) return;
+      fpsPollTimer = setTimeout(runFpsPoll, ENCODER_FPS_POLL_MS);
+      // Do not let the poll timer keep the Node process alive on its own.
+      fpsPollTimer.unref?.();
+    };
+    const runFpsPoll = (): void => {
+      void page
+        .evaluate(
+          () =>
+            (window as unknown as { __videocall_encoder_fps?: unknown }).__videocall_encoder_fps,
+        )
+        .then((raw) => {
+          const fps = coerceEncoderFps(raw);
+          onFps(fps);
+          scheduleNextFpsPoll();
+        })
+        .catch(() => {
+          // A rejection may be terminal (page closed on teardown/hang-up) or
+          // transient (e.g. "Execution context was destroyed" during an
+          // in-meeting SPA navigation while the page stays alive). We keep
+          // polling either way so a transient error never permanently blinds
+          // the bot on the verdict-critical fps signal; `shutdown()` is the
+          // authoritative stop (sets `fpsPollStopped`), and on a truly dead
+          // page the next evaluate simply rejects again at the same cadence
+          // (self-throttled, unref'd — no storm, no process hold).
+          scheduleNextFpsPoll();
+        });
+    };
+    scheduleNextFpsPoll();
+  }
+
   const leaveMeeting = async (): Promise<void> => {
     const hangUp = page.locator("button.video-control-button", {
       has: page.locator("span.tooltip", { hasText: "Hang Up" }),
@@ -506,6 +636,14 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   };
 
   const shutdown = async (): Promise<void> => {
+    // Authoritative stop for the fps poll chain: set the flag so any in-flight
+    // `page.evaluate` that settles after teardown does not reschedule, and
+    // cancel a pending timer.
+    fpsPollStopped = true;
+    if (fpsPollTimer !== undefined) {
+      clearTimeout(fpsPollTimer);
+      fpsPollTimer = undefined;
+    }
     try {
       await context.close();
     } catch (e) {

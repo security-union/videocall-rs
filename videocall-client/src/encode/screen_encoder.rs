@@ -1425,6 +1425,7 @@ pub struct ScreenEncoder {
     state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
     current_fps: Arc<AtomicU32>,
+    last_layer0_chunk_ms: Arc<AtomicU64>,
     on_encoder_settings_update: Option<Callback<String>>,
     on_state_change: Option<Callback<ScreenShareEvent>>,
     /// Holds the active MediaStream so `stop()` can synchronously kill all tracks.
@@ -1657,6 +1658,7 @@ impl ScreenEncoder {
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(bitrate_kbps)),
             current_fps: Arc::new(AtomicU32::new(0)),
+            last_layer0_chunk_ms: Arc::new(AtomicU64::new(0)),
             on_encoder_settings_update: Some(on_encoder_settings_update),
             on_state_change: Some(on_state_change),
             screen_stream: Rc::new(RefCell::new(None)),
@@ -1951,6 +1953,7 @@ impl ScreenEncoder {
     pub fn set_encoder_control(&mut self) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         let tier_max_width = self.tier_max_width.clone();
@@ -2135,6 +2138,23 @@ impl ScreenEncoder {
                     break;
                 }
                 let now = js_sys::Date::now();
+                // #2060 idle-decay: `last_layer0_chunk_ms` is stamped in the base-layer callback
+                // with performance().now() (monotonic), so the staleness check MUST use a fresh
+                // performance().now() here — NOT the loop's `now` above (js_sys::Date::now(),
+                // wall-clock, a DIFFERENT epoch). Do not "simplify" by reusing `now`: a
+                // cross-clock comparison silently breaks the decay and no unit test catches it.
+                let perf_now = window()
+                    .performance()
+                    .expect("Performance API not available")
+                    .now();
+                if let Some(value) = crate::encode::fps_after_idle_decay(
+                    current_fps.load(Ordering::Relaxed),
+                    perf_now,
+                    last_layer0_chunk_ms.load(Ordering::Relaxed) as f64,
+                    crate::adaptive_quality_constants::SCREEN_ENCODER_FPS_IDLE_DECAY_MS,
+                ) {
+                    current_fps.store(value, Ordering::Relaxed);
+                }
                 // ── Issue #1229: share start/stop edge handling ───────────────
                 // Track the previous sharing state so we can (a) re-arm cold
                 // start on the RISING edge of a (re)share and (b) avoid drifting
@@ -2712,6 +2732,8 @@ impl ScreenEncoder {
     /// It sets the encoder flags, notifies the client at the protocol level,
     /// and synchronously stops all media tracks.
     pub fn stop(&mut self) {
+        crate::encode::reset_output_fps(&self.current_fps);
+
         // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
         clear_screen_sharing_flags(&self.screen_sharing_active, &self.screen_sharing_active_arc);
 
@@ -2872,6 +2894,7 @@ impl ScreenEncoder {
     /// The stream is consumed: this method takes ownership and will stop its
     /// tracks when encoding ends or `stop()` is called.
     pub fn start_with_stream(&mut self, stream: MediaStream, initial_tier: usize) {
+        crate::encode::reset_output_fps(&self.current_fps);
         self.apply_initial_tier(initial_tier);
 
         let EncoderState {
@@ -2886,6 +2909,7 @@ impl ScreenEncoder {
         let aes = client.aes();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let on_state_change = self.on_state_change.clone();
         let screen_stream = self.screen_stream.clone();
         let tier_max_width = self.tier_max_width.clone();
@@ -2926,6 +2950,7 @@ impl ScreenEncoder {
                 aes,
                 current_bitrate,
                 current_fps,
+                last_layer0_chunk_ms,
                 on_state_change,
                 screen_stream,
                 tier_max_width,
@@ -2966,6 +2991,7 @@ impl ScreenEncoder {
     /// use [`start_with_stream`](Self::start_with_stream) instead, obtaining the
     /// stream directly in the click handler.
     pub fn start(&mut self, initial_tier: usize) {
+        crate::encode::reset_output_fps(&self.current_fps);
         self.apply_initial_tier(initial_tier);
 
         let EncoderState {
@@ -2981,6 +3007,7 @@ impl ScreenEncoder {
         let aes = client.aes();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let last_layer0_chunk_ms = self.last_layer0_chunk_ms.clone();
         let on_state_change = self.on_state_change.clone();
         let screen_stream = self.screen_stream.clone();
         let tier_max_width = self.tier_max_width.clone();
@@ -3058,6 +3085,7 @@ impl ScreenEncoder {
                 aes,
                 current_bitrate,
                 current_fps,
+                last_layer0_chunk_ms,
                 on_state_change,
                 screen_stream,
                 tier_max_width,
@@ -3105,6 +3133,7 @@ impl ScreenEncoder {
         aes: Rc<Aes128State>,
         current_bitrate: Rc<AtomicU32>,
         current_fps: Arc<AtomicU32>,
+        last_layer0_chunk_ms: Arc<AtomicU64>,
         on_state_change: Option<Callback<ScreenShareEvent>>,
         screen_stream: Rc<RefCell<Option<MediaStream>>>,
         tier_max_width: Rc<AtomicU32>,
@@ -3300,6 +3329,7 @@ impl ScreenEncoder {
             let mut last_chunk_time = performance.now();
             let mut chunks_in_last_second = 0;
             let current_fps = current_fps.clone();
+            let last_layer0_chunk_ms = last_layer0_chunk_ms.clone();
             let userid = userid.clone();
             let aes = aes.clone();
             let client = client.clone();
@@ -3321,6 +3351,7 @@ impl ScreenEncoder {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
 
                 // Update FPS calculation
+                last_layer0_chunk_ms.store(now as u64, Ordering::Relaxed);
                 chunks_in_last_second += 1;
                 if now - last_chunk_time >= 1000.0 {
                     let fps = chunks_in_last_second;
@@ -6000,6 +6031,8 @@ mod tests {
         VideoCallClient::new(VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
+            max_received_layer: None,
+            skip_canvas_paint: false,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -6178,6 +6211,34 @@ mod tests {
         assert!(
             !encoder.congestion_step_down.load(Ordering::Acquire),
             "the screen congestion flag must be SEPARATE from the camera's"
+        );
+    }
+
+    /// #2060: `stop()` must reset the shared `current_fps` atomic to 0 so a
+    /// re-enable re-warms honestly (no stale-nonzero republish downstream). This
+    /// pins the stop()->`reset_output_fps` CALL-SITE — the pure helper itself is
+    /// unit-tested in `encode/mod.rs`; this guards that `stop()` actually calls
+    /// it. MUTATION: deleting `reset_output_fps(&self.current_fps)` from `stop()`
+    /// leaves `current_fps` at 30 and fails this assertion.
+    #[test]
+    fn stop_resets_current_fps_to_zero() {
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+            1, // max_layers (single layer)
+        );
+        // Simulate a live encoder that has produced layer-0 output.
+        encoder.current_fps.store(30, Ordering::Relaxed);
+        assert_eq!(encoder.get_current_fps(), 30);
+        encoder.stop();
+        assert_eq!(
+            encoder.get_current_fps(),
+            0,
+            "#2060: stop() must reset current_fps to 0"
         );
     }
 

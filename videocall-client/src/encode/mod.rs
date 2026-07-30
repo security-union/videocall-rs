@@ -52,6 +52,29 @@ pub use screen_encoder::{
     ScreenQualitySnapshot, ScreenQualityTierBounds, ScreenShareEvent,
 };
 
+/// Idle-decay decision for the encoder output-fps atomic (#2060). Returns
+/// `Some(0)` when a nonzero fps has gone stale (no layer-0 chunk within
+/// `timeout_ms`), else `None`.
+///
+/// Pure so the 1 Hz AQ loops can pin it with a native test. Both loops call this
+/// each tick with `performance.now()`.
+pub(crate) fn fps_after_idle_decay(
+    current_fps: u32,
+    now_ms: f64,
+    last_chunk_ms: f64,
+    timeout_ms: f64,
+) -> Option<u32> {
+    if current_fps != 0 && now_ms - last_chunk_ms >= timeout_ms {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn reset_output_fps(fps: &AtomicU32) {
+    fps.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Trait to abstract over different microphone encoder implementations
 pub trait MicrophoneEncoderTrait {
     fn start(&mut self);
@@ -221,4 +244,25 @@ pub fn create_microphone_encoder(
         shared_audio_tier_index,
         max_layers,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fps_after_idle_decay, reset_output_fps};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn fps_after_idle_decay_handles_stale_fresh_zero_and_boundary() {
+        assert_eq!(fps_after_idle_decay(30, 3000.0, 500.0, 2000.0), Some(0));
+        assert_eq!(fps_after_idle_decay(30, 1000.0, 500.0, 2000.0), None);
+        assert_eq!(fps_after_idle_decay(0, 9999.0, 0.0, 2000.0), None);
+        assert_eq!(fps_after_idle_decay(30, 2500.0, 500.0, 2000.0), Some(0));
+    }
+
+    #[test]
+    fn reset_output_fps_clears_nonzero_value() {
+        let fps = AtomicU32::new(30);
+        reset_output_fps(&fps);
+        assert_eq!(fps.load(Ordering::Relaxed), 0);
+    }
 }

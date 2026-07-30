@@ -356,6 +356,13 @@ pub struct VideoPeerDecoder {
     /// Shared (`Rc`) with the paint closure captured in [`Self::new`]; the
     /// `Cell` is sufficient because every access is on the single render thread.
     paint_enabled: Rc<Cell<bool>>,
+    /// Operator decode-and-drop mode. Separate from `paint_enabled` because
+    /// `decode()` deliberately re-enables the visibility gate on every frame.
+    /// The production read happens via the paint closure's own `Rc` clone
+    /// (`should_paint` at the rAF gate in `new`); this stored handle exists only
+    /// for the `#[cfg(test)]` accessor, hence the non-test dead-code allow.
+    #[cfg_attr(not(test), allow(dead_code))]
+    skip_canvas_paint: Rc<Cell<bool>>,
     /// Issue #1025: proactive keyframe-request route. The underlying `WasmDecoder`'s
     /// worker-message closure (captured in [`Self::new`]) holds a clone of this `Rc` and,
     /// when the worker posts a `RequestKeyframeMessage`, invokes the inner closure if set.
@@ -448,6 +455,10 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
 pub const MEDIA_TYPE_CAMERA: &str = "VIDEO";
 pub const MEDIA_TYPE_SCREEN: &str = "SCREEN";
 
+pub(crate) fn should_paint(paint_enabled: bool, skip_canvas_paint: bool) -> bool {
+    paint_enabled && !skip_canvas_paint
+}
+
 /// Decide what `(from_peer, to_peer)` to stamp on a freshly-constructed
 /// [`CanvasRenderer`] inside [`VideoPeerDecoder::set_canvas`].
 ///
@@ -494,6 +505,7 @@ impl VideoPeerDecoder {
     pub fn new(
         canvas: Option<HtmlCanvasElement>,
         media_type: &'static str,
+        skip_canvas_paint: bool,
     ) -> Result<Self, JsValue> {
         let canvas_renderer = Rc::new(RefCell::new(None));
 
@@ -523,6 +535,7 @@ impl VideoPeerDecoder {
         // decoder belongs to a visible tile), gated off by `clear_canvas()`,
         // back on by the next `decode()`.
         let paint_enabled = Rc::new(Cell::new(true));
+        let skip_canvas_paint = Rc::new(Cell::new(skip_canvas_paint));
 
         // Issue #1783 realtime-first playout: the latest-wins presentation mailbox and its
         // rAF-scheduled paint. The offer closure below hands every decoded frame here and schedules
@@ -552,6 +565,7 @@ impl VideoPeerDecoder {
             let mailbox = latest_frame.clone();
             let canvas_ref = canvas_renderer.clone();
             let paint_flag = paint_enabled.clone();
+            let skip_flag = skip_canvas_paint.clone();
             let first_render_flag = first_render_pending_ack.clone();
             let first_render_fired = first_render_fired.clone();
             let raf_scheduled_for_paint = raf_scheduled.clone();
@@ -569,7 +583,7 @@ impl VideoPeerDecoder {
                     // frame WITHOUT painting — still close it to release GPU memory — so it cannot
                     // repaint the wiped tile. Checking here (not only at offer) closes the window
                     // fully, since the actual draw now happens later than the offer.
-                    if !paint_flag.get() {
+                    if !should_paint(paint_flag.get(), skip_flag.get()) {
                         video_frame.close();
                         return;
                     }
@@ -718,6 +732,7 @@ impl VideoPeerDecoder {
             first_render_pending_ack,
             first_render_fired,
             paint_enabled,
+            skip_canvas_paint,
             keyframe_request_route,
             latest_frame,
             raf_scheduled,
@@ -1115,6 +1130,7 @@ impl VideoPeerDecoder {
             first_render_pending_ack: Rc::new(RefCell::new(false)),
             first_render_fired: Rc::new(RefCell::new(false)),
             paint_enabled: Rc::new(Cell::new(true)),
+            skip_canvas_paint: Rc::new(Cell::new(false)),
             keyframe_request_route: Rc::new(RefCell::new(None)),
             latest_frame: Rc::new(RefCell::new(LatestFrameMailbox::new())),
             raf_scheduled: Rc::new(Cell::new(false)),
@@ -1132,6 +1148,11 @@ impl VideoPeerDecoder {
     #[cfg(test)]
     pub(crate) fn paint_enabled_for_test(&self) -> bool {
         self.paint_enabled.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn skip_canvas_paint_for_test(&self) -> bool {
+        self.skip_canvas_paint.get()
     }
 
     /// issue 508: test seam — overwrite the renderer's cached dimensions so a
@@ -1970,6 +1991,36 @@ mod tests {
         .into();
         pkt.frame_type = "key".to_string();
         Arc::new(pkt)
+    }
+
+    #[test]
+    fn paint_decision_requires_enabled_and_not_skipped() {
+        assert!(should_paint(true, false));
+        assert!(!should_paint(true, true));
+        assert!(!should_paint(false, false));
+        assert!(!should_paint(false, true));
+    }
+
+    /// Decode re-arms the visibility gate without clearing the independent
+    /// operator decode-and-drop choice.
+    ///
+    /// MUTATION: implementing skip via `paint_enabled` makes one of these two
+    /// states false after `decode()` and fails the test.
+    #[test]
+    fn decode_reenables_visibility_paint_gate_without_clearing_skip_flag() {
+        let mut d = VideoPeerDecoder::noop();
+        d.skip_canvas_paint.set(true);
+        d.clear_canvas();
+
+        d.decode(&minimal_video_packet())
+            .expect("noop decode of a VP8 packet succeeds on host");
+
+        assert!(d.paint_enabled_for_test());
+        assert!(d.skip_canvas_paint_for_test());
+        assert!(!should_paint(
+            d.paint_enabled_for_test(),
+            d.skip_canvas_paint_for_test()
+        ));
     }
 
     #[test]

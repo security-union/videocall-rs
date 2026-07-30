@@ -126,17 +126,20 @@ describe("control server", () => {
     expect(res.status).toBe(401);
   });
 
-  it("GET /bots returns the registered bots", async () => {
-    const entry = newRegistryEntry(fakeTask({ participant: "bob" }));
+  it("GET /bots returns the registered bots with their video mode", async () => {
+    const entry = newRegistryEntry(fakeTask({ participant: "bob", videoMode: "clock" }));
     surface.registry.set(entry.botId, entry);
     const res = await fetchJson(handle.port, "/bots", {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
-    const body = res.body as { bots: { botId: string; participant: string }[] };
+    const body = res.body as {
+      bots: { botId: string; participant: string; videoMode: string | null }[];
+    };
     expect(body.bots).toHaveLength(1);
     expect(body.bots[0].participant).toBe("bob");
     expect(body.bots[0].botId).toBe(entry.botId);
+    expect(body.bots[0].videoMode).toBe("clock");
   });
 
   it("GET /bots/:id returns 404 for unknown id", async () => {

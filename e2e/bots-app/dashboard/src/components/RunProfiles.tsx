@@ -139,8 +139,8 @@ export function RunProfiles({ hasBots, onToast }: RunProfilesProps) {
                     {profile.name}
                   </p>
                   <p className="text-xs text-neutral-500 dark:text-slate-400">
-                    {profile.botCount} bot{profile.botCount === 1 ? "" : "s"} ·{" "}
-                    saved {formatSavedAt(profile.savedAt)}
+                    {profile.botCount} bot{profile.botCount === 1 ? "" : "s"} · saved{" "}
+                    {formatSavedAt(profile.savedAt)}
                   </p>
                 </div>
                 <button
@@ -194,9 +194,7 @@ export function RunProfiles({ hasBots, onToast }: RunProfilesProps) {
           setShowSave(false);
           refresh();
         }}
-        onError={(msg) =>
-          onToast({ title: "Save failed", description: msg, variant: "error" })
-        }
+        onError={(msg) => onToast({ title: "Save failed", description: msg, variant: "error" })}
         onToast={onToast}
       />
       <ConfirmDialog
@@ -296,8 +294,8 @@ function SaveProfileDialog({ open, onClose, onSaved, onError, onToast }: SavePro
             Save current bots as a profile
           </Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-neutral-600 dark:text-slate-300">
-            Snapshots every bot currently in the orchestrator&apos;s registry. Pick a unique
-            name to avoid overwriting an existing profile.
+            Snapshots every bot currently in the orchestrator&apos;s registry. Pick a unique name to
+            avoid overwriting an existing profile.
           </Dialog.Description>
           <div className="mt-4">
             <label className="text-sm font-medium text-neutral-800 dark:text-slate-200">
@@ -433,8 +431,8 @@ function RenameProfileDialog({ oldName, onClose, onRenamed }: RenameProfileDialo
           </Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-neutral-600 dark:text-slate-300">
             Updates the file under <code>{"<runDir>/profiles/"}</code> and the profile&apos;s
-            internal <code>name</code> field. Other dashboards picking up the list will see the
-            new name on their next refresh.
+            internal <code>name</code> field. Other dashboards picking up the list will see the new
+            name on their next refresh.
           </Dialog.Description>
           <div className="mt-4 space-y-3">
             <div>
@@ -585,9 +583,7 @@ function ProfileDetailsDialog({
           </div>
           <div className="min-h-0 flex-1 overflow-auto px-5 py-4">
             {query.isLoading ? (
-              <p className="text-sm text-neutral-500 dark:text-slate-400">
-                Loading profile…
-              </p>
+              <p className="text-sm text-neutral-500 dark:text-slate-400">Loading profile…</p>
             ) : query.isError ? (
               <p
                 className="text-sm text-red-600 dark:text-red-400"
@@ -652,9 +648,7 @@ function ProfileDetailsDialog({
 function ProfileBotsTable({ bots }: { bots: readonly ProfileBotSpec[] }) {
   if (bots.length === 0) {
     return (
-      <p className="text-sm text-neutral-500 dark:text-slate-400">
-        This profile has no bots.
-      </p>
+      <p className="text-sm text-neutral-500 dark:text-slate-400">This profile has no bots.</p>
     );
   }
   return (
@@ -670,6 +664,7 @@ function ProfileBotsTable({ bots }: { bots: readonly ProfileBotSpec[] }) {
             <Th>Meeting URL</Th>
             <Th>TTL</Th>
             <Th>Network</Th>
+            <Th>Video mode</Th>
             <Th>Headless</Th>
             <Th>Auth</Th>
             <Th>Costume</Th>
@@ -702,6 +697,7 @@ function ProfileBotsTable({ bots }: { bots: readonly ProfileBotSpec[] }) {
                 </Td>
                 <Td>{bot.ttl}</Td>
                 <Td>{networkLabel(bot.network)}</Td>
+                <Td>{bot.videoMode ?? "costume"}</Td>
                 <Td>{bot.headless ? "headless" : "headed"}</Td>
                 <Td>{bot.authBackend}</Td>
                 <Td>
@@ -734,11 +730,7 @@ function Td({ children }: { children: React.ReactNode }) {
  * as the local chip (the silent forward-compat fallback the launch
  * route applies in lock-step).
  */
-function HostChip({
-  runLocation,
-}: {
-  runLocation: ProfileBotSpec["runLocation"];
-}) {
+function HostChip({ runLocation }: { runLocation: ProfileBotSpec["runLocation"] }) {
   if (runLocation?.kind === "ssh") {
     return (
       <span
@@ -782,4 +774,3 @@ function AssetCell({ value }: { value: string | undefined }) {
     </code>
   );
 }
-

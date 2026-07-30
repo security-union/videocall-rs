@@ -46,6 +46,8 @@
 //! let options = VideoCallClientOptions {
 //!     enable_e2ee: true,
 //!     enable_webtransport: true,
+//!     max_received_layer: None,
+//!     skip_canvas_paint: false,
 //!     on_peer_added: Callback::noop(),
 //!     on_peer_first_frame: Callback::noop(),
 //!     get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
@@ -103,7 +105,8 @@
 //!
 //! # use videocall_client::VideoCallClientOptions;
 //! # let options = VideoCallClientOptions {
-//! #     enable_e2ee: false, enable_webtransport: false, on_peer_added: Callback::noop(),
+//! #     enable_e2ee: false, enable_webtransport: false, max_received_layer: None,
+//! #     skip_canvas_paint: false, on_peer_added: Callback::noop(),
 //! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
 //! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), user_id: "user".to_string(),
 //! #     display_name: "User".to_string(), meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],

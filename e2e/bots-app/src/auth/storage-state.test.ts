@@ -33,6 +33,37 @@ describe("chooseAuthBackend", () => {
   it("honors an explicit override regardless of hostname", () => {
     expect(chooseAuthBackend("app.videocall.rs", "jwt")).toBe("jwt");
     expect(chooseAuthBackend("localhost", "storage-state")).toBe("storage-state");
+    // form-login is a valid explicit override too.
+    expect(chooseAuthBackend("app.videocall.labsworkspace.fnxlabs.com", "form-login")).toBe(
+      "form-login",
+    );
+  });
+
+  // PR #2082 blocker regression: form-login must NEVER be auto-selected.
+  // An earlier revision auto-selected form-login for any non-JWT host when
+  // BOT_EMAIL/BOT_PASSWORD were present, which could type real creds into a
+  // third-party login form (e.g. Google on app.videocall.rs). The only path
+  // to form-login now is an explicit override.
+  it("never auto-selects form-login — non-JWT hosts default to storage-state", () => {
+    // The reference form-login target itself still defaults to storage-state
+    // with no override. This is the mutation guard: re-introducing any
+    // host-based (or env-based) form-login auto-select flips one of these to
+    // "form-login" and fails.
+    expect(chooseAuthBackend("app.videocall.labsworkspace.fnxlabs.com")).toBe("storage-state");
+    expect(chooseAuthBackend("app.videocall.rs")).toBe("storage-state");
+    expect(chooseAuthBackend("evil.example.com")).toBe("storage-state");
+  });
+
+  it("only reaches form-login via an explicit override", () => {
+    // Explicit opt-in is the sole route — for the reference host AND for a
+    // host that would otherwise resolve to jwt or storage-state.
+    expect(chooseAuthBackend("app.videocall.labsworkspace.fnxlabs.com", "form-login")).toBe(
+      "form-login",
+    );
+    expect(chooseAuthBackend("app.videocall.rs", "form-login")).toBe("form-login");
+    // An explicit override always wins over the host-based auto-selection.
+    expect(chooseAuthBackend("app.videocall.labsworkspace.fnxlabs.com", "none")).toBe("none");
+    expect(chooseAuthBackend("localhost", "storage-state")).toBe("storage-state");
   });
 });
 

@@ -194,6 +194,8 @@ fn start_observer_connection(
         webtransport_urls,
         enable_e2ee: false,
         enable_webtransport: effective_wt_enabled,
+        max_received_layer: crate::constants::max_received_layer(),
+        skip_canvas_paint: crate::constants::skip_canvas_paint(),
         // Issue #1884: guest lobby OBSERVER client — no in-call reaction overlay,
         // so no reaction callback.
         on_reaction: None,

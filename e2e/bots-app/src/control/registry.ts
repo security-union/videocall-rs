@@ -188,6 +188,7 @@ export interface BotSnapshot {
   startedAt: number;
   meetingURL: string;
   network: string | null;
+  videoMode: "costume" | "file" | "clock" | null;
   ttl: string;
   ttlRemainingMs: number | null;
   finishReason?: string;
@@ -322,6 +323,7 @@ export function snapshotEntry(entry: BotRegistryEntry, now: number = Date.now())
     startedAt: entry.startedAt,
     meetingURL: entry.task.meetingURL,
     network: entry.network,
+    videoMode: entry.task.videoMode ?? null,
     ttl: formatDuration(entry.ttl),
     ttlRemainingMs,
     host: entry.host,

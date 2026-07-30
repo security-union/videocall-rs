@@ -6377,6 +6377,30 @@ html[data-theme="light"] .decode-paused-pill-action {
   color: var(--text-secondary);
 }
 
+/* Persistent live-region wrapper for the experimental-WebTransport notice.
+   Always in the DOM so screen readers register the aria-live region once and
+   announce later content changes reliably. `display: contents` removes its own
+   box so it never participates in the Network section's flex `gap` — the empty
+   (WebSocket-default) state adds no stray spacing, and when populated the panel
+   inside flows as a normal section child. */
+.transport-warning-live {
+  display: contents;
+}
+
+/* Warning-toned variant of the inline info panel (e.g. the experimental
+   WebTransport notice in the Network tab). Reuses the base structure and
+   overrides border / background / accent colour with the shared warning
+   tokens so it stays theme-aware in both light and dark. */
+.settings-info-panel--warning {
+  border-color: var(--btn-warning-border);
+  background: var(--btn-warning-bg);
+}
+
+.settings-info-panel--warning .settings-info-panel-icon,
+.settings-info-panel--warning .settings-info-panel-title {
+  color: var(--warning-text);
+}
+
 /* ── Transport segmented control ───────────────────────────────── */
 /*
  * Three-way pill picker that replaces the glass dropdown in the Network
@@ -9142,6 +9166,44 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   width: 1px;
   margin: 0 2px;
   background: var(--glass-popover-border);
+}
+
+/* issue 2086: reset control that clears the recent-CUSTOM quick-picks. Keeps the
+   .reaction-option box (44px hit target, hover/active/focus-visible treatment) so
+   it lines up with the row it acts on, but is deliberately de-emphasised: a
+   secondary, destructive action must not read as one more sendable reaction.
+   Overrides the emoji font stack — its ↺ glyph is UI text, not an emoji — and
+   sizes down to 18px so it stays visibly subordinate to the 24px reactions while
+   remaining legible in a 44px box. Rendered only alongside the quick-picks, so it
+   never appears with nothing to reset.
+
+   NEVER A LIGHT BACKDROP: the palette paints --glass-popover-bg, which global.css
+   defines ONLY inside html[data-theme="dark"] (the block at :338-719, definition
+   at :710) with no light-theme counterpart. So the theme system never repaints
+   this surface light: in dark theme it is dark glass, and in light theme the
+   background falls back to the initial value and the control sits over the video
+   grid behind it. (That light-theme fallback is a pre-existing palette-wide gap,
+   tracked separately — not introduced here.) Either way near-black text is wrong,
+   so the colours come from the theme-INDEPENDENT --on-dark-* set (global.css
+   "Fixed dark surfaces"). The theme-aware --text-secondary / --text-primary flip
+   to near-black under html[data-theme="light"], which would wash out the rest
+   state and make HOVER the least legible state of the three — the opposite of the
+   feedback a hover exists to give. `color` is in the transition so the hover
+   change fades with the background rather than snapping. */
+.reaction-option--reset {
+  font-family: inherit;
+  font-size: var(--fs-8);
+  line-height: 1;
+  color: var(--on-dark-text-secondary);
+  transition:
+    transform 0.12s ease,
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.reaction-option--reset:hover,
+.reaction-option--reset:focus-visible {
+  color: var(--on-dark-text);
 }
 
 /* ===== Standard-emoji picker (CUSTOM reaction, issue 1884) ===== */

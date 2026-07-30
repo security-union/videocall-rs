@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
+import type { AuthBackend } from "../auth/storage-state";
 import type { LaunchSpec } from "./server";
 
 /**
@@ -40,7 +41,12 @@ export interface ProfileBotSpec {
   ttl: string;
   headless: boolean;
   network: string;
-  authBackend: "jwt" | "storage-state" | "none";
+  // Widened to the shared `AuthBackend` (issue 2035) so a CLI-originated
+  // `form-login` bot type-checks when snapshotted. The profile-save validator
+  // (`validateBotSpec`) still only ACCEPTS "jwt" | "storage-state" | "none" on
+  // reload, so form-login profiles are not a supported round-trip yet — the
+  // widening only lets an in-memory snapshot represent the value faithfully.
+  authBackend: AuthBackend;
   videoMode?: "costume" | "file" | "clock" | null;
   storageStateFile?: string;
   /**
@@ -228,8 +234,16 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
   const network = expectString(o.network, `${where}.network`);
   const auth = o.authBackend;
   if (auth !== "jwt" && auth !== "storage-state" && auth !== "none") {
+    // form-login is intentionally not persistable (creds live in the
+    // environment, not the profile) — name it explicitly so a hand-edited or
+    // legacy file that carries it gets an actionable message rather than a
+    // bare "must be one of the three legacy values".
+    const hint =
+      auth === "form-login"
+        ? ` — form-login bots are not persistable (creds come from BOT_EMAIL/BOT_PASSWORD at launch); relaunch with --auth form-login instead of saving a profile`
+        : "";
     throw new ProfileValidationError(
-      `${where}.authBackend must be "jwt", "storage-state", or "none"`,
+      `${where}.authBackend must be "jwt", "storage-state", or "none"${hint}`,
     );
   }
   if (typeof o.headless !== "boolean") {

@@ -3,10 +3,7 @@ import { useMutation } from "@tanstack/react-query";
 import { FileUp, Loader2, Play, Upload, Wand2 } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
-import type {
-  LaunchFromConfigPreviewResponse,
-  LaunchFromConfigResponse,
-} from "../api/types";
+import type { LaunchFromConfigPreviewResponse, LaunchFromConfigResponse } from "../api/types";
 import type { ToastEntry } from "./ToastShelf";
 import { HelpPopover } from "./ui/HelpPopover";
 
@@ -111,7 +108,9 @@ export function ConfigImportPanel({ onToast }: ConfigImportPanelProps) {
         </div>
         <HelpPopover fieldLabel="YAML config import" testId="help-config-import">
           <p>The YAML must include a top-level meeting_url and a bots[] list.</p>
-          <p className="mt-1">Per-bot ttl, network, and auth fields override the meeting-level defaults.</p>
+          <p className="mt-1">
+            Per-bot ttl, network, and auth fields override the meeting-level defaults.
+          </p>
           <p className="mt-1">
             Generate a starting template with{" "}
             <code className="font-mono text-[11px]">bots-app gen --count N --seed S</code>.
@@ -199,6 +198,10 @@ export function ConfigImportPanel({ onToast }: ConfigImportPanelProps) {
                 <dd>{preview.ttl ?? "(none)"}</dd>
                 <dt className="text-neutral-500 dark:text-slate-400">Default network</dt>
                 <dd>{preview.network ?? "(none)"}</dd>
+                <dt className="text-neutral-500 dark:text-slate-400">Default video mode</dt>
+                <dd data-testid="config-import-preview-video-mode">
+                  {preview.videoMode ?? "costume"}
+                </dd>
                 <dt className="text-neutral-500 dark:text-slate-400">Default auth</dt>
                 <dd>{preview.auth ?? "(none)"}</dd>
                 <dt className="text-neutral-500 dark:text-slate-400">Bot count</dt>
@@ -217,6 +220,7 @@ export function ConfigImportPanel({ onToast }: ConfigImportPanelProps) {
                       [{i}] {b.participant}
                       {b.ttl ? ` ttl=${b.ttl}` : ""}
                       {b.network ? ` net=${b.network}` : ""}
+                      {b.videoMode ? ` video=${b.videoMode}` : ""}
                       {b.auth ? ` auth=${b.auth}` : ""}
                     </li>
                   ))}
@@ -233,9 +237,7 @@ export function ConfigImportPanel({ onToast }: ConfigImportPanelProps) {
               className="inline-flex items-center gap-2 rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 shadow-sm hover:bg-neutral-50 disabled:cursor-not-allowed disabled:bg-neutral-50 disabled:text-neutral-400 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-700 dark:disabled:bg-slate-800 dark:disabled:text-slate-500"
               data-testid="config-import-preview-button"
             >
-              {previewMutation.isPending && (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              )}
+              {previewMutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
               Preview
             </button>
             <button

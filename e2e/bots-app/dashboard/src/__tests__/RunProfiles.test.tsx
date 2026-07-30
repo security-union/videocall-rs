@@ -197,6 +197,7 @@ describe("<RunProfiles />", () => {
               ttl: "5m",
               headless: false,
               network: "none",
+              videoMode: "clock",
               authBackend: "jwt",
               costume: "pirate.y4m",
               audio: "alice.wav",
@@ -227,6 +228,7 @@ describe("<RunProfiles />", () => {
     expect(screen.getByTestId("profile-details-row-0")).toHaveTextContent("alice");
     expect(screen.getByTestId("profile-details-row-0")).toHaveTextContent("pirate.y4m");
     expect(screen.getByTestId("profile-details-row-0")).toHaveTextContent("alice.wav");
+    expect(screen.getByTestId("profile-details-row-0")).toHaveTextContent("clock");
     expect(screen.getByTestId("profile-details-row-1")).toHaveTextContent("bob");
     expect(screen.getByTestId("profile-details-row-1")).toHaveTextContent("auto-match");
     // Metadata line shows the schema version + bot count so operators
@@ -323,9 +325,7 @@ describe("<RunProfiles />", () => {
     fireEvent.change(input, { target: { value: "new-name" } });
     fireEvent.click(screen.getByTestId("rename-profile-submit"));
     await waitFor(() => {
-      expect(state.renameCalls).toEqual([
-        { oldName: "old-name", body: { newName: "new-name" } },
-      ]);
+      expect(state.renameCalls).toEqual([{ oldName: "old-name", body: { newName: "new-name" } }]);
     });
     await waitFor(() => {
       expect(toast).toHaveBeenCalledWith(

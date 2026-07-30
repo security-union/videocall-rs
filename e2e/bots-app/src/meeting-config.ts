@@ -26,19 +26,30 @@ export const NETSIM_PRESETS: readonly string[] = [
 ] as const;
 
 /**
- * Names accepted on the optional `auth:` field in a meeting config.
- * Mirrors the runtime `AuthBackend` type in `src/auth/storage-state.ts`
- * — kept as a TS-side string list so this module stays free of
- * runtime imports from `bot.ts`.
+ * Names accepted on the optional `auth:` field in a meeting config —
+ * mirrors the runtime `AuthBackend` type in `src/auth/storage-state.ts`,
+ * kept as a TS-side string list so this module stays free of runtime
+ * imports from `bot.ts`.
+ *
+ * `form-login` is included so a meeting config can fully specify a
+ * form-login run against the labsworkspace identity-service (the config's
+ * `meeting_url` names the target host — no ambient/host-list inference).
+ * It is an EXPLICIT opt-in only: `chooseAuthBackend` never auto-selects it
+ * (PR #2082 blocker fix), and `form-login.ts` additionally refuses to type
+ * credentials into a known public IdP.
  */
-export const AUTH_BACKEND_NAMES: readonly string[] = ["jwt", "storage-state", "none"] as const;
+export const AUTH_BACKEND_NAMES: readonly string[] = [
+  "jwt",
+  "storage-state",
+  "none",
+  "form-login",
+] as const;
 
-/**
- * One bot's entry within a meeting config. Currently only carries the
- * participant handle; `ttl` and (future) network-condition overrides
- * are placeholders for phase 3+ work but don't ship per-bot yet so
- * `bot.ts` doesn't need to know about them.
- */
+export const VIDEO_MODE_NAMES = ["costume", "file", "clock"] as const;
+
+export type MeetingConfigVideoMode = (typeof VIDEO_MODE_NAMES)[number];
+
+/** One bot's entry within a meeting config, including optional per-bot overrides. */
 export interface BotEntry {
   participant: string;
   /**
@@ -58,6 +69,11 @@ export interface BotEntry {
    * See discussion #793 phase 3.
    */
   network?: string;
+  /**
+   * Optional per-bot fake-video source. Overrides the meeting-level
+   * default when present.
+   */
+  videoMode?: MeetingConfigVideoMode;
   /**
    * Optional per-bot auth backend override (one of
    * `AUTH_BACKEND_NAMES`). Overrides the meeting-level default. When
@@ -83,6 +99,8 @@ export interface MeetingConfig {
    * See `BotEntry.network` for the per-bot override.
    */
   network?: string;
+  /** Optional meeting-level fake-video source inherited by each bot. */
+  videoMode?: MeetingConfigVideoMode;
   /**
    * Optional meeting-level auth backend (one of `AUTH_BACKEND_NAMES`).
    * Bots that do not specify their own `auth` inherit this value.
@@ -132,6 +150,18 @@ function validateAuthBackend(value: unknown, where: string): string {
   return value;
 }
 
+function validateVideoMode(value: unknown, where: string): MeetingConfigVideoMode {
+  if (typeof value !== "string") {
+    throw new Error(`${where}.video_mode, when present, must be a string`);
+  }
+  if (!(VIDEO_MODE_NAMES as readonly string[]).includes(value)) {
+    throw new Error(
+      `${where}.video_mode must be one of: ${VIDEO_MODE_NAMES.join(", ")} (got "${value}")`,
+    );
+  }
+  return value as MeetingConfigVideoMode;
+}
+
 /**
  * Parse a meeting config from YAML text. Throws with a human-readable
  * message on malformed input.
@@ -153,6 +183,8 @@ export function parseMeetingConfigText(text: string): MeetingConfig {
   }
   const network =
     obj.network !== undefined ? validateNetsimProfile(obj.network, "meeting") : undefined;
+  const videoMode =
+    obj.video_mode !== undefined ? validateVideoMode(obj.video_mode, "meeting") : undefined;
   const auth = obj.auth !== undefined ? validateAuthBackend(obj.auth, "meeting") : undefined;
   if (!Array.isArray(obj.bots)) {
     throw new Error("bots must be an array");
@@ -175,12 +207,20 @@ export function parseMeetingConfigText(text: string): MeetingConfig {
     }
     const botNetwork =
       row.network !== undefined ? validateNetsimProfile(row.network, `bots[${idx}]`) : undefined;
+    const botVideoMode =
+      row.video_mode !== undefined ? validateVideoMode(row.video_mode, `bots[${idx}]`) : undefined;
     const botAuth =
       row.auth !== undefined ? validateAuthBackend(row.auth, `bots[${idx}]`) : undefined;
-    return { participant, ttl: botTtl, network: botNetwork, auth: botAuth };
+    return {
+      participant,
+      ttl: botTtl,
+      network: botNetwork,
+      videoMode: botVideoMode,
+      auth: botAuth,
+    };
   });
   const meta = obj.meta;
-  const result: MeetingConfig = { meetingUrl, ttl, network, auth, bots };
+  const result: MeetingConfig = { meetingUrl, ttl, network, videoMode, auth, bots };
   if (meta != null && typeof meta === "object" && !Array.isArray(meta)) {
     const m = meta as Record<string, unknown>;
     result.meta = {
@@ -212,6 +252,9 @@ export function emitMeetingConfigYaml(config: MeetingConfig): string {
   if (config.network !== undefined) {
     out.network = config.network;
   }
+  if (config.videoMode !== undefined) {
+    out.video_mode = config.videoMode;
+  }
   if (config.auth !== undefined) {
     out.auth = config.auth;
   }
@@ -219,6 +262,7 @@ export function emitMeetingConfigYaml(config: MeetingConfig): string {
     const entry: Record<string, unknown> = { participant: b.participant };
     if (b.ttl !== undefined) entry.ttl = b.ttl;
     if (b.network !== undefined) entry.network = b.network;
+    if (b.videoMode !== undefined) entry.video_mode = b.videoMode;
     if (b.auth !== undefined) entry.auth = b.auth;
     return entry;
   });

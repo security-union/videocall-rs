@@ -30,6 +30,7 @@ export interface BotSnapshot {
   startedAt: number;
   meetingURL: string;
   network: string | null;
+  videoMode?: "costume" | "file" | "clock" | null;
   ttl: string;
   ttlRemainingMs: number | null;
   finishReason?: string;
@@ -89,6 +90,14 @@ export interface LaunchRequest {
   headless: boolean;
   network: string;
   videoMode?: "costume" | "file" | "clock";
+  // NOTE: the CLI's AuthBackend also has a 4th value, "form-login" (#2035),
+  // but it is deliberately NOT dashboard-launchable — it needs BOT_EMAIL/
+  // BOT_PASSWORD from the environment and is never persisted to a profile
+  // (see e2e/bots-app/src/control/profiles.ts). Every control-server launch
+  // route rejects it at runtime — the single/multi/preview launch validators,
+  // the profile validators, AND the config-launch/preview routes
+  // (rejectFormLoginConfig) — so keeping it narrow here is intentional, not
+  // drift.
   authBackend: "jwt" | "storage-state" | "none";
   storageStateFile?: string;
   /**
@@ -162,6 +171,7 @@ export interface ProfileBotSpec {
   ttl: string;
   headless: boolean;
   network: string;
+  videoMode?: "costume" | "file" | "clock" | null;
   authBackend: "jwt" | "storage-state" | "none";
   storageStateFile?: string;
   /**
@@ -342,12 +352,14 @@ export interface LaunchFromConfigPreviewResponse {
   meetingUrl: string;
   ttl: string | null;
   network: string | null;
+  videoMode: "costume" | "file" | "clock" | null;
   auth: string | null;
   botCount: number;
   bots: Array<{
     participant: string;
     ttl?: string;
     network?: string;
+    videoMode?: "costume" | "file" | "clock";
     auth?: string;
   }>;
   meta: { seed?: number; generatedAt?: string } | null;

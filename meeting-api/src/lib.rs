@@ -28,6 +28,7 @@ pub mod feed_events;
 pub mod nats_consumers;
 pub mod nats_events;
 pub mod oauth;
+pub mod password;
 pub mod routes;
 pub mod search;
 pub mod session_refresh;

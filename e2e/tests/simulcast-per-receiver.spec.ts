@@ -20,12 +20,12 @@
  * `bot/tests/aq_degradation.rs` (`bot_does_not_degrade_on_receiver_fps`,
  * `bot_degrades_on_synthetic_backpressure`, `bot_degrades_on_congestion_cut`).
  *
- * The feature is FLAG-GATED OFF in production (`experimentalSimulcastMaxLayers`
- * defaults to 1 = single layer; effective layers =
- * `min(flag, device-capability-ceiling)`). This spec ENABLES the flag for the
- * test browser only via `enableSimulcastFlag` (a `/config.js` route patch — it
- * does NOT modify the committed `dioxus-ui/scripts/config.js` nor the
- * developer's gitignored `config.local.js`).
+ * The runtime/code default is 3 layers (#1082), with effective video/screen
+ * layers = `min(flag, device-capability-ceiling)`. The committed dev/E2E
+ * `config.js` explicitly pins the flag to 1, so this stack remains single-layer
+ * unless the spec overrides it. This spec sets 3 for the test browser only via
+ * `enableSimulcastFlag` (a `/config.js` route patch — it does NOT modify the
+ * committed file or the developer's gitignored `config.local.js`).
  *
  * ## STATUS: #1093 hook DELIVERED — the 4 SEND-side tests now RUN
  *

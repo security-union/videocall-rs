@@ -364,7 +364,20 @@ Room `a2vp`: pat (`viewport_visible_count: 1`) discovered 2 publishers, sent
 `VIEWPORT (change) rendering 1 of 2 known peer(s)`. Visible source (alice)
 delivered 216 kbps to pat; hidden source (bob) delivered ZERO video — the
 `videocall_video_bitrate_kbps{reporter_name="pat",peer_name="bob"}` series was
-never created. Relay: `relay_viewport_set_size`=1, forwarded=18,177,
+never created.
+
+> ⚠️ **This pass criterion is stale on two axes — do NOT reuse it verbatim on a
+> re-run.** (1) Issue 2145 removed the `bitrate_kbps != 0` / `fps_received != 0.0`
+> guards in `metrics_server.rs`, but whether a hidden source's series exists depends
+> on its history. If the receiver got at least one frame before filtering began, its
+> existing tracker emits `0` and the series is created or updated to read `0`. If no
+> frame ever reached the receiver, no tracker or `video_stats` exists and the series
+> remains absent. Do not use series absence alone as the pass criterion; assert on
+> the receiver's per-source inbound bytes and the relay's `filtered` count instead.
+> (2) The `reporter_name`/`peer_name` labels were REMOVED by #1580/#1954 — filter on
+> `from_peer`/`to_peer` and join `videocall_peer_info` for display names.
+
+Relay: `relay_viewport_set_size`=1, forwarded=18,177,
 filtered=5,679, updates accepted=23 / rate_limited=1. V17 follows from any
 nonzero filtered count (filtering keys on the bot's cleartext `media_kind`).
 V19: periodic `(reconnect)` re-assert captured at the 10s cadence; the forced

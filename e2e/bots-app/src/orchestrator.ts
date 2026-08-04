@@ -18,6 +18,12 @@ import {
   type LaunchSpec,
   type OrchestratorControlSurface,
 } from "./control/server";
+import {
+  applyNetemAction,
+  defaultNetemExec,
+  NETEM_IFACE_DEFAULT,
+  type NetemExec,
+} from "./control/netem";
 import { getHost, type SshHost } from "./control/ssh-hosts";
 import { spawnRemoteBot, type SshBotHandle, type SshLaunchSpec } from "./control/ssh-launcher";
 import { loadManifest, type Manifest } from "./manifest";
@@ -50,6 +56,31 @@ export interface RunOptions {
     port: number;
     token: string;
     tokenFilePath: string;
+    /**
+     * Address the control HTTP server binds to. Defaults to
+     * `127.0.0.1` (loopback, back-compat). Pods that must be driven by
+     * an in-cluster conductor set `0.0.0.0`. When non-loopback, the
+     * control server refuses to start without a token (enforced in
+     * {@link startControlServer}).
+     */
+    bindAddress?: string;
+    /**
+     * OS-level `tc`/netem shaping config (issue #2072 Increment 3).
+     * When set, the control surface gains a `setNetem` method and the
+     * `/netem` endpoint becomes live. Left unset in dashboard /
+     * operator-host mode so the endpoint replies 501 and no `tc`
+     * command is ever run against the operator's own interface.
+     */
+    netem?: {
+      /** Interface to shape (default {@link NETEM_IFACE_DEFAULT} = eth0). */
+      iface?: string;
+      /**
+       * Injection seam for tests — defaults to {@link defaultNetemExec}
+       * (a real `execFile("tc", …)` runner). Tests pass a recorder so
+       * no real `tc` ever runs.
+       */
+      exec?: NetemExec;
+    };
     /**
      * Run directory shared with the CLI's `--assets-dir`. Forwarded
      * to the control server so the `/profiles*` endpoints can read
@@ -439,17 +470,35 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
     },
   };
 
+  // Netem is a per-pod capability, wired onto the surface ONLY when the
+  // run opted in (opts.control.netem present). Attaching the method here
+  // — rather than always — is what makes `/netem` reply 501 in
+  // dashboard / operator-host mode, so no `tc` command ever runs against
+  // an operator's own interface. Each pod runs one local bot, so the
+  // shaped interface is genuinely that bot's uplink.
+  if (opts.control?.netem) {
+    const iface = opts.control.netem.iface ?? NETEM_IFACE_DEFAULT;
+    const exec = opts.control.netem.exec ?? defaultNetemExec();
+    surface.setNetem = async (action) => {
+      const result = await applyNetemAction(action, { iface, exec });
+      console.log(`[orchestrator] netem ${result.op} (${result.label}): ${result.argv.join(" ")}`);
+      return result;
+    };
+  }
+
   let controlHandle: ControlServerHandle | null = null;
   if (opts.control) {
+    const bindAddress = opts.control.bindAddress ?? "127.0.0.1";
     controlHandle = await startControlServer({
       port: opts.control.port,
       token: opts.control.token,
       surface,
+      bindAddress,
       runDir: opts.control.runDir,
       manifestPath: opts.control.manifestPath,
     });
     console.log(
-      `[orchestrator] control server listening on http://127.0.0.1:${controlHandle.port}`,
+      `[orchestrator] control server listening on http://${bindAddress}:${controlHandle.port}`,
     );
     if (opts.control.onListen) {
       await opts.control.onListen({ port: controlHandle.port, token: opts.control.token });

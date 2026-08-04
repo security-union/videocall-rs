@@ -30,6 +30,21 @@ pub struct ClientMessage {
     pub user: String,
     pub room: RoomId,
     pub msg: Packet,
+    /// When true, `ChatServer` must NOT fan this packet out unless `session` is
+    /// the room's current HOST (issue #2136).
+    ///
+    /// Set only by
+    /// [`SessionLogic::create_host_gated_client_message`](crate::actors::session_logic::SessionLogic::create_host_gated_client_message),
+    /// which in turn is reached only from the
+    /// [`InboundAction::ForwardHostOnly`](crate::actors::session_logic::InboundAction::ForwardHostOnly)
+    /// branch — i.e. today, only for MEETING_TIMER packets.
+    ///
+    /// The flag travels here rather than the check being made in `SessionLogic`
+    /// because `SessionLogic::is_host` is a JWT-claim snapshot that goes stale in
+    /// BOTH directions across a transfer-host, whereas `ChatServer` holds the
+    /// live, NATS-refreshed presence mirror. `false` is the pre-existing
+    /// behaviour for every other packet class and must remain the default.
+    pub requires_host: bool,
 }
 
 #[derive(ActixMessage)]
@@ -89,6 +104,17 @@ pub struct Connect {
 #[rtype(result = "()")]
 pub struct Packet {
     pub data: Arc<Vec<u8>>,
+    /// Propagates [`ClientMessage::requires_host`] through the transport actor's
+    /// own mailbox (issue #2136).
+    ///
+    /// The transports forward via `ctx.notify(Packet { .. })` rather than
+    /// sending to `ChatServer` directly, so the host-gated flag has to ride the
+    /// `Packet` hop to reach `create_host_gated_client_message`. Carrying it here
+    /// — instead of short-circuiting to a direct `do_send` in the
+    /// `ForwardHostOnly` arm — keeps a MEETING_TIMER in the SAME mailbox queue as
+    /// every other packet from this session, so it cannot overtake media the
+    /// session enqueued before it.
+    pub requires_host: bool,
 }
 
 #[derive(ActixMessage)]
@@ -151,4 +177,24 @@ pub struct RebroadcastPresence {
     /// requester is already served by the in-memory replay) and is the unicast
     /// target for a single-join re-announce.
     pub requester_session: SessionId,
+    /// The joiner's CLAIMED per-tab `instance_id`, carried on the wire by
+    /// `PARTICIPANT_LIST_REQUEST`, or `None` when the joiner supplied none, sent
+    /// an over-long one, or the request came from a relay predating the field.
+    ///
+    /// This is a **client-supplied hint, not an identity**. It originates as the
+    /// `?instance_id=` query parameter on the joiner's own connect, and the only
+    /// processing applied anywhere is a length/emptiness bound — it is never
+    /// checked against the authenticated JWT `sub`, so a client can present any
+    /// value it likes, including another client's.
+    ///
+    /// It is trusted for exactly one decision: whether the flush answers a
+    /// requester by unicast or by broadcast. One client's WS and WT election
+    /// candidates hold distinct `requester_session`s but present the same value,
+    /// so keying the distinct-requester count on it stops a single join from
+    /// being mistaken for a wave (#1600 item 2). Every way the claim can be false
+    /// resolves toward BROADCAST, which reaches strictly more sessions than the
+    /// unicast fan would — see the trust section on
+    /// `RequesterKey` in `actors::chat_server` for the full argument. `None`
+    /// falls back to keying on `requester_session`, the pre-#1600 behaviour.
+    pub requester_instance: Option<String>,
 }

@@ -15,6 +15,8 @@ pub enum ActionBarSlot {
     Mic,
     Camera,
     Reactions,
+    #[serde(rename = "raise_hand")]
+    RaiseHand,
     #[serde(rename = "screen")]
     ScreenShare,
     #[serde(rename = "participants")]
@@ -28,6 +30,10 @@ pub enum ActionBarSlot {
     Recording,
     #[serde(rename = "meeting_options")]
     MeetingOptions,
+    /// Issue 2136: the host's meeting-timer control. HOST-ONLY — see
+    /// [`meeting_timer_slot_visible`].
+    #[serde(rename = "meeting_timer")]
+    MeetingTimer,
 }
 
 impl ActionBarSlot {
@@ -37,6 +43,7 @@ impl ActionBarSlot {
             ActionBarSlot::Mic => "Microphone",
             ActionBarSlot::Camera => "Camera",
             ActionBarSlot::Reactions => "Reactions",
+            ActionBarSlot::RaiseHand => "Raise hand",
             ActionBarSlot::ScreenShare => "Screen share",
             ActionBarSlot::PeerList => "Participants",
             ActionBarSlot::DensityMode => "Density mode",
@@ -44,6 +51,7 @@ impl ActionBarSlot {
             ActionBarSlot::DeviceSettings => "Settings",
             ActionBarSlot::Recording => "Record",
             ActionBarSlot::MeetingOptions => "Meeting options",
+            ActionBarSlot::MeetingTimer => "Meeting timer",
         }
     }
 
@@ -62,6 +70,7 @@ impl ActionBarSlot {
             ActionBarSlot::Mic => "mic",
             ActionBarSlot::Camera => "camera",
             ActionBarSlot::Reactions => "reactions",
+            ActionBarSlot::RaiseHand => "raise_hand",
             ActionBarSlot::ScreenShare => "screen",
             ActionBarSlot::PeerList => "participants",
             ActionBarSlot::DensityMode => "density",
@@ -69,6 +78,7 @@ impl ActionBarSlot {
             ActionBarSlot::DeviceSettings => "settings",
             ActionBarSlot::Recording => "recording",
             ActionBarSlot::MeetingOptions => "meeting_options",
+            ActionBarSlot::MeetingTimer => "meeting_timer",
         }
     }
 
@@ -79,6 +89,7 @@ impl ActionBarSlot {
             "mic" => ActionBarSlot::Mic,
             "camera" => ActionBarSlot::Camera,
             "reactions" => ActionBarSlot::Reactions,
+            "raise_hand" => ActionBarSlot::RaiseHand,
             "screen" => ActionBarSlot::ScreenShare,
             "participants" => ActionBarSlot::PeerList,
             "density" => ActionBarSlot::DensityMode,
@@ -86,6 +97,7 @@ impl ActionBarSlot {
             "settings" => ActionBarSlot::DeviceSettings,
             "recording" => ActionBarSlot::Recording,
             "meeting_options" => ActionBarSlot::MeetingOptions,
+            "meeting_timer" => ActionBarSlot::MeetingTimer,
             _ => return None,
         })
     }
@@ -97,6 +109,12 @@ pub const DEFAULT_SLOTS: &[ActionBarSlot] = &[
     // Issue #1884: Reactions at index 2 (after Camera). Existing users get it
     // appended by migrate_stored_layout's forward-compat pass.
     ActionBarSlot::Reactions,
+    // Issue 2135: Raise hand at index 3, immediately after Reactions — the two
+    // are the same class of action (a broadcast signal to the room) and users
+    // reach for them interchangeably. Existing users get it appended by
+    // `migrate_stored_layout`'s forward-compat pass, so nobody's saved ordering
+    // is rewritten; only a fresh install sees it here.
+    ActionBarSlot::RaiseHand,
     ActionBarSlot::ScreenShare,
     ActionBarSlot::PeerList,
     ActionBarSlot::DensityMode,
@@ -104,6 +122,11 @@ pub const DEFAULT_SLOTS: &[ActionBarSlot] = &[
     ActionBarSlot::DeviceSettings,
     ActionBarSlot::Recording,
     ActionBarSlot::MeetingOptions,
+    // Issue 2136: the meeting timer sits last in the default order, next to
+    // Meeting options — both are host-only surfaces, so a non-host sees neither
+    // and the visible bar is unchanged for them. Existing users get it appended
+    // by `migrate_stored_layout`'s forward-compat pass.
+    ActionBarSlot::MeetingTimer,
 ];
 
 /// On-disk schema for the action-bar layout. Two shapes have ever shipped to
@@ -318,6 +341,27 @@ pub fn record_slot_visible(
     !is_guest && (is_owner || recording_allowed_for_all)
 }
 
+/// Whether the meeting-timer slot is visible for this user (issue 2136).
+///
+/// HOST-ONLY, and `is_host` here MUST be the caller's LIVE host signal — the one
+/// kept in step by the HOST_GRANTED / HOST_REVOKED broadcasts — not the `is_owner`
+/// prop, which only catches up after a `check_status` round-trip. The relay
+/// authorizes MEETING_TIMER against its own live mirror of the same flag, so a
+/// gate on the lagging value shows a demoted ex-host controls whose every packet
+/// is silently dropped.
+///
+/// Guests are excluded outright: a guest is never the host, so the term is
+/// redundant against a correct `is_host`, but it is stated explicitly here for
+/// the same reason `record_slot_visible` states it — the two flags being mutually
+/// exclusive is a property of how tokens are minted, not an invariant anything
+/// enforces.
+///
+/// Extracted as a pure function so the gating decision is host-testable without a
+/// Dioxus runtime; the production render path calls this directly.
+pub fn meeting_timer_slot_visible(is_host: bool, is_guest: bool) -> bool {
+    !is_guest && is_host
+}
+
 /// Result of a keyboard-reorder attempt on the action-bar. `old_idx` is the
 /// slot's position before the keystroke; `new_idx` is its position after.
 /// When they are equal the caller MUST NOT persist and should still announce
@@ -368,6 +412,62 @@ pub fn apply_keyboard_reorder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // Issue 2136 -- the meeting-timer slot gate
+    // ---------------------------------------------------------------------
+
+    /// The gate must be a real DISCRIMINATOR in both directions. A gate that
+    /// returned a constant would still let the control render (or never render),
+    /// and the failure is silent either way: a non-host who sees the control gets
+    /// buttons the relay drops on the floor.
+    #[test]
+    fn meeting_timer_slot_is_visible_only_to_a_non_guest_host() {
+        assert!(
+            meeting_timer_slot_visible(true, false),
+            "the host must see the meeting-timer control"
+        );
+        assert!(
+            !meeting_timer_slot_visible(false, false),
+            "a non-host must NOT see it -- the relay drops their packets, so the \
+             control would look live and silently do nothing"
+        );
+    }
+
+    /// Guests are excluded regardless of the host flag. This is belt-and-braces
+    /// (a guest is never the host), and it is written down for the same reason
+    /// `record_slot_visible` states it: the two flags being mutually exclusive is
+    /// a property of how tokens are minted, not an invariant anything enforces.
+    #[test]
+    fn meeting_timer_slot_is_hidden_from_guests_even_if_the_host_flag_is_set() {
+        assert!(!meeting_timer_slot_visible(true, true));
+        assert!(!meeting_timer_slot_visible(false, true));
+    }
+
+    /// The slot must be a real member of the default layout, and must round-trip
+    /// through the persistence tag. A slot whose tag did not parse back would be
+    /// silently dropped from a saved layout on the next load.
+    #[test]
+    fn meeting_timer_slot_round_trips_through_its_storage_tag() {
+        assert!(
+            DEFAULT_SLOTS.contains(&ActionBarSlot::MeetingTimer),
+            "the meeting timer must be in the default layout or a fresh install \
+             never shows it"
+        );
+        let tag = ActionBarSlot::MeetingTimer.slug();
+        assert_eq!(
+            ActionBarSlot::from_slug(tag),
+            Some(ActionBarSlot::MeetingTimer),
+            "slug/from_slug must round-trip, or a saved layout and the \
+             keyboard-reorder lookup both lose the slot"
+        );
+        assert_eq!(
+            tag, "meeting_timer",
+            "the slug is also the serde tag and the `data-slot` attribute the \
+             E2E spec addresses; changing it silently drops the slot from every \
+             already-saved layout"
+        );
+    }
 
     /// Test wrapper: calls the EXACT same migration the production loader
     /// runs, but without touching `localStorage`. Because this delegates to
@@ -649,15 +749,26 @@ mod tests {
     /// wrapping/unchecked expression and this test fails.
     #[test]
     fn keyboard_reorder_arrow_delta_moves_and_clamps() {
-        // Right arrow from the middle. ScreenShare sits at index 3 in
-        // DEFAULT_SLOTS (after Mic, Camera, Reactions — issue 1884 inserted
-        // Reactions at index 2), so a +1 arrow moves it to index 4.
+        // Right arrow from the middle. ScreenShare sits at index 4 in
+        // DEFAULT_SLOTS (after Mic, Camera, Reactions, RaiseHand — issue #1884
+        // inserted Reactions at index 2 and issue 2135 inserted RaiseHand at
+        // index 3), so a +1 arrow moves it to index 5. The index is read from
+        // DEFAULT_SLOTS rather than hard-coded so a future insertion does not
+        // silently make this test assert about a different slot.
         let mut slots: Vec<ActionBarSlot> = DEFAULT_SLOTS.to_vec();
+        let screen_idx = DEFAULT_SLOTS
+            .iter()
+            .position(|s| *s == ActionBarSlot::ScreenShare)
+            .expect("ScreenShare is a default slot");
+        assert_eq!(
+            screen_idx, 4,
+            "ScreenShare's default position (Mic, Camera, Reactions, RaiseHand first)"
+        );
         let result = apply_keyboard_reorder(&mut slots, ActionBarSlot::ScreenShare, Some(1), None)
             .expect("ScreenShare is present");
-        assert_eq!(result.old_idx, 3);
-        assert_eq!(result.new_idx, 4);
-        assert_eq!(slots[4], ActionBarSlot::ScreenShare);
+        assert_eq!(result.old_idx, screen_idx);
+        assert_eq!(result.new_idx, screen_idx + 1);
+        assert_eq!(slots[screen_idx + 1], ActionBarSlot::ScreenShare);
 
         // Left arrow at index 0 clamps (no move).
         let mut slots: Vec<ActionBarSlot> = DEFAULT_SLOTS.to_vec();

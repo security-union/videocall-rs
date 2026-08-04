@@ -65,7 +65,9 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
 
   async function openDockMenu(page: Page): Promise<void> {
     await page.locator(".video-controls-container").hover();
-    const toggleBtn = page.locator('.dock-position-wrapper button[aria-haspopup="listbox"]');
+    // Stable id, not `aria-haspopup` — issue 1762 changed that value from
+    // "listbox" to "menu".
+    const toggleBtn = page.locator("#dock-menu-trigger");
     await toggleBtn.click();
     await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 5_000 });
   }
@@ -236,8 +238,12 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
     // Dock menu opening alone must NOT close the peer list
     await expect(page.locator("#peer-list-container")).toHaveClass(/visible/);
 
+    // Case-SENSITIVE regex, not a string: Playwright's string `hasText` is
+    // case-insensitive, so "Action Bar" would also match the "Auto-hide action
+    // bar" item (issue 1762 renamed it from "Turn Hiding On/Off") and this
+    // locator would resolve to two elements, failing strict mode on click.
     const actionBarOption = page.locator(".glass-select-menu .glass-select-option", {
-      hasText: "Action Bar",
+      hasText: /Action Bar/,
     });
     await actionBarOption.click();
 
@@ -255,8 +261,12 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
 
     await openDockMenu(page);
 
+    // Case-SENSITIVE regex, not a string: Playwright's string `hasText` is
+    // case-insensitive, so "Action Bar" would also match the "Auto-hide action
+    // bar" item (issue 1762 renamed it from "Turn Hiding On/Off") and this
+    // locator would resolve to two elements, failing strict mode on click.
     const actionBarOption = page.locator(".glass-select-menu .glass-select-option", {
-      hasText: "Action Bar",
+      hasText: /Action Bar/,
     });
     await actionBarOption.click();
 

@@ -276,6 +276,122 @@ pub const SIMULCAST_VIDEO_LAYERS: &[VideoQualityTier] = &[
     },
 ];
 
+/// REDUCED-top camera simulcast ladder, selected by [`LadderVariant::Reduced`]
+/// (issue #1768).
+///
+/// Identical to [`SIMULCAST_VIDEO_LAYERS`] except the top rung is **540p instead
+/// of 720p**. Same length (so the layer-id space and every count clamp are
+/// unchanged) and same lowest-first ordering.
+///
+/// # Why the TOP rung and not the floor
+///
+/// At each rung's own target fps the encode cost is wildly lopsided —
+/// `low` 320×180@7 = 0.40 Mpx/s (1.3% of a 3-layer encode), `standard`
+/// 640×360@15 = 3.46 (11.0%), `hd` 1280×720@30 = **27.65 (87.8%)**. Lowering the
+/// floor saves essentially nothing; lowering the top is the entire win. Swapping
+/// 720p→540p takes the top rung to 15.55 Mpx/s, cutting the 3-layer total from
+/// ~31.5 to ~19.4 Mpx/s (≈38%).
+///
+/// # Why 540p specifically
+///
+/// It matches Google Meet's 540p rung (their documented ladder is
+/// 180p/360p/540p/720p, and their documented typical group-meeting inbound of
+/// ~1.3 Mbps shows their receivers sit low in the grid, which is why our video
+/// looks sharper in the same tile). It also keeps us **above** the 180p floor
+/// where a full-screen or 2-person view would go soft — going below 180p was
+/// explicitly rejected. And 960×540 is already validated geometry in this
+/// codebase: it is the `standard` rung of [`VIDEO_QUALITY_TIERS`], whose
+/// 900/500/1500 kbps band is reused here rather than inventing values.
+///
+/// # The `n == 2` case
+///
+/// [`spaced_ladder_positions`] anchors base+top and skips the interior, so a
+/// 2-layer publisher (any device sniffing 6–9 cores) gets `[low, top]` — `[180p,
+/// 720p]` by default, `[180p, 540p]` here. The gap between the two rungs narrows on
+/// both measures: **pixel area 16× → 9×**, and **throughput 68.6× → 38.6× Mpx/s**
+/// (the throughput figure folds in the 7 vs 30 fps difference; it is the "69×"
+/// number quoted in the #2143 analysis, and it is NOT the pixel ratio — the two are
+/// easily conflated).
+///
+/// **This does NOT give the #1256 tile-size lid a new target**, and an earlier
+/// revision of this doc claiming it did was wrong. `size_cap_layer` returns the
+/// FIRST rung whose height covers the tile and otherwise falls through to
+/// `highest_available`, so reaching the top index means every lower rung already
+/// failed — the top rung's height never enters the decision. A 2-layer publisher's
+/// receiver therefore selects the SAME index under either ladder;
+/// `size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung` (videocall-client)
+/// proves that exhaustively. The benefit of the narrower gap is that a receiver
+/// forced to the top rung now pays 540p instead of 720p — cheaper DECODE and less
+/// downlink for the SAME selection, not a better selection.
+///
+/// # The receiver-side saving, quantified
+///
+/// This is the headline result for the low-power devices this project targets (no
+/// hardware VP8/VP9 decode, where software decode is the binding constraint), so it
+/// is stated in numbers rather than as "cheaper": 960×540 is **0.5625×** the pixels
+/// of 1280×720, so a receiver on the top rung does **~43.8% less** decode work per
+/// frame — **15.55 vs 27.65 Mpx/s** at the rung's 30 fps. Downlink for that rung
+/// falls with it (ideal 900 vs 1500 kbps, −40%). Pinned by
+/// `reduced_ladder_cuts_top_rung_decode_cost` so the receiver claim is tied to the
+/// tables exactly as the publisher-side encode claim is.
+pub const SIMULCAST_VIDEO_LAYERS_REDUCED: &[VideoQualityTier] = &[
+    VideoQualityTier {
+        label: "low",
+        max_width: 320,
+        max_height: 180,
+        target_fps: 7,
+        ideal_bitrate_kbps: 120,
+        min_bitrate_kbps: 60, // achievable on ~100-200 kbps constrained links
+        max_bitrate_kbps: 200,
+        keyframe_interval_frames: 35, // ~5s at 7fps; wall-clock cap guarantees ≤5s
+    },
+    VideoQualityTier {
+        label: "standard",
+        max_width: 640,
+        max_height: 360,
+        target_fps: 15,
+        ideal_bitrate_kbps: 350,
+        min_bitrate_kbps: 150,
+        max_bitrate_kbps: 600,
+        keyframe_interval_frames: 75, // ~5s at 15fps; wall-clock cap guarantees ≤5s
+    },
+    VideoQualityTier {
+        // Named distinctly from the default ladder's `hd` so a log/diagnostic
+        // line naming the rung is unambiguous about which ladder produced it.
+        label: "hd540",
+        max_width: 960,
+        max_height: 540,
+        target_fps: 30,
+        // Band reused from the `standard` rung of VIDEO_QUALITY_TIERS (960×540@30),
+        // which is already the tuned 540p operating point in this codebase.
+        ideal_bitrate_kbps: 900,
+        min_bitrate_kbps: 500,
+        max_bitrate_kbps: 1500,
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
+    },
+];
+
+/// Compile-time guard: both camera ladders must be the SAME DEPTH.
+///
+/// The wire `simulcast_layer_id` space, `spaced_ladder_positions` selection, and
+/// every layer-count clamp (`SIMULCAST_MAX_LAYERS`, the client's
+/// `clamp_layer_count`, the relay's id bucketing) are shared across variants. A
+/// variant of a different length would silently change the meaning of a layer id
+/// between publishers, so this is asserted at build time rather than trusted.
+const _: () = assert!(
+    SIMULCAST_VIDEO_LAYERS_REDUCED.len() == SIMULCAST_VIDEO_LAYERS.len(),
+    "the reduced camera ladder must have the same rung count as the default ladder"
+);
+
+/// Compile-time guard: the reduced ladder's top rung must actually be SMALLER
+/// than the default's, or the variant is pointless and a future retune that
+/// inverts them would silently make `Reduced` the heavier option.
+const _: () = assert!(
+    SIMULCAST_VIDEO_LAYERS_REDUCED[SIMULCAST_VIDEO_LAYERS_REDUCED.len() - 1].max_height
+        < SIMULCAST_VIDEO_LAYERS[SIMULCAST_VIDEO_LAYERS.len() - 1].max_height,
+    "the reduced ladder's top rung must be lower-resolution than the default top rung"
+);
+
 /// Per-layer framerate-cap slack for the simulcast encode throttle (issue
 /// #1768), as a fraction of the rung's nominal frame interval.
 ///
@@ -368,19 +484,136 @@ fn spaced_ladder_positions(n: usize, len: usize) -> Vec<usize> {
 /// crashing a live call — issue #1082). Callers should still clamp upstream
 /// (the client's `clamp_layer_count`).
 pub fn simulcast_layers(n: usize) -> &'static [VideoQualityTier] {
+    simulcast_layers_for(n, LadderVariant::Default)
+}
+
+/// Which camera simulcast ladder a publisher is encoding against (issue #1768).
+///
+/// The rung RESOLUTIONS differ; the rung COUNT does not — both variants are
+/// [`SIMULCAST_MAX_LAYERS`] deep, so `spaced_ladder_positions` selection, the
+/// wire `simulcast_layer_id` space, and every layer-count clamp are unchanged.
+/// Only the pixels/bitrate behind a given index move.
+///
+/// # Why a runtime variant rather than an edit or a cargo feature
+///
+/// Re-cutting the ladder needs a wasm rebuild + full deploy to evaluate, which
+/// makes each experiment a multi-day cycle. A runtime variant, delivered through
+/// the same `runtimeConfig` → `config.js` → `window.__APP_CONFIG` path as
+/// `experimentalSimulcastMaxLayers`, lets an operator flip the ladder with a
+/// `helm upgrade`. A cargo feature would be compile-time and defeat that.
+///
+/// # This is a DEPLOYMENT-WIDE switch, not a per-user A/B
+///
+/// The wire carries only a layer INDEX and no geometry, so a receiver resolves a
+/// rung's dimensions/bitrate from its OWN copy of the ladder. Which copy depends on
+/// what the answer is FOR (the #2156 split): `layer_chooser::received_layer_snapshot`
+/// — the SELECTION resolver — stays pinned to [`LadderVariant::Default`], while
+/// `received_layer_snapshot_for_display` takes the deployment's variant. Two
+/// consequences, and they differ in severity:
+///
+/// * **DECODE and layer SELECTION are unaffected.** The decoder sizes from the
+///   decoded frame itself (`peer_decoder.rs`, `video_frame.display_width()`), never
+///   from this table. And the #1256 tile-size lid is *provably* insensitive to a
+///   TOP-rung change: `size_cap_layer` returns the first rung covering the tile and
+///   otherwise falls through to `highest_available`. Reaching the top means every
+///   lower rung already failed, so the result is the top index whether that rung
+///   covers or the loop falls through. Pinned
+///   exhaustively by `size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung`
+///   (videocall-client), which turns red if a future retune moves a non-top rung
+///   and the lid therefore DOES need the variant plumbed.
+/// * **Receiver-side DISPLAY follows the variant (fixed in issue #2156).** The
+///   receiver's READOUTS — the performance panel's `{w}x{h}` line, the peer-row
+///   `540p · ~900k` metric, the receive slider's rung labels and their
+///   `aria-valuetext`, the diagnostics drawer's per-kind line, and the signal-quality
+///   popup — resolve rung geometry through
+///   `layer_chooser::received_layer_snapshot_for_display`, which is handed the
+///   deployment's variant via `VideoCallClientOptions::camera_ladder_variant` →
+///   `PeerDecodeManager::set_camera_ladder_variant`. Before #2156 they were pinned to
+///   the shipped ladder, so a `Reduced` deployment labelled a 960×540 @ ~900 kbps
+///   stream "720p · ~1.5M" — wrong by 67% on the bitrate operators judge a run by.
+///   Receiver rung labels are therefore ground truth when every publisher uses the
+///   deployment's variant. In a mixed room containing native `bot/` publishers,
+///   which remain [`LadderVariant::Default`]-pinned, use each publisher's
+///   `AQ_STATUS ladder=` field to interpret its rung. For browser publishers,
+///   `videocall_encoder_active_layers` remains authoritative for SEND-side layer
+///   counts; native bots expose that count through `AQ_STATUS active_layers=`.
+///
+///   This changed **no metric**: `health_reporter`'s `received_*_layer` maps carry
+///   layer INDICES only, with no geometry or bitrate, so Prometheus was never wrong.
+///
+/// So a mixed-variant room is not a correctness break; keep the variant uniform
+/// across a deployment anyway so rung labels and selection stay interpretable.
+///
+/// # The publisher-side halves MUST agree
+///
+/// The encoder derives per-layer GEOMETRY from these rungs; the AQ controller
+/// derives the per-layer BITRATE TARGETS from them (and hands those to the encoder
+/// via `shared_layer_bitrates_bps` → `set_bitrate`). Gating only one half would
+/// therefore encode one ladder's resolutions at the OTHER ladder's bitrates — e.g.
+/// 960×540 configured for 1500 kbps — so the variant is threaded to both from a
+/// single read of the flag.
+///
+/// It would **not** cause a spurious layer shed. [`uplink_budget_kbps`] sums the
+/// same tiers whose ideals become the targets, so `sum == budget` by construction
+/// and [`cap_layers_to_budget`] no-ops under either variant; shed decisions read
+/// encoder-queue backpressure, the union/user caps and tier movement, none of which
+/// consults this table. (An earlier revision of this doc claimed a "phantom
+/// ceiling" shed — that mechanism does not exist in the code.)
+///
+/// # The native `bot` crate cannot see this
+///
+/// `bot/` links this crate but has no `window.__APP_CONFIG`, so it always
+/// encodes against [`LadderVariant::Default`]. A Rust bot sharing a room with
+/// gated-on browsers publishes a different top rung — harmless per the decode
+/// note above, but it makes a measurement run non-uniform. The browser bots-app
+/// (`e2e/bots-app`) is unaffected: it drives the real client, so it inherits
+/// whatever the deployment serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LadderVariant {
+    /// The shipped ladder: `[low 320×180@7, standard 640×360@15, hd 1280×720@30]`.
+    #[default]
+    Default,
+    /// Reduced-top ladder: `[low 320×180@7, standard 640×360@15, 540p 960×540@30]`.
+    ///
+    /// Drops the 720p top to 540p. Rationale (issue #1768 + the #2143 run):
+    /// the top rung is ~87.8% of the whole 3-layer encode cost (27.65 of 31.5
+    /// Mpx/s), so lowering it — not touching the near-free 180p floor — is where
+    /// the CPU is. It also narrows the `n == 2` gap on BOTH measures:
+    /// **pixel area 16× → 9×** and **throughput 68.6× → 38.6× Mpx/s**
+    /// (`[180p, 720p]` → `[180p, 540p]`), so a 6–9-core publisher's receivers pay
+    /// 540p rather than 720p when they land on the top rung. It does NOT change
+    /// WHICH rung the #1256 lid selects — see the `n == 2` section on
+    /// [`SIMULCAST_VIDEO_LAYERS_REDUCED`].
+    ///
+    /// The "**69×**" figure quoted in the #2143 analysis is the THROUGHPUT ratio
+    /// (it folds in 30 vs 7 fps), **not** pixel area — the two are easily
+    /// conflated, and both are pinned by
+    /// `reduced_ladder_n2_keeps_the_middle_skip_but_shrinks_the_cliff`.
+    Reduced,
+}
+
+/// Resolve the simulcast layer tiers for an `n`-layer ladder in a specific
+/// [`LadderVariant`] (issue #1768).
+///
+/// [`simulcast_layers`] is this function pinned to [`LadderVariant::Default`];
+/// see that function for the `n`-selection contract, which is identical here
+/// (same [`spaced_ladder_positions`] rule, same clamping, same never-panics
+/// guarantee).
+pub fn simulcast_layers_for(n: usize, variant: LadderVariant) -> &'static [VideoQualityTier] {
     // Static, build-once tables so the function can return `&'static`. We build
-    // one cached `Vec<VideoQualityTier>` per ladder size lazily via `OnceLock`.
+    // one cached `Vec<VideoQualityTier>` per (variant, ladder size) lazily via
+    // `OnceLock`.
     use std::sync::OnceLock;
 
-    fn ladder(n: usize) -> Vec<VideoQualityTier> {
+    fn ladder(n: usize, source: &[VideoQualityTier]) -> Vec<VideoQualityTier> {
         // Derive the lowest-`n` well-spaced rungs generically from the ladder
         // definition (issue #1082): no per-`n` `match` arm, so raising
         // SIMULCAST_MAX_LAYERS requires no change here. The ladder is already
         // lowest-first, so a selected position IS the layer id (issue #1768).
-        spaced_ladder_positions(n, SIMULCAST_VIDEO_LAYERS.len())
+        spaced_ladder_positions(n, source.len())
             .into_iter()
             .map(|pos| {
-                let t = &SIMULCAST_VIDEO_LAYERS[pos];
+                let t = &source[pos];
                 // VideoQualityTier is Copy-able plain data; clone field-by-field
                 // so the returned vec owns 'static-compatible values.
                 VideoQualityTier {
@@ -397,13 +630,21 @@ pub fn simulcast_layers(n: usize) -> &'static [VideoQualityTier] {
             .collect()
     }
 
-    // One OnceLock cache cell per supported ladder size. Indexed by clamped n.
-    static LADDERS: [OnceLock<Vec<VideoQualityTier>>; SIMULCAST_MAX_LAYERS] =
+    // One OnceLock cache cell per supported ladder size, PER VARIANT. Indexed by
+    // clamped n. Separate arrays (not one keyed array) so a cache cell can never
+    // be filled by the wrong variant.
+    static LADDERS_DEFAULT: [OnceLock<Vec<VideoQualityTier>>; SIMULCAST_MAX_LAYERS] =
+        [const { OnceLock::new() }; SIMULCAST_MAX_LAYERS];
+    static LADDERS_REDUCED: [OnceLock<Vec<VideoQualityTier>>; SIMULCAST_MAX_LAYERS] =
         [const { OnceLock::new() }; SIMULCAST_MAX_LAYERS];
 
     let clamped = n.clamp(1, SIMULCAST_MAX_LAYERS);
-    LADDERS[clamped - 1]
-        .get_or_init(|| ladder(clamped))
+    let (cache, source) = match variant {
+        LadderVariant::Default => (&LADDERS_DEFAULT, SIMULCAST_VIDEO_LAYERS),
+        LadderVariant::Reduced => (&LADDERS_REDUCED, SIMULCAST_VIDEO_LAYERS_REDUCED),
+    };
+    cache[clamped - 1]
+        .get_or_init(|| ladder(clamped, source))
         .as_slice()
 }
 
@@ -1199,8 +1440,16 @@ pub const ENCODER_FPS_IDLE_DECAY_MS: f64 = 2000.0;
 /// Note: the static-keyframe floor is itself budget-bounded
 /// (`SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET`), so a share that stays fully static
 /// past ~12s stops emitting layer-0 chunks entirely and WILL then decay to 0 —
-/// which is honest (no new content is being produced). Screen fps is log-only,
-/// so this is cosmetic either way.
+/// which is honest (no new content is being produced).
+///
+/// **No longer cosmetic (issue #2147).** An earlier revision of this doc said
+/// "screen fps is log-only, so this is cosmetic either way." That is now FALSE:
+/// the same atom this decays is exported as `screen_encoder_output_fps`
+/// (health-packet field 109) → the `videocall_screen_encoder_output_fps` gauge,
+/// which is deliberately NOT `> 0`-gated. So this constant is what decides how
+/// long a quiesced share keeps reporting its last nonzero fps before the gauge
+/// reads 0 — retune it only with that consumer in mind. A 0 from this decay is
+/// honest, not a fault; read it against `screen_sharing_active`.
 pub const SCREEN_ENCODER_FPS_IDLE_DECAY_MS: f64 = 5000.0;
 
 // ---------------------------------------------------------------------------
@@ -2730,6 +2979,222 @@ mod tests {
         assert_eq!(l[0].keyframe_interval_frames, 35); // 5s × 7fps
         assert_eq!(l[1].keyframe_interval_frames, 75); // 5s × 15fps
         assert_eq!(l[2].keyframe_interval_frames, 150); // 5s × 30fps
+    }
+
+    #[test]
+    fn reduced_ladder_exact_values_through_the_resolver() {
+        // Issue #1768: pin the REDUCED ladder through the PRODUCTION resolver
+        // (`simulcast_layers_for`), so changing a rung — or wiring the variant to
+        // the wrong source table — FAILS here. Values are (w, h, fps, ideal_kbps).
+        let l = simulcast_layers_for(3, LadderVariant::Reduced);
+        let got: Vec<(u32, u32, u32, u32)> = l
+            .iter()
+            .map(|t| {
+                (
+                    t.max_width,
+                    t.max_height,
+                    t.target_fps,
+                    t.ideal_bitrate_kbps,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(320, 180, 7, 120), (640, 360, 15, 350), (960, 540, 30, 900),],
+            "reduced camera ladder must be 180p/360p/540p with the 540p band"
+        );
+        // Keyframe intervals track ~5s wall-clock at each rung's fps (unchanged
+        // fps ⇒ unchanged intervals; the top rung stays 30fps at 540p).
+        assert_eq!(l[0].keyframe_interval_frames, 35); // 5s × 7fps
+        assert_eq!(l[1].keyframe_interval_frames, 75); // 5s × 15fps
+        assert_eq!(l[2].keyframe_interval_frames, 150); // 5s × 30fps
+                                                        // The min/max band comes from VIDEO_QUALITY_TIERS' 540p rung, not invented.
+        assert_eq!((l[2].min_bitrate_kbps, l[2].max_bitrate_kbps), (500, 1500));
+    }
+
+    #[test]
+    fn default_variant_is_byte_identical_to_the_plain_resolver() {
+        // The gate must be INERT when off. NOTE the assertion shape: comparing
+        // `simulcast_layers(n)` against `simulcast_layers_for(n, Default)` would be a
+        // TAUTOLOGY — the former is *defined* as the latter, so both sides move
+        // together under any mutation and the comparison can never fail. (An earlier
+        // revision of this test did exactly that, and claimed mutation power it did
+        // not have.) So resolve against `SIMULCAST_VIDEO_LAYERS` — the independent
+        // source of truth — via `spaced_ladder_positions`, which is what actually
+        // fails if the Default arm is pointed at the reduced table.
+        for n in 1..=SIMULCAST_MAX_LAYERS {
+            let resolved = simulcast_layers(n);
+            let expected_positions = spaced_ladder_positions(n, SIMULCAST_VIDEO_LAYERS.len());
+            assert_eq!(
+                resolved.len(),
+                expected_positions.len(),
+                "default ladder depth must match the spaced selection at n={n}"
+            );
+            for (rung, &pos) in resolved.iter().zip(expected_positions.iter()) {
+                let src = &SIMULCAST_VIDEO_LAYERS[pos];
+                assert_eq!(
+                    (
+                        rung.label,
+                        rung.max_width,
+                        rung.max_height,
+                        rung.target_fps,
+                        rung.ideal_bitrate_kbps
+                    ),
+                    (
+                        src.label,
+                        src.max_width,
+                        src.max_height,
+                        src.target_fps,
+                        src.ideal_bitrate_kbps
+                    ),
+                    "flag-off must resolve rungs from SIMULCAST_VIDEO_LAYERS at n={n}"
+                );
+            }
+        }
+        // And the DEFAULT top rung must still be 720p — i.e. the gate did not
+        // quietly re-cut the shipped ladder while adding the variant.
+        let top = simulcast_layers(3).last().expect("3-rung ladder");
+        assert_eq!(
+            (top.max_width, top.max_height),
+            (1280, 720),
+            "flag-off must still publish the 720p top rung"
+        );
+    }
+
+    #[test]
+    fn reduced_ladder_n2_keeps_the_middle_skip_but_shrinks_the_cliff() {
+        // With `spaced_ladder_positions` anchoring base+top, n=2 skips the interior
+        // on BOTH ladders; what changes is the SIZE of the resulting gap. NOTE the
+        // units: the pixel-AREA ratio is 16x -> 9x, while 68.6x -> 38.6x is
+        // THROUGHPUT (Mpx/s, folding in 30 vs 7 fps) — the "69x" quoted in the #2143
+        // analysis is the latter. Both are asserted below.
+        //
+        // This narrows what a top-rung receiver PAYS (540p instead of 720p); it does
+        // NOT change which rung the #1256 lid selects — `size_cap_layer` never
+        // consults the top rung's height (proved exhaustively by
+        // `size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung`).
+        let d = simulcast_layers_for(2, LadderVariant::Default);
+        let r = simulcast_layers_for(2, LadderVariant::Reduced);
+        assert_eq!(d.len(), 2, "n=2 must yield exactly 2 rungs");
+        assert_eq!(r.len(), 2, "n=2 must yield exactly 2 rungs");
+        // Same base on both.
+        assert_eq!((d[0].max_width, d[0].max_height), (320, 180));
+        assert_eq!((r[0].max_width, r[0].max_height), (320, 180));
+        // Different tops: 720p vs 540p.
+        assert_eq!((d[1].max_width, d[1].max_height), (1280, 720));
+        assert_eq!((r[1].max_width, r[1].max_height), (960, 540));
+        // Cliff-size claims, checked rather than asserted in prose. NOTE the two
+        // ratios are different numbers and are routinely confused: the widely
+        // quoted "69x" for `[180p, 720p]` is the DECODE/ENCODE THROUGHPUT ratio
+        // (Mpx/s, which folds in fps 7 vs 30), while the PIXEL-AREA ratio is 16x.
+        // Both are pinned so neither figure can drift unnoticed.
+        let px = |t: &VideoQualityTier| (t.max_width as f64) * (t.max_height as f64);
+        let mpx = |t: &VideoQualityTier| px(t) * (t.target_fps as f64) / 1e6;
+
+        // Pixel area: 921_600/57_600 = 16.0x  vs  518_400/57_600 = 9.0x
+        let d_px_ratio = px(&d[1]) / px(&d[0]);
+        let r_px_ratio = px(&r[1]) / px(&r[0]);
+        assert!(
+            (d_px_ratio - 16.0).abs() < 0.1,
+            "default n=2 pixel-area cliff should be 16.0x, got {d_px_ratio:.1}x"
+        );
+        assert!(
+            (r_px_ratio - 9.0).abs() < 0.1,
+            "reduced n=2 pixel-area cliff should be 9.0x, got {r_px_ratio:.1}x"
+        );
+
+        // Throughput (the "69x" figure): 27.65/0.40 = 68.6x  vs  15.55/0.40 = 38.6x
+        let d_mpx_ratio = mpx(&d[1]) / mpx(&d[0]);
+        let r_mpx_ratio = mpx(&r[1]) / mpx(&r[0]);
+        assert!(
+            d_mpx_ratio > 60.0,
+            "default n=2 throughput cliff should be ~69x, got {d_mpx_ratio:.1}x"
+        );
+        assert!(
+            r_mpx_ratio < 45.0,
+            "reduced n=2 throughput cliff should be ~39x, got {r_mpx_ratio:.1}x"
+        );
+        assert!(
+            r_mpx_ratio < d_mpx_ratio * 0.6,
+            "reduced variant must materially shrink the n=2 throughput cliff"
+        );
+    }
+
+    #[test]
+    fn reduced_ladder_cuts_the_dominant_encode_cost() {
+        // The justification for touching the TOP rung rather than the floor: the
+        // top is ~88% of the 3-layer encode cost. Compute Mpx/s from the
+        // production tables so a future retune that moves the cost elsewhere (or
+        // that "reduces" the ladder without reducing cost) fails here.
+        let mpx = |t: &VideoQualityTier| {
+            (t.max_width as f64) * (t.max_height as f64) * (t.target_fps as f64) / 1e6
+        };
+        let d: f64 = simulcast_layers(3).iter().map(mpx).sum();
+        let r: f64 = simulcast_layers_for(3, LadderVariant::Reduced)
+            .iter()
+            .map(mpx)
+            .sum();
+        assert!(
+            r < d * 0.7,
+            "reduced ladder must cut total encode Mpx/s by >30% (default {d:.1}, reduced {r:.1})"
+        );
+        // And the top rung must still dominate its own ladder (it is the lever).
+        let top_share = mpx(simulcast_layers(3).last().unwrap()) / d;
+        assert!(
+            top_share > 0.8,
+            "default top rung should be >80% of encode cost, got {:.1}%",
+            top_share * 100.0
+        );
+    }
+
+    /// The RECEIVER-side saving, pinned to the tables the same way the publisher's
+    /// encode saving is (issue #1768).
+    ///
+    /// A receiver's cost is set by the rung it actually decodes, and the reduced
+    /// ladder's whole receiver-side benefit is that a peer forced to the TOP rung
+    /// decodes 540p instead of 720p. On the low-power devices this project targets
+    /// (no hardware VP8/VP9 decode) software decode is the binding constraint, so
+    /// this is the headline receiver result — and it was previously asserted in prose
+    /// with no number behind it.
+    ///
+    /// MUTATION: raise the reduced top rung back toward 720p (or drop its fps) and
+    /// the ratio assertion fails.
+    #[test]
+    fn reduced_ladder_cuts_top_rung_decode_cost() {
+        let px = |t: &VideoQualityTier| (t.max_width as f64) * (t.max_height as f64);
+        let mpx = |t: &VideoQualityTier| px(t) * (t.target_fps as f64) / 1e6;
+
+        let d_top = simulcast_layers(3).last().expect("default top rung");
+        let r_top = simulcast_layers_for(3, LadderVariant::Reduced)
+            .last()
+            .expect("reduced top rung");
+
+        // Per-frame decode work: 960x540 is 0.5625x the pixels of 1280x720, i.e.
+        // ~43.8% less. Allow a small band so a future retune to another sane 540p-ish
+        // geometry still passes, while a regression toward 720p fails.
+        let ratio = px(r_top) / px(d_top);
+        assert!(
+            ratio < 0.60,
+            "the reduced top rung must cut per-frame decode work by >40% (ratio {ratio:.4})"
+        );
+
+        // Sustained decode throughput at each rung's own fps.
+        assert!(
+            mpx(r_top) < mpx(d_top) * 0.60,
+            "reduced top rung decode throughput must be <60% of default (default \
+             {:.2} Mpx/s, reduced {:.2} Mpx/s)",
+            mpx(d_top),
+            mpx(r_top)
+        );
+
+        // Downlink for that rung falls too, which is the other half of the
+        // receiver-side win on a constrained link.
+        assert!(
+            r_top.ideal_bitrate_kbps < d_top.ideal_bitrate_kbps,
+            "the reduced top rung must also cost less downlink ({} vs {} kbps)",
+            r_top.ideal_bitrate_kbps,
+            d_top.ideal_bitrate_kbps
+        );
     }
 
     #[test]

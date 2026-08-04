@@ -27,8 +27,10 @@ use protobuf::Enum;
 use protobuf::Message as ProtobufMessage;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::meeting_timer_packet::MeetingTimerPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::raise_hand_packet::RaiseHandPacket;
 use videocall_types::protos::reaction_packet::reaction_packet::ReactionType;
 use videocall_types::protos::reaction_packet::ReactionPacket;
 
@@ -38,7 +40,10 @@ use crate::constants::{
     KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN,
     KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN_CONGESTED,
     KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS, KEYFRAME_REQUEST_WINDOW_MS,
-    REACTION_CUSTOM_EMOJI_MAX_BYTES, REACTION_MAX_PER_WINDOW, REACTION_WINDOW_MS,
+    MEETING_TIMER_MAX_DURATION_MS, MEETING_TIMER_MAX_PER_WINDOW, MEETING_TIMER_PACKET_MAX_BYTES,
+    MEETING_TIMER_WINDOW_MS, RAISE_HAND_MAX_PER_WINDOW, RAISE_HAND_PACKET_MAX_BYTES,
+    RAISE_HAND_WINDOW_MS, REACTION_CUSTOM_EMOJI_MAX_BYTES, REACTION_MAX_PER_WINDOW,
+    REACTION_WINDOW_MS,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -215,6 +220,41 @@ pub enum PacketKind {
     /// classified [`PacketKind::Dropped`] and never reaches the limiter, and a
     /// flood of invalid reactions cannot consume a sender's valid budget.
     Reaction,
+    /// RAISE_HAND packet (#2135) that PASSED ingress validation in
+    /// [`classify_packet`] (the raw inner payload is within
+    /// [`RAISE_HAND_PACKET_MAX_BYTES`] and parses as a `RaiseHandPacket`). It is
+    /// subject to the per-sender [`RaiseHandRateLimiter`] in
+    /// `SessionLogic::handle_inbound`; within budget it is FORWARDED on the
+    /// standard media fan-out (re-broadcast to the room, sender self-skipped),
+    /// over budget it is dropped as Processed.
+    ///
+    /// Mirrors [`PacketKind::Reaction`]'s split of responsibilities — stateless
+    /// validation here, stateful metering in `handle_inbound` — so a flood of
+    /// OVERSIZED or unparseable raise-hand packets cannot consume a sender's
+    /// valid budget.
+    ///
+    /// Unlike a REACTION there is no closed enum to allowlist: the payload is a
+    /// `bool` plus two cosmetic/advisory fields, so "valid" here means
+    /// "well-formed and bounded", and a `raised = false` default (from an empty
+    /// or truncated payload) is the SAFE degradation — see the proto doc.
+    RaiseHand,
+    /// MEETING_TIMER packet (#2136) that PASSED ingress validation in
+    /// [`classify_packet`] (raw payload within
+    /// [`MEETING_TIMER_PACKET_MAX_BYTES`], inner `MeetingTimerPacket` parses,
+    /// and `duration_ms` within [`MEETING_TIMER_MAX_DURATION_MS`]).
+    ///
+    /// It is subject to the per-sender [`MeetingTimerRateLimiter`] in
+    /// `SessionLogic::handle_inbound`; within budget it becomes an
+    /// `InboundAction::ForwardHostOnly`, which the `chat_server` fan-out funnel
+    /// admits ONLY if the sending session is the room's current host.
+    ///
+    /// AUTHORITY IS NOT CHECKED HERE, AND CANNOT BE. `classify_packet` is a free
+    /// function over raw bytes with no session context, and the session-local
+    /// `SessionLogic::is_host` it could otherwise reach is a JWT-claim snapshot
+    /// that goes stale across a transfer-host. See `PacketKind::MeetingTimer`'s
+    /// handling in `session_logic.rs` and `session_is_room_host` in
+    /// `chat_server.rs` for where the real gate lives and why.
+    MeetingTimer,
 }
 
 /// Bounded frame-kind label for publisher-leg inbound-arrival instrumentation.
@@ -373,6 +413,123 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
             // set field 3, so this cannot affect them.
             Ok(_) if !reaction.custom_emoji.is_empty() => PacketKind::Dropped,
             Ok(_) => PacketKind::Reaction,
+        };
+    }
+
+    // Validate and classify client-originated RAISE_HAND packets (#2135).
+    //
+    // Like REACTION this is a client-authored packet the relay RE-BROADCASTS to
+    // the whole room, so its content is validated at ingress. It has no closed
+    // enum to allowlist (the payload is a `bool` plus two cosmetic/advisory
+    // fields), so validation is two terms:
+    //
+    //  1. SIZE. The raw inner payload must be within
+    //     `RAISE_HAND_PACKET_MAX_BYTES`. This is checked FIRST, on the raw
+    //     bytes, BEFORE the parse — both because it is the cheap term and
+    //     because it is the ONLY term that bounds the packet at all.
+    //     rust-protobuf preserves UNKNOWN FIELDS across parse/serialize (needed
+    //     so a newer client's field survives an older relay), which means the
+    //     `display_name` cap applied later does NOT bound the payload; without
+    //     this check a forged RAISE_HAND stuffed with megabytes of unknown
+    //     fields would be re-broadcast verbatim to every participant. See the
+    //     constant's doc for the byte budget.
+    //  2. WELL-FORMEDNESS. It must parse as a `RaiseHandPacket`; unparseable
+    //     drops (fail-closed), so the fan-out never carries bytes the relay
+    //     could not decode.
+    //
+    // There is deliberately NO validation of `raised`, `raised_at_ms`, or
+    // `display_name` CONTENT here:
+    //   * `raised` is a bool — every wire value is meaningful, and the proto3
+    //     default (`false`, which an empty payload decodes to) is the SAFE
+    //     degradation: combined with the relay-stamped envelope session_id
+    //     (#2124), the worst a corrupt payload can do is lower the SENDER'S OWN
+    //     hand.
+    //   * `raised_at_ms` is any u64 — there is no syntactically invalid value,
+    //     and every rewrite rule that would blunt a forged one (clamp to the
+    //     future, clamp to a floor) ALSO breaks legitimate re-announce of a hand
+    //     raised minutes ago. It is documented as an advisory display-ordering
+    //     hint, never authorization. Adding a clamp here would be inert code
+    //     that looks like security.
+    //   * `display_name` is BOUNDED rather than validated, in
+    //     `stamp_raise_hand_for_broadcast` on the forward path — truncated, not
+    //     dropped, because the hand STATE is valid and discarding it over a
+    //     cosmetic field would leave the room's view of that participant wrong.
+    //
+    // Validation runs HERE, BEFORE the per-sender `RaiseHandRateLimiter` in
+    // `SessionLogic::handle_inbound`, so a flood of oversized/garbage raise-hand
+    // packets is discarded without consuming a sender's valid-budget window.
+    // Both the WS and WT paths route inbound through the shared
+    // `handle_inbound` → `classify_packet`, so this single arm is the sole
+    // enforcement point across transports.
+    if packet_wrapper.packet_type == PacketType::RAISE_HAND.into() {
+        if packet_wrapper.data.len() > RAISE_HAND_PACKET_MAX_BYTES {
+            return PacketKind::Dropped;
+        }
+        return match RaiseHandPacket::parse_from_bytes(&packet_wrapper.data) {
+            Ok(_) => PacketKind::RaiseHand,
+            Err(_) => PacketKind::Dropped,
+        };
+    }
+
+    // Validate and classify host-originated MEETING_TIMER packets (#2136).
+    //
+    // NOT the MEETING arm above, despite the adjacent name — the two have
+    // OPPOSITE trust models and this arm sits directly below the drop so the
+    // contrast is impossible to miss. MEETING (7) is server-authored by
+    // meeting-api and a client-sent one is ALWAYS forged, hence the
+    // unconditional drop. MEETING_TIMER (19) is CLIENT-authored by the meeting
+    // host and re-broadcast, like REACTION (17).
+    //
+    // Two things are validated here, and one deliberately is not:
+    //
+    //  * A SIZE CAP on the inner payload, checked BEFORE the inner parse.
+    //    rust-protobuf preserves unknown fields across parse/serialize
+    //    (deliberately — a newer client's field must survive an older relay), so
+    //    a forged MEETING_TIMER stuffed with megabytes of unknown fields would
+    //    otherwise be re-broadcast verbatim to every participant. See
+    //    `MEETING_TIMER_PACKET_MAX_BYTES` for what this does and does NOT bound
+    //    (it is the inner payload only; the outer wrapper is bounded by
+    //    MAX_FRAME_SIZE, as it is for every packet class).
+    //  * `duration_ms`, bounded by its own MAGNITUDE. See
+    //    `MEETING_TIMER_MAX_DURATION_MS`: this is arithmetic hygiene for the
+    //    client's progress-proportion math, not authorization.
+    //  * `ends_at_ms >= duration_ms`, an INTERNAL-CONSISTENCY check between two
+    //    fields of the same packet. The wire contract has every client compute
+    //    `started_at_ms = ends_at_ms - duration_ms` to render a progress
+    //    proportion; without this, `running=true, ends_at_ms=0,
+    //    duration_ms=300_000` underflows that subtraction on every receiver —
+    //    a panic in a debug wasm build, which aborts the module and takes the
+    //    whole call down for that tab (the same blast radius #2095 documents),
+    //    and a ~1.8e19 garbage proportion in release.
+    //
+    // NOT validated: the MAGNITUDE of `ends_at_ms`. Sanity-checking an ABSOLUTE
+    // instant means comparing it to the RELAY's clock, and a relay whose clock
+    // stepped backwards would then reject legitimate timers — a fail-closed
+    // wedge of the #2122 shape — while buying nothing, since the sender is the
+    // authorized host and may set any end time. Note the consistency check above
+    // is NOT that: it compares two fields of the packet to each other, involves
+    // no clock, and therefore cannot wedge. This arm performs no clock
+    // arithmetic at all, which is what makes it wedge-proof.
+    //
+    // Validation runs HERE, BEFORE the per-sender `MeetingTimerRateLimiter` in
+    // `SessionLogic::handle_inbound`, so a flood of INVALID packets is discarded
+    // without ever consuming a sender's valid-budget window. Both WS and WT
+    // route inbound through the shared `handle_inbound` → `classify_packet`, so
+    // this single arm is the sole ingress enforcement point across transports.
+    //
+    // AUTHORITY (host-only) is NOT enforced here — see `PacketKind::MeetingTimer`.
+    if packet_wrapper.packet_type == PacketType::MEETING_TIMER.into() {
+        if packet_wrapper.data.len() > MEETING_TIMER_PACKET_MAX_BYTES {
+            return PacketKind::Dropped;
+        }
+        return match MeetingTimerPacket::parse_from_bytes(&packet_wrapper.data) {
+            Ok(timer)
+                if timer.duration_ms <= MEETING_TIMER_MAX_DURATION_MS
+                    && timer.ends_at_ms >= timer.duration_ms =>
+            {
+                PacketKind::MeetingTimer
+            }
+            _ => PacketKind::Dropped,
         };
     }
 
@@ -838,10 +995,11 @@ impl KeyframeRequestLimiter {
     /// this clear must be reconciled to the same layer.)
     ///
     /// O(1): a single HashMap lookup + a field clear. It does NOT create an
-    /// entry — only clears an existing one. Creating on delivery would be an
-    /// unbounded-growth vector keyed by the attacker-forgeable outer
-    /// `session_id` (delivery key option A — see `handle_outbound`); refusing to
-    /// insert closes that.
+    /// entry — only clears an existing one. Creating on delivery would have been
+    /// an unbounded-growth vector keyed by the then-forgeable outer `session_id`
+    /// (delivery key option A — see `handle_outbound`); refusing to insert
+    /// closes that independently of #2095's relay-side stamp, which now also
+    /// makes that key unforgeable.
     pub fn observe_delivery(&mut self, target: KeyframeTarget, kind: KeyframeMediaKind) {
         if let Some(entry) = self.per_target.get_mut(&(target, kind, 0u32)) {
             entry.waiting_since = None;
@@ -912,6 +1070,154 @@ impl ReactionRateLimiter {
             Duration::from_millis(REACTION_WINDOW_MS),
             REACTION_MAX_PER_WINDOW,
         )
+    }
+}
+
+/// Per-session tumbling-window rate limiter for RAISE_HAND packets (#2135).
+///
+/// Structurally identical to [`ReactionRateLimiter`] — one per SENDING session,
+/// one bucket, one window, no per-target dimension (a raised hand is aimed at
+/// the room) — but with its OWN budget ([`RAISE_HAND_MAX_PER_WINDOW`] per
+/// [`RAISE_HAND_WINDOW_MS`]) because the legitimate traffic shape differs: a
+/// hand toggle is human-paced and rare, but a raised-hand client ALSO
+/// re-announces its state on peer-join, which produces a short burst during a
+/// join wave that a reaction never does. See the constants' docs.
+///
+/// A SEPARATE type rather than a shared/parameterised limiter, deliberately: the
+/// two surfaces are metered for different reasons at different budgets, and
+/// collapsing them would make a future tuning change to one silently retune the
+/// other. Both are thin wrappers over the SAME [`WindowCounter`], which is where
+/// the tumbling-window math actually lives, so there is no duplicated logic —
+/// only a duplicated (and independently documented) budget.
+///
+/// CONSEQUENCE OF A DROP, stated plainly because it differs from REACTION's:
+/// dropping a reaction loses an ephemeral float; dropping a RAISE_HAND loses a
+/// STATE TRANSITION, and the relay holds no hand registry to repair it from. The
+/// budget is therefore sized so a well-behaved client cannot reach it, and the
+/// wire contract asks the client to re-announce on the next peer-join (the
+/// packet is idempotent state, so a repeat is always safe).
+///
+/// Ingress validation (size cap + parse) runs in [`classify_packet`] BEFORE a
+/// packet ever reaches this limiter, so a flood of oversized/garbage raise-hand
+/// packets cannot consume a sender's valid-budget window here.
+///
+/// Reuses [`WindowCounter`]; its keyframe-only `waiting_since` field stays
+/// `None` (unused here) and is untouched by [`WindowCounter::try_consume`].
+pub struct RaiseHandRateLimiter {
+    window: WindowCounter,
+}
+
+impl Default for RaiseHandRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RaiseHandRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            window: WindowCounter::new(Instant::now()),
+        }
+    }
+
+    /// Try to consume one raise-hand slot for this sender. Returns `true` when
+    /// the packet is within budget for the current window (forward it), `false`
+    /// when the per-sender budget is saturated (drop it as Processed). The
+    /// window slides on its own: once [`RAISE_HAND_WINDOW_MS`] elapses with the
+    /// next call, the count resets and the budget refills.
+    pub fn allow(&mut self) -> bool {
+        self.window.try_consume(
+            Instant::now(),
+            Duration::from_millis(RAISE_HAND_WINDOW_MS),
+            RAISE_HAND_MAX_PER_WINDOW,
+        )
+    }
+
+    /// Test-only: push this limiter's window start `by` into the past so the
+    /// next [`allow`](Self::allow) rolls the window and refills the budget,
+    /// without a real sleep.
+    ///
+    /// Exists because `WindowCounter::window_start` is private to this module,
+    /// so `session_logic`'s call-site test — which must drive the REAL
+    /// `handle_inbound` arm, not the limiter in isolation — has no other way to
+    /// prove the budget RECOVERS. That recovery is load-bearing for #2135: a
+    /// raise-hand carries persistent state with no relay-side registry to repair
+    /// from, so a limiter that could not refill would wedge a participant's hand
+    /// state for the rest of the meeting.
+    #[cfg(test)]
+    pub fn rewind_window_for_test(&mut self, by: Duration) {
+        self.window.window_start = Instant::now() - by;
+    }
+}
+
+/// Per-session tumbling-window rate limiter for MEETING_TIMER packets (#2136).
+///
+/// Each SENDING session owns one. A MEETING_TIMER is a client-authored packet
+/// the relay RE-BROADCASTS to the whole room, so — like REACTION — it needs an
+/// abuse ceiling: a SINGLE per-sender bucket of
+/// [`MEETING_TIMER_MAX_PER_WINDOW`] per [`MEETING_TIMER_WINDOW_MS`].
+///
+/// It has its OWN budget rather than reusing [`ReactionRateLimiter`]'s because
+/// the legitimate traffic shape is not click-driven at all — a ~5s heartbeat
+/// while a timer runs, plus a 3-packet repeat burst on each transition. See
+/// [`MEETING_TIMER_MAX_PER_WINDOW`] for the sizing and for why the margin
+/// matters more here than for reactions (a dropped CANCEL leaves the room
+/// counting down to an audible expiry the host already called off).
+///
+/// The limiter runs BEFORE the host gate, because the relay cannot know whether
+/// a sender is the host until the packet reaches the `chat_server` fan-out
+/// funnel. A non-host flood is therefore metered here and rejected there: each
+/// forged sender is bounded to its own [`MEETING_TIMER_MAX_PER_WINDOW`] packets
+/// of at most [`MEETING_TIMER_PACKET_MAX_BYTES`] each, and none of them reach
+/// another participant.
+///
+/// Ingress validation runs in [`classify_packet`] BEFORE this limiter (an
+/// oversized or unparseable packet is [`PacketKind::Dropped`]), so a flood of
+/// garbage cannot consume a sender's valid-budget window here.
+///
+/// Reuses [`WindowCounter`] for the tumbling-window math; its keyframe-only
+/// `waiting_since` field stays `None` and is untouched by
+/// [`WindowCounter::try_consume`].
+pub struct MeetingTimerRateLimiter {
+    window: WindowCounter,
+}
+
+impl Default for MeetingTimerRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MeetingTimerRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            window: WindowCounter::new(Instant::now()),
+        }
+    }
+
+    /// Try to consume one MEETING_TIMER slot for this sender. `true` = within
+    /// budget (forward it), `false` = per-sender budget saturated (drop it as
+    /// Processed). The window is TUMBLING, not sliding: once
+    /// [`MEETING_TIMER_WINDOW_MS`] has elapsed at the next call, the count
+    /// resets wholesale and the budget refills — so the limiter cannot
+    /// permanently wedge a host out of controlling the room's timer. (The
+    /// tumbling reset means a burst straddling a window boundary can pass up to
+    /// 2× the budget within one window-length SPAN; see
+    /// [`MEETING_TIMER_MAX_PER_WINDOW`], whose stated rate is the sustained
+    /// average, not an instantaneous bound.)
+    pub fn allow(&mut self) -> bool {
+        self.window.try_consume(
+            Instant::now(),
+            Duration::from_millis(MEETING_TIMER_WINDOW_MS),
+            MEETING_TIMER_MAX_PER_WINDOW,
+        )
+    }
+
+    /// Test-only: pretend the current window started `by` ago, so a test can
+    /// prove the budget REFILLS without sleeping for a real window.
+    #[cfg(test)]
+    pub fn rewind_window_for_test(&mut self, by: Duration) {
+        self.window.window_start = Instant::now() - by;
     }
 }
 
@@ -986,6 +1292,186 @@ pub fn stamp_reaction_for_broadcast(
     wrapper.write_to_bytes().ok()
 }
 
+/// Re-stamp a validated RAISE_HAND `PacketWrapper` for room fan-out (#2135).
+///
+/// The exact analogue of [`stamp_reaction_for_broadcast`], and for the same two
+/// reasons:
+///
+/// 1. It overwrites `PacketWrapper.session_id` UNCONDITIONALLY with
+///    `authenticated_session`. Since #2124 (issue #2095) the generic broadcast
+///    stamp (`stamp_wrapper_for_broadcast`, in `chat_server`'s
+///    `Handler<ClientMessage>`) already does this for EVERY forwarded packet, so
+///    this write is REDUNDANT on the live path — and it is retained anyway, on
+///    purpose. Attribution for a raised hand is the whole feature (a forged
+///    session_id would raise a victim's hand, cleartext, with no E2EE backstop),
+///    and that guarantee must not depend on an invariant enforced in a different
+///    module that a future refactor could move. This is the same
+///    defense-in-depth reasoning the `MAX_TRACKED_SENDERS` doc states for the
+///    congestion-tracker cap. Cost is one `u64` store.
+/// 2. It bounds the cosmetic `display_name` to `max_name_bytes`, truncating at a
+///    UTF-8 char boundary. The name is attacker-controlled and fanned out to
+///    every participant, so an oversized value is an egress-amplification
+///    surface. Truncate (not drop): the hand STATE is valid and the name is only
+///    a cosmetic fallback, so discarding a real state transition over an
+///    oversized cosmetic field would leave the room's view of that participant
+///    wrong — with no server-side registry to repair it from.
+///
+/// Note the division of labour with [`classify_packet`]: the SIZE cap
+/// (`RAISE_HAND_PACKET_MAX_BYTES`, on the raw bytes) is what bounds the packet
+/// as a whole — including unknown fields, which rust-protobuf preserves — and it
+/// runs at ingress. This function only bounds the one KNOWN field the relay can
+/// meaningfully shorten.
+///
+/// Runs on the shared `SessionLogic::handle_inbound` RAISE_HAND path (both WS
+/// and WT), AFTER ingress validation and the per-sender rate limiter, so the
+/// ordering "validate → meter → stamp → fan out" matches REACTION's. Returns
+/// `None` (→ caller drops the packet, fail-closed, never fanning out an
+/// unstamped one) if the wrapper or inner packet cannot be parsed/reserialized;
+/// that is unreachable for a packet `classify_packet` already accepted as
+/// `PacketKind::RaiseHand`, but the fail-closed default is the safe one.
+pub fn stamp_raise_hand_for_broadcast(
+    data: &[u8],
+    authenticated_session: u64,
+    max_name_bytes: usize,
+) -> Option<Vec<u8>> {
+    let mut wrapper = PacketWrapper::parse_from_bytes(data).ok()?;
+    wrapper.session_id = authenticated_session;
+
+    // Bound the cosmetic display_name. Parse the inner packet only to measure
+    // it; re-serialize the inner (and thus rewrite `wrapper.data`) ONLY when we
+    // actually truncate, so the common in-bound case pays no re-encode cost —
+    // and, importantly, so an in-bound packet's UNKNOWN FIELDS survive byte-for
+    // -byte (forward compatibility with a newer client's added field).
+    let mut inner = RaiseHandPacket::parse_from_bytes(&wrapper.data).ok()?;
+    if inner.display_name.len() > max_name_bytes {
+        let end = floor_utf8_boundary(&inner.display_name, max_name_bytes);
+        inner.display_name.truncate(end);
+        wrapper.data = inner.write_to_bytes().ok()?;
+    }
+
+    wrapper.write_to_bytes().ok()
+}
+
+/// Re-stamp EVERY room-fan-out `PacketWrapper` with the relay-authenticated
+/// identity of the session that published it (#2095, security).
+///
+/// This is the generic counterpart to [`stamp_reaction_for_broadcast`]: it runs
+/// once per packet in `ChatServer`'s `Handler<ClientMessage>`, the single funnel
+/// through which every forwarded packet from every transport reaches NATS and
+/// therefore every peer.
+///
+/// ## What it fixes
+///
+/// The pre-#2095 code stamped `session_id` FILL-IF-ZERO
+/// (`if wrapper.session_id == 0 { wrapper.session_id = session }`) and never
+/// stamped `user_id` at all, so a client that supplied a NONZERO `session_id` or
+/// any `user_id` had those values forwarded to every peer untouched. Both outer
+/// scalars are consumed by the receiving client as ATTRIBUTION:
+///
+/// * `session_id` keys `set_peer_device_info` in
+///   `videocall-client/src/client/video_call_client.rs`. Because
+///   `client_diagnostics::trim_health_packet_for_peers` deliberately strips the
+///   inner identity scalars from the peer-facing HEALTH copy, this outer field is
+///   the ONLY attribution the peer UI has — a forged value matching a live peer
+///   overwrote THAT peer's rendered device info.
+/// * `session_id` + `user_id` together feed `ensure_peer`, which mints the peer
+///   entry (and its user-id/email fallback label) on the first packet seen from a
+///   session.
+///
+/// Stamping the ENVELOPE — rather than patching the HEALTH device-info consumer —
+/// closes both at the one place all fan-out traffic passes, for every packet type
+/// at once.
+///
+/// ## Unconditional, not fill-if-zero
+///
+/// `session_id` is written unconditionally: a `u64` store is cheaper than the
+/// compare it replaces, and "only when the client sent 0" is exactly the hole.
+///
+/// `user_id` is written only when it DIFFERS from the authenticated value. That is
+/// observationally identical to an unconditional write — on exit
+/// `wrapper.user_id == authenticated_user_id.as_bytes()` holds on both branches,
+/// and `Vec<u8>` equality is byte equality, so the skipped write could only have
+/// stored bytes already present. The branch exists purely to avoid a heap
+/// allocation: `user_id` is `Vec<u8>`, so an unconditional write would `to_vec()`
+/// a fresh buffer FOR EVERY PACKET on the relay's hottest loop. A well-behaved
+/// client already sends its own id here (see `videocall-client`'s
+/// `transform_video_chunk` / `transform_screen_chunk` / `transform_audio_chunk`),
+/// so the common case is a ≤64-byte `memcmp` and zero allocations.
+///
+/// ## Guests / empty identities
+///
+/// The authenticated `user_id` is the session's JWT `sub` (or the sanitized path
+/// segment on the deprecated endpoint). If it is EMPTY, this writes empty — which
+/// is correct: an empty relay-side identity means the relay knows of no user id
+/// for this session, and forwarding a client's self-asserted one instead would be
+/// precisely the trust the fix removes. The receiving client already handles an
+/// empty `user_id` (it renders the display name resolved from the
+/// server-authored PARTICIPANT_JOINED, falling back to the session id).
+///
+/// A session with an empty identity should never exist in the first place —
+/// `Handler<JoinRoom>` now refuses one, alongside the reserved `SYSTEM_USER_ID`
+/// — so this arm is defense in depth for a session that somehow reaches the
+/// broadcast path without a join, not a supported configuration.
+///
+/// ## Fail-CLOSED: `None` means DROP, exactly like the REACTION stamp
+///
+/// Returns `None` — never a fallback payload — when the input does not parse as
+/// a `PacketWrapper`, or when the stamped wrapper will not re-serialize. The
+/// caller MUST skip the publish entirely on `None`; returning `Vec::new()`
+/// instead would still publish, and empty bytes parse as a DEFAULT
+/// `PacketWrapper` (session_id 0, user_id empty, packet_type UNSPECIFIED) — a
+/// forwarded packet with no identity at all.
+///
+/// Two distinct reasons, one behavior:
+///
+/// 1. **Unparseable input is a remote DoS, not opaque data.** `classify_packet`
+///    routes bytes that FAIL to parse as a `PacketWrapper` to `PacketKind::Data`
+///    ("unparseable, treat as opaque data"), so they reach here. The pre-#2095
+///    code forwarded them verbatim. That is NOT safe on the default transport:
+///    `videocall-types`' `From<Binary> for PacketWrapper`
+///    (`videocall-types/src/lib.rs` ~132-136) calls `parse_from_bytes(..).unwrap()`,
+///    and a wasm panic ABORTS — trapping the module and killing the call for
+///    that tab. WebTransport drops a bad datagram cleanly, but WebSocket has
+///    been the DEFAULT transport since #2045. `handle_msg`'s outbound filters do
+///    not save an ADMITTED participant either: its packet-type predicates are all
+///    `parsed.map(..).unwrap_or(false)`, and each is a "relay-authored control
+///    packet" EXEMPTION from the self-echo guard, so `false` means "forward
+///    normally" — an unparseable frame (`parsed == None`) matches no drop
+///    condition and the viewport VIDEO filter needs a `media_kind` it also
+///    cannot read. (An OBSERVER receiver is safe: its allowlist is an ALLOW
+///    predicate, so the same `unwrap_or(false)` drops there. Observers were
+///    never the target.) Net effect before this change: one 4-byte frame from
+///    any authenticated participant (a guest suffices) crashed every OTHER
+///    participant's tab — relay-amplified, unrate-limited. Dropping at the relay
+///    is the fix that belongs here; the client-side `.unwrap()` is a separate
+///    hardening item on a shared type.
+///
+/// 2. **A serialize failure would forward an UNSTAMPED identity.** These bytes
+///    DID parse, so the attacker-controlled `session_id`/`user_id` in them are
+///    readable by every peer. Falling back to `data.to_vec()` would hand the
+///    forgery through the one function whose entire job is to remove it.
+///    Effectively unreachable (rust-protobuf writes into a `Vec`, and proto3 has
+///    no required-field check that could fail), but "unreachable" is not a
+///    reason to leave the unsafe arm in place.
+///
+/// This costs nothing legitimate: every packet a real client emits on this path
+/// is a serialized `PacketWrapper` by construction, so no well-behaved frame can
+/// take either arm.
+pub fn stamp_wrapper_for_broadcast(
+    data: &[u8],
+    authenticated_session: u64,
+    authenticated_user_id: &str,
+) -> Option<Vec<u8>> {
+    let mut wrapper = PacketWrapper::parse_from_bytes(data).ok()?;
+
+    wrapper.session_id = authenticated_session;
+    if wrapper.user_id != authenticated_user_id.as_bytes() {
+        wrapper.user_id = authenticated_user_id.as_bytes().to_vec();
+    }
+
+    wrapper.write_to_bytes().ok()
+}
+
 /// Cheap delivery-observation peek for an OUTBOUND forwarded frame (#1297).
 ///
 /// Returns `Some((target, kind))` ONLY for a MEDIA packet whose OUTER cleartext
@@ -1019,15 +1505,20 @@ pub fn stamp_reaction_for_broadcast(
 /// little longer (≤ the min-retry rate, still under the global cap) — never a
 /// wrongful throttle and never a storm.
 ///
-/// ## Delivery-key trust (option A — outer `session_id`, forgeable, bounded)
+/// ## Delivery-key trust (option A — outer `session_id`, bounded)
 ///
 /// The authoritative publisher identity is the NATS subject (set by the relay,
 /// unforgeable — see `chat_server::handle_msg` ~4199), NOT the outer
-/// `session_id` (which a publisher can forge — ingress only stamps it when the
-/// client sends 0). We key the delivery observation off the outer
+/// `session_id`. We key the delivery observation off the outer
 /// `session_id`/`user_id` here (mirroring [`KeyframeTarget::from_request`]) to
-/// keep `handle_outbound` self-contained and off the `Message` hot struct. The
-/// abuse bound holds regardless of key fidelity: a publisher forging its OWN
+/// keep `handle_outbound` self-contained and off the `Message` hot struct.
+///
+/// Since #2095 those outer scalars are no longer publisher-forgeable at all:
+/// the broadcast path stamps BOTH with the publisher's authenticated identity
+/// (`stamp_wrapper_for_broadcast`) before anything is published, so by the time
+/// an OUTBOUND frame reaches this function the key already agrees with the
+/// subject. The bound below is kept because it does not depend on that: a
+/// publisher forging its OWN
 /// media's outer `session_id` can only mis-key the waiting-flag CLEAR on the
 /// receivers it sends to — at worst leaving a receiver's OWN waiting flag set so
 /// that receiver's re-requests stay in the delivery-aware path. That is still
@@ -3487,5 +3978,1355 @@ mod tests {
             out_inner.custom_emoji, emoji,
             "custom_emoji must be preserved on the no-truncate fast path"
         );
+    }
+
+    // =====================================================================
+    // #2135: RAISE_HAND classify validation, per-sender limiter, and the
+    // relay-side attribution stamp.
+    //
+    // Every test here is a pure function over real wire bytes — no broker, no
+    // actor — so they EXECUTE in every environment rather than silently
+    // skipping when NATS is unreachable.
+    // =====================================================================
+
+    /// Build the raw bytes of a `PacketWrapper{RAISE_HAND}` carrying an inner
+    /// cleartext `RaiseHandPacket`. Exercises the REAL wire path
+    /// `classify_packet` / `stamp_raise_hand_for_broadcast` parse (not an
+    /// in-memory struct), so these tests pin the production contract.
+    fn raise_hand_wrapper_with(
+        session_id: u64,
+        raised: bool,
+        raised_at_ms: u64,
+        display_name: Vec<u8>,
+    ) -> Vec<u8> {
+        let inner = RaiseHandPacket {
+            raised,
+            raised_at_ms,
+            display_name,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::RAISE_HAND.into(),
+            session_id,
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    #[test]
+    fn test_2135_classify_wellformed_raise_hand_is_forwardable() {
+        // Both hand states classify as the forwardable `RaiseHand` class the
+        // per-sender limiter meters before the media fan-out. A LOWER
+        // (`raised = false`) matters as much as a RAISE: proto3 omits default
+        // values, so a lower serializes to an EMPTY inner payload — it must not
+        // be mistaken for a malformed packet and dropped, or a user could raise
+        // their hand and never be able to put it down.
+        //
+        // ADVERSARIAL (mutation): delete the whole `PacketType::RAISE_HAND` arm
+        // from `classify_packet` and these fall through to the wrapper's
+        // catch-all `PacketKind::Data` -> both asserts fail. Flip the accepting
+        // arm to `PacketKind::Dropped` -> both fail.
+        assert_eq!(
+            classify_packet(&raise_hand_wrapper_with(
+                0,
+                true,
+                1_700_000_000_000,
+                b"Ada".to_vec()
+            )),
+            PacketKind::RaiseHand,
+            "a well-formed RAISE (raised=true) must classify as forwardable"
+        );
+        let lower = raise_hand_wrapper_with(0, false, 0, Vec::new());
+        assert_eq!(
+            PacketWrapper::parse_from_bytes(&lower).unwrap().data.len(),
+            0,
+            "sanity: proto3 default-elision makes a bare LOWER an EMPTY inner payload — \
+             the exact shape the next assert proves is still accepted"
+        );
+        assert_eq!(
+            classify_packet(&lower),
+            PacketKind::RaiseHand,
+            "a LOWER (empty inner payload after proto3 default-elision) must still be \
+             forwardable — otherwise a raised hand could never be put down"
+        );
+    }
+
+    #[test]
+    fn test_2135_classify_drops_oversized_raise_hand_payload() {
+        // The size cap is the ONLY term that bounds a RAISE_HAND as a whole.
+        // rust-protobuf PRESERVES unknown fields across parse/serialize (needed
+        // for forward compatibility), so the display_name bound applied later on
+        // the stamp path does NOT bound the payload: without this check a forged
+        // RAISE_HAND stuffed with unknown fields would be re-broadcast verbatim
+        // to every participant.
+        //
+        // The oversized packet is deliberately WELL-FORMED (it parses fine), so
+        // the ONLY thing that can reject it is the size check — the parse arm
+        // cannot accidentally cover for a deleted cap.
+        //
+        // ADVERSARIAL (mutation): delete the
+        // `if packet_wrapper.data.len() > RAISE_HAND_PACKET_MAX_BYTES` guard and
+        // this classifies as `RaiseHand` -> fails.
+        let huge = raise_hand_wrapper_with(0, true, 1, vec![b'x'; RAISE_HAND_PACKET_MAX_BYTES * 4]);
+        let inner_len = PacketWrapper::parse_from_bytes(&huge).unwrap().data.len();
+        assert!(
+            inner_len > RAISE_HAND_PACKET_MAX_BYTES,
+            "sanity: the fixture's inner payload ({inner_len}B) must exceed the \
+             {RAISE_HAND_PACKET_MAX_BYTES}B cap or the test proves nothing"
+        );
+        assert!(
+            RaiseHandPacket::parse_from_bytes(
+                &PacketWrapper::parse_from_bytes(&huge).unwrap().data
+            )
+            .is_ok(),
+            "sanity: the oversized fixture PARSES cleanly, so only the size cap can reject it"
+        );
+        assert_eq!(
+            classify_packet(&huge),
+            PacketKind::Dropped,
+            "an over-cap RAISE_HAND payload must be dropped at ingress, never re-broadcast"
+        );
+    }
+
+    #[test]
+    fn test_2135_classify_accepts_raise_hand_exactly_at_the_cap() {
+        // Boundary: the check is `> cap`, so a payload of EXACTLY
+        // RAISE_HAND_PACKET_MAX_BYTES is admitted. Pins the comparison operator.
+        //
+        // ADVERSARIAL (mutation): change `>` to `>=` and this at-cap packet is
+        // dropped -> fails.
+        //
+        // The inner payload is grown to land exactly on the cap: a `display_name`
+        // of N bytes costs `2 + N` (tag + length for N <= 127, tag + 2-byte
+        // varint length above), so we search rather than hardcode the arithmetic.
+        let name_len = (1..RAISE_HAND_PACKET_MAX_BYTES)
+            .find(|n| {
+                RaiseHandPacket {
+                    display_name: vec![b'x'; *n],
+                    ..Default::default()
+                }
+                .write_to_bytes()
+                .unwrap()
+                .len()
+                    == RAISE_HAND_PACKET_MAX_BYTES
+            })
+            .expect("some display_name length must serialize to exactly the cap");
+        let at_cap = raise_hand_wrapper_with(0, false, 0, vec![b'x'; name_len]);
+        assert_eq!(
+            PacketWrapper::parse_from_bytes(&at_cap).unwrap().data.len(),
+            RAISE_HAND_PACKET_MAX_BYTES,
+            "sanity: the fixture must sit exactly ON the cap"
+        );
+        assert_eq!(
+            classify_packet(&at_cap),
+            PacketKind::RaiseHand,
+            "a payload of exactly RAISE_HAND_PACKET_MAX_BYTES must be admitted (the check is `>`)"
+        );
+    }
+
+    #[test]
+    fn test_2135_classify_drops_unparseable_raise_hand_inner() {
+        // Well-formedness is the second ingress term: a within-cap payload that
+        // is NOT a decodable RaiseHandPacket is dropped fail-closed, so the
+        // fan-out never carries bytes the relay could not decode.
+        //
+        // The fixture is a TRUNCATED length-delimited field 3 (`display_name`):
+        // tag 0x1a, claimed length 5, but only 1 byte follows. That is a hard
+        // protobuf decode error, not an unknown field that would be skipped.
+        //
+        // ADVERSARIAL (mutation): change the `Err(_) => PacketKind::Dropped` arm
+        // to `PacketKind::RaiseHand` -> fails.
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::RAISE_HAND.into(),
+            data: vec![0x1a, 0x05, 0x61],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert!(
+            RaiseHandPacket::parse_from_bytes(&[0x1a, 0x05, 0x61]).is_err(),
+            "sanity: the fixture must genuinely fail to parse, or the test proves nothing"
+        );
+        assert_eq!(
+            classify_packet(&bytes),
+            PacketKind::Dropped,
+            "an unparseable RaiseHandPacket must be dropped at ingress"
+        );
+    }
+
+    #[test]
+    fn test_2135_raise_hand_limiter_admits_up_to_max_then_drops() {
+        // Up to RAISE_HAND_MAX_PER_WINDOW announces in one window are admitted;
+        // the next is dropped. All calls happen within microseconds so the window
+        // never slides — deterministic without a sleep.
+        //
+        // ADVERSARIAL (mutation): raise the cap, or point `RaiseHandRateLimiter`
+        // at REACTION's constants, and the (MAX+1)th is admitted -> the final
+        // assert fails.
+        let mut limiter = RaiseHandRateLimiter::new();
+        for i in 0..RAISE_HAND_MAX_PER_WINDOW {
+            assert!(
+                limiter.allow(),
+                "raise-hand announce {i} within the per-sender budget must be admitted"
+            );
+        }
+        assert!(
+            !limiter.allow(),
+            "the announce after RAISE_HAND_MAX_PER_WINDOW ({RAISE_HAND_MAX_PER_WINDOW}) in one \
+             window must be dropped (over budget)"
+        );
+    }
+
+    #[test]
+    fn test_2135_raise_hand_limiter_window_slides_and_resets() {
+        // Once the window elapses the per-sender budget refills. This is the
+        // property that keeps a rate-limit drop RECOVERABLE: a raise-hand carries
+        // persistent state with no relay-side registry to repair from, so a
+        // limiter that could not refill would pin a participant's hand state
+        // wrong for the rest of the meeting.
+        //
+        // Rewind the internal `window_start` (same-module access, exactly as the
+        // reaction and keyframe limiter tests do) to avoid a real sleep.
+        //
+        // ADVERSARIAL (mutation): remove the window-roll reset in `try_consume`,
+        // or give `RaiseHandRateLimiter::allow` a window LONGER than the rewind
+        // (e.g. leaving it pointed at a much larger constant), and the post-slide
+        // allow stays denied -> fails.
+        let mut limiter = RaiseHandRateLimiter::new();
+        for _ in 0..RAISE_HAND_MAX_PER_WINDOW {
+            assert!(limiter.allow());
+        }
+        assert!(
+            !limiter.allow(),
+            "budget must be exhausted within a single window"
+        );
+
+        limiter.window.window_start =
+            Instant::now() - Duration::from_millis(RAISE_HAND_WINDOW_MS + 50);
+
+        assert!(
+            limiter.allow(),
+            "after the window slides, the per-sender raise-hand budget must refill"
+        );
+    }
+
+    #[test]
+    fn test_2135_stamp_raise_hand_overwrites_forged_session_id() {
+        // SECURITY (#2135): attribution IS the feature. A RAISE_HAND arriving
+        // with a NON-ZERO session_id is a forge — an authenticated participant
+        // stamping a victim's session (learned from presence) to raise the
+        // VICTIM's hand, cleartext, with no E2EE backstop. Unlike a reaction this
+        // is not a transient float: it plants a durable, named entry in every
+        // participant's raised-hands list until the victim notices and lowers a
+        // hand they never raised.
+        //
+        // ADVERSARIAL (mutation): delete the
+        // `wrapper.session_id = authenticated_session` line (or make it
+        // fill-if-zero) and the forged 9999 survives -> fails.
+        const FORGED_VICTIM: u64 = 9999;
+        const AUTHENTICATED: u64 = 42;
+        let bytes = raise_hand_wrapper_with(FORGED_VICTIM, true, 1_700_000_000_000, Vec::new());
+
+        let stamped = stamp_raise_hand_for_broadcast(
+            &bytes,
+            AUTHENTICATED,
+            crate::constants::RAISE_HAND_DISPLAY_NAME_MAX_BYTES,
+        )
+        .expect("a valid RAISE_HAND must re-stamp");
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.session_id, AUTHENTICATED,
+            "a forged non-zero session_id must be overwritten with the authenticated session"
+        );
+    }
+
+    #[test]
+    fn test_2135_stamp_raise_hand_preserves_state_on_the_truncation_path() {
+        // The stamp re-serializes the inner packet ONLY when it truncates an
+        // overlong display_name. The STATE fields must round-trip through that
+        // rewrite: a stamp that dropped them would silently convert a RAISE into
+        // a LOWER (proto3 elides `false`) for every peer — the worst possible
+        // failure for this feature, and one no display_name assertion catches.
+        //
+        // ADVERSARIAL (mutation): rebuild a FRESH `RaiseHandPacket` carrying only
+        // the truncated display_name instead of mutating the PARSED `inner`, and
+        // `raised` comes back false / `raised_at_ms` comes back 0 -> fails.
+        // The overlong name FORCES the re-serialize branch, so preservation is
+        // actually exercised rather than trivially true.
+        const AUTHENTICATED: u64 = 3;
+        const RAISED_AT: u64 = 1_700_000_000_123;
+        let cap = crate::constants::RAISE_HAND_DISPLAY_NAME_MAX_BYTES;
+        let bytes = raise_hand_wrapper_with(0, true, RAISED_AT, vec![b'x'; cap + 100]);
+
+        let stamped = stamp_raise_hand_for_broadcast(&bytes, AUTHENTICATED, cap).unwrap();
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        let out_inner = RaiseHandPacket::parse_from_bytes(&out.data).unwrap();
+        assert!(
+            out_inner.display_name.len() <= cap,
+            "the overlong display_name must be truncated (proving the re-serialize path ran)"
+        );
+        assert!(
+            out_inner.raised,
+            "`raised` must survive the display_name-truncation re-serialize — losing it \
+             would turn a RAISE into a LOWER room-wide"
+        );
+        assert_eq!(
+            out_inner.raised_at_ms, RAISED_AT,
+            "`raised_at_ms` must survive the rewrite verbatim, or the room's ordering \
+             collapses for anyone whose name happened to be overlong"
+        );
+    }
+
+    #[test]
+    fn test_2135_stamp_raise_hand_truncation_never_splits_a_codepoint() {
+        // 100 x 'あ' (E3 81 82 = 3 bytes) = 300 bytes. A cap of 256 lands at byte
+        // 256, which is mid-codepoint (256 = 3*85 + 1), so a naive byte truncate
+        // would split 'あ' and yield invalid UTF-8. `floor_utf8_boundary` must
+        // back up to byte 255 (85 whole codepoints).
+        //
+        // ADVERSARIAL (mutation): replace `floor_utf8_boundary` with a plain
+        // `truncate(max)` and the result ends in a split sequence -> from_utf8
+        // fails -> this fails.
+        const AUTHENTICATED: u64 = 1;
+        let bytes = raise_hand_wrapper_with(0, true, 7, "あ".repeat(100).into_bytes());
+
+        let stamped = stamp_raise_hand_for_broadcast(&bytes, AUTHENTICATED, 256).unwrap();
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        let out_inner = RaiseHandPacket::parse_from_bytes(&out.data).unwrap();
+        assert!(out_inner.display_name.len() <= 256);
+        let s = std::str::from_utf8(&out_inner.display_name)
+            .expect("truncation must produce valid UTF-8 (no split codepoint)");
+        assert!(
+            !s.is_empty() && s.chars().all(|c| c == 'あ'),
+            "only whole codepoints may survive truncation"
+        );
+    }
+
+    #[test]
+    fn test_2135_stamp_raise_hand_preserves_unknown_fields_on_the_fast_path() {
+        // FORWARD COMPATIBILITY, and the reason the size cap (not the stamp) is
+        // what bounds this packet: on the common in-bound path the stamp does NOT
+        // re-serialize the inner packet, so a NEWER client's added field survives
+        // an OLDER relay byte-for-byte instead of being silently stripped.
+        //
+        // The "future field" is simulated as an unknown field 9 (varint) appended
+        // to a current-shape payload — exactly what a `uint64 something = 9;`
+        // added later would put on the wire.
+        //
+        // ADVERSARIAL (mutation): make the stamp ALWAYS rebuild `wrapper.data`
+        // from a fresh `RaiseHandPacket` (dropping `special_fields`) and the
+        // unknown field is gone -> fails.
+        const AUTHENTICATED: u64 = 11;
+        let mut inner_bytes = RaiseHandPacket {
+            raised: true,
+            raised_at_ms: 5,
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+        // field 9, wiretype 0 (varint) = (9 << 3) | 0 = 0x48; value 1.
+        inner_bytes.extend_from_slice(&[0x48, 0x01]);
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::RAISE_HAND.into(),
+            data: inner_bytes.clone(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(
+            classify_packet(&bytes),
+            PacketKind::RaiseHand,
+            "sanity: a packet carrying an unknown (future) field must still pass ingress"
+        );
+
+        let stamped = stamp_raise_hand_for_broadcast(
+            &bytes,
+            AUTHENTICATED,
+            crate::constants::RAISE_HAND_DISPLAY_NAME_MAX_BYTES,
+        )
+        .unwrap();
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(out.session_id, AUTHENTICATED);
+        assert_eq!(
+            out.data, inner_bytes,
+            "on the no-truncate fast path the inner payload — including a future \
+             client's unknown field — must be forwarded byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn test_2135_stamp_raise_hand_preserves_unknown_fields_through_truncation() {
+        // The companion to the fast-path test above, and the one that actually
+        // VERIFIES the mechanism claimed in `RAISE_HAND_PACKET_MAX_BYTES`'s doc:
+        // rust-protobuf carries unknown fields in `special_fields` and RE-EMITS
+        // them on `write_to_bytes`. That is what makes the size cap load-bearing
+        // (the display_name bound cannot bound what it does not know about) and
+        // what keeps forward compatibility on the truncation path too.
+        //
+        // Asserting it here rather than asserting it in prose: the overlong
+        // display_name FORCES the re-serialize branch, so if rust-protobuf ever
+        // stopped preserving unknown fields — or if this function were changed to
+        // rebuild a canonical packet — the future field would vanish and this
+        // fails.
+        //
+        // ADVERSARIAL (mutation): rebuild `wrapper.data` from a fresh
+        // `RaiseHandPacket` (copying only the known fields) instead of
+        // re-serializing the PARSED `inner`, and the unknown field is stripped
+        // -> fails.
+        const AUTHENTICATED: u64 = 12;
+        let cap = crate::constants::RAISE_HAND_DISPLAY_NAME_MAX_BYTES;
+        let mut inner_bytes = RaiseHandPacket {
+            raised: true,
+            raised_at_ms: 5,
+            display_name: vec![b'x'; cap + 100],
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+        // field 9, wiretype 0 (varint) = (9 << 3) | 0 = 0x48; value 1.
+        inner_bytes.extend_from_slice(&[0x48, 0x01]);
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::RAISE_HAND.into(),
+            data: inner_bytes,
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+
+        let stamped = stamp_raise_hand_for_broadcast(&bytes, AUTHENTICATED, cap).unwrap();
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        let out_inner = RaiseHandPacket::parse_from_bytes(&out.data).unwrap();
+        assert!(
+            out_inner.display_name.len() <= cap,
+            "sanity: the overlong name must be truncated, proving the re-serialize path ran"
+        );
+        assert!(
+            out_inner
+                .special_fields
+                .unknown_fields()
+                .get(9)
+                .is_some_and(|v| v == protobuf::UnknownValueRef::Varint(1)),
+            "the future client's unknown field 9 must survive the display_name-truncation \
+             re-serialize — this is the `special_fields` round-trip the size cap's doc relies on"
+        );
+    }
+
+    #[test]
+    fn test_2135_stamp_raise_hand_output_still_classifies() {
+        // Ties the stamp output back to the ingress contract: the stamped bytes
+        // must STILL classify as a forwardable RaiseHand. A stamp that corrupted
+        // the packet (or pushed it over the size cap) would break re-classify.
+        const AUTHENTICATED: u64 = 5;
+        let bytes = raise_hand_wrapper_with(0, true, 99, b"Bob".to_vec());
+
+        let stamped = stamp_raise_hand_for_broadcast(
+            &bytes,
+            AUTHENTICATED,
+            crate::constants::RAISE_HAND_DISPLAY_NAME_MAX_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_packet(&stamped),
+            PacketKind::RaiseHand,
+            "stamped bytes must still classify as a forwardable RaiseHand"
+        );
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        let out_inner = RaiseHandPacket::parse_from_bytes(&out.data).unwrap();
+        assert!(out_inner.raised);
+        assert_eq!(out_inner.raised_at_ms, 99);
+        assert_eq!(
+            out_inner.display_name,
+            b"Bob".to_vec(),
+            "a within-bound display_name must be preserved unchanged"
+        );
+    }
+
+    #[test]
+    fn test_2135_stamp_raise_hand_is_fail_closed_on_garbage() {
+        // Fail-closed default: unparseable input returns `None`, and the caller
+        // DROPS rather than fanning out an unstamped packet. Unreachable for a
+        // packet `classify_packet` already accepted, but the default must be the
+        // safe one.
+        //
+        // ADVERSARIAL (mutation): change either `.ok()?` to a
+        // `.unwrap_or_default()` and this returns `Some(..)` -> fails.
+        assert!(
+            stamp_raise_hand_for_broadcast(&[0xff, 0xff, 0xff, 0xff], 1, 256).is_none(),
+            "an unparseable wrapper must fail closed (None => caller drops)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #2095 (security): unconditional envelope identity stamp on the generic
+    // broadcast path via `stamp_wrapper_for_broadcast`.
+    //
+    // Every one of these tests runs with NO broker and NO actor — the stamp is
+    // a pure function precisely so its guarantees are pinned by tests that
+    // actually EXECUTE in every environment, not ones that silently skip when
+    // NATS is unreachable.
+    // ---------------------------------------------------------------------
+
+    /// The relay-authenticated identity used across the #2095 tests. Distinct
+    /// from every forged value below so a mix-up cannot pass by coincidence.
+    const AUTH_SESSION: u64 = 4242;
+    const AUTH_USER: &str = "attacker@example.com";
+    /// A live peer's identity the attacker learned from presence.
+    const VICTIM_SESSION: u64 = 777;
+    const VICTIM_USER: &str = "victim@example.com";
+
+    /// Build the raw bytes of a peer-facing HEALTH `PacketWrapper` — the exact
+    /// wire shape that carries device info to every participant's UI. The inner
+    /// packet holds ONLY the seven device fields, mirroring what
+    /// `client_diagnostics::trim_health_packet_for_peers` emits before fan-out
+    /// (it strips the inner identity scalars, which is WHY the outer envelope is
+    /// the only attribution the peer UI has — the premise of this whole fix).
+    fn health_wrapper_with(session_id: u64, user_id: &str, cores: u32) -> Vec<u8> {
+        use videocall_types::protos::health_packet::HealthPacket;
+
+        let inner = HealthPacket {
+            client_cores: Some(cores),
+            client_os: Some("macOS".to_string()),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::HEALTH.into(),
+            session_id,
+            user_id: user_id.as_bytes().to_vec(),
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    #[test]
+    fn stamp_wrapper_overwrites_forged_nonzero_session_id() {
+        // SECURITY (#2095), the core of the fix. Pre-#2095 the broadcast path
+        // stamped session_id FILL-IF-ZERO, so a client that supplied a NON-ZERO
+        // value had it forwarded to every peer untouched. Because the peer UI
+        // keys `set_peer_device_info` off this outer field (the inner identity
+        // scalars are stripped by `trim_health_packet_for_peers`), a value
+        // matching a live peer overwrote THAT peer's rendered device info.
+        //
+        // MUTATION PROOF: wrap the assignment in the old
+        // `if wrapper.session_id == 0 { .. }` guard — or delete the
+        // `wrapper.session_id = authenticated_session;` line — and the forged
+        // VICTIM_SESSION survives, so this assert fails.
+        let bytes = health_wrapper_with(VICTIM_SESSION, AUTH_USER, 8);
+
+        let stamped = stamp_wrapper_for_broadcast(&bytes, AUTH_SESSION, AUTH_USER)
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.session_id, AUTH_SESSION,
+            "a forged NON-ZERO envelope session_id must be replaced by the \
+             sender's authenticated session before peer fan-out"
+        );
+    }
+
+    #[test]
+    fn stamp_wrapper_overwrites_forged_user_id() {
+        // SECURITY (#2095): `PacketWrapper.user_id` was never stamped at all —
+        // not even fill-if-empty. The receiving client feeds BOTH outer scalars
+        // to `ensure_peer(session_id, user_id)`, which mints the peer entry and
+        // its user-id/email fallback label from the first packet seen for a
+        // session, so an unstamped user_id let a sender label its own tile with
+        // another participant's identity.
+        //
+        // MUTATION PROOF: delete the `wrapper.user_id = ...` branch and the
+        // forged VICTIM_USER survives, so this assert fails.
+        let bytes = health_wrapper_with(0, VICTIM_USER, 8);
+
+        let stamped = stamp_wrapper_for_broadcast(&bytes, AUTH_SESSION, AUTH_USER)
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.user_id,
+            AUTH_USER.as_bytes(),
+            "a client-supplied envelope user_id must be replaced by the \
+             sender's authenticated user id before peer fan-out"
+        );
+    }
+
+    #[test]
+    fn stamp_wrapper_health_device_info_survives_identity_rewrite() {
+        // The user-visible half of #2095, end to end on the REAL peer-facing
+        // shape: run the relay's peer trim (which is what strips the inner
+        // identity scalars) and then the stamp, and assert BOTH that the forged
+        // envelope identity is gone AND that the device payload the peer UI
+        // renders is untouched. A "fix" that closed the attribution hole by
+        // mangling the device fields would break the Device panel for everyone.
+        //
+        // MUTATION PROOF: revert either stamp and the identity asserts fail;
+        // rebuild the wrapper from scratch instead of mutating the parsed one
+        // and the device-field asserts fail.
+        use videocall_types::protos::health_packet::HealthPacket;
+
+        let forged = health_wrapper_with(VICTIM_SESSION, VICTIM_USER, 12);
+        let trimmed =
+            crate::client_diagnostics::health_processor::trim_health_packet_for_peers(&forged);
+
+        let stamped = stamp_wrapper_for_broadcast(&trimmed, AUTH_SESSION, AUTH_USER)
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.session_id, AUTH_SESSION,
+            "peer device info must be attributed to the sender's authenticated session"
+        );
+        assert_eq!(
+            out.user_id,
+            AUTH_USER.as_bytes(),
+            "peer device info must be attributed to the sender's authenticated user id"
+        );
+        assert_eq!(
+            out.packet_type.enum_value(),
+            Ok(PacketType::HEALTH),
+            "the packet type must be untouched — the relay stamps identity, not routing"
+        );
+        let inner = HealthPacket::parse_from_bytes(&out.data).unwrap();
+        assert_eq!(
+            inner.client_cores,
+            Some(12),
+            "the device payload the peer UI renders must survive the identity rewrite"
+        );
+        assert_eq!(inner.client_os.as_deref(), Some("macOS"));
+    }
+
+    #[test]
+    fn stamp_wrapper_still_fills_a_zero_session_id() {
+        // Happy-path neutrality: on the media path the well-behaved client
+        // leaves session_id at the proto3 default 0 (`transform_video_chunk` /
+        // `transform_screen_chunk` / `transform_audio_chunk` never set it), which
+        // the pre-#2095 fill-if-zero stamp already handled. That behavior must be
+        // preserved, otherwise every legitimate packet loses its attribution.
+        //
+        // NOT a claim that no client packet carries a non-zero outer session_id:
+        // `videocall-client`'s `build_heartbeat_packet`
+        // (connection/connection.rs ~572-573) DOES set it, from the connection's
+        // OWN server-assigned id. That packet is `PacketType::MEDIA` with
+        // `media_kind` unset, so `classify_packet` returns `PacketKind::Data` and
+        // it is forwarded through this stamp — where the write is a genuine
+        // no-op, because the value it carries already equals the authenticated
+        // session. `stamp_wrapper_overwrites_forged_nonzero_session_id` covers
+        // the case where those two DISAGREE, which is the attack.
+        let bytes = health_wrapper_with(0, AUTH_USER, 4);
+
+        let stamped = stamp_wrapper_for_broadcast(&bytes, AUTH_SESSION, AUTH_USER)
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.session_id, AUTH_SESSION,
+            "session_id = 0 must still be stamped with the authenticated session"
+        );
+    }
+
+    #[test]
+    fn stamp_wrapper_preserves_payload_and_cleartext_discriminators() {
+        // WIRE NEUTRALITY: the stamp touches fields 2 and 4 ONLY. Every other
+        // field is load-bearing downstream — `packet_type` (1) drives
+        // `classify_packet` and the client's packet dispatch, `data` (3) is the
+        // AES-sealed media payload, `simulcast_layer_id` (5) drives the relay's
+        // per-receiver layer filter, and `media_kind` (6) drives viewport-aware
+        // VIDEO filtering. Clobbering any of them would break media delivery
+        // while the security asserts above stayed green.
+        //
+        // MUTATION PROOF: build a fresh `PacketWrapper` inside the stamp instead
+        // of mutating the parsed one and all four asserts below fail.
+        let payload = b"sealed-media-bytes".to_vec();
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            media_kind: MediaKind::SCREEN.into(),
+            simulcast_layer_id: 2,
+            session_id: VICTIM_SESSION,
+            user_id: VICTIM_USER.as_bytes().to_vec(),
+            data: payload.clone(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+
+        let stamped = stamp_wrapper_for_broadcast(&bytes, AUTH_SESSION, AUTH_USER)
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.data, payload,
+            "the sealed media payload must be untouched"
+        );
+        assert_eq!(out.packet_type.enum_value(), Ok(PacketType::MEDIA));
+        assert_eq!(out.media_kind.enum_value(), Ok(MediaKind::SCREEN));
+        assert_eq!(
+            out.simulcast_layer_id, 2,
+            "the cleartext simulcast layer id must survive the stamp"
+        );
+        // ...and the stamped bytes still classify identically at ingress, tying
+        // the stamp output back to the relay's own routing contract.
+        assert!(matches!(
+            classify_packet(&stamped),
+            PacketKind::Media { .. }
+        ));
+    }
+
+    #[test]
+    fn stamp_wrapper_writes_empty_when_the_session_has_no_user_id() {
+        // GUEST / EMPTY-IDENTITY case. The authenticated user id is the JWT
+        // `sub`; if the relay has no user id for a session, the correct stamp is
+        // EMPTY. Forwarding the client's self-asserted id instead would be
+        // exactly the trust this fix removes, so "empty overwrites non-empty"
+        // has to hold rather than degrading to fill-if-empty.
+        //
+        // MUTATION PROOF: change the write to `if wrapper.user_id.is_empty()`
+        // (fill-if-empty) and the forged VICTIM_USER survives -> this fails.
+        let bytes = health_wrapper_with(0, VICTIM_USER, 4);
+
+        let stamped = stamp_wrapper_for_broadcast(&bytes, AUTH_SESSION, "")
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert!(
+            out.user_id.is_empty(),
+            "an empty authenticated user id must CLEAR a client-supplied one, \
+             not fall back to it"
+        );
+        assert_eq!(
+            out.session_id, AUTH_SESSION,
+            "the session stamp is independent of the user_id stamp"
+        );
+    }
+
+    #[test]
+    fn stamp_wrapper_skipped_user_id_write_is_observationally_identical() {
+        // PERFORMANCE-CORRECTNESS PIN. `user_id` is `Vec<u8>`, so an
+        // unconditional write would allocate a fresh buffer for EVERY packet on
+        // the relay's hottest loop. The stamp therefore writes only when the
+        // value DIFFERS. This test pins that the branch is observationally
+        // identical to an unconditional write: two inputs that differ ONLY in
+        // whether the client already sent the authenticated user_id must produce
+        // byte-identical output.
+        //
+        // MUTATION PROOF: make the branch skip the write when the value differs
+        // (e.g. invert the `!=`) and the two outputs diverge -> this fails.
+        let already_correct = health_wrapper_with(0, AUTH_USER, 4);
+        let forged = health_wrapper_with(0, VICTIM_USER, 4);
+
+        // `.expect` on BOTH so the assert cannot pass vacuously on `None == None`
+        // if the function ever started dropping well-formed input.
+        let from_correct = stamp_wrapper_for_broadcast(&already_correct, AUTH_SESSION, AUTH_USER)
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+        let from_forged = stamp_wrapper_for_broadcast(&forged, AUTH_SESSION, AUTH_USER)
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+
+        assert_eq!(
+            from_correct, from_forged,
+            "skipping the write when the value already matches must yield the \
+             same bytes as rewriting it"
+        );
+    }
+
+    #[test]
+    fn stamp_wrapper_drops_unparseable_bytes_instead_of_forwarding_them() {
+        // SECURITY (#2095 review, HIGH): fail CLOSED, like
+        // `stamp_reaction_for_broadcast`. `classify_packet` routes bytes that
+        // FAIL to parse as a PacketWrapper to `PacketKind::Data` ("unparseable,
+        // treat as opaque data"), so they reach this function; the pre-#2095
+        // code forwarded them verbatim, and so did the first cut of this stamp.
+        //
+        // That is a relay-amplified remote DoS on the DEFAULT transport. The
+        // receiving client's `From<Binary> for PacketWrapper`
+        // (videocall-types/src/lib.rs ~132-136) does
+        // `parse_from_bytes(..).unwrap()`, and a wasm panic ABORTS — trapping the
+        // module and killing the call for that tab. WebTransport drops a bad
+        // datagram cleanly, but WebSocket has been the default since #2045, and
+        // `handle_msg`'s outbound filters are all `parsed.map(..).unwrap_or(false)`
+        // so an unparseable frame matches no drop condition. One 4-byte frame
+        // from any authenticated participant crashed every other tab in the call.
+        //
+        // The assert is deliberately `is_none()` and NOT "the output is empty":
+        // an empty `Vec` would still be published and parses as a DEFAULT
+        // wrapper, so only the `None`/skip-the-publish contract is safe.
+        //
+        // MUTATION PROOF: restore `return data.to_vec()` (or `Some(data.to_vec())`,
+        // or `Some(Vec::new())`) on the parse-failure arm and this fails.
+        let garbage = vec![0xFF_u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(
+            PacketWrapper::parse_from_bytes(&garbage).is_err(),
+            "precondition: these bytes must not parse as a PacketWrapper"
+        );
+
+        assert!(
+            stamp_wrapper_for_broadcast(&garbage, AUTH_SESSION, AUTH_USER).is_none(),
+            "unparseable bytes must be DROPPED, never forwarded: the receiving \
+             client unwraps its parse and a wasm panic aborts the whole tab"
+        );
+
+        // The 4-byte frame from the report, verbatim — the cheapest form of the
+        // attack, and the one that must classify as `Data` to reach this function
+        // at all. Pinning the classification here ties the drop to the actual
+        // reachable path rather than to a hand-picked byte string.
+        let four_bytes = vec![0xFF_u8, 0xFF, 0xFF, 0xFF];
+        assert!(
+            matches!(classify_packet(&four_bytes), PacketKind::Data),
+            "precondition: unparseable bytes reach the broadcast path as Data"
+        );
+        assert!(
+            stamp_wrapper_for_broadcast(&four_bytes, AUTH_SESSION, AUTH_USER).is_none(),
+            "the 4-byte crash frame must be dropped at the relay"
+        );
+    }
+
+    #[test]
+    fn stamp_wrapper_defeats_an_appended_duplicate_field_forgery() {
+        // The E2E companion, at unit level. A malicious client does not have to
+        // build a whole wrapper: protobuf takes LAST-WINS for a repeated scalar,
+        // so it can take a legitimate serialized packet and simply APPEND another
+        // `user_id` (field 2, wire type 2) and `session_id` (field 4, wire type 0)
+        // to override what it already wrote. This is byte-for-byte the forgery
+        // the `peer-device-metrics` E2E performs inside the browser, so pinning it
+        // here means the relay-side guarantee is proven even when the browser
+        // harness cannot be run.
+        //
+        // It also pins the premise the E2E depends on: that appending really does
+        // override (i.e. protobuf last-wins), which would silently change if the
+        // `protobuf` crate ever altered that semantic.
+        //
+        // MUTATION PROOF: revert either stamp and the appended values survive, so
+        // both asserts fail. Remove the `precondition` assert and a protobuf
+        // behaviour change would make this test vacuous instead of loud.
+        let mut bytes = health_wrapper_with(0, AUTH_USER, 8);
+
+        let victim = VICTIM_USER.as_bytes();
+        bytes.push(0x12); // field 2 (user_id), wire type 2 (length-delimited)
+        bytes.push(victim.len() as u8);
+        bytes.extend_from_slice(victim);
+        bytes.push(0x20); // field 4 (session_id), wire type 0 (varint)
+                          // LEB128 for VICTIM_SESSION (777 = 6 * 128 + 9): low group 9 with the
+                          // continuation bit set, then 6.
+        bytes.push(0x89);
+        bytes.push(0x06);
+
+        // Precondition: the append really is a forgery — an UNSTAMPED parse of
+        // these bytes yields the attacker's values, not the client's originals.
+        let raw = PacketWrapper::parse_from_bytes(&bytes).expect("appended fields must parse");
+        assert_eq!(
+            raw.session_id, VICTIM_SESSION,
+            "precondition: protobuf last-wins must let the appended session_id override"
+        );
+        assert_eq!(
+            raw.user_id, victim,
+            "precondition: protobuf last-wins must let the appended user_id override"
+        );
+
+        let stamped = stamp_wrapper_for_broadcast(&bytes, AUTH_SESSION, AUTH_USER)
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.session_id, AUTH_SESSION,
+            "an appended-duplicate session_id forgery must not survive the stamp"
+        );
+        assert_eq!(
+            out.user_id,
+            AUTH_USER.as_bytes(),
+            "an appended-duplicate user_id forgery must not survive the stamp"
+        );
+    }
+
+    #[test]
+    fn stamp_wrapper_drops_an_earlier_duplicate_when_the_user_id_write_is_skipped() {
+        // The REVERSE ordering of the test above, and the one that exercises the
+        // SKIPPED `user_id` write. There the appended copy was the victim's, so
+        // the parsed value DIFFERED from the authenticated one and the write ran.
+        // Here the appended copy is the AUTHENTICATED id: protobuf last-wins makes
+        // the parsed value already equal to it, so `wrapper.user_id !=
+        // authenticated_user_id.as_bytes()` is FALSE and the stamp writes nothing
+        // — while an EARLIER victim copy is still sitting on the input wire.
+        //
+        // That is the one shape where "skip the write" could plausibly differ from
+        // an unconditional write, so it is asserted rather than argued. It holds
+        // because the stamp re-SERIALIZES from the parsed message: rust-protobuf
+        // emits each scalar exactly once, so the earlier duplicate is dropped on
+        // write-out and cannot reach a peer's parser to win a different last-wins
+        // race. Same for the session_id half, appended in the same direction.
+        //
+        // MUTATION PROOF (verified, not asserted): returning the INPUT bytes
+        // instead of `write_to_bytes()` output on the success path (e.g.
+        // `Some(data.to_vec())`) leaves the victim copy on the wire -> the "no
+        // victim bytes" assert and the byte-identity assert both fail.
+        //
+        // COVERAGE LIMIT, stated so no one over-reads this test: inverting the
+        // `!=` guard does NOT fail here, and cannot. This input is constructed so
+        // the parsed `user_id` ALREADY equals the authenticated one, so an
+        // inverted guard just rewrites the same bytes — that is precisely the
+        // "skipped write is a no-op" property being pinned. The inverted guard is
+        // caught by `stamp_wrapper_overwrites_forged_user_id` and
+        // `stamp_wrapper_writes_empty_when_the_session_has_no_user_id`, whose
+        // inputs DIFFER from the authenticated value.
+        let mut bytes = health_wrapper_with(VICTIM_SESSION, VICTIM_USER, 8);
+
+        let auth = AUTH_USER.as_bytes();
+        bytes.push(0x12); // field 2 (user_id), wire type 2 (length-delimited)
+        bytes.push(auth.len() as u8);
+        bytes.extend_from_slice(auth);
+        bytes.push(0x20); // field 4 (session_id), wire type 0 (varint)
+                          // LEB128 for AUTH_SESSION (4242 = 33 * 128 + 18): low group
+                          // 18 with the continuation bit set, then 33.
+        bytes.push(0x92);
+        bytes.push(0x21);
+
+        // Precondition: last-wins really does make the PARSED values already equal
+        // to the authenticated ones, i.e. the stamp's `!=` guard is FALSE and the
+        // user_id write is genuinely skipped on this input. Without this the test
+        // would silently degrade into a copy of the previous one.
+        let raw = PacketWrapper::parse_from_bytes(&bytes).expect("appended fields must parse");
+        assert_eq!(
+            raw.user_id, auth,
+            "precondition: the appended authenticated user_id must win, so the \
+             stamp's conditional write is SKIPPED for this input"
+        );
+        assert_eq!(raw.session_id, AUTH_SESSION, "precondition: last-wins");
+        // ...and the victim's copy really is still present in the INPUT bytes, so
+        // the post-stamp absence assert below is meaningful.
+        assert!(
+            bytes
+                .windows(VICTIM_USER.len())
+                .any(|w| w == VICTIM_USER.as_bytes()),
+            "precondition: the earlier victim user_id must still be on the input wire"
+        );
+
+        let stamped = stamp_wrapper_for_broadcast(&bytes, AUTH_SESSION, AUTH_USER)
+            .expect("a well-formed PacketWrapper must stamp, not drop");
+
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.user_id, auth,
+            "the skipped write must still leave the authenticated user_id in place"
+        );
+        assert_eq!(out.session_id, AUTH_SESSION);
+        assert!(
+            !stamped
+                .windows(VICTIM_USER.len())
+                .any(|w| w == VICTIM_USER.as_bytes()),
+            "the earlier duplicate user_id must be GONE from the published bytes — \
+             re-serializing from the parsed message is what removes it"
+        );
+
+        // Strongest form of the equivalence: the output is byte-identical to
+        // stamping a clean wrapper that already carried the authenticated
+        // identity, so a peer cannot tell the forgery attempt happened at all.
+        let clean = stamp_wrapper_for_broadcast(
+            &health_wrapper_with(0, AUTH_USER, 8),
+            AUTH_SESSION,
+            AUTH_USER,
+        )
+        .expect("a well-formed PacketWrapper must stamp, not drop");
+        assert_eq!(
+            stamped, clean,
+            "a duplicate-field forgery must serialize to exactly the same bytes as \
+             an honest packet from the same session"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #2136 — MEETING_TIMER ingress validation + rate limiting
+    // ---------------------------------------------------------------------
+
+    /// Build the raw bytes of a `PacketWrapper{MEETING_TIMER}` carrying an inner
+    /// `MeetingTimerPacket` — the exact wire shape `classify_packet` validates.
+    fn meeting_timer_wrapper_with(
+        running: bool,
+        ends_at_ms: u64,
+        duration_ms: u64,
+        updated_at_ms: u64,
+    ) -> Vec<u8> {
+        use videocall_types::protos::meeting_timer_packet::MeetingTimerPacket;
+        let inner = MeetingTimerPacket {
+            running,
+            ends_at_ms,
+            duration_ms,
+            updated_at_ms,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING_TIMER.into(),
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    /// A well-formed START and a well-formed CANCEL must both be forwardable.
+    ///
+    /// The CANCEL half is the one that earns its keep. proto3 elides default
+    /// values, so a bare cancel (`running = false` and nothing else) serializes
+    /// to an EMPTY inner payload — a shape it is very easy to reject by accident
+    /// (an `is_empty()` guard, a "must have an end time" check). If a cancel
+    /// cannot cross the relay, a host can start a timer it can never stop, and
+    /// the room hears the expiry sound anyway.
+    ///
+    /// MUTATION PROOF: delete the `PacketType::MEETING_TIMER` arm from
+    /// `classify_packet` and both asserts fail (the packet falls through to
+    /// `PacketKind::Data`).
+    #[test]
+    fn test_2136_classify_wellformed_meeting_timer_is_forwardable() {
+        assert_eq!(
+            classify_packet(&meeting_timer_wrapper_with(
+                true,
+                1_700_000_300_000,
+                300_000,
+                1_700_000_000_000
+            )),
+            PacketKind::MeetingTimer,
+            "a well-formed START (running = true) must classify as forwardable"
+        );
+
+        let cancel = meeting_timer_wrapper_with(false, 0, 0, 0);
+        assert_eq!(
+            PacketWrapper::parse_from_bytes(&cancel).unwrap().data.len(),
+            0,
+            "sanity: proto3 default-elision makes a bare CANCEL an EMPTY inner payload — \
+             the exact shape the next assert proves is still accepted"
+        );
+        assert_eq!(
+            classify_packet(&cancel),
+            PacketKind::MeetingTimer,
+            "a CANCEL (empty inner payload after proto3 default-elision) must still be \
+             forwardable — otherwise a started timer could never be stopped"
+        );
+    }
+
+    /// An over-cap raw payload is dropped at ingress, never re-broadcast.
+    ///
+    /// The size cap is the ONLY bound on this packet's total size: rust-protobuf
+    /// round-trips unknown fields, so without it a forged MEETING_TIMER stuffed
+    /// with megabytes of unknown fields is amplified to every participant.
+    ///
+    /// MUTATION PROOF: remove the `data.len() > MEETING_TIMER_PACKET_MAX_BYTES`
+    /// check and the oversized packet classifies as `MeetingTimer` -> fails. The
+    /// second sanity assert is what makes this specific: the fixture PARSES
+    /// cleanly and its `duration_ms` is in range, so the size cap is the only
+    /// thing that can reject it.
+    #[test]
+    fn test_2136_classify_drops_oversized_meeting_timer_payload() {
+        use videocall_types::protos::meeting_timer_packet::MeetingTimerPacket;
+
+        // Unknown-field padding, since this message has no string field to
+        // inflate — which is exactly the amplification shape the cap exists for.
+        let mut inner = MeetingTimerPacket {
+            running: true,
+            ends_at_ms: 1_700_000_300_000,
+            duration_ms: 300_000,
+            updated_at_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        inner
+            .special_fields
+            .mut_unknown_fields()
+            .add_length_delimited(9999, vec![b'x'; MEETING_TIMER_PACKET_MAX_BYTES * 4]);
+        let huge = PacketWrapper {
+            packet_type: PacketType::MEETING_TIMER.into(),
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+
+        let inner_len = PacketWrapper::parse_from_bytes(&huge).unwrap().data.len();
+        assert!(
+            inner_len > MEETING_TIMER_PACKET_MAX_BYTES,
+            "sanity: the fixture's inner payload ({inner_len}B) must exceed the \
+             {MEETING_TIMER_PACKET_MAX_BYTES}B cap or the test proves nothing"
+        );
+        let reparsed = MeetingTimerPacket::parse_from_bytes(
+            &PacketWrapper::parse_from_bytes(&huge).unwrap().data,
+        )
+        .expect("sanity: the oversized fixture PARSES cleanly");
+        assert!(
+            reparsed.duration_ms <= MEETING_TIMER_MAX_DURATION_MS,
+            "sanity: the fixture's duration is IN range, so only the size cap can reject it"
+        );
+
+        assert_eq!(
+            classify_packet(&huge),
+            PacketKind::Dropped,
+            "an over-cap MEETING_TIMER payload must be dropped at ingress, never re-broadcast"
+        );
+    }
+
+    /// The size cap is inclusive: a payload of EXACTLY the cap is accepted.
+    ///
+    /// MUTATION PROOF: change the check from `>` to `>=` and this fails, while
+    /// every other test in this file stays green.
+    #[test]
+    fn test_2136_classify_accepts_meeting_timer_exactly_at_the_cap() {
+        use videocall_types::protos::meeting_timer_packet::MeetingTimerPacket;
+
+        let mut inner = MeetingTimerPacket {
+            running: true,
+            ends_at_ms: 1_700_000_300_000,
+            duration_ms: 300_000,
+            updated_at_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let base_len = inner.write_to_bytes().unwrap().len();
+        // Pad with an unknown field until the inner payload is exactly the cap.
+        // `add_length_delimited` costs (tag + length varint + payload), so solve
+        // for the payload length by search rather than by arithmetic guesswork.
+        let pad = (0..MEETING_TIMER_PACKET_MAX_BYTES)
+            .find(|n| {
+                let mut probe = inner.clone();
+                probe
+                    .special_fields
+                    .mut_unknown_fields()
+                    .add_length_delimited(9999, vec![b'x'; *n]);
+                probe.write_to_bytes().unwrap().len() == MEETING_TIMER_PACKET_MAX_BYTES
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "some padding length must serialize to exactly the {MEETING_TIMER_PACKET_MAX_BYTES}B \
+                     cap (base payload is {base_len}B)"
+                )
+            });
+        inner
+            .special_fields
+            .mut_unknown_fields()
+            .add_length_delimited(9999, vec![b'x'; pad]);
+        let at_cap = PacketWrapper {
+            packet_type: PacketType::MEETING_TIMER.into(),
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+
+        assert_eq!(
+            PacketWrapper::parse_from_bytes(&at_cap).unwrap().data.len(),
+            MEETING_TIMER_PACKET_MAX_BYTES,
+            "sanity: the fixture must sit EXACTLY on the cap or it pins the wrong boundary"
+        );
+        assert_eq!(
+            classify_packet(&at_cap),
+            PacketKind::MeetingTimer,
+            "a payload of exactly MEETING_TIMER_PACKET_MAX_BYTES must be ACCEPTED — the cap \
+             is an inclusive upper bound, not an exclusive one"
+        );
+    }
+
+    /// An out-of-range `duration_ms` drops the whole packet; the cap itself is
+    /// inclusive.
+    ///
+    /// MUTATION PROOF: delete the `timer.duration_ms <= MEETING_TIMER_MAX_DURATION_MS`
+    /// guard and the first assert fails. Change `<=` to `<` and the second
+    /// (at-cap) assert fails.
+    #[test]
+    fn test_2136_classify_bounds_meeting_timer_duration() {
+        let over = meeting_timer_wrapper_with(
+            true,
+            1_700_000_300_000,
+            MEETING_TIMER_MAX_DURATION_MS + 1,
+            1_700_000_000_000,
+        );
+        assert!(
+            PacketWrapper::parse_from_bytes(&over).unwrap().data.len()
+                <= MEETING_TIMER_PACKET_MAX_BYTES,
+            "sanity: the over-duration fixture is WITHIN the size cap, so only the duration \
+             bound can reject it"
+        );
+        assert_eq!(
+            classify_packet(&over),
+            PacketKind::Dropped,
+            "a duration beyond MEETING_TIMER_MAX_DURATION_MS must be dropped at ingress — an \
+             unbounded u64 would overflow the client's progress arithmetic"
+        );
+
+        assert_eq!(
+            classify_packet(&meeting_timer_wrapper_with(
+                true,
+                1_700_000_300_000,
+                MEETING_TIMER_MAX_DURATION_MS,
+                1_700_000_000_000
+            )),
+            PacketKind::MeetingTimer,
+            "a duration of EXACTLY the cap must be accepted — the bound is inclusive"
+        );
+    }
+
+    /// `ends_at_ms` is deliberately NOT range-checked, however absurd.
+    ///
+    /// This pins a DELIBERATE non-decision, and it is the #2122 lesson in test
+    /// form. Bounding an absolute instant means comparing it against the RELAY's
+    /// clock; a relay whose clock stepped backwards would then start refusing
+    /// legitimate timers — a fail-closed wedge — while buying nothing, since the
+    /// sender is the authorized host and may set any end time.
+    ///
+    /// MUTATION PROOF: add any `ends_at_ms` sanity check to the arm (e.g. reject
+    /// values more than a day ahead of `SystemTime::now()`) and the first assert
+    /// fails. It also fails if someone "helpfully" rejects `ends_at_ms == 0` on a
+    /// running timer.
+    #[test]
+    fn test_2136_classify_does_no_clock_arithmetic_on_ends_at_ms() {
+        assert_eq!(
+            classify_packet(&meeting_timer_wrapper_with(true, u64::MAX, 300_000, 1)),
+            PacketKind::MeetingTimer,
+            "a far-future ends_at_ms must be forwarded: validating it requires the RELAY's \
+             clock, and a backwards relay clock step would then wedge legitimate timers"
+        );
+        // An already-EXPIRED timer must still forward. Kept internally consistent
+        // (`ends_at_ms >= duration_ms`) so this pins the no-clock-arithmetic
+        // property and NOT the consistency check, which has its own test below.
+        assert_eq!(
+            classify_packet(&meeting_timer_wrapper_with(true, 300_000, 300_000, 1)),
+            PacketKind::MeetingTimer,
+            "a long-past ends_at_ms must be forwarded too — 'already expired' is a state \
+             the client renders, not one the relay adjudicates"
+        );
+    }
+
+    /// `ends_at_ms < duration_ms` is rejected: it underflows the
+    /// `started_at_ms = ends_at_ms - duration_ms` subtraction the wire contract
+    /// asks EVERY receiver to perform.
+    ///
+    /// This is NOT the clock check the sibling test forbids, and the distinction
+    /// is the whole point: it compares two fields of the SAME packet to each
+    /// other, reads no clock, and so cannot wedge if any clock steps. Without
+    /// it, one forged packet panics a debug wasm build on every receiver —
+    /// aborting the module and dropping the whole call for that tab.
+    ///
+    /// MUTATION PROOF: remove `&& timer.ends_at_ms >= timer.duration_ms` from
+    /// the arm and the first assert fails. Change `>=` to `>` and the
+    /// equal-values assert fails (a zero-length span is degenerate but
+    /// consistent, and a CANCEL sends 0/0).
+    #[test]
+    fn test_2136_classify_rejects_internally_inconsistent_timer() {
+        assert_eq!(
+            classify_packet(&meeting_timer_wrapper_with(true, 0, 300_000, 1)),
+            PacketKind::Dropped,
+            "ends_at_ms < duration_ms must be dropped: every receiver computes \
+             `ends_at_ms - duration_ms`, and this packet underflows it"
+        );
+        assert_eq!(
+            classify_packet(&meeting_timer_wrapper_with(true, 300_000, 300_001, 1)),
+            PacketKind::Dropped,
+            "the check must bite on an underflow of ONE, not just on an obvious zero"
+        );
+        assert_eq!(
+            classify_packet(&meeting_timer_wrapper_with(true, 300_000, 300_000, 1)),
+            PacketKind::MeetingTimer,
+            "equal values are consistent (a zero-length elapsed span) and must be accepted — \
+             the bound is inclusive"
+        );
+        assert_eq!(
+            classify_packet(&meeting_timer_wrapper_with(false, 0, 0, 0)),
+            PacketKind::MeetingTimer,
+            "a CANCEL sends 0/0 and must survive this check — rejecting it would leave a \
+             host able to start a timer it can never stop"
+        );
+    }
+
+    /// MEETING_TIMER and MEETING are adjacent in name and OPPOSITE in trust
+    /// model. This pins the contrast their doc comments claim.
+    ///
+    /// MUTATION PROOF: renumber MEETING_TIMER to 7, or move the MEETING_TIMER
+    /// arm above the MEETING drop and widen it, and the two asserts collide.
+    /// Deleting the MEETING drop makes the second assert fail — which is the
+    /// far more serious direction, since a client-forged MEETING packet
+    /// broadcasts fake host actions.
+    #[test]
+    fn test_2136_meeting_timer_is_forwarded_where_meeting_is_dropped() {
+        assert_eq!(
+            classify_packet(&meeting_timer_wrapper_with(
+                true,
+                1_700_000_300_000,
+                300_000,
+                1
+            )),
+            PacketKind::MeetingTimer,
+            "MEETING_TIMER (19) is CLIENT-authored and re-broadcast"
+        );
+
+        let client_meeting = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+        assert_eq!(
+            classify_packet(&client_meeting),
+            PacketKind::Dropped,
+            "MEETING (7) is SERVER-authored: a client-originated one is always forged and \
+             must stay dropped"
+        );
+    }
+
+    /// The per-sender budget both BINDS and REFILLS.
+    ///
+    /// The refill half matters more than it looks: the relay holds no timer
+    /// registry, so a limiter that could permanently wedge a host would leave a
+    /// room with a countdown nobody can cancel.
+    ///
+    /// MUTATION PROOF: change `MEETING_TIMER_MAX_PER_WINDOW` (either direction)
+    /// and the first loop or the "one past budget" assert fails. Make
+    /// `WindowCounter::try_consume` never reset the window and the refill assert
+    /// fails.
+    #[test]
+    fn test_2136_meeting_timer_rate_limiter_binds_and_refills() {
+        let mut limiter = MeetingTimerRateLimiter::new();
+        for i in 0..MEETING_TIMER_MAX_PER_WINDOW {
+            assert!(
+                limiter.allow(),
+                "packet {i} must be within the per-sender budget of \
+                 {MEETING_TIMER_MAX_PER_WINDOW}"
+            );
+        }
+        assert!(
+            !limiter.allow(),
+            "one packet past MEETING_TIMER_MAX_PER_WINDOW must be refused"
+        );
+
+        // Pretend a full window elapsed: the budget must come back, so a host
+        // cannot be locked out of controlling its own room's timer.
+        limiter.rewind_window_for_test(Duration::from_millis(MEETING_TIMER_WINDOW_MS + 1));
+        assert!(
+            limiter.allow(),
+            "the budget must REFILL once the window elapses — a limiter that could wedge \
+             would leave the room with a timer nobody can cancel"
+        );
+    }
+
+    /// The budget must comfortably admit the traffic shape the wire contract
+    /// asks the client for: a 3-packet transition burst plus a heartbeat inside
+    /// one window.
+    ///
+    /// This is the test that would catch someone "tidying" the budget down to
+    /// REACTION's value. It asserts against the CONSTANT, not a literal, so it
+    /// pins the relationship rather than a number.
+    ///
+    /// MUTATION PROOF: set `MEETING_TIMER_MAX_PER_WINDOW` to 3 (or to REACTION's
+    /// value) and this fails.
+    #[test]
+    fn test_2136_meeting_timer_budget_admits_a_transition_burst_plus_heartbeat() {
+        // Wire contract: 3 repeats per transition (rule 2) + 1 heartbeat (rule 1)
+        // can land in the same 2s window.
+        const WORST_CASE_WELL_BEHAVED_BURST: u32 = 4;
+        // A `const` block, so shrinking the budget is a COMPILE error rather than
+        // a test failure — this relationship is a wire-contract invariant, and
+        // catching it at build time is strictly stronger than catching it at
+        // test time.
+        const {
+            assert!(
+                MEETING_TIMER_MAX_PER_WINDOW > WORST_CASE_WELL_BEHAVED_BURST,
+                "MEETING_TIMER_MAX_PER_WINDOW must exceed the 4-packet worst case a \
+                 WELL-BEHAVED host produces (a 3-packet cancel repeat overlapping a \
+                 heartbeat) — a dropped CANCEL leaves the room counting down to a sound \
+                 the host already called off"
+            );
+        }
+
+        let mut limiter = MeetingTimerRateLimiter::new();
+        for i in 0..WORST_CASE_WELL_BEHAVED_BURST {
+            assert!(
+                limiter.allow(),
+                "packet {i} of a well-behaved host's worst-case burst must not be throttled"
+            );
+        }
     }
 }

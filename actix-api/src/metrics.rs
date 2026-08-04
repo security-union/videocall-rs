@@ -318,6 +318,36 @@ lazy_static! {
     )
     .expect("Failed to create health_reports_total metric");
 
+    /// Client-reported floating-point samples REJECTED for being non-finite
+    /// (NaN / +Inf / -Inf) before they could reach a gauge or histogram
+    /// (issue 2047).
+    ///
+    /// Deliberately UNLABELED: a client that emits non-finite telemetry is
+    /// misbehaving or malicious, and adding meeting/session/peer labels here
+    /// would hand it exactly the unbounded-cardinality lever the guard exists to
+    /// deny. This series therefore answers "is anyone sending garbage?" but NOT
+    /// "who" — identifying the reporter is a separate investigation, since
+    /// nothing on this path records it.
+    pub static ref NON_FINITE_SAMPLES_DROPPED_TOTAL: Counter = register_counter!(
+        "videocall_client_non_finite_samples_dropped_total",
+        "Client-reported NaN/Inf telemetry samples rejected before reaching a metric (issue 2047)"
+    )
+    .expect("Failed to create client_non_finite_samples_dropped_total metric");
+
+    /// `TierTransition` entries DISCARDED from a single health packet for
+    /// exceeding the per-packet ingest cap (issue 2047).
+    ///
+    /// Unlabeled for the same reason as
+    /// [`NON_FINITE_SAMPLES_DROPPED_TOTAL`]: the condition is only reachable by
+    /// a misbehaving or malicious client, and labeling it would reintroduce the
+    /// cardinality lever the cap exists to close. A conformant client emits
+    /// single digits per packet, so any non-zero value here is worth a look.
+    pub static ref TIER_TRANSITIONS_DROPPED_TOTAL: Counter = register_counter!(
+        "videocall_tier_transitions_dropped_total",
+        "TierTransition entries discarded for exceeding the per-packet ingest cap (issue 2047)"
+    )
+    .expect("Failed to create tier_transitions_dropped_total metric");
+
     /// Whether peer can receive audio (1 = yes, 0 = no)
     pub static ref PEER_CAN_LISTEN: GaugeVec = register_gauge_vec!(
         "videocall_peer_can_listen",
@@ -1017,6 +1047,92 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create encoder_output_fps metric");
+
+    /// SCREEN encoder output FPS (issue #2147).
+    ///
+    /// A SEPARATE metric name rather than a `media_kind` label on
+    /// `ENCODER_OUTPUT_FPS` above: that gauge has no `media_kind` today, so adding
+    /// one would silently double the series returned by every existing query —
+    /// including the live `meeting-investigation` Grafana panel, which no workflow
+    /// redeploys automatically. This is additive and changes no existing query.
+    /// (The asymmetry with `ENCODER_{ACTIVE,EFFECTIVE}_LAYERS`, which DO carry
+    /// `media_kind`, is the accepted cost; see issue #2147 for both options.)
+    ///
+    /// **A 0 here is meaningful, not "no data."** Unlike the camera gauge — whose
+    /// source-side `> 0` gate (#2079) makes a genuine stall absent and therefore
+    /// indistinguishable from never-started — the client emits this field whenever a
+    /// screen encoder is BOUND, including an honest 0.
+    ///
+    /// **A 0 does NOT mean "not sharing."** The dioxus-ui client binds its screen
+    /// encoder eagerly at Host mount, so it reports 0 while merely idle; the field
+    /// is omitted only by a client that binds no screen encoder at all. Interpret
+    /// with `videocall_screen_sharing_active`:
+    ///   * 0 + active=0 → idle, nothing to see.
+    ///   * 0 + active=1 → sharing; static-and-fine OR stalled. Receiver-side
+    ///     `content_staleness_ms` also reads 0 once fps is 0, so use
+    ///     `videocall_screen_encoder_stall_episodes_total` to identify publisher
+    ///     tick starvation.
+    ///   * >0 + active=1 → sharing and producing.
+    pub static ref SCREEN_ENCODER_OUTPUT_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_encoder_output_fps",
+        "Actual frames per second produced by the SCREEN encoder's base layer; 0 is a real reading (an idle or legitimately-static share produces none) -- join with videocall_screen_sharing_active to interpret it, and with videocall_screen_encoder_stall_episodes_total to detect a freeze (fps alone cannot)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create screen_encoder_output_fps metric");
+
+    /// Screen encoder TICK-STARVATION stall episodes (issue #2147; discussion
+    /// #1960 issue 2). **This is the gauge that can actually see a screen freeze.**
+    ///
+    /// `SCREEN_ENCODER_OUTPUT_FPS` above counts encoded CHUNKS, and the static/PLI
+    /// synthetic retained-frame re-encodes share the base-layer output callback with
+    /// fresh captures — so during the #1899/#2143 freeze it reads a small NONZERO
+    /// while every receiver is stuck on minutes-stale content. Each episode counted
+    /// here is one encode-loop tick resume whose gap exceeded the client's
+    /// `SCREEN_ENCODER_STALL_GAP_MS`, i.e. a main-thread freeze during which the
+    /// encoder could not sample fresh capture — exactly that symptom.
+    ///
+    /// READ AS A PAIR with the fps gauge:
+    ///   * fps > 0, episodes FLAT   → genuinely healthy.
+    ///   * fps > 0, episodes RISING → THE FREEZE (stale re-encoded content).
+    ///   * fps == 0 + sharing       → idle/static share, honest.
+    ///
+    /// A GaugeVec carrying the client's CUMULATIVE page-session count (same pattern
+    /// as `ENCODER_RESTART_TOTAL`), so chart with `rate()`/`increase()`.
+    ///
+    /// # Counter-reset semantics — read this before trusting an `increase()`
+    ///
+    /// A page reload does NOT produce a within-series drop: it resets the client
+    /// statics AND mints a new `session_id`, so it is series CHURN (old series ends,
+    /// new one begins at a low value). The case that DOES bite, and is easy to miss:
+    /// a mid-call **reconnect / re-election** mints a new `session_id` while the
+    /// client statics keep counting. The new series is therefore born at the
+    /// already-accumulated value (say 11) and `increase()` over a window spanning the
+    /// reconnect silently loses the pre-reconnect episodes — i.e. it can UNDERCOUNT
+    /// during exactly the incidents this metric exists to measure. When investigating
+    /// a specific freeze, prefer `max_over_time(...)` per `session_id` and sum across
+    /// the peer's sessions rather than a single `increase()`.
+    /// NAMING: `_total` matches every sibling of this shape
+    /// (`videocall_encoder_restart_total`, `videocall_rtt_probe_dropped_total`, …) —
+    /// a cumulative count carried in a GaugeVec. The `..._max_stall_gap_ms` companion
+    /// below deliberately has NO suffix: it is a high-water MARK, not a count.
+    pub static ref SCREEN_ENCODER_STALL_EPISODES: GaugeVec = register_gauge_vec!(
+        "videocall_screen_encoder_stall_episodes_total",
+        "Cumulative screen-encoder tick-starvation stall episodes reported by the client (main-thread freezes where the encoder could not sample fresh capture, so receivers saw fps>0 on stale re-encoded content). Chart with rate()/increase(); pair with videocall_screen_encoder_output_fps (#2147)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create screen_encoder_stall_episodes metric");
+
+    /// Worst single screen-encoder tick-starvation gap since page load, in ms
+    /// (issue #2147). The SEVERITY companion to `SCREEN_ENCODER_STALL_EPISODES`:
+    /// 3 episodes at a 200 ms max is scheduling jitter, 3 episodes at a 23000 ms max
+    /// is the #2143 incident. A high-water mark, so it only ever rises within a page
+    /// session.
+    pub static ref SCREEN_ENCODER_MAX_STALL_GAP_MS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_encoder_max_stall_gap_ms",
+        "Largest single screen-encoder tick-starvation gap observed since page load (ms) -- the severity companion to videocall_screen_encoder_stall_episodes_total (#2147)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create screen_encoder_max_stall_gap_ms metric");
 
     /// Per-receiver outbound channel depth keyed by session.
     pub static ref RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION: GaugeVec = register_gauge_vec!(

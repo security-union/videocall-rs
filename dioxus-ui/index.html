@@ -3,7 +3,19 @@
     <head>
         <meta charset="utf-8" />
         <title>videocall.rs</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <!-- interactive-widget=resizes-content (issue 2141): the default,
+             resizes-visual, leaves the LAYOUT viewport at full height when the
+             soft keyboard opens, so every `position: fixed` bottom-anchored
+             surface — the controls dock, the reactions palette and its emoji
+             search field — stays pinned behind the keyboard. resizes-content
+             shrinks the layout viewport instead, lifting those surfaces above
+             it. Safe for the existing layout: `body`/`#main-container` are sized
+             in `vh`, which is the LARGE viewport and is unaffected by this
+             directive; only bottom-anchored fixed elements move, which is the
+             intent. Honoured by Chromium 108+; WebKit ignores it as of iOS 18,
+             which is why the picker ALSO suppresses its autofocus on a
+             touch-primary device and caps the palette height in CSS. -->
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content">
         <link data-trunk rel="copy-dir" href="./assets" />
         <link data-trunk rel="rust" href="Cargo.toml"/>
         <link data-trunk rel="css" href="./static/leptos-style.css" />

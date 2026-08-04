@@ -21,7 +21,9 @@
 //! 3. Authenticated user who joined someone else's meeting → `is_owner = false`.
 //! 4. Mix of owned + non-owned joined meetings → ordering by most-recent-join desc.
 //! 5. `limit=2` with 5 joined meetings → returns the 2 most recent.
-//! 6. Unauthenticated request → 401 / `UNAUTHORIZED` envelope.
+//! 6. Unauthenticated request → 401 / `UNAUTHORIZED` envelope. Paired with an
+//!    authenticated-200 control, because the 401 alone cannot tell "the route
+//!    is protected" from "the route is gone" — see that test's doc comment.
 //! 7. User who only ever waited (never admitted) → does NOT appear.
 //! 8. Meeting joined then ended → still appears with `state = "ended"`.
 //! 9. Negative `limit` → 400 / `INVALID_INPUT` envelope.
@@ -30,6 +32,7 @@ mod test_helpers;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use meeting_api::db::meetings as db_meetings;
 use meeting_api::db::participants as db_participants;
 use serial_test::serial;
 use sqlx::PgPool;
@@ -378,26 +381,102 @@ async fn test_list_joined_respects_limit_returning_most_recent() {
 
 // ── Scenario 6: unauthenticated → 401 ────────────────────────────────────────
 
+/// Contract lock: `GET /api/v1/meetings/joined` must reject a request carrying
+/// no session cookie and no `Authorization` header with **401** and the
+/// canonical `UNAUTHORIZED` error envelope.
+///
+/// Every row this endpoint returns is selected by the caller's identity —
+/// `routes::meetings::list_joined_meetings` takes the `user_id` out of the
+/// `AuthUser` extractor in its signature and passes it straight to
+/// `db_meetings::list_joined_by_user`. Because `AuthUser` is an extractor, its
+/// rejection is produced before the handler body runs, so an unauthenticated
+/// request can never reach the query.
+///
+/// The second half is a control against a **vacuous** pass, and on this route
+/// it is load-bearing rather than belt-and-braces (issue #2114, backporting the
+/// pattern established for `/api/v1/meetings/feed` in issue #501 / PR #2111 —
+/// see `list_feed_tests::test_feed_unauthenticated_returns_401`).
+/// `/api/v1/meetings/{meeting_id}` is registered as a sibling GET route and is
+/// itself `AuthUser`-gated, so the literal `joined` segment is absorbed by it
+/// as a `{meeting_id}` the moment the static `/api/v1/meetings/joined`
+/// registration goes away. An unauthenticated caller would then still be
+/// answered with 401 — by `get_meeting`, not by this endpoint — and **all
+/// three** assertions in the first half would keep passing against a route that
+/// no longer exists. Both routes gate on the same `AuthUser` extractor, whose
+/// single terminal rejection is
+/// `AppError::new(StatusCode::UNAUTHORIZED, APIError::unauthorized())`
+/// (`auth.rs`), so the status, `success = false`, and the `UNAUTHORIZED` code
+/// are byte-for-byte identical no matter which of the two answered.
+/// Requiring 200 for the SAME uri with a valid session cookie is what
+/// distinguishes the two: the deleted-route case answers the authenticated call
+/// with 404, because no meeting has the room_id `joined`.
+///
+/// That last clause is a real dependency on the shared DB fixture, so it is
+/// asserted below rather than assumed — a future test that created a meeting
+/// named `joined` would make `get_meeting` answer 200 and silently disarm the
+/// control.
 #[tokio::test]
 #[serial]
 async fn test_list_joined_unauthenticated_returns_401() {
     let pool = get_test_pool().await;
-    let app = build_app(pool.clone());
+    const URI: &str = "/api/v1/meetings/joined";
 
+    // ── No credentials: no `Cookie: session=…`, no `Authorization: Bearer …`.
+    let app = build_app(pool.clone());
     let req = Request::builder()
         .method("GET")
-        .uri("/api/v1/meetings/joined")
+        .uri(URI)
         .body(Body::empty())
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "unauthenticated GET {URI} must be 401 — the per-user joined list must \
+         never be served without an authenticated principal"
+    );
 
     let body: APIResponse<APIError> = response_json(resp).await;
-    assert!(!body.success);
+    assert!(!body.success, "a 401 must carry success = false");
     assert_eq!(
         body.result.code, "UNAUTHORIZED",
         "error envelope must use the canonical UNAUTHORIZED code"
+    );
+
+    // ── Precondition for the control below: it can only detect a deleted route
+    // while `get_meeting` answers `joined` with 404, i.e. while no meeting owns
+    // that room_id. Checked through the very query `get_meeting` runs, so it
+    // tracks the real behaviour — including the `deleted_at IS NULL` filter,
+    // which is why a soft-deleted row would (correctly) not trip this.
+    assert!(
+        db_meetings::get_by_room_id(&pool, "joined")
+            .await
+            .expect("lookup of a meeting with room_id `joined` must succeed")
+            .is_none(),
+        "fixture invariant broken: a meeting with room_id `joined` exists, so \
+         `GET /api/v1/meetings/{{meeting_id}}` would answer the control below \
+         with 200 even if the static `/api/v1/meetings/joined` route were \
+         deleted — disarming the only assertion in this test able to detect \
+         that. Delete that meeting, or give it a room_id that is not also a \
+         static route segment."
+    );
+
+    // ── Control: the SAME uri, authenticated, must still be the joined route.
+    // This caller creates no rows, so the test leaves no state behind for the
+    // other tests sharing this DB fixture.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("GET", URI, "joined-unauth-control@example.com")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "control: authenticated GET {URI} must be 200. A 404 here means the \
+         joined route is gone and `joined` was absorbed by the \
+         `/api/v1/meetings/{{meeting_id}}` route, which would make the 401 \
+         asserted above a vacuous pass"
     );
 }
 

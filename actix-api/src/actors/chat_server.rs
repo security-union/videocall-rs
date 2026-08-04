@@ -23,6 +23,7 @@ use crate::{
         LAYER_PREFERENCE_MAX_LAYER_ID, LAYER_PREFERENCE_MIN_UPDATE_INTERVAL,
         LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL,
         LAYER_PREFERENCE_SESSIONS_SWEEP_ROOMS_PER_MESSAGE, PARTICIPANT_REBROADCAST_COALESCE_MS,
+        PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS, PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS,
         RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL,
     },
     messages::{
@@ -52,6 +53,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::actors::packet_handler::stamp_wrapper_for_broadcast;
 use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
     RELAY_CONGESTION_FILTERED_TOTAL, RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL,
@@ -435,6 +437,85 @@ fn apply_member_host_flag(members: &mut [RoomMemberInfo], user_id: &str, is_host
     updated
 }
 
+/// Whether `session` is the room's current HOST, given the room's member slice
+/// (issue #2136). This is the relay's authority check for host-only packet
+/// classes — today, MEETING_TIMER.
+///
+/// # Why this slice and not the session's JWT claim
+///
+/// `SessionLogic::is_host` is the room JWT's `is_host` claim, captured once when
+/// the connection was established and never refreshed. After a transfer-host it
+/// is wrong in BOTH directions: the demoted ex-host keeps `true` until it
+/// reconnects, and the promoted new host keeps `false` — and the UI deliberately
+/// does NOT reconnect on promotion (it re-fetches `/status`, re-signs the room
+/// token and re-renders in place), so gating on the claim would leave the real
+/// host's every packet silently dropped while the ex-host kept its authority.
+///
+/// `RoomMemberInfo::is_host` is the flag `internal.meeting_host_changed` keeps in
+/// step with the authoritative `meeting_participants.is_host` column
+/// ([`apply_member_host_flag`]), and which the reconnect path reconciles against
+/// a stale re-presented JWT (`reconnect_is_host`). It is correct in both
+/// directions, which is why the gate lives in this actor.
+///
+/// # Fail-closed by construction
+///
+/// Every term must hold, and the absence of any row means NOT host:
+///
+/// * `m.session == session` — resolves the SENDER's own row. The caller passes
+///   the `ClientMessage`'s `session`, which `SessionLogic` populates from its own
+///   authenticated session id and never from the packet, so a client cannot
+///   present another participant's session and borrow their authority.
+/// * `m.origin == MemberOrigin::Local` — the relay runs as two binaries (ws +
+///   wt) sharing one NATS bus, and a `Remote` row is an INERT roster mirror of a
+///   session owned by the OTHER binary, seeded with a hard-coded `is_host:
+///   false` (see [`MemberOrigin`]). Requiring `Local` states the #1202 inertness
+///   invariant explicitly instead of leaning on that hard-coded `false`. A host
+///   connected to the other binary is authorized by THAT binary, where its row
+///   is `Local`.
+/// * `m.is_host` — the live flag itself.
+///
+/// A session with no row at all (not yet joined, already torn down) is not the
+/// host, which is the safe answer.
+/// # Why `overrides` exists, and why it takes precedence
+///
+/// `RoomMemberInfo::is_host` is *usually* fresh, but it has one re-seeding path
+/// that reintroduces the untrusted JWT claim: `JoinRoom` seeds the row with
+/// `reconnect_is_host.unwrap_or(is_host)`, and `reconnect_is_host` is `Some`
+/// ONLY when a client-supplied `instance_id` matches a live `pending_departures`
+/// entry in THIS process. A demoted ex-host that reconnects with a fresh or
+/// absent `instance_id`, after the grace window, or onto the other relay binary,
+/// therefore gets its row re-seeded `is_host = true` straight from the frozen
+/// room token — and would regain the authority the fanout had just removed, for
+/// as long as that token is valid.
+///
+/// That was tolerable while the flag only fed the host-leave heuristic; it is
+/// not tolerable now that it authorizes a packet class. `overrides` is written
+/// ONLY by [`Handler<UpdateMemberHostFlag>`] — i.e. only by the authoritative
+/// `internal.meeting_host_changed` fanout, which no client can publish to — so
+/// once a transfer has been observed for a user, no amount of reconnecting with
+/// a stale token can talk this gate out of it.
+///
+/// Deliberately scoped to THIS gate rather than applied to the `JoinRoom` seed
+/// itself: rewriting that seed would also change `was_last_present_host`, and
+/// therefore the host-leave → MEETING_ENDED decision, which is a much larger
+/// blast radius than this feature should carry. The seed keeps its existing
+/// behaviour; only the authorization answer consults the override.
+fn session_is_room_host(
+    members: &[RoomMemberInfo],
+    session: SessionId,
+    overrides: Option<&HashMap<String, bool>>,
+) -> bool {
+    members
+        .iter()
+        .find(|m| m.session == session && m.origin == MemberOrigin::Local)
+        .is_some_and(|m| {
+            overrides
+                .and_then(|o| o.get(&m.user_id))
+                .copied()
+                .unwrap_or(m.is_host)
+        })
+}
+
 /// Whether a departing session was the LAST present host, given the room's
 /// members AFTER the departing session was removed. A host may hold several
 /// sessions; "ends when the host leaves" must fire only when none remain.
@@ -816,17 +897,203 @@ struct MirrorRemoteMembership {
 #[rtype(result = "()")]
 struct FlushRebroadcasts;
 
+/// Maximum byte length accepted for a joiner's `instance_id`.
+///
+/// This is the bound `JoinRoom` applies to the raw client-supplied
+/// `?instance_id=` query parameter, named here so the re-checks applied to a
+/// value arriving over NATS from another relay provably match it rather than
+/// drifting from a second magic number.
+const REQUESTER_INSTANCE_ID_MAX_BYTES: usize = 64;
+
+/// Identity a `PARTICIPANT_LIST_REQUEST` is deduped by when the flush counts
+/// "distinct requesters" (#1600 item 2).
+///
+/// Keying on the raw `session_id` over-counts: during RTT election one client
+/// briefly holds two candidate sessions (WS + WT) with distinct `session_id`s
+/// but the SAME per-tab `instance_id`, and both publish a request. Counting them
+/// as two tripped the wave threshold and broadcast a single join.
+///
+/// `Instance` is therefore preferred; `Session` is the fallback for a joiner
+/// that supplied no `instance_id` — and for a request from a relay predating the
+/// wire field — which reproduces the pre-#1600 behaviour exactly.
+///
+/// ## Trust: this is a CLIENT-SUPPLIED HINT, not an identity
+///
+/// `instance_id` originates as a client-supplied query parameter (`?instance_id=`
+/// on the WebSocket / WebTransport connect) and is only ever length-checked. It
+/// is never compared against the authenticated JWT `sub`, and never overwritten
+/// from server-side session state the way `stamp_reaction_for_broadcast`
+/// overwrites `session_id`. Two requests sharing an `Instance` key therefore mean
+/// "these requests CLAIM to come from one client", not "they provably do".
+///
+/// That is deliberately sufficient here, because the only decision keyed on it is
+/// unicast-vs-broadcast, and every way the claim can be false fails SAFE toward
+/// broadcast — which reaches strictly more sessions, never fewer:
+/// * Colliding on another requester's key merely appends the liar to that key's
+///   [`RebroadcastPending::targets`]; the honest requester keeps its own target
+///   slot and is still answered.
+/// * Saturating those targets sets `saw_other_requester`, so the flush broadcasts
+///   to `room.{room}.system` and reaches every session in the room.
+///
+/// Nothing keyed on this value gates delivery, authorises an action, or is echoed
+/// to another participant, so a forged value cannot suppress a peer's presence
+/// answer. Do NOT extend this key to a decision lacking that fail-safe property
+/// without first binding the value to authenticated identity.
+// NOT `Clone`, deliberately: the instance String must be MOVED into
+// `RebroadcastPending`, never duplicated on the per-request path. Dropping the
+// derive makes a reintroduced `.clone()` a compile error rather than silent waste.
+#[derive(Debug, PartialEq, Eq)]
+enum RequesterKey {
+    /// The joiner's claimed per-tab `instance_id`.
+    Instance(String),
+    /// No usable instance — fall back to the raw session.
+    Session(SessionId),
+}
+
+impl RequesterKey {
+    /// Resolve the dedupe identity for one request.
+    ///
+    /// `instance` arrives over NATS from ANOTHER relay, so it is re-checked here
+    /// against [`REQUESTER_INSTANCE_ID_MAX_BYTES`] rather than trusted — it
+    /// becomes a map key. Ingress applies the same bound in
+    /// [`requester_instance_of`]; this second check keeps the map-key guard true
+    /// however a [`RebroadcastPresence`] was constructed.
+    fn resolve(requester_session: SessionId, instance: Option<&str>) -> Self {
+        match instance {
+            Some(iid) if !iid.is_empty() && iid.len() <= REQUESTER_INSTANCE_ID_MAX_BYTES => {
+                Self::Instance(iid.to_owned())
+            }
+            _ => Self::Session(requester_session),
+        }
+    }
+}
+
+/// Lift the dedupe instance hint off an inbound `PARTICIPANT_LIST_REQUEST`.
+///
+/// This is the ONLY path carrying `requester_instance_id` from the wire into
+/// [`RebroadcastPresence`], so it is a named function rather than an inline
+/// expression at the call site: the mapping is then directly testable, and
+/// reverting it (returning `None`) is caught by
+/// `test_1600_requester_instance_is_lifted_off_the_wire` and
+/// `test_1600_wire_instance_survives_the_intercept` rather than silently
+/// reinstating the O(N²) relay→client fan-out #1600 exists to remove.
+///
+/// The value is MOVED out of `packet`, never cloned. `packet` is an owned
+/// `MeetingPacket` parsed for this one message and dropped immediately after, so
+/// the allocation the parser already made is reused. This runs for every local
+/// session × every request in a join wave, and runs even when the actor goes on to
+/// drop the message as a local requester, so the clone it replaces was pure waste.
+///
+/// Sanitised HERE, at ingress, rather than only later at
+/// [`RequesterKey::resolve`]: that bounds what gets logged and what sits in the
+/// actor mailbox, not merely what becomes a map key. Empty — the proto3 default
+/// sent by a joiner with no `instance_id`, and by any relay predating the field —
+/// and over-long values both yield `None`, which makes the responder fall back to
+/// keying on `requester_session`: the pre-#1600 behaviour.
+fn requester_instance_of(packet: &mut MeetingPacket) -> Option<String> {
+    let instance = std::mem::take(&mut packet.requester_instance_id);
+    let usable = !instance.is_empty() && instance.len() <= REQUESTER_INSTANCE_ID_MAX_BYTES;
+    usable.then_some(instance)
+}
+
 /// Per-responder coalescing state. Tracks just enough to answer "did this
 /// responder see one distinct requester or ≥2 during the window?" — the threshold
-/// that selects unicast (single join) vs broadcast (wave) at flush, without
-/// storing the full requester set.
+/// that selects unicast (single join) vs broadcast (wave) at flush — plus the
+/// requester SESSIONS a unicast has to reach.
 struct RebroadcastPending {
-    /// The first requester that armed this responder; the unicast target when it
-    /// stays the only distinct requester.
-    first_requester: SessionId,
-    /// Set once a requester different from `first_requester` arrives — a wave,
-    /// which flips the flush to a broadcast.
+    /// Dedupe identity of the first requester that armed this responder.
+    first_requester: RequesterKey,
+    /// The distinct requester sessions sharing [`Self::first_requester`], and the
+    /// unicast targets while it stays the only distinct requester. Usually one; a
+    /// client mid-election contributes one per candidate connection, and EVERY one
+    /// must be answered because the relay cannot know which candidate will win the
+    /// election and the client drops inbound packets from the losers once it has.
+    ///
+    /// A fixed inline array rather than a `Vec`: the fan is hard-capped at
+    /// [`PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS`] in [`Self::record`], so the
+    /// whole set is 4 × u64 = 32 bytes stored INLINE in this struct, costing zero
+    /// heap allocations per armed responder instead of one. Only the first
+    /// [`Self::targets_len`] entries are live — read them through
+    /// [`Self::targets`], never the field directly.
+    targets: [SessionId; PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS],
+    /// Live prefix length of [`Self::targets`]. `u8` because the cap is 4.
+    targets_len: u8,
+    /// Set once a requester with a DIFFERENT [`RequesterKey`] arrives — a wave,
+    /// which flips the flush to a broadcast — or once the unicast fan would
+    /// exceed [`PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS`], where one
+    /// broadcast is cheaper than the fan.
     saw_other_requester: bool,
+}
+
+impl RebroadcastPending {
+    /// First request for this responder in the window.
+    fn new(first_requester: RequesterKey, requester_session: SessionId) -> Self {
+        let mut targets = [0; PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS];
+        targets[0] = requester_session;
+        Self {
+            first_requester,
+            targets,
+            targets_len: 1,
+            saw_other_requester: false,
+        }
+    }
+
+    /// The live requester sessions recorded so far.
+    fn targets(&self) -> &[SessionId] {
+        &self.targets[..self.targets_len as usize]
+    }
+
+    /// Fold one more request for the same responder into this window.
+    fn record(&mut self, key: RequesterKey, requester_session: SessionId) {
+        if key != self.first_requester {
+            // A second distinct requester identity (or instance-less session): a
+            // real wave.
+            self.saw_other_requester = true;
+            return;
+        }
+        if self.saw_other_requester || self.targets().contains(&requester_session) {
+            return;
+        }
+        if self.targets_len as usize >= PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS {
+            // Fall back to one broadcast rather than growing the fan. Broadcast
+            // reaches a SUPERSET of the recorded targets, so the session that
+            // would not have fitted is still answered — the property that keeps a
+            // forged `instance_id` from dropping anyone (see [`RequesterKey`]).
+            self.saw_other_requester = true;
+            return;
+        }
+        self.targets[self.targets_len as usize] = requester_session;
+        self.targets_len += 1;
+    }
+
+    /// Flush addressing: `None` broadcasts to `room.{room}.system`; `Some(t)`
+    /// unicasts one re-announce per session in `t`.
+    fn unicast_targets(&self) -> Option<&[SessionId]> {
+        if self.saw_other_requester {
+            None
+        } else {
+            Some(self.targets())
+        }
+    }
+}
+
+/// How long a responder must still wait before it may re-announce again, or
+/// `None` when it is already eligible (#1600 item 1).
+///
+/// Pure, so the cross-window rate limit is testable without a broker: `last` is
+/// the responder's previous re-announce instant (`None` = never), `now` the flush
+/// instant, `min_interval` [`PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS`].
+fn rebroadcast_cooldown_remaining(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    min_interval: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let elapsed = now.saturating_duration_since(last?);
+    if elapsed >= min_interval {
+        None
+    } else {
+        Some(min_interval - elapsed)
+    }
 }
 
 /// Bounded DEMAND-side simulcast gauge sweep command (#1170 item 2, #1284).
@@ -1120,6 +1387,20 @@ pub struct ChatServer {
     /// reconnect. Read by [`ChatServer::leave_rooms`] when deciding whether
     /// to broadcast `MEETING_ENDED`. See [`RoomPolicy`].
     room_policy: HashMap<String, RoomPolicy>,
+    /// Authoritative per-`(room, user_id)` host flags observed on the
+    /// `internal.meeting_host_changed` fanout (issue #2136).
+    ///
+    /// Written ONLY by [`Handler<UpdateMemberHostFlag>`], and read ONLY by
+    /// [`session_is_room_host`] — where it takes precedence over
+    /// `RoomMemberInfo::is_host`, because that field can be re-seeded from the
+    /// frozen room-token claim on a reconnect that misses the grace window. See
+    /// [`session_is_room_host`] for the full argument.
+    ///
+    /// Absent entry = "no transfer observed for this user", which correctly
+    /// falls back to the JoinRoom-seeded flag. Evicted with the rest of a room's
+    /// caches in [`ChatServer::forget_room_if_empty`], so it is bounded by live
+    /// rooms exactly as `room_policy` is.
+    room_host_overrides: HashMap<String, HashMap<String, bool>>,
     /// Pending departures keyed by `(room_id, instance_key)`.
     ///
     /// `instance_key` is the client's `instance_id` when one was provided at
@@ -1257,6 +1538,10 @@ pub struct ChatServer {
     /// self-clears (the flush re-resolves and skips it), like
     /// [`pending_recompute_rooms`] tolerates a drained room.
     ///
+    /// An entry may also OUTLIVE one flush: a responder still inside its
+    /// [`PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS`] cooldown is re-inserted rather
+    /// than published, and the flush re-arms for the remainder (#1600 item 1).
+    ///
     /// [`rebroadcast_coalesce_handle`]: ChatServer::rebroadcast_coalesce_handle
     pending_rebroadcasts: HashMap<SessionId, RebroadcastPending>,
     /// Single in-flight coalescing timer handle for [`pending_rebroadcasts`].
@@ -1265,6 +1550,29 @@ pub struct ChatServer {
     /// debounce trailing — it dedups the whole wave rather than firing per
     /// request. Cancelled in [`Actor::stopping`] so no `SpawnHandle` leaks.
     rebroadcast_coalesce_handle: Option<SpawnHandle>,
+    /// When each responder last actually published a presence re-announce — the
+    /// cross-window rate limit of #1600 item 1. A responder whose entry is newer
+    /// than [`PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS`] is DEFERRED at flush (kept
+    /// in [`pending_rebroadcasts`], never dropped), so a peer looping
+    /// `PARTICIPANT_LIST_REQUEST`s at the coalescing cadence cannot drive a chosen
+    /// responder above one re-announce per interval.
+    ///
+    /// What actually bounds this map is the UNCONDITIONAL `retain` at the top of
+    /// every [`FlushRebroadcasts`]: it drops every entry whose interval has
+    /// elapsed, whether or not that session still exists. Both explicit teardown
+    /// paths — [`ChatServer::leave_rooms`] and [`ChatServer::forget_session`] —
+    /// additionally remove the departing session immediately, which keeps the map
+    /// tight between flushes but is not what makes it safe.
+    ///
+    /// That distinction matters because a session can also exit through a THIRD
+    /// path that runs neither: the #1311 grace period. A non-observer `Disconnect`
+    /// parks the session in `pending_departures` without calling `leave_rooms`
+    /// (only the observer branch leaves immediately), and if the same tab
+    /// reconnects inside the grace window, `JoinRoom` cancels the departure timer,
+    /// so `leave_rooms` never runs for the OLD session id. Any stamp that session
+    /// left behind is therefore released by the `retain`, one interval later, and
+    /// not before — correct, just not immediate.
+    last_rebroadcast_at: HashMap<SessionId, std::time::Instant>,
     /// Cross-instance membership mirror master switch (issue #1202). Read ONCE
     /// from the `MEMBERSHIP_MIRROR_ENABLED` env var at actor construction and
     /// never mutated at runtime (except via the `#[cfg(test)]`
@@ -1292,6 +1600,7 @@ impl ChatServer {
             layer_preference_sweep_queued: HashSet::new(),
             layer_preference_sweep_remaining: 0,
             room_policy: HashMap::new(),
+            room_host_overrides: HashMap::new(),
             pending_departures: HashMap::new(),
             suppress_join_broadcast: std::collections::HashSet::new(),
             instance_index: HashMap::new(),
@@ -1306,6 +1615,7 @@ impl ChatServer {
             layer_hint_recheck_handles: HashMap::new(),
             pending_rebroadcasts: HashMap::new(),
             rebroadcast_coalesce_handle: None,
+            last_rebroadcast_at: HashMap::new(),
             // #1202: OFF unless explicitly enabled (`1`/`true`, case-insensitive).
             // Read once here; the flag gates both the Stage-A mirror tap/handler
             // and the Stage-B union inclusion. Default OFF = today's behavior.
@@ -1338,6 +1648,11 @@ impl ChatServer {
         // Drop the per-session layer-preference map (#989, Phase 1b). Same
         // teardown invariant as the viewport set above.
         let _ = self.session_layer_prefs.remove(session_id);
+
+        // Drop this session's presence re-announce cooldown stamp (#1600 item 1).
+        // Same teardown invariant again: the map is otherwise only pruned at
+        // flush time, so a departing session must release its entry here.
+        let _ = self.last_rebroadcast_at.remove(session_id);
 
         // Clean up instance_index via reverse map: O(1) instead of O(n) retain.
         // If the entry was already replaced by a newer session (eviction), the
@@ -1818,6 +2133,10 @@ impl ChatServer {
         if self.room_members.contains_key(room) && self.local_is_empty(room) {
             self.room_members.remove(room);
             self.room_policy.remove(room);
+            // #2136: the host-override map is per-room and must be evicted on
+            // exactly the same edge as `room_policy`, or it leaks one entry per
+            // transfer-host for the process lifetime.
+            self.room_host_overrides.remove(room);
             // Bound room-labeled relay series to LIVE rooms (issue #996):
             // remove every `{room=...}` CounterVec/GaugeVec series for this
             // drained room (was previously just the #988 viewport gauge).
@@ -1886,6 +2205,9 @@ impl ChatServer {
         // the `leave_rooms` cleanup; both teardown paths must release it.
         let _ = self.session_layer_prefs.remove(&session_id);
         let _ = self.session_room.remove(&session_id);
+        // Presence re-announce cooldown stamp (#1600 item 1) — mirrors the
+        // `leave_rooms` cleanup; both teardown paths must release it.
+        let _ = self.last_rebroadcast_at.remove(&session_id);
 
         // Publish-side suppression teardown + restore (#1108, Stage 3) — the
         // eviction analog of the `leave_rooms` trigger. An evicted session may
@@ -2547,6 +2869,7 @@ impl Actor for ChatServer {
             ctx.cancel_future(handle);
         }
         self.pending_rebroadcasts.clear();
+        self.last_rebroadcast_at.clear();
         actix::Running::Stop
     }
 }
@@ -2990,19 +3313,32 @@ impl Handler<RebroadcastPresence> for ChatServer {
 
         // Record this responder once and track distinct requesters: the flush
         // unicasts for a single join and broadcasts only once a second distinct
-        // requester proves a wave. Identity is re-resolved at flush, so don't
-        // snapshot room/name here.
-        self.pending_rebroadcasts
-            .entry(msg.session)
-            .and_modify(|p| {
-                if msg.requester_session != p.first_requester {
-                    p.saw_other_requester = true;
-                }
-            })
-            .or_insert(RebroadcastPending {
-                first_requester: msg.requester_session,
-                saw_other_requester: false,
-            });
+        // requester proves a wave. Requesters are counted by [`RequesterKey`], so
+        // one human's WS + WT election candidates count once (#1600 item 2).
+        // Identity is re-resolved at flush, so don't snapshot room/name here.
+        //
+        // Arming is NOT gated on the re-announce cooldown: dropping a request
+        // here would lose a joiner's presence answer outright. The cooldown is
+        // applied at flush, which DEFERS instead (#1600 item 1).
+        let requester_key =
+            RequesterKey::resolve(msg.requester_session, msg.requester_instance.as_deref());
+        // Matched rather than `and_modify(..).or_insert_with(..)`: those two
+        // closures would each need to own `requester_key`, forcing a clone of the
+        // instance String on every request. Exactly one arm runs, so the key can
+        // simply be moved into it.
+        match self.pending_rebroadcasts.entry(msg.session) {
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                existing
+                    .get_mut()
+                    .record(requester_key, msg.requester_session);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(RebroadcastPending::new(
+                    requester_key,
+                    msg.requester_session,
+                ));
+            }
+        }
         if self.rebroadcast_coalesce_handle.is_none() {
             let handle = ctx.notify_later(
                 FlushRebroadcasts,
@@ -3025,6 +3361,15 @@ impl Handler<RebroadcastPresence> for ChatServer {
 /// Identity is re-resolved here (not snapshotted at arm time), so a peer that
 /// left, was evicted, or dropped out of `Active` during the window self-clears —
 /// like [`FlushPendingRecomputes`] tolerates a room that drained to empty.
+///
+/// A responder that re-announced less than
+/// [`PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS`] ago is DEFERRED, not dropped
+/// (#1600 item 1): its pending entry is put back and the flush re-arms itself for
+/// the soonest remaining cooldown, so the answer still goes out — at most one per
+/// responder per interval — and a looping requester cannot drive a peer above
+/// that rate. Because the cooldown is stamped only on an actual publish and the
+/// re-arm is scheduled for exactly the moment the soonest responder becomes
+/// eligible, a deferred responder cannot be starved by ongoing contention.
 impl Handler<FlushRebroadcasts> for ChatServer {
     type Result = ();
 
@@ -3032,9 +3377,43 @@ impl Handler<FlushRebroadcasts> for ChatServer {
         // Clear the in-flight handle first so a re-arm during the drain schedules
         // a fresh timer rather than no-op against the handle we're consuming.
         self.rebroadcast_coalesce_handle = None;
+        let now = std::time::Instant::now();
+        let min_interval =
+            std::time::Duration::from_millis(PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS);
+        // Release cooldown stamps that no longer restrain anyone. Uses the same
+        // predicate the deferral below does, so there is exactly one definition
+        // of "still cooling down", and it bounds the map to responders that
+        // re-announced within the last interval.
+        self.last_rebroadcast_at.retain(|_, last| {
+            rebroadcast_cooldown_remaining(Some(*last), now, min_interval).is_some()
+        });
+
         let responders: Vec<(SessionId, RebroadcastPending)> =
             self.pending_rebroadcasts.drain().collect();
+        // Shortest wait among the responders deferred by the cooldown; the flush
+        // re-arms for it so each becomes eligible exactly when its interval ends.
+        let mut soonest_eligible: Option<std::time::Duration> = None;
         for (session, pending) in responders {
+            if let Some(remaining) = rebroadcast_cooldown_remaining(
+                self.last_rebroadcast_at.get(&session).copied(),
+                now,
+                min_interval,
+            ) {
+                debug!(
+                    "FlushRebroadcasts: deferring re-announce for session {} \
+                     ({} ms of cooldown left)",
+                    session,
+                    remaining.as_millis()
+                );
+                soonest_eligible =
+                    Some(soonest_eligible.map_or(remaining, |soonest| soonest.min(remaining)));
+                // Put the request back rather than dropping it: this responder
+                // still owes its requesters an answer. `pending_rebroadcasts` was
+                // drained above and the actor processes one message at a time, so
+                // nothing can have re-entered this key meanwhile.
+                self.pending_rebroadcasts.insert(session, pending);
+                continue;
+            }
             let resolved = self
                 .session_room
                 .get(&session)
@@ -3057,22 +3436,28 @@ impl Handler<FlushRebroadcasts> for ChatServer {
                 .unwrap_or(false);
 
             // Threshold hybrid: broadcast only for a genuine wave (≥2 distinct
-            // requesters); otherwise unicast to the lone requester.
-            let target = if pending.saw_other_requester {
-                None
-            } else {
-                Some(pending.first_requester)
+            // requesters); otherwise unicast. A single requester IDENTITY may
+            // still own several candidate sessions mid-election, and each needs
+            // its own copy — see `RebroadcastPending::targets`.
+            let targets: Vec<Option<SessionId>> = match pending.unicast_targets() {
+                None => vec![None],
+                Some(sessions) => sessions.iter().copied().map(Some).collect(),
             };
 
-            if let Some((subject, bytes)) = SessionManager::rebroadcast_publication(
-                &room_id,
-                &user_id,
-                &display_name,
-                session,
-                is_guest,
-                responder_is_active,
-                target,
-            ) {
+            let mut published = false;
+            for target in targets {
+                let Some((subject, bytes)) = SessionManager::rebroadcast_publication(
+                    &room_id,
+                    &user_id,
+                    &display_name,
+                    session,
+                    is_guest,
+                    responder_is_active,
+                    target,
+                ) else {
+                    continue;
+                };
+                published = true;
                 #[cfg(test)]
                 {
                     REBROADCAST_PUBLISH_INVOCATIONS
@@ -3097,13 +3482,30 @@ impl Handler<FlushRebroadcasts> for ChatServer {
                 };
                 ctx.spawn(actix::fut::wrap_future::<_, Self>(fut));
             }
+
+            // Stamp the cooldown only when something actually went out — a
+            // responder suppressed by `rebroadcast_publication` (no longer
+            // `Active`) must not start a cooldown it never earned.
+            if published {
+                self.last_rebroadcast_at.insert(session, now);
+            }
+        }
+
+        // Re-arm for the deferred responders. Any request arriving before that
+        // deadline piggybacks on this timer instead of arming its own, so it can
+        // wait up to the cooldown rather than the 300 ms window — bounded, and it
+        // only coalesces harder.
+        if let Some(delay) = soonest_eligible {
+            self.rebroadcast_coalesce_handle = Some(ctx.notify_later(FlushRebroadcasts, delay));
         }
     }
 }
 
 /// Counts all `FlushRebroadcasts`-driven re-announce publishes (unicast +
 /// broadcast) so the tests can assert "M requests for a peer → one publish" by
-/// counting real handler invocations. `cfg(test)` only, zero production cost.
+/// counting real handler invocations. Note a broadcast is one publish while a
+/// unicast is one publish PER target session, so a client mid-election with two
+/// candidate sessions contributes two. `cfg(test)` only, zero production cost.
 #[cfg(test)]
 pub(crate) static REBROADCAST_PUBLISH_INVOCATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -3177,12 +3579,92 @@ impl Handler<TestForgetMember> for ChatServer {
     }
 }
 
-/// Test-only: report the coalescing state (`pending_rebroadcasts.len()`,
-/// `rebroadcast_coalesce_handle.is_some()`) so a test can assert dedup and that
-/// the flush drained everything, without reaching into private fields.
+/// Test-only: force a session's [`ConnectionState`] while leaving its
+/// `room_members` row and `session_room` entry intact.
+///
+/// This reaches the one state `TestForgetMember` cannot produce: a responder the
+/// flush still RESOLVES (so it runs past the identity lookup and attempts a
+/// publish) but which is no longer `Active`, so `rebroadcast_publication`
+/// suppresses the publish. That is the only way to exercise the flush's
+/// `if published` guard on the cooldown stamp.
 #[cfg(test)]
 #[derive(ActixMessage)]
-#[rtype(result = "(usize, bool)")]
+#[rtype(result = "()")]
+struct TestSetConnectionState {
+    session: SessionId,
+    state: ConnectionState,
+}
+
+#[cfg(test)]
+impl Handler<TestSetConnectionState> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: TestSetConnectionState, _ctx: &mut Self::Context) -> Self::Result {
+        self.connection_states.insert(msg.session, msg.state);
+    }
+}
+
+/// Test-only: run the REAL [`ChatServer::forget_session`] teardown so a test can
+/// assert what that production path releases, instead of a hand-rolled mock that
+/// would keep passing after the production cleanup is deleted.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct TestForgetSession {
+    session: SessionId,
+    room: String,
+    user_id: String,
+}
+
+#[cfg(test)]
+impl Handler<TestForgetSession> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: TestForgetSession, ctx: &mut Self::Context) -> Self::Result {
+        self.forget_session(msg.session, &msg.room, &msg.user_id, ctx);
+    }
+}
+
+/// Test-only: run the REAL [`ChatServer::leave_rooms`] teardown — the OTHER
+/// production path a session exits through — so a test can assert it releases
+/// the same per-session state `forget_session` does.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct TestLeaveRooms {
+    session: SessionId,
+    room: String,
+    user_id: String,
+}
+
+#[cfg(test)]
+impl Handler<TestLeaveRooms> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: TestLeaveRooms, ctx: &mut Self::Context) -> Self::Result {
+        self.leave_rooms(
+            LeaveContext {
+                session_id: &msg.session,
+                room: Some(&msg.room),
+                user_id: Some(&msg.user_id),
+                display_name: Some(&msg.user_id),
+                observer: false,
+                is_host: false,
+                end_on_host_leave: false,
+            },
+            ctx,
+        );
+    }
+}
+
+/// Test-only: report the coalescing state (`pending_rebroadcasts.len()`,
+/// `rebroadcast_coalesce_handle.is_some()`, `last_rebroadcast_at.len()`) so a
+/// test can assert dedup, that the flush drained everything, and that the #1600
+/// cooldown map neither leaks nor outlives its sessions — without reaching into
+/// private fields.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "(usize, bool, usize)")]
 struct TestRebroadcastState;
 
 #[cfg(test)]
@@ -3193,6 +3675,7 @@ impl Handler<TestRebroadcastState> for ChatServer {
         MessageResult((
             self.pending_rebroadcasts.len(),
             self.rebroadcast_coalesce_handle.is_some(),
+            self.last_rebroadcast_at.len(),
         ))
     }
 }
@@ -3383,8 +3866,15 @@ impl Handler<MirrorRemoteMembership> for ChatServer {
                         session: msg.session,
                         user_id: msg.user_id,
                         display_name: msg.display_name,
-                        // is_host cannot come off the wire; safe because the only
-                        // is_host reader (`was_last_present_host`) is local-only.
+                        // is_host cannot come off the wire. Safe because EVERY
+                        // is_host reader is local-only: `was_last_present_host`
+                        // (host-leave) and, since #2136, `session_is_room_host`
+                        // (the host-only packet gate), which requires
+                        // `origin == Local` explicitly rather than leaning on
+                        // this hard-coded `false`. A host connected to the OTHER
+                        // relay binary is authorized by THAT binary, where its
+                        // row is Local. Any future is_host reader must keep that
+                        // property or this `false` becomes a silent wrong answer.
                         is_host: false,
                         end_on_host_leave: false,
                         origin: MemberOrigin::Remote,
@@ -3706,6 +4196,22 @@ impl Handler<UpdateMemberHostFlag> for ChatServer {
         if let Some(members) = self.room_members.get_mut(&room_id) {
             apply_member_host_flag(members, &user_id, is_host);
         }
+
+        // #2136: also record the delta out-of-band, keyed by user rather than by
+        // session. `apply_member_host_flag` above can only reach sessions that
+        // are present RIGHT NOW; a session that joins (or rejoins) later is
+        // seeded from its room token, which is frozen at mint time and still
+        // claims the pre-transfer role. `session_is_room_host` prefers this map
+        // so a demoted ex-host cannot recover authority by reconnecting, and a
+        // promoted host does not lose it by reconnecting onto a binary that
+        // never saw its prior session.
+        //
+        // Recorded unconditionally, including for a user with no session here:
+        // the whole point is to be correct for a session that does not exist yet.
+        self.room_host_overrides
+            .entry(room_id)
+            .or_default()
+            .insert(user_id, is_host);
     }
 }
 
@@ -3907,7 +4413,8 @@ impl Handler<ClientMessage> for ChatServer {
             session,
             room,
             msg,
-            user: _,
+            user,
+            requires_host,
         } = msg;
         trace!("got message in server room {room} session {session}");
 
@@ -3926,25 +4433,94 @@ impl Handler<ClientMessage> for ChatServer {
             return; // Don't publish during Testing state
         }
 
+        // SECURITY (#2136): host-only packet classes are authorized HERE.
+        //
+        // `requires_host` is set exclusively by
+        // `SessionLogic::create_host_gated_client_message`, reached only from the
+        // `InboundAction::ForwardHostOnly` branch, which `handle_inbound` returns
+        // only for `PacketKind::MeetingTimer`. It is `false` for every other
+        // packet class, so this costs one already-loaded bool test on the relay's
+        // hottest handler and the O(members) scan runs only for the rare
+        // host-gated packet.
+        //
+        // This is THE enforcement point, not a second opinion. The UI hides the
+        // timer control from non-hosts, but a modified client is the threat and a
+        // client-side check enforces nothing — an unauthorized MEETING_TIMER
+        // would otherwise let ANY participant hijack the room's timer and, when
+        // it hit zero, trigger an expiry SOUND on every participant's device.
+        //
+        // Why here and not beside the observer guard in `SessionLogic`, where
+        // the rest of the inbound authorization lives: that actor's `is_host` is
+        // a JWT-claim snapshot that goes stale in both directions across a
+        // transfer-host. This actor holds the live presence mirror. See
+        // `session_is_room_host` for the full argument and the fail-closed terms.
+        //
+        // Fail-closed: a room with no member slice at all yields `false`.
+        if requires_host
+            && !self.room_members.get(&room).is_some_and(|members| {
+                session_is_room_host(members, session, self.room_host_overrides.get(&room))
+            })
+        {
+            // `debug!`, not `warn!`: the reachable cases are a forged client and
+            // a host that was demoted between sending and this handler running,
+            // and logging every drop at warn would hand a flood a
+            // log-amplification lever — the same reasoning as the REACTION
+            // rate-limiter. The drop is the enforcement.
+            debug!(
+                "Dropping host-only packet from non-host session {session} (user {user}) in \
+                 room {room}"
+            );
+            return;
+        }
+
+        // SECURITY (#2095): every packet that reaches any peer passes through
+        // HERE — both transports funnel their `InboundAction::Forward` through
+        // `SessionLogic::create_client_message` into this one handler — so this
+        // is the single place the relay can make envelope attribution
+        // trustworthy. `stamp_wrapper_for_broadcast` overwrites the outer
+        // `session_id` and `user_id` with THIS connection's authenticated
+        // identity, unconditionally. Before #2095 `session_id` was only filled
+        // when the client sent 0 and `user_id` was never touched, so a forged
+        // non-zero `session_id` reached peers intact and mis-attributed the
+        // sender's HEALTH device info onto the victim's tile (the peer UI keys
+        // `set_peer_device_info` off this field, and the peer-facing HEALTH copy
+        // has had its inner identity scalars trimmed away, so it is the ONLY
+        // attribution available).
+        //
+        // The identity arguments are the `ClientMessage`'s OWN `session` /
+        // `user`, which `SessionLogic::create_client_message` populates from
+        // `&self` session state — never from the packet. Do NOT re-derive either
+        // one from `msg.data` here: that is the single edit that would
+        // reintroduce the vulnerability with every stamping test still green.
+        //
+        // `msg.data` must not be published directly any more. The stamp fails
+        // CLOSED: `None` means the bytes did not parse as a `PacketWrapper` (or
+        // would not re-serialize), and such a frame must be DROPPED, not
+        // published. Forwarding it crashed every receiving tab — the client's
+        // `From<Binary> for PacketWrapper` does `parse_from_bytes(..).unwrap()`
+        // and a wasm panic aborts the module — so one 4-byte frame from any
+        // authenticated participant took down the whole call. Do NOT "recover"
+        // here by publishing `msg.data`, and do not let the stamp return an
+        // empty Vec instead: empty bytes parse as a DEFAULT wrapper and would
+        // still be fanned out. See `stamp_wrapper_for_broadcast`'s doc comment.
+        let Some(packet_bytes) = stamp_wrapper_for_broadcast(&msg.data, session, &user) else {
+            // `debug!`, not `warn!`: no well-behaved client can reach this arm
+            // (everything it sends on this path is a serialized `PacketWrapper`),
+            // so a hit means a malformed or hostile sender — and logging every
+            // drop at warn would hand a flood a log-amplification lever, exactly
+            // as the REACTION rate-limiter reasons. The drop is the enforcement.
+            debug!(
+                "Dropping unparseable packet from session {session} (user {user}) in room {room}: \
+                 forwarding it would crash every receiving client"
+            );
+            return;
+        };
+
+        // Built AFTER the stamp so the drop path allocates nothing (this is the
+        // relay's hottest handler, and the drop path is the attacker-reachable one).
         let nc = self.nats_connection.clone();
         let subject = format!("room.{room}.{session}");
         let subject = subject.replace(' ', "_");
-
-        let packet_bytes =
-            if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
-                if packet_wrapper.session_id == 0 {
-                    packet_wrapper.session_id = session;
-                }
-                match packet_wrapper.write_to_bytes() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        error!("Failed to serialize PacketWrapper with session_id: {}", e);
-                        msg.data.to_vec()
-                    }
-                }
-            } else {
-                msg.data.to_vec()
-            };
 
         let b = bytes::Bytes::from(packet_bytes);
         let fut = async move {
@@ -3990,6 +4566,21 @@ impl Handler<JoinRoom> for ChatServer {
             return MessageResult(Err("Cannot use reserved system user ID".into()));
         }
 
+        // #2095 review: an EMPTY authenticated identity is rejected for the same
+        // reason the reserved one is. Since #2095 the relay stamps this exact
+        // value onto every fanned-out `PacketWrapper.user_id`, so an empty id is
+        // published room-wide as the sender's identity — and the receiving client
+        // uses `(session_id, user_id)` to mint the peer entry and its label.
+        // Empty is not reachable through any legitimate path: a guest `sub` is
+        // `guest:{uuid4}`, and the deprecated path-based endpoint cannot produce
+        // an empty segment (the route would not match). The only way in is an
+        // IdP that mints a token with an empty `sub`, which `decode_room_token`
+        // does not regex-validate the way it validates `room`. Refuse the join
+        // rather than admit a session with no identity to stamp.
+        if user_id.is_empty() {
+            return MessageResult(Err("Cannot join with an empty user ID".into()));
+        }
+
         // Persist the server-authoritative guest flag so downstream
         // handlers (ActivateConnection, Disconnect, leave_rooms, and the
         // "existing members" broadcast in this handler) can retrieve it
@@ -4001,7 +4592,12 @@ impl Handler<JoinRoom> for ChatServer {
         }
 
         // Sanitize instance_id: reject oversized values to prevent memory abuse.
-        let instance_id = instance_id.filter(|iid| !iid.is_empty() && iid.len() <= 64);
+        // This is the ONLY processing applied to the client-supplied
+        // `?instance_id=` — it is a length bound, not an authenticity check — so
+        // everything downstream must treat the value as a hint (see
+        // [`RequesterKey`]).
+        let instance_id = instance_id
+            .filter(|iid| !iid.is_empty() && iid.len() <= REQUESTER_INSTANCE_ID_MAX_BYTES);
 
         // Record session→iid now; the forward index and eviction are deferred to
         // ActivateConnection. During RTT election both WS and WT candidates share
@@ -4114,6 +4710,11 @@ impl Handler<JoinRoom> for ChatServer {
             .clone()
             .unwrap_or_else(|| display_name.clone());
         let session_id = session;
+        // Stamped onto this session's PARTICIPANT_LIST_REQUEST so responding
+        // relays can tell this joiner's election candidates apart from a genuine
+        // second joiner (#1600 item 2). Already sanitised above; empty when the
+        // client supplied none.
+        let instance_id_for_request = instance_id.clone().unwrap_or_default();
         let nc = self.nats_connection.clone();
 
         let session_str = session.to_string();
@@ -4412,6 +5013,7 @@ impl Handler<JoinRoom> for ChatServer {
                             observer,
                             &room_clone,
                             session_clone,
+                            &instance_id_for_request,
                         )
                     {
                         if let Err(e) = nc2.publish(subject_req, request_bytes.into()).await {
@@ -4634,9 +5236,12 @@ async fn send_meeting_info(
 ///   publishes to `room.{room}.{session}`), so it cannot be forged by a peer.
 /// * Any VIEWPORT arriving on a DIFFERENT subject is dropped WITHOUT mutating
 ///   state. This closes the cross-session tampering vector where an attacker
-///   crafts `PacketWrapper{ session_id: victim, .. }`: the payload
-///   `session_id` is attacker-controllable (it is only stamped when the client
-///   sends 0) and is therefore NEVER consulted for ownership here.
+///   crafts `PacketWrapper{ session_id: victim, .. }`. Since #2095 the payload
+///   `session_id` is in fact relay-stamped on the broadcast path
+///   (`stamp_wrapper_for_broadcast`) and so is no longer attacker-controllable,
+///   but it is still NEVER consulted for ownership here: subject-derived
+///   ownership needs no cross-module guarantee to hold, which is the property
+///   that makes this check worth keeping.
 ///
 /// The receiver's own session_id is filtered out of the recorded set (a
 /// session does not render itself), so a lone `[self]` viewport collapses to
@@ -5016,10 +5621,14 @@ fn try_intercept_layer_preference(
 /// the unicast subject does NOT widen the attack surface. That arm must NEVER be
 /// removed; its behavior is pinned by the #1704 regression test (added by PR #1707).
 /// The `user_id == SYSTEM_USER_ID` check below is REDUNDANT confirmation, NOT an
-/// independent lock — given that ingress already drops all client-authored MEETING
-/// packets, and because an authenticated client CAN forge `user_id == SYSTEM_USER_ID`
-/// on its own subject (the relay forwards the outer `PacketWrapper.user_id` verbatim;
-/// only `session_id` is stamped, chat_server.rs:3806-3820).
+/// independent lock: ingress already drops every client-authored MEETING packet,
+/// so nothing a client sends can reach this function regardless of what user_id it
+/// claims. (Since #2095 a client could not forge that user_id anyway —
+/// `stamp_wrapper_for_broadcast` overwrites the outer `PacketWrapper.user_id` with
+/// the sender's authenticated id on the broadcast path, and `Handler<JoinRoom>`
+/// rejects a session whose authenticated id IS `SYSTEM_USER_ID` — but that is a
+/// second lock, not this one.) Do not restructure this gate on the assumption that
+/// the SYSTEM_USER_ID check is what makes the widened subject safe.
 ///
 /// A self-origin event (`session_id == own_session`) is ignored — a pod hears its
 /// own broadcasts on `.system` and must not mirror its own sessions as remote.
@@ -5062,11 +5671,14 @@ fn observe_participant_presence(
     //
     // The `user_id == SYSTEM_USER_ID` gate below is REDUNDANT confirmation, NOT an
     // independent lock: ingress already drops all client-authored MEETING packets,
-    // and an authenticated client CAN forge `user_id == SYSTEM_USER_ID` on its own
-    // `room.{room}.{self}` subject — the relay forwards the outer
-    // `PacketWrapper.user_id` verbatim (only `session_id` is stamped,
-    // chat_server.rs:3806-3820). So do not lean on the SYSTEM_USER_ID gate for
-    // authenticity; the MEETING -> Dropped ingress arm is the lock.
+    // so nothing a client sends can arrive here on ANY subject, whatever user_id it
+    // claims. Since #2095 the forgery is separately impossible — the broadcast path
+    // rewrites the outer `PacketWrapper.user_id` to the sender's authenticated id
+    // (`stamp_wrapper_for_broadcast`, called from `Handler<ClientMessage>`), and
+    // `Handler<JoinRoom>` refuses a session whose authenticated id IS
+    // `SYSTEM_USER_ID` — but that is a SECOND lock. Do not lean on the
+    // SYSTEM_USER_ID gate for authenticity; the MEETING -> Dropped ingress arm is
+    // the lock.
     if !(msg.subject.ends_with(".system") || msg.subject.as_str() == self_subject) {
         return;
     }
@@ -5163,7 +5775,10 @@ fn try_intercept_participant_list_request(
         return false;
     }
 
-    let inner = match MeetingPacket::parse_from_bytes(&wrapper.data) {
+    // Owned (not a borrow of `wrapper`) so `requester_instance_of` can MOVE the
+    // instance hint out instead of cloning it — this runs per local session per
+    // request, i.e. S² times across a join wave.
+    let mut inner = match MeetingPacket::parse_from_bytes(&wrapper.data) {
         Ok(p) => p,
         Err(_) => return false,
     };
@@ -5177,14 +5792,22 @@ fn try_intercept_participant_list_request(
         return true;
     }
 
+    // Sanitise BEFORE logging and before the value enters the actor mailbox, so an
+    // unbounded wire string never reaches either. `None` means the joiner had no
+    // instance_id, sent an over-long one, or the request came from a relay
+    // predating the field — in every case the actor falls back to keying the
+    // distinct-requester count on `requester_session`.
+    let requester_instance = requester_instance_of(&mut inner);
+
     debug!(
-        "PARTICIPANT_LIST_REQUEST received (requester session={}), re-broadcasting own presence \
-         for session {}",
-        inner.session_id, own_session
+        "PARTICIPANT_LIST_REQUEST received (requester session={}, instance={:?}), \
+         re-broadcasting own presence for session {}",
+        inner.session_id, requester_instance, own_session
     );
     server.do_send(RebroadcastPresence {
         session: own_session,
         requester_session: inner.session_id,
+        requester_instance,
     });
     true
 }
@@ -5872,11 +6495,15 @@ fn handle_msg(
         // packet.
         //
         // SOURCE IDENTITY MUST come from the NATS subject, NEVER from the
-        // payload `pw.session_id`. The wrapper `session_id` is
-        // attacker-controllable (ingress only stamps it when the client sends 0;
-        // see the self-echo note above), so a modified client could forge it to
-        // a receiver-VISIBLE peer's id and smuggle off-screen VIDEO past these
-        // filters. The subject — `room.{room}.{publisher_session}` — is set by
+        // payload `pw.session_id`. Historically the wrapper `session_id` was
+        // attacker-controllable (ingress stamped it only when the client sent
+        // 0), so a modified client could forge it to a receiver-VISIBLE peer's
+        // id and smuggle off-screen VIDEO past these filters. #2095 stamps that
+        // field unconditionally on the broadcast path
+        // (`stamp_wrapper_for_broadcast`), so the forgery is closed at the
+        // source — but this rule STANDS unchanged: the subject is authoritative
+        // by construction and does not depend on another module upholding a
+        // stamping invariant. The subject — `room.{room}.{publisher_session}` — is set by
         // the relay from the authenticated connection and cannot be forged by a
         // peer, exactly as relied on for `subject_self` and VIEWPORT ownership.
         // Room IDs match `^[a-zA-Z0-9_-]*$` (no dots) and the session is a
@@ -6638,6 +7265,82 @@ mod tests {
     }
 
     // ==========================================================================
+    // TEST (#2095 review): JoinRoom rejects an EMPTY user_id synchronously
+    // ==========================================================================
+    /// Sibling of the SYSTEM_USER_ID rejection above, and for the same reason.
+    ///
+    /// Since #2095 the relay STAMPS the session's authenticated `user_id` onto
+    /// every fanned-out `PacketWrapper`, so admitting a session with an empty one
+    /// publishes "no identity" room-wide as that sender's identity, and the
+    /// receiving client mints its peer entry and label from it. Reject at the
+    /// door instead.
+    ///
+    /// Empty is not reachable through any legitimate path today (guest `sub` is
+    /// `guest:{uuid4}`; the deprecated path endpoint cannot match an empty
+    /// segment), so this is a fail-closed backstop against an IdP minting a token
+    /// with an empty `sub` — `decode_room_token` regex-validates `room` but
+    /// deliberately does NOT validate `sub`.
+    ///
+    /// MUTATION PROOF: delete the `if user_id.is_empty()` arm in
+    /// `Handler<JoinRoom>` and the join succeeds -> `result.is_err()` fails.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_rejects_empty_user_id_synchronously() {
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 1_002_096u64;
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: "test-room-2095-empty-user".to_string(),
+                user_id: String::new(),
+                display_name: "Anonymous".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result.is_err(),
+            "JoinRoom with an empty user_id must return Err, not Ok"
+        );
+        let error_msg = result.unwrap_err();
+        assert!(
+            error_msg.contains("empty user ID"),
+            "Error should mention the empty user ID, got: {error_msg}"
+        );
+    }
+
+    // ==========================================================================
     // TEST: JoinRoom succeeds with valid user_id
     // ==========================================================================
     #[actix_rt::test]
@@ -6943,15 +7646,22 @@ mod tests {
             }
         });
 
-        // Send message while in Testing state - should NOT publish
+        // Send message while in Testing state - should NOT publish.
+        //
+        // The payload MUST be a well-formed `PacketWrapper`. Since the #2095
+        // review the handler drops anything that does not parse, so a garbage
+        // payload here would make this test pass even if the ConnectionState gate
+        // were deleted — it would be pinning the parse gate, not the state gate.
         chat_server
             .send(ClientMessage {
                 session: session_id,
                 room: room.clone(),
                 msg: Packet {
-                    data: Arc::new(b"test data".to_vec()),
+                    data: Arc::new(well_formed_wrapper_bytes()),
+                    requires_host: false,
                 },
                 user: "test@example.com".to_string(),
+                requires_host: false,
             })
             .await
             .expect("Message delivery should succeed");
@@ -7030,15 +7740,21 @@ mod tests {
             }
         });
 
-        // Send message while in Active state - should publish
+        // Send message while in Active state - should publish. Must be a
+        // well-formed `PacketWrapper`: since the #2095 review the handler drops
+        // unparseable payloads outright, so garbage would never be published and
+        // this test would fail for a reason that has nothing to do with
+        // ConnectionState.
         chat_server
             .send(ClientMessage {
                 session: session_id,
                 room: room.clone(),
                 msg: Packet {
-                    data: Arc::new(b"test data".to_vec()),
+                    data: Arc::new(well_formed_wrapper_bytes()),
+                    requires_host: false,
                 },
                 user: "test@example.com".to_string(),
+                requires_host: false,
             })
             .await
             .expect("Message delivery should succeed");
@@ -7049,6 +7765,265 @@ mod tests {
         assert!(
             published.load(Ordering::Relaxed),
             "Message should be published while in Active state"
+        );
+    }
+
+    // ==========================================================================
+    // TEST (#2095, security): the CALL SITE, not just the stamping function
+    // ==========================================================================
+    /// A forged envelope identity must not survive `Handler<ClientMessage>`.
+    ///
+    /// The eight `stamp_wrapper_*` unit tests in `packet_handler` guard the
+    /// stamping FUNCTION; they stay green if this handler stops calling it or
+    /// feeds it the packet's own values. This test closes that gap by driving a
+    /// real `ClientMessage` — the exact message BOTH transports construct via
+    /// `SessionLogic::create_client_message` — through the real actor and reading
+    /// the bytes back off NATS, which is what every peer actually receives.
+    ///
+    /// The identity the handler must apply is the `ClientMessage`'s own
+    /// `session` / `user` (session-derived by construction), while the packet
+    /// INSIDE it claims a different session and user.
+    ///
+    /// MUTATION PROOF: point the handler back at `msg.data.to_vec()`, or restore
+    /// the pre-#2095 fill-if-zero stamp, and the forged 999_001 / "victim@..."
+    /// arrive on the subject -> both asserts fail.
+    ///
+    /// Skips (does not fail) when no broker is reachable — the environment-gated
+    /// half of the #2095 coverage; the unconditional half is the pure-function
+    /// suite in `packet_handler`.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_client_message_stamps_forged_envelope_identity() {
+        use crate::messages::server::Packet;
+        use futures::StreamExt;
+        use protobuf::Message as _;
+        use std::sync::Arc;
+        use tokio::time::Duration;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 1_002_095u64;
+        let room = "test-room-2095-stamp".to_string();
+        const AUTH_USER: &str = "attacker@example.com";
+        const FORGED_SESSION: u64 = 999_001;
+        const FORGED_USER: &str = "victim@example.com";
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let subject = format!("room.{room}.{session_id}").replace(' ', "_");
+        let mut sub = nats_client
+            .subscribe(subject.clone())
+            .await
+            .expect("Failed to subscribe");
+
+        // A HEALTH packet claiming ANOTHER participant's identity: this is the
+        // shape that mis-attributes peer device info, because the peer-facing
+        // copy has had its inner identity scalars trimmed away and the UI keys
+        // `set_peer_device_info` off the envelope alone.
+        let forged = PacketWrapper {
+            packet_type: PacketType::HEALTH.into(),
+            session_id: FORGED_SESSION,
+            user_id: FORGED_USER.as_bytes().to_vec(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .expect("forged wrapper must encode");
+
+        chat_server
+            .send(ClientMessage {
+                session: session_id,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(forged),
+                    requires_host: false,
+                },
+                user: AUTH_USER.to_string(),
+                requires_host: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        let received = tokio::time::timeout(Duration::from_secs(2), sub.next())
+            .await
+            .expect("the stamped packet must be published within the timeout")
+            .expect("subscription must yield the published packet");
+        let out = PacketWrapper::parse_from_bytes(&received.payload)
+            .expect("the relay must publish a well-formed PacketWrapper");
+
+        assert_eq!(
+            out.session_id, session_id,
+            "the relay must publish the AUTHENTICATED session id, not the forged one"
+        );
+        assert_eq!(
+            out.user_id,
+            AUTH_USER.as_bytes(),
+            "the relay must publish the AUTHENTICATED user id, not the forged one"
+        );
+    }
+
+    // ==========================================================================
+    // TEST (#2095 review, HIGH): the CALL SITE must SKIP the publish on a drop
+    // ==========================================================================
+    /// An unparseable packet must never reach NATS, and therefore never reach a
+    /// peer.
+    ///
+    /// `stamp_wrapper_drops_unparseable_bytes_instead_of_forwarding_them` in
+    /// `packet_handler` pins that the stamp returns `None`; it stays green if this
+    /// handler ignores the `None` and publishes `msg.data` anyway. This test
+    /// closes that gap by driving a real `ClientMessage` through the real actor
+    /// and asserting SILENCE on the subject every peer subscribes to.
+    ///
+    /// Why it matters: the receiving client's `From<Binary> for PacketWrapper`
+    /// (`videocall-types/src/lib.rs` ~132-136) is a `parse_from_bytes(..).unwrap()`,
+    /// and a wasm panic aborts the module — so a forwarded unparseable frame
+    /// crashed every other participant's tab. WebSocket has been the default
+    /// transport since #2045.
+    ///
+    /// The test then publishes a WELL-FORMED packet on the same subscription and
+    /// requires it to arrive. Without that second half the silence would be
+    /// indistinguishable from a broken subscription, and the test would pass on a
+    /// harness that can never receive anything.
+    ///
+    /// MUTATION PROOF: replace the `else { return; }` arm in
+    /// `Handler<ClientMessage>` with a fallback publish of `msg.data`, or make
+    /// `stamp_wrapper_for_broadcast` return `Some(data.to_vec())` on parse
+    /// failure, and the garbage frame arrives -> the `is_err()` (timeout) assert
+    /// fails.
+    ///
+    /// Skips (does not fail) when no broker is reachable; the unconditional half
+    /// is the pure-function test in `packet_handler`.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_client_message_drops_unparseable_packet_instead_of_publishing() {
+        use crate::messages::server::Packet;
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use tokio::time::Duration;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 1_002_097u64;
+        let room = "test-room-2095-drop".to_string();
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let subject = format!("room.{room}.{session_id}").replace(' ', "_");
+        let mut sub = nats_client
+            .subscribe(subject.clone())
+            .await
+            .expect("Failed to subscribe");
+        nats_client.flush().await.expect("flush should succeed");
+
+        // The 4-byte crash frame from the security report. It costs the attacker
+        // nothing and there is no rate limit on this path.
+        let garbage = vec![0xFF_u8, 0xFF, 0xFF, 0xFF];
+        assert!(
+            PacketWrapper::parse_from_bytes(&garbage).is_err(),
+            "precondition: these bytes must not parse as a PacketWrapper"
+        );
+
+        chat_server
+            .send(ClientMessage {
+                session: session_id,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(garbage),
+                    requires_host: false,
+                },
+                user: "attacker@example.com".to_string(),
+                requires_host: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), sub.next())
+                .await
+                .is_err(),
+            "an unparseable packet must be DROPPED at the relay, never published: \
+             forwarding it aborts the wasm module in every receiving tab"
+        );
+
+        // Liveness control: the SAME subscription must still deliver a
+        // well-formed packet, so the silence above is the drop and not a dead
+        // harness.
+        chat_server
+            .send(ClientMessage {
+                session: session_id,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(well_formed_wrapper_bytes()),
+                    requires_host: false,
+                },
+                user: "attacker@example.com".to_string(),
+                requires_host: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        let received = tokio::time::timeout(Duration::from_secs(2), sub.next())
+            .await
+            .expect("control: a well-formed packet must still be published")
+            .expect("control: subscription must yield the published packet");
+        let out = PacketWrapper::parse_from_bytes(&received.payload)
+            .expect("the relay must publish a well-formed PacketWrapper");
+        assert_eq!(
+            out.session_id, session_id,
+            "control: the well-formed packet must arrive stamped"
         );
     }
 
@@ -17220,6 +18195,43 @@ mod tests {
         }
     }
 
+    /// Minimal well-formed `PacketWrapper` bytes for `Handler<ClientMessage>`
+    /// tests that are about something OTHER than packet validity.
+    ///
+    /// Since the #2095 review that handler DROPS anything which does not parse as
+    /// a `PacketWrapper`, so a `b"test data"`-style payload silently turns a test
+    /// of (say) the ConnectionState gate into a test of the parse gate. Use this.
+    fn well_formed_wrapper_bytes() -> Vec<u8> {
+        use protobuf::Message as _;
+        PacketWrapper {
+            packet_type: PacketType::HEALTH.into(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .expect("a default PacketWrapper must encode")
+    }
+
+    /// A `ChatServer` whose NATS client never needs a live broker.
+    ///
+    /// `retry_on_initial_connect` makes `async_nats::connect` hand back a client
+    /// immediately and keep reconnecting in the background, so the actor and all
+    /// its handlers run normally while `publish` calls go nowhere. That is enough
+    /// for the coalescing tests, which count real `FlushRebroadcasts` publish
+    /// DECISIONS (via `REBROADCAST_*_INVOCATIONS`, incremented in the handler
+    /// before the publish future is spawned) rather than delivered NATS messages
+    /// — and it lets them run in an environment with no broker, unlike the
+    /// `connect_nats_or_skip` tests which silently skip there.
+    async fn offline_nats_chat_server() -> Addr<ChatServer> {
+        // Port 1 (tcpmux) is reserved and never has a NATS server behind it, so
+        // this can never accidentally latch onto a real broker.
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect("nats://127.0.0.1:1")
+            .await
+            .expect("retry_on_initial_connect must yield a client without a broker");
+        ChatServer::new(client).await.start()
+    }
+
     /// #1203: N DEPARTURE-driven coalesced recomputes for the SAME room within
     /// the window collapse into exactly ONE timer and ONE recompute; two
     /// distinct rooms produce exactly TWO recomputes. After the window the
@@ -17415,10 +18427,12 @@ mod tests {
             chat.send(RebroadcastPresence {
                 session: 8001,
                 requester_session: requester,
+                // Distinct humans: each joiner has its own instance.
+                requester_instance: Some(format!("tab-{requester}")),
             })
             .await
             .expect("message delivery should succeed");
-            let (pending_len, armed) = chat
+            let (pending_len, armed, _) = chat
                 .send(TestRebroadcastState)
                 .await
                 .expect("state probe should succeed");
@@ -17437,10 +18451,11 @@ mod tests {
         chat.send(RebroadcastPresence {
             session: 8002,
             requester_session: 9006,
+            requester_instance: Some("tab-9006".to_string()),
         })
         .await
         .expect("message delivery should succeed");
-        let (pending_len, armed) = chat
+        let (pending_len, armed, _) = chat
             .send(TestRebroadcastState)
             .await
             .expect("state probe should succeed");
@@ -17479,7 +18494,7 @@ mod tests {
         );
 
         // The flush drained the set and cleared the timer handle.
-        let (pending_after, armed_after) = chat
+        let (pending_after, armed_after, _) = chat
             .send(TestRebroadcastState)
             .await
             .expect("state probe should succeed");
@@ -17526,6 +18541,7 @@ mod tests {
             chat.send(RebroadcastPresence {
                 session: 8301,
                 requester_session: 9301,
+                requester_instance: Some("tab-9301".to_string()),
             })
             .await
             .expect("message delivery should succeed");
@@ -17584,11 +18600,12 @@ mod tests {
         chat.send(RebroadcastPresence {
             session: 8101,
             requester_session: 9101, // local (tracked in connection_states)
+            requester_instance: Some("tab-9101".to_string()),
         })
         .await
         .expect("message delivery should succeed");
 
-        let (pending, armed) = chat
+        let (pending, armed, _) = chat
             .send(TestRebroadcastState)
             .await
             .expect("state probe should succeed");
@@ -17631,6 +18648,7 @@ mod tests {
         chat.send(RebroadcastPresence {
             session: 8201,
             requester_session: 9201,
+            requester_instance: Some("tab-9201".to_string()),
         })
         .await
         .expect("message delivery should succeed");
@@ -17650,12 +18668,712 @@ mod tests {
             0,
             "a responder that left during the window must NOT be broadcast"
         );
-        let (pending_after, armed_after) = chat
+        let (pending_after, armed_after, _) = chat
             .send(TestRebroadcastState)
             .await
             .expect("state probe should succeed");
         assert_eq!(pending_after, 0, "flush must still drain the pending set");
         assert!(!armed_after, "flush must clear the in-flight timer");
+    }
+
+    // --- #1600: cross-window rate limit + instance-level requester dedupe ---
+    //
+    // These run WITHOUT a broker (`offline_nats_chat_server`), so unlike the
+    // `connect_nats_or_skip` tests above they execute everywhere.
+
+    /// The dedupe identity prefers the joiner's `instance_id` and falls back to
+    /// the raw session only when there is no usable one — the whole basis of
+    /// #1600 item 2.
+    ///
+    /// MUTATION PROOF: make `RequesterKey::resolve` ignore `instance` (always
+    /// `Session`) → the first assert fails, because two candidate sessions of one
+    /// tab stop comparing equal.
+    #[test]
+    fn test_1600_requester_key_prefers_instance_over_session() {
+        // One human's WS + WT election candidates: different sessions, same tab.
+        assert_eq!(
+            RequesterKey::resolve(100, Some("tab-a")),
+            RequesterKey::resolve(101, Some("tab-a")),
+            "two candidate sessions of one tab must resolve to ONE requester identity"
+        );
+        // Two humans.
+        assert_ne!(
+            RequesterKey::resolve(100, Some("tab-a")),
+            RequesterKey::resolve(101, Some("tab-b"))
+        );
+        // No instance → session keying (the pre-#1600 behaviour).
+        assert_eq!(
+            RequesterKey::resolve(100, None),
+            RequesterKey::resolve(100, Some("")),
+            "an empty instance must be treated as absent, not as a shared key"
+        );
+        assert_ne!(
+            RequesterKey::resolve(100, None),
+            RequesterKey::resolve(101, None)
+        );
+        // Over-long values arrive from another relay and must not become map
+        // keys — same 64-byte bound `JoinRoom` applies to the client value.
+        let oversized = "x".repeat(65);
+        assert_eq!(
+            RequesterKey::resolve(100, Some(&oversized)),
+            RequesterKey::resolve(100, None),
+            "an oversized instance must fall back to session keying"
+        );
+        assert_eq!(
+            RequesterKey::resolve(100, Some(&"x".repeat(64))),
+            RequesterKey::Instance("x".repeat(64)),
+            "exactly 64 bytes is still accepted"
+        );
+    }
+
+    /// One human mid-election (two candidate sessions, one `instance_id`) is ONE
+    /// distinct requester → unicast, not broadcast — and BOTH candidate sessions
+    /// are targeted, because the relay cannot know which one will win.
+    ///
+    /// MUTATION PROOF: make `RequesterKey::resolve` ignore `instance` → the two
+    /// candidates become distinct requesters, `unicast_targets()` returns `None`,
+    /// and the first assert fails.
+    #[test]
+    fn test_1600_dual_election_sessions_are_one_requester_but_two_targets() {
+        let mut pending = RebroadcastPending::new(RequesterKey::resolve(9601, Some("tab-a")), 9601);
+        pending.record(RequesterKey::resolve(9602, Some("tab-a")), 9602);
+
+        assert_eq!(
+            pending.unicast_targets(),
+            Some([9601u64, 9602].as_slice()),
+            "one human's dual candidates must unicast to BOTH sessions, never broadcast"
+        );
+    }
+
+    /// A genuine ≥2-human wave still broadcasts, and a repeat from the same
+    /// session adds no extra target.
+    ///
+    /// MUTATION PROOF: drop the `key != self.first_requester` arm in
+    /// `RebroadcastPending::record` → the wave assert fails (it would unicast).
+    /// Drop the `targets.contains` guard → the repeat assert fails (two copies).
+    #[test]
+    fn test_1600_distinct_humans_still_broadcast() {
+        let mut wave = RebroadcastPending::new(RequesterKey::resolve(9701, Some("tab-a")), 9701);
+        wave.record(RequesterKey::resolve(9702, Some("tab-b")), 9702);
+        assert_eq!(
+            wave.unicast_targets(),
+            None,
+            "two distinct humans in one window are a wave and must broadcast"
+        );
+
+        // Instance-less joiners keep session keying, so two of them are still a
+        // wave — #1600 must not weaken the pre-existing behaviour.
+        let mut legacy = RebroadcastPending::new(RequesterKey::resolve(9801, None), 9801);
+        legacy.record(RequesterKey::resolve(9802, None), 9802);
+        assert_eq!(legacy.unicast_targets(), None);
+
+        let mut repeat = RebroadcastPending::new(RequesterKey::resolve(9901, Some("tab-a")), 9901);
+        repeat.record(RequesterKey::resolve(9901, Some("tab-a")), 9901);
+        assert_eq!(
+            repeat.unicast_targets(),
+            Some([9901u64].as_slice()),
+            "the same session asking twice is one requester and one target"
+        );
+    }
+
+    /// The unicast fan is bounded: past
+    /// `PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS` sessions on one identity the
+    /// flush falls back to a single broadcast rather than growing the fan.
+    ///
+    /// MUTATION PROOF: delete the cap arm in `RebroadcastPending::record` → the
+    /// assert fails because it keeps unicasting to all 5.
+    #[test]
+    fn test_1600_unicast_fan_is_bounded() {
+        let mut pending = RebroadcastPending::new(RequesterKey::resolve(1, Some("tab-a")), 1);
+        for session in 2..=(PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS as u64 + 1) {
+            pending.record(RequesterKey::resolve(session, Some("tab-a")), session);
+        }
+        assert_eq!(
+            pending.unicast_targets(),
+            None,
+            "a fan wider than the cap must collapse to one broadcast"
+        );
+    }
+
+    /// The cooldown arithmetic itself: never-published is eligible, an elapsed
+    /// interval is eligible, and a fresh publish reports the exact remainder.
+    ///
+    /// MUTATION PROOF: flip `elapsed >= min_interval` to `>` → the
+    /// exactly-at-the-boundary assert fails. Return `None` unconditionally → the
+    /// mid-cooldown assert fails.
+    #[test]
+    fn test_1600_cooldown_remaining_arithmetic() {
+        let now = std::time::Instant::now();
+        let interval = std::time::Duration::from_millis(PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS);
+
+        assert_eq!(
+            rebroadcast_cooldown_remaining(None, now, interval),
+            None,
+            "a responder that never re-announced is immediately eligible"
+        );
+        assert_eq!(
+            rebroadcast_cooldown_remaining(Some(now - interval), now, interval),
+            None,
+            "exactly one full interval must be eligible, not one tick short"
+        );
+        assert_eq!(
+            rebroadcast_cooldown_remaining(
+                Some(now - std::time::Duration::from_millis(400)),
+                now,
+                interval
+            ),
+            Some(interval - std::time::Duration::from_millis(400)),
+            "mid-cooldown must report the exact remaining wait"
+        );
+    }
+
+    /// END-TO-END for #1600 item 1, through the real `RebroadcastPresence` →
+    /// `notify_later` → `FlushRebroadcasts` path: consecutive coalescing windows
+    /// cannot exceed one re-announce per
+    /// `PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS`, and the suppressed re-announce
+    /// is DEFERRED (it still goes out afterwards), not dropped.
+    ///
+    /// MUTATION PROOF: delete the cooldown check in `FlushRebroadcasts` (publish
+    /// unconditionally) → the mid-test `== 1` assert sees 2, because the second
+    /// window would publish ~250 ms before it runs.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1600_consecutive_windows_are_rate_limited() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let chat = offline_nats_chat_server().await;
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        chat.send(TestSeedActiveMember {
+            session: 8501,
+            room: "test-1600-rate-limit".to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        // Window 1 — a remote joiner asks; the trailing flush publishes.
+        chat.send(RebroadcastPresence {
+            session: 8501,
+            requester_session: 9501,
+            requester_instance: Some("tab-9501".to_string()),
+        })
+        .await
+        .expect("message delivery should succeed");
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 150,
+        ))
+        .await;
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "the first window must re-announce promptly — the cooldown must not \
+             delay a responder that has not re-announced yet"
+        );
+
+        // Window 2 — a different joiner asks ~450 ms later. The debounce alone
+        // would publish ~300 ms after this, i.e. ~250 ms before the assert below.
+        chat.send(RebroadcastPresence {
+            session: 8501,
+            requester_session: 9502,
+            requester_instance: Some("tab-9502".to_string()),
+        })
+        .await
+        .expect("message delivery should succeed");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "a second window inside the minimum interval must NOT produce a \
+             second re-announce"
+        );
+        let (pending_mid, armed_mid, _) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            pending_mid, 1,
+            "the rate-limited re-announce must be HELD, not discarded"
+        );
+        assert!(
+            armed_mid,
+            "the flush must re-arm itself for the end of the cooldown"
+        );
+
+        // …and once the interval elapses it goes out. Deferred, never dropped.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            2,
+            "the deferred re-announce must still be delivered once the cooldown \
+             elapses — a rate limit must not lose a joiner's presence answer"
+        );
+        let (pending_after, armed_after, stamps) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(pending_after, 0, "the deferred entry must drain");
+        assert!(!armed_after, "no timer should remain armed");
+        assert_eq!(stamps, 1, "the responder keeps exactly one cooldown stamp");
+    }
+
+    /// END-TO-END for #1600 item 2: one client's dual election candidate sessions
+    /// yield unicasts (one per candidate), while two genuine joiners still
+    /// broadcast — driven through the real handlers, not the helper types.
+    ///
+    /// This test enters at [`RebroadcastPresence`], so it pins the ACTOR half of
+    /// the mechanism only. MUTATION PROOF: make `RequesterKey::resolve` ignore
+    /// `instance` (always `Session`) → the dual-candidate responder broadcasts,
+    /// so `REBROADCAST_BROADCAST_INVOCATIONS` becomes 2 instead of 1 and the
+    /// publish total drops from 3 to 2.
+    ///
+    /// It does NOT cover the wire→actor half: passing `None` from
+    /// `try_intercept_participant_list_request` leaves this test green, because
+    /// nothing here reads the wire. That mutation is caught by
+    /// `test_1600_wire_instance_survives_the_intercept`, which drives the same
+    /// scenario from real `PARTICIPANT_LIST_REQUEST` bytes through the real
+    /// intercept.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1600_dual_election_candidates_do_not_trip_the_wave_threshold() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let chat = offline_nats_chat_server().await;
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        REBROADCAST_BROADCAST_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-1600-dedupe";
+        for (session, name) in [(8601u64, "alice@x.com"), (8602u64, "bob@x.com")] {
+            chat.send(TestSeedActiveMember {
+                session,
+                room: room.to_string(),
+                user_id: name.to_string(),
+                display_name: name.to_string(),
+            })
+            .await
+            .expect("seed should succeed");
+        }
+
+        // Responder 8601: ONE human mid-election — WS and WT candidates, distinct
+        // sessions, same tab.
+        for candidate in [9601u64, 9602] {
+            chat.send(RebroadcastPresence {
+                session: 8601,
+                requester_session: candidate,
+                requester_instance: Some("tab-one-human".to_string()),
+            })
+            .await
+            .expect("message delivery should succeed");
+        }
+        // Responder 8602: TWO humans — a genuine wave.
+        for (candidate, tab) in [(9701u64, "tab-carol"), (9702, "tab-dave")] {
+            chat.send(RebroadcastPresence {
+                session: 8602,
+                requester_session: candidate,
+                requester_instance: Some(tab.to_string()),
+            })
+            .await
+            .expect("message delivery should succeed");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        assert_eq!(
+            REBROADCAST_BROADCAST_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "only the genuine two-human wave (8602) may broadcast; one human's \
+             dual election candidates (8601) must not trip the wave threshold"
+        );
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            3,
+            "8601 unicasts once per candidate session (2) and 8602 broadcasts once"
+        );
+    }
+
+    /// The wire→actor mapping itself: `requester_instance_of` lifts a usable
+    /// `requester_instance_id` off an inbound `PARTICIPANT_LIST_REQUEST`, MOVES it
+    /// (rather than cloning), and rejects the two unusable shapes — empty (a
+    /// joiner with no instance, or a relay predating the field) and over-long.
+    ///
+    /// MUTATION PROOF: make `requester_instance_of` return `None` unconditionally
+    /// → the first assert fails. Replace `std::mem::take` with a `.clone()` → the
+    /// "moved off the packet" assert fails, since the field would still hold the
+    /// value. Drop the `<= REQUESTER_INSTANCE_ID_MAX_BYTES` bound → the oversized
+    /// assert fails. Widen the bound to `< 64` → the exactly-64 assert fails.
+    #[test]
+    fn test_1600_requester_instance_is_lifted_off_the_wire() {
+        let mut usable = MeetingPacket {
+            requester_instance_id: "tab-a".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            requester_instance_of(&mut usable),
+            Some("tab-a".to_string()),
+            "a usable instance must reach the actor message"
+        );
+        assert!(
+            usable.requester_instance_id.is_empty(),
+            "the value must be MOVED off the packet, not cloned — this line is the \
+             per-session-per-request allocation the seam exists to avoid"
+        );
+
+        // Proto3 default: a joiner with no instance_id, and every relay that
+        // predates the field. Must fall back to session keying, not become a
+        // shared empty-string map key.
+        let mut empty = MeetingPacket::default();
+        assert_eq!(requester_instance_of(&mut empty), None);
+
+        // Bounded at INGRESS, before the value is logged or enters the mailbox.
+        let mut oversized = MeetingPacket {
+            requester_instance_id: "x".repeat(REQUESTER_INSTANCE_ID_MAX_BYTES + 1),
+            ..Default::default()
+        };
+        assert_eq!(
+            requester_instance_of(&mut oversized),
+            None,
+            "an over-long wire value must be rejected here, not only at map-key time"
+        );
+
+        let mut exact = MeetingPacket {
+            requester_instance_id: "x".repeat(REQUESTER_INSTANCE_ID_MAX_BYTES),
+            ..Default::default()
+        };
+        assert_eq!(
+            requester_instance_of(&mut exact),
+            Some("x".repeat(REQUESTER_INSTANCE_ID_MAX_BYTES)),
+            "exactly the bound is still accepted"
+        );
+    }
+
+    /// END-TO-END from the WIRE: real `PARTICIPANT_LIST_REQUEST` bytes, built by
+    /// the requesting relay's own helper, fed through the real
+    /// `try_intercept_participant_list_request` exactly as the NATS loop feeds it.
+    ///
+    /// This is the only test covering the wire→actor plumbing — the single line
+    /// that moves `requester_instance_id` off the packet and into
+    /// [`RebroadcastPresence`]. Without it, reverting that line to `None` is a
+    /// complete revert of #1600 item 2 that leaves every other test green while
+    /// reinstating the O(N²) relay→client fan-out: one client's two election
+    /// candidates would resolve to two `RequesterKey::Session`s, trip
+    /// `saw_other_requester`, and broadcast.
+    ///
+    /// MUTATION PROOF: pass `requester_instance: None` in
+    /// `try_intercept_participant_list_request` (or drop the
+    /// `requester_instance_of` call) → the two candidates become distinct
+    /// requesters, the responder broadcasts, and BOTH asserts fail (broadcast 1
+    /// not 0, publishes 1 not 2). Making `RequesterKey::resolve` ignore `instance`
+    /// fails it identically.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1600_wire_instance_survives_the_intercept() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let chat = offline_nats_chat_server().await;
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        REBROADCAST_BROADCAST_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-1600-wire";
+        let responder = 8901u64;
+        chat.send(TestSeedActiveMember {
+            session: responder,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        // ONE joiner mid-election: two candidate connections, distinct sessions,
+        // one `instance_id` — serialised by the requesting relay and parsed back
+        // by the responder, so the whole wire round-trip is exercised.
+        for candidate in [9901u64, 9902] {
+            let bytes =
+                SessionManager::build_participant_list_request(room, candidate, "tab-one-client");
+            let wrapper =
+                PacketWrapper::parse_from_bytes(&bytes).expect("request must parse as a wrapper");
+            let msg = make_nats_message(&format!("room.{room}.system"), bytes.clone());
+            assert!(
+                try_intercept_participant_list_request(&msg, Some(&wrapper), responder, &chat),
+                "a PARTICIPANT_LIST_REQUEST on .system must be intercepted and consumed"
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        assert_eq!(
+            REBROADCAST_BROADCAST_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "the instance carried ON THE WIRE must collapse the two candidates into \
+             ONE requester — a broadcast here means the wire value never reached the actor"
+        );
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            2,
+            "one unicast per candidate session, since the relay cannot know which wins"
+        );
+    }
+
+    /// ADVERSARIAL: a forged `instance_id` cannot drop anyone from the announce.
+    ///
+    /// `instance_id` is client-supplied and never bound to the authenticated JWT,
+    /// so any client can present another's value. The whole security argument for
+    /// leaving it unbound is that the dedupe fails SAFE — saturating one
+    /// `RequesterKey`'s target set flips the flush to a BROADCAST, which reaches a
+    /// superset of the unicast fan. This test pins that property, which is
+    /// otherwise asserted only in prose.
+    ///
+    /// Scenario: four sessions present the victim's `instance_id`, filling the
+    /// unicast fan to its cap; the victim's own session then asks. The victim must
+    /// NOT be silently dropped from both the unicast set and the broadcast.
+    ///
+    /// MUTATION PROOF: change the cap arm in `RebroadcastPending::record` from
+    /// `saw_other_requester = true; return;` to a bare `return;` (i.e. silently
+    /// discard the overflow target instead of falling back to broadcast) → the
+    /// responder unicasts to the first four sessions only, so broadcasts becomes 0
+    /// (not 1) and publishes becomes 4 (not 1). The victim receives nothing. Both
+    /// asserts fail.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1600_forged_instance_cannot_drop_a_session_from_the_announce() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        // Unit level first: past the cap the addressing MUST become broadcast.
+        let forged = "victim-tab";
+        let mut pending = RebroadcastPending::new(RequesterKey::resolve(7001, Some(forged)), 7001);
+        for attacker in 7002..=(PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS as u64 + 7000) {
+            pending.record(RequesterKey::resolve(attacker, Some(forged)), attacker);
+        }
+        let victim = PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS as u64 + 7001;
+        pending.record(RequesterKey::resolve(victim, Some(forged)), victim);
+        assert_eq!(
+            pending.unicast_targets(),
+            None,
+            "a saturated forged key must fall back to broadcast, never to a unicast \
+             fan that silently excludes the session which did not fit"
+        );
+
+        // End-to-end through the real handlers: exactly ONE broadcast goes out,
+        // and it is a broadcast (reaching the victim) rather than a fan of
+        // unicasts that would exclude it.
+        let chat = offline_nats_chat_server().await;
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        REBROADCAST_BROADCAST_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-1600-forged";
+        let responder = 8801u64;
+        chat.send(TestSeedActiveMember {
+            session: responder,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        // Distinct sessions are the ONLY identity the responder has for a remote
+        // requester; the forged instance makes them share one `RequesterKey`. The
+        // victim asks last, so it is the one an overflow-dropping cap would lose.
+        for requester in 7001..=victim {
+            chat.send(RebroadcastPresence {
+                session: responder,
+                requester_session: requester,
+                requester_instance: Some(forged.to_string()),
+            })
+            .await
+            .expect("message delivery should succeed");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        assert_eq!(
+            REBROADCAST_BROADCAST_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "saturating a forged key must BROADCAST, so every session in the room — \
+             including the one that did not fit the unicast fan — still gets the announce"
+        );
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "and it must be exactly that one broadcast, not a unicast fan"
+        );
+    }
+
+    /// The flush stamps a cooldown ONLY when a re-announce actually went out.
+    ///
+    /// A responder that dropped out of `Active` during the window is suppressed by
+    /// `rebroadcast_publication`, which returns `None`. Stamping anyway would start
+    /// a cooldown it never earned, and — because the stamp is what defers the next
+    /// window — could delay a real re-announce by a full interval after the
+    /// responder recovers.
+    ///
+    /// Reaching this needs a responder the flush still RESOLVES (room membership
+    /// intact) but which is no longer `Active`; `TestForgetMember` cannot produce
+    /// that, since dropping the membership row makes the flush `continue` before it
+    /// ever attempts a publish.
+    ///
+    /// MUTATION PROOF: delete the `if published` guard in `FlushRebroadcasts` and
+    /// stamp unconditionally → `stamps` is 1, not 0, and the test fails.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1600_suppressed_publish_earns_no_cooldown() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let chat = offline_nats_chat_server().await;
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        REBROADCAST_BROADCAST_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-1600-no-stamp";
+        let responder = 8951u64;
+        chat.send(TestSeedActiveMember {
+            session: responder,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        // Arm while Active — `RebroadcastPresence` refuses to arm otherwise.
+        chat.send(RebroadcastPresence {
+            session: responder,
+            requester_session: 9951,
+            requester_instance: Some("tab-9951".to_string()),
+        })
+        .await
+        .expect("message delivery should succeed");
+
+        // Then drop out of Active BEFORE the flush fires. The membership row stays,
+        // so the flush still resolves this responder and reaches the publish
+        // attempt — which `rebroadcast_publication` suppresses.
+        chat.send(TestSetConnectionState {
+            session: responder,
+            state: ConnectionState::Testing,
+        })
+        .await
+        .expect("state override should succeed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        let (pending, armed, stamps) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "a responder that is no longer Active must publish nothing"
+        );
+        assert_eq!(
+            stamps, 0,
+            "a responder that published nothing must not start a cooldown it never earned"
+        );
+        assert_eq!(pending, 0, "the flush must still drain the pending entry");
+        assert!(
+            !armed,
+            "nothing was deferred, so no timer should remain armed"
+        );
+    }
+
+    /// The cooldown map is released by BOTH real teardown paths — eviction
+    /// (`forget_session`) and ordinary departure (`leave_rooms`) — so a departed
+    /// session leaves no entry behind. Both are asserted because the field's doc
+    /// claims both, and only one of them running would still leak.
+    ///
+    /// MUTATION PROOF: delete either `last_rebroadcast_at.remove` line → the
+    /// corresponding post-teardown assert sees 1 instead of 0.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1600_cooldown_stamp_released_on_session_teardown() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let room = "test-1600-teardown";
+
+        // Seed one Active responder, drive one real re-announce, and confirm it
+        // recorded a cooldown stamp.
+        async fn stamped_server(room: &str, session: SessionId) -> Addr<ChatServer> {
+            let chat = offline_nats_chat_server().await;
+            chat.send(TestSeedActiveMember {
+                session,
+                room: room.to_string(),
+                user_id: "alice@x.com".to_string(),
+                display_name: "alice@x.com".to_string(),
+            })
+            .await
+            .expect("seed should succeed");
+            chat.send(RebroadcastPresence {
+                session,
+                requester_session: 9801,
+                requester_instance: Some("tab-9801".to_string()),
+            })
+            .await
+            .expect("message delivery should succeed");
+            tokio::time::sleep(std::time::Duration::from_millis(
+                PARTICIPANT_REBROADCAST_COALESCE_MS + 150,
+            ))
+            .await;
+            let (_, _, stamps) = chat
+                .send(TestRebroadcastState)
+                .await
+                .expect("state probe should succeed");
+            assert_eq!(
+                stamps, 1,
+                "a re-announce must record the responder's cooldown stamp"
+            );
+            chat
+        }
+
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        // Path 1: eviction.
+        let chat = stamped_server(room, 8701).await;
+        chat.send(TestForgetSession {
+            session: 8701,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("forget should succeed");
+        let (_, _, after_forget) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            after_forget, 0,
+            "forget_session must release the departed session's cooldown stamp"
+        );
+
+        // Path 2: ordinary departure.
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        let chat = stamped_server(room, 8702).await;
+        chat.send(TestLeaveRooms {
+            session: 8702,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("leave should succeed");
+        let (_, _, after_leave) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            after_leave, 0,
+            "leave_rooms must release the departed session's cooldown stamp"
+        );
     }
 
     // --- Transfer-host: in-memory presence-map logic -----------------
@@ -18296,6 +20014,661 @@ mod tests {
             0,
             "no orphaned suppress re-check may fire after the window once demand \
              was restored (a non-zero count means a cancelled timer still ran)"
+        );
+    }
+
+    // =====================================================================
+    // #2136 — host-only packet authorization (MEETING_TIMER)
+    // =====================================================================
+
+    /// Build a `RoomMemberInfo` for the `session_is_room_host` unit tests.
+    fn host_gate_member(
+        session: SessionId,
+        user_id: &str,
+        is_host: bool,
+        origin: MemberOrigin,
+    ) -> RoomMemberInfo {
+        RoomMemberInfo {
+            session,
+            user_id: user_id.to_string(),
+            display_name: user_id.to_string(),
+            is_host,
+            end_on_host_leave: false,
+            origin,
+        }
+    }
+
+    /// `session_is_room_host` must require ALL THREE terms, and answer "no" when
+    /// the session has no row at all.
+    ///
+    /// Each assert kills a different mutation, which is why they are enumerated
+    /// rather than folded together:
+    ///
+    /// MUTATION PROOF:
+    ///
+    /// * drop `m.is_host` -> the non-host assert fails: any participant could
+    ///   drive the room's timer.
+    /// * drop `m.session == session` -> the wrong-session assert fails: a
+    ///   non-host borrows the host's authority merely by being in the same room,
+    ///   which is the whole point of the gate.
+    /// * drop the `Local` term -> the remote-mirror assert fails.
+    /// * return `true` on an empty slice, or flip the predicate -> the first and
+    ///   last asserts fail.
+    #[test]
+    fn test_2136_session_is_room_host_requires_every_term() {
+        const HOST_SESSION: SessionId = 8_136_001;
+        const OTHER_SESSION: SessionId = 8_136_002;
+
+        let members = vec![
+            host_gate_member(HOST_SESSION, "host@example.com", true, MemberOrigin::Local),
+            host_gate_member(
+                OTHER_SESSION,
+                "guest@example.com",
+                false,
+                MemberOrigin::Local,
+            ),
+        ];
+
+        assert!(
+            session_is_room_host(&members, HOST_SESSION, None),
+            "the room's host session must be authorized"
+        );
+        assert!(
+            !session_is_room_host(&members, OTHER_SESSION, None),
+            "a NON-host participant must not be authorized — otherwise any attendee could \
+             hijack the room's timer and trigger the expiry sound on every device"
+        );
+        assert!(
+            !session_is_room_host(&members, 8_136_999, None),
+            "a session with no member row at all must not be authorized (fail-closed)"
+        );
+        assert!(
+            !session_is_room_host(&[], HOST_SESSION, None),
+            "an empty member slice must not authorize anyone (fail-closed)"
+        );
+
+        // #1202 inertness: a `Remote` row is an inert roster mirror of a session
+        // owned by the OTHER relay binary. Even if one somehow carried
+        // `is_host = true`, this binary must not authorize on it — the binary
+        // that actually owns that session holds it as `Local` and authorizes
+        // there.
+        let mirrored = vec![host_gate_member(
+            HOST_SESSION,
+            "host@example.com",
+            true,
+            MemberOrigin::Remote,
+        )];
+        assert!(
+            !session_is_room_host(&mirrored, HOST_SESSION, None),
+            "a Remote-origin mirror row must never authorize a host-only packet on this binary"
+        );
+    }
+
+    /// The live presence flag — not the JWT snapshot — is what
+    /// `session_is_room_host` reads, so a transfer-host takes effect with no
+    /// reconnect.
+    ///
+    /// This drives the REAL fanout helper (`apply_member_host_flag`, the function
+    /// `Handler<UpdateMemberHostFlag>` calls on every
+    /// `internal.meeting_host_changed` event), so it pins the two halves TOGETHER:
+    /// the writer the NATS subscription drives and the reader the packet gate
+    /// uses must agree on the same field.
+    ///
+    /// MUTATION PROOF: point `session_is_room_host` at any snapshot that the
+    /// fanout does not update and BOTH asserts fail — the promoted host stays
+    /// unauthorized and the demoted one keeps its authority.
+    #[test]
+    fn test_2136_host_gate_follows_transfer_host_without_a_reconnect() {
+        const OLD_HOST_SESSION: SessionId = 8_136_010;
+        const NEW_HOST_SESSION: SessionId = 8_136_011;
+
+        let mut members = vec![
+            host_gate_member(
+                OLD_HOST_SESSION,
+                "old@example.com",
+                true,
+                MemberOrigin::Local,
+            ),
+            host_gate_member(
+                NEW_HOST_SESSION,
+                "new@example.com",
+                false,
+                MemberOrigin::Local,
+            ),
+        ];
+        assert!(session_is_room_host(&members, OLD_HOST_SESSION, None));
+        assert!(!session_is_room_host(&members, NEW_HOST_SESSION, None));
+
+        // Exactly what meeting-api's transfer_host publishes: two per-user deltas.
+        apply_member_host_flag(&mut members, "old@example.com", false);
+        apply_member_host_flag(&mut members, "new@example.com", true);
+
+        assert!(
+            session_is_room_host(&members, NEW_HOST_SESSION, None),
+            "the PROMOTED host must be authorized immediately. Its room JWT still claims \
+             is_host = false and the UI deliberately does not reconnect on promotion, so a \
+             gate reading that claim would silently drop the real host's every timer packet"
+        );
+        assert!(
+            !session_is_room_host(&members, OLD_HOST_SESSION, None),
+            "the DEMOTED ex-host must lose authority immediately. Its room JWT still claims \
+             is_host = true until it reconnects, so a gate reading that claim would let it \
+             keep driving the room's timer after losing the role"
+        );
+    }
+
+    /// #2136 (SECURITY): a demoted ex-host must NOT regain timer authority by
+    /// reconnecting with its stale room token.
+    ///
+    /// This is the hole a security audit of this change found, and it is subtle
+    /// because it is invisible to every other test here: `apply_member_host_flag`
+    /// correctly demotes the ex-host's LIVE row, but `JoinRoom` re-seeds a NEW
+    /// row from `reconnect_is_host.unwrap_or(is_host)`, and `reconnect_is_host`
+    /// is `Some` only when the client-supplied `instance_id` matches a live
+    /// pending departure IN THIS PROCESS. Reconnect with a fresh instance_id,
+    /// after the grace window, or onto the other relay binary, and the fallback
+    /// is `claims.is_host` — the frozen token, still claiming host.
+    ///
+    /// Room tokens are stateless with no relay-side revocation, so without the
+    /// override map the ex-host could drive the room's timer — and its audible
+    /// expiry — for the remaining lifetime of that token.
+    ///
+    /// MUTATION PROOF: delete the `room_host_overrides` insert from
+    /// `Handler<UpdateMemberHostFlag>`, or drop the `overrides` lookup from
+    /// `session_is_room_host`, and the first assert fails. The promoted-host
+    /// assert covers the mirror-image false NEGATIVE: the same stale-token
+    /// reconnect must not LOCK OUT the real host either.
+    #[test]
+    fn test_2136_demoted_host_cannot_regain_authority_by_reconnecting() {
+        const RECONNECTED_EX_HOST: SessionId = 8_136_020;
+        const RECONNECTED_NEW_HOST: SessionId = 8_136_021;
+
+        // The authoritative fanout observed the transfer (this is what
+        // `Handler<UpdateMemberHostFlag>` records).
+        let mut overrides: HashMap<String, bool> = HashMap::new();
+        overrides.insert("old@example.com".to_string(), false);
+        overrides.insert("new@example.com".to_string(), true);
+
+        // Both then reconnect. `JoinRoom` re-seeded each row straight from its
+        // frozen room token, so BOTH rows are now wrong.
+        let members = vec![
+            host_gate_member(
+                RECONNECTED_EX_HOST,
+                "old@example.com",
+                true, // stale token still claims host
+                MemberOrigin::Local,
+            ),
+            host_gate_member(
+                RECONNECTED_NEW_HOST,
+                "new@example.com",
+                false, // token minted before the promotion
+                MemberOrigin::Local,
+            ),
+        ];
+
+        // Control: without the override map, the stale rows win — i.e. this test
+        // is exercising a real hazard, not a hypothetical one.
+        assert!(
+            session_is_room_host(&members, RECONNECTED_EX_HOST, None),
+            "control: with no override the re-seeded stale claim DOES authorize the \
+             ex-host — which is precisely the hole the override map closes"
+        );
+
+        assert!(
+            !session_is_room_host(&members, RECONNECTED_EX_HOST, Some(&overrides)),
+            "the demoted ex-host must stay unauthorized across a reconnect: its room token \
+             is frozen at mint time and the relay cannot revoke it, so the authoritative \
+             fanout must win over the re-seeded claim"
+        );
+        assert!(
+            session_is_room_host(&members, RECONNECTED_NEW_HOST, Some(&overrides)),
+            "and the promoted host must stay authorized across a reconnect — the same \
+             stale-token re-seed must not lock the REAL host out of its own timer"
+        );
+    }
+
+    /// The override map is consulted per-USER, so it must not leak authority to
+    /// a different participant, and an absent entry must fall back cleanly.
+    ///
+    /// MUTATION PROOF: key the override lookup on anything other than the
+    /// resolved member's `user_id` (the room, the session, a blanket "any true
+    /// value in the map") and the first assert fails.
+    #[test]
+    fn test_2136_host_override_is_scoped_to_the_matching_user() {
+        const HOST_SESSION: SessionId = 8_136_030;
+        const OTHER_SESSION: SessionId = 8_136_031;
+
+        let members = vec![
+            host_gate_member(HOST_SESSION, "host@example.com", true, MemberOrigin::Local),
+            host_gate_member(
+                OTHER_SESSION,
+                "guest@example.com",
+                false,
+                MemberOrigin::Local,
+            ),
+        ];
+        let mut overrides: HashMap<String, bool> = HashMap::new();
+        overrides.insert("host@example.com".to_string(), true);
+
+        assert!(
+            !session_is_room_host(&members, OTHER_SESSION, Some(&overrides)),
+            "an override recorded for the HOST must not authorize a different participant"
+        );
+        assert!(
+            session_is_room_host(&members, HOST_SESSION, Some(&overrides)),
+            "the override must apply to the user it was recorded for"
+        );
+
+        // A user with no entry falls back to its seeded row rather than to a
+        // hard-coded answer in either direction.
+        let mut unrelated: HashMap<String, bool> = HashMap::new();
+        unrelated.insert("someone-else@example.com".to_string(), false);
+        assert!(
+            session_is_room_host(&members, HOST_SESSION, Some(&unrelated)),
+            "an override map with no entry for this user must fall back to the seeded flag, \
+             not deny"
+        );
+    }
+
+    /// END-TO-END regression for the ex-host reconnect hole, driving the REAL
+    /// `Handler<UpdateMemberHostFlag>` writer rather than a hand-built map.
+    ///
+    /// The pure-function tests above pin the READER
+    /// (`session_is_room_host`). They cannot catch a handler that never
+    /// populates `room_host_overrides` — deleting that insert leaves every one of
+    /// them green, which is exactly the "tests bracket the gap on both sides"
+    /// failure a review caught elsewhere in this change. This test joins the two
+    /// halves: it drives the real actor through the real transfer-host message,
+    /// then the real reconnect, then the real `Handler<ClientMessage>` gate, and
+    /// reads the answer off NATS.
+    ///
+    /// Sequence: host joins -> authoritative transfer demotes them -> they
+    /// RECONNECT on a new session presenting the SAME stale room token
+    /// (`is_host: true`, no `instance_id`, so nothing reconciles it) -> their
+    /// host-only packet must still be refused.
+    ///
+    /// MUTATION PROOF: delete the `room_host_overrides` insert from
+    /// `Handler<UpdateMemberHostFlag>` and the reconnected ex-host's packet is
+    /// published -> the silence assert fails. The control at the end keeps a
+    /// drop-everything gate from passing.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_2136_reconnected_ex_host_is_refused_end_to_end() {
+        use crate::messages::server::Packet;
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use tokio::time::Duration;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let room = "test-room-2136-exhost".to_string();
+        const EX_HOST: &str = "old@example.com";
+        let first_session = 1_002_138u64;
+        let reconnected_session = 1_002_139u64;
+
+        // --- the original host joins -------------------------------------
+        let dummy = DummySession.start();
+        chat_server
+            .send(Connect {
+                id: first_session,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        let _ = chat_server
+            .send(JoinRoom {
+                session: first_session,
+                room: room.clone(),
+                user_id: EX_HOST.to_string(),
+                display_name: "Old Host".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("JoinRoom should be delivered");
+
+        // --- meeting-api transfers host away ------------------------------
+        // The exact message the `internal.meeting_host_changed` subscription
+        // delivers. Driving it directly keeps the test deterministic (no sleep
+        // waiting on a NATS round trip) while still exercising the real handler.
+        chat_server
+            .send(UpdateMemberHostFlag(MeetingHostChangePayload {
+                room_id: room.clone(),
+                user_id: EX_HOST.to_string(),
+                is_host: false,
+            }))
+            .await
+            .expect("host-change should be delivered");
+
+        // --- the demoted user RECONNECTS with its STALE token -------------
+        // `is_host: true` is what the frozen room token still claims, and
+        // `instance_id: None` means no pending departure can reconcile it — so
+        // the new member row is seeded `is_host = true`. Only the override map
+        // stands between this session and the room's timer.
+        chat_server
+            .send(Connect {
+                id: reconnected_session,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        let _ = chat_server
+            .send(JoinRoom {
+                session: reconnected_session,
+                room: room.clone(),
+                user_id: EX_HOST.to_string(),
+                display_name: "Old Host".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true, // <-- the stale claim
+                end_on_host_leave: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("JoinRoom should be delivered");
+        chat_server
+            .send(ActivateConnection {
+                session: reconnected_session,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let subject = format!("room.{room}.{reconnected_session}").replace(' ', "_");
+        let mut sub = nats_client
+            .subscribe(subject.clone())
+            .await
+            .expect("Failed to subscribe");
+
+        chat_server
+            .send(ClientMessage {
+                session: reconnected_session,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(well_formed_wrapper_bytes()),
+                    requires_host: true,
+                },
+                user: EX_HOST.to_string(),
+                requires_host: true,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), sub.next())
+                .await
+                .is_err(),
+            "a demoted ex-host must NOT regain timer authority by reconnecting with its \
+             stale room token — the relay cannot revoke that token, so the authoritative \
+             host-change fanout has to outrank the re-seeded claim"
+        );
+
+        // CONTROL: the same session's ordinary traffic is unaffected — being an
+        // ex-host removes host AUTHORITY, not participation.
+        chat_server
+            .send(ClientMessage {
+                session: reconnected_session,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(well_formed_wrapper_bytes()),
+                    requires_host: false,
+                },
+                user: EX_HOST.to_string(),
+                requires_host: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        tokio::time::timeout(Duration::from_secs(2), sub.next())
+            .await
+            .expect(
+                "control: the ex-host's ORDINARY packets must still flow — it is still a \
+                 participant, just not the host",
+            )
+            .expect("control: subscription must yield the published packet");
+    }
+
+    /// CALL-SITE test: `Handler<ClientMessage>` must actually CONSULT the gate.
+    ///
+    /// This is deliberately separate from the pure-function tests above, which
+    /// pin `session_is_room_host` but cannot catch the mistake that matters
+    /// here — a handler that computes the answer and publishes anyway, or never
+    /// calls it at all. It drives a real `ClientMessage` (the exact message both
+    /// transports construct) through the real actor and reads the subject off
+    /// NATS, which is what every peer actually receives.
+    ///
+    /// The CONTROL half is what makes it specific: the SAME session sends the
+    /// SAME bytes with `requires_host: false` and that one MUST publish. Without
+    /// it, deleting the whole publish path would pass.
+    ///
+    /// MUTATION PROOF: delete the `if requires_host && !..` block and the
+    /// non-host packet arrives on the subject -> the silence assert fails. Invert
+    /// the condition and the control assert fails.
+    ///
+    /// Skips (does not fail) when no broker is reachable, like its #2095 sibling.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_2136_host_only_packet_from_non_host_is_not_published() {
+        use crate::messages::server::Packet;
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use tokio::time::Duration;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 1_002_136u64;
+        let room = "test-room-2136-nonhost".to_string();
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        // is_host: FALSE — an ordinary attendee.
+        let _ = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.clone(),
+                user_id: "attendee@example.com".to_string(),
+                display_name: "Attendee".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                end_on_host_leave: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("JoinRoom should be delivered");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let subject = format!("room.{room}.{session_id}").replace(' ', "_");
+        let mut sub = nats_client
+            .subscribe(subject.clone())
+            .await
+            .expect("Failed to subscribe");
+
+        chat_server
+            .send(ClientMessage {
+                session: session_id,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(well_formed_wrapper_bytes()),
+                    requires_host: true,
+                },
+                user: "attendee@example.com".to_string(),
+                requires_host: true,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), sub.next())
+                .await
+                .is_err(),
+            "a host-only packet from a NON-host must never reach the room's fan-out — \
+             otherwise any attendee can drive the meeting timer and trigger the expiry \
+             sound on every participant's device"
+        );
+
+        // CONTROL: same session, same bytes, not host-gated -> must publish.
+        chat_server
+            .send(ClientMessage {
+                session: session_id,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(well_formed_wrapper_bytes()),
+                    requires_host: false,
+                },
+                user: "attendee@example.com".to_string(),
+                requires_host: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        tokio::time::timeout(Duration::from_secs(2), sub.next())
+            .await
+            .expect(
+                "control: an ordinary packet from the same session MUST still publish — \
+                     without this the gate could be 'passing' by dropping everything",
+            )
+            .expect("control: subscription must yield the published packet");
+    }
+
+    /// CALL-SITE test, the positive direction: the room's HOST is admitted.
+    ///
+    /// Paired with the negative test above — a gate that dropped everything would
+    /// pass that one. Together they pin the gate as a real discriminator.
+    ///
+    /// MUTATION PROOF: invert the `if requires_host && !..` condition, or make
+    /// `session_is_room_host` always return false, and this fails.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_2136_host_only_packet_from_host_is_published() {
+        use crate::messages::server::Packet;
+        use futures::StreamExt;
+        use protobuf::Message as _;
+        use std::sync::Arc;
+        use tokio::time::Duration;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 1_002_137u64;
+        let room = "test-room-2136-host".to_string();
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        // is_host: TRUE — the meeting host.
+        let _ = chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.clone(),
+                user_id: "host@example.com".to_string(),
+                display_name: "Host".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("JoinRoom should be delivered");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        let subject = format!("room.{room}.{session_id}").replace(' ', "_");
+        let mut sub = nats_client
+            .subscribe(subject.clone())
+            .await
+            .expect("Failed to subscribe");
+
+        chat_server
+            .send(ClientMessage {
+                session: session_id,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(well_formed_wrapper_bytes()),
+                    requires_host: true,
+                },
+                user: "host@example.com".to_string(),
+                requires_host: true,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        let received = tokio::time::timeout(Duration::from_secs(2), sub.next())
+            .await
+            .expect("the host's host-only packet MUST be fanned out within the timeout")
+            .expect("subscription must yield the published packet");
+        let out = PacketWrapper::parse_from_bytes(&received.payload)
+            .expect("the relay must publish a well-formed PacketWrapper");
+        assert_eq!(
+            out.session_id, session_id,
+            "the fanned-out envelope must carry the host's authenticated session"
         );
     }
 }

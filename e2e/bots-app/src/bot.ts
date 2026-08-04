@@ -11,6 +11,7 @@ import { resolveAssetsForParticipant } from "./assets";
 import { ensureAssetsPrimed, type PrimeProgress } from "./auto-prime";
 import { isDevServerNoise } from "./dev-noise";
 import { type Manifest } from "./manifest";
+import { buildReceiverConfigInitScript, buildReceiverConfigOverrides } from "./receiver-caps";
 import { coerceEncoderFps } from "./resource/fps";
 import {
   joinMeetingAndEnableMedia,
@@ -27,6 +28,40 @@ const CHROME_ARGS = [
 ];
 
 /**
+ * Fleet-credential env-var names, matched for removal before the browser is
+ * launched. In the K8s fleet (#2035) the StatefulSet injects the WHOLE
+ * `bot-accounts` Secret into every pod via `envFrom` — so `process.env` holds
+ * EVERY ordinal's `BOT_EMAIL_<N>`/`BOT_PASSWORD_<N>` (plus the single-mode
+ * `BOT_EMAIL`/`BOT_PASSWORD`), plus the fleet-wide `BOT_CTL_TOKEN` (#2072) — the
+ * control-API bearer token, a STRICTLY higher-value secret than any single bot
+ * account since it drives `/netem` and `/leave` on every pod. Only the
+ * orchestrator (this Node process) needs any of these; the Chromium subprocess —
+ * which renders untrusted page JS and is the highest-risk component for a
+ * sandbox escape — needs NONE of them. Stripping them from the browser's
+ * environment is defense-in-depth against a renderer→browser escape reading the
+ * fleet's credentials out of the process environment. (Page JavaScript cannot
+ * read OS env, so this is not a live hole — but the browser process holding zero
+ * fleet secrets is strictly better than it holding all of them.)
+ */
+const FLEET_CRED_ENV_RE = /^BOT_(EMAIL|PASSWORD|CTL_TOKEN)(_\d+)?$/;
+
+/**
+ * `process.env` with every fleet-credential variable removed, as a string-only
+ * record suitable for Playwright's `chromium.launch({ env })` (which REPLACES
+ * the browser env rather than merging). Non-credential vars (PATH, DISPLAY, …)
+ * are preserved so the browser launches normally.
+ */
+export function browserEnvWithoutFleetCreds(
+  source: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(source)) {
+    if (v !== undefined && !FLEET_CRED_ENV_RE.test(k)) out[k] = v;
+  }
+  return out;
+}
+
+/**
  * Delay (ms) between encoder-fps polls of `window.__videocall_encoder_fps`
  * (#2062). The client republishes the value on its ~5s health tick. The global
  * is a PERSISTED LEVEL, not an event, so any interval observes each published
@@ -40,6 +75,45 @@ const CHROME_ARGS = [
  * so polls can never pile up in flight.
  */
 export const ENCODER_FPS_POLL_MS = 2000;
+
+const ALREADY_CLOSED_MESSAGES = [
+  "Target page, context or browser has been closed",
+  "Page has been closed.",
+  "Pipe has been closed",
+] as const;
+
+/**
+ * Whether a `context.close()` / `browser.close()` rejection is the EXPECTED
+ * "already torn down" race rather than a real failure.
+ *
+ * The message alone is NOT sufficient, and that distinction is the whole point of
+ * the second argument. Playwright emits these same strings when Chromium CRASHES
+ * or exits unexpectedly, so matching on the text alone would demote a genuine
+ * crash's close rejection to `debug`. The `disconnected` listener in `launchBot`
+ * does log the crash itself at error level, so that rejection is not the ONLY
+ * signal — but it is the diagnostic that says what failed while tearing down (the
+ * message and stack), and it belongs at error level next to the crash line rather
+ * than buried in `debug`. Note the bot has no other error-level reporter on this
+ * path: the encoder-fps poll swallows its rejections by design, since a transient
+ * "execution context destroyed" during an in-meeting SPA navigation must not blind
+ * the fps signal.
+ *
+ * `browserDiedUnexpectedly` is the disambiguator: if Playwright reported
+ * `browser.on("disconnected")` while NO intentional close was in progress, the
+ * browser went away on its own — a crash — and the close rejection must stay at
+ * error level. Only when we initiated the teardown ourselves is an already-closed
+ * target expected. (Playwright emits `disconnected` for a normal `browser.close()`
+ * too, which is why the caller raises an "intentional close" flag before every
+ * deliberate teardown rather than only inside `shutdown()`.)
+ *
+ * Anything that does not match a known message stays at error level regardless,
+ * so a NEW close failure mode is never masked.
+ */
+export function isBenignTeardownError(e: unknown, browserDiedUnexpectedly: boolean): boolean {
+  if (browserDiedUnexpectedly) return false;
+  if (!(e instanceof Error)) return false;
+  return ALREADY_CLOSED_MESSAGES.some((message) => e.message.includes(message));
+}
 
 export type VideoMode = "costume" | "file" | "clock";
 
@@ -147,6 +221,27 @@ export interface BotRunOptions {
    */
   network?: string | null;
   /**
+   * Spoof `navigator.hardwareConcurrency` to this value via a Playwright
+   * `addInitScript` injected BEFORE the first navigation (issue #2035
+   * increment 2).
+   *
+   * The served videocall-client caps encoded simulcast layers at
+   * `min(experimentalSimulcastMaxLayers, capability_max_simulcast_layers())`,
+   * and the capability sniff reads `navigator.hardwareConcurrency` at
+   * Host-mount time (dioxus-ui `capability_check.rs`: `<6 cores → 1 layer`,
+   * `6–9 → 2`, `>=10 → 3`). In a container, Chrome reports the *node's*
+   * core count (e.g. 32) regardless of the pod's CPU limit, so every bot
+   * would sniff a 3-layer ceiling and over-commit encode CPU. Setting this
+   * to match the pod's CPU budget (e.g. `2` → 1 layer, `8` → 2 layers) makes
+   * the sniffed ceiling realistic per-pod.
+   *
+   * This is a `navigator` property (not an `__APP_CONFIG` key), so the spoof
+   * SURVIVES the app's runtime `window.__APP_CONFIG` reassignment. When
+   * unset / `null` / `<= 0`, NOTHING is injected and the browser's real value
+   * is used — default behavior unchanged.
+   */
+  hardwareConcurrency?: number | null;
+  /**
    * Receives a capture/encode FPS reading from this bot. The orchestrator wires
    * this to a per-bot {@link FpsTracker}. bot.ts feeds it by polling
    * `window.__videocall_encoder_fps`, published by videocall-client #2057,
@@ -156,6 +251,27 @@ export interface BotRunOptions {
    * tracker can reset a sustained-low run without recording a reading.
    */
   onEncoderFps?: ((fps: number | null) => void) | null;
+  /**
+   * Cap the RECEIVED simulcast layer via `window.__APP_CONFIG.maxReceivedLayer`
+   * (issue #2068). `0` = base rung only (lowest decode CPU); `undefined`/`null`
+   * = no receive cap (client ceiling fully open). Injected at launch through a
+   * `window.__APP_CONFIG` setter-merge (see {@link buildReceiverConfigInitScript})
+   * BEFORE the first navigation, because the client parses `__APP_CONFIG` once
+   * and prod `config.js` freezes it — it is NOT runtime-toggleable. Only takes
+   * effect against a deployment carrying videocall-client PR #2078; harmless
+   * otherwise. Independent of {@link hardwareConcurrency} (which caps the bot's
+   * ENCODE layers) — this caps what the bot DECODES.
+   */
+  maxReceivedLayer?: number | null;
+  /**
+   * Skip per-tile canvas paint via `window.__APP_CONFIG.skipCanvasPaint`
+   * (issue #2069). `true` = decode-and-drop (saves paint/GPU only — decode
+   * still runs; use {@link maxReceivedLayer} to cut decode CPU). `false` =
+   * force paint on. `undefined`/`null` = inherit the deployment's value. Same
+   * launch-time `__APP_CONFIG` injection + PR #2078 dependency as
+   * {@link maxReceivedLayer}.
+   */
+  skipCanvasPaint?: boolean | null;
 }
 
 /**
@@ -342,7 +458,79 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   const browser = await chromium.launch({
     headless: opts.headless,
     args: launchArgs,
+    // Strip the fleet's BOT_EMAIL_*/BOT_PASSWORD_* from the browser subprocess's
+    // environment (see browserEnvWithoutFleetCreds) — the renderer/browser is the
+    // highest-risk process and never needs the credentials the orchestrator used.
+    env: browserEnvWithoutFleetCreds(),
+    // Do not let Playwright preempt the bots-app's process lifecycle policy
+    // (#2089). Playwright defaults these to `true` (`browserType.js`
+    // `_launchProcess`), installing signal handlers that call
+    // `gracefullyCloseAll()` and immediately close every launched browser.
+    //
+    // That RACES our shutdown and is the root cause of this issue's symptom: the
+    // orchestrator's signal handler only resolves a promise, after which the wait
+    // loop `await`s `leaveMeeting()` (network I/O) BEFORE `shutdown()`. Playwright's
+    // close lands during that await, so our `context.close()` finds an
+    // already-closed target and logs at error level on every graceful pod
+    // shutdown.
+    //
+    // On SIGTERM it also breaks the crash detector below: Playwright's close fires
+    // `disconnected` with no intentional-close flag raised, which is
+    // indistinguishable from a real crash. Opting out makes that premise true on
+    // the orchestrator's graceful pod-shutdown path. Playwright's handler registry
+    // is process-global, so the coexisting SSO recapture launch opts out too.
+    //
+    // Chrome is still not leaked: `addProcessHandlerIfNeeded("exit")` is installed
+    // UNCONDITIONALLY by `processLauncher.js`, independent of these options, and
+    // its `killSet` kills the browser process on Node exit.
+    //
+    // SIGINT is left at Playwright's default deliberately: its `sigintHandler`
+    // calls `process.exit(130)` after closing, and Ctrl-C behaviour for a local
+    // operator is out of scope for this fix. SIGHUP differs from SIGTERM: the
+    // orchestrator does not handle it, so disabling Playwright's handler preserves
+    // Node's default process termination instead of swallowing the signal after
+    // only closing the browsers.
+    handleSIGTERM: false,
+    handleSIGHUP: false,
   });
+  // Crash detector for the teardown-log classifier (#2089). Playwright emits the
+  // same "…has been closed" messages for an expected double-close race AND for a
+  // Chromium crash, so the message alone cannot distinguish them.
+  //
+  // Playwright ALSO emits `disconnected` during a perfectly normal
+  // `browser.close()`, so the listener must know whether WE asked. Every
+  // intentional teardown in this function — `shutdown()` and each early-exit
+  // path (missing form-login creds, form-login failure, manual hang-up,
+  // waiting-room / join-rejected) — therefore goes through
+  // `closeBrowserIntentionally()`, which raises the flag FIRST. Setting it only
+  // in `shutdown()` is not enough: the early exits would each log a false crash
+  // on a graceful hang-up, which is exactly the spurious error line #2089 exists
+  // to remove.
+  let intentionalCloseStarted = false;
+  let browserDiedUnexpectedly = false;
+  browser.on("disconnected", () => {
+    if (!intentionalCloseStarted) {
+      browserDiedUnexpectedly = true;
+      console.error(`[${label}] browser disconnected unexpectedly (crash or external kill)`);
+    }
+  });
+  /**
+   * Tear down context + browser as a DELIBERATE act, swallowing errors. Use this
+   * for every early-exit teardown; `shutdown()` does the same sequencing with its
+   * own error-reporting closes.
+   *
+   * The flag is raised immediately before `browser.close()` and NOT before
+   * `context.close()`. Closing a CONTEXT does not disconnect the browser, so a
+   * `disconnected` arriving during the context close can only be a real crash or
+   * an external kill — raising the flag earlier would blind the listener across
+   * exactly the window where a crash is most likely, and demote the resulting
+   * close error to `debug`.
+   */
+  const closeBrowserIntentionally = async (): Promise<void> => {
+    await context.close().catch(() => {});
+    intentionalCloseStarted = true;
+    await browser.close().catch(() => {});
+  };
   let initialStorageState: string | undefined;
   let ssoStateLoaded = false;
   if (opts.authBackend === "storage-state" && opts.storageStateFile) {
@@ -400,6 +588,47 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   }
 
   const page = await context.newPage();
+
+  // Issue #2035 (increment 2): optionally spoof `navigator.hardwareConcurrency`
+  // BEFORE the first navigation. Playwright's addInitScript is evaluated after
+  // the document is created but BEFORE any of the page's own scripts run — and
+  // the WASM videocall-client (which reads `navigator.hardwareConcurrency` in
+  // its simulcast capability sniff at Host-mount time) loads as a page script —
+  // so the spoofed value is in place well before the client ever sniffs it, and
+  // therefore controls the sniffed layer ceiling. In a container Chrome reports
+  // the NODE's core count (e.g. 32) regardless of the pod's CPU limit, so every
+  // bot would sniff a 3-layer ceiling and over-commit encode CPU; pinning this
+  // to the pod's CPU budget caps the encoded layers realistically. Defining an
+  // OWN accessor on the `navigator` instance shadows the read-only prototype
+  // getter that `web_sys::Navigator::hardware_concurrency()` reads; it is a
+  // navigator property (not an `__APP_CONFIG` key) so it survives the app's
+  // runtime config reassignment. Unset / `<= 0` ⇒ inject nothing (real value).
+  if (opts.hardwareConcurrency != null && opts.hardwareConcurrency > 0) {
+    const cores = Math.floor(opts.hardwareConcurrency);
+    await page.addInitScript(
+      `Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => ${cores}, configurable: true });`,
+    );
+    console.log(`[${label}] navigator.hardwareConcurrency spoofed → ${cores} (issue #2035)`);
+  }
+
+  // Issues #2068/#2069 (increment 5): optionally cap the RECEIVED simulcast
+  // layer and/or skip the per-tile canvas paint, to cut this bot's decode +
+  // paint CPU. These are `window.__APP_CONFIG` overrides injected BEFORE the
+  // first navigation via a setter-merge (the client parses __APP_CONFIG once
+  // and prod config.js freezes it, so they are launch-time-only — see
+  // receiver-caps.ts). When neither is set, nothing is injected and the
+  // deployment config is used verbatim (default behavior unchanged).
+  const receiverOverrides = buildReceiverConfigOverrides({
+    maxReceivedLayer: opts.maxReceivedLayer ?? undefined,
+    skipCanvasPaint: opts.skipCanvasPaint ?? undefined,
+  });
+  if (receiverOverrides !== null) {
+    await page.addInitScript(buildReceiverConfigInitScript(receiverOverrides));
+    console.log(
+      `[${label}] receiver caps → __APP_CONFIG ${JSON.stringify(receiverOverrides)} (issues #2068/#2069)`,
+    );
+  }
+
   if (videoMode === "clock") {
     await page.addInitScript(
       `globalThis.__CLOCK_PARTICIPANT = ${JSON.stringify(opts.displayName)};`,
@@ -460,8 +689,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     if (!creds) {
       // Tear the browser down before surfacing the error so a
       // mis-configured launch doesn't leak a Chrome process.
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
+      await closeBrowserIntentionally();
       throw new Error(
         `[${label}] auth: form-login requires BOT_EMAIL and BOT_PASSWORD environment variables to be set`,
       );
@@ -476,8 +704,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
         label,
       });
     } catch (e) {
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
+      await closeBrowserIntentionally();
       throw e;
     }
   }
@@ -530,8 +757,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       }
       // Tear down quietly — caller (orchestrator) will see this via
       // `userHangupDetected` and skip the leaveMeeting step.
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
+      await closeBrowserIntentionally();
       // Re-throw so the orchestrator's `launchBot` await sees the
       // typed sentinel and can branch on it.
       throw e;
@@ -542,11 +768,46 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       // to do — tear it down and let the orchestrator classify the
       // exit (graceful for WaitingRoomError, failure for
       // JoinRejectedError).
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
+      await closeBrowserIntentionally();
       throw e;
     }
     throw e;
+  }
+
+  // Issues #2068/#2069: assert the receiver-cap overrides actually landed in
+  // `window.__APP_CONFIG` once we are on `/meeting/<id>` (config.js has run and
+  // our setter-merge fired). Best-effort + non-fatal: a mismatch means the
+  // setter did not intercept the assignment (e.g. config.js switched to
+  // `Object.defineProperty`, or the deployment predates the knobs) — surface it
+  // loudly rather than let a silently-uncapped bot skew the load test. This
+  // proves the override is PRESENT in __APP_CONFIG; whether the deployed client
+  // HONORS it depends on it carrying videocall-client PR #2078.
+  if (receiverOverrides !== null) {
+    try {
+      const applied = await page.evaluate((keys) => {
+        const cfg = (globalThis as unknown as { __APP_CONFIG?: Record<string, unknown> })
+          .__APP_CONFIG;
+        const out: Record<string, unknown> = {};
+        for (const k of keys) out[k] = cfg?.[k];
+        return out;
+      }, Object.keys(receiverOverrides));
+      const mismatched = Object.keys(receiverOverrides).filter(
+        (k) => applied[k] !== receiverOverrides[k],
+      );
+      if (mismatched.length === 0) {
+        console.log(
+          `[${label}] receiver caps verified in __APP_CONFIG: ${JSON.stringify(applied)}`,
+        );
+      } else {
+        console.error(
+          `[${label}] WARNING: receiver caps did NOT land in __APP_CONFIG (expected ${JSON.stringify(
+            receiverOverrides,
+          )}, got ${JSON.stringify(applied)}); the bot may not be capped (issues #2068/#2069)`,
+        );
+      }
+    } catch (e) {
+      console.error(`[${label}] receiver-caps __APP_CONFIG assertion check failed:`, e);
+    }
   }
 
   // Best-effort: log the suppression summary once, after a successful
@@ -647,12 +908,25 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     try {
       await context.close();
     } catch (e) {
-      console.error(`[${label}] context.close failed:`, e);
+      if (isBenignTeardownError(e, browserDiedUnexpectedly)) {
+        console.debug(`[${label}] context was already closed during teardown:`, e);
+      } else {
+        console.error(`[${label}] context.close failed:`, e);
+      }
     }
+    // Raised HERE, not before `context.close()` above: closing a context does not
+    // disconnect the browser, so a `disconnected` during the context close is a
+    // genuine crash and must stay visible. Playwright DOES emit `disconnected` for
+    // this `browser.close()`, which is what the flag suppresses.
+    intentionalCloseStarted = true;
     try {
       await browser.close();
     } catch (e) {
-      console.error(`[${label}] browser.close failed:`, e);
+      if (isBenignTeardownError(e, browserDiedUnexpectedly)) {
+        console.debug(`[${label}] browser was already closed during teardown:`, e);
+      } else {
+        console.error(`[${label}] browser.close failed:`, e);
+      }
     }
   };
 

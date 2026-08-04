@@ -18,6 +18,7 @@
 
 pub mod callback;
 pub mod feature_flags;
+pub mod limits;
 pub mod protos;
 pub mod user_id;
 pub mod validation;
@@ -118,6 +119,12 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             }
             protos::packet_wrapper::packet_wrapper::PacketType::REACTION => {
                 write!(f, "REACTION")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::RAISE_HAND => {
+                write!(f, "RAISE_HAND")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::MEETING_TIMER => {
+                write!(f, "MEETING_TIMER")
             }
         }
     }
@@ -360,6 +367,31 @@ mod reaction_packet_wire_tests {
             PacketType::REACTION.value(),
             17,
             "PacketType::REACTION must be wire value 17 (15/16 reserved for #1843)"
+        );
+    }
+
+    /// #2136: the MEETING_TIMER envelope discriminant is pinned at 19. If a future edit
+    /// renumbers it, this fails — catching a silent wire-compat break with peers and with the
+    /// relay's `classify_packet` arm before it ships.
+    ///
+    /// The second assert is the part that actually earns its keep: it pins 19 as DISTINCT from
+    /// MEETING (7). The two names are adjacent and their trust models are opposite (MEETING is
+    /// server-authored and dropped on client ingress; MEETING_TIMER is client-authored and
+    /// re-broadcast), so a collision would silently route host timers into the drop arm — or,
+    /// far worse, route forged client MEETING packets into the re-broadcast arm.
+    #[test]
+    fn meeting_timer_packet_type_is_wire_value_19_and_distinct_from_meeting() {
+        assert_eq!(
+            PacketType::MEETING_TIMER.value(),
+            19,
+            "PacketType::MEETING_TIMER must be wire value 19 (15/16 reserved for #1843, \
+             17 = REACTION, 18 = RAISE_HAND per #2135)"
+        );
+        assert_ne!(
+            PacketType::MEETING_TIMER.value(),
+            PacketType::MEETING.value(),
+            "MEETING_TIMER (client-authored, re-broadcast) must never collide with MEETING \
+             (server-authored, dropped on client ingress) — they have opposite trust models"
         );
     }
 }

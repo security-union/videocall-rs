@@ -2,6 +2,7 @@ import { test, expect, Page, Locator } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { enableSimulcastFlag } from "../helpers/simulcast-config";
+import { setReducedLadderFlag } from "../helpers/reduced-ladder-config";
 
 /**
  * E2E coverage for the in-meeting "Performance" settings panel (issue #961,
@@ -84,7 +85,8 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *   per-chart `diag-chart-{buffer,decode,packets,reorder}-help` "?" icon (the old
  *   section-level `diag-charts-help` was removed).
  *   The drawer title became "Performance & Diagnostics". The Settings modal now
- *   has exactly FOUR tabs (Audio / Video / Network / Appearance) and NO
+ *   has exactly FIVE tabs (Audio / Video / Network / Appearance / Preferences —
+ *   Preferences was added later, in the Action Bar Customization work) and NO
  *   performance affordance at all: the transitional `settings-perf-moved` redirect
  *   row was REMOVED in the iteration (the drawer is the only home of the
  *   Performance controls; the "performance" deep link still routes to the drawer
@@ -1316,11 +1318,11 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
 // second surface to navigate to. The old round-trip cross-nav test is replaced
 // below by (a) a single-surface assertion that the perf panel and the
 // "Simulcast layers" section coexist in ONE open drawer, and (b) a Settings-modal
-// assertion that the modal has exactly FOUR tabs and NO performance affordance.
+// assertion that the modal has exactly FIVE tabs and NO performance affordance.
 //
 // #1131 ITERATION: the transitional `settings-perf-moved` redirect row was
 // REMOVED (the product decision reversed the one-release link). The contract is
-// now: the Settings modal has exactly four tabs and offers NO path to Performance
+// now: the Settings modal has exactly five tabs and offers NO path to Performance
 // at all — the drawer is the only home of the Performance controls, opened via the
 // toolbar "Open Diagnostics" button (and the "performance" deep link, which still
 // routes to the drawer via attendants). The old "moved row opens the drawer"
@@ -1402,21 +1404,58 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(sidebar.locator('[data-testid="perf-open-diagnostics"]')).toHaveCount(0);
   });
 
-  test("Settings has exactly FOUR tabs and offers NO performance affordance (#1131 iteration removed the moved row)", async ({
+  // TAGGED @bvt1 (issue 2158): this is the ONE test in this file that runs in
+  // per-PR CI. It is here because the tablist assertion below drifted for ~6
+  // weeks — the spec is otherwise untagged, so `--project=bvt1` never ran it and
+  // nothing failed when a 5th tab landed. ~22s against a smoke job that already
+  // spends minutes on npm ci + browser install + docker build, in exchange for
+  // closing the root cause. Do NOT tag the whole file: it is 5.3 min.
+  test("@bvt1 Settings has exactly FIVE tabs and offers NO performance affordance (#1131 iteration removed the moved row)", async ({
     page,
   }) => {
     await joinMeeting(page, "settings_no_perf");
 
-    // ── The Settings modal has exactly FOUR tabs (Performance tab removed) ──
+    // ── The Settings modal has exactly FIVE tabs (Performance tab removed) ──
+    // MIRRORS RUST: this list is the DOM mirror of `SettingsSection::all()` in
+    // `dioxus-ui/src/components/device_settings_modal.rs`, which is itself pinned
+    // by the unit test `tablist_has_five_sections_without_performance` (same
+    // count, same titles, same "no Performance" clause).
+    //
+    // Do NOT read that pairing as drift-proof: the two halves are NOT gated
+    // equally per-PR. The Rust test runs on every PR (`cargo test -p videocall-ui
+    // --lib`); this spec is tagged `@bvt1` (below) specifically so it does too.
+    // Before that tag, only the Rust half was gated — which is exactly how #2158
+    // happened: the Preferences tab landed WITH its Rust test correctly updated
+    // to 5, while this assertion sat at 4 and failed unnoticed for ~6 weeks
+    // because per-PR CI (`--project=bvt1`) never ran the untagged spec.
     await openSettingsModal(page);
     const modal = page.locator(".device-settings-modal");
     const tabs = modal.getByRole("tab");
-    await expect(tabs).toHaveCount(4);
-    // The four surviving tabs, by accessible name.
-    for (const name of ["Audio", "Video", "Network", "Appearance"] as const) {
-      await expect(modal.getByRole("tab", { name }), `${name} tab present`).toBeVisible();
+    await expect(tabs).toHaveCount(5);
+    // The five surviving tabs, by accessible name. The nav button renders an
+    // `aria-hidden="true"` icon plus a `.settings-nav-label` span, so the
+    // accessible name is `SettingsSection::title()`.
+    //
+    // MATCHER ASYMMETRY — deliberate, and verified empirically against the
+    // installed Playwright (a bare `name` string defaults to `exact: false`,
+    // i.e. case-insensitive SUBSTRING). The two directions need OPPOSITE modes:
+    //   * POSITIVE (this loop) uses `exact: true` so the DOM label must equal
+    //     `title()`. Bare would accept a drifted "Preferences (Beta)" and let the
+    //     titles silently diverge from the Rust list this block claims to mirror.
+    //   * NEGATIVE (`name: "Performance"` below) stays BARE on purpose, because
+    //     substring is what catches a Performance tab smuggled in under a renamed
+    //     label ("Video Performance"). `exact: true` there would MISS it and
+    //     quietly gut the #1131 contract this test exists to enforce.
+    // Verified: bare finds "Video Performance" (count 1) where exact does not
+    // (count 0); exact rejects "Preferences (Beta)" where bare accepts it.
+    for (const name of ["Audio", "Video", "Network", "Appearance", "Preferences"] as const) {
+      await expect(
+        modal.getByRole("tab", { name, exact: true }),
+        `${name} tab present`,
+      ).toBeVisible();
     }
-    // The Performance tab is GONE — it is NOT one of the tabs.
+    // The Performance tab is GONE — it is NOT one of the tabs. Bare (substring)
+    // matcher on purpose — see the MATCHER ASYMMETRY note above.
     await expect(modal.getByRole("tab", { name: "Performance" })).toHaveCount(0);
     await expect(modal.locator('[data-testid="settings-nav-performance"]')).toHaveCount(0);
 
@@ -2043,5 +2082,359 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
         "the fixed Y-axis must live OUTSIDE the scroll box (a sibling, not a child)",
       ).toHaveCount(0);
     }
+  });
+});
+
+/**
+ * Issue #1768 — the `experimentalReducedLadder` gate's ONE user-visible surface.
+ *
+ * The flag switches every publisher's CAMERA simulcast ladder from a 720p top rung
+ * to 540p. Nearly all of that is invisible (encoder geometry + AQ bitrate targets),
+ * but the performance drawer's SEND rung-strip pip LABEL is derived from the
+ * deployed ladder, so the top video pip must read "540p" when the flag is on and
+ * "720p" when it is off.
+ *
+ * WHY THIS SPEC EXISTS (pre-submit gate finding). The unit tests around this feature
+ * cover the PURE halves only — `camera_ladder_variant_from_flag` (config→variant)
+ * and `send_layer_labels_with_top` (labels given a top rung) — while the IMPURE seam
+ * that joins them, `active_camera_top_rung_label()`, had ZERO callers in any test at
+ * any level. It needs a browser (`window.__APP_CONFIG`) AND the AQ table lookup in
+ * one call, so only a browser test reaches it. Hardcoding it to `"720p"` — silently
+ * killing the feature's entire visible half — left every other test green.
+ *
+ * NOT tagged @bvt0/@bvt1, so this does NOT run in per-PR CI (`--project=bvt1`);
+ * validate via the local docker stack:
+ *   make e2e-up && make e2e SPEC=performance-settings.spec.ts
+ */
+test.describe("reduced camera ladder gate (#1768)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  // Auth is bypassed via a JWT session cookie, exactly as every other describe in
+  // this file does. WITHOUT this the app redirects to the meeting-api login page and
+  // `joinMeeting`'s `toHaveURL(/\/meeting\/…/)` times out — which is how these two
+  // tests failed on their first real run.
+  test.beforeEach(async ({ context, baseURL }) => {
+    await injectSessionCookie(context, { baseURL });
+  });
+
+  /**
+   * `capabilityMaxLayersOverride: 3` is LOAD-BEARING, not belt-and-braces.
+   * `host.rs` computes `effective_max_layers = min(flag, capability_ceiling)`, and
+   * the containerized CI/dev runner reports 1–2 logical cores, which clamps the
+   * sniffed ceiling to 1. At one layer the Video arm returns just `["180p"]`, the
+   * top-rung pip is never rendered, and the assertion below would be VACUOUSLY
+   * green — testing nothing. Forcing 3 is what makes the top pip exist.
+   */
+  const THREE_LAYERS = { capabilityMaxLayersOverride: 3 } as const;
+
+  /**
+   * Read the top video SEND pip's label after opening the drawer.
+   *
+   * Returns `null` when fewer than 3 pips rendered — which, given both callers force
+   * `capabilityMaxLayersOverride: 3`, means the config injection did not take. BOTH
+   * callers therefore treat a null as a HARD FAILURE, not a reason to skip: a skip
+   * would read green in the summary, which is exactly how an earlier revision of
+   * these tests hid a broken harness on every machine.
+   */
+  async function topVideoSendPipLabel(page: Page): Promise<string | null> {
+    await openPerformanceDrawer(page);
+    await selectSendDirection(page);
+    const panel = perfDrawer(page);
+    const pips = panel.locator('[data-testid^="perf-video-send-rung-"]');
+    await expect(pips.first()).toBeVisible({ timeout: 10_000 });
+    if ((await pips.count()) < 3) return null;
+    return (
+      await panel.locator('[data-testid="perf-video-send-rung-2"] .perf-rung__label').innerText()
+    ).trim();
+  }
+
+  test("flag OFF: the top SEND pip reads 720p (the shipped ladder)", async ({ page }) => {
+    // No `setReducedLadderFlag` call at all — this is the PRODUCTION default path
+    // (the committed config.js omits the key, so RuntimeConfig defaults it to "").
+    await enableSimulcastFlag(page.context(), 3, THREE_LAYERS);
+    await joinMeeting(page, "ladder_default", { cameraOff: true });
+
+    // SYMMETRIC with the ON case below — deliberately NOT `test.skip`. This test
+    // passes the same `THREE_LAYERS` capability override, so 3 pips are guaranteed
+    // here too; a null means the config injection broke, not that the runner is
+    // weak. Leaving a skip here would make the DEFAULT-OFF guarantee — the one
+    // protecting every deployment today — the single assertion that can still
+    // vanish into a green summary.
+    const label = await topVideoSendPipLabel(page);
+    expect(
+      label,
+      "3 video SEND pips must render (testCapabilityMaxLayersOverride: 3 forces them). " +
+        "A null here means the config.js injection did not take.",
+    ).not.toBeNull();
+    expect(
+      label,
+      "flag off must keep the shipped 720p top rung — this is the default-OFF guarantee",
+    ).toBe("720p");
+  });
+
+  test("flag ON: the top SEND pip reads 540p, and the base pip does not move", async ({ page }) => {
+    // ORDER IS LOAD-BEARING — `setReducedLadderFlag` MUST be registered FIRST.
+    //
+    // `BrowserContext.route()` registers with `_routes.unshift(...)`
+    // (playwright-core/lib/client/browserContext.js), so the LAST-registered handler
+    // for a URL wins, and `_onRoute` stops at the first handler that reports
+    // `handled` — which `fulfill()` does. `route.fetch()` does NOT re-enter the
+    // handler list. Both helpers register a `**/config.js` handler, so whichever is
+    // registered LAST shadows the other's config.js entirely.
+    //
+    // Registering the ladder flag first means `enableSimulcastFlag`'s config.js
+    // handler wins (injecting `experimentalSimulcastMaxLayers: 3` +
+    // `testCapabilityMaxLayersOverride`), while the ladder key still lands via the
+    // ladder helper's separate, unshadowed `**/config.local.js` handler — the
+    // AUTHORITATIVE last config layer the app reads.
+    //
+    // Reversed, this test SILENTLY SKIPS on every machine: the served
+    // `dioxus-ui/scripts/config.js` pins `experimentalSimulcastMaxLayers: 1` (and
+    // `docker/start-dioxus.sh` deliberately leaves that tracked file alone), so
+    // `effective_max_layers = min(1, capability) = 1`, only the 180p pip renders,
+    // and the guard below returns null. A skipped test reads GREEN in the summary.
+    await setReducedLadderFlag(page.context(), "true");
+    await enableSimulcastFlag(page.context(), 3, THREE_LAYERS);
+    await joinMeeting(page, "ladder_reduced", { cameraOff: true });
+
+    // Hard-fail on a null, SYMMETRIC with the OFF case above (neither uses
+    // `test.skip`). With the flags injected in the correct order, 3 pips are
+    // GUARANTEED — the capability sniff is overridden — so a null means the config
+    // injection itself broke, which is the very failure that made an earlier revision
+    // of this test skip on every machine and read GREEN. Fail loudly instead.
+    const label = await topVideoSendPipLabel(page);
+    expect(
+      label,
+      "3 video SEND pips must render (testCapabilityMaxLayersOverride: 3 forces them). " +
+        "A null here means the config.js/config.local.js injection did not take — check " +
+        "that setReducedLadderFlag is registered BEFORE enableSimulcastFlag.",
+    ).not.toBeNull();
+    // MUTATION: hardcode `active_camera_top_rung_label()` (or the Video arm of
+    // `send_layer_labels_with_top`) back to "720p" and this is the only test in the
+    // repo that fails.
+    expect(label, "#1768: with experimentalReducedLadder on, the top rung is 960x540").toBe("540p");
+
+    // The 180p BASE rung is intentionally identical across variants (the floor is
+    // ~1.3% of encode cost, so #1768 lowered only the top). If this moves, the
+    // reduced ladder changed more than it should have — and the receiver-side size
+    // lid, which only ever reads rungs BELOW the top, would stop being insensitive.
+    const panel = perfDrawer(page);
+    await expect(
+      panel.locator('[data-testid="perf-video-send-rung-0"] .perf-rung__label'),
+      "the 180p base rung must be identical across ladder variants",
+    ).toHaveText("180p");
+
+    // The pip's tooltip carries the same ladder-derived label, so a partial fix
+    // that updated only the visible text would still be caught here.
+    await expect(
+      panel.locator('[data-testid="perf-video-send-rung-2"]'),
+      "the pip tooltip must carry the same ladder-derived label",
+    ).toHaveAttribute("title", /540p/);
+  });
+});
+
+/**
+ * Issue #2156 — the RECEIVE-side rung labels must follow the deployed camera ladder.
+ *
+ * #1768's `experimentalReducedLadder` swapped the CAMERA publisher ladder from
+ * `[180p, 360p, 720p]` to `[180p, 360p, 540p]`. The SEND pip label followed
+ * (covered by the `reduced camera ladder gate (#1768)` describe above); the
+ * RECEIVE readouts did NOT, so the "Receiving" column labelled a 960x540 @ ~900 kbps
+ * stream "720p / ~1.5M" — wrong by 67% on the bitrate operators judge a run by, and
+ * SPOKEN wrongly by `aria-valuetext` on the receive range inputs (WCAG 2.2 4.1.2).
+ *
+ * WHY THIS SPEC IS THE RIGHT LEVEL FOR IT. The Rust unit tests cover both halves
+ * PURELY — `index_label_with_top` / `span_text_with_top` given a top rung, and
+ * `camera_ladder_variant_from_flag` for config→variant — but the IMPURE seam that
+ * joins them on the RECEIVE side (`receive::index_label` →
+ * `active_camera_top_rung_label()` → `window.__APP_CONFIG` + the AQ table) has no
+ * non-browser caller. Hardcoding that seam back to `"720p"` leaves every Rust test
+ * green. Same argument, and same shape, as the #1768 SEND spec above.
+ *
+ * WHY IT CANNOT VACUOUSLY PASS. Unlike the SEND rung strip, the RECEIVE slider's
+ * depth is NOT CPU-clamped: it comes from `receive::labels_for(kind).len()`, a
+ * constant 3, so `max="2"` and the top-rung end label ALWAYS render regardless of
+ * the runner's core count. No capability override is needed and there is no
+ * skip path — a failure here is a real failure. (`enableSimulcastFlag` is still
+ * passed so the two describes run under comparable config, and so the SEND column
+ * in the same panel is meaningful.)
+ *
+ * NOT tagged @bvt0/@bvt1, so this does NOT run in per-PR CI (`--project=bvt1`);
+ * validate via the local docker stack:
+ *   make e2e-up && make e2e SPEC=performance-settings.spec.ts
+ */
+test.describe("reduced camera ladder gate — RECEIVE labels (#2156)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  // Auth bypass via JWT session cookie, as every other describe in this file does.
+  // Without it the app redirects to the meeting-api login page and `joinMeeting`'s
+  // `toHaveURL(/\/meeting\/…/)` times out.
+  test.beforeEach(async ({ context, baseURL }) => {
+    await injectSessionCookie(context, { baseURL });
+  });
+
+  /** Same 3-layer capability override the #1768 SEND describe uses. */
+  const THREE_LAYERS = { capabilityMaxLayersOverride: 3 } as const;
+
+  /**
+   * Open the drawer and read the RECEIVE video slider's three user-visible
+   * rung-label surfaces at the TOP rung:
+   *   - `endLabel`  — the right-hand `.perf-range-end-label` text
+   *   - `valueText` — `aria-valuetext` on the MAX thumb (what a screen reader speaks)
+   *   - `bandText`  — the "Receiving: {lo} – {hi}" caption
+   *
+   * The min thumb is driven to the TOP too, so the MIN thumb's `aria-valuetext` is
+   * read at index 2 as well: the issue names only the max thumb, but the min thumb
+   * speaks the same wrong label when a user drags it up.
+   */
+  async function readReceiveVideoTopLabels(page: Page): Promise<{
+    endLabel: string;
+    maxValueText: string | null;
+    minValueText: string | null;
+    bandText: string;
+  }> {
+    await openPerformanceDrawer(page);
+    await selectReceiveDirection(page);
+    const panel = perfDrawer(page);
+
+    const maxInput = panel.locator('[data-testid="perf-recv-video-range-max"]');
+    const minInput = panel.locator('[data-testid="perf-recv-video-range-min"]');
+    await expect(maxInput).toBeVisible({ timeout: 10_000 });
+
+    // The receive ladder is a fixed 3 rungs (NOT capability-clamped), so this is a
+    // guaranteed invariant, asserted rather than tolerated — if it ever becomes
+    // variant-dependent the whole "depth is invariant" premise of #2156 is void.
+    await expect(
+      maxInput,
+      "the receive video ladder is a constant 3 rungs under BOTH ladder variants " +
+        "(#1768 changed rung RESOLUTIONS, never the depth — compile-time asserted in " +
+        "videocall-aq), so the top thumb position must be 2",
+    ).toHaveAttribute("max", "2");
+
+    // Drive the MIN thumb to the top as well so its aria-valuetext is read at the
+    // top rung too (it collapses the band, which is a legal state).
+    await setRangeValue(page, "perf-recv-video-range-min", 2);
+    await expect(minInput).toHaveValue("2");
+
+    const endLabel = (
+      await panel.locator('[data-testid="perf-recv-video-range-max"]').evaluate((el) => {
+        // The right-hand end label is the LAST `.perf-range-end-label` inside this
+        // slider's own `.perf-range` container — scoped to the container so the
+        // send-side sliders' end labels in the same card cannot be picked up.
+        const range = el.closest(".perf-range");
+        const labels = range?.querySelectorAll(".perf-range-end-label");
+        return labels && labels.length > 0 ? (labels[labels.length - 1].textContent ?? "") : "";
+      })
+    ).trim();
+
+    const maxValueText = await maxInput.getAttribute("aria-valuetext");
+    const minValueText = await minInput.getAttribute("aria-valuetext");
+    const bandText = (
+      await panel.locator('[data-testid="perf-recv-video-range-value"]').innerText()
+    ).trim();
+
+    return { endLabel, maxValueText, minValueText, bandText };
+  }
+
+  test("flag OFF: the RECEIVE video top rung reads 720p (the shipped ladder)", async ({ page }) => {
+    // No `setReducedLadderFlag` call — the PRODUCTION default path (the committed
+    // config.js omits the key, so RuntimeConfig defaults it to ""). This is the
+    // default-OFF guarantee protecting every deployment today.
+    await enableSimulcastFlag(page.context(), 3, THREE_LAYERS);
+    await joinMeeting(page, "recv_ladder_default", { cameraOff: true });
+
+    const labels = await readReceiveVideoTopLabels(page);
+    expect(labels.endLabel, "flag off must keep the shipped 720p receive end label").toBe("720p");
+    expect(labels.maxValueText, "flag off: the MAX thumb must SPEAK 720p (WCAG 2.2 4.1.2)").toBe(
+      "720p",
+    );
+    expect(labels.minValueText, "flag off: the MIN thumb at index 2 must also speak 720p").toBe(
+      "720p",
+    );
+    expect(labels.bandText, "flag off: the visible band readout must say 720p").toContain("720p");
+  });
+
+  test("flag ON: the RECEIVE video top rung reads 540p on all three surfaces", async ({ page }) => {
+    // ORDER IS LOAD-BEARING — `setReducedLadderFlag` MUST be registered FIRST.
+    //
+    // `BrowserContext.route()` registers with `_routes.unshift(...)`
+    // (playwright-core/lib/client/browserContext.js), so the LAST-registered handler
+    // for a URL is tried FIRST, and `_onRoute` stops at the first handler that reports
+    // `handled` — which `fulfill()` does. `route.fetch()` does NOT re-enter the handler
+    // list. BOTH helpers register a `**/config.js` handler, so whichever is registered
+    // LAST shadows the other's config.js entirely.
+    //
+    // Registering the ladder flag FIRST means `enableSimulcastFlag`'s config.js handler
+    // wins (injecting `experimentalSimulcastMaxLayers: 3` +
+    // `testCapabilityMaxLayersOverride`), while the ladder key still lands via the
+    // ladder helper's separate, UNSHADOWED `**/config.local.js` handler — the
+    // AUTHORITATIVE last config layer the app reads.
+    //
+    // Reversed, `experimentalReducedLadder` silently reverts to the committed
+    // config.js value (absent → ""), the flag reads OFF, and the assertions below fail
+    // with "720p" — which at least fails LOUDLY here, unlike the #1768 SEND test that
+    // silently SKIPPED. This spec has no skip path precisely so that mistake cannot
+    // read green again.
+    await setReducedLadderFlag(page.context(), "true");
+    await enableSimulcastFlag(page.context(), 3, THREE_LAYERS);
+    await joinMeeting(page, "recv_ladder_reduced", { cameraOff: true });
+
+    const labels = await readReceiveVideoTopLabels(page);
+
+    // MUTATION: hardcode `receive::index_label` back to the `VIDEO_LAYER_LABELS`
+    // const table (i.e. drop the `camera_top` substitution in
+    // `index_label_with_top`) and these are the only tests in the repo that fail.
+    expect(
+      labels.endLabel,
+      "#2156: with experimentalReducedLadder on, the receive top rung is 960x540",
+    ).toBe("540p");
+    expect(
+      labels.maxValueText,
+      "#2156: the MAX thumb's aria-valuetext SPEAKS the rung — it must say 540p, " +
+        "not the shipped 720p (WCAG 2.2 4.1.2)",
+    ).toBe("540p");
+    expect(
+      labels.minValueText,
+      "#2156: the MIN thumb at index 2 is equally wrong if unfixed — the issue names " +
+        "only the max thumb, but both inputs render aria-valuetext from index_label",
+    ).toBe("540p");
+    expect(
+      labels.bandText,
+      "#2156: the visible band readout (receive::span_text) must agree with the end " +
+        "label — a partial fix would render '180p – 720p' beside a '540p' end label",
+    ).toContain("540p");
+    expect(
+      labels.bandText,
+      "the band readout must NOT still mention the shipped 720p rung",
+    ).not.toContain("720p");
+
+    // The 180p BASE rung is intentionally identical across variants (#1768 lowered
+    // only the top). If this moves, the receiver-side size lid — which only ever reads
+    // rungs BELOW the top — would stop being insensitive to the variant.
+    const panel = perfDrawer(page);
+    const baseEndLabel = (
+      await panel.locator('[data-testid="perf-recv-video-range-min"]').evaluate((el) => {
+        const range = el.closest(".perf-range");
+        return range?.querySelector(".perf-range-end-label")?.textContent ?? "";
+      })
+    ).trim();
+    expect(baseEndLabel, "the 180p base rung must be identical across ladder variants").toBe(
+      "180p",
+    );
+
+    // SCREEN is variant-INVARIANT: its ladder is untouched by #1768 and
+    // `simulcast_screen_layers` has no variant at all. This is the highest-risk
+    // OVER-FIX in #2156 (`format_content_receive_summary` reads `snap.width/height`
+    // and looks like the video case), so pin that the screen labels did not move.
+    const screenMax = panel.locator('[data-testid="perf-recv-screen-range-max"]');
+    await expect(
+      screenMax,
+      "screen receive labels are qualitative and variant-invariant — a 540p here " +
+        "would mean the camera ladder leaked into the screen arm",
+    ).toHaveAttribute("aria-valuetext", "high");
   });
 });

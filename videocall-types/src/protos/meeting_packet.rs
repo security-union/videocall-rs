@@ -58,6 +58,26 @@ pub struct MeetingPacket {
     ///  keeps the wire format backward-compatible with older peers.
     // @@protoc_insertion_point(field:MeetingPacket.is_guest)
     pub is_guest: bool,
+    ///  For PARTICIPANT_LIST_REQUEST: the requesting joiner's CLAIMED per-tab
+    ///  instance_id. Relay-internal — PARTICIPANT_LIST_REQUEST is consumed by
+    ///  the receiving relay and never forwarded to clients.
+    ///
+    ///  NOT server-authoritative. The value originates as the client's own
+    ///  ?instance_id= connect parameter; the joiner's relay copies it onto the
+    ///  wire after a length/emptiness check only, and never checks it against
+    ///  the authenticated JWT sub. Treat it as a hint a client could forge.
+    ///
+    ///  It lets a responding relay count one client's dual election candidate
+    ///  sessions (WS + WT, distinct session_id, same instance_id) as ONE
+    ///  distinct requester, which selects a unicast re-announce instead of a
+    ///  broadcast. That is the only decision keyed on it, and a false claim
+    ///  resolves toward broadcast — reaching more sessions, never fewer — so a
+    ///  forged value cannot withhold a presence answer from anyone. Empty when
+    ///  the joiner supplied no instance_id or the request came from an older
+    ///  relay; receivers then fall back to keying on session_id, which is the
+    ///  pre-#1600 behaviour.
+    // @@protoc_insertion_point(field:MeetingPacket.requester_instance_id)
+    pub requester_instance_id: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:MeetingPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -75,7 +95,7 @@ impl MeetingPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(11);
+        let mut fields = ::std::vec::Vec::with_capacity(12);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "event_type",
@@ -132,6 +152,11 @@ impl MeetingPacket {
             |m: &MeetingPacket| { &m.is_guest },
             |m: &mut MeetingPacket| { &mut m.is_guest },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "requester_instance_id",
+            |m: &MeetingPacket| { &m.requester_instance_id },
+            |m: &mut MeetingPacket| { &mut m.requester_instance_id },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MeetingPacket>(
             "MeetingPacket",
             fields,
@@ -183,6 +208,9 @@ impl ::protobuf::Message for MeetingPacket {
                 88 => {
                     self.is_guest = is.read_bool()?;
                 },
+                98 => {
+                    self.requester_instance_id = is.read_string()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -228,6 +256,9 @@ impl ::protobuf::Message for MeetingPacket {
         if self.is_guest != false {
             my_size += 1 + 1;
         }
+        if !self.requester_instance_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(12, &self.requester_instance_id);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -267,6 +298,9 @@ impl ::protobuf::Message for MeetingPacket {
         if self.is_guest != false {
             os.write_bool(11, self.is_guest)?;
         }
+        if !self.requester_instance_id.is_empty() {
+            os.write_string(12, &self.requester_instance_id)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -295,6 +329,7 @@ impl ::protobuf::Message for MeetingPacket {
         self.session_id = 0;
         self.display_name.clear();
         self.is_guest = false;
+        self.requester_instance_id.clear();
         self.special_fields.clear();
     }
 
@@ -311,6 +346,7 @@ impl ::protobuf::Message for MeetingPacket {
             session_id: 0,
             display_name: ::std::vec::Vec::new(),
             is_guest: false,
+            requester_instance_id: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -475,7 +511,7 @@ pub mod meeting_packet {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1atypes/meeting_packet.proto\"\xd5\x06\n\rMeetingPacket\x12>\n\neven\
+    \n\x1atypes/meeting_packet.proto\"\x89\x07\n\rMeetingPacket\x12>\n\neven\
     t_type\x18\x01\x20\x01(\x0e2\x1f.MeetingPacket.MeetingEventTypeR\teventT\
     ype\x12\x17\n\x07room_id\x18\x02\x20\x01(\tR\x06roomId\x12\"\n\rstart_ti\
     me_ms\x18\x03\x20\x01(\x04R\x0bstartTimeMs\x12\x18\n\x07message\x18\x04\
@@ -485,18 +521,19 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x1d\n\nroom_token\x18\x08\x20\x01(\tR\troomToken\x12\x1d\n\nsession_id\
     \x18\t\x20\x01(\x04R\tsessionId\x12!\n\x0cdisplay_name\x18\n\x20\x01(\
     \x0cR\x0bdisplayName\x12\x19\n\x08is_guest\x18\x0b\x20\x01(\x08R\x07isGu\
-    est\"\xbe\x03\n\x10MeetingEventType\x12\x1e\n\x1aMEETING_EVENT_TYPE_UNKN\
-    OWN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\x01\x12\x11\n\rMEETING_ENDED\
-    \x10\x02\x12\x16\n\x12PARTICIPANT_JOINED\x10\x03\x12\x14\n\x10PARTICIPAN\
-    T_LEFT\x10\x04\x12\x15\n\x11MEETING_ACTIVATED\x10\x05\x12\x18\n\x14PARTI\
-    CIPANT_ADMITTED\x10\x06\x12\x18\n\x14PARTICIPANT_REJECTED\x10\x07\x12\
+    est\x122\n\x15requester_instance_id\x18\x0c\x20\x01(\tR\x13requesterInst\
+    anceId\"\xbe\x03\n\x10MeetingEventType\x12\x1e\n\x1aMEETING_EVENT_TYPE_U\
+    NKNOWN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\x01\x12\x11\n\rMEETING_END\
+    ED\x10\x02\x12\x16\n\x12PARTICIPANT_JOINED\x10\x03\x12\x14\n\x10PARTICIP\
+    ANT_LEFT\x10\x04\x12\x15\n\x11MEETING_ACTIVATED\x10\x05\x12\x18\n\x14PAR\
+    TICIPANT_ADMITTED\x10\x06\x12\x18\n\x14PARTICIPANT_REJECTED\x10\x07\x12\
     \x18\n\x14WAITING_ROOM_UPDATED\x10\x08\x12$\n\x20PARTICIPANT_DISPLAY_NAM\
     E_CHANGED\x10\t\x12\x1c\n\x18MEETING_SETTINGS_UPDATED\x10\n\x12\x19\n\
     \x15HOST_MUTE_PARTICIPANT\x10\x0b\x12\x16\n\x12HOST_DISABLE_VIDEO\x10\
     \x0c\x12\x16\n\x12PARTICIPANT_KICKED\x10\r\x12\x1c\n\x18PARTICIPANT_LIST\
     _REQUEST\x10\x0e\x12\x10\n\x0cHOST_GRANTED\x10\x0f\x12\x10\n\x0cHOST_REV\
-    OKED\x10\x10J\xc0\x14\n\x06\x12\x04\0\0:\x01\n\x08\n\x01\x0c\x12\x03\0\0\
-    \x12\nH\n\x02\x04\0\x12\x04\x03\0:\x01\x1a<\x20Meeting\x20lifecycle\x20m\
+    OKED\x10\x10J\xa5\x1d\n\x06\x12\x04\0\0M\x01\n\x08\n\x01\x0c\x12\x03\0\0\
+    \x12\nH\n\x02\x04\0\x12\x04\x03\0M\x01\x1a<\x20Meeting\x20lifecycle\x20m\
     essages\x20sent\x20between\x20server\x20and\x20clients\n\n\n\n\x03\x04\0\
     \x01\x12\x03\x03\x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x04\x02&\x03\n\
     \x0c\n\x05\x04\0\x04\0\x01\x12\x03\x04\x07\x17\n\r\n\x06\x04\0\x04\0\x02\
@@ -587,7 +624,32 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     m\x20on\x20the\x20server.\x20Default\x20false\n\x20keeps\x20the\x20wire\
     \x20format\x20backward-compatible\x20with\x20older\x20peers.\n\n\x0c\n\
     \x05\x04\0\x02\n\x05\x12\x039\x02\x06\n\x0c\n\x05\x04\0\x02\n\x01\x12\
-    \x039\x07\x0f\n\x0c\n\x05\x04\0\x02\n\x03\x12\x039\x12\x14b\x06proto3\
+    \x039\x07\x0f\n\x0c\n\x05\x04\0\x02\n\x03\x12\x039\x12\x14\n\xb8\x08\n\
+    \x04\x04\0\x02\x0b\x12\x03L\x02$\x1a\xaa\x08\x20For\x20PARTICIPANT_LIST_\
+    REQUEST:\x20the\x20requesting\x20joiner's\x20CLAIMED\x20per-tab\n\x20ins\
+    tance_id.\x20Relay-internal\x20\xe2\x80\x94\x20PARTICIPANT_LIST_REQUEST\
+    \x20is\x20consumed\x20by\n\x20the\x20receiving\x20relay\x20and\x20never\
+    \x20forwarded\x20to\x20clients.\n\n\x20NOT\x20server-authoritative.\x20T\
+    he\x20value\x20originates\x20as\x20the\x20client's\x20own\n\x20?instance\
+    _id=\x20connect\x20parameter;\x20the\x20joiner's\x20relay\x20copies\x20i\
+    t\x20onto\x20the\n\x20wire\x20after\x20a\x20length/emptiness\x20check\
+    \x20only,\x20and\x20never\x20checks\x20it\x20against\n\x20the\x20authent\
+    icated\x20JWT\x20sub.\x20Treat\x20it\x20as\x20a\x20hint\x20a\x20client\
+    \x20could\x20forge.\n\n\x20It\x20lets\x20a\x20responding\x20relay\x20cou\
+    nt\x20one\x20client's\x20dual\x20election\x20candidate\n\x20sessions\x20\
+    (WS\x20+\x20WT,\x20distinct\x20session_id,\x20same\x20instance_id)\x20as\
+    \x20ONE\n\x20distinct\x20requester,\x20which\x20selects\x20a\x20unicast\
+    \x20re-announce\x20instead\x20of\x20a\n\x20broadcast.\x20That\x20is\x20t\
+    he\x20only\x20decision\x20keyed\x20on\x20it,\x20and\x20a\x20false\x20cla\
+    im\n\x20resolves\x20toward\x20broadcast\x20\xe2\x80\x94\x20reaching\x20m\
+    ore\x20sessions,\x20never\x20fewer\x20\xe2\x80\x94\x20so\x20a\n\x20forge\
+    d\x20value\x20cannot\x20withhold\x20a\x20presence\x20answer\x20from\x20a\
+    nyone.\x20Empty\x20when\n\x20the\x20joiner\x20supplied\x20no\x20instance\
+    _id\x20or\x20the\x20request\x20came\x20from\x20an\x20older\n\x20relay;\
+    \x20receivers\x20then\x20fall\x20back\x20to\x20keying\x20on\x20session_i\
+    d,\x20which\x20is\x20the\n\x20pre-#1600\x20behaviour.\n\n\x0c\n\x05\x04\
+    \0\x02\x0b\x05\x12\x03L\x02\x08\n\x0c\n\x05\x04\0\x02\x0b\x01\x12\x03L\t\
+    \x1e\n\x0c\n\x05\x04\0\x02\x0b\x03\x12\x03L!#b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

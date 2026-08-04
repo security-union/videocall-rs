@@ -17,8 +17,9 @@
  */
 
 use crate::components::action_bar_layout::{
-    apply_keyboard_reorder, load_action_bar_layout, record_slot_visible, remove_action_bar_layout,
-    save_action_bar_layout, ActionBarSlot, DEFAULT_SLOTS,
+    apply_keyboard_reorder, load_action_bar_layout, meeting_timer_slot_visible,
+    record_slot_visible, remove_action_bar_layout, save_action_bar_layout, ActionBarSlot,
+    DEFAULT_SLOTS,
 };
 use crate::components::decode_budget::{
     build_decoded_bucket, build_unified_render_list, decide_step, effective_cap,
@@ -43,6 +44,7 @@ use crate::components::{
     emoji_picker::EmojiPicker,
     host::Host,
     host_controls::HostControls,
+    icons::raised_hand::RaisedHandIcon,
     media_metrics_overlay::{MediaMetricsOverlayCtx, MEDIA_METRICS_OVERLAY_KEY},
     meeting_ended_overlay::MeetingEndedOverlay,
     meeting_options_controls::MeetingOptionsControls,
@@ -54,8 +56,9 @@ use crate::components::{
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
         js_state_to_record_button_state, CameraButton, DensityModeButton, DeviceSettingsButton,
-        DiagnosticsButton, HangUpButton, MeetingOptionsButton, MicButton, MockPeersButton,
-        PeerListButton, ReactionsButton, RecordButton, RecordButtonState, ScreenShareButton,
+        DiagnosticsButton, HangUpButton, MeetingOptionsButton, MeetingTimerButton, MicButton,
+        MockPeersButton, PeerListButton, RaiseHandButton, ReactionsButton, RecordButton,
+        RecordButtonState, ScreenShareButton,
     },
 };
 use crate::console_log_collector::{
@@ -77,9 +80,10 @@ use crate::context::{
     save_preferred_speaker_id, validate_display_name, AppearanceSettingsCtx, AutohideCtx,
     CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx, DetachedShareCtx,
     DisplayNameCtx, DockPosition, DockPositionCtx, HostRefreshNonceCtx, HostSetCtx,
-    LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap,
-    RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState, SignalPopupStateMap,
-    TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
+    LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerMetadata, PeerMetadataCtx,
+    PeerSignalHistoryMap, PeerStatusMap, RaisedHandsCtx, RecordingSetCtx, ScreenActualSizeCtx,
+    ScreenZoomCtx, ScreenZoomState, SignalPopupStateMap, TransportPreference,
+    TransportPreferenceCtx, UserRequestedDecodeCtx,
 };
 use crate::local_storage::{load_bool, load_f64, load_json, remove_item, save_f64, save_json};
 use crate::types::DeviceInfo;
@@ -90,10 +94,25 @@ use crate::components::reactions::{
     sanitize_recent_custom_emojis, show_recents_group, step_reaction, FloatingReaction, REACTIONS,
     REACTION_FLOAT_LIFETIME_MS, REACTION_PALETTE_AUTOHIDE_MS, REACTION_SR_THROTTLE_MS,
 };
+// Issue 2135: the raised-hand roster store (ordering + copy) and its banner.
+use crate::components::raised_hands::{
+    clear_raised_hand, clear_self_raised_hand, resync_self_session_id, set_raised_hand,
+    set_self_raised_hand, would_clear_raised_hand_change, would_set_raised_hand_change, RaisedHand,
+    RaisedHandsBanner, RaisedHandsLiveRegion, SELF_RAISED_HAND_BADGE_LABEL,
+};
+// Issue 2136: the host-set meeting countdown. The chip and the live region are
+// the ONLY readers of `MeetingTimerCtx`; this module provides the context and
+// drives the send cadence but deliberately never reads the state back.
+use crate::components::icons::meeting_timer::MeetingTimerIcon;
+use crate::components::meeting_timer::{
+    extend_state, should_drop_timer_on_connect, start_state, would_apply_change, MeetingTimerChip,
+    MeetingTimerCtx, MeetingTimerDockControl, MeetingTimerLiveRegion, MeetingTimerPopover,
+    MEETING_TIMER_EXTEND_STEP_MS,
+};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
-use gloo_timers::callback::Timeout;
+use gloo_timers::callback::{Interval, Timeout};
 use gloo_utils::window;
 use log::error;
 use std::cell::{Cell, RefCell};
@@ -104,7 +123,8 @@ use videocall_client::Callback as VcCallback;
 use videocall_client::MediaDeviceList;
 use videocall_client::{
     validate_custom_emoji, ConnectionLostReason, MediaAccessKind, MediaDeviceAccess,
-    MediaPermission, MediaPermissionsErrorState, PermissionState, ReactionSelfThrottle,
+    MediaPermission, MediaPermissionsErrorState, MeetingTimerScheduler, MeetingTimerState,
+    PermissionState, RaiseHandAnnouncer, RaiseHandSend, RaiseHandTrigger, ReactionSelfThrottle,
     ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
 };
 #[cfg(feature = "media-server-jwt-auth")]
@@ -810,6 +830,150 @@ fn push_reaction_float(
     .forget();
 }
 
+/// Carry out one [`RaiseHandSend`] decision (issue 2135): put the packet on the
+/// wire, arm the single deferred-send timer, or do nothing.
+///
+/// Split out from [`drive_raise_hand`] so the `Now` and `Defer` handling lives in
+/// exactly one place for BOTH entry points (a fresh request and a timer flush).
+///
+/// The level and stamp are read from the announcer at SEND time, never captured
+/// when the timer was armed — that is what makes a coalesced burst of toggles
+/// send the user's FINAL choice rather than a stale one.
+fn apply_raise_hand_decision(
+    decision: RaiseHandSend,
+    client: &VideoCallClient,
+    announcer: &Rc<RefCell<RaiseHandAnnouncer>>,
+    mut timer: Signal<Option<Timeout>>,
+    now_ms: f64,
+) {
+    match decision {
+        RaiseHandSend::Now => {
+            let (raised, raised_at_ms) = {
+                let a = announcer.borrow();
+                (a.is_raised(), a.raised_at_ms())
+            };
+            client.send_raise_hand(raised, raised_at_ms);
+            announcer.borrow_mut().note_sent(now_ms);
+        }
+        RaiseHandSend::Defer { delay_ms } => {
+            let client = client.clone();
+            let announcer = announcer.clone();
+            // Replacing the signal's contents DROPS any previous handle, which
+            // cancels it. Safe here because the announcer guarantees at most one
+            // outstanding deferral (it answers `Coalesced` while one is armed),
+            // so the handle being replaced is always a SPENT one whose closure
+            // has already returned — never the closure we are inside of.
+            // `delay_millis` performs the f64 -> u32 clamp in the (host-tested)
+            // client module rather than as a bare cast here.
+            let delay = RaiseHandSend::Defer { delay_ms }
+                .delay_millis()
+                .unwrap_or(0);
+            timer.set(Some(Timeout::new(delay, move || {
+                let now = js_sys::Date::now();
+                // `flush` returns only Now or Skip, so this cannot re-arm the
+                // timer from inside its own callback (see its doc comment).
+                let decision = announcer.borrow_mut().flush(now);
+                if matches!(decision, RaiseHandSend::Now) {
+                    let (raised, raised_at_ms) = {
+                        let a = announcer.borrow();
+                        (a.is_raised(), a.raised_at_ms())
+                    };
+                    client.send_raise_hand(raised, raised_at_ms);
+                    announcer.borrow_mut().note_sent(now);
+                }
+            })));
+        }
+        // Nothing to do: the room already knows this level, or an armed flush
+        // will carry the request.
+        RaiseHandSend::Skip | RaiseHandSend::Coalesced => {}
+    }
+}
+
+/// Ask the announcer what to do about `trigger` and carry it out (issue 2135).
+///
+/// The single entry point every caller uses — the local toggle, the peer-join
+/// re-announce, and the post-reconnect self-heal — so the rate gate and the
+/// join-wave coalescing can never be bypassed by one of them.
+fn drive_raise_hand(
+    client: &VideoCallClient,
+    announcer: &Rc<RefCell<RaiseHandAnnouncer>>,
+    timer: Signal<Option<Timeout>>,
+    trigger: RaiseHandTrigger,
+) {
+    let now = js_sys::Date::now();
+    let decision = announcer.borrow_mut().request(trigger, now);
+    apply_raise_hand_decision(decision, client, announcer, timer, now);
+}
+
+/// How often the meeting-timer send pump polls the scheduler (issue 2136).
+///
+/// The scheduler decides WHAT to send and WHEN; this only bounds how late a due
+/// packet can be. 250ms keeps a transition burst's ~1s spacing accurate to within
+/// a quarter second while costing four integer comparisons a second on the only
+/// client that ever arms it.
+const MEETING_TIMER_PUMP_MS: u32 = 250;
+
+/// Arm the meeting-timer send pump if it is not already running (issue 2136).
+///
+/// Armed LAZILY — on the first transition this client authors — rather than at
+/// mount, so a participant who never touches the timer never runs the interval at
+/// all. Once armed it stays armed until unmount: an idle poll is two integer
+/// comparisons, and self-disarming from inside the closure that owns the handle
+/// is a lifetime knot for no measurable saving.
+///
+/// The handle is HELD in a signal, never `.forget()`-ed, so unmount drops and
+/// cancels it. The closure writes NO signal — it only reads the scheduler and
+/// calls the client — so it cannot hit the dropped-scope panic that
+/// `Signal::set` (i.e. `try_write().unwrap()`) would.
+fn arm_meeting_timer_pump(
+    client: &VideoCallClient,
+    scheduler: &Rc<RefCell<MeetingTimerScheduler>>,
+    mut pump: Signal<Option<Interval>>,
+) {
+    if pump.peek().is_some() {
+        return;
+    }
+    let client = client.clone();
+    let scheduler = scheduler.clone();
+    let interval = Interval::new(MEETING_TIMER_PUMP_MS, move || {
+        let now = js_sys::Date::now() as u64;
+        // Poll returns at most one packet per call by design, so a burst is
+        // spread across polls rather than emitted back-to-back.
+        let due = scheduler.borrow_mut().poll(now);
+        if let Some(state) = due {
+            client.send_meeting_timer(state);
+        }
+    });
+    pump.set(Some(interval));
+}
+
+/// Apply a host meeting-timer transition: schedule it for the wire AND render the
+/// local echo (issue 2136).
+///
+/// The echo is required, not an optimisation: the relay SELF-SKIPS the sender on
+/// the fan-out, exactly as it does for reactions, so the host never receives its
+/// own timer back and would otherwise see nothing at all after clicking start.
+///
+/// Both halves take the SAME `state` value, so the host's own view and the room's
+/// cannot disagree — including `updated_at_ms`, which means a packet the host
+/// echoes locally and then hears back from a re-broadcast (it should not, but the
+/// transport self-filter is not airtight during a re-election) is suppressed by
+/// `would_apply_change` as a no-op rather than re-applied.
+fn apply_meeting_timer_transition(
+    client: &VideoCallClient,
+    scheduler: &Rc<RefCell<MeetingTimerScheduler>>,
+    pump: Signal<Option<Interval>>,
+    mut state_signal: Signal<Option<MeetingTimerState>>,
+    state: MeetingTimerState,
+    now_ms: u64,
+) {
+    scheduler.borrow_mut().request(state, now_ms);
+    arm_meeting_timer_pump(client, scheduler, pump);
+    if would_apply_change(*state_signal.peek(), state) {
+        state_signal.set(Some(state));
+    }
+}
+
 /// Buffer one peer reaction for screen-reader announcement and, if no flush is
 /// already pending, schedule the throttled drain (issue #1884). Called ONLY on
 /// the receive path — the local "You" echo is never announced. The flush fires
@@ -1239,6 +1403,40 @@ fn should_clear_departed_recorder(is_reconnecting: bool, departing_session_in_se
     recording_set_write_needed(RecordingWriteOp::Remove, departing_session_in_set)
 }
 
+/// Whether `on_peer_left` must drop the departing session's RAISED HAND (issue
+/// 2135) — deliberately INDEPENDENT of the local client's reconnect state, for
+/// exactly the reasons spelled out on [`should_clear_departed_recorder`].
+///
+/// The reasoning transfers verbatim, because raised-hand state has the same
+/// shape as recording state: it is purely LIVE (there is no server-side hand
+/// registry and no roster reconciliation), and a departing participant can no
+/// longer send the `raised = false` that would clear it. So a hand left up on
+/// departure stays up in the banner, the roster, and every tile badge until page
+/// reload — and unlike a stuck recording dot, it actively misleads: the meeting
+/// keeps calling on someone who is gone.
+///
+/// The reconnect independence matters for the same reason too: the leave toast
+/// IS suppressed while the LOCAL client is mid-reconnect (issue #244), but the
+/// relay only ever broadcasts `PARTICIPANT_LEFT` for a GENUINE departure — a
+/// transport-only reconnect is cancelled within the grace period and never emits
+/// LEFT (see `chat_server` `pending_departures`). Every left event that reaches
+/// the UI therefore means that exact session is truly gone, whether or not we
+/// happen to be reconnecting, so the clear must run ahead of the early return.
+///
+/// `is_reconnecting` is accepted so that contract is explicit and
+/// mutation-pinnable: a future change that (wrongly) gated the removal on
+/// reconnect would have to alter this function, and the test would fail. Kept
+/// pure (see `mod tests`).
+fn should_clear_departed_hand(is_reconnecting: bool, departing_session_raised: bool) -> bool {
+    // Intentionally unused — see the doc comment.
+    let _ = is_reconnecting;
+    // Membership-guarded like the recording clear: the vast majority of leavers
+    // never raised a hand, and an unconditional `Signal::write()` would dirty
+    // the roster (re-rendering the banner, the peer list, and every peer tile)
+    // once per departure during a reconnection wave.
+    departing_session_raised
+}
+
 /// One side effect `on_peer_left` performs, listed in the ORDER it must run.
 ///
 /// Extracted so the *ordering* itself is unit-testable. The headline fix for the
@@ -1260,6 +1458,12 @@ enum OnPeerLeftAction {
     /// guard) and, crucially, INDEPENDENT of `is_reconnecting` — so it is always
     /// ordered ahead of `SuppressLeaveAndReturn`.
     ClearRecordingIcon,
+    /// Drop the departing session's raised hand (issue 2135), clearing its
+    /// banner entry, roster badge, and tile badge. Emitted iff that session's
+    /// hand is actually up (the redundant-write guard) and, like
+    /// [`Self::ClearRecordingIcon`], INDEPENDENT of `is_reconnecting` — so it is
+    /// always ordered ahead of `SuppressLeaveAndReturn`.
+    ClearRaisedHand,
     /// Suppress the leave toast + sound and stop processing (the reconnect
     /// early-return, issue #244). Terminal: no action follows it.
     SuppressLeaveAndReturn,
@@ -1276,6 +1480,7 @@ enum OnPeerLeftAction {
 fn on_peer_left_actions(
     is_reconnecting: bool,
     departing_session_in_set: bool,
+    departing_session_raised: bool,
 ) -> Vec<OnPeerLeftAction> {
     let mut actions = Vec::new();
     // (1) Recording-set cleanup FIRST — NOT gated on reconnect. This ordering IS
@@ -1285,12 +1490,19 @@ fn on_peer_left_actions(
     if should_clear_departed_recorder(is_reconnecting, departing_session_in_set) {
         actions.push(OnPeerLeftAction::ClearRecordingIcon);
     }
-    // (2) THEN the reconnect early-return suppresses the toast/sound and stops.
+    // (2) Raised-hand cleanup, on the same terms and for the same reason (issue
+    // 2135): purely live state the departing session can no longer retract, so
+    // it must be cleared ahead of the reconnect early-return or the hand stays
+    // up for the rest of the meeting.
+    if should_clear_departed_hand(is_reconnecting, departing_session_raised) {
+        actions.push(OnPeerLeftAction::ClearRaisedHand);
+    }
+    // (3) THEN the reconnect early-return suppresses the toast/sound and stops.
     if is_reconnecting {
         actions.push(OnPeerLeftAction::SuppressLeaveAndReturn);
         return actions;
     }
-    // (3) Otherwise fall through to the normal leave-notification path.
+    // (4) Otherwise fall through to the normal leave-notification path.
     actions.push(OnPeerLeftAction::ProcessLeaveNotification);
     actions
 }
@@ -1484,12 +1696,20 @@ fn read_nav_axis_gap_px(nav: &web_sys::Element, is_vertical: bool) -> f64 {
 // ─── Shared `.glass-select-menu` keyboard-navigation helpers ────────────────
 // WCAG 2.1.1 keyboard equivalents for the dock-position dropdown that houses
 // Bottom/Left/Right, autohide, Customize, and Reset to Default. Before these
-// helpers the menu options were `<div role="option">` with only `onclick` —
-// a keyboard user could not enter customize mode or reset the bar at all.
+// helpers the menu options were `<div>`s with only `onclick` — a keyboard user
+// could not enter customize mode or reset the bar at all.
 // The helpers are reusable across any wrapper that hosts a
 // `.glass-select-menu` with `.glass-select-option` children (and optional
 // `.glass-select-separator` interlopers, which are naturally skipped by the
 // `.glass-select-option` class selector).
+//
+// They key off the `.glass-select-option` CLASS, never off `role`. That is why
+// re-roling the dock menu from listbox/option to menu/menuitem* (issue 1762)
+// left every navigation path below byte-identical, and why they would apply
+// unchanged to `device_settings_modal`'s device-picker, which keeps its own
+// inline sibling walk and a genuine `role="listbox"`. (Today every caller of
+// these two helpers lives in this file and passes `.dock-position-wrapper`;
+// the device picker has not been migrated onto them.)
 
 /// Focus the element with the given `id`. Silently no-op if the id is not
 /// present in the document or the element is not focusable — this lets
@@ -1589,9 +1809,9 @@ fn focus_glass_option_at(wrapper_selector: &str, last: bool) {
 /// Move focus to the next (`delta = +1`) or previous (`delta = -1`)
 /// `.glass-select-option` relative to the currently-focused element.
 /// Separators are skipped by walking sibling-by-sibling and matching on the
-/// option class. Focus wraps at the ends (APG listbox convention). No-op if
-/// nothing in the document has focus or the active element isn't inside a
-/// menu.
+/// option class. Focus wraps at the ends (the APG convention shared by the
+/// listbox and menu patterns). No-op if nothing in the document has focus or
+/// the active element isn't inside a menu.
 fn focus_glass_option_relative(delta: i32) {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
@@ -1770,6 +1990,12 @@ fn overflow_slot_icon(slot: ActionBarSlot) -> Element {
                 path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
             }
         },
+        // Issue 2136: reuses the shared icon component rather than inlining a
+        // second copy of the path data, so the customize picker and the live
+        // control can never drift apart visually.
+        ActionBarSlot::MeetingTimer => rsx! {
+            MeetingTimerIcon { decorative: true }
+        },
         // Issue #1884: Reactions (smiley), mirroring the ReactionsButton glyph.
         ActionBarSlot::Reactions => rsx! {
             svg {
@@ -1787,53 +2013,63 @@ fn overflow_slot_icon(slot: ActionBarSlot) -> Element {
                 line { x1: "15", y1: "9", x2: "15.01", y2: "9" }
             }
         },
+        // Issue 2135: Raise hand, sharing the exact glyph the action-bar button
+        // uses so the control is recognisable after it overflows into the menu.
+        ActionBarSlot::RaiseHand => rsx! {
+            RaisedHandIcon { decorative: true }
+        },
         // Mic + Camera never appear in the overflow popover.
         _ => rsx! {},
     }
 }
 
-fn is_action_bar_slot_visible(
-    slot: ActionBarSlot,
+/// The flags that decide whether a given action-bar slot is rendered.
+///
+/// A STRUCT rather than six positional `bool` parameters, which is what this
+/// was until issue 2136 added a seventh flag and tripped
+/// `clippy::too_many_arguments`. The lint was pointing at a real hazard: at a
+/// call site, six consecutive bare `bool`s can be transposed in any pair and
+/// still compile, silently showing the record button to someone who should not
+/// have it (or hiding the host's timer). Named fields make that a type error.
+#[derive(Clone, Copy, Debug)]
+struct SlotVisibility {
     customize_mode: bool,
     ios_device: bool,
     has_screen_share: bool,
     is_owner: bool,
+    /// Pre-computed by [`record_slot_visible`] (issue 1746).
     recording_visible: bool,
-) -> bool {
+    /// Pre-computed by [`meeting_timer_slot_visible`] (issue 2136). Derives from
+    /// the caller's LIVE host signal, NOT `is_owner` above -- see that function.
+    meeting_timer_visible: bool,
+}
+
+fn is_action_bar_slot_visible(slot: ActionBarSlot, vis: SlotVisibility) -> bool {
     match slot {
-        ActionBarSlot::ScreenShare => customize_mode || !ios_device,
-        ActionBarSlot::DensityMode => customize_mode || !has_screen_share,
-        ActionBarSlot::MeetingOptions => is_owner,
+        ActionBarSlot::ScreenShare => vis.customize_mode || !vis.ios_device,
+        ActionBarSlot::DensityMode => vis.customize_mode || !vis.has_screen_share,
+        ActionBarSlot::MeetingOptions => vis.is_owner,
         // Recording gating (#1746): guests never see it, the host always does,
         // authenticated non-hosts only when the meeting allows it. The caller
         // pre-computes this via `record_slot_visible` so the per-slot rule stays
         // host-testable and this function keeps a single `bool` for it.
-        ActionBarSlot::Recording => recording_visible,
+        ActionBarSlot::Recording => vis.recording_visible,
+        // Issue 2136: host-only, and gated on the caller's LIVE host signal
+        // rather than the `is_owner` prop above -- see
+        // `meeting_timer_slot_visible` for why the distinction is
+        // security-relevant rather than cosmetic. Pre-computed by the caller so
+        // the per-slot rule stays host-testable and this function keeps a single
+        // `bool` for it, exactly as Recording does.
+        ActionBarSlot::MeetingTimer => vis.meeting_timer_visible,
         _ => true,
     }
 }
 
-fn visible_action_bar_slots(
-    slots: &[ActionBarSlot],
-    customize_mode: bool,
-    ios_device: bool,
-    has_screen_share: bool,
-    is_owner: bool,
-    recording_visible: bool,
-) -> Vec<ActionBarSlot> {
+fn visible_action_bar_slots(slots: &[ActionBarSlot], vis: SlotVisibility) -> Vec<ActionBarSlot> {
     slots
         .iter()
         .copied()
-        .filter(|slot| {
-            is_action_bar_slot_visible(
-                *slot,
-                customize_mode,
-                ios_device,
-                has_screen_share,
-                is_owner,
-                recording_visible,
-            )
-        })
+        .filter(|slot| is_action_bar_slot_visible(*slot, vis))
         .collect()
 }
 
@@ -1910,25 +2146,14 @@ fn action_bar_overflow_hidden(
 fn merge_visible_action_bar_slots(
     full_slots: &[ActionBarSlot],
     reordered_visible_slots: &[ActionBarSlot],
-    customize_mode: bool,
-    ios_device: bool,
-    has_screen_share: bool,
-    is_owner: bool,
-    recording_visible: bool,
+    vis: SlotVisibility,
 ) -> Vec<ActionBarSlot> {
     let mut visible_idx = 0usize;
     full_slots
         .iter()
         .copied()
         .map(|slot| {
-            if is_action_bar_slot_visible(
-                slot,
-                customize_mode,
-                ios_device,
-                has_screen_share,
-                is_owner,
-                recording_visible,
-            ) {
+            if is_action_bar_slot_visible(slot, vis) {
                 let mapped_slot = reordered_visible_slots
                     .get(visible_idx)
                     .copied()
@@ -1943,12 +2168,439 @@ fn merge_visible_action_bar_slots(
 }
 
 /// Returns true if the keyboard event carries an "activate this option" key:
-/// Enter or Space. On a `<div role="option">` the browser does NOT synthesise
-/// a click for either key (unlike a `<button>`), so callers must handle the
-/// activation themselves.
+/// Enter or Space. On a non-button `div` (whatever its ARIA role — this fn
+/// serves `option`, `menuitem`, `menuitemradio` and `menuitemcheckbox`
+/// callers) the browser does NOT synthesise a click for either key, unlike a
+/// `<button>`, so callers must handle the activation themselves. The name
+/// predates the issue-1762 re-roling and is kept so the device-picker call
+/// sites don't churn.
 fn is_option_activate_key(evt: &Event<KeyboardData>) -> bool {
     let key = evt.key();
     key == Key::Enter || matches!(&key, Key::Character(s) if s == " ")
+}
+
+/// Screen-reader confirmation pushed into the action-bar live region when
+/// "Reset to Default" restores the stock layout (issue 1765). Reset lives in
+/// the dock menu, which only renders while customize mode is OFF; the live
+/// region that carries this text is mounted unconditionally inside
+/// `.controls`, so the announcement is observable on both the pointer and the
+/// keyboard activation path.
+const ACTION_BAR_RESET_ANNOUNCEMENT: &str = "Action bar reset to default layout.";
+
+/// `id` of the visually-hidden element that describes the arrow-key reorder
+/// affordance, referenced by every customize-mode slot button through
+/// `aria-describedby` (issue 1765). Both the element and the references are
+/// gated on the same `customize_mode()` condition and therefore land in the
+/// same Dioxus render commit, so the reference is never left dangling.
+const ACTION_BAR_SLOT_HINT_ID: &str = "action-bar-slot-reorder-hint";
+
+/// Visible label of the dock menu's auto-hide item (issue 1762).
+///
+/// Deliberately a STABLE NOUN, not the imperative "Turn Hiding On/Off" it used
+/// to be. The item carries `role="menuitemcheckbox"` + `aria-checked`, and the
+/// universal reading of a checkbox is "the thing named is true". An imperative
+/// label flips with the state that `aria-checked` also flips, so the two
+/// signals cancel: auto-hide ON rendered "Turn Hiding Off" + `checked`, which a
+/// screen reader speaks as "Turn Hiding Off, check box, checked" — the user
+/// concludes hiding is OFF at the exact moment it is ON. WCAG 4.1.2
+/// Name/Role/Value. A noun label leaves `aria-checked` as the single source of
+/// truth for the state.
+///
+/// An `aria-label` override was rejected: it would strip the visible text from
+/// the accessible name and break WCAG 2.5.3 Label in Name.
+const DOCK_AUTOHIDE_LABEL: &str = "Auto-hide action bar";
+
+/// Number of `.glass-select-option` children the dock menu renders (issue
+/// 1762): Bottom, Left, Right, auto-hide, Customize, Reset to Default, Action
+/// Bar…. Drives the roving-tabindex arithmetic below. `.glass-select-separator`
+/// children are NOT counted — `focus_glass_option_relative` skips them, so the
+/// roving index must be over options only.
+///
+/// If an item is added or removed, this constant must move with it. The pin is
+/// the `toHaveCount` assertion on `.dock-position-wrapper .glass-select-menu
+/// .glass-select-option` in `e2e/tests/dock-settings.spec.ts`, which fails loudly
+/// on drift.
+const DOCK_MENU_ITEM_COUNT: usize = 7;
+
+/// Next roving-tabindex index for the dock menu, wrapping at both ends.
+///
+/// Mirrors the wrap behavior of `focus_glass_option_relative` (which wraps to
+/// the first/last `.glass-select-option` when the sibling walk runs off the
+/// end) so the rendered `tabindex="0"` always lands on the item that DOM focus
+/// just moved to. `count == 0` is defended against because a `%` by zero
+/// panics; it cannot happen with the constant above but the fn is pure and
+/// unit-tested, so it should not depend on its caller for that.
+fn next_dock_menu_index(current: usize, delta: i32, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let current = current % count;
+    if delta >= 0 {
+        (current + 1) % count
+    } else {
+        (current + count - 1) % count
+    }
+}
+
+/// Text rendered into the action-bar live region (issue 1765).
+///
+/// A live region only re-announces when its text NODE actually changes:
+/// `dioxus-core`'s `diff_vtext` emits `set_node_text` solely when
+/// `left.value != right.value`, so writing the SAME string twice produces no
+/// DOM mutation and therefore no second announcement. That silently swallowed
+/// the second of two consecutive "Reset to Default" presses, and every repeat
+/// of "X is already at position N of M." on the reorder path.
+///
+/// The fix is an alternating invisible suffix driven by a nonce the writers
+/// bump on every write: odd nonces append U+00A0 NO-BREAK SPACE, even ones
+/// append nothing. `VText.value` therefore differs between consecutive writes
+/// of identical logical text, the mutation fires, and the region re-announces.
+/// U+00A0 is whitespace — invisible on screen and not spoken.
+///
+/// An empty message stays exactly empty so the "clear on customize-mode exit"
+/// path parks the region silent rather than holding a lone whitespace node.
+fn action_bar_announce_text(message: &str, nonce: u32) -> String {
+    if message.is_empty() {
+        String::new()
+    } else if nonce % 2 == 1 {
+        format!("{message}\u{00A0}")
+    } else {
+        message.to_string()
+    }
+}
+
+/// RAII guard for a `window` event listener: the handler is registered on
+/// construction and **removed on `Drop`**.
+///
+/// Generalised from the resize-only guard of issue 2053 (issue 2100): the event
+/// name is now a field, so the SAME guard covers the dock auto-hide
+/// `mousemove` / `touchstart` listeners and the permission-recheck `focus`
+/// listener, all of which had the identical `.forget()`-plus-signal-write
+/// defect.
+///
+/// Store one in a `use_hook` (wrapped in `Rc`, since `use_hook` requires
+/// `Clone` and hands back a clone each render) to bind the listener's lifetime
+/// to the component INSTANCE: Dioxus drops a scope's hook values when the scope
+/// is torn down, which is the very mechanism `use_drop` is built on
+/// (`dioxus_core::use_drop` stores an `Rc<LifeCycle>` in a `use_hook` and runs
+/// its callback from that value's `Drop`). So a `Drop`-implementing hook value
+/// is cleaned up on unmount just as reliably as a `use_drop` closure.
+///
+/// This type exists because `Closure::forget()` keeps a callback alive for the
+/// lifetime of the PAGE, not the component — so a SINGLE unmount is already a
+/// bug; no remount is needed. The reachable trigger is an in-page router
+/// unmount: `MeetingPage` is a client-side route
+/// (`#[route("/meeting/:id", MeetingPage)]` in `routing.rs`), so navigating away
+/// from it — browser Back being the easy one — unmounts `AttendantsComponent`
+/// while the wasm instance keeps running. A forgotten closure stays registered
+/// and still fires on the next resize, writing a signal whose scope is gone. In
+/// Dioxus 0.7 `Signal::write`/`with_mut` is `try_write().unwrap()`
+/// (dioxus-signals `write.rs:271`), so that write panics the client
+/// (issue 2053).
+///
+/// NOT the trigger, despite the issue body saying so: the transport reconnect
+/// (#1311) does not unmount this component. `MeetingPage`'s `on_connection_lost`
+/// only `log::warn!`s and never touches `meeting_status` (`pages/meeting.rs`),
+/// and the host-refresh path re-renders IN PLACE deliberately without a `key`
+/// (`context.rs`, `pages/meeting.rs`). Nor is it an `Admitted` round trip: once
+/// `Admitted` is reached the only later setter re-sets `Admitted`, and both
+/// leave paths hard-navigate via `location().set_href("/")`
+/// (`meeting_ended_overlay.rs`, and the hangup handler below), which resets the
+/// page instead of remounting within it.
+struct WindowEventListener {
+    /// The event this guard registered for, kept so `Drop` deregisters the
+    /// SAME event it registered — passing a different name to
+    /// `removeEventListener` is a silent no-op, i.e. the leak all over again.
+    event: &'static str,
+    /// `Some` while registered; taken by `Drop` after the listener is removed.
+    /// Dropping the `Closure` frees the wasm callback slot — the leak that
+    /// `Closure::forget()` made permanent.
+    cb: Option<Closure<dyn FnMut()>>,
+}
+
+impl WindowEventListener {
+    /// Registers `handler` for `window`'s `event` and returns the guard that
+    /// owns it. The handler fires until the guard is dropped.
+    ///
+    /// The handler takes no arguments even for events that carry one (`focus`,
+    /// `mousemove`, `touchstart`): JS ignores extra parameters a callback does
+    /// not declare, and none of the call sites read the event object.
+    fn new(event: &'static str, handler: impl FnMut() + 'static) -> Self {
+        let cb = Closure::<dyn FnMut()>::new(handler);
+        if let Some(win) = web_sys::window() {
+            let _ = win.add_event_listener_with_callback(event, cb.as_ref().unchecked_ref());
+        }
+        Self {
+            event,
+            cb: Some(cb),
+        }
+    }
+}
+
+impl Drop for WindowEventListener {
+    fn drop(&mut self) {
+        if let Some(cb) = self.cb.take() {
+            // Deregister BEFORE the `Closure` is dropped at the end of this
+            // scope: a still-registered closure whose backing storage has been
+            // freed throws "closure invoked after being dropped" when JS
+            // dispatches into it.
+            if let Some(win) = web_sys::window() {
+                let _ = win
+                    .remove_event_listener_with_callback(self.event, cb.as_ref().unchecked_ref());
+            }
+        }
+    }
+}
+
+/// Dock auto-hide narrows the action bar after this long without pointer input.
+const DOCK_NARROW_DELAY_MS: u32 = 1_000;
+/// Dock auto-hide hides the action bar entirely after this long without pointer
+/// input. Deliberately longer than `DOCK_NARROW_DELAY_MS`: the bar narrows
+/// first, then disappears.
+const DOCK_HIDE_DELAY_MS: u32 = 4_000;
+
+/// A pending dock auto-hide timer, shared between the pointer listeners and the
+/// initial arming.
+///
+/// `gloo`'s `Timeout` cancels its `setTimeout` on `Drop` AND frees the wasm
+/// closure it owns, which is what makes both halves of issue 2100 work here:
+/// replacing the `Option`'s contents cancels the timer it supersedes (instead
+/// of leaking a `Closure::once(..).forget()` per pointer event), and dropping
+/// the cell on unmount cancels whatever is still pending (instead of firing
+/// `controls_visible.set(false)` into a torn-down scope up to 4s later).
+type DockTimerCell = Rc<RefCell<Option<Timeout>>>;
+
+/// Owns every resource the dock auto-hide block installs, so that dropping it —
+/// which Dioxus does when the component's scope is torn down, because it is
+/// stored in a `use_hook` — deregisters both listeners and cancels both pending
+/// timers. See the block in `AttendantsComponent` for the full issue-2100
+/// rationale.
+struct DockAutoHide {
+    _mouse_listener: WindowEventListener,
+    _touch_listener: WindowEventListener,
+    _narrow_timer: DockTimerCell,
+    _hide_timer: DockTimerCell,
+}
+
+/// (Re)arms the dock auto-hide timers: narrow after `DOCK_NARROW_DELAY_MS`,
+/// hide after `DOCK_HIDE_DELAY_MS`, each cancelling the pending timer it
+/// replaces.
+///
+/// The fired timer is deliberately NOT taken out of its cell from inside its
+/// own callback (the pre-fix code did the equivalent with raw handles): a
+/// `Timeout`'s `Drop` also drops the `Closure` it owns, and dropping a closure
+/// while its body is executing frees storage that is still borrowed. Leaving
+/// the spent `Timeout` in place is harmless — it is dropped at the next arming
+/// or at unmount, and `clearTimeout` on an already-fired id is a no-op.
+fn arm_dock_autohide(
+    narrow_timer: &DockTimerCell,
+    hide_timer: &DockTimerCell,
+    autohide_enabled: Signal<bool>,
+    mut controls_visible: Signal<bool>,
+    mut controls_expanded: Signal<bool>,
+) {
+    let narrow = Timeout::new(DOCK_NARROW_DELAY_MS, move || {
+        // `try_peek`/`try_write`, not `()`/`set`: both are `try_*().unwrap()`
+        // in Dioxus 0.7, and a timer that fires while teardown is in flight
+        // must no-op rather than panic (issue 1884's stale-closure idiom).
+        if matches!(autohide_enabled.try_peek().map(|v| *v), Ok(true)) {
+            if let Ok(mut expanded) = controls_expanded.try_write() {
+                *expanded = false;
+            }
+        }
+    });
+    *narrow_timer.borrow_mut() = Some(narrow);
+
+    let hide = Timeout::new(DOCK_HIDE_DELAY_MS, move || {
+        if matches!(autohide_enabled.try_peek().map(|v| *v), Ok(true)) {
+            if let Ok(mut visible) = controls_visible.try_write() {
+                *visible = false;
+            }
+        }
+    });
+    *hide_timer.borrow_mut() = Some(hide);
+}
+
+/// Issue #1466 / #2103: the per-tile force-decode toggle, as a hook whose
+/// `EventHandler` identity is STABLE across renders.
+///
+/// Extracted from `AttendantsComponent` so the identity contract is testable
+/// (`toggle_request_decode_keeps_a_stable_identity_across_renders`): reverting
+/// this to `EventHandler::new(..)` — the pre-fix shape, and the revert a future
+/// edit is most likely to make, since it still compiles — hands every
+/// `PeerTile` a new prop identity per render and defeats the child's
+/// memoization.
+///
+/// Keyed on the tile's SESSION_ID (the `key`/`peer_id` the avatar tile passes
+/// to `on_request_decode`), NOT user_id — `user_requested_decode` and
+/// `display_peers` both hold session_ids and the phase-4 merge parses them to
+/// u64. Toggle semantics: a second click removes the id so the budget may
+/// re-pause the peer (the PLAY button is not a one-way latch). Writing this
+/// signal re-renders the parent (it is `.read()` in the promotion + phase-4
+/// merge), which recomputes the partition and pushes the new
+/// `active_decode_set`.
+fn use_toggle_request_decode(
+    mut user_requested_decode: Signal<HashSet<String>>,
+) -> EventHandler<String> {
+    use_callback(move |session_id: String| {
+        let mut set = user_requested_decode.write();
+        if set.contains(&session_id) {
+            set.remove(&session_id);
+        } else {
+            set.insert(session_id);
+        }
+    })
+}
+
+/// Pointer activity woke the dock: show it, expand it, and restart the
+/// auto-hide countdown.
+///
+/// Both signal writes are change-guarded. `Signal::write` marks subscribers
+/// dirty UNCONDITIONALLY (dioxus-signals 0.7.3 drops a `SignalSubscriberDrop`
+/// that calls `update_subscribers`, with no value comparison), so the pre-fix
+/// unconditional `set(true)` pair dirtied `AttendantsComponent` on EVERY
+/// `mousemove` — a full re-render of the meeting view for every frame in which
+/// the pointer moved, whether or not the dock's state actually changed. Writing
+/// only on a real `false -> true` transition renders identically (the value
+/// ends up `true` either way) while removing that per-event render.
+///
+/// A signal whose scope is gone reads `Err`; that is treated as "already
+/// awake", so the write is skipped rather than attempted.
+fn wake_dock(
+    narrow_timer: &DockTimerCell,
+    hide_timer: &DockTimerCell,
+    autohide_enabled: Signal<bool>,
+    mut controls_visible: Signal<bool>,
+    mut controls_expanded: Signal<bool>,
+) {
+    if !controls_visible.try_peek().map(|v| *v).unwrap_or(true) {
+        if let Ok(mut visible) = controls_visible.try_write() {
+            *visible = true;
+        }
+    }
+    if !controls_expanded.try_peek().map(|v| *v).unwrap_or(true) {
+        if let Ok(mut expanded) = controls_expanded.try_write() {
+            *expanded = true;
+        }
+    }
+    arm_dock_autohide(
+        narrow_timer,
+        hide_timer,
+        autohide_enabled,
+        controls_visible,
+        controls_expanded,
+    );
+}
+
+/// Publish the shared meeting-time context for this render — writing ONLY on a
+/// real change (issue #2103).
+///
+/// `MeetingTimeCtx` is a context-provided `Signal<MeetingTime>` that EVERY
+/// `PeerTile` subscribes to (`peer_tile.rs` reads `mt()` to derive the signal
+/// history window start), so this is the one render-body write in
+/// `AttendantsComponent` that reaches into every child scope.
+///
+/// WHY THE GUARD IS LOAD-BEARING — it is what makes the rest of issue 2103
+/// actually pay off, and without it the stable-callback work is inert:
+///
+///  1. `Signal`'s write guard marks subscribers dirty UNCONDITIONALLY when it
+///     drops — dioxus-signals 0.7.3 `SignalSubscriberDrop::drop` calls
+///     `update_subscribers()` with no value comparison — so an unconditional
+///     `set` here put every tile's scope into `dirty_scopes` on every parent
+///     render.
+///  2. `diff_vcomponent`'s MEMOIZED branch returns EARLY, without the
+///     `dom.dirty_scopes.remove(..)` that the non-memoized branch performs
+///     (dioxus-core 0.7.3 `diff/component.rs`). So a tile whose props memoized
+///     was still popped off the dirty queue afterwards and re-rendered anyway.
+///
+/// Net: stable `Callback` identities are necessary but NOT sufficient. The
+/// parent must also stop dirtying the tiles from its own body, or the render
+/// count is unchanged.
+///
+/// `MeetingTime` is `PartialEq` and both of its fields only move on real
+/// meeting events (first connect, `SESSION_ASSIGNED`, leave), so the guard
+/// skips the write on essentially every render while leaving the published
+/// value bit-identical.
+///
+/// The guard reads with `peek()`, NOT `()`/`read()`: subscribing the parent to
+/// a signal it writes in its own body would make every publish re-dirty the
+/// parent itself.
+fn publish_meeting_time(mut meeting_time: Signal<MeetingTime>, next: MeetingTime) {
+    // Bound the `peek()` guard to its own statement: holding a read borrow
+    // across `set()` (a write borrow) would panic on the generational box.
+    let changed = *meeting_time.peek() != next;
+    if changed {
+        meeting_time.set(next);
+    }
+}
+
+/// Build the [`PeerMetadataCtx`] snapshot for `session_ids`, in that order.
+///
+/// `lookup` yields `(user_id, display_name, is_guest)` for one session id.
+/// Production passes the three `VideoCallClient` getters — `get_peer_user_id`,
+/// `get_peer_display_name`, `get_peer_is_guest` — which are EXACTLY the calls
+/// `canvas_generator::generate_for_peer` makes to render a tile's name, crown
+/// and "Guest" badge. Injected rather than taking `&VideoCallClient` so the
+/// ordering / missing-field contract is testable without a live client.
+///
+/// Order follows `display_peers`, so the resulting `Vec` compares stably in
+/// `publish_peer_metadata`'s guard (a `HashMap` would let iteration order
+/// masquerade as a change and re-dirty every tile).
+///
+/// A `None` here is honest: it means "the client does not know yet" — either
+/// `PARTICIPANT_JOINED` has not landed for this session, or the getter hit a
+/// momentarily-busy `inner` borrow (every one of them returns `None` on
+/// contention). Both resolve on a later parent render, which republishes.
+fn peer_metadata_snapshot(
+    session_ids: &[String],
+    lookup: impl Fn(&str) -> (Option<String>, Option<String>, bool),
+) -> Vec<PeerMetadata> {
+    session_ids
+        .iter()
+        .map(|session_id| {
+            let (user_id, display_name, is_guest) = lookup(session_id);
+            PeerMetadata {
+                session_id: session_id.clone(),
+                user_id,
+                display_name,
+                is_guest,
+            }
+        })
+        .collect()
+}
+
+/// Publish the shared peer-metadata context for this render — writing ONLY on
+/// a real change (issue #2103 follow-up; the #2125 e2e regression).
+///
+/// WHY THIS EXISTS AT ALL. `PeerTile` -> `generate_for_peer` resolves a tile's
+/// display name, `user_id` and guest flag with NON-reactive client getters, so
+/// the tile subscribes to nothing that changes when they resolve. Until
+/// `publish_meeting_time` was change-guarded, the parent's unconditional
+/// `MeetingTimeCtx` write dirtied every tile on every parent render and
+/// refreshed those reads BY ACCIDENT. Guarding that write was correct — it is
+/// what issue 2103 asked for — but it removed the accident, and a display name
+/// that lands after its tile has mounted then never reached the DOM: the host
+/// grid rendered `tileorderb@videocall.rs` where the e2e specs expect
+/// `TileOrderGuestB`. This context is the deliberate, narrow replacement.
+///
+/// WHY THE GUARD IS LOAD-BEARING — the same two dioxus 0.7.3 facts that make
+/// `publish_meeting_time`'s guard load-bearing apply verbatim here: a `Signal`
+/// write guard marks subscribers dirty with NO value comparison, and
+/// `diff_vcomponent`'s memoized branch returns early without undirtying the
+/// scope. So an UNGUARDED write here would put every tile straight back onto
+/// the per-parent-render re-render path and undo issue 2103 entirely. The
+/// snapshot only moves on real meeting events (a join, a rename, a leave), so
+/// in steady state this writes nothing.
+///
+/// Like `publish_meeting_time` the guard reads with `peek()`, not `()`: the
+/// parent must not subscribe to a signal it writes in its own body.
+fn publish_peer_metadata(mut peer_metadata: Signal<Vec<PeerMetadata>>, next: Vec<PeerMetadata>) {
+    // Bound the `peek()` guard to its own statement: holding a read borrow
+    // across `set()` (a write borrow) would panic on the generational box.
+    let changed = *peer_metadata.peek() != next;
+    if changed {
+        peer_metadata.set(next);
+    }
 }
 
 #[component]
@@ -2061,14 +2713,28 @@ pub fn AttendantsComponent(
     let mut controls_expanded = use_signal(|| true);
     let mut dock_position: Signal<DockPosition> = use_signal(load_dock_position);
     let mut dock_menu_open = use_signal(|| false);
+    // Roving-tabindex position within the dock menu (issue 1762). Exactly one
+    // `.glass-select-option` carries `tabindex="0"`; the other six carry "-1",
+    // per the WAI-ARIA APG menu pattern. Kept in lock-step with DOM focus by
+    // the menu's Arrow/Home/End branches, which move focus and advance this
+    // index together, and reset to 0 whenever the menu opens.
+    let mut dock_menu_highlight: Signal<usize> = use_signal(|| 0);
     let mut autohide_enabled = use_signal(load_dock_autohide);
     let mut customize_mode = use_signal(|| false);
     // Text pushed into the customize-mode aria-live region on keyboard reorder
-    // (WCAG 2.1.1). Empty when there is nothing new to announce; a fresh string
-    // — even the SAME logical position revisited — must be produced so screen
-    // readers re-announce it. Reset to empty when customize mode exits so the
-    // region is silent between edit sessions.
+    // (WCAG 2.1.1). Empty when there is nothing new to announce. Reset to empty
+    // when customize mode exits so the region is silent between edit sessions.
+    //
+    // This signal holds the LOGICAL message only. Writing the same message
+    // twice would produce no DOM text mutation and therefore no second
+    // announcement, so every writer also bumps `action_bar_announce_nonce` and
+    // the region renders `action_bar_announce_text(msg, nonce)` — see that fn
+    // for why, and for the `dioxus-core` diffing rule that forces it.
     let mut action_bar_announce: Signal<String> = use_signal(String::new);
+    // Monotonic counter bumped on every write to `action_bar_announce`,
+    // including writes that repeat the previous message verbatim. Its parity
+    // selects the invisible suffix that makes the rendered text differ.
+    let mut action_bar_announce_nonce: Signal<u32> = use_signal(|| 0);
     // Action-bar layout is persisted as a (visible_slots, hidden_slots) pair so
     // that user-removed slots stay removed across reloads. `load_action_bar_layout`
     // returns the migrated pair; both signals must be kept in lock-step on every
@@ -2190,17 +2856,39 @@ pub fn AttendantsComponent(
                 }
                 raf_flag.set(true);
                 let flag = raf_flag.clone();
-                let raf_cb = Closure::<dyn FnMut()>::once(move || {
+                // `once_into_js`, NOT `Closure::once(..)` + `forget()` (issue
+                // 2102). `Closure::forget` is `mem::forget(self)`: the boxed
+                // closure AND its wasm function-table slot are never reclaimed,
+                // and this schedules ONE PER ANIMATION FRAME for the whole
+                // duration of a resize drag — a monotonic per-EVENT leak, not
+                // the per-mount one issue 2053 fixed. `once_into_js` hands the
+                // closure to JS with a self-freeing shim: the first invocation
+                // drops the `FnOnce` and releases the table slot. (A frame that
+                // never fires — e.g. the tab closes first — still leaks, which
+                // is bounded by one entry per page rather than per frame.) The
+                // same idiom is already used by the drawer-resize rAF below.
+                let raf_cb = Closure::once_into_js(move |_ts: f64| {
                     flag.set(false);
                     if let Some(win) = web_sys::window() {
+                        // `try_write`, not `set`: `set` is `try_write().unwrap()`
+                        // in Dioxus 0.7. The resize LISTENER is deregistered on
+                        // unmount by the `use_drop` above, but a frame already
+                        // scheduled by the last pre-unmount resize is NOT
+                        // cancelled and still runs — writing a torn-down scope's
+                        // signal. `try_write` turns that into a no-op instead of
+                        // a client panic (issue 2100 / the #1884 idiom).
                         if let Ok(w) = win.inner_width() {
                             if let Some(v) = w.as_f64() {
-                                viewport_width.set(v);
+                                if let Ok(mut vw) = viewport_width.try_write() {
+                                    *vw = v;
+                                }
                             }
                         }
                         if let Ok(h) = win.inner_height() {
                             if let Some(v) = h.as_f64() {
-                                viewport_height.set(v);
+                                if let Ok(mut vh) = viewport_height.try_write() {
+                                    *vh = v;
+                                }
                             }
                         }
                     }
@@ -2208,7 +2896,6 @@ pub fn AttendantsComponent(
                 if let Some(win) = web_sys::window() {
                     let _ = win.request_animation_frame(raf_cb.as_ref().unchecked_ref());
                 }
-                raf_cb.forget();
             });
             if let Some(win) = web_sys::window() {
                 let _ = win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
@@ -2216,6 +2903,103 @@ pub fn AttendantsComponent(
             *resize_cb_effect.borrow_mut() = Some(cb);
         });
     }
+
+    // NOTE (issue 2136): these two are declared HERE, well above their other
+    // consumers, because the action-bar overflow effect immediately below
+    // filters slots through `is_action_bar_slot_visible`, which needs
+    // `meeting_timer_visible` -- and that derives from `local_is_host`. Both are
+    // unconditional hooks whose only inputs are component props, so hoisting them
+    // changes hook ORDER consistently on every render and nothing else.
+    // Host set: the `user_id`(s) currently holding host (single-host, so ≤1).
+    // Seeded ONLY from `is_owner` (our own /status flag), NOT from `host_user_id`
+    // — that's the meeting CREATOR and goes stale once host is transferred away
+    // (seeding it would paint a wrong crown on the creator). Other peers' current
+    // host is filled in by the `/participants` roster seed below and kept live by
+    // HOST_GRANTED/HOST_REVOKED. Consumed by `peer_list` / `canvas_generator`.
+    let host_set_signal: Signal<std::collections::HashSet<String>> = {
+        let user_id = user_id.clone();
+        use_signal(move || {
+            let mut set = std::collections::HashSet::new();
+            if is_owner {
+                if let Some(uid) = user_id.clone() {
+                    set.insert(uid);
+                }
+            }
+            set
+        })
+    };
+    // Provided by `MeetingPage`. Bumping this nonce re-fetches our participant
+    // status and re-renders this component IN PLACE with the corrected
+    // `is_owner`.
+    //
+    // It does NOT remount, and it does NOT rebuild the media client. The previous
+    // wording claimed both and neither is true — corrected under issue 2136,
+    // which depends on the actual behaviour. The evidence, since this is the kind
+    // of claim that gets re-asserted:
+    //   * `MeetingPage` renders `AttendantsComponent` with NO `key:` (there is no
+    //     `key:` anywhere in `meeting.rs`), and the nonce effect there (the
+    //     "Self host-change refresh" `use_effect`) transitions
+    //     `MeetingStatus::Admitted{..}` to `MeetingStatus::Admitted{..}` — the
+    //     SAME match arm at the same position, which Dioxus diffs in place. No
+    //     unmount, no remount. Adding OTHER arms to that match (issue 1613 added
+    //     `PasswordRequired`) does not disturb this: the `Admitted` arm is still
+    //     the same arm, and the transition is still arm-to-itself.
+    //   * The `VideoCallClient` is built in a `use_hook` below, which runs once
+    //     per component INSTANCE and never re-runs on re-render. With no remount
+    //     it is never rebuilt, and the re-signed `room_token` never reaches the
+    //     live client by this path — the client refreshes its own token through
+    //     `refresh_room_token_callback` instead.
+    // `context.rs` (`HostRefreshNonceCtx`) and the "Self host-change refresh"
+    // comment in `meeting.rs` both describe this correctly; this comment was the
+    // outlier. That the client SURVIVES a host change is
+    // load-bearing for the meeting timer: its callbacks are registered once at
+    // mount and must therefore be registered UNCONDITIONALLY, never gated on
+    // `is_owner`, or a participant promoted to host mid-call would hold a client
+    // with no timer callback and no opportunity to add one.
+    // `None` when rendered without the provider (e.g. isolated component tests).
+    let host_refresh_nonce = try_use_context::<HostRefreshNonceCtx>();
+
+    // Issue 2136: does the LOCAL user hold host RIGHT NOW? This gates the
+    // meeting-timer controls, and the choice of signal is the security-relevant
+    // part of that gate.
+    //
+    // It reads `host_set_signal` — NOT the `is_owner` prop — because
+    // `host_set_signal` is the UI signal that tracks the same thing the RELAY's
+    // gate does. The relay authorizes MEETING_TIMER against its live per-room
+    // presence mirror, which `internal.meeting_host_changed` keeps in step with
+    // the `meeting_participants.is_host` column; `host_set_signal` is kept in
+    // step by the HOST_GRANTED / HOST_REVOKED broadcasts that the SAME fanout
+    // produces. `is_owner`, by contrast, only catches up after the host-refresh
+    // nonce round-trips through `check_status`, so gating on it would be wrong in
+    // BOTH directions during that window:
+    //
+    //   * a DEMOTED ex-host would keep seeing timer controls whose every packet
+    //     the relay silently drops — controls that look live and do nothing,
+    //     which is the specific failure this comment exists to prevent; and
+    //   * a freshly PROMOTED host would see no controls while the relay would
+    //     happily accept its packets.
+    //
+    // A `use_memo` so the attendants body re-renders only when the BOOLEAN
+    // flips, not on every unrelated change to the host set (a remote transfer
+    // between two other participants moves the set without moving this).
+    //
+    // This gate is COSMETIC — it decides what is on screen, never what is
+    // permitted. Enforcement is the relay's `session_is_room_host`, and a
+    // modified client that renders the controls anyway still cannot drive the
+    // room's timer.
+    let local_is_host = {
+        let user_id = user_id.clone();
+        use_memo(move || match user_id.as_ref() {
+            Some(uid) => host_set_signal.read().contains(uid),
+            None => false,
+        })
+    };
+
+    // Issue 2136: whether the meeting-timer slot is rendered for this user.
+    // Computed once here and threaded into every `is_action_bar_slot_visible`
+    // call, exactly as `record_slot_visible` is, so the per-slot rule stays in
+    // one host-testable function instead of being restated at nine call sites.
+    let meeting_timer_visible = meeting_timer_slot_visible(local_is_host(), is_guest);
 
     // Compute which secondary slots overflow — pure function of viewport
     // size, visible slot count, dock position, customize mode, and slot
@@ -2244,11 +3028,18 @@ pub fn AttendantsComponent(
         let ios_device = is_ios();
         let visible = visible_action_bar_slots(
             &slots,
-            false,
-            ios_device,
-            has_ss,
-            is_owner,
-            record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+            SlotVisibility {
+                customize_mode: false,
+                ios_device,
+                has_screen_share: has_ss,
+                is_owner,
+                recording_visible: record_slot_visible(
+                    is_owner,
+                    is_guest,
+                    recording_allowed_for_all_toggle(),
+                ),
+                meeting_timer_visible,
+            },
         );
 
         let is_vertical = dock != DockPosition::Bottom;
@@ -2366,6 +3157,93 @@ pub fn AttendantsComponent(
     // write — so key-repeat can never sustain whole-component re-renders. Narrows
     // "every click restarts the window" to "every click >=150ms apart restarts".
     let reaction_last_press = use_hook(|| Rc::new(Cell::new(0f64)));
+    // Issue 2135: the raised-hand roster (in raise order) shared with the banner,
+    // the peer tiles, and the roster rows via `RaisedHandsCtx`. Purely live —
+    // there is no server-side hand registry, so it is driven only by inbound
+    // RAISE_HAND packets, the local toggle, and departure cleanup.
+    let raised_hands: Signal<Vec<RaisedHand>> = use_signal(Vec::new);
+    use_context_provider(|| RaisedHandsCtx(raised_hands));
+    // Issue 2136: the room-global meeting-timer state, shared with the countdown
+    // chip and the live region via `MeetingTimerCtx`. Like the hand roster it is
+    // purely live — the relay holds no timer registry — but unlike it there is no
+    // per-session dimension and nothing to clear on departure. A host LEAVING
+    // does not stop a timer already on screen — `ends_at_ms` is self-sufficient,
+    // and stopping on host-leave would let a wifi blip kill a presenter's clock
+    // with no way to tell "left" from "reconnecting".
+    //
+    // It IS dropped on our OWN reconnect (`should_drop_timer_on_connect`) and
+    // re-acquired from the next heartbeat. The residual, stated rather than
+    // glossed: a viewer who reconnects after the host has already gone loses the
+    // countdown permanently. That is the accepted price of not counting down to
+    // an audible expiry after a CANCEL missed while offline — a cancel has no
+    // heartbeat behind it, so it cannot be re-acquired the way a start can.
+    //
+    // Written ONLY through `would_apply_change`, which is what keeps the host's
+    // ~5s heartbeat from dirtying every subscriber twelve times a minute.
+    // Deliberately NOT read in this render body — the chip reads it itself, for
+    // the same blast-radius reason `self_hand_raised` exists.
+    let meeting_timer_state: Signal<Option<MeetingTimerState>> = use_signal(|| None);
+    use_context_provider(|| MeetingTimerCtx(meeting_timer_state));
+    // The HOST's send cadence (heartbeat + transition repeat + debounce).
+    // `use_hook`, not `use_signal`: nothing renders from it, so it must never
+    // dirty the component. Present on every client, not just the host's — the
+    // client is built once at mount and never rebuilt (see the host-refresh nonce
+    // comment below), so a participant promoted to host mid-call must already
+    // have one. It stays inert until a transition is requested.
+    let meeting_timer_scheduler = use_hook(|| Rc::new(RefCell::new(MeetingTimerScheduler::new())));
+    // The single interval that drives the scheduler. HELD in a signal (never
+    // `.forget()`-ed) so unmount drops and cancels it.
+    let meeting_timer_pump: Signal<Option<Interval>> = use_signal(|| None);
+
+    // Issue 2136: a DEMOTED ex-host must stop announcing the room's timer.
+    //
+    // Nothing else does this. The relay drops a demoted host's packets, so the
+    // pump would otherwise poll and send for the rest of the meeting to no
+    // effect — and worse, a packet slipping through the brief window before the
+    // relay's host mirror updates carries a stamp OLDER than the new host's,
+    // which the bounded last-writer-wins rule reads as a clock step and APPLIES.
+    // A demoted host could therefore briefly overwrite the real host's timer.
+    //
+    // The controls are already hidden on demotion (the slot gate and the popover
+    // both read `local_is_host`), which is precisely why this is needed: an
+    // ex-host cannot reach a Cancel button to stop it by hand.
+    //
+    // Runs for every non-host on mount too, where it is a no-op on an empty
+    // scheduler and an unarmed pump.
+    {
+        let meeting_timer_scheduler = meeting_timer_scheduler.clone();
+        use_effect(move || {
+            if local_is_host() {
+                return;
+            }
+            meeting_timer_scheduler.borrow_mut().stop();
+            let mut pump = meeting_timer_pump;
+            if pump.peek().is_some() {
+                // Dropping the Interval cancels it.
+                pump.set(None);
+            }
+        });
+    }
+    // The LOCAL user's own level, mirrored out of `raised_hands` into its own
+    // signal purely for blast radius: the action-bar toggle is the one raised-hand
+    // consumer that lives in `AttendantsComponent`'s own render body, and reading
+    // the roster here would subscribe this ~9,000-line RSX (and every keyed
+    // `PeerTile` under it) to EVERY peer's hand change — the #1296 / #2103 hazard.
+    // This signal only ever moves when the LOCAL user toggles. The announcer
+    // remains the single authority; both this and the roster entry are mirrors of
+    // it, written together in `toggle_raise_hand`.
+    let self_hand_raised: Signal<bool> = use_signal(|| false);
+    // The local user's own send policy. `use_hook` (not `use_signal`) because
+    // nothing RENDERS from it — the rendered self-state lives in `raised_hands`
+    // and `self_hand_raised` — so it must never dirty the component. It coalesces
+    // rather than drops: a dropped
+    // RAISE_HAND would lose a state transition the relay cannot repair.
+    let raise_hand_announcer = use_hook(|| Rc::new(RefCell::new(RaiseHandAnnouncer::new())));
+    // The single deferred-send timer the announcer's contract allows to be armed
+    // at a time. HELD in a signal (never `.forget()`-ed) so unmounting the
+    // component drops and CANCELS it — a forgotten timer writing a signal on a
+    // dropped scope panics in dioxus-signals 0.7.
+    let raise_hand_timer: Signal<Option<Timeout>> = use_signal(|| None);
     // Screen-reader announcement channel + its throttle state. Peer reactions
     // are buffered in `reaction_sr_buffer` and flushed to `reaction_announcement`
     // at most once per REACTION_SR_THROTTLE_MS; `reaction_sr_flush_scheduled`
@@ -2375,8 +3253,11 @@ pub fn AttendantsComponent(
     let reaction_sr_flush_scheduled = use_hook(|| Rc::new(Cell::new(false)));
     // Issue 1884: standard-emoji picker for the CUSTOM reaction. `emoji_picker_open`
     // toggles the browser panel appended below the quick row; `emoji_group` is the
-    // selected category tab. Only the SELECTED category's grid is mounted at a time
-    // (see the palette RSX), so we never render the full ~3600-emoji table at once.
+    // selected category tab. Only the SELECTED category's grid — or, with a search
+    // query active (issue 2141), at most `EMOJI_SEARCH_RESULT_CAP` results — is
+    // mounted at a time (see `emoji_picker.rs`), so we never render the full
+    // 1914-emoji table at once. ("~3600" here was wrong: `emojis::iter()` is 1914
+    // entries; corrected and pinned by a test in issue 2141.)
     let mut emoji_picker_open = use_signal(|| false);
     let emoji_group: Signal<emojis::Group> = use_signal(|| emojis::Group::SmileysAndEmotion);
     // Issue 1884: the last <=3 CUSTOM (picker) emojis, shown as palette quick-picks.
@@ -2410,6 +3291,18 @@ pub fn AttendantsComponent(
             if let Some((_, _, slug)) = reaction_glyph(*reaction_highlight.peek()) {
                 let active_id = format!("reaction-opt-{slug}");
                 Timeout::new(100, move || {
+                    // Issue 2141: if the emoji picker was opened inside this
+                    // 100ms window, its search field already holds focus (it
+                    // focuses itself on mount) — jumping to the quick row here
+                    // would yank the caret out of a field the user just asked
+                    // for. `try_peek` because this timer is `.forget()`ed and
+                    // can outlive the scope; a plain `peek()`/`read()` is
+                    // `try_*().unwrap()` in dioxus-signals 0.7 and would panic.
+                    // Fail-safe: an unreadable signal keeps the pre-2141
+                    // behaviour.
+                    if emoji_picker_open.try_peek().map(|o| *o).unwrap_or(false) {
+                        return;
+                    }
                     focus_element_by_id(&active_id);
                 })
                 .forget();
@@ -2550,160 +3443,120 @@ pub fn AttendantsComponent(
     // via `.peek()` inside that effect (never reactively) so writing it back
     // cannot self-retrigger the effect.
     let mut prev_db_snapshot = use_signal(|| (MIN_CAP, MIN_CAP, false, false, 0usize));
-    // Viewport size signal — updated on window resize so layout recomputes.
+    // Viewport re-render tick — bumped on every window resize.
+    //
+    // This is what makes a resize re-render THIS component, and it is load
+    // bearing: the render body reads `window().inner_width()/inner_height()`
+    // imperatively into the plain locals `vw`/`vh` (see the "Viewport
+    // dimensions" block below), which feed the grid `--tile-w`/`--tile-h`
+    // custom properties and the per-peer `set_peer_tile_hints` size LID
+    // (#1256). Plain locals are only re-read when the component re-renders, so
+    // without this tick a resize would leave both stale. `viewport_width` /
+    // `viewport_height` do NOT cover this: they are read only inside the
+    // action-bar overflow `use_effect`, and on its normal (non-customize) path
+    // every write there is change-guarded (`if *overflowed_slots.peek() !=
+    // hidden`), so a resize that does not move the overflow set dirties nothing
+    // and triggers no render at all.
     let mut viewport_version = use_signal(|| 0u32);
     {
         let _ = viewport_version();
     }
-    use_hook(move || {
-        let win = window();
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            viewport_version.with_mut(|v| *v = v.wrapping_add(1));
-        });
-        let _ = win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
-        // Keep the closure alive for the component's lifetime.
-        // Runs once (use_hook), so no accumulation on re-renders.
-        cb.forget();
+    // The listener's lifetime is THIS component instance: the guard is stored
+    // in a `use_hook`, so Dioxus drops it — removing the listener — when the
+    // scope is torn down. Previously the closure was `Closure::forget()`-ed,
+    // which kept it registered for the lifetime of the PAGE; after an unmount +
+    // remount (leaving and re-entering `MeetingStatus::Admitted`) the stale
+    // copy still fired and wrote a dropped scope's signal, panicking the
+    // client (issue 2053).
+    let _viewport_resize_listener = use_hook(move || {
+        Rc::new(WindowEventListener::new("resize", move || {
+            // `try_write`, not `with_mut`: `with_mut`/`write` are
+            // `try_write().unwrap()` in Dioxus 0.7. The guard above already
+            // removes this listener on unmount, so this is defence in depth —
+            // it turns any fire that races teardown into a no-op rather than a
+            // panic (the #1884 stale-closure guard).
+            if let Ok(mut v) = viewport_version.try_write() {
+                let next = v.wrapping_add(1);
+                *v = next;
+            }
+        }))
     });
 
     // Dock-style auto-hide: narrow after 1s, hide after 4s of inactivity.
-    use_hook(move || {
-        let win = window();
-        // Two timer handles: one for narrowing (1s), one for hiding (4s).
-        let narrow_timer: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
-        let hide_timer: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+    //
+    // LIFECYCLE (issue 2100). Everything this block schedules is owned by the
+    // value the `use_hook` returns, so Dioxus's scope teardown tears all of it
+    // down — the same mechanism `use_drop` is built on (see
+    // `WindowEventListener`). Three separate leaks lived here before:
+    //
+    //  1. `mouse_cb.forget()` / `touch_cb.forget()` kept the two listeners
+    //     registered for the lifetime of the PAGE. After one unmount they still
+    //     fired, and `controls_visible.set(true)` is `try_write().unwrap()` in
+    //     Dioxus 0.7 — a client panic on the very next pointer move, i.e. the
+    //     issue-2053 failure mode on a far more frequently fired event.
+    //  2. The pending `setTimeout`s were never cancelled, so
+    //     `controls_visible.set(false)` / `controls_expanded.set(false)` fired
+    //     up to 4s AFTER unmount into the same panic (the issue-1884 hazard).
+    //     `gloo` `Timeout` cancels on drop, so holding the pending timers in
+    //     hook-owned cells cancels them on teardown, and re-arming (replacing a
+    //     cell's contents) cancels the timer it supersedes.
+    //  3. Each pointer event built two `Closure::once`s and `forget()`-ed both,
+    //     leaking a boxed closure plus a permanent wasm function-table slot PER
+    //     MOUSEMOVE — the issue-2102 per-event class, at pointer-move rate.
+    //     `Timeout` owns its closure and frees it when the timer is dropped, so
+    //     at most two are live at a time.
+    //
+    // The handlers additionally use `try_write()` rather than `set()` (the
+    // issue-1884 stale-closure idiom): deregistration already prevents a
+    // post-unmount fire, so this is defence in depth for a fire that races
+    // teardown.
+    let _dock_autohide = use_hook(move || {
+        // Pending narrow (1s) / hide (4s) timers. `Rc` because both listeners
+        // and the initial arming share them; `RefCell<Option<Timeout>>` because
+        // arming REPLACES (and therefore cancels) whatever was pending.
+        let narrow_timer: DockTimerCell = Rc::new(RefCell::new(None));
+        let hide_timer: DockTimerCell = Rc::new(RefCell::new(None));
 
-        // mousemove listener
-        let nt1 = narrow_timer.clone();
-        let ht1 = hide_timer.clone();
-        let win1 = win.clone();
-        let mouse_cb = Closure::<dyn FnMut()>::new(move || {
-            controls_visible.set(true);
-            controls_expanded.set(true);
-            // Clear existing timers
-            if let Some(id) = nt1.borrow_mut().take() {
-                win1.clear_timeout_with_handle(id);
-            }
-            if let Some(id) = ht1.borrow_mut().take() {
-                win1.clear_timeout_with_handle(id);
-            }
-            // Narrow after 1s
-            let nt_inner = nt1.clone();
-            let narrow_cb = Closure::<dyn FnMut()>::once(move || {
-                nt_inner.borrow_mut().take();
-                if autohide_enabled() {
-                    controls_expanded.set(false);
-                }
-            });
-            let id = win1
-                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    narrow_cb.as_ref().unchecked_ref(),
-                    1_000,
-                )
-                .unwrap_or(0);
-            nt1.borrow_mut().replace(id);
-            narrow_cb.forget();
-            // Hide after 4s
-            let ht_inner = ht1.clone();
-            let hide_cb = Closure::<dyn FnMut()>::once(move || {
-                ht_inner.borrow_mut().take();
-                if autohide_enabled() {
-                    controls_visible.set(false);
-                }
-            });
-            let id = win1
-                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    hide_cb.as_ref().unchecked_ref(),
-                    4_000,
-                )
-                .unwrap_or(0);
-            ht1.borrow_mut().replace(id);
-            hide_cb.forget();
+        let nt_mouse = narrow_timer.clone();
+        let ht_mouse = hide_timer.clone();
+        let mouse_listener = WindowEventListener::new("mousemove", move || {
+            wake_dock(
+                &nt_mouse,
+                &ht_mouse,
+                autohide_enabled,
+                controls_visible,
+                controls_expanded,
+            );
         });
-        let _ =
-            win.add_event_listener_with_callback("mousemove", mouse_cb.as_ref().unchecked_ref());
-        mouse_cb.forget();
 
-        // touchstart listener
-        let nt2 = narrow_timer.clone();
-        let ht2 = hide_timer.clone();
-        let win2 = win.clone();
-        let touch_cb = Closure::<dyn FnMut()>::new(move || {
-            controls_visible.set(true);
-            controls_expanded.set(true);
-            if let Some(id) = nt2.borrow_mut().take() {
-                win2.clear_timeout_with_handle(id);
-            }
-            if let Some(id) = ht2.borrow_mut().take() {
-                win2.clear_timeout_with_handle(id);
-            }
-            let nt_inner = nt2.clone();
-            let narrow_cb = Closure::<dyn FnMut()>::once(move || {
-                nt_inner.borrow_mut().take();
-                if autohide_enabled() {
-                    controls_expanded.set(false);
-                }
-            });
-            let id = win2
-                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    narrow_cb.as_ref().unchecked_ref(),
-                    1_000,
-                )
-                .unwrap_or(0);
-            nt2.borrow_mut().replace(id);
-            narrow_cb.forget();
-            let ht_inner = ht2.clone();
-            let hide_cb = Closure::<dyn FnMut()>::once(move || {
-                ht_inner.borrow_mut().take();
-                if autohide_enabled() {
-                    controls_visible.set(false);
-                }
-            });
-            let id = win2
-                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    hide_cb.as_ref().unchecked_ref(),
-                    4_000,
-                )
-                .unwrap_or(0);
-            ht2.borrow_mut().replace(id);
-            hide_cb.forget();
+        let nt_touch = narrow_timer.clone();
+        let ht_touch = hide_timer.clone();
+        let touch_listener = WindowEventListener::new("touchstart", move || {
+            wake_dock(
+                &nt_touch,
+                &ht_touch,
+                autohide_enabled,
+                controls_visible,
+                controls_expanded,
+            );
         });
-        let _ =
-            win.add_event_listener_with_callback("touchstart", touch_cb.as_ref().unchecked_ref());
-        touch_cb.forget();
 
-        // Initial timers
-        let nt_init = narrow_timer.clone();
-        let narrow_init = Closure::<dyn FnMut()>::once(move || {
-            nt_init.borrow_mut().take();
-            if autohide_enabled() {
-                controls_expanded.set(false);
-            }
-        });
-        let id = win
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                narrow_init.as_ref().unchecked_ref(),
-                1_000,
-            )
-            .unwrap_or(0);
-        narrow_timer.borrow_mut().replace(id);
-        narrow_init.forget();
+        // Initial arming: the dock starts visible + expanded and collapses on
+        // its own if the user never moves the pointer.
+        arm_dock_autohide(
+            &narrow_timer,
+            &hide_timer,
+            autohide_enabled,
+            controls_visible,
+            controls_expanded,
+        );
 
-        let ht_init = hide_timer.clone();
-        let hide_init = Closure::<dyn FnMut()>::once(move || {
-            ht_init.borrow_mut().take();
-            if autohide_enabled() {
-                controls_visible.set(false);
-            }
-        });
-        let id = win
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                hide_init.as_ref().unchecked_ref(),
-                4_000,
-            )
-            .unwrap_or(0);
-        hide_timer.borrow_mut().replace(id);
-        hide_init.forget();
+        Rc::new(DockAutoHide {
+            _mouse_listener: mouse_listener,
+            _touch_listener: touch_listener,
+            _narrow_timer: narrow_timer,
+            _hide_timer: hide_timer,
+        })
     });
 
     use_effect(move || {
@@ -2719,6 +3572,10 @@ pub fn AttendantsComponent(
     // In-call Meeting Options panel (host-only). Lets the owner change meeting
     // options live without leaving the call.
     let mut meeting_options_open = use_signal(|| false);
+    // Issue 2136: the host's meeting-timer controls popover. Holds only the
+    // OPEN state — the timer state itself lives in `meeting_timer_state`, which
+    // this component deliberately never reads (the chip does).
+    let mut meeting_timer_open = use_signal(|| false);
     // Host publishes its live diagnostics reader handle here once on mount, so the
     // Diagnostics sidebar (a sibling of Host that can't reach the encoders) can
     // render the "Simulcast layers" section from the live SEND snapshots. (#1095)
@@ -2881,30 +3738,6 @@ pub fn AttendantsComponent(
     let video_off_toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
     let peer_display_name_version = use_signal(|| 0u32);
 
-    // Host set: the `user_id`(s) currently holding host (single-host, so ≤1).
-    // Seeded ONLY from `is_owner` (our own /status flag), NOT from `host_user_id`
-    // — that's the meeting CREATOR and goes stale once host is transferred away
-    // (seeding it would paint a wrong crown on the creator). Other peers' current
-    // host is filled in by the `/participants` roster seed below and kept live by
-    // HOST_GRANTED/HOST_REVOKED. Consumed by `peer_list` / `canvas_generator`.
-    let host_set_signal: Signal<std::collections::HashSet<String>> = {
-        let user_id = user_id.clone();
-        use_signal(move || {
-            let mut set = std::collections::HashSet::new();
-            if is_owner {
-                if let Some(uid) = user_id.clone() {
-                    set.insert(uid);
-                }
-            }
-            set
-        })
-    };
-    // Provided by `MeetingPage`. Bumping this nonce re-fetches our participant
-    // status and remounts this component, so a freshly granted/revoked host gets
-    // a rebuilt media client with the correct `is_owner` and a fresh room token.
-    // `None` when rendered without the provider (e.g. isolated component tests).
-    let host_refresh_nonce = try_use_context::<HostRefreshNonceCtx>();
-
     // Monotonic counter bumped on every HOST_GRANTED/HOST_REVOKED. The roster
     // seed below snapshots it before its async fetch and skips the overwrite if a
     // host event landed meanwhile (live events are fresher) — keeping the replace
@@ -2979,6 +3812,11 @@ pub fn AttendantsComponent(
     // callback can access the client for reconnection. The cell is populated
     // right after VideoCallClient::new().
     let client = use_hook(|| {
+        // Issue 2136: this closure is the client's ONE construction site and it
+        // runs once per component instance, so anything it captures must be
+        // cloned rather than moved out of the body -- the scheduler is read again
+        // by the host transition callbacks further down.
+        let meeting_timer_scheduler = meeting_timer_scheduler.clone();
         #[cfg(feature = "media-server-jwt-auth")]
         let token = {
             let t = room_token.clone();
@@ -3066,6 +3904,13 @@ pub fn AttendantsComponent(
             enable_webtransport: effective_wt_enabled,
             max_received_layer: crate::constants::max_received_layer(),
             skip_canvas_paint: crate::constants::skip_canvas_paint(),
+            // Issue #2156: the deployment's CAMERA ladder, so this receiver's rung
+            // labels / {w}x{h} / ~kbps readouts describe the stream it actually
+            // decodes. Read here (not inside videocall-client) because only the UI
+            // can see `window.__APP_CONFIG`. ALL FOUR client-construction sites must
+            // pass this — see `dioxus-ui/tests/reduced_ladder_receive_labels.rs`,
+            // which pins the set.
+            camera_ladder_variant: crate::constants::camera_ladder_variant(),
             // Issue 1884: reaction receive callback. Fires ONLY for peers (the
             // relay self-skips the sender, so our own reaction never comes back
             // over the wire — the UI renders its own "You" echo on click). The
@@ -3124,6 +3969,90 @@ pub fn AttendantsComponent(
                     },
                 ))
             },
+            // Issue 2135: raised-hand receive callback. Fires ONLY for peers (the
+            // relay self-skips the sender, and the client arm additionally skips
+            // our own current/recent session ids), so the local user's own hand
+            // is never sourced from the wire — it is applied optimistically on
+            // click and lives in the same roster.
+            //
+            // `raised` is a LEVEL: ASSIGN it, never flip a local bit, or one
+            // duplicated packet inverts that peer's state permanently.
+            //
+            // THE HOT PATH. This fires per inbound RAISE_HAND packet, and the
+            // COMMON inbound packet is a redundant re-announce: every peer that
+            // joins makes every raised hand re-broadcast its unchanged level. So
+            // the guard is two-stage, and the order matters:
+            //
+            //   1. `would_*_change` reads the roster THROUGH `peek()` — no
+            //      subscription, no dirtying, and crucially NO ALLOCATION. It
+            //      answers "is this packet news?" against the borrowed list.
+            //   2. Only then do we clone the `Vec` (every `RaisedHand`, every
+            //      `String`) to hand `Signal::set` an owned value.
+            //
+            // The previous shape cloned FIRST and asked second, so every
+            // redundant re-announce allocated a full roster copy purely to
+            // discover it had nothing to do. The mutators still return whether
+            // they changed anything and that return is still honoured, so the
+            // predicates are an optimisation in front of the guard, never a
+            // replacement for it — they share `is_peer_entry` with the mutators
+            // precisely so the two answers cannot diverge.
+            on_raise_hand: {
+                Some(VcCallback::from(
+                    move |(session_id, raised, raised_at_ms, name): (u64, bool, u64, String)| {
+                        let mut hands = raised_hands;
+                        if raised {
+                            let incoming = RaisedHand {
+                                session_id,
+                                raised_at_ms,
+                                name,
+                                is_self: false,
+                            };
+                            if !would_set_raised_hand_change(&hands.peek(), &incoming) {
+                                return;
+                            }
+                            let mut next = hands.peek().clone();
+                            if set_raised_hand(&mut next, incoming) {
+                                hands.set(next);
+                            }
+                        } else {
+                            if !would_clear_raised_hand_change(&hands.peek(), session_id) {
+                                return;
+                            }
+                            let mut next = hands.peek().clone();
+                            if clear_raised_hand(&mut next, session_id) {
+                                hands.set(next);
+                            }
+                        }
+                    },
+                ))
+            },
+            // Issue 2136: meeting-timer receive callback. Registered
+            // UNCONDITIONALLY, never gated on `is_owner` — the client is built
+            // once in a `use_hook` and is NOT rebuilt when host changes hands
+            // (see the host-refresh nonce comment above), so a callback added
+            // only for the current host would leave a promoted participant with a
+            // client that can never render a timer.
+            //
+            // Every non-host receives these too, and must: the whole point of the
+            // feature is that the countdown is visible to the ROOM. Authority is
+            // the relay's — a non-host's outbound packet is dropped at the funnel,
+            // so anything arriving here was authorized at source.
+            //
+            // THE HOT PATH, in the same sense as the raise-hand callback above:
+            // the common inbound packet is the ~5s heartbeat carrying the state we
+            // already hold. `would_apply_change` answers "is this news?" through
+            // `peek()` — no subscription, no dirtying — and only a genuine
+            // transition reaches `set`. Without that guard a running timer would
+            // re-render every subscriber twelve times a minute for its whole life.
+            on_meeting_timer: {
+                Some(VcCallback::from(move |incoming: MeetingTimerState| {
+                    let mut state = meeting_timer_state;
+                    if !would_apply_change(*state.peek(), incoming) {
+                        return;
+                    }
+                    state.set(Some(incoming));
+                }))
+            },
             on_connected: {
                 let meeting_id_for_log = id.clone();
                 // Initial room_token for console-log upload auth. The collector
@@ -3151,6 +4080,8 @@ pub fn AttendantsComponent(
                 // reconnect (see `host_reconcile_first_connect` above).
                 let host_reconcile_first_connect = host_reconcile_first_connect.clone();
                 let host_reconcile_meeting_id = id.clone();
+                let raise_hand_announcer = raise_hand_announcer.clone();
+                let client_cell_for_hand = client_for_reconnect.clone();
                 VcCallback::from(move |_| {
                     log::info!("DIOXUS-UI: Connection established");
                     let mut connection_error = connection_error;
@@ -3159,6 +4090,90 @@ pub fn AttendantsComponent(
                     connection_error.set(None);
                     call_start_time.set(Some(js_sys::Date::now()));
                     session_loaded.set(true);
+
+                    // Issue 2135 RECONNECT SELF-HEAL. A transport gap can desync
+                    // the room's view of our hand in BOTH directions: a genuine
+                    // departure made every peer clear us on PARTICIPANT_LEFT, and
+                    // a LOWER sent while the transport was down reached nobody.
+                    // `invalidate_announced` marks the room's view UNKNOWN so the
+                    // next re-announce repairs whichever happened — including the
+                    // lowered case, which the steady-state "never announce
+                    // lowered" rule would otherwise suppress forever.
+                    //
+                    // Run on EVERY connect, not just reconnects, deliberately: a
+                    // participant that has never raised a hand short-circuits
+                    // inside `invalidate_announced` (its `ever_raised` guard), so
+                    // the common case costs nothing and needs no first-connect
+                    // flag; and on the rare initial connect with a hand already
+                    // up, announcing is the correct thing to do anyway.
+                    //
+                    // The send itself is deferred by the coalesce window (a
+                    // re-announce never resolves to an immediate `Now`), so this
+                    // never writes the wire from inside the connect callback.
+                    if let Some(ref client) = *client_cell_for_hand.borrow() {
+                        // A re-election mints a NEW session id. Our own roster
+                        // entry still carries the old one, and the roster row
+                        // looks itself up by the CURRENT id — so without this the
+                        // local user's own badge silently vanishes while their
+                        // hand is still up and still visible to everyone else.
+                        // `raised_at_ms` is untouched, so our queue position does
+                        // not move.
+                        if let Some(sid) = client
+                            .get_own_session_id()
+                            .and_then(|s| s.parse::<u64>().ok())
+                        {
+                            let mut hands = raised_hands;
+                            let mut next = hands.peek().clone();
+                            if resync_self_session_id(&mut next, sid) {
+                                hands.set(next);
+                            }
+                        }
+                        raise_hand_announcer.borrow_mut().invalidate_announced();
+                        drive_raise_hand(
+                            client,
+                            &raise_hand_announcer,
+                            raise_hand_timer,
+                            RaiseHandTrigger::ReAnnounce,
+                        );
+                    }
+
+                    // Issue 2136: DROP a meeting-timer state we are only a VIEWER
+                    // of, on every (re)connect, and let the host's heartbeat
+                    // re-establish it.
+                    //
+                    // This closes the one hole the heartbeat cannot repair on its
+                    // own. Rule 1 re-announces a RUNNING timer every ~5s, so a
+                    // viewer that missed a start or an extend converges by itself.
+                    // A CANCEL has no heartbeat behind it — once `running` is
+                    // false the host goes quiet — so its only delivery is the
+                    // 3-packet transition burst. A viewer whose connection was
+                    // down across that burst keeps a timer the host already
+                    // stopped, counts it to zero, and PLAYS THE EXPIRY SOUND. A
+                    // spurious "time is up" for one participant is the worst
+                    // outcome this feature has, and it is silent to everyone else,
+                    // so it would be reported as a ghost rather than diagnosed.
+                    //
+                    // Clearing trades that for a gap of at most one heartbeat in
+                    // which a genuinely running timer is not shown — silent,
+                    // self-healing, and strictly the better failure.
+                    //
+                    // The guard is "am I DRIVING this timer", read off our own
+                    // scheduler, NOT `local_is_host`. The host never receives its
+                    // own packet back (the relay self-skips the sender), so its
+                    // chip is a local echo with nothing to re-establish it —
+                    // clearing there would blank the host's own timer until it
+                    // touched the controls again. The host flag is separately the
+                    // wrong test here: it can itself be stale at this exact moment,
+                    // which is why the roster reseed below exists.
+                    {
+                        // `driving()`, not `current()` — a transition still inside its
+                        // debounce window is already this client's timer.
+                        let driving = meeting_timer_scheduler.borrow().driving();
+                        let mut timer_state = meeting_timer_state;
+                        if should_drop_timer_on_connect(driving, *timer_state.peek()) {
+                            timer_state.set(None);
+                        }
+                    }
 
                     // Re-seed host state from the roster on reconnect, so
                     // host controls drifted by a swallowed HOST_REVOKED are fixed
@@ -3679,10 +4694,26 @@ pub fn AttendantsComponent(
                         // first, this loop would `return` before clearing — exactly the
                         // regression `on_peer_left_clears_recording_before_reconnect_return`
                         // guards against.
+                        //
+                        // Issue 2135 rides the SAME ordered action list for the
+                        // same reason: a departing participant can no longer send
+                        // `raised = false`, and there is no hand registry to
+                        // reconcile from, so a hand left up outlives its owner —
+                        // and unlike a stuck recording dot it actively misleads,
+                        // because the meeting keeps calling on someone who left.
+                        // Membership-guarded on the roster (`peek`, which does not
+                        // subscribe) so the overwhelming majority of departures —
+                        // participants who never raised a hand — cost no write.
                         let mut rec_ids = recording_peer_ids;
+                        let mut hands = raised_hands;
+                        let departing_session_u64 = session_id.parse::<u64>().ok();
+                        let departing_session_raised = departing_session_u64
+                            .map(|sid| hands.peek().iter().any(|h| h.session_id == sid))
+                            .unwrap_or(false);
                         let actions = on_peer_left_actions(
                             is_reconnecting,
                             rec_ids.peek().contains(&session_id),
+                            departing_session_raised,
                         );
                         for action in &actions {
                             match action {
@@ -3692,6 +4723,20 @@ pub fn AttendantsComponent(
                                     // → `recording_set_write_needed`), so this write
                                     // always changes the set.
                                     rec_ids.write().remove(&session_id);
+                                }
+                                OnPeerLeftAction::ClearRaisedHand => {
+                                    // Emitted only when this session's hand is
+                                    // actually up (guarded by
+                                    // `should_clear_departed_hand`), so the write
+                                    // always changes the roster. Iterating the
+                                    // list in ORDER is what makes this run BEFORE
+                                    // the reconnect early-return below.
+                                    if let Some(sid) = departing_session_u64 {
+                                        let mut next = hands.peek().clone();
+                                        if clear_raised_hand(&mut next, sid) {
+                                            hands.set(next);
+                                        }
+                                    }
                                 }
                                 OnPeerLeftAction::SuppressLeaveAndReturn => {
                                     // Reconnect early-return (issue 244): the server
@@ -3785,6 +4830,7 @@ pub fn AttendantsComponent(
             },
             on_peer_joined: {
                 let client_cell = client_for_reconnect.clone();
+                let raise_hand_announcer = raise_hand_announcer.clone();
                 Some(VcCallback::from(
                     move |(display_name, user_id, session_id): (String, String, String)| {
                         log::debug!(
@@ -3793,6 +4839,34 @@ pub fn AttendantsComponent(
                             user_id,
                             session_id
                         );
+
+                        // Issue 2135 RE-ANNOUNCE: the relay keeps no hand
+                        // registry, so a hand raised BEFORE this peer joined only
+                        // reaches it if we re-send our current level now. Skipped
+                        // entirely when our hand is down (a lowered hand is this
+                        // peer's default, so telling it would be pure O(peers)
+                        // waste), and COALESCED across the whole join wave — the
+                        // announcer always defers a re-announce by
+                        // RAISE_HAND_REANNOUNCE_COALESCE_MS and answers
+                        // `Coalesced` while that window is open, so a 20-person
+                        // wave costs ONE packet, not 20 (which would trip the
+                        // relay's 6/2000ms limiter). See
+                        // `reannounce_is_debounced_even_when_the_rate_gate_is_open`.
+                        //
+                        // That mandatory deferral is also what makes this safe to
+                        // call from here: this callback runs SYNCHRONOUSLY inside
+                        // `Inner::on_inbound_media` while the client holds its own
+                        // borrows, and a re-announce can never resolve to an
+                        // immediate `Now` — the wire write always happens later,
+                        // from the timer, after this stack has unwound.
+                        if let Some(ref client) = *client_cell.borrow() {
+                            drive_raise_hand(
+                                client,
+                                &raise_hand_announcer,
+                                raise_hand_timer,
+                                RaiseHandTrigger::ReAnnounce,
+                            );
+                        }
 
                         let settings = appearance_settings.peek();
                         // Always show notifications while recording so join/leave events are captured.
@@ -4927,37 +6001,52 @@ pub fn AttendantsComponent(
     // Re-check permissions when the window regains focus, mirroring Yew behavior.
     // Only fires for users already in-meeting who had a prior denial — on the
     // pre-join screen (meeting_joined=false) this is a no-op.
-    {
+    //
+    // LIFECYCLE (issue 2100): this was a `use_effect` that `.forget()`-ed its
+    // closure, so the listener outlived the component and the next window
+    // `focus` after an unmount ran `meeting_joined()` (= `try_read().unwrap()`)
+    // and `device_was_denied.set(true)` (= `try_write().unwrap()`) on a
+    // torn-down scope — the issue-2053 panic class on a third event. It is now
+    // a `use_hook`-owned `WindowEventListener` (removed on scope teardown) and
+    // every signal access inside is fallible, so a fire that races teardown
+    // no-ops. `use_hook` rather than `use_effect` because the effect body read
+    // nothing reactively — it installed the listener exactly once.
+    let _focus_permission_listener = {
         let mda = mda.clone();
-        use_effect(move || {
+        use_hook(move || {
             let value = mda.clone();
-            let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-                if !meeting_joined() || session_loaded() || connecting() {
+            Rc::new(WindowEventListener::new("focus", move || {
+                let Ok(joined) = meeting_joined.try_peek().map(|v| *v) else {
+                    return;
+                };
+                let Ok(loaded) = session_loaded.try_peek().map(|v| *v) else {
+                    return;
+                };
+                let Ok(is_connecting) = connecting.try_peek().map(|v| *v) else {
+                    return;
+                };
+                if !joined || loaded || is_connecting {
                     return;
                 }
 
-                let mic_denied = matches!(
-                    mic_error.read().as_ref(),
-                    Some(MediaErrorState::PermissionDenied)
-                );
-                let video_denied = matches!(
-                    video_error.read().as_ref(),
-                    Some(MediaErrorState::PermissionDenied)
-                );
+                let mic_denied = mic_error
+                    .try_peek()
+                    .map(|e| matches!(e.as_ref(), Some(MediaErrorState::PermissionDenied)))
+                    .unwrap_or(false);
+                let video_denied = video_error
+                    .try_peek()
+                    .map(|e| matches!(e.as_ref(), Some(MediaErrorState::PermissionDenied)))
+                    .unwrap_or(false);
 
                 if mic_denied || video_denied {
-                    device_was_denied.set(true);
+                    if let Ok(mut denied) = device_was_denied.try_write() {
+                        *denied = true;
+                    }
                 }
                 value.borrow().request();
-            }) as Box<dyn FnMut(_)>);
-
-            if let Some(win) = web_sys::window() {
-                let _ =
-                    win.add_event_listener_with_callback("focus", closure.as_ref().unchecked_ref());
-            }
-            closure.forget();
-        });
-    }
+            }))
+        })
+    };
 
     // Provide contexts for child components
     use_context_provider(|| client.clone());
@@ -4970,8 +6059,15 @@ pub fn AttendantsComponent(
     // Provide the recording set so peer-list rows and video tiles render a
     // per-recorder indicator for every participant currently recording.
     use_context_provider(|| RecordingSetCtx(recording_peer_ids));
-    let mut meeting_time_signal = use_signal(MeetingTime::default);
+    // Not `mut`: the only write goes through `publish_meeting_time`, which takes
+    // the (`Copy`) signal by value and re-binds it mutably behind the guard.
+    let meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
+    // Reactive peer identity metadata for the video tiles (issue #2103
+    // follow-up). Not `mut` for the same reason as `meeting_time_signal`: the
+    // only write goes through the change-guarded `publish_peer_metadata`.
+    let peer_metadata_signal: Signal<Vec<PeerMetadata>> = use_signal(Vec::new);
+    use_context_provider(|| PeerMetadataCtx(peer_metadata_signal));
     let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
     let _ = local_audio_level_ctx.0;
     use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
@@ -6599,6 +7695,22 @@ pub fn AttendantsComponent(
         .into_iter()
         .filter(|session_id| *session_id != own_session)
         .collect();
+    // Republish the peer identity metadata every tile reads IMPERATIVELY
+    // (name, user_id, guest flag). Change-guarded — see `publish_peer_metadata`
+    // for why an unguarded write here would undo issue 2103, and why the tiles
+    // need this at all now that the parent no longer dirties them by accident.
+    // Placed HERE, above the `!meeting_joined()` early return, so the value the
+    // tiles subscribe to is already correct on the render that mounts them.
+    publish_peer_metadata(
+        peer_metadata_signal,
+        peer_metadata_snapshot(&display_peers, |session_id| {
+            (
+                client.get_peer_user_id(session_id),
+                client.get_peer_display_name(session_id),
+                client.get_peer_is_guest(session_id).unwrap_or(false),
+            )
+        }),
+    );
     // Assign synthetic join times to mock peers for local testing.
     // Real peers get their join time recorded in the on_peer_added callback
     // (not during render) to avoid signal-writes-during-render loops.
@@ -7648,6 +8760,369 @@ pub fn AttendantsComponent(
     let effective_user_id = user_id.as_deref().unwrap_or(&latest_display_name);
     let can_stream =
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
+    // ── Stable-identity child callbacks (issue 2103) ──────────────────────
+    //
+    // These are `use_callback`, not per-render closures / `EventHandler::new`.
+    //
+    // COST 1 — defeated child memoization (the big one). A closure at an
+    // `EventHandler`/`Callback` prop site is converted with `Callback::new`,
+    // whose `PartialEq` is a pointer comparison on the generational box; a new
+    // box per render means the prop never compares equal, and the derived
+    // `Properties::memoize` compares props BEFORE re-pointing the handlers. So
+    // every `PeerTile` re-rendered on every parent render even when nothing
+    // about that tile had changed — and a resize drag re-renders this component
+    // at frame rate. `use_callback` keeps ONE box for the component's lifetime
+    // and swaps the boxed closure in place each render, so the identity is
+    // stable while the captured values stay fresh.
+    //
+    // NECESSARY BUT NOT SUFFICIENT: memoized props only help if nothing else
+    // dirties the child's scope. See `publish_meeting_time` — a render-body
+    // write to a context signal every tile subscribes to re-renders them all
+    // regardless, because dioxus's memoized diff branch does not undirty a
+    // scope. Both halves are required for the tile render count to drop.
+    //
+    // COST 2 — a generational-box entry per render, for the handlers built in
+    // the component BODY only. `Callback::new` inserts into the CURRENT owner,
+    // and dioxus documents that calling it in a component body leaks until the
+    // component is dropped.
+    //
+    // This does NOT apply to a bare closure at a PROP site, though the reason is
+    // not "the builder drops its owner after the diff". The `Props` derive emits
+    // a `<Name>PropsWithOwner { inner, owner: generational_box::Owner }` wrapper
+    // whenever the struct has child-owned fields, converts each such field
+    // inside `dioxus_core::with_owner(self.owner.clone(), ..)`, and moves that
+    // same owner into the wrapper (dioxus-core-macro 0.7.3, `props/mod.rs`). The
+    // wrapper IS the props value the `VComponent` carries and the scope stores,
+    // so a prop-site closure's box lives exactly as long as the props value that
+    // owns it: on the memoized diff branch the NEW props (and its owner) is
+    // dropped at the end of the diff while the MOUNT render's props stays pinned
+    // in `ScopeState.props` until unmount; on the non-memoized branch the
+    // previous render's props is replaced, so its owner drops one render later.
+    // Either way at most a couple of owners are live per mounted child and
+    // nothing accumulates per render.
+    //
+    // The entries that really accumulated were three of the five
+    // `EventHandler::new(..)` calls in this body: `toggle_request_decode`,
+    // `send_reaction` and `send_custom_reaction` ran on EVERY meeting-view
+    // render and were freed only at unmount — those are the three converted
+    // here. The other two are the `on_dismiss` handlers inside
+    // `if show_device_warning()`, which allocate only while that modal is open,
+    // so they are left as-is.
+    //
+    // Declared HERE, above the `!meeting_joined()` early return below, rather
+    // than next to their `rsx!` call sites: `use_callback` is a hook, and hooks
+    // must run unconditionally on every render.
+    let toggle_pin: EventHandler<PinnedTile> = use_callback({
+        let client = client.clone();
+        move |target: PinnedTile| {
+            // target.user_id is already a user_id from canvas_generator.rs.
+            // Keep normalization defensive in case a session_id is passed in the future.
+            let normalized = PinnedTile {
+                user_id: client
+                    .get_peer_user_id(&target.user_id)
+                    .unwrap_or(target.user_id),
+                kind: target.kind,
+            };
+
+            // Clicking the SAME (peer, tile-kind) that is already pinned releases
+            // the pin; clicking a DIFFERENT one — including the SAME peer's OTHER
+            // tile-kind (e.g. their screen while their camera is pinned) — SWITCHES
+            // the spotlight to it. See `next_pin_target` for the reducer semantics:
+            // equality includes `kind`, so pinning the camera while the screen is
+            // pinned un-maximizes the screen and maximizes the camera.
+            let cur = pinned_peer_id();
+            let next = next_pin_target(cur.as_ref(), normalized);
+            pinned_peer_id.set(next);
+        }
+    });
+
+    // Shared no-op pin handler for the mock layout-placeholder tiles, which are
+    // not pinnable. A fresh `move |_| {}` at each of the two call sites would be
+    // a fresh `Callback` identity every render — exactly the memoization defeat
+    // this block exists to remove (issue 2103).
+    let noop_toggle_pin: EventHandler<PinnedTile> = use_callback(|_: PinnedTile| {});
+
+    // Shared no-op force-decode handler, passed EXPLICITLY by every `PeerTile`
+    // call site that has no real one. Leaving `on_request_decode` to its
+    // `#[props(default)]` is NOT equivalent: the default resolves to
+    // `Callback::default()`, which is `Callback::new(|_| Default::default())` —
+    // a brand-new generational box, and therefore a brand-new prop identity, on
+    // EVERY render. That alone makes `PeerTileProps::memoize` return false, so
+    // a tile whose `on_toggle_pin` is stable would still re-render with its
+    // parent. Pinned by
+    // `peer_tile_props_memoize_only_with_a_stable_callback_identity`.
+    let noop_request_decode: EventHandler<String> = use_callback(|_: String| {});
+
+    // Issue #1466: toggle a peer's force-decode request. Mirrors `toggle_pin`
+    // but is keyed on the tile's SESSION_ID — see `use_toggle_request_decode`
+    // for the full semantics and the issue-2103 identity contract.
+    let toggle_request_decode: EventHandler<String> =
+        use_toggle_request_decode(user_requested_decode);
+
+    // Issue 2135: toggle the LOCAL user's raised hand.
+    //
+    // The rendered state is the roster entry, applied OPTIMISTICALLY here rather
+    // than waiting for the wire: the relay self-skips the sender, so our own
+    // packet never comes back, exactly as with the reaction local echo. The
+    // announcer owns the wire policy (rate gate + join-wave coalescing) and is
+    // the ONLY thing that decides when a packet goes out.
+    //
+    // Two failure modes this deliberately avoids:
+    //   * It NEVER computes the next level from the roster. `set_level` takes an
+    //     absolute value derived from the announcer's own level, so a double-fired
+    //     click or a stale render cannot desync the local level from what the
+    //     room was told.
+    //   * It never DROPS an over-rate press. The announcer coalesces and sends the
+    //     user's final level, because a dropped RAISE_HAND loses a state
+    //     transition the relay has no registry to repair — unlike a reaction,
+    //     where a dropped click loses only a float.
+    let toggle_raise_hand: EventHandler<()> = use_callback({
+        let client = client.clone();
+        let raise_hand_announcer = raise_hand_announcer.clone();
+        move |_| {
+            let now = js_sys::Date::now();
+            let next = {
+                let announcer = raise_hand_announcer.borrow();
+                !announcer.is_raised()
+            };
+            {
+                let mut announcer = raise_hand_announcer.borrow_mut();
+                announcer.set_level(next, now);
+            }
+            // Mirror the new level into the shared roster so the banner, the self
+            // tile badge, and the roster row update on this frame. `raised_at_ms`
+            // comes from the announcer (the value that will actually be sent), so
+            // our own queue position matches how every peer will order us.
+            let (raised_at_ms, own_session) = {
+                let announcer = raise_hand_announcer.borrow();
+                (
+                    announcer.raised_at_ms(),
+                    // The relay-stamped session id peers will attribute us by.
+                    // Falling back to `u64::MAX` (rather than 0) keeps a
+                    // not-yet-assigned local session sorted LAST among equal
+                    // stamps instead of first, so a transient pre-SESSION_ASSIGNED
+                    // state cannot make us appear to have jumped the queue.
+                    client
+                        .get_own_session_id()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(u64::MAX),
+                )
+            };
+            let mut hands = raised_hands;
+            let mut next_list = hands.peek().clone();
+            // The self path is keyed on `is_self`, NOT on `own_session`: that id
+            // is resolved fresh here and can differ between the raise and the
+            // lower (it is `None` before SESSION_ASSIGNED and changes on a
+            // re-election), which would otherwise orphan the local entry in the
+            // banner with no way to clear it.
+            let changed = if next {
+                set_self_raised_hand(
+                    &mut next_list,
+                    RaisedHand {
+                        session_id: own_session,
+                        raised_at_ms,
+                        name: current_display_name(),
+                        is_self: true,
+                    },
+                )
+            } else {
+                clear_self_raised_hand(&mut next_list)
+            };
+            if changed {
+                hands.set(next_list);
+            }
+            let mut self_raised = self_hand_raised;
+            if should_write_bool_signal(*self_raised.peek(), next) {
+                self_raised.set(next);
+            }
+            drive_raise_hand(
+                &client,
+                &raise_hand_announcer,
+                raise_hand_timer,
+                RaiseHandTrigger::LocalToggle,
+            );
+        }
+    });
+
+    // Issue 2136 — host meeting-timer transitions.
+    //
+    // All three are gated in the UI on `local_is_host` (below), which tracks the
+    // SAME live signal the relay's gate does. They are deliberately NOT gated
+    // here as well: a second check against a different signal is how the button
+    // and the wire end up disagreeing, and the relay is the enforcement point
+    // regardless — a forged call to any of these is dropped at the funnel.
+
+    // Start a timer of `duration_ms` from now.
+    let start_meeting_timer: EventHandler<u64> = use_callback({
+        let client = client.clone();
+        let meeting_timer_scheduler = meeting_timer_scheduler.clone();
+        move |duration_ms: u64| {
+            let now = js_sys::Date::now() as u64;
+            apply_meeting_timer_transition(
+                &client,
+                &meeting_timer_scheduler,
+                meeting_timer_pump,
+                meeting_timer_state,
+                start_state(duration_ms, now),
+                now,
+            );
+        }
+    });
+
+    // Extend the running timer by one step. A no-op when nothing is running —
+    // the control is hidden in that case, but the guard keeps a stray keyboard
+    // activation from starting a timer the host did not ask for.
+    let extend_meeting_timer: EventHandler<()> = use_callback({
+        let client = client.clone();
+        let meeting_timer_scheduler = meeting_timer_scheduler.clone();
+        move |_| {
+            let Some(current) = *meeting_timer_state.peek() else {
+                return;
+            };
+            if !current.running {
+                return;
+            }
+            let now = js_sys::Date::now() as u64;
+            apply_meeting_timer_transition(
+                &client,
+                &meeting_timer_scheduler,
+                meeting_timer_pump,
+                meeting_timer_state,
+                extend_state(current, MEETING_TIMER_EXTEND_STEP_MS, now),
+                now,
+            );
+        }
+    });
+
+    // Cancel the running timer. This is the transition whose loss hurts most —
+    // there is no heartbeat behind `running = false`, so the room would keep
+    // counting down to a sound the host already called off — which is why the
+    // scheduler repeats it three times.
+    let cancel_meeting_timer: EventHandler<()> = use_callback({
+        let client = client.clone();
+        let meeting_timer_scheduler = meeting_timer_scheduler.clone();
+        move |_| {
+            let now = js_sys::Date::now() as u64;
+            apply_meeting_timer_transition(
+                &client,
+                &meeting_timer_scheduler,
+                meeting_timer_pump,
+                meeting_timer_state,
+                MeetingTimerState::cleared(now),
+                now,
+            );
+        }
+    });
+
+    // Issue 1884: activate a reaction from the palette (mouse click or
+    // keyboard Enter/Space). The palette STAYS OPEN after a click so the user
+    // can fire several reactions in a row; it auto-hides
+    // ~REACTION_PALETTE_AUTOHIDE_MS after the LATEST click (Escape /
+    // outside-click / the X close it immediately). EVERY activation shows ~150ms
+    // of pressed feedback on the chosen option AND (re)arms the auto-hide timer
+    // — INCLUDING an over-budget click, which the send self-throttle turns into
+    // a silent no-op (no wire packet, no echo) but which still gets the pressed
+    // feedback and keeps the window alive (the user is engaged). An allowed send
+    // fires the wire packet AND pushes the local "You" echo, because the relay
+    // self-skips the sender (the UI must render its own reaction rather than
+    // wait for it to come back over the wire).
+    let send_reaction: EventHandler<ReactionType> = use_callback({
+        let client = client.clone();
+        let reaction_throttle = reaction_throttle.clone();
+        let reaction_id_counter = reaction_id_counter.clone();
+        let reaction_autohide_gen = reaction_autohide_gen.clone();
+        let reaction_last_press = reaction_last_press.clone();
+        move |reaction: ReactionType| {
+            let now = js_sys::Date::now();
+            // Local press gate (perf, approved deviation): a held Enter/Space on
+            // a focused option key-repeats at 20-30/s; without this each repeat
+            // would set reaction_pressed twice + re-arm, i.e. ~2 whole-component
+            // re-renders per repeat. Coalesce anything within the ~150ms pressed
+            // window — skip BEFORE any signal write (no pressed render, no
+            // re-arm, no send). A repeat this fast is throttle-rejected anyway,
+            // so nothing user-visible is lost; intentional clicking (>=150ms
+            // apart) is unaffected.
+            if now - reaction_last_press.get() < 150.0 {
+                return;
+            }
+            reaction_last_press.set(now);
+            reaction_pressed.set(Some(reaction));
+            let allowed = reaction_throttle.borrow_mut().try_acquire(now);
+            if allowed {
+                client.send_reaction(reaction);
+                if let Some((emoji, _label, _slug)) = reaction_glyph(reaction) {
+                    push_reaction_float(
+                        active_reactions,
+                        &reaction_id_counter,
+                        u64::MAX,
+                        emoji.to_string(),
+                        "You".to_string(),
+                    );
+                }
+            }
+            // (Re)arm the auto-hide window on every click (throttled or not), so
+            // sequential reactions keep the palette open.
+            arm_reaction_autohide(reactions_open, &reaction_autohide_gen);
+            // Clear the ~150ms pressed feedback WITHOUT closing (the palette
+            // stays open now). try_write: this can fire after unmount, where a
+            // plain set() would panic on the dropped signal.
+            Timeout::new(150, move || {
+                if let Ok(mut pressed) = reaction_pressed.try_write() {
+                    *pressed = None;
+                }
+            })
+            .forget();
+        }
+    });
+
+    // Issue 1884: send a CUSTOM reaction carrying a picker-selected standard
+    // emoji. Mirrors `send_reaction`'s press-gate + self-throttle + local-echo +
+    // auto-hide, but keyed on the emoji STRING. The picker only offers emoji that
+    // pass `validate_custom_emoji`, and the client re-validates at the wire
+    // boundary; we validate here too (defense in depth) so an invalid string is
+    // never sent OR echoed. The picker (and palette) stay OPEN after a click so
+    // the user can fire several — matching the quick-row semantics.
+    let send_custom_reaction: EventHandler<String> = use_callback({
+        let client = client.clone();
+        let reaction_throttle = reaction_throttle.clone();
+        let reaction_id_counter = reaction_id_counter.clone();
+        let reaction_autohide_gen = reaction_autohide_gen.clone();
+        let reaction_last_press = reaction_last_press.clone();
+        move |emoji: String| {
+            // Reject anything not on the exact standard-emoji allowlist before any
+            // work (also blocks a stale/garbled grid value).
+            if !validate_custom_emoji(&emoji) {
+                return;
+            }
+            let now = js_sys::Date::now();
+            // Same held-key/rapid press gate as the quick row (shares the clock).
+            if now - reaction_last_press.get() < 150.0 {
+                return;
+            }
+            reaction_last_press.set(now);
+            let allowed = reaction_throttle.borrow_mut().try_acquire(now);
+            if allowed && client.send_custom_reaction(&emoji) {
+                // Record it as the most-recent CUSTOM quick-pick (dedupe + cap)
+                // and persist, BEFORE the echo consumes `emoji`. peek() keeps
+                // this event handler from subscribing to its own write.
+                let mut updated = recent_custom_emojis.peek().clone();
+                push_recent_custom_emoji(&mut updated, &emoji);
+                save_recent_custom_emojis(&updated);
+                recent_custom_emojis.set(updated);
+                // Relay self-skips the sender: render our own echo locally.
+                push_reaction_float(
+                    active_reactions,
+                    &reaction_id_counter,
+                    u64::MAX,
+                    emoji,
+                    "You".to_string(),
+                );
+            }
+            // Keep the palette/picker open on every click (throttled or not).
+            arm_reaction_autohide(reactions_open, &reaction_autohide_gen);
+        }
+    });
+
     // --- Pre-join screen ---
     if !meeting_joined() {
         // Every device joins regardless of capabilities (issue #1054): the
@@ -7789,11 +9264,17 @@ pub fn AttendantsComponent(
     }
 
     // --- Meeting view ---
-    // Update the meeting time context signal
-    meeting_time_signal.set(MeetingTime {
-        call_start_time: call_start_time(),
-        meeting_start_time: meeting_start_time_server(),
-    });
+    // Update the meeting time context signal. Change-guarded (issue #2103): an
+    // unconditional `set` here dirties every `PeerTile` scope on every parent
+    // render, and dioxus's memoized diff branch does NOT undirty them — see
+    // `publish_meeting_time`.
+    publish_meeting_time(
+        meeting_time_signal,
+        MeetingTime {
+            call_start_time: call_start_time(),
+            meeting_start_time: meeting_start_time_server(),
+        },
+    );
 
     // Snapshot the local session_id once per render so every PeerTile can pin
     // self-identification on session_id instead of user_id. Two tabs of the
@@ -7998,158 +9479,6 @@ pub fn AttendantsComponent(
             *prev = peer_tile_hints.clone();
         }
     }
-
-    let toggle_pin = {
-        let client = client.clone();
-        move |target: PinnedTile| {
-            // target.user_id is already a user_id from canvas_generator.rs.
-            // Keep normalization defensive in case a session_id is passed in the future.
-            let normalized = PinnedTile {
-                user_id: client
-                    .get_peer_user_id(&target.user_id)
-                    .unwrap_or(target.user_id),
-                kind: target.kind,
-            };
-
-            // Clicking the SAME (peer, tile-kind) that is already pinned releases
-            // the pin; clicking a DIFFERENT one — including the SAME peer's OTHER
-            // tile-kind (e.g. their screen while their camera is pinned) — SWITCHES
-            // the spotlight to it. See `next_pin_target` for the reducer semantics:
-            // equality includes `kind`, so pinning the camera while the screen is
-            // pinned un-maximizes the screen and maximizes the camera.
-            let cur = pinned_peer_id();
-            let next = next_pin_target(cur.as_ref(), normalized);
-            pinned_peer_id.set(next);
-        }
-    };
-
-    // Issue #1466: toggle a peer's force-decode request. Mirrors `toggle_pin`
-    // but is keyed on the tile's SESSION_ID (the `key`/`peer_id` the avatar tile
-    // passes to `on_request_decode`), NOT user_id — `user_requested_decode` and
-    // `display_peers` both hold session_ids and the phase-4 merge parses them to
-    // u64. Toggle semantics: a second click removes the id so the budget may
-    // re-pause the peer (the PLAY button is not a one-way latch). Writing this
-    // signal re-renders the parent (it is `.read()` in the promotion + phase-4
-    // merge above), which recomputes the partition and pushes the new
-    // active_decode_set.
-    let toggle_request_decode: EventHandler<String> =
-        EventHandler::new(move |session_id: String| {
-            let mut set = user_requested_decode.write();
-            if set.contains(&session_id) {
-                set.remove(&session_id);
-            } else {
-                set.insert(session_id);
-            }
-        });
-
-    // Issue 1884: activate a reaction from the palette (mouse click or
-    // keyboard Enter/Space). The palette STAYS OPEN after a click so the user
-    // can fire several reactions in a row; it auto-hides
-    // ~REACTION_PALETTE_AUTOHIDE_MS after the LATEST click (Escape /
-    // outside-click / the X close it immediately). EVERY activation shows ~150ms
-    // of pressed feedback on the chosen option AND (re)arms the auto-hide timer
-    // — INCLUDING an over-budget click, which the send self-throttle turns into
-    // a silent no-op (no wire packet, no echo) but which still gets the pressed
-    // feedback and keeps the window alive (the user is engaged). An allowed send
-    // fires the wire packet AND pushes the local "You" echo, because the relay
-    // self-skips the sender (the UI must render its own reaction rather than
-    // wait for it to come back over the wire).
-    let send_reaction: EventHandler<ReactionType> = {
-        let client = client.clone();
-        let reaction_throttle = reaction_throttle.clone();
-        let reaction_id_counter = reaction_id_counter.clone();
-        let reaction_autohide_gen = reaction_autohide_gen.clone();
-        let reaction_last_press = reaction_last_press.clone();
-        EventHandler::new(move |reaction: ReactionType| {
-            let now = js_sys::Date::now();
-            // Local press gate (perf, approved deviation): a held Enter/Space on
-            // a focused option key-repeats at 20-30/s; without this each repeat
-            // would set reaction_pressed twice + re-arm, i.e. ~2 whole-component
-            // re-renders per repeat. Coalesce anything within the ~150ms pressed
-            // window — skip BEFORE any signal write (no pressed render, no
-            // re-arm, no send). A repeat this fast is throttle-rejected anyway,
-            // so nothing user-visible is lost; intentional clicking (>=150ms
-            // apart) is unaffected.
-            if now - reaction_last_press.get() < 150.0 {
-                return;
-            }
-            reaction_last_press.set(now);
-            reaction_pressed.set(Some(reaction));
-            let allowed = reaction_throttle.borrow_mut().try_acquire(now);
-            if allowed {
-                client.send_reaction(reaction);
-                if let Some((emoji, _label, _slug)) = reaction_glyph(reaction) {
-                    push_reaction_float(
-                        active_reactions,
-                        &reaction_id_counter,
-                        u64::MAX,
-                        emoji.to_string(),
-                        "You".to_string(),
-                    );
-                }
-            }
-            // (Re)arm the auto-hide window on every click (throttled or not), so
-            // sequential reactions keep the palette open.
-            arm_reaction_autohide(reactions_open, &reaction_autohide_gen);
-            // Clear the ~150ms pressed feedback WITHOUT closing (the palette
-            // stays open now). try_write: this can fire after unmount, where a
-            // plain set() would panic on the dropped signal.
-            Timeout::new(150, move || {
-                if let Ok(mut pressed) = reaction_pressed.try_write() {
-                    *pressed = None;
-                }
-            })
-            .forget();
-        })
-    };
-
-    // Issue 1884: send a CUSTOM reaction carrying a picker-selected standard
-    // emoji. Mirrors `send_reaction`'s press-gate + self-throttle + local-echo +
-    // auto-hide, but keyed on the emoji STRING. The picker only offers emoji that
-    // pass `validate_custom_emoji`, and the client re-validates at the wire
-    // boundary; we validate here too (defense in depth) so an invalid string is
-    // never sent OR echoed. The picker (and palette) stay OPEN after a click so
-    // the user can fire several — matching the quick-row semantics.
-    let send_custom_reaction: EventHandler<String> = {
-        let client = client.clone();
-        let reaction_throttle = reaction_throttle.clone();
-        let reaction_id_counter = reaction_id_counter.clone();
-        let reaction_autohide_gen = reaction_autohide_gen.clone();
-        let reaction_last_press = reaction_last_press.clone();
-        EventHandler::new(move |emoji: String| {
-            // Reject anything not on the exact standard-emoji allowlist before any
-            // work (also blocks a stale/garbled grid value).
-            if !validate_custom_emoji(&emoji) {
-                return;
-            }
-            let now = js_sys::Date::now();
-            // Same held-key/rapid press gate as the quick row (shares the clock).
-            if now - reaction_last_press.get() < 150.0 {
-                return;
-            }
-            reaction_last_press.set(now);
-            let allowed = reaction_throttle.borrow_mut().try_acquire(now);
-            if allowed && client.send_custom_reaction(&emoji) {
-                // Record it as the most-recent CUSTOM quick-pick (dedupe + cap)
-                // and persist, BEFORE the echo consumes `emoji`. peek() keeps
-                // this event handler from subscribing to its own write.
-                let mut updated = recent_custom_emojis.peek().clone();
-                push_recent_custom_emoji(&mut updated, &emoji);
-                save_recent_custom_emojis(&updated);
-                recent_custom_emojis.set(updated);
-                // Relay self-skips the sender: render our own echo locally.
-                push_reaction_float(
-                    active_reactions,
-                    &reaction_id_counter,
-                    u64::MAX,
-                    emoji,
-                    "You".to_string(),
-                );
-            }
-            // Keep the palette/picker open on every click (throttled or not).
-            arm_reaction_autohide(reactions_open, &reaction_autohide_gen);
-        })
-    };
 
     rsx! {
         div {
@@ -8633,6 +9962,49 @@ pub fn AttendantsComponent(
                         }
                     },
 
+                    // Issue 2135: the persistent raised-hands banner. Mounted
+                    // UNCONDITIONALLY and self-gating, and it reads the roster
+                    // ITSELF from `RaisedHandsCtx` rather than taking props — so a
+                    // hand going up re-renders this ~10-node child instead of the
+                    // whole attendants RSX.
+                    //
+                    // "Self-gating" here means it emits NO element node at all
+                    // while no hand is up: the banner's whole template is one
+                    // `if let Some(text) = compose_raised_hands_banner(..)`, and
+                    // `compose_raised_hands_banner(&[]) == None` is pinned by
+                    // `raised_hands::tests::banner_is_absent_when_no_hand_is_up`.
+                    // That is load-bearing for `#grid-container`'s child ORDER:
+                    // the split screen-share layout's panes are addressed
+                    // positionally (`> div:nth-child(1|3)`) by several E2E specs,
+                    // so a permanently-present child here silently re-points every
+                    // one of them at the wrong element. The screen-reader live
+                    // region — which genuinely must never unmount — is therefore a
+                    // SEPARATE component mounted as the LAST child of this
+                    // container (see `RaisedHandsLiveRegion` at the end of
+                    // `#grid-container`), where it perturbs no leading index.
+                    //
+                    // That is a claim about THIS component's blast radius and
+                    // nothing more. The tile badges do not ride on this decision:
+                    // each `PeerTile` reaches the roster on its own, through a
+                    // `use_memo` over `RaisedHandsCtx::is_raised`, so a toggle
+                    // re-renders only the tile whose hand actually moved. (An
+                    // earlier version of this comment claimed the self-read also
+                    // spared "every keyed `PeerTile`". It did not — every tile
+                    // held a direct subscription at the time, so a hand wave
+                    // re-rendered all of them.)
+                    //
+                    // This is the surface that actually answers the issue's "peers
+                    // see who has the hand raised EVEN IF THE TILE IS NOT BEEN
+                    // DISPLAYED": tile badges vanish with the tile (decode-budget
+                    // shedding, a screen share collapsing the grid, a camera-off
+                    // participant with no tile at all), and this does not.
+                    //
+                    // Rendered as an EARLIER SIBLING of the decode-budget banner on
+                    // purpose: both are pinned top-centre, and the CSS rule
+                    // `.raised-hands-banner ~ .decode-budget-banner` pushes the
+                    // decode banner down only while this one is actually in the DOM.
+                    RaisedHandsBanner {}
+
                     // Meeting-level decode-budget banner (#1142 Phase 1). It owns
                     // its own anti-flap damper, so it is mounted UNCONDITIONALLY —
                     // it self-gates on `pressured`/`avatar_count` and the sustain /
@@ -8727,7 +10099,8 @@ pub fn AttendantsComponent(
                                             // HCL bug #2: the shared-content tile shows
                                             // ONLY the screen-share metric in its popup.
                                             meter_mode: SignalMeterMode::ScreenOnly,
-                                            on_toggle_pin: toggle_pin.clone(),
+                                            on_toggle_pin: toggle_pin,
+                                            on_request_decode: noop_request_decode,
                                         }
                                     }
                                 }
@@ -8759,7 +10132,8 @@ pub fn AttendantsComponent(
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
                                                         my_session_id: my_session_id.clone(),
-                                                        on_toggle_pin: move |_: PinnedTile| {},
+                                                        on_toggle_pin: noop_toggle_pin,
+                                                        on_request_decode: noop_request_decode,
                                                     }
                                                 }
                                             } else if force_avatar {
@@ -8773,7 +10147,7 @@ pub fn AttendantsComponent(
                                                         render_mode: TileMode::VideoOnly,
                                                         my_session_id: my_session_id.clone(),
                                                         pinned_peer_id: current_pinned.clone(),
-                                                        on_toggle_pin: toggle_pin.clone(),
+                                                        on_toggle_pin: toggle_pin,
                                                         // Issue #1466: PLAY button force-decodes this SS off-budget peer.
                                                         on_request_decode: toggle_request_decode,
                                                         room_id: Some(id.clone()),
@@ -8790,7 +10164,8 @@ pub fn AttendantsComponent(
                                                         render_mode: TileMode::VideoOnly,
                                                         my_session_id: my_session_id.clone(),
                                                         pinned_peer_id: current_pinned.clone(),
-                                                        on_toggle_pin: toggle_pin.clone(),
+                                                        on_toggle_pin: toggle_pin,
+                                                        on_request_decode: noop_request_decode,
                                                         room_id: Some(id.clone()),
                                                         is_current_user_host: is_owner,
                                                     }
@@ -8823,7 +10198,8 @@ pub fn AttendantsComponent(
                                             force_avatar,
                                             host_user_id: host_user_id.clone(),
                                             my_session_id: my_session_id.clone(),
-                                            on_toggle_pin: move |_: PinnedTile| {},
+                                            on_toggle_pin: noop_toggle_pin,
+                                            on_request_decode: noop_request_decode,
                                         }
                                     }
                                 } else if force_avatar {
@@ -8839,7 +10215,7 @@ pub fn AttendantsComponent(
                                             host_user_id: host_user_id.clone(),
                                             my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
-                                            on_toggle_pin: toggle_pin.clone(),
+                                            on_toggle_pin: toggle_pin,
                                             on_request_decode: toggle_request_decode,
                                             room_id: Some(id.clone()),
                                             is_current_user_host: is_owner,
@@ -8857,7 +10233,8 @@ pub fn AttendantsComponent(
                                             host_user_id: host_user_id.clone(),
                                             my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
-                                            on_toggle_pin: toggle_pin.clone(),
+                                            on_toggle_pin: toggle_pin,
+                                            on_request_decode: noop_request_decode,
                                             room_id: Some(id.clone()),
                                             is_current_user_host: is_owner,
                                         }
@@ -8996,12 +10373,62 @@ pub fn AttendantsComponent(
                                 // reorder, and is reset back to empty in the
                                 // customize_mode-exit `use_effect` (search for
                                 // "Silence the keyboard-reorder live region").
+                                //
+                                // issue 1765: rendered through
+                                // `action_bar_announce_text` so a REPEATED message
+                                // (two consecutive Resets, or bumping a slot
+                                // against the same end twice) still mutates the
+                                // text node and re-announces. `aria-atomic` alone
+                                // cannot do that — with no mutation there is no
+                                // announcement to make atomic.
                                 div {
                                     class: "visually-hidden",
                                     role: "status",
                                     "aria-live": "polite",
                                     "aria-atomic": "true",
-                                    "{action_bar_announce}"
+                                    {action_bar_announce_text(&action_bar_announce.read(), action_bar_announce_nonce())}
+                                }
+                                // issue 1765: per-slot reorder hint. The entry
+                                // instructions above are announced ONCE, on
+                                // customize-mode entry; a user who Tabs to a
+                                // slot later had no way to learn that arrows
+                                // move it. Every customize-mode slot button
+                                // points its `aria-describedby` here, so the
+                                // affordance is discoverable at any point.
+                                //
+                                // Deliberately NOT a live region (no role, no
+                                // aria-live): it is a description target only,
+                                // reached on focus, never announced on its own.
+                                // Mounted only in customize mode — outside it,
+                                // nothing references the id and a permanently
+                                // parked instruction would just be noise for
+                                // anyone reading the page in browse mode. The
+                                // element and every reference to it are gated
+                                // on the same `customize_mode()` condition, so
+                                // they land in one Dioxus render commit and the
+                                // reference is never dangling.
+                                //
+                                // Kept TERSE on purpose. The slot loop is keyed
+                                // by slug, so a keyboard reorder MOVES the DOM
+                                // node, blurring it; the handler re-focuses via
+                                // `Timeout::new(0, ..)`. Focus therefore genuinely
+                                // re-lands on every single arrow press, and the
+                                // description is respoken every time — before the
+                                // live region adds "… moved to position N of M."
+                                // A verbose hint here turns a five-position move
+                                // into a wall of repeated speech, and duplicates
+                                // the customize-entry instructions above almost
+                                // word for word. The entry region carries the full
+                                // explanation once; this only has to remind.
+                                // (Atlassian's drag-and-drop a11y pattern: terse
+                                // per-item description, verbose live-region
+                                // feedback.)
+                                if customize_mode() {
+                                    span {
+                                        id: ACTION_BAR_SLOT_HINT_ID,
+                                        class: "visually-hidden",
+                                        "Arrow keys reorder; Home and End move it to the ends."
+                                    }
                                 }
                                 nav {
                                     class: {
@@ -9027,9 +10454,11 @@ pub fn AttendantsComponent(
                                     //   Cmd+ArrowLeft to jump home also jumped the slot to
                                     //   position 1, and Cmd+ArrowRight jumped to position N —
                                     //   the "jumps to 9 first, then walks to 5" report.
-                                    // - `KeyboardEvent.repeat` → skip. OS-level auto-repeat
+                                    // - `KeyboardEvent.repeat` → skip, but only AFTER
+                                    //   `prevent_default()` (issue 1765). OS-level auto-repeat
                                     //   fires ~30 events/s while a key is held; a slot would
-                                    //   race from 3 to 9 in a blink. Single press = single step.
+                                    //   race from 3 to 9 in a blink. Single press = single step —
+                                    //   and a held key still scrolls nothing.
                                     // - Target inside the remove button → skip. Arrow keys
                                     //   there mean "I'm about to click Remove", not "reorder".
                                     onkeydown: move |evt: Event<KeyboardData>| {
@@ -9073,9 +10502,6 @@ pub fn AttendantsComponent(
                                             _ => return,
                                         };
                                         let ke: web_sys::KeyboardEvent = evt.as_web_event().unchecked_into();
-                                        // OS-level auto-repeat → skip. A held key must not
-                                        // fast-forward a slot through the whole bar.
-                                        if ke.repeat() { return; }
                                         let Some(target) = ke.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else { return; };
                                         // If focus is on the − remove button inside a slot,
                                         // arrow keys must not reorder that slot; the user is on
@@ -9088,22 +10514,42 @@ pub fn AttendantsComponent(
                                         let Some(slot) = ActionBarSlot::from_slug(&slug) else { return; };
                                         // Always suppress the browser's default (page scroll on
                                         // arrows, Home/End jump) so a focused slot in customize
-                                        // mode never scrolls the meeting view. Even a no-op key
-                                        // (already at the edge) should not scroll.
+                                        // mode never scrolls the meeting view. "Always" means
+                                        // every key event this handler claims — including a
+                                        // no-op key (slot already at the edge) and including
+                                        // every OS auto-repeat of a HELD key.
                                         evt.prevent_default();
+                                        // issue 1765: the auto-repeat guard sits BELOW
+                                        // `prevent_default()` on purpose. It used to sit above,
+                                        // which made the comment just above it a lie: each repeat
+                                        // returned before the default was suppressed, so holding
+                                        // an arrow scrolled the meeting view behind the customize
+                                        // backdrop. Suppressing first and skipping second gives a
+                                        // held key both properties it needs — non-scrolling AND
+                                        // single-step (one press moves a slot exactly one
+                                        // position, never fast-forwarding it across the bar).
+                                        if ke.repeat() { return; }
                                         let ios_device = is_ios();
                                         let current_full = action_bar_slots.read().clone();
                                         let mut visible_slots = visible_action_bar_slots(
                                             &current_full,
-                                            customize_mode(),
-                                            ios_device,
-                                            has_screen_share,
-                                            is_owner,
-                                            record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                            SlotVisibility {
+                                                customize_mode: customize_mode(),
+                                                ios_device,
+                                                has_screen_share,
+                                                is_owner,
+                                                recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                meeting_timer_visible,
+                                            },
                                         );
                                         let Some(result) = apply_keyboard_reorder(&mut visible_slots, slot, delta, absolute) else { return; };
                                         let len = visible_slots.len();
                                         if result.new_idx == result.old_idx {
+                                            // Nonce bump before every write, including
+                                            // this one — bumping a slot against the same
+                                            // end twice produces the SAME message, which
+                                            // would otherwise be silent on the repeat.
+                                            action_bar_announce_nonce += 1;
                                             action_bar_announce.set(format!(
                                                 "{} is already at position {} of {}.",
                                                 slot.display_name(),
@@ -9115,14 +10561,18 @@ pub fn AttendantsComponent(
                                         let next = merge_visible_action_bar_slots(
                                             &current_full,
                                             &visible_slots,
-                                            customize_mode(),
-                                            ios_device,
-                                            has_screen_share,
-                                            is_owner,
-                                            record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                            SlotVisibility {
+                                                customize_mode: customize_mode(),
+                                                ios_device,
+                                                has_screen_share,
+                                                is_owner,
+                                                recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                meeting_timer_visible,
+                                            },
                                         );
                                         action_bar_slots.set(next);
                                         save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
+                                        action_bar_announce_nonce += 1;
                                         action_bar_announce.set(format!(
                                             "{} moved to position {} of {}.",
                                             slot.display_name(),
@@ -9171,11 +10621,14 @@ pub fn AttendantsComponent(
                                             let orig_slots = drag_orig_layout();
                                             let orig_visible = visible_action_bar_slots(
                                                 &orig_slots,
-                                                customize_mode(),
-                                                ios_device,
-                                                has_screen_share,
-                                                is_owner,
-                                                record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                SlotVisibility {
+                                                    customize_mode: customize_mode(),
+                                                    ios_device,
+                                                    has_screen_share,
+                                                    is_owner,
+                                                    recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                    meeting_timer_visible,
+                                                },
                                             );
                                             let orig_idx = orig_visible.iter().position(|s| *s == dragged).unwrap_or(0);
                                             let num_slots = orig_visible.len();
@@ -9189,11 +10642,14 @@ pub fn AttendantsComponent(
                                                 let current_full = action_bar_slots.read().clone();
                                                 let mut next_visible = visible_action_bar_slots(
                                                     &current_full,
-                                                    customize_mode(),
-                                                    ios_device,
-                                                    has_screen_share,
-                                                    is_owner,
-                                                    record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                    SlotVisibility {
+                                                        customize_mode: customize_mode(),
+                                                        ios_device,
+                                                        has_screen_share,
+                                                        is_owner,
+                                                        recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                        meeting_timer_visible,
+                                                    },
                                                 );
                                                 if let Some(cur) = next_visible.iter().position(|s| *s == dragged) {
                                                     next_visible.remove(cur);
@@ -9201,11 +10657,14 @@ pub fn AttendantsComponent(
                                                     let next_full = merge_visible_action_bar_slots(
                                                         &current_full,
                                                         &next_visible,
-                                                        customize_mode(),
-                                                        ios_device,
-                                                        has_screen_share,
-                                                        is_owner,
-                                                        record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                        SlotVisibility {
+                                                            customize_mode: customize_mode(),
+                                                            ios_device,
+                                                            has_screen_share,
+                                                            is_owner,
+                                                            recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                            meeting_timer_visible,
+                                                        },
                                                     );
                                                     action_bar_slots.set(next_full);
                                                 }
@@ -9304,14 +10763,30 @@ pub fn AttendantsComponent(
                                     // emitted sibling is keyed (no keyed+keyless fragment mix).
                                     for slot in visible_action_bar_slots(
                                         &action_bar_slots.read(),
-                                        customize_mode(),
-                                        is_ios(),
-                                        has_screen_share,
-                                        is_owner,
-                                        record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                        SlotVisibility {
+                                            customize_mode: customize_mode(),
+                                            ios_device: is_ios(),
+                                            has_screen_share,
+                                            is_owner,
+                                            recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                            meeting_timer_visible,
+                                        },
                                     ) {
                                         {
                                         let slug = slot.slug();
+                                        // issue 1765: in customize mode every slot's
+                                        // primary button is described by the arrow-key
+                                        // reorder hint, so Tabbing to a slot at any
+                                        // point surfaces the affordance — not only on
+                                        // mode entry. Outside customize mode this is
+                                        // `None`, Dioxus omits the attribute, and the
+                                        // hint element is not mounted either (both are
+                                        // gated on this same `customize_mode()` read).
+                                        let slot_describedby = if customize_mode() {
+                                            Some(ACTION_BAR_SLOT_HINT_ID)
+                                        } else {
+                                            None
+                                        };
                                                 let tier = match slot {
                                                     ActionBarSlot::Mic | ActionBarSlot::Camera => "slot-primary",
                                                     _ => "slot-secondary",
@@ -9363,11 +10838,14 @@ pub fn AttendantsComponent(
                                                             drag_orig_layout.set(current_full.clone());
                                                             let src_visible = visible_action_bar_slots(
                                                                 &current_full,
-                                                                customize_mode(),
-                                                                is_ios(),
-                                                                has_screen_share,
-                                                                is_owner,
-                                                                record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                                SlotVisibility {
+                                                                    customize_mode: customize_mode(),
+                                                                    ios_device: is_ios(),
+                                                                    has_screen_share,
+                                                                    is_owner,
+                                                                    recording_visible: record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+                                                                    meeting_timer_visible,
+                                                                },
                                                             );
                                                             let src_idx = src_visible.iter().position(|s| *s == slot).unwrap_or(0);
                                                             dragging_slot.set(Some(slot));
@@ -9400,6 +10878,7 @@ pub fn AttendantsComponent(
                                                                     MicButton {
                                                                         enabled: mic_enabled(),
                                                                         available: mic_error.read().is_none(),
+                                                                        describedby: slot_describedby,
                                                                         onclick: move |_| {
                                                                             if customize_mode() { return; }
                                                                             if !mic_enabled() {
@@ -9433,6 +10912,7 @@ pub fn AttendantsComponent(
                                                                     CameraButton {
                                                                         enabled: video_enabled(),
                                                                         available: video_error.read().is_none(),
+                                                                        describedby: slot_describedby,
                                                                         onclick: move |_| {
                                                                             if customize_mode() { return; }
                                                                             if !video_enabled() {
@@ -9476,6 +10956,7 @@ pub fn AttendantsComponent(
                                                                     ScreenShareButton {
                                                                         active: is_active,
                                                                         disabled: is_disabled,
+                                                                        describedby: slot_describedby,
                                                                         onclick: move |_| {
                                                                             if customize_mode() { return; }
                                                                             if matches!(screen_share_state(), ScreenShareState::Idle) {
@@ -9570,6 +11051,7 @@ pub fn AttendantsComponent(
                                                                 PeerListButton {
                                                                     id: "peer-list-trigger",
                                                                     open: peer_list_open(),
+                                                                    describedby: slot_describedby,
                                                                     onclick: move |e: MouseEvent| {
                                                                         if customize_mode() { return; }
                                                                         // Mirror the density toggle: stop the click
@@ -9593,6 +11075,7 @@ pub fn AttendantsComponent(
                                                                 DensityModeButton {
                                                                     label: density_mode().label().to_string(),
                                                                     open: density_open(),
+                                                                    describedby: slot_describedby,
                                                                     onclick: move |e: MouseEvent| {
                                                                         if customize_mode() { return; }
                                                                         e.stop_propagation();
@@ -9615,6 +11098,7 @@ pub fn AttendantsComponent(
                                                                 ReactionsButton {
                                                                     id: "reactions-trigger",
                                                                     open: reactions_open(),
+                                                                    describedby: slot_describedby,
                                                                     onclick: move |e: MouseEvent| {
                                                                         if customize_mode() { return; }
                                                                         e.stop_propagation();
@@ -9635,10 +11119,27 @@ pub fn AttendantsComponent(
                                                                     },
                                                                 }
                                                             },
+                                                            ActionBarSlot::RaiseHand => rsx! {
+                                                                RaiseHandButton {
+                                                                    id: "raise-hand-trigger",
+                                                                    raised: self_hand_raised(),
+                                                                    describedby: slot_describedby,
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        // Mirror the sibling toggles: stop the click
+                                                                        // reaching `#main-container`'s background
+                                                                        // handler, which light-dismisses side panels
+                                                                        // (#1790).
+                                                                        e.stop_propagation();
+                                                                        toggle_raise_hand.call(());
+                                                                    },
+                                                                }
+                                                            },
                                                             ActionBarSlot::Diagnostics => rsx! {
                                                                 DiagnosticsButton {
                                                                     id: "diagnostics-trigger",
                                                                     open: diagnostics_open(),
+                                                                    describedby: slot_describedby,
                                                                     onclick: move |e: MouseEvent| {
                                                                         if customize_mode() { return; }
                                                                         // Mirror the density toggle (see PeerListButton
@@ -9661,6 +11162,7 @@ pub fn AttendantsComponent(
                                                             ActionBarSlot::DeviceSettings => rsx! {
                                                                 DeviceSettingsButton {
                                                                     open: device_settings_open(),
+                                                                    describedby: slot_describedby,
                                                                     onclick: move |_| {
                                                                         if customize_mode() { return; }
                                                                         device_settings_initial_section.set(None);
@@ -9683,6 +11185,7 @@ pub fn AttendantsComponent(
                                                             ActionBarSlot::MeetingOptions => rsx! {
                                                                 MeetingOptionsButton {
                                                                     open: meeting_options_open(),
+                                                                    describedby: slot_describedby,
                                                                     onclick: move |_| {
                                                                         if customize_mode() { return; }
                                                                         let was_closed = !meeting_options_open();
@@ -9699,6 +11202,39 @@ pub fn AttendantsComponent(
                                                                     },
                                                                 }
                                                             },
+                                                            // Issue 2136: host-only meeting-timer controls.
+                                                            // Visibility is gated upstream in
+                                                            // `visible_action_bar_slots` via
+                                                            // `meeting_timer_slot_visible`, on the LIVE host
+                                                            // signal rather than the lagging `is_owner` prop —
+                                                            // see that function for why that matters.
+                                                            ActionBarSlot::MeetingTimer => rsx! {
+                                                                MeetingTimerDockControl {
+                                                                    id: "meeting-timer-trigger",
+                                                                    open: meeting_timer_open(),
+                                                                    describedby: slot_describedby,
+                                                                    onclick: move |evt: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        // Stop the click reaching `#main-container`'s
+                                                                        // background handler, which light-dismisses side
+                                                                        // panels (#1790) — without this the popover would
+                                                                        // open and immediately close.
+                                                                        evt.stop_propagation();
+                                                                        let was_closed = !meeting_timer_open();
+                                                                        meeting_timer_open.set(!meeting_timer_open());
+                                                                        if was_closed {
+                                                                            device_settings_open.set(false);
+                                                                            peer_list_open.set(false);
+                                                                            diagnostics_open.set(false);
+                                                                            density_open.set(false);
+                                                                            reactions_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                            meeting_options_open.set(false);
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
                                                             ActionBarSlot::Recording => {
                                                                 // Recording controls (#1746): host / allowed
                                                                 // participants start & stop a client-side
@@ -9711,6 +11247,7 @@ pub fn AttendantsComponent(
                                                                 rsx! {
                                                                     RecordButton {
                                                                         state: record_state(),
+                                                                        describedby: slot_describedby,
                                                                         onclick: move |_| {
                                                                             if customize_mode() { return; }
                                                                             match record_state() {
@@ -9954,9 +11491,36 @@ pub fn AttendantsComponent(
                                                         for slot in secondary_slots.iter().copied() {
                                                             {
                                                                 let label = slot.display_name();
+                                                                // Issue 2135: RaiseHand is the only
+                                                                // overflow item that carries STATE, so it
+                                                                // is the only one that gets `aria-pressed`
+                                                                // (a plain action item must not claim to
+                                                                // be a toggle). Without it the item read
+                                                                // "Raise hand, button" whether the hand was
+                                                                // up or down, while activating it did the
+                                                                // OPPOSITE half the time — and by the
+                                                                // migration's append-at-the-end rule this
+                                                                // is where existing users meet the control
+                                                                // FIRST, so it is the highest-traffic path.
+                                                                //
+                                                                // `display_name()` is already the stable
+                                                                // noun "Raise hand", which is exactly what
+                                                                // `aria-pressed` needs beside it: a name
+                                                                // that flips alongside the state cancels it
+                                                                // out (see `DOCK_AUTOHIDE_LABEL`).
+                                                                let is_raise_hand = matches!(slot, ActionBarSlot::RaiseHand);
+                                                                let hand_up = is_raise_hand && self_hand_raised();
+                                                                let item_class = if hand_up { "overflow-item raised" } else { "overflow-item" };
+                                                                let aria_pressed = if is_raise_hand {
+                                                                    Some(if hand_up { "true" } else { "false" })
+                                                                } else {
+                                                                    None
+                                                                };
                                                                 rsx! {
                                                                     button {
-                                                                        class: "overflow-item",
+                                                                        class: item_class,
+                                                                        "aria-pressed": aria_pressed,
+                                                                        "data-raised": if is_raise_hand { Some(if hand_up { "true" } else { "false" }) } else { None },
                                                                         onclick: move |_| {
                                                                             overflow_menu_open.set(false);
                                                                             match slot {
@@ -10050,6 +11614,60 @@ pub fn AttendantsComponent(
                                                                                         mock_peers_open.set(false);
                                                                                     }
                                                                                 }
+                                                                                // Issue 2135: toggle the raised hand from
+                                                                                // the overflow menu. Unlike its siblings
+                                                                                // this opens nothing, so there are no
+                                                                                // popovers to close — it just calls the
+                                                                                // same handler the action-bar button does,
+                                                                                // which keeps the announcer as the single
+                                                                                // authority for the level.
+                                                                                //
+                                                                                // Load-bearing, not cosmetic: RaiseHand is
+                                                                                // removable and lands at DEFAULT_SLOTS
+                                                                                // index 3, so it is genuinely reachable in
+                                                                                // overflow on a narrow bar — and existing
+                                                                                // users get it APPENDED to the end of their
+                                                                                // saved layout by the forward-compat
+                                                                                // migration, which makes overflow their
+                                                                                // MOST likely first encounter with it.
+                                                                                // Without this arm the menu item rendered
+                                                                                // and did nothing but close the menu.
+                                                                                ActionBarSlot::RaiseHand => {
+                                                                                    toggle_raise_hand.call(());
+                                                                                }
+                                                                                // Issue 2136: open the meeting-timer
+                                                                                // controls from the overflow menu. Mirrors
+                                                                                // the MeetingOptions arm above, including
+                                                                                // the mutual-exclusion set, so the popover
+                                                                                // behaves identically whichever route the
+                                                                                // host took to it.
+                                                                                //
+                                                                                // Load-bearing for exactly the reason the
+                                                                                // RaiseHand arm above records, and MORE so:
+                                                                                // `migrate_stored_layout` APPENDS a new slot
+                                                                                // to every existing user's saved layout, so
+                                                                                // overflow is the host's most likely FIRST
+                                                                                // encounter with this control. It is also
+                                                                                // the host's ONLY route to it on a bar
+                                                                                // narrower than the 1103px this slot pushed
+                                                                                // the full-fit threshold to. Without this
+                                                                                // arm the item rendered (the icon and label
+                                                                                // arms both exist) and did nothing but
+                                                                                // close the menu.
+                                                                                ActionBarSlot::MeetingTimer => {
+                                                                                    let was_closed = !meeting_timer_open();
+                                                                                    meeting_timer_open.set(!meeting_timer_open());
+                                                                                    if was_closed {
+                                                                                        device_settings_open.set(false);
+                                                                                        peer_list_open.set(false);
+                                                                                        diagnostics_open.set(false);
+                                                                                        density_open.set(false);
+                                                                                        reactions_open.set(false);
+                                                                                        dock_menu_open.set(false);
+                                                                                        mock_peers_open.set(false);
+                                                                                        meeting_options_open.set(false);
+                                                                                    }
+                                                                                }
                                                                                 // Mic + Camera are never in overflow
                                                                                 _ => {}
                                                                             }
@@ -10124,13 +11742,25 @@ pub fn AttendantsComponent(
                                                     class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
                                                     title: "Action bar position",
                                                     r#type: "button",
-                                                    "aria-haspopup": "listbox",
+                                                    // issue 1762: the popup is a command menu
+                                                    // (`role="menu"`), not a value list, so the
+                                                    // trigger advertises `menu`. Announcing
+                                                    // `listbox` here promised AT users a value
+                                                    // picker that the popup — which mixes dock
+                                                    // positions with Customize / Reset commands —
+                                                    // does not deliver.
+                                                    "aria-haspopup": "menu",
                                                     "aria-expanded": if dock_menu_open() { "true" } else { "false" },
                                                     onclick: move |e| {
                                                         e.stop_propagation();
                                                         let opening = !dock_menu_open();
                                                         dock_menu_open.set(opening);
                                                         if opening {
+                                                            // Roving tabindex starts at the first item on
+                                                            // every open, so a Tab out of the trigger lands
+                                                            // on exactly one predictable menu item rather
+                                                            // than wherever a previous session left it.
+                                                            dock_menu_highlight.set(0);
                                                             density_open.set(false);
                                                             reactions_open.set(false);
                                                             mock_peers_open.set(false);
@@ -10152,6 +11782,12 @@ pub fn AttendantsComponent(
                                                         } else if key == Key::ArrowDown {
                                                             evt.stop_propagation();
                                                             evt.prevent_default();
+                                                            // Focus lands on the FIRST option either way,
+                                                            // so the roving index is 0 either way. Set it
+                                                            // synchronously (not inside the Timeout) so the
+                                                            // very render that mounts the menu already puts
+                                                            // `tabindex="0"` on the item about to be focused.
+                                                            dock_menu_highlight.set(0);
                                                             if dock_menu_open() {
                                                                 focus_glass_option_at(".dock-position-wrapper", false);
                                                             } else {
@@ -10167,6 +11803,7 @@ pub fn AttendantsComponent(
                                                         } else if key == Key::ArrowUp {
                                                             evt.stop_propagation();
                                                             evt.prevent_default();
+                                                            dock_menu_highlight.set(DOCK_MENU_ITEM_COUNT - 1);
                                                             if dock_menu_open() {
                                                                 focus_glass_option_at(".dock-position-wrapper", true);
                                                             } else {
@@ -10204,18 +11841,97 @@ pub fn AttendantsComponent(
                                                 if dock_menu_open() {
                                                     div {
                                                         class: "glass-select-menu",
-                                                        role: "listbox",
+                                                        // issue 1762: this popup is a MENU, not a
+                                                        // listbox. Its items are not values of one
+                                                        // property — three of them set the dock
+                                                        // position (`menuitemradio`), one toggles a
+                                                        // persisted boolean (`menuitemcheckbox`),
+                                                        // and the rest invoke commands
+                                                        // (`menuitem`). The shared
+                                                        // `.glass-select-menu` class is kept: it is
+                                                        // purely visual and is also worn by the
+                                                        // device-picker in `device_settings_modal`,
+                                                        // which IS a genuine listbox and keeps
+                                                        // `role="listbox"`. Roles/names are the
+                                                        // only thing that changes here; the
+                                                        // keyboard helpers below match on the
+                                                        // `.glass-select-option` CLASS, never on
+                                                        // role, so navigation is untouched.
+                                                        //
+                                                        // DELIBERATELY NO `role="group"` around the
+                                                        // three `menuitemradio`s, even though APG
+                                                        // normally groups a radio set. The reason is
+                                                        // structural, not stylistic:
+                                                        // `focus_glass_option_relative` navigates by
+                                                        // walking `next_element_sibling()` /
+                                                        // `previous_element_sibling()`, and its wrap
+                                                        // fallback is
+                                                        // `active.parent_element().query_selector_all(
+                                                        // ".glass-select-option")`. A group wrapper
+                                                        // would make the three radios each other's
+                                                        // only siblings AND make the wrapper their
+                                                        // parent — so arrow keys would wrap inside the
+                                                        // group forever and auto-hide, Customize,
+                                                        // Reset and Action Bar… would become
+                                                        // unreachable by keyboard. Adding the group
+                                                        // requires rewriting the helper to a flat
+                                                        // `querySelectorAll` over the menu first.
+                                                        role: "menu",
+                                                        // A `role="menu"` with no accessible name
+                                                        // announces as an unnamed menu.
+                                                        "aria-label": "Action bar position and customization",
                                                         onclick: move |e: MouseEvent| e.stop_propagation(),
                                                         // Menu-level keyboard navigation (WCAG 2.1.1).
                                                         // Each option only owns Enter/Space (activation)
-                                                        // — Escape, Arrow keys, Home, and End are
+                                                        // — Escape, Tab, Arrow keys, Home, and End are
                                                         // handled once here so we don't duplicate the
                                                         // navigation logic across every option. The
                                                         // arrow helpers skip `.glass-select-separator`
                                                         // children by matching on `.glass-select-option`.
+                                                        //
+                                                        // Every branch that moves DOM focus also advances
+                                                        // `dock_menu_highlight`, which is what renders the
+                                                        // single `tabindex="0"` (issue 1762). The two must
+                                                        // move together or the roving position drifts away
+                                                        // from the focused item. `next_dock_menu_index`
+                                                        // wraps exactly the way `focus_glass_option_relative`
+                                                        // wraps, so they agree at both ends.
                                                         onkeydown: move |evt: Event<KeyboardData>| {
                                                             let key = evt.key();
                                                             if key == Key::Escape {
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
+                                                            } else if key == Key::Tab {
+                                                                // WAI-ARIA APG menu pattern: Tab dismisses the
+                                                                // menu and hands focus back to the trigger.
+                                                                //
+                                                                // Before this branch existed, `role="menu"`
+                                                                // shipped with listbox-era `tabindex="0"` on
+                                                                // all seven items: Tab walked them one by one
+                                                                // with the menu still open, then landed on a
+                                                                // control BEHIND the `z-index: 1000` popup
+                                                                // (WCAG 2.4.11 Focus Not Obscured, on top of
+                                                                // a 2.4.3 focus-order oddity).
+                                                                //
+                                                                // `prevent_default()` IS required here, even
+                                                                // though APG describes Tab as landing on the
+                                                                // element after the menu button. The signal
+                                                                // write is async — Dioxus has not unmounted
+                                                                // the menu yet when this handler returns — but
+                                                                // the browser's default tab navigation runs
+                                                                // immediately after dispatch, computing "next
+                                                                // tabbable after the trigger". The menu is a
+                                                                // DOM SIBLING that follows the trigger and
+                                                                // still holds the roving `tabindex="0"` item,
+                                                                // so the default action would land on a menu
+                                                                // item that is about to be removed — dropping
+                                                                // focus to <body> on the very next commit, i.e.
+                                                                // reintroducing the bug this branch fixes.
+                                                                // Parking focus on the trigger is deterministic
+                                                                // and the user's next Tab (menu now gone)
+                                                                // continues normally from there.
                                                                 evt.stop_propagation();
                                                                 evt.prevent_default();
                                                                 dock_menu_open.set(false);
@@ -10224,30 +11940,51 @@ pub fn AttendantsComponent(
                                                                 evt.stop_propagation();
                                                                 evt.prevent_default();
                                                                 focus_glass_option_relative(1);
+                                                                dock_menu_highlight.set(next_dock_menu_index(
+                                                                    dock_menu_highlight(), 1, DOCK_MENU_ITEM_COUNT,
+                                                                ));
                                                             } else if key == Key::ArrowUp {
                                                                 evt.stop_propagation();
                                                                 evt.prevent_default();
                                                                 focus_glass_option_relative(-1);
+                                                                dock_menu_highlight.set(next_dock_menu_index(
+                                                                    dock_menu_highlight(), -1, DOCK_MENU_ITEM_COUNT,
+                                                                ));
                                                             } else if key == Key::Home {
                                                                 evt.stop_propagation();
                                                                 evt.prevent_default();
                                                                 focus_glass_option_at(".dock-position-wrapper", false);
+                                                                dock_menu_highlight.set(0);
                                                             } else if key == Key::End {
                                                                 evt.stop_propagation();
                                                                 evt.prevent_default();
                                                                 focus_glass_option_at(".dock-position-wrapper", true);
+                                                                dock_menu_highlight.set(DOCK_MENU_ITEM_COUNT - 1);
                                                             }
                                                         },
                                                         div {
                                                             class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
-                                                            role: "option",
-                                                            tabindex: "0",
-                                                            "aria-selected": if dock_position() == DockPosition::Bottom { "true" } else { "false" },
+                                                            // issue 1762: Bottom/Left/Right are a
+                                                            // single-select group → `menuitemradio`
+                                                            // + `aria-checked` (`aria-selected` is
+                                                            // not supported on menu items).
+                                                            role: "menuitemradio",
+                                                            // Roving tabindex (APG menu pattern):
+                                                            // exactly one item is in the tab
+                                                            // sequence. Index 0 of
+                                                            // DOCK_MENU_ITEM_COUNT.
+                                                            tabindex: if dock_menu_highlight() == 0 { "0" } else { "-1" },
+                                                            "aria-checked": if dock_position() == DockPosition::Bottom { "true" } else { "false" },
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
                                                                 dock_position.set(DockPosition::Bottom);
                                                                 save_dock_position(DockPosition::Bottom);
                                                                 dock_menu_open.set(false);
+                                                                // Clicking a focusable div focuses it in
+                                                                // Chrome; unmounting the menu would then
+                                                                // drop focus to <body>. Restore it to the
+                                                                // trigger, matching the keydown path.
+                                                                focus_element_by_id("dock-menu-trigger");
                                                             },
                                                             onkeydown: move |evt: Event<KeyboardData>| {
                                                                 if !is_option_activate_key(&evt) { return; }
@@ -10262,14 +11999,15 @@ pub fn AttendantsComponent(
                                                         }
                                                         div {
                                                             class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
-                                                            role: "option",
-                                                            tabindex: "0",
-                                                            "aria-selected": if dock_position() == DockPosition::Left { "true" } else { "false" },
+                                                            role: "menuitemradio",
+                                                            tabindex: if dock_menu_highlight() == 1 { "0" } else { "-1" },
+                                                            "aria-checked": if dock_position() == DockPosition::Left { "true" } else { "false" },
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
                                                                 dock_position.set(DockPosition::Left);
                                                                 save_dock_position(DockPosition::Left);
                                                                 dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
                                                             },
                                                             onkeydown: move |evt: Event<KeyboardData>| {
                                                                 if !is_option_activate_key(&evt) { return; }
@@ -10284,14 +12022,15 @@ pub fn AttendantsComponent(
                                                         }
                                                         div {
                                                             class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
-                                                            role: "option",
-                                                            tabindex: "0",
-                                                            "aria-selected": if dock_position() == DockPosition::Right { "true" } else { "false" },
+                                                            role: "menuitemradio",
+                                                            tabindex: if dock_menu_highlight() == 2 { "0" } else { "-1" },
+                                                            "aria-checked": if dock_position() == DockPosition::Right { "true" } else { "false" },
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
                                                                 dock_position.set(DockPosition::Right);
                                                                 save_dock_position(DockPosition::Right);
                                                                 dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
                                                             },
                                                             onkeydown: move |evt: Event<KeyboardData>| {
                                                                 if !is_option_activate_key(&evt) { return; }
@@ -10304,17 +12043,36 @@ pub fn AttendantsComponent(
                                                             },
                                                             "Right"
                                                         }
-                                                        div { class: "glass-select-separator" }
+                                                        div { class: "glass-select-separator", role: "separator" }
                                                         div {
-                                                            class: "glass-select-option",
-                                                            role: "option",
-                                                            tabindex: "0",
+                                                            // issue 1762: `.selected` when the
+                                                            // setting is ON, so the ✓ that
+                                                            // `.glass-select-option.selected::before`
+                                                            // paints matches `aria-checked`. Without
+                                                            // it the item shipped `aria-checked=
+                                                            // "true"` with NO visible checked
+                                                            // indicator — sighted users saw a bare
+                                                            // command, AT users heard a checkbox.
+                                                            class: if autohide_enabled() { "glass-select-option selected" } else { "glass-select-option" },
+                                                            // issue 1762: auto-hide is a persisted
+                                                            // boolean, so it is a checkbox item.
+                                                            // `aria-checked` tracks the SETTING
+                                                            // (checked = the bar auto-hides) and the
+                                                            // visible label is the stable NOUN
+                                                            // `DOCK_AUTOHIDE_LABEL` — see that
+                                                            // constant for why the old imperative
+                                                            // "Turn Hiding On/Off" was a WCAG 4.1.2
+                                                            // defect on a checkbox role.
+                                                            role: "menuitemcheckbox",
+                                                            "aria-checked": if autohide_enabled() { "true" } else { "false" },
+                                                            tabindex: if dock_menu_highlight() == 3 { "0" } else { "-1" },
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
                                                                 let new_val = !autohide_enabled();
                                                                 autohide_enabled.set(new_val);
                                                                 save_dock_autohide(new_val);
                                                                 dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
                                                             },
                                                             onkeydown: move |evt: Event<KeyboardData>| {
                                                                 if !is_option_activate_key(&evt) { return; }
@@ -10326,17 +12084,25 @@ pub fn AttendantsComponent(
                                                                 dock_menu_open.set(false);
                                                                 focus_element_by_id("dock-menu-trigger");
                                                             },
-                                                            if autohide_enabled() {
-                                                                "Turn Hiding Off"
-                                                            } else {
-                                                                "Turn Hiding On"
-                                                            }
+                                                            {DOCK_AUTOHIDE_LABEL}
                                                         }
-                                                        div { class: "glass-select-separator" }
+                                                        div { class: "glass-select-separator", role: "separator" }
                                                         div {
                                                             class: "glass-select-option",
-                                                            role: "option",
-                                                            tabindex: "0",
+                                                            // issue 1762: Customize invokes an
+                                                            // action; it selects no value → plain
+                                                            // `menuitem`.
+                                                            role: "menuitem",
+                                                            tabindex: if dock_menu_highlight() == 4 { "0" } else { "-1" },
+                                                            // No `focus_element_by_id` on either
+                                                            // activation path, unlike its siblings:
+                                                            // entering customize mode REPLACES
+                                                            // `#dock-menu-trigger` with the Done
+                                                            // button, so there is nothing to restore
+                                                            // to. The customize-mode entry
+                                                            // `use_effect` seeds focus at the first
+                                                            // slot button instead (search
+                                                            // "Always seed keyboard focus").
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
                                                                 customize_mode.set(true);
@@ -10353,14 +12119,29 @@ pub fn AttendantsComponent(
                                                         }
                                                         div {
                                                             class: "glass-select-option",
-                                                            role: "option",
-                                                            tabindex: "0",
+                                                            // issue 1762: Reset invokes an action.
+                                                            role: "menuitem",
+                                                            tabindex: if dock_menu_highlight() == 5 { "0" } else { "-1" },
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
                                                                 action_bar_slots.set(DEFAULT_SLOTS.to_vec());
                                                                 action_bar_hidden.set(Vec::new());
                                                                 remove_action_bar_layout();
+                                                                // issue 1765: Reset silently
+                                                                // rewrote the layout — an AT user
+                                                                // got no confirmation anything
+                                                                // happened. Reuse the reorder live
+                                                                // region rather than adding a
+                                                                // second one. The nonce bump is what
+                                                                // makes the SECOND consecutive Reset
+                                                                // audible: the message is a constant,
+                                                                // so without it the text node never
+                                                                // changes and the region stays mute.
+                                                                action_bar_announce_nonce += 1;
+                                                                action_bar_announce
+                                                                    .set(ACTION_BAR_RESET_ANNOUNCEMENT.to_string());
                                                                 dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
                                                             },
                                                             onkeydown: move |evt: Event<KeyboardData>| {
                                                                 if !is_option_activate_key(&evt) { return; }
@@ -10369,16 +12150,21 @@ pub fn AttendantsComponent(
                                                                 action_bar_slots.set(DEFAULT_SLOTS.to_vec());
                                                                 action_bar_hidden.set(Vec::new());
                                                                 remove_action_bar_layout();
+                                                                action_bar_announce_nonce += 1;
+                                                                action_bar_announce
+                                                                    .set(ACTION_BAR_RESET_ANNOUNCEMENT.to_string());
                                                                 dock_menu_open.set(false);
                                                                 focus_element_by_id("dock-menu-trigger");
                                                             },
                                                             "Reset to Default"
                                                         }
-                                                        div { class: "glass-select-separator" }
+                                                        div { class: "glass-select-separator", role: "separator" }
                                                         div {
                                                             class: "glass-select-option",
-                                                            role: "option",
-                                                            tabindex: "0",
+                                                            // issue 1762: opens the Settings modal
+                                                            // — a command, not a value.
+                                                            role: "menuitem",
+                                                            tabindex: if dock_menu_highlight() == DOCK_MENU_ITEM_COUNT - 1 { "0" } else { "-1" },
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
                                                                 let was_closed = !device_settings_open();
@@ -10552,10 +12338,12 @@ pub fn AttendantsComponent(
                                                             ActionBarSlot::PeerList => rsx! { PeerListButton { open: peer_list_open(), onclick: |_| {} } },
                                                             ActionBarSlot::DensityMode => rsx! { DensityModeButton { label: density_mode().label().to_string(), open: density_open(), onclick: |_: MouseEvent| {} } },
                                                             ActionBarSlot::Reactions => rsx! { ReactionsButton { open: reactions_open(), onclick: |_: MouseEvent| {} } },
+                                                            ActionBarSlot::RaiseHand => rsx! { RaiseHandButton { raised: self_hand_raised(), onclick: |_: MouseEvent| {} } },
                                                             ActionBarSlot::Diagnostics => rsx! { DiagnosticsButton { open: diagnostics_open(), onclick: |_| {} } },
                                                             ActionBarSlot::DeviceSettings => rsx! { DeviceSettingsButton { open: device_settings_open(), onclick: |_| {} } },
                                                             ActionBarSlot::Recording => rsx! { RecordButton { state: record_state(), onclick: |_| {} } },
                                                             ActionBarSlot::MeetingOptions => rsx! { MeetingOptionsButton { open: meeting_options_open(), onclick: |_| {} } },
+                                                            ActionBarSlot::MeetingTimer => rsx! { MeetingTimerButton { open: false, running: false, onclick: |_| {} } },
                                                         }
                                                     }
                                                 }
@@ -10823,11 +12611,76 @@ pub fn AttendantsComponent(
                                         }
                                         {transport_badge(self_badge_transport, true)}
                                         ConnectionQualityIndicator {}
+                                        // Issue 2135: the SELF tile's raised-hand
+                                        // badge. It belongs HERE and not in
+                                        // `peer_tile.rs`: `display_peers` filters
+                                        // `own_session` out, so peer tiles are
+                                        // remote-only and a badge added there would
+                                        // never render for the local user.
+                                        //
+                                        // Reads `self_hand_raised` (not the roster)
+                                        // for the same blast-radius reason the
+                                        // action-bar toggle does — see that signal's
+                                        // declaration.
+                                        if self_hand_raised() {
+                                            span {
+                                                class: "raised-hand-badge raised-hand-badge--self",
+                                                "data-testid": "self-raised-hand-badge",
+                                                RaisedHandIcon {
+                                                    decorative: false,
+                                                    // The one string this feature
+                                                    // spoke from outside
+                                                    // `raised_hands.rs`; it now
+                                                    // lives beside the rest.
+                                                    label: SELF_RAISED_HAND_BADGE_LABEL,
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+
+                    // Issue 2135: the raised-hand roster's screen-reader channel.
+                    // Unconditionally mounted (an SR live region that is torn down
+                    // and re-inserted re-announces its stale contents on insertion,
+                    // so this node must outlive every empty<->non-empty roster
+                    // transition) and therefore ALWAYS one element child of this
+                    // container.
+                    //
+                    // It is mounted LAST on purpose. Every positional selector that
+                    // reads this container — the split screen-share panes, at
+                    // `> div:nth-child(1)` / `:nth-child(3)` / `> div` .nth(2) —
+                    // indexes from the FRONT, so a trailing child shifts none of
+                    // them. It is `position: absolute` (`.visually-hidden`), hence
+                    // out of flow and not a grid item either: it consumes no cell
+                    // of the `#grid-container` template.
+                    RaisedHandsLiveRegion {}
+
+                    // Issue 2136: the host-set countdown, visible to EVERY
+                    // participant, and its milestone-cadence screen-reader
+                    // channel.
+                    //
+                    // Mounted LAST, after the raised-hands live region, for the
+                    // same positional-selector reason documented above: trailing
+                    // children shift no `nth-child` index. The chip is
+                    // `position: fixed`, so it is not a grid item and consumes no
+                    // cell of the container template either.
+                    //
+                    // The chip is SELF-GATING — it emits zero element nodes while
+                    // no timer is running — so in the common case this adds
+                    // nothing to the container at all. That is belt-and-braces
+                    // given it is already last and already out of flow, but the
+                    // #2135 post-mortem is explicit that a permanently-present
+                    // child here is the hazard, and matching that discipline
+                    // costs nothing.
+                    //
+                    // Both take NO props and read `MeetingTimerCtx` themselves, so
+                    // a timer transition re-renders these two small components
+                    // instead of this RSX and every keyed `PeerTile` under it.
+                    MeetingTimerChip {}
+                    MeetingTimerLiveRegion {}
                 }
 
                 // Peer list sidebar
@@ -11328,6 +13181,43 @@ pub fn AttendantsComponent(
                     }
                 }
 
+                // Issue 2136: the host's meeting-timer controls.
+                //
+                // Rendered only while OPEN and only for a LIVE host — the second
+                // term is not redundant with the action-bar gate: a host demoted
+                // while the popover was open must lose the controls immediately,
+                // not keep a panel whose every button the relay now silently
+                // drops.
+                //
+                // Deliberately NOT gated on `has_screen_share` (unlike the density
+                // popover below): bounding a presenter's slot is the motivating
+                // use case for the whole feature, so the one moment the host most
+                // needs these controls is exactly while a screen share is up.
+                //
+                // The panel is a COMPONENT rather than inline RSX so the
+                // running/idle branch reads `MeetingTimerCtx` in its own scope —
+                // reading it here would subscribe this whole RSX (see the
+                // meeting_timer module docs).
+                if meeting_timer_open() && local_is_host() {
+                    MeetingTimerPopover {
+                        on_start: move |ms: u64| {
+                            start_meeting_timer.call(ms);
+                            meeting_timer_open.set(false);
+                            focus_element_by_id("meeting-timer-trigger");
+                        },
+                        on_extend: move |_| extend_meeting_timer.call(()),
+                        on_cancel: move |_| {
+                            cancel_meeting_timer.call(());
+                            meeting_timer_open.set(false);
+                            focus_element_by_id("meeting-timer-trigger");
+                        },
+                        on_close: move |_| {
+                            meeting_timer_open.set(false);
+                            focus_element_by_id("meeting-timer-trigger");
+                        },
+                    }
+                }
+
                 // Density mode popover
                 if !has_screen_share && density_open() {
                     div { class: "density-popover",
@@ -11805,6 +13695,1521 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    // ───────────────────────────────────────────────────────────────────────
+    // Issue 2053: the viewport `resize` listener must not outlive the
+    // component instance that installed it.
+    //
+    // The pre-fix code built the closure, registered it on `window`, and called
+    // `Closure::forget()` with no removal anywhere. That keeps it alive for the
+    // lifetime of the PAGE rather than the component, so ONE in-page unmount is
+    // enough: the stale closure is still registered and the next resize drives
+    // it into `viewport_version.with_mut(..)` on a torn-down scope —
+    // `try_write().unwrap()` in Dioxus 0.7, i.e. a client panic. No remount is
+    // required. See `WindowEventListener` for the reachable trigger.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Dispatch a real `resize` event on `window`. `dispatchEvent` is
+    /// synchronous, so every registered listener has run by the time it
+    /// returns.
+    fn dispatch_window_resize() {
+        let evt = web_sys::Event::new("resize").expect("construct a resize event");
+        web_sys::window()
+            .expect("run_in_browser guarantees a window")
+            .dispatch_event(&evt)
+            .expect("dispatch resize");
+    }
+
+    /// `WindowEventListener` deregisters its callback on `Drop`.
+    ///
+    /// There are two distinct ways to break the guard, and they need two
+    /// different assertions because `cb` is OWNED by the struct — so any `Drop`
+    /// mutation still drops the `Closure`, and a dropped closure never runs its
+    /// body:
+    ///
+    /// MUTATION SENSITIVITY (a) — the pre-fix leak: `cb.forget()` in `Drop`
+    /// instead of removing the listener. The closure survives, so the post-drop
+    /// dispatch runs the handler and the counter reaches 2, failing
+    /// `hits == 1`. (Merely DELETING the `remove_event_listener_with_callback`
+    /// call does NOT reproduce this: `cb` is still dropped, the handler body
+    /// cannot run, and the counter stays 1.)
+    ///
+    /// MUTATION SENSITIVITY (b) — take without deregistering, e.g. the
+    /// plausible refactor `fn drop(&mut self) { self.cb.take(); }`. That frees
+    /// the closure but leaves the registration live, so the next resize
+    /// dispatches into freed wasm storage and throws "closure invoked after
+    /// being dropped" into the page. The handler body never runs, so (a) stays
+    /// green — only the `errors == 0` assertion catches it.
+    ///
+    /// The first assertion pins the other direction: the listener really is
+    /// registered while the guard is alive, so neither post-drop assertion is
+    /// passing vacuously.
+    #[wasm_bindgen_test]
+    fn window_resize_listener_stops_firing_once_dropped() {
+        let hits = Rc::new(Cell::new(0u32));
+        let hits_in_cb = hits.clone();
+        let listener = WindowEventListener::new("resize", move || {
+            hits_in_cb.set(hits_in_cb.get() + 1);
+        });
+
+        dispatch_window_resize();
+        assert_eq!(
+            hits.get(),
+            1,
+            "a live guard's handler must observe a resize"
+        );
+
+        // Watch for an uncaught error across the post-drop dispatch. An
+        // exception thrown by a listener during `dispatchEvent` is reported at
+        // the global as an `error` event, which is how mutation (b) surfaces.
+        let errors = Rc::new(Cell::new(0u32));
+        let errors_in_cb = errors.clone();
+        let on_error = Closure::<dyn FnMut()>::new(move || {
+            errors_in_cb.set(errors_in_cb.get() + 1);
+        });
+        let win = web_sys::window().expect("run_in_browser guarantees a window");
+        let _ = win.add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref());
+
+        drop(listener);
+
+        dispatch_window_resize();
+
+        let _ = win.remove_event_listener_with_callback("error", on_error.as_ref().unchecked_ref());
+
+        assert_eq!(
+            hits.get(),
+            1,
+            "issue 2053: a dropped guard must have deregistered its listener — a \
+             stale fire here is exactly the one that writes a torn-down scope's signal"
+        );
+        assert_eq!(
+            errors.get(),
+            0,
+            "issue 2053: `Drop` must DEREGISTER, not merely free the closure — a \
+             surviving registration whose closure was dropped throws on the next resize"
+        );
+    }
+
+    /// The Dioxus half of the fix: a `Drop`-implementing value stored in a
+    /// `use_hook` IS dropped when its scope is torn down. `AttendantsComponent`
+    /// relies on precisely this to remove the resize listener on unmount, and
+    /// the doc comment on `WindowEventListener` states it as a contract — this
+    /// test is what makes that claim traceable instead of merely asserted.
+    ///
+    /// Mounting the real `AttendantsComponent` is not viable in a unit test (it
+    /// needs a live `VideoCallClient` and a dozen context providers), so this
+    /// drives a minimal component that stores the SAME production guard type
+    /// through the SAME hook. The subject under test is the framework contract,
+    /// not a re-implementation of production logic.
+    ///
+    /// MUTATION SENSITIVITY: mutation (a) above — `cb.forget()` in
+    /// `WindowEventListener::drop` — makes the post-unmount dispatch run the
+    /// handler again and fails this test. Mutation (b) (take without
+    /// deregistering) is NOT caught here, because the freed closure's body
+    /// never runs and this test only counts handler hits; the `errors == 0`
+    /// assertion in `window_resize_listener_stops_firing_once_dropped` is what
+    /// pins that case.
+    #[wasm_bindgen_test]
+    fn viewport_resize_listener_is_removed_when_its_scope_is_dropped() {
+        thread_local! {
+            static PROBE_HITS: Cell<u32> = const { Cell::new(0) };
+        }
+
+        #[allow(non_snake_case)]
+        fn ResizeProbe() -> Element {
+            // Same shape as the production call site in `AttendantsComponent`.
+            let _guard = use_hook(|| {
+                Rc::new(WindowEventListener::new("resize", || {
+                    PROBE_HITS.with(|h| h.set(h.get() + 1));
+                }))
+            });
+            rsx! { div {} }
+        }
+
+        let mut vdom = VirtualDom::new(ResizeProbe);
+        vdom.rebuild_in_place();
+
+        dispatch_window_resize();
+        assert_eq!(
+            PROBE_HITS.with(|h| h.get()),
+            1,
+            "a mounted component's resize listener must fire"
+        );
+
+        // Dropping the VirtualDom drops every scope, which drops each scope's
+        // hook values — the same teardown an unmount performs.
+        drop(vdom);
+
+        dispatch_window_resize();
+        assert_eq!(
+            PROBE_HITS.with(|h| h.get()),
+            1,
+            "issue 2053: unmounting must remove the listener, so a later resize \
+             cannot reach a dropped scope"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Issue 2100: the dock auto-hide pointer listeners and their pending
+    // timers must not outlive the component instance that installed them.
+    //
+    // The pre-fix code registered `mousemove` + `touchstart` with
+    // `Closure::forget()` and never cancelled the `setTimeout`s it armed, so
+    // after ONE unmount the stale listeners still fired
+    // `controls_visible.set(true)` and the pending timers still fired
+    // `controls_visible.set(false)` up to 4s later — all `try_write().unwrap()`
+    // in Dioxus 0.7, i.e. a client panic on a torn-down scope. Same class as
+    // 2053, on the events that fire most.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Dispatch a real event of `name` on `window`. `dispatchEvent` is
+    /// synchronous, so every registered listener has run by the time it
+    /// returns.
+    fn dispatch_window_event(name: &str) {
+        let evt = web_sys::Event::new(name).expect("construct an event");
+        web_sys::window()
+            .expect("run_in_browser guarantees a window")
+            .dispatch_event(&evt)
+            .expect("dispatch event");
+    }
+
+    /// `WindowEventListener` deregisters the event it REGISTERED, not a
+    /// hardcoded one — the property that makes the issue-2053 guard reusable
+    /// for the issue-2100 dock listeners.
+    ///
+    /// MUTATION SENSITIVITY (a) — the pre-fix leak: `cb.forget()` in `Drop`
+    /// instead of removing the listener. The closure survives the guard, so the
+    /// post-drop dispatch runs the handler and `hits` reaches 2.
+    ///
+    /// MUTATION SENSITIVITY (c) — the mistake the generalisation invites:
+    /// deregistering a hardcoded `"resize"` (or any name other than
+    /// `self.event`) in `Drop`. `removeEventListener` with a non-matching type
+    /// is a SILENT no-op, so the `mousemove` registration survives while its
+    /// `Closure` is freed; the next dispatch throws "closure invoked after
+    /// being dropped" and `errors` reaches 1. `hits` stays 1 under this
+    /// mutation, so only the `errors == 0` assertion catches it.
+    ///
+    /// The first assertion pins the other direction: the listener really is
+    /// registered while the guard is alive, so neither post-drop assertion is
+    /// passing vacuously.
+    #[wasm_bindgen_test]
+    fn window_event_listener_deregisters_the_event_it_registered() {
+        let hits = Rc::new(Cell::new(0u32));
+        let hits_in_cb = hits.clone();
+        // `mousemove`, not `resize`: the dock auto-hide event of issue 2100,
+        // and a name the pre-generalisation guard could not have removed.
+        let listener = WindowEventListener::new("mousemove", move || {
+            hits_in_cb.set(hits_in_cb.get() + 1);
+        });
+
+        dispatch_window_event("mousemove");
+        assert_eq!(
+            hits.get(),
+            1,
+            "a live guard's handler must observe its own event"
+        );
+
+        let errors = Rc::new(Cell::new(0u32));
+        let errors_in_cb = errors.clone();
+        let on_error = Closure::<dyn FnMut()>::new(move || {
+            errors_in_cb.set(errors_in_cb.get() + 1);
+        });
+        let win = web_sys::window().expect("run_in_browser guarantees a window");
+        let _ = win.add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref());
+
+        drop(listener);
+
+        dispatch_window_event("mousemove");
+
+        let _ = win.remove_event_listener_with_callback("error", on_error.as_ref().unchecked_ref());
+
+        assert_eq!(
+            hits.get(),
+            1,
+            "issue 2100: a dropped guard must have deregistered its listener — a \
+             stale pointer-move fire here is the one that writes a torn-down \
+             scope's `controls_visible`"
+        );
+        assert_eq!(
+            errors.get(),
+            0,
+            "issue 2100: `Drop` must deregister `self.event`, not a hardcoded \
+             name — `removeEventListener` with the wrong type silently keeps the \
+             registration alive over freed closure storage"
+        );
+    }
+
+    /// The dock's listeners die with the scope that installed them.
+    ///
+    /// Mounting the real `AttendantsComponent` is not viable in a unit test (it
+    /// needs a live `VideoCallClient` and a dozen context providers), so this
+    /// drives a probe that stores the SAME production `DockAutoHide` value,
+    /// built from the SAME production `WindowEventListener` and driving the
+    /// SAME production `wake_dock`, through the SAME `use_hook`. The subject is
+    /// the lifecycle contract: a `Drop`-implementing hook value is torn down on
+    /// unmount.
+    ///
+    /// The hit counter is an `Rc<Cell>` owned by the TEST, not by the scope, so
+    /// it survives the teardown and can observe a stale fire. `wake_dock` itself
+    /// cannot: post-teardown its signal reads return `Err` and it no-ops by
+    /// design, which is exactly why the leak needs a counter to be visible.
+    ///
+    /// MUTATION SENSITIVITY (a) — the pre-fix leak: replacing the
+    /// `WindowEventListener` with a `Closure ... .forget()` makes the
+    /// post-unmount dispatch run the handler again and the counter reaches 2.
+    ///
+    /// MUTATION SENSITIVITY (b) — a `Drop` that deregisters a hardcoded event
+    /// name instead of `self.event`. The hit counter CANNOT catch this on its
+    /// own: the closure is owned by the guard, so it is freed either way and a
+    /// still-registered-but-freed listener throws rather than incrementing.
+    /// The window `error` counter is what fails, exactly as in the sibling
+    /// `window_event_listener_deregisters_the_event_it_registered`. Both
+    /// dispatches are made (`mousemove` AND `touchstart`) so the assertion
+    /// covers both of the dock's listeners.
+    #[wasm_bindgen_test]
+    fn dock_pointer_listeners_are_removed_when_their_scope_is_dropped() {
+        thread_local! {
+            static DOCK_HITS: Cell<u32> = const { Cell::new(0) };
+        }
+        DOCK_HITS.with(|h| h.set(0));
+
+        #[allow(non_snake_case)]
+        fn DockProbe() -> Element {
+            let autohide_enabled = use_signal(|| true);
+            let controls_visible = use_signal(|| false);
+            let controls_expanded = use_signal(|| false);
+
+            // Same shape as the production `use_hook` in `AttendantsComponent`.
+            let _guard = use_hook(move || {
+                let narrow_timer: DockTimerCell = Rc::new(RefCell::new(None));
+                let hide_timer: DockTimerCell = Rc::new(RefCell::new(None));
+
+                let nt = narrow_timer.clone();
+                let ht = hide_timer.clone();
+                let mouse_listener = WindowEventListener::new("mousemove", move || {
+                    DOCK_HITS.with(|h| h.set(h.get() + 1));
+                    wake_dock(
+                        &nt,
+                        &ht,
+                        autohide_enabled,
+                        controls_visible,
+                        controls_expanded,
+                    );
+                });
+                let nt = narrow_timer.clone();
+                let ht = hide_timer.clone();
+                let touch_listener = WindowEventListener::new("touchstart", move || {
+                    wake_dock(
+                        &nt,
+                        &ht,
+                        autohide_enabled,
+                        controls_visible,
+                        controls_expanded,
+                    );
+                });
+
+                Rc::new(DockAutoHide {
+                    _mouse_listener: mouse_listener,
+                    _touch_listener: touch_listener,
+                    _narrow_timer: narrow_timer,
+                    _hide_timer: hide_timer,
+                })
+            });
+            rsx! { div {} }
+        }
+
+        let mut vdom = VirtualDom::new(DockProbe);
+        vdom.rebuild_in_place();
+
+        dispatch_window_event("mousemove");
+        assert_eq!(
+            DOCK_HITS.with(|h| h.get()),
+            1,
+            "a mounted component's dock listener must fire"
+        );
+
+        // A window `error` counter, for the same reason its sibling
+        // `window_event_listener_deregisters_the_event_it_registered` needs one:
+        // the hit counter ALONE cannot distinguish "deregistered" from
+        // "still registered over freed closure storage". Under a `Drop` that
+        // removes the wrong event name the registration survives, and the next
+        // dispatch THROWS inside the listener instead of incrementing — so the
+        // `== 1` assertion below would pass vacuously.
+        let errors = Rc::new(Cell::new(0u32));
+        let errors_in_cb = errors.clone();
+        let on_error = Closure::<dyn FnMut()>::new(move || {
+            errors_in_cb.set(errors_in_cb.get() + 1);
+        });
+        let win = web_sys::window().expect("run_in_browser guarantees a window");
+        let _ = win.add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref());
+
+        // Dropping the VirtualDom drops every scope, which drops each scope's
+        // hook values — the same teardown an unmount performs.
+        drop(vdom);
+
+        dispatch_window_event("mousemove");
+        dispatch_window_event("touchstart");
+
+        let _ = win.remove_event_listener_with_callback("error", on_error.as_ref().unchecked_ref());
+
+        assert_eq!(
+            DOCK_HITS.with(|h| h.get()),
+            1,
+            "issue 2100: unmounting must remove the dock listeners, so a later \
+             pointer move cannot reach a dropped scope"
+        );
+        assert_eq!(
+            errors.get(),
+            0,
+            "issue 2100: BOTH dock listeners must be deregistered by name. A `Drop` \
+             that removes a hardcoded event type leaves the registration pointing at \
+             freed closure storage — the dispatch then throws instead of running the \
+             body, which the hit counter alone cannot tell apart from a clean removal"
+        );
+    }
+
+    /// The other half of issue 2100: a pending auto-hide timer must be
+    /// CANCELLED when the cell that owns it goes away, not fire into a
+    /// torn-down scope up to `DOCK_HIDE_DELAY_MS` later.
+    ///
+    /// Phase 1 is the positive control — with the cells held, the narrow timer
+    /// really does fire and collapse `controls_expanded`. Without it, phase 2
+    /// would pass vacuously (a timer that never fires proves nothing about
+    /// cancellation).
+    ///
+    /// Phase 2 arms the same way and then drops the cells, which is what scope
+    /// teardown does to the `DockAutoHide` hook value.
+    ///
+    /// MUTATION SENSITIVITY: reverting `arm_dock_autohide` to a `.forget()`-ed
+    /// timer (`Timeout::new(..).forget()`, leaving the cell `None`) makes the
+    /// phase-2 timer fire anyway and `controls_expanded` reads `false`.
+    ///
+    /// The probe component deliberately does NOT read the signals, so they have
+    /// no reactive subscribers and the writes performed from the timer callback
+    /// need no ambient runtime — matching the production case, where these
+    /// timers also fire outside any Dioxus render.
+    #[wasm_bindgen_test]
+    async fn dock_autohide_timer_is_cancelled_when_its_cell_is_dropped() {
+        /// `(autohide_enabled, controls_visible, controls_expanded)` — the trio
+        /// `arm_dock_autohide` takes, published by the probe so the test can
+        /// observe them from outside the render.
+        type DockSignals = (Signal<bool>, Signal<bool>, Signal<bool>);
+        thread_local! {
+            static PROBE_SIGNALS: RefCell<Option<DockSignals>> = const { RefCell::new(None) };
+        }
+
+        #[allow(non_snake_case)]
+        fn SignalProbe() -> Element {
+            let enabled = use_signal(|| true);
+            let visible = use_signal(|| true);
+            let expanded = use_signal(|| true);
+            use_hook(move || {
+                PROBE_SIGNALS.with(|s| *s.borrow_mut() = Some((enabled, visible, expanded)));
+            });
+            rsx! { div {} }
+        }
+
+        // Kept alive for the whole test: dropping it would drop the signals.
+        let mut vdom = VirtualDom::new(SignalProbe);
+        vdom.rebuild_in_place();
+        let (enabled, visible, mut expanded) =
+            PROBE_SIGNALS.with(|s| s.borrow().expect("probe published its signals"));
+
+        // Wait for the narrow delay plus a generous margin for a loaded CI
+        // browser. The hide timer (4s) is never awaited — only armed — so the
+        // test stays fast.
+        let settle_ms = DOCK_NARROW_DELAY_MS + 300;
+
+        // ── Phase 1: cells held -> the timer fires. ──
+        let narrow_held: DockTimerCell = Rc::new(RefCell::new(None));
+        let hide_held: DockTimerCell = Rc::new(RefCell::new(None));
+        arm_dock_autohide(&narrow_held, &hide_held, enabled, visible, expanded);
+        TimeoutFuture::new(settle_ms).await;
+        assert!(
+            !expanded.try_peek().map(|v| *v).unwrap_or(true),
+            "positive control: a LIVE narrow timer must collapse `controls_expanded`"
+        );
+
+        // ── Phase 2: same arming, cells dropped -> the timer is cancelled. ──
+        expanded.set(true);
+        let narrow_dropped: DockTimerCell = Rc::new(RefCell::new(None));
+        let hide_dropped: DockTimerCell = Rc::new(RefCell::new(None));
+        arm_dock_autohide(&narrow_dropped, &hide_dropped, enabled, visible, expanded);
+        drop(narrow_dropped);
+        drop(hide_dropped);
+        TimeoutFuture::new(settle_ms).await;
+        assert!(
+            expanded.try_peek().map(|v| *v).unwrap_or(false),
+            "issue 2100: dropping the timer cells (what scope teardown does to the \
+             `DockAutoHide` hook value) must CANCEL the pending auto-hide timer — a \
+             `.forget()`-ed one fires into a torn-down scope up to 4s after unmount"
+        );
+
+        PROBE_SIGNALS.with(|s| *s.borrow_mut() = None);
+        drop(vdom);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Issue 2103: a child's `Callback`/`EventHandler` props must keep a STABLE
+    // identity across parent renders, or the child's derived `memoize` can
+    // never short-circuit and every parent render re-runs every child.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// The mechanism, against the REAL `PeerTileProps`: the derived
+    /// `Properties::memoize` is a pointer comparison over the handler props, so
+    /// identical tile inputs memoize only when EVERY handler prop has a stable
+    /// identity.
+    ///
+    /// This is what makes `attendants.rs`'s `use_callback` change load-bearing:
+    /// its `PeerTile` call sites pass the same values every render, so the
+    /// handler identities were the only thing that differed.
+    ///
+    /// The `defaulted` arm pins a trap that is easy to miss and that silently
+    /// nullifies the fix: `#[props(default)]` on a handler prop resolves to
+    /// `Callback::default()`, which is `Callback::new(|_| Default::default())`
+    /// (dioxus-core `events.rs`) — a BRAND NEW generational box on every build.
+    /// So a call site that merely OMITS `on_request_decode` can never memoize,
+    /// no matter how stable `on_toggle_pin` is. That is why `attendants.rs`
+    /// passes an explicit stable no-op at the tile sites that have no real
+    /// force-decode handler.
+    ///
+    /// MUTATION SENSITIVITY: the arms are each other's mutations. Dropping the
+    /// explicit `on_request_decode` from the `stable` arm reproduces the
+    /// `defaulted` arm and fails the first assertion; if a future dioxus
+    /// release stopped comparing handler props, the `per_render` assertion
+    /// fails loudly — which is the signal that this fix is no longer needed,
+    /// rather than silently ineffective.
+    #[test]
+    fn peer_tile_props_memoize_only_with_a_stable_callback_identity() {
+        use crate::components::peer_tile::PeerTileProps;
+        use dioxus_core::Properties;
+
+        thread_local! {
+            static MEMOIZED: Cell<(bool, bool, bool)> = const { Cell::new((false, false, false)) };
+        }
+
+        #[allow(non_snake_case)]
+        fn MemoProbe() -> Element {
+            // `use_callback` keeps ONE generational box for the component's
+            // lifetime — the production fix.
+            let pin: EventHandler<PinnedTile> = use_callback(|_: PinnedTile| {});
+            let decode: EventHandler<String> = use_callback(|_: String| {});
+
+            // (1) Every handler stable, every value identical -> memoized.
+            let mut a = PeerTileProps::builder()
+                .peer_id("peer-1".to_string())
+                .on_toggle_pin(pin)
+                .on_request_decode(decode)
+                .build();
+            let b = PeerTileProps::builder()
+                .peer_id("peer-1".to_string())
+                .on_toggle_pin(pin)
+                .on_request_decode(decode)
+                .build();
+            let all_stable = a.memoize(&b);
+
+            // (2) Same, but `on_request_decode` left to `#[props(default)]`.
+            let mut c = PeerTileProps::builder()
+                .peer_id("peer-1".to_string())
+                .on_toggle_pin(pin)
+                .build();
+            let d = PeerTileProps::builder()
+                .peer_id("peer-1".to_string())
+                .on_toggle_pin(pin)
+                .build();
+            let defaulted = c.memoize(&d);
+
+            // (3) The pre-fix shape: a bare closure at the prop site, converted
+            // with `Callback::new` -> a new identity every render.
+            let mut e = PeerTileProps::builder()
+                .peer_id("peer-1".to_string())
+                .on_toggle_pin(|_: PinnedTile| {})
+                .on_request_decode(decode)
+                .build();
+            let f = PeerTileProps::builder()
+                .peer_id("peer-1".to_string())
+                .on_toggle_pin(|_: PinnedTile| {})
+                .on_request_decode(decode)
+                .build();
+            let per_render = e.memoize(&f);
+
+            MEMOIZED.with(|m| m.set((all_stable, defaulted, per_render)));
+            rsx! { div {} }
+        }
+
+        let mut vdom = VirtualDom::new(MemoProbe);
+        vdom.rebuild_in_place();
+        let (all_stable, defaulted, per_render) = MEMOIZED.with(|m| m.get());
+
+        assert!(
+            all_stable,
+            "issue 2103: with every handler identity stable and unchanged tile inputs, \
+             `PeerTileProps::memoize` must short-circuit so the tile is not re-rendered"
+        );
+        assert!(
+            !defaulted,
+            "issue 2103: `#[props(default)]` on a handler prop builds a fresh \
+             `Callback` per render, so omitting `on_request_decode` defeats \
+             memoization even with a stable `on_toggle_pin` — the call sites must \
+             pass an explicit stable handler"
+        );
+        assert!(
+            !per_render,
+            "issue 2103: a fresh per-render closure gives the prop a new identity, so \
+             `PeerTileProps::memoize` cannot short-circuit — this is the defect"
+        );
+    }
+
+    /// The production hook itself: `use_toggle_request_decode` must return the
+    /// SAME `EventHandler` identity on every render of its component, and must
+    /// still toggle the set.
+    ///
+    /// This is the arm of issue 2103 that guards `attendants.rs` rather than the
+    /// framework: `PeerTileProps::memoize` compares handler props by pointer, so
+    /// a hook that hands back a fresh handle each render silently un-memoizes
+    /// every tile no matter what the call sites look like.
+    ///
+    /// MUTATION SENSITIVITY: reverting the hook's body from `use_callback(..)`
+    /// to `EventHandler::new(..)` — the pre-fix shape, and the one revert that
+    /// still compiles against the `EventHandler<String>` return type — makes the
+    /// second render allocate a new generational box, so `first != second` and
+    /// the identity assertion fails. Confirmed by performing exactly that
+    /// mutation.
+    #[test]
+    fn toggle_request_decode_keeps_a_stable_identity_across_renders() {
+        thread_local! {
+            static SEEN: RefCell<Vec<EventHandler<String>>> = const { RefCell::new(Vec::new()) };
+            static TOGGLED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        SEEN.with(|s| s.borrow_mut().clear());
+        TOGGLED.with(|t| t.borrow_mut().clear());
+
+        #[allow(non_snake_case)]
+        fn DecodeProbe() -> Element {
+            let requested = use_signal(HashSet::<String>::new);
+            let handler = use_toggle_request_decode(requested);
+            SEEN.with(|s| s.borrow_mut().push(handler));
+            // Snapshot the set so the behaviour half is observable from outside.
+            TOGGLED.with(|t| {
+                let mut ids: Vec<String> = requested.read().iter().cloned().collect();
+                ids.sort();
+                *t.borrow_mut() = ids;
+            });
+            rsx! { div {} }
+        }
+
+        let mut vdom = VirtualDom::new(DecodeProbe);
+        vdom.rebuild_in_place();
+        vdom.mark_dirty(ScopeId::APP);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+
+        let (first, second) = SEEN.with(|s| {
+            let s = s.borrow();
+            assert_eq!(s.len(), 2, "the probe must have rendered twice");
+            (s[0], s[1])
+        });
+        assert!(
+            first == second,
+            "issue 2103: `use_toggle_request_decode` must hand back the SAME \
+             handler identity on every render — a fresh one per render is what \
+             defeats `PeerTileProps::memoize`"
+        );
+
+        // The handler still does its job, and toggling is symmetric: a second
+        // call on the same session_id removes it (the PLAY button is not a
+        // one-way latch).
+        vdom.in_runtime(|| first.call("session-7".to_string()));
+        vdom.mark_dirty(ScopeId::APP);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        assert_eq!(
+            TOGGLED.with(|t| t.borrow().clone()),
+            vec!["session-7".to_string()],
+            "the stable handler must still insert the session_id"
+        );
+
+        vdom.in_runtime(|| second.call("session-7".to_string()));
+        vdom.mark_dirty(ScopeId::APP);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        assert!(
+            TOGGLED.with(|t| t.borrow().is_empty()),
+            "a second call on the same session_id must REMOVE it — and the \
+             render-2 handle must drive the same state as the render-1 handle"
+        );
+    }
+
+    /// The same thing measured as RENDER COUNTS, which is the number issue 2103
+    /// asks for: how many times does a child body run when only the parent
+    /// re-rendered?
+    ///
+    /// The child here is a probe rather than `PeerTile` (which needs a live
+    /// `VideoCallClient` plus five context providers to mount); the memoization
+    /// path it exercises is the same derived `Properties::memoize` that
+    /// `peer_tile_props_memoize_only_with_a_stable_callback_identity` pins
+    /// against the real `PeerTileProps`.
+    ///
+    /// MUTATION SENSITIVITY: swapping `use_callback` for a bare closure in
+    /// `StableParent` makes its child count match the unstable one (6), failing
+    /// the `== 1` assertion.
+    #[test]
+    fn a_stable_callback_prop_stops_the_child_re_rendering_with_its_parent() {
+        // Render tallies, indexed by `slot`: 0 = the unstable parent's child,
+        // 1 = the stable parent's. A plain `usize` prop keeps `ProbeChildProps`
+        // `PartialEq`, which the memoization under test requires.
+        thread_local! {
+            static CHILD_RENDERS: [Cell<u32>; 2] = const { [Cell::new(0), Cell::new(0)] };
+        }
+        fn child_renders(slot: usize) -> u32 {
+            CHILD_RENDERS.with(|c| c[slot].get())
+        }
+
+        #[derive(PartialEq, Clone, Props)]
+        struct ProbeChildProps {
+            label: String,
+            slot: usize,
+            on_thing: EventHandler<String>,
+        }
+
+        #[allow(non_snake_case)]
+        fn ProbeChild(props: ProbeChildProps) -> Element {
+            CHILD_RENDERS.with(|c| c[props.slot].set(c[props.slot].get() + 1));
+            rsx! { div { "{props.label}" } }
+        }
+
+        #[allow(non_snake_case)]
+        fn UnstableParent() -> Element {
+            // Pre-fix shape: a brand-new closure -> a brand-new `Callback` ->
+            // a prop that never compares equal.
+            rsx! {
+                ProbeChild {
+                    label: "tile".to_string(),
+                    slot: 0,
+                    on_thing: move |_: String| {},
+                }
+            }
+        }
+
+        #[allow(non_snake_case)]
+        fn StableParent() -> Element {
+            let cb: EventHandler<String> = use_callback(|_: String| {});
+            rsx! {
+                ProbeChild {
+                    label: "tile".to_string(),
+                    slot: 1,
+                    on_thing: cb,
+                }
+            }
+        }
+
+        /// Mount, then force `PARENT_RE_RENDERS` parent-only re-renders — the
+        /// resize case: the parent re-runs, every child input is unchanged.
+        const PARENT_RE_RENDERS: u32 = 5;
+        fn drive(app: fn() -> Element) {
+            let mut vdom = VirtualDom::new(app);
+            vdom.rebuild_in_place();
+            for _ in 0..PARENT_RE_RENDERS {
+                vdom.mark_dirty(ScopeId::APP);
+                vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+            }
+        }
+
+        CHILD_RENDERS.with(|c| {
+            c[0].set(0);
+            c[1].set(0);
+        });
+        drive(UnstableParent);
+        drive(StableParent);
+
+        assert_eq!(
+            child_renders(0),
+            1 + PARENT_RE_RENDERS,
+            "pre-fix baseline: a per-render closure prop re-runs the child body on \
+             every parent render"
+        );
+        assert_eq!(
+            child_renders(1),
+            1,
+            "issue 2103: with `use_callback` the child body runs ONCE — the parent's \
+             later renders memoize away"
+        );
+    }
+
+    /// The OTHER half of issue 2103, and the one that decides whether the fix
+    /// is real: a parent that writes a context signal in its render body
+    /// re-renders every subscriber no matter how well the props memoize.
+    ///
+    /// This drives the production `publish_meeting_time` — the exact call the
+    /// meeting view makes — against a child that memoizes perfectly (plain
+    /// `PartialEq` props, no handler props at all) and subscribes to
+    /// `MeetingTimeCtx` the same way `PeerTile` does (`use_context` + a
+    /// reactive read of the signal). The `unguarded` arm is the pre-fix shape.
+    ///
+    /// MUTATION SENSITIVITY: deleting the `if changed` guard inside
+    /// `publish_meeting_time` (leaving a bare `meeting_time.set(next)`) makes
+    /// the guarded arm count `1 + PARENT_RE_RENDERS` like the unguarded one,
+    /// failing the `== 1` assertion. Confirmed by performing exactly that
+    /// mutation.
+    #[test]
+    fn publishing_an_unchanged_meeting_time_does_not_re_render_its_subscribers() {
+        // 0 = the unguarded (pre-fix) parent's child, 1 = the production one's.
+        thread_local! {
+            static SUB_RENDERS: [Cell<u32>; 2] = const { [Cell::new(0), Cell::new(0)] };
+        }
+
+        #[derive(PartialEq, Clone, Props)]
+        struct TimeSubProps {
+            slot: usize,
+        }
+
+        /// Memoizes on every parent render (its only prop is an unchanged
+        /// `usize`), so the ONLY thing that can re-run its body is the
+        /// context-signal subscription — the same subscription `peer_tile.rs`
+        /// makes to derive the signal-history window start.
+        #[allow(non_snake_case)]
+        fn TimeSub(props: TimeSubProps) -> Element {
+            let mt = use_context::<crate::context::MeetingTimeCtx>();
+            let _ = mt().meeting_start_time;
+            SUB_RENDERS.with(|c| c[props.slot].set(c[props.slot].get() + 1));
+            rsx! { div {} }
+        }
+
+        #[allow(non_snake_case)]
+        fn UnguardedPublisher() -> Element {
+            let mut meeting_time = use_signal(MeetingTime::default);
+            use_context_provider(|| meeting_time);
+            // Pre-fix shape: an unconditional write in the render body.
+            meeting_time.set(MeetingTime {
+                call_start_time: None,
+                meeting_start_time: Some(1_000.0),
+            });
+            rsx! { TimeSub { slot: 0 } }
+        }
+
+        #[allow(non_snake_case)]
+        fn GuardedPublisher() -> Element {
+            let meeting_time = use_signal(MeetingTime::default);
+            use_context_provider(|| meeting_time);
+            // The production call, verbatim.
+            publish_meeting_time(
+                meeting_time,
+                MeetingTime {
+                    call_start_time: None,
+                    meeting_start_time: Some(1_000.0),
+                },
+            );
+            rsx! { TimeSub { slot: 1 } }
+        }
+
+        // Each pass is one `render_immediate`. Note the ONE-PASS LAG: a scope's
+        // `ReactiveContext` update callback only `unbounded_send`s
+        // `SchedulerMsg::Immediate(id)` (dioxus-core 0.7.3
+        // `ReactiveContext::new_for_scope`), and that channel is drained into
+        // `dirty_scopes` by `queue_events`, which `render_immediate` calls at
+        // the TOP of the pass. So a write performed while the parent is
+        // rendering re-renders the subscriber on the NEXT pass, not this one.
+        // Hence the unguarded child's tally is `PARENT_RE_RENDERS` (mount, then
+        // one re-render per pass from the second onwards), not
+        // `1 + PARENT_RE_RENDERS`. The steady-state cost is still exactly one
+        // extra child render per parent render, which is what production sees
+        // during a resize drag.
+        const PARENT_RE_RENDERS: u32 = 5;
+        fn drive(app: fn() -> Element) {
+            let mut vdom = VirtualDom::new(app);
+            vdom.rebuild_in_place();
+            for _ in 0..PARENT_RE_RENDERS {
+                vdom.mark_dirty(ScopeId::APP);
+                vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+            }
+        }
+
+        SUB_RENDERS.with(|c| {
+            c[0].set(0);
+            c[1].set(0);
+        });
+        drive(UnguardedPublisher);
+        drive(GuardedPublisher);
+
+        assert_eq!(
+            SUB_RENDERS.with(|c| c[0].get()),
+            PARENT_RE_RENDERS,
+            "pre-fix baseline: an unconditional render-body `set` on a context signal \
+             re-renders every subscriber on every parent render — memoized props do \
+             NOT save them, because dioxus's memoized diff branch returns without \
+             removing the scope from `dirty_scopes`"
+        );
+        assert_eq!(
+            SUB_RENDERS.with(|c| c[1].get()),
+            1,
+            "issue 2103: `publish_meeting_time` must skip the write when the value is \
+             unchanged, so a parent-only re-render leaves its subscribers alone"
+        );
+    }
+
+    /// DRAIN THE MOUNT-EFFECT DIRTY BEFORE MEASURING — without this every
+    /// assertion below that uses the two-pass idiom passes VACUOUSLY.
+    ///
+    /// Mounting queues exactly one dirty for the tile: `PeerTile`'s post-mount
+    /// `use_effect` seeds `audio_enabled` / `video_enabled` / `audio_level`
+    /// from the client snapshot, and the body reads all three. That dirty is
+    /// then STARVED for as long as the test keeps calling
+    /// `mark_dirty(ScopeId::APP)`: the parent scope is shallower, so each
+    /// `render_immediate` services it and returns before reaching the tile. The
+    /// leftover therefore survives an arbitrary number of parent-only passes
+    /// and lands on the first BARE `render_immediate` — i.e. on the second pass
+    /// of any "change something, then render twice" control, which is exactly
+    /// where such a control reads its result. Measured directly: the cadence is
+    /// `M ... | B - - | . - . - . - | . d -` (mount, three starved parent
+    /// passes, the leftover landing on the first bare pass and nothing after,
+    /// three parent passes that dirty nothing at all, then a REAL change
+    /// arriving on its bare second pass).
+    ///
+    /// Two bare passes: the first services the leftover, the second proves the
+    /// queue is now empty (a third would be indistinguishable from the second).
+    fn drain_mount_effect_dirty(vdom: &mut VirtualDom) {
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+    }
+
+    /// Issue 2103's acceptance criterion measured on the REAL path: the
+    /// production `PeerTile`, mounted for real, under a parent that publishes
+    /// `MeetingTimeCtx` through the production `publish_meeting_time`.
+    ///
+    /// HOW A REAL TILE RENDER IS OBSERVED FROM OUTSIDE. `PeerTile`'s body opens
+    /// its entry in the context-provided `PeerSignalHistoryMap` with
+    /// `map.entry(peer_id).or_insert_with(..)` on EVERY render, and it only
+    /// ever `write()`s that map — never `read()`s it — so the tile is not a
+    /// subscriber and the test can poke the map without dirtying the tile.
+    /// Deleting the tile's entry between renders is therefore a one-shot
+    /// marker: it reappears if and only if the tile's body ran again.
+    ///
+    /// The two positive controls are what keep this from passing vacuously: the
+    /// mount assertion proves the real tile rendered at all (it needs five
+    /// context providers, one of them a live `VideoCallClient`, so a silent
+    /// failure to mount is the obvious way to get a free pass), and the
+    /// changed-value assertion proves the marker technique actually detects a
+    /// re-render.
+    ///
+    /// Runs in the browser because `PeerTile` -> `generate_for_peer` touches
+    /// `window`/`localStorage`.
+    ///
+    /// MUTATION SENSITIVITY: deleting the `if changed` guard inside
+    /// `publish_meeting_time` makes the unchanged-publish re-render the real
+    /// tile, so the entry reappears and the middle assertion fails. Confirmed
+    /// by performing exactly that mutation.
+    #[wasm_bindgen_test]
+    fn peer_tile_stops_re_rendering_with_its_parent_on_the_real_path() {
+        use crate::components::peer_tile::PeerTile;
+        use crate::context::{AppearanceSettings, AppearanceSettingsCtx, SignalPopupStateMap};
+
+        const TILE_ID: &str = "real-path-peer";
+
+        thread_local! {
+            /// Published out of the parent so the test can poke the history map
+            /// and drive the meeting-start value.
+            static REAL_PATH: RefCell<Option<PeerSignalHistoryMap>> = const { RefCell::new(None) };
+            static MEETING_START_MS: Cell<f64> = const { Cell::new(1_000.0) };
+        }
+        REAL_PATH.with(|p| *p.borrow_mut() = None);
+        MEETING_START_MS.with(|m| m.set(1_000.0));
+
+        #[allow(non_snake_case)]
+        fn RealTileParent() -> Element {
+            // Every context `PeerTile` -> `generate_for_peer` requires. The
+            // optional ones (`HostSetCtx`, `RecordingSetCtx`, `CroppedTilesCtx`,
+            // `MediaMetricsOverlayCtx`) are deliberately left absent: they are
+            // read with `try_use_context` and their absence is the documented
+            // "isolated test" path.
+            let client = use_hook(|| VideoCallClient::new_for_test("local-user"));
+            use_context_provider(|| client.clone());
+            let history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
+            use_context_provider(|| history_map);
+            let popup_map: SignalPopupStateMap = use_signal(HashMap::new);
+            use_context_provider(|| popup_map);
+            let appearance = use_signal(AppearanceSettings::default);
+            use_context_provider(|| AppearanceSettingsCtx(appearance));
+            let meeting_time = use_signal(MeetingTime::default);
+            use_context_provider(|| meeting_time);
+            use_hook(move || REAL_PATH.with(|p| *p.borrow_mut() = Some(history_map)));
+
+            // The production write, exactly as the meeting view performs it.
+            publish_meeting_time(
+                meeting_time,
+                MeetingTime {
+                    call_start_time: None,
+                    meeting_start_time: Some(MEETING_START_MS.with(|m| m.get())),
+                },
+            );
+
+            // The production handler shape: stable identities, and
+            // `on_request_decode` passed EXPLICITLY (leaving it to
+            // `#[props(default)]` builds a fresh `Callback` per render and
+            // defeats memoization on its own).
+            let pin: EventHandler<PinnedTile> = use_callback(|_: PinnedTile| {});
+            let decode: EventHandler<String> = use_callback(|_: String| {});
+            rsx! {
+                PeerTile {
+                    peer_id: TILE_ID.to_string(),
+                    on_toggle_pin: pin,
+                    on_request_decode: decode,
+                }
+            }
+        }
+
+        fn tile_rendered(history_map: &PeerSignalHistoryMap) -> bool {
+            history_map.peek().contains_key(TILE_ID)
+        }
+        fn clear_marker(history_map: &mut PeerSignalHistoryMap) {
+            history_map.write().remove(TILE_ID);
+        }
+
+        let mut vdom = VirtualDom::new(RealTileParent);
+        vdom.rebuild_in_place();
+        let mut history_map =
+            REAL_PATH.with(|p| (*p.borrow()).expect("the parent published its history map"));
+
+        // POSITIVE CONTROL 1 — the real tile actually mounted and ran its body.
+        assert!(
+            tile_rendered(&history_map),
+            "positive control: the real `PeerTile` must have mounted and rendered, \
+             otherwise the re-render assertions below are vacuous"
+        );
+
+        // Drain the one dirty that mounting leaves queued for the tile — see
+        // `drain_mount_effect_dirty`. POSITIVE CONTROL 2 below renders twice
+        // after its change, and without this drain that second pass services
+        // the mount leftover instead: the control then passes whether or not
+        // the meeting-time change reached the tile at all.
+        drain_mount_effect_dirty(&mut vdom);
+
+        // The measurement: parent-only re-renders, every tile input unchanged.
+        // BOTH passes are taken per iteration so a dirty that is merely starved
+        // behind the shallower parent scope cannot hide from this assertion.
+        const PARENT_RE_RENDERS: u32 = 5;
+        clear_marker(&mut history_map);
+        for _ in 0..PARENT_RE_RENDERS {
+            vdom.mark_dirty(ScopeId::APP);
+            vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+            vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        }
+        assert!(
+            !tile_rendered(&history_map),
+            "issue 2103 acceptance criterion, on the real path: the production \
+             `PeerTile` must NOT re-render when only the parent re-rendered with \
+             unchanged tile inputs. An unguarded `meeting_time_signal.set(..)` in the \
+             parent's render body re-dirties every tile scope, and the memoized diff \
+             branch does not undirty it — so the tile renders anyway"
+        );
+
+        // POSITIVE CONTROL 2 — the marker really does detect a re-render, and a
+        // GENUINE meeting-time change still reaches the tile.
+        //
+        // TWO passes, because of the one-pass lag: a scope's `ReactiveContext`
+        // update callback only `unbounded_send`s `SchedulerMsg::Immediate(id)`
+        // (dioxus-core 0.7.3 `ReactiveContext::new_for_scope`), and that channel
+        // is drained into `dirty_scopes` by `queue_events` at the TOP of
+        // `render_immediate`. A write performed while the parent renders is
+        // therefore only serviced on the following pass.
+        MEETING_START_MS.with(|m| m.set(2_000.0));
+        clear_marker(&mut history_map);
+        vdom.mark_dirty(ScopeId::APP);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        assert!(
+            tile_rendered(&history_map),
+            "positive control: a REAL meeting-time change must still re-render the \
+             tile — the guard suppresses redundant writes, not real ones"
+        );
+
+        REAL_PATH.with(|p| *p.borrow_mut() = None);
+        drop(vdom);
+    }
+
+    /// Issue 2135's perf acceptance criterion: ONE hand moving must re-render
+    /// exactly ONE tile.
+    ///
+    /// WHY THIS NEEDED ITS OWN TEST RATHER THAN RIDING ON #2125's. The
+    /// memoization #2125 installed gives props stable identity so a PARENT
+    /// re-render stops at the `PartialEq` check. A raised hand does not travel
+    /// through props at all: `RaisedHandsCtx` is one room-wide
+    /// `Signal<Vec<RaisedHand>>`, and a signal write marks every SUBSCRIBED
+    /// SCOPE dirty directly in the runtime. Props are never consulted, so the
+    /// #2125 gate never runs and cannot report the regression. The first
+    /// implementation read the context inside `generate_for_peer` — a plain
+    /// `fn`, so those reads bound to the CALLING tile's scope — which
+    /// subscribed every mounted tile to every hand in the room. In a 20-person
+    /// Q&A a single wave re-rendered all N tiles (each re-running a 1,200-line
+    /// body plus a 1,155-line generator) on a machine already software-decoding
+    /// up to 30 streams; the decode budget answers that CPU by SHEDDING TILES,
+    /// so raising hands could itself trigger video shedding.
+    ///
+    /// The fix is a `use_memo` in `PeerTile` whose output is one `bool` about
+    /// one session: it re-runs for every tile on every roster change (cheap) but
+    /// only DIRTIES the tile whose own answer changed.
+    ///
+    /// Same marker technique as `peer_tile_stops_re_rendering_with_its_parent_on_the_real_path`
+    /// above — see its doc for why a `PeerSignalHistoryMap` entry is a sound
+    /// one-shot render marker, and for the two-pass dirty lag. Peer ids are
+    /// NUMERIC because `RaisedHandsCtx::is_raised` parses them as `u64`; a
+    /// non-numeric id never matches, which would make the raiser assertion
+    /// vacuous.
+    ///
+    /// MUTATION SENSITIVITY: replace the `use_memo` in `peer_tile.rs` with the
+    /// direct read it replaced —
+    /// `let hand_raised = raised_hands_ctx.as_ref().map(|rh| rh.is_raised(&peer_id)).unwrap_or(false);`
+    /// — and the BYSTANDER assertion fails, because that read subscribes every
+    /// tile to the whole roster. Confirmed by performing exactly that mutation.
+    #[wasm_bindgen_test]
+    fn a_raised_hand_re_renders_only_the_tile_whose_hand_moved() {
+        use crate::components::peer_tile::PeerTile;
+        use crate::context::{AppearanceSettings, AppearanceSettingsCtx, SignalPopupStateMap};
+
+        // Numeric: `is_raised` / `queue_slot` parse the session id as u64.
+        const RAISER: &str = "1001";
+        const BYSTANDER: &str = "1002";
+
+        thread_local! {
+            static TWO_TILE_HISTORY: RefCell<Option<PeerSignalHistoryMap>> =
+                const { RefCell::new(None) };
+            static TWO_TILE_HANDS: RefCell<Option<Signal<Vec<RaisedHand>>>> =
+                const { RefCell::new(None) };
+        }
+        TWO_TILE_HISTORY.with(|p| *p.borrow_mut() = None);
+        TWO_TILE_HANDS.with(|h| *h.borrow_mut() = None);
+
+        #[allow(non_snake_case)]
+        fn TwoTileParent() -> Element {
+            let client = use_hook(|| VideoCallClient::new_for_test("local-user"));
+            use_context_provider(|| client.clone());
+            let history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
+            use_context_provider(|| history_map);
+            let popup_map: SignalPopupStateMap = use_signal(HashMap::new);
+            use_context_provider(|| popup_map);
+            let appearance = use_signal(AppearanceSettings::default);
+            use_context_provider(|| AppearanceSettingsCtx(appearance));
+            let meeting_time = use_signal(MeetingTime::default);
+            use_context_provider(|| meeting_time);
+            // The roster, provided exactly as the meeting view provides it. The
+            // parent never READS it, so it is not itself a subscriber — which is
+            // what keeps a roster write from dirtying the parent and re-rendering
+            // both tiles from above, hiding the very thing under test.
+            let hands: Signal<Vec<RaisedHand>> = use_signal(Vec::new);
+            use_context_provider(|| RaisedHandsCtx(hands));
+            use_hook(move || {
+                TWO_TILE_HISTORY.with(|p| *p.borrow_mut() = Some(history_map));
+                TWO_TILE_HANDS.with(|h| *h.borrow_mut() = Some(hands));
+            });
+
+            // Stable identities, and `on_request_decode` passed EXPLICITLY —
+            // leaving it to `#[props(default)]` builds a fresh `Callback` per
+            // render and defeats memoization on its own.
+            let pin: EventHandler<PinnedTile> = use_callback(|_: PinnedTile| {});
+            let decode: EventHandler<String> = use_callback(|_: String| {});
+            // No `key:` — these are STATIC siblings at fixed RSX positions, not
+            // loop items, so each already owns a stable scope whose `peer_id`
+            // never changes (Dioxus rejects keys outside a keyed list anyway).
+            // Production call sites ARE keyed, on the peer id; see the note on
+            // `PeerTile`'s raised-hand memo for why that matters there.
+            rsx! {
+                PeerTile {
+                    peer_id: RAISER.to_string(),
+                    on_toggle_pin: pin,
+                    on_request_decode: decode,
+                }
+                PeerTile {
+                    peer_id: BYSTANDER.to_string(),
+                    on_toggle_pin: pin,
+                    on_request_decode: decode,
+                }
+            }
+        }
+
+        fn rendered(history_map: &PeerSignalHistoryMap, id: &str) -> bool {
+            history_map.peek().contains_key(id)
+        }
+
+        let mut vdom = VirtualDom::new(TwoTileParent);
+        vdom.rebuild_in_place();
+        let mut history_map =
+            TWO_TILE_HISTORY.with(|p| (*p.borrow()).expect("the parent published its history map"));
+        let mut hands =
+            TWO_TILE_HANDS.with(|h| (*h.borrow()).expect("the parent published its roster"));
+
+        // POSITIVE CONTROL 1 — both real tiles mounted. Without this a silent
+        // mount failure would make every assertion below vacuously true.
+        assert!(
+            rendered(&history_map, RAISER) && rendered(&history_map, BYSTANDER),
+            "positive control: both real `PeerTile`s must have mounted and rendered"
+        );
+
+        drain_mount_effect_dirty(&mut vdom);
+
+        // THE MEASUREMENT: one hand goes up, through the production mutator and
+        // the production change-guarded write that `attendants.rs` performs.
+        history_map.write().remove(RAISER);
+        history_map.write().remove(BYSTANDER);
+        let mut next = hands.peek().clone();
+        assert!(
+            set_raised_hand(
+                &mut next,
+                RaisedHand {
+                    session_id: RAISER.parse::<u64>().expect("numeric peer id"),
+                    raised_at_ms: 1_000,
+                    name: "Raiser".to_string(),
+                    is_self: false,
+                },
+            ),
+            "precondition: the first raise must report a change"
+        );
+        hands.set(next);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+
+        // POSITIVE CONTROL 2 — the raiser's OWN tile must still re-render, or
+        // its badge would never appear. This is what stops the fix from being
+        // "subscribe to nothing", which would trivially satisfy the assertion
+        // below while breaking the feature.
+        assert!(
+            rendered(&history_map, RAISER),
+            "positive control: the tile whose hand went up MUST re-render — \
+             otherwise its raised-hand badge never appears"
+        );
+
+        // The issue 2135 perf criterion.
+        assert!(
+            !rendered(&history_map, BYSTANDER),
+            "issue 2135 perf acceptance criterion: a hand moving on ANOTHER peer \
+             must not re-render this tile. A direct `RaisedHandsCtx` read in the \
+             tile body (or inside the plain-`fn` `generate_for_peer`, whose \
+             context reads bind to the tile's scope) subscribes EVERY tile to the \
+             room-wide roster, so one hand wave re-renders all N tiles — a cost \
+             that scales with meeting size on machines already software-decoding \
+             up to 30 streams"
+        );
+
+        TWO_TILE_HISTORY.with(|p| *p.borrow_mut() = None);
+        TWO_TILE_HANDS.with(|h| *h.borrow_mut() = None);
+        drop(vdom);
+    }
+
+    /// The peer-metadata half of issue 2103, and the regression the #2125 CI
+    /// red caught: a display name that arrives AFTER its tile has mounted must
+    /// still reach the tile — WITHOUT putting the tile back on the
+    /// re-render-with-every-parent-render path that issue 2103 removed.
+    ///
+    /// Both halves are asserted here because they pull in opposite directions,
+    /// and shipping either one alone is a bug:
+    ///
+    ///   * LEG A — a parent re-render with an UNCHANGED snapshot must NOT
+    ///     re-render the tile. Deleting the `if changed` guard inside
+    ///     `publish_peer_metadata` fails this, and would silently restore the
+    ///     exact per-render dirtying `publish_meeting_time`'s guard removed.
+    ///   * LEG B — a snapshot whose `display_name` moves from `None` to
+    ///     `Some(..)` (the wire order that broke: media packet first,
+    ///     `PARTICIPANT_JOINED` second) MUST re-render the tile. Deleting the
+    ///     `peer_metadata.0.read()` subscription in `peer_tile.rs` fails this,
+    ///     which is precisely the state PR #2125 shipped: the host grid kept
+    ///     rendering `tileorderb@videocall.rs` instead of `TileOrderGuestB`.
+    ///
+    /// Same real-path harness as
+    /// `peer_tile_stops_re_rendering_with_its_parent_on_the_real_path`: the
+    /// production `PeerTile` mounted for real, its renders observed from
+    /// outside via the `PeerSignalHistoryMap` entry its body re-opens every
+    /// render (it only `write()`s that map, never `read()`s it, so clearing the
+    /// marker cannot itself dirty the tile). `MeetingTimeCtx` is held CONSTANT
+    /// throughout so the only thing that can reach the tile is the metadata
+    /// snapshot.
+    ///
+    /// MUTATION SENSITIVITY: confirmed by performing both mutations above.
+    #[wasm_bindgen_test]
+    fn peer_tile_re_renders_when_peer_metadata_arrives() {
+        use crate::components::peer_tile::PeerTile;
+        use crate::context::{AppearanceSettings, AppearanceSettingsCtx, SignalPopupStateMap};
+
+        const TILE_ID: &str = "metadata-peer";
+
+        thread_local! {
+            static META_PATH: RefCell<Option<PeerSignalHistoryMap>> = const { RefCell::new(None) };
+            /// `None` until the (simulated) `PARTICIPANT_JOINED` lands.
+            static PEER_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
+        }
+        META_PATH.with(|p| *p.borrow_mut() = None);
+        PEER_NAME.with(|n| *n.borrow_mut() = None);
+
+        #[allow(non_snake_case)]
+        fn MetadataParent() -> Element {
+            let client = use_hook(|| VideoCallClient::new_for_test("local-user"));
+            use_context_provider(|| client.clone());
+            let history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
+            use_context_provider(|| history_map);
+            let popup_map: SignalPopupStateMap = use_signal(HashMap::new);
+            use_context_provider(|| popup_map);
+            let appearance = use_signal(AppearanceSettings::default);
+            use_context_provider(|| AppearanceSettingsCtx(appearance));
+            let meeting_time = use_signal(MeetingTime::default);
+            use_context_provider(|| meeting_time);
+            let peer_metadata: Signal<Vec<PeerMetadata>> = use_signal(Vec::new);
+            use_context_provider(|| PeerMetadataCtx(peer_metadata));
+            use_hook(move || META_PATH.with(|p| *p.borrow_mut() = Some(history_map)));
+
+            // Meeting time is deliberately CONSTANT: this test must fail only
+            // for metadata reasons, never because the other context moved.
+            publish_meeting_time(meeting_time, MeetingTime::default());
+
+            // The production write, through the production snapshot builder.
+            // The `lookup` stands in for the three client getters — the client
+            // built by `new_for_test` has no peers, so driving it from a cell
+            // is the only way to model a name that lands mid-call.
+            publish_peer_metadata(
+                peer_metadata,
+                peer_metadata_snapshot(&[TILE_ID.to_string()], |_session_id| {
+                    (
+                        Some("peer@videocall.rs".to_string()),
+                        PEER_NAME.with(|n| n.borrow().clone()),
+                        false,
+                    )
+                }),
+            );
+
+            let pin: EventHandler<PinnedTile> = use_callback(|_: PinnedTile| {});
+            let decode: EventHandler<String> = use_callback(|_: String| {});
+            rsx! {
+                PeerTile {
+                    peer_id: TILE_ID.to_string(),
+                    on_toggle_pin: pin,
+                    on_request_decode: decode,
+                }
+            }
+        }
+
+        fn tile_rendered(history_map: &PeerSignalHistoryMap) -> bool {
+            history_map.peek().contains_key(TILE_ID)
+        }
+        fn clear_marker(history_map: &mut PeerSignalHistoryMap) {
+            history_map.write().remove(TILE_ID);
+        }
+
+        let mut vdom = VirtualDom::new(MetadataParent);
+        vdom.rebuild_in_place();
+        let mut history_map =
+            META_PATH.with(|p| (*p.borrow()).expect("the parent published its history map"));
+
+        // POSITIVE CONTROL — the real tile mounted, so the legs below are not
+        // vacuous.
+        assert!(
+            tile_rendered(&history_map),
+            "positive control: the real `PeerTile` must have mounted and rendered"
+        );
+
+        // Drain the one dirty that mounting leaves queued for the tile — see
+        // `drain_mount_effect_dirty`. Both legs below render TWICE per parent
+        // pass, so an undrained leftover would land inside LEG A (failing it
+        // for the wrong reason) and would make LEG B pass without any
+        // subscription at all.
+        drain_mount_effect_dirty(&mut vdom);
+
+        // LEG A — the issue 2103 win must survive: parent-only re-renders with
+        // an unchanged snapshot leave the tile alone. BOTH passes are taken so
+        // a dirty that is merely starved behind the shallower parent scope
+        // cannot hide from this assertion.
+        const PARENT_RE_RENDERS: u32 = 5;
+        clear_marker(&mut history_map);
+        for _ in 0..PARENT_RE_RENDERS {
+            vdom.mark_dirty(ScopeId::APP);
+            vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+            vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        }
+        assert!(
+            !tile_rendered(&history_map),
+            "issue 2103: subscribing the tile to `PeerMetadataCtx` must NOT put it \
+             back on the per-parent-render path — an UNGUARDED `publish_peer_metadata` \
+             re-dirties every tile scope, and the memoized diff branch does not \
+             undirty it"
+        );
+
+        // LEG B — the #2125 regression: the name lands after the tile mounted
+        // and MUST reach it.
+        //
+        // TWO passes because of the one-pass lag: a scope's `ReactiveContext`
+        // update callback only `unbounded_send`s `SchedulerMsg::Immediate(id)`
+        // (dioxus-core 0.7.3 `ReactiveContext::new_for_scope`), and that channel
+        // is drained into `dirty_scopes` by `queue_events` at the TOP of
+        // `render_immediate`. A write performed while the parent renders is
+        // therefore only serviced on the following pass. LEG A above took both
+        // passes for exactly this reason, so the queue reaching here is empty
+        // and the only thing that can produce a render is the publish.
+        PEER_NAME.with(|n| *n.borrow_mut() = Some("GuestUser".to_string()));
+        clear_marker(&mut history_map);
+        vdom.mark_dirty(ScopeId::APP);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        assert!(
+            tile_rendered(&history_map),
+            "issue 2125: a display name that arrives AFTER the tile mounted must \
+             re-render it. Without the `PeerMetadataCtx` subscription in \
+             `peer_tile.rs` the tile keeps rendering the fallback user_id forever, \
+             which is what turned `Playwright bvt1` red"
+        );
+
+        META_PATH.with(|p| *p.borrow_mut() = None);
+        PEER_NAME.with(|n| *n.borrow_mut() = None);
+        drop(vdom);
+    }
+
+    /// `peer_metadata_snapshot` must preserve the caller's session order and
+    /// carry a not-yet-known field through as `None` rather than inventing a
+    /// value.
+    ///
+    /// Both properties are load-bearing, not cosmetic. ORDER is what lets
+    /// `publish_peer_metadata`'s `PartialEq` guard mean "the metadata moved"
+    /// rather than "the iteration order moved" — a `HashMap`-shaped snapshot
+    /// would re-dirty every tile at random and silently undo issue 2103.
+    /// `None` is what makes the arrival of a name a real change: a builder that
+    /// substituted the session id (or the user_id) for a missing name would
+    /// publish a value that never transitions, so the tile would never be
+    /// dirtied and the #2125 regression would survive the fix.
+    ///
+    /// MUTATION SENSITIVITY: sorting the ids, or falling back to
+    /// `session_id.clone()` for a missing `display_name`, fails this test.
+    #[test]
+    fn peer_metadata_snapshot_preserves_order_and_unknown_fields() {
+        // Deliberately NOT in sorted order: a builder that sorts would pass a
+        // sorted fixture.
+        let ids = vec!["30".to_string(), "10".to_string(), "20".to_string()];
+
+        let snapshot = peer_metadata_snapshot(&ids, |session_id| match session_id {
+            // The joined peer: everything known.
+            "10" => (
+                Some("guest@videocall.rs".to_string()),
+                Some("GuestUser".to_string()),
+                true,
+            ),
+            // The racing peer: created by a media packet, no
+            // `PARTICIPANT_JOINED` yet.
+            _ => (None, None, false),
+        });
+
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|m| m.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["30", "10", "20"],
+            "the snapshot must follow `display_peers` order so the publish guard \
+             compares stably"
+        );
+        assert_eq!(snapshot[1].user_id.as_deref(), Some("guest@videocall.rs"));
+        assert_eq!(snapshot[1].display_name.as_deref(), Some("GuestUser"));
+        assert!(snapshot[1].is_guest);
+        assert_eq!(
+            snapshot[0].display_name, None,
+            "a name the client does not know yet must stay `None`, so its later \
+             arrival is a real change the publish guard lets through"
+        );
+        assert_eq!(snapshot[0].user_id, None);
+        assert!(!snapshot[2].is_guest);
+    }
+
+    /// Issue 2100/2103: `wake_dock` must not dirty its scope when the dock is
+    /// ALREADY awake.
+    ///
+    /// This is the render-cadence half of the dock fix, and the one that fires
+    /// in ordinary use: `mousemove` runs `wake_dock` on every pointer frame,
+    /// while `resize` only fires during a drag. `Signal::write` marks
+    /// subscribers dirty UNCONDITIONALLY (dioxus-signals 0.7.3
+    /// `SignalSubscriberDrop::drop` -> `update_subscribers`, no value
+    /// comparison), so the pre-fix `set(true)` pair re-rendered the whole
+    /// meeting view on every frame in which the pointer moved — with the dock
+    /// already visible and expanded, i.e. with nothing to change.
+    ///
+    /// wasm rather than native because `wake_dock` -> `arm_dock_autohide`
+    /// constructs `gloo` `Timeout`s, which need a browser.
+    ///
+    /// MUTATION SENSITIVITY: removing EITHER change-guard in `wake_dock` (i.e.
+    /// reverting that half to an unconditional `controls_visible.set(true)` /
+    /// `controls_expanded.set(true)`) makes the write unconditional, so
+    /// `update_subscribers` dirties the probe and it renders a second time,
+    /// failing the `== 1` assertion. Confirmed by performing both mutations
+    /// independently.
+    #[wasm_bindgen_test]
+    fn waking_an_already_awake_dock_does_not_dirty_its_subscribers() {
+        type DockSignals = (Signal<bool>, Signal<bool>, Signal<bool>);
+        thread_local! {
+            static WAKE_SIGNALS: RefCell<Option<DockSignals>> = const { RefCell::new(None) };
+            static WAKE_RENDERS: Cell<u32> = const { Cell::new(0) };
+        }
+        WAKE_SIGNALS.with(|s| *s.borrow_mut() = None);
+        WAKE_RENDERS.with(|r| r.set(0));
+
+        /// Unlike the `dock_autohide_timer_is_cancelled_when_its_cell_is_dropped`
+        /// probe, this one READS both dock signals — that subscription is the
+        /// whole point: it is what the meeting view does (`controls_visible` /
+        /// `controls_expanded` are consumed as CSS class strings in its render
+        /// body), and it is what an unconditional write re-renders.
+        #[allow(non_snake_case)]
+        fn WakeProbe() -> Element {
+            let enabled = use_signal(|| true);
+            let visible = use_signal(|| true);
+            let expanded = use_signal(|| true);
+            let _ = visible();
+            let _ = expanded();
+            WAKE_RENDERS.with(|r| r.set(r.get() + 1));
+            use_hook(move || {
+                WAKE_SIGNALS.with(|s| *s.borrow_mut() = Some((enabled, visible, expanded)));
+            });
+            rsx! { div {} }
+        }
+
+        let mut vdom = VirtualDom::new(WakeProbe);
+        vdom.rebuild_in_place();
+        let (enabled, visible, expanded) =
+            WAKE_SIGNALS.with(|s| s.borrow().expect("probe published its signals"));
+        assert_eq!(
+            WAKE_RENDERS.with(|r| r.get()),
+            1,
+            "positive control: the probe must have rendered exactly once at mount"
+        );
+
+        // Cells kept alive so the armed auto-hide timers are cancelled on drop
+        // at the end of the test rather than firing into a live scope.
+        let narrow: DockTimerCell = Rc::new(RefCell::new(None));
+        let hide: DockTimerCell = Rc::new(RefCell::new(None));
+
+        // The dock is already visible AND expanded, so both writes are no-ops.
+        vdom.in_runtime(|| wake_dock(&narrow, &hide, enabled, visible, expanded));
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        assert_eq!(
+            WAKE_RENDERS.with(|r| r.get()),
+            1,
+            "issue 2100: `wake_dock` must not dirty the scope when the dock is already \
+             awake — an unconditional `set(true)` pair re-renders the entire meeting \
+             view on every `mousemove` frame"
+        );
+
+        // POSITIVE CONTROL — a real wake (dock hidden and collapsed) MUST
+        // re-render. Without this the assertion above would also pass if
+        // `wake_dock` had simply stopped writing at all.
+        let mut visible_mut = visible;
+        let mut expanded_mut = expanded;
+        visible_mut.set(false);
+        expanded_mut.set(false);
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        let before_real_wake = WAKE_RENDERS.with(|r| r.get());
+        vdom.in_runtime(|| wake_dock(&narrow, &hide, enabled, visible, expanded));
+        vdom.render_immediate(&mut dioxus_core::NoOpMutations);
+        assert!(
+            WAKE_RENDERS.with(|r| r.get()) > before_real_wake,
+            "positive control: a REAL wake (dock hidden/collapsed) must still write the \
+             signals and re-render — the guard suppresses redundant writes, not real ones"
+        );
+        assert!(
+            visible.peek().to_owned() && expanded.peek().to_owned(),
+            "a real wake must leave the dock visible AND expanded"
+        );
+
+        WAKE_SIGNALS.with(|s| *s.borrow_mut() = None);
+        drop(narrow);
+        drop(hide);
+        drop(vdom);
+    }
+
     // ── Action-bar overflow fit: must expand back as the window widens ──
     // (issue 2044). `action_bar_overflow_hidden` must be a monotonically
     // non-increasing function of viewport width: widening can only ever REVEAL
@@ -11826,6 +15231,108 @@ mod tests {
             ActionBarSlot::Diagnostics,
             ActionBarSlot::DeviceSettings,
         ]
+    }
+
+    // ── issue 1765: repeated live-region messages must still announce ──
+    //
+    // `dioxus-core`'s `diff_vtext` emits `set_node_text` only when
+    // `left.value != right.value`, so a live region fed the SAME string twice
+    // never mutates and never re-announces. Two consecutive "Reset to Default"
+    // presses set a *constant*, so the second was silent — exactly the
+    // complaint issue 1765 filed. `action_bar_announce_text` breaks the tie with
+    // a nonce-parity invisible suffix.
+
+    #[test]
+    fn repeated_announcement_renders_a_different_text_node() {
+        // The production writers bump the nonce on EVERY write, so two
+        // consecutive Resets render nonce N and N+1 with identical messages.
+        // If those two renders were equal, Dioxus would emit no mutation.
+        for nonce in 0..8u32 {
+            let first = action_bar_announce_text(ACTION_BAR_RESET_ANNOUNCEMENT, nonce);
+            let second = action_bar_announce_text(ACTION_BAR_RESET_ANNOUNCEMENT, nonce + 1);
+            assert_ne!(
+                first,
+                second,
+                "two consecutive writes of the SAME message (nonce {nonce} -> {}) rendered an \
+                 identical text node; dioxus-core's diff_vtext would skip the mutation and the \
+                 screen reader would stay silent on the repeat (issue 1765)",
+                nonce + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn announcement_suffix_is_invisible_whitespace_only() {
+        // The differentiator must not be readable or speakable: whatever we
+        // append has to trim away to the exact message the user should hear.
+        for nonce in 0..8u32 {
+            let rendered = action_bar_announce_text(ACTION_BAR_RESET_ANNOUNCEMENT, nonce);
+            assert_eq!(
+                rendered.trim_matches(|c: char| c.is_whitespace()),
+                ACTION_BAR_RESET_ANNOUNCEMENT,
+                "nonce {nonce} rendered {rendered:?}, which is not the reset message plus \
+                 whitespace — the differentiator must be inaudible",
+            );
+        }
+    }
+
+    #[test]
+    fn empty_announcement_stays_exactly_empty() {
+        // The customize-mode-exit effect clears the region by writing "". If
+        // the suffix leaked through, the region would park holding a lone
+        // U+00A0 instead of being silent between edit sessions.
+        for nonce in 0..4u32 {
+            assert_eq!(
+                action_bar_announce_text("", nonce),
+                "",
+                "clearing the live region at nonce {nonce} left residue behind",
+            );
+        }
+    }
+
+    // ── issue 1762: dock-menu roving tabindex ──
+
+    #[test]
+    fn dock_menu_index_wraps_at_both_ends() {
+        let n = DOCK_MENU_ITEM_COUNT;
+        assert_eq!(
+            next_dock_menu_index(n - 1, 1, n),
+            0,
+            "ArrowDown on the last item must wrap to the first, matching how \
+             focus_glass_option_relative wraps its sibling walk",
+        );
+        assert_eq!(
+            next_dock_menu_index(0, -1, n),
+            n - 1,
+            "ArrowUp on the first item must wrap to the last",
+        );
+        assert_eq!(next_dock_menu_index(0, 1, n), 1);
+        assert_eq!(next_dock_menu_index(3, -1, n), 2);
+    }
+
+    #[test]
+    fn dock_menu_index_returns_to_start_after_a_full_lap() {
+        // Guards against an off-by-one in the wrap: stepping forward exactly
+        // DOCK_MENU_ITEM_COUNT times must land back where it started, and every
+        // intermediate index must be addressable (< count) so it can never
+        // point at an item that does not render.
+        let n = DOCK_MENU_ITEM_COUNT;
+        let mut idx = 0usize;
+        for step in 0..n {
+            idx = next_dock_menu_index(idx, 1, n);
+            assert!(
+                idx < n,
+                "step {step} produced index {idx}, outside the {n} rendered options",
+            );
+        }
+        assert_eq!(idx, 0, "a full forward lap must return to the first item");
+    }
+
+    #[test]
+    fn dock_menu_index_does_not_divide_by_zero() {
+        // Pure fn, so it must not depend on its caller to uphold count > 0.
+        assert_eq!(next_dock_menu_index(0, 1, 0), 0);
+        assert_eq!(next_dock_menu_index(5, -1, 0), 0);
     }
 
     #[test]
@@ -11904,6 +15411,141 @@ mod tests {
             3,
             "at 620px exactly 3 of 6 secondary slots fit (3 hidden) with the current \
              spacing constants; a change here means btn/gap/pad drifted",
+        );
+    }
+
+    // ── The DEFAULT bar must fit at the width the E2E calls "wide" (issue 2135) ──
+    //
+    // `action_bar_overflow_hidden` is exercised above against a FIXED 6-slot
+    // list, which says nothing about the layout users actually get. The tests
+    // below run it against `DEFAULT_SLOTS` itself, because that is the input
+    // that silently changed and turned CI red.
+
+    /// The viewport width `e2e/tests/action-bar-overflow.spec.ts` widens to
+    /// before asserting that the overflow trigger has cleared and every
+    /// secondary button is back ("widening restores buttons with no hover").
+    /// Keep the two in lockstep — this constant exists so that browser-level
+    /// premise is checked here in milliseconds instead of after a 6-minute
+    /// Playwright run.
+    const ACTION_BAR_E2E_WIDE_WIDTH: f64 = 1280.0;
+
+    /// The narrowest viewport width, in CSS px at a 16px root, that fits the
+    /// WHOLE default action bar with nothing behind the overflow trigger.
+    ///
+    /// Derived from `action_bar_overflow_hidden`'s constants at 10 secondary
+    /// slots (`DEFAULT_SLOTS` minus Mic/Camera, as an owner sees it):
+    ///   sacred 3.49.6 + 3.19.2 + 48 + 2 = 256.4 ; trigger 49.6 + 19.2 = 68.8
+    ///   secondary 49.6 + 9.68.8 = 668.8 ; so vw >= 668.8 + 256.4 + 68.8 + 40
+    /// Pinned rather than recomputed here so the test cannot drift with the
+    /// production formula it is supposed to be watching.
+    ///
+    /// Issue 2136 added the host-only MeetingTimer slot — one more button+gap
+    /// for an owner, exactly as this pin is designed to surface. 1034 leaves
+    /// 246px of headroom under `ACTION_BAR_E2E_WIDE_WIDTH` (1280), so the E2E
+    /// fixture still shows the whole bar with nothing behind the overflow
+    /// trigger.
+    const DEFAULT_ACTION_BAR_MIN_FIT_WIDTH: f64 = 1034.0;
+
+    /// The fresh-install secondary set, built by the PRODUCTION filter: every
+    /// `DEFAULT_SLOTS` entry a non-iOS meeting OWNER sees, minus the sacred
+    /// Mic/Camera pair. This is the widest the bar ever gets by default — an
+    /// owner sees `MeetingOptions`, and the host always sees `Recording`
+    /// (issue 1746) — so it is the case the overflow budget has to accommodate.
+    fn default_secondary_slots() -> Vec<ActionBarSlot> {
+        visible_action_bar_slots(
+            DEFAULT_SLOTS,
+            SlotVisibility {
+                customize_mode: false,
+                ios_device: false,
+                has_screen_share: false,
+                is_owner: true,
+                // The host always sees the record button (issue 1746).
+                recording_visible: true,
+                // Host-only, so an owner sees it (issue 2136).
+                meeting_timer_visible: true,
+            },
+        )
+        .into_iter()
+        .filter(|s| !matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
+        .collect()
+    }
+
+    /// A fresh install's action bar must fit ENTIRELY — nothing tucked behind
+    /// the overflow trigger — at the width the E2E suite calls wide.
+    ///
+    /// This is the invariant issue 2135 broke. Adding `RaiseHand` to
+    /// `DEFAULT_SLOTS` grew the default secondary set by one slot — a whole
+    /// button+gap (68.8px) — while the spec was still widening to only 1000px.
+    /// The extra slot did not fit, the trigger stayed on screen, and the spec
+    /// went red in CI with no local signal.
+    ///
+    /// ADVERSARIAL (mutation): set `ACTION_BAR_E2E_WIDE_WIDTH` back to 1000.0
+    /// and this goes red, naming the slot that would overflow.
+    #[test]
+    fn default_action_bar_fits_entirely_at_the_e2e_wide_width() {
+        let secondary = default_secondary_slots();
+        let hidden = action_bar_overflow_hidden(
+            ACTION_BAR_E2E_WIDE_WIDTH,
+            800.0,
+            false,
+            16.0,
+            3, // Mic + Camera + Hangup
+            &secondary,
+        );
+        assert!(
+            hidden.is_empty(),
+            "the DEFAULT action bar ({} secondary slots) does not fit at {}px: {hidden:?} would \
+             sit behind the overflow trigger, so action-bar-overflow.spec.ts (\"widening \
+             restores buttons with no hover\") fails in CI. Either the default layout grew past \
+             what a reference desktop viewport holds — reorder so a less important slot \
+             overflows, or drop one — or the spacing constants drifted.",
+            secondary.len(),
+            ACTION_BAR_E2E_WIDE_WIDTH,
+        );
+    }
+
+    /// Pins the NARROWEST viewport at which the whole default bar fits.
+    ///
+    /// `default_action_bar_fits_entirely_at_the_e2e_wide_width` has several
+    /// slots of headroom at 1280px, so it will not notice the next addition or
+    /// two. This one notices every single change: add a default slot, remove
+    /// one, or touch btn/gap/pad and the threshold moves. Updating the number
+    /// then becomes a deliberate act, with the remaining headroom to the E2E
+    /// width visible right here.
+    ///
+    /// ADVERSARIAL (mutation): delete `ActionBarSlot::RaiseHand` from
+    /// `DEFAULT_SLOTS` and the threshold drops a whole button+gap → red.
+    #[test]
+    fn default_action_bar_overflow_threshold_is_pinned() {
+        let secondary = default_secondary_slots();
+        // Scan upward for the first width that hides nothing. The fit function
+        // is monotonic (pinned by
+        // `action_bar_overflow_is_monotonic_as_window_widens`), so the first
+        // hit is THE threshold.
+        let mut threshold = None;
+        let mut w = 600.0_f64;
+        while w <= 2000.0 {
+            if action_bar_overflow_hidden(w, 800.0, false, 16.0, 3, &secondary).is_empty() {
+                threshold = Some(w);
+                break;
+            }
+            w += 1.0;
+        }
+        let threshold = threshold.expect("the default bar must fit at SOME width under 2000px");
+        assert_eq!(
+            threshold,
+            DEFAULT_ACTION_BAR_MIN_FIT_WIDTH,
+            "the narrowest viewport that holds the whole default action bar moved to \
+             {threshold}px ({} secondary slots). If a slot was added or removed on purpose, \
+             update DEFAULT_ACTION_BAR_MIN_FIT_WIDTH and re-check it stays under \
+             ACTION_BAR_E2E_WIDE_WIDTH ({}px).",
+            secondary.len(),
+            ACTION_BAR_E2E_WIDE_WIDTH,
+        );
+        assert!(
+            threshold <= ACTION_BAR_E2E_WIDE_WIDTH,
+            "the default bar needs {threshold}px but the E2E only widens to {}px",
+            ACTION_BAR_E2E_WIDE_WIDTH,
         );
     }
 
@@ -12640,7 +16282,7 @@ mod tests {
     #[test]
     fn on_peer_left_clears_recording_before_reconnect_return() {
         // A recorder genuinely departs while the LOCAL client is mid-reconnect.
-        let actions = on_peer_left_actions(true, true);
+        let actions = on_peer_left_actions(true, true, false);
         let clear_pos = actions
             .iter()
             .position(|a| *a == OnPeerLeftAction::ClearRecordingIcon);
@@ -12674,24 +16316,115 @@ mod tests {
     fn on_peer_left_action_order_matrix() {
         use OnPeerLeftAction::*;
         assert_eq!(
-            on_peer_left_actions(true, true),
+            on_peer_left_actions(true, true, false),
             vec![ClearRecordingIcon, SuppressLeaveAndReturn],
             "recorder departing mid-reconnect: clear THEN suppress"
         );
         assert_eq!(
-            on_peer_left_actions(true, false),
+            on_peer_left_actions(true, false, false),
             vec![SuppressLeaveAndReturn],
             "non-recording peer leaving mid-reconnect: suppress only, no set write"
         );
         assert_eq!(
-            on_peer_left_actions(false, true),
+            on_peer_left_actions(false, true, false),
             vec![ClearRecordingIcon, ProcessLeaveNotification],
             "recorder departing normally: clear THEN show the leave notification"
         );
         assert_eq!(
-            on_peer_left_actions(false, false),
+            on_peer_left_actions(false, false, false),
             vec![ProcessLeaveNotification],
             "non-recording peer leaving normally: just the leave notification"
+        );
+    }
+
+    // ── Issue 2135: the departing peer's raised hand ──────────────────────
+
+    /// A hand left up by a departing participant outlives its owner unless
+    /// `on_peer_left` clears it: the participant can no longer send
+    /// `raised = false`, and there is no server-side hand registry to reconcile
+    /// against. Unlike a stuck recording dot this actively misleads — the meeting
+    /// keeps calling on someone who is gone.
+    ///
+    /// The reconnect independence is the load-bearing half, exactly as for the
+    /// recording clear: the leave TOAST is suppressed mid-reconnect (issue #244),
+    /// but the relay only broadcasts PARTICIPANT_LEFT for a GENUINE departure, so
+    /// the hand must clear regardless.
+    ///
+    /// ADVERSARIAL (mutation): change `should_clear_departed_hand` to
+    /// `!is_reconnecting && departing_session_raised` → the first assertion goes
+    /// red.
+    #[test]
+    fn departed_hand_clears_regardless_of_reconnect() {
+        assert!(
+            should_clear_departed_hand(true, true),
+            "a raised hand must clear on departure even while the LOCAL client is reconnecting"
+        );
+        assert!(
+            should_clear_departed_hand(false, true),
+            "and on the normal departure path"
+        );
+        assert!(
+            !should_clear_departed_hand(true, false),
+            "a departing peer with no hand up must not dirty the roster"
+        );
+        assert!(
+            !should_clear_departed_hand(false, false),
+            "likewise on the normal path"
+        );
+    }
+
+    /// ORDERING guard, the analogue of
+    /// `on_peer_left_clears_recording_before_reconnect_return`: the predicate
+    /// alone still passes if someone moves the `ClearRaisedHand` push BELOW the
+    /// `if is_reconnecting { ...; return }` block, because the closure iterates
+    /// this list IN ORDER and returns on `SuppressLeaveAndReturn`.
+    ///
+    /// ADVERSARIAL (mutation): move the `ClearRaisedHand` push after the
+    /// reconnect early-return block in `on_peer_left_actions` → the
+    /// `(true, true)` row loses the clear entirely and `hand_pos < suppress_pos`
+    /// has no `hand_pos` to compare → red.
+    #[test]
+    fn on_peer_left_clears_raised_hand_before_reconnect_return() {
+        let actions = on_peer_left_actions(true, false, true);
+        let hand_pos = actions
+            .iter()
+            .position(|a| *a == OnPeerLeftAction::ClearRaisedHand);
+        let suppress_pos = actions
+            .iter()
+            .position(|a| *a == OnPeerLeftAction::SuppressLeaveAndReturn);
+        assert!(
+            hand_pos.is_some(),
+            "the raised-hand clear must be emitted even mid-reconnect; got {actions:?}"
+        );
+        assert!(
+            hand_pos < suppress_pos,
+            "the raised-hand clear must run BEFORE the reconnect early-return,              or the loop returns before ever clearing; got {actions:?}"
+        );
+    }
+
+    /// The full ordered list when a departing participant was BOTH recording and
+    /// had a hand up — the case where a wrong ordering silently drops one of the
+    /// two clears.
+    ///
+    /// ADVERSARIAL (mutation): drop the `ClearRaisedHand` push, or reorder it
+    /// after `SuppressLeaveAndReturn`, and either row flips.
+    #[test]
+    fn on_peer_left_action_matrix_with_a_raised_hand() {
+        use OnPeerLeftAction::*;
+        assert_eq!(
+            on_peer_left_actions(true, true, true),
+            vec![ClearRecordingIcon, ClearRaisedHand, SuppressLeaveAndReturn],
+            "recorder with a raised hand departing mid-reconnect: BOTH clears, then suppress"
+        );
+        assert_eq!(
+            on_peer_left_actions(false, false, true),
+            vec![ClearRaisedHand, ProcessLeaveNotification],
+            "hand-raiser departing normally: clear THEN show the leave notification"
+        );
+        assert_eq!(
+            on_peer_left_actions(false, true, false),
+            vec![ClearRecordingIcon, ProcessLeaveNotification],
+            "a departing peer with no hand up emits no raised-hand clear"
         );
     }
 

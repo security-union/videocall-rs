@@ -52,6 +52,14 @@ pub use screen_encoder::{
     ScreenQualitySnapshot, ScreenQualityTierBounds, ScreenShareEvent,
 };
 
+/// **TEST-ONLY** re-export of the stall-counter setter (issue #2147), so
+/// `health_reporter`'s tests can drive the two process-global statics that the
+/// encode loop's tick-starvation detector normally owns. Without it the health
+/// packet's `> 0`-gated stall emission is unreachable from any host test. The module
+/// itself stays private.
+#[cfg(test)]
+pub(crate) use screen_encoder::set_screen_encoder_stall_counters_for_test;
+
 /// Idle-decay decision for the encoder output-fps atomic (#2060). Returns
 /// `Some(0)` when a nonzero fps has gone stale (no layer-0 chunk within
 /// `timeout_ms`), else `None`.

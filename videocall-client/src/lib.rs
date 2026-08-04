@@ -48,6 +48,8 @@
 //!     enable_webtransport: true,
 //!     max_received_layer: None,
 //!     skip_canvas_paint: false,
+//!     // #2156: receiver-side rung LABELS resolve against this ladder.
+//!     camera_ladder_variant: videocall_client::adaptive_quality_constants::LadderVariant::Default,
 //!     on_peer_added: Callback::noop(),
 //!     on_peer_first_frame: Callback::noop(),
 //!     get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
@@ -81,6 +83,8 @@
 //!     on_peer_left: None,    // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
 //!     on_peer_joined: None,  // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
 //!     on_reaction: None,     // Option<Callback<(u64, i32, String, Option<String>)>> -- (sender_session_id, reaction_enum, resolved_name, custom_emoji)
+//!     on_raise_hand: None,   // Option<Callback<(u64, bool, u64, String)>> -- (sender_session_id, raised, raised_at_ms, resolved_name)
+//!     on_meeting_timer: None, // Option<Callback<MeetingTimerState>> -- the host's room-global countdown state (issue 2136)
 //!     on_display_name_changed: None,
 //!     on_host_mute: None,
 //!     on_host_disable_video: None,
@@ -106,7 +110,9 @@
 //! # use videocall_client::VideoCallClientOptions;
 //! # let options = VideoCallClientOptions {
 //! #     enable_e2ee: false, enable_webtransport: false, max_received_layer: None,
-//! #     skip_canvas_paint: false, on_peer_added: Callback::noop(),
+//! #     skip_canvas_paint: false,
+//! #     camera_ladder_variant: videocall_client::adaptive_quality_constants::LadderVariant::Default,
+//! #     on_peer_added: Callback::noop(),
 //! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
 //! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), user_id: "user".to_string(),
 //! #     display_name: "User".to_string(), meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],
@@ -128,6 +134,8 @@
 //! #     on_peer_left: None,
 //! #     on_peer_joined: None,
 //! #     on_reaction: None,
+//! #     on_raise_hand: None,
+//! #     on_meeting_timer: None,
 //! #     on_display_name_changed: None,
 //! #     on_host_mute: None,
 //! #     on_host_disable_video: None,
@@ -148,6 +156,7 @@
 //!     Callback::noop(),
 //!     Callback::noop(), // on_error callback for camera errors
 //!     1,                // max simulcast layers (1 = single stream / off)
+//!     videocall_client::adaptive_quality_constants::LadderVariant::Default, // camera ladder (#1768)
 //! );
 //! let mut microphone = create_microphone_encoder(
 //!     client.clone(),
@@ -253,6 +262,23 @@ pub mod screen_first_render_inject;
 pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;
+// Issue 2135: raise-hand send policy. Pure + host-testable; the UI owns one
+// `RaiseHandAnnouncer` and drives it (see the module docs for why this coalesces
+// rather than drops, unlike the reactions self-throttle below).
+pub use client::raise_hand::{
+    RaiseHandAnnouncer, RaiseHandSend, RaiseHandTrigger, RAISE_HAND_MAX_DEFER_MS,
+    RAISE_HAND_MIN_SEND_INTERVAL_MS, RAISE_HAND_REANNOUNCE_COALESCE_MS,
+};
+// Issue 2136: meeting-timer wire policy. Pure + host-testable; the UI owns one
+// `MeetingTimerScheduler` and drives it. The comparator and the countdown sample
+// are re-exported because the UI must not re-implement either — a second copy of
+// the bounded-window LWW rule is how the two drift apart.
+pub use client::meeting_timer::{
+    clamp_duration_ms, remaining_ms, should_apply, CountdownSample, MeetingTimerScheduler,
+    MeetingTimerState, MEETING_TIMER_DEBOUNCE_MS, MEETING_TIMER_HEARTBEAT_MS,
+    MEETING_TIMER_LWW_REJECT_WINDOW_MS, MEETING_TIMER_MAX_DURATION_MS,
+    MEETING_TIMER_REPEAT_SPACING_MS, MEETING_TIMER_TRANSITION_REPEATS,
+};
 pub use client::reactions::{
     resolve_reaction_display_name, sanitize_reaction_display_name, validate_custom_emoji,
     ReactionSelfThrottle, REACTION_CUSTOM_EMOJI_MAX_BYTES, REACTION_DISPLAY_NAME_MAX_CHARS,

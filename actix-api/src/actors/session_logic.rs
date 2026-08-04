@@ -25,13 +25,15 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::{
     classify_packet, keyframe_per_pair_budget, outbound_keyframe_observation,
-    stamp_reaction_for_broadcast, InboundFrameKind, KeyframeRequestLimiter, KeyframeTarget,
-    PacketKind, ReactionRateLimiter,
+    stamp_raise_hand_for_broadcast, stamp_reaction_for_broadcast, InboundFrameKind,
+    KeyframeRequestLimiter, KeyframeTarget, MeetingTimerRateLimiter, PacketKind,
+    RaiseHandRateLimiter, ReactionRateLimiter,
 };
-use crate::client_diagnostics::health_processor;
+use crate::client_diagnostics::health_processor::{self, AuthenticatedReporter};
 use crate::constants::{
     CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
-    KEYFRAME_CONGESTION_RELAX_WINDOW, REACTION_DISPLAY_NAME_MAX_BYTES,
+    KEYFRAME_CONGESTION_RELAX_WINDOW, RAISE_HAND_DISPLAY_NAME_MAX_BYTES,
+    REACTION_DISPLAY_NAME_MAX_BYTES,
 };
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
@@ -139,6 +141,42 @@ pub enum InboundAction {
     Echo(Arc<Vec<u8>>),
     /// Forward to ChatServer for room routing
     Forward(Arc<Vec<u8>>),
+    /// Forward to ChatServer for room routing, but ONLY if the sending session
+    /// is the room's current HOST (issue #2136).
+    ///
+    /// A separate variant rather than a flag on [`InboundAction::Forward`] so
+    /// that every existing `Forward` site — including the transports and their
+    /// tests — keeps its meaning unchanged, and so that "this packet class needs
+    /// an authority check" is visible in the type rather than buried in a bool.
+    ///
+    /// WHY THE CHECK IS NOT MADE HERE, next to the observer guard where every
+    /// other authorization in this function lives. `SessionLogic` holds an
+    /// `is_host` field, but it is a snapshot of the room JWT's `is_host` claim
+    /// taken once at construction and NEVER refreshed. After a transfer-host it
+    /// is stale in BOTH directions:
+    ///
+    ///   * the DEMOTED ex-host still carries `is_host = true` until it
+    ///     reconnects, so gating here would let it keep driving the room's
+    ///     timer after losing the role; and
+    ///   * the PROMOTED new host still carries `is_host = false`, and the UI
+    ///     explicitly does NOT reconnect on promotion (it re-fetches `/status`,
+    ///     re-signs the room token and re-renders in place), so gating here
+    ///     would show the new host a timer control whose every packet the relay
+    ///     silently dropped.
+    ///
+    /// The relay's own presence mirror — `ChatServer.room_members[..].is_host`,
+    /// kept in step with the authoritative `meeting_participants.is_host` column
+    /// by the `internal.meeting_host_changed` NATS fanout, and reconciled
+    /// against a stale re-presented JWT on reconnect — is correct in both
+    /// directions. It lives in the `ChatServer` actor, so the check happens
+    /// there, on the single fan-out funnel every packet already passes through.
+    /// See `session_is_room_host` in `chat_server.rs`.
+    ///
+    /// The check is deliberately NOT duplicated here as "defense in depth":
+    /// AND-ing a stale flag with a fresh one reintroduces the false NEGATIVE
+    /// (the promoted host stays blocked), which is the worse of the two
+    /// failures.
+    ForwardHostOnly(Arc<Vec<u8>>),
     /// Already processed (health packet), no further action
     Processed,
     /// Keep-alive ping, no action needed
@@ -216,12 +254,17 @@ const CLEANUP_INTERVAL: u32 = 100;
 /// entry per distinct `sender_session_id` seen — a memory-amplification vector
 /// in the SAME client-forgeable trust class as #1303. The key is the outer
 /// `PacketWrapper.session_id` of the forwarded media packet (see
-/// `on_outbound_drop`); ingress only stamps it when the client sends 0
-/// (`chat_server::handle_msg`), so a non-zero value is publisher-controlled and
-/// fanned out unchanged — a malicious publisher can stamp a distinct id on each
-/// of its own packets and mint a fresh entry per dropped packet on any
-/// saturated receiver (no join/leave churn needed). This cap makes key fidelity
-/// irrelevant: it is ~5–10× the largest realistic room (≈13× a 20-user room),
+/// `on_outbound_drop`).
+///
+/// #2095 CLOSED the forgery this cap was sized against: the broadcast path now
+/// stamps that field UNCONDITIONALLY with the publisher's authenticated session
+/// (`packet_handler::stamp_wrapper_for_broadcast`, called from
+/// `chat_server::Handler<ClientMessage>`), so a publisher can no longer mint a
+/// distinct key per packet — it contributes exactly ONE entry, as a legitimate
+/// publisher always did. The cap is RETAINED as defense-in-depth (it also
+/// bounds honest join/leave churn between amortized passes, and it must not
+/// depend on a guarantee enforced in a different module). It is ~5–10× the
+/// largest realistic room (≈13× a 20-user room),
 /// so it never constrains legitimate traffic and only backstops the abuse case.
 /// At ~40 bytes per [`SenderDropState`], 256 entries is ~10 KB per receiver.
 const MAX_TRACKED_SENDERS: usize = 256;
@@ -410,6 +453,18 @@ pub struct SessionLogic {
     /// Per-session rate limiter for client-authored REACTION broadcasts (#1884).
     /// Meters this SENDER's reactions before they are re-broadcast to the room.
     pub reaction_limiter: ReactionRateLimiter,
+    /// Per-session rate limiter for client-authored RAISE_HAND broadcasts
+    /// (#2135). Meters this SENDER's hand-state announces (including the
+    /// re-announces it emits when a new peer joins) before they are re-broadcast
+    /// to the room. Separate budget from `reaction_limiter` — see
+    /// [`RaiseHandRateLimiter`].
+    pub raise_hand_limiter: RaiseHandRateLimiter,
+    /// Per-session rate limiter for client-authored MEETING_TIMER broadcasts
+    /// (#2136). Meters this SENDER's timer state announces — including the ~5s
+    /// heartbeat while a timer runs and the repeat burst on each transition —
+    /// before they are re-broadcast to the room. Separate budget from
+    /// `reaction_limiter`; see [`MeetingTimerRateLimiter`].
+    pub meeting_timer_limiter: MeetingTimerRateLimiter,
     /// Shared receiver-downlink-congestion signal for #1219 Half 2.
     ///
     /// Written by THIS transport actor in [`SessionLogic::on_outbound_drop`]
@@ -474,6 +529,8 @@ impl SessionLogic {
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
             reaction_limiter: ReactionRateLimiter::new(),
+            raise_hand_limiter: RaiseHandRateLimiter::new(),
+            meeting_timer_limiter: MeetingTimerRateLimiter::new(),
             downlink_congested_epoch: Arc::new(AtomicU64::new(DOWNLINK_EPOCH_NEVER)),
             publisher_inbound_frame_gap_tracker: PublisherInboundFrameGapTracker::default(),
         }
@@ -537,6 +594,45 @@ impl SessionLogic {
         SessionManager::build_session_assigned_packet(self.id)
     }
 
+    /// This session's relay-authenticated identity, for stamping onto telemetry
+    /// the client authored (issue 2047).
+    ///
+    /// Deliberately takes ONLY `&self`: the inbound packet is not in scope here,
+    /// so the returned identity is session-derived BY CONSTRUCTION and cannot be
+    /// sourced from client-supplied bytes. Callers must use this rather than
+    /// assembling an [`AuthenticatedReporter`] inline — an inline literal at the
+    /// call site is the one edit that reintroduces the telemetry-impersonation
+    /// vulnerability while leaving every stamping test green.
+    ///
+    /// Read fresh on each call, never cached: a reconnect or re-election builds a
+    /// NEW `SessionLogic` with a new [`Self::id`], and none of the three fields is
+    /// mutated in place for the life of a session, so this is always the CURRENT
+    /// identity.
+    ///
+    /// See [`AuthenticatedReporter`] for the provenance of each field (and the
+    /// caveat that on the deprecated path-based endpoint the identity is
+    /// URL-chosen rather than JWT-authenticated).
+    pub fn authenticated_reporter(&self) -> AuthenticatedReporter {
+        Self::reporter_from_session_fields(&self.room, self.id, &self.user_id)
+    }
+
+    /// Field mapping for [`Self::authenticated_reporter`], split out as a pure
+    /// function so a unit test can pin WHICH session field feeds WHICH telemetry
+    /// label without standing up an actor (a real `SessionLogic` needs a live
+    /// NATS connection). Transposing `room` and `user_id` here would silently
+    /// relabel every dashboard.
+    fn reporter_from_session_fields(
+        room: &str,
+        session_id: u64,
+        user_id: &str,
+    ) -> AuthenticatedReporter {
+        AuthenticatedReporter {
+            meeting_id: room.to_string(),
+            session_id,
+            user_id: user_id.to_string(),
+        }
+    }
+
     /// Build MEETING_ENDED packet (for errors)
     pub fn build_meeting_ended(&self, reason: &str) -> Vec<u8> {
         SessionManager::build_meeting_ended_packet(&self.room, reason)
@@ -580,6 +676,47 @@ impl SessionLogic {
             user: self.user_id.clone(),
             room: self.room.clone(),
             msg,
+            requires_host: false,
+        }
+    }
+
+    /// Build a [`ClientMessage`] that the `ChatServer` funnel must refuse to fan
+    /// out unless this session is the room's current HOST (issue #2136).
+    ///
+    /// The ONLY producer is the [`InboundAction::ForwardHostOnly`] branch in the
+    /// transports, which `handle_inbound` returns exclusively for
+    /// [`PacketKind::MeetingTimer`]. Read [`InboundAction::ForwardHostOnly`] for
+    /// why the authority check lives at the funnel rather than here.
+    ///
+    /// Identity is taken from `&self` session state (`self.id`), never from the
+    /// packet — the funnel resolves host-ness by that session id against the
+    /// room's presence mirror, so a client cannot present another participant's
+    /// session and borrow their authority.
+    pub fn create_host_gated_client_message(&self, msg: Packet) -> ClientMessage {
+        ClientMessage {
+            session: self.id,
+            user: self.user_id.clone(),
+            room: self.room.clone(),
+            msg,
+            requires_host: true,
+        }
+    }
+
+    /// Build the right [`ClientMessage`] for an outgoing [`Packet`], preserving
+    /// its `requires_host` flag (issue #2136).
+    ///
+    /// THE SINGLE SITE both transports call from their `Handler<Packet>`. It
+    /// exists specifically so the WS and WT paths cannot drift: the flag is what
+    /// decides whether `ChatServer` applies the host authorization, so a
+    /// mirrored `if` in each transport would mean a one-line edit in either file
+    /// could silently disable the gate on THAT TRANSPORT ONLY — the hardest
+    /// class of bug to notice, because the feature keeps working for whichever
+    /// transport the tester happens to be on. One function, one test.
+    pub fn client_message_for(&self, msg: Packet) -> ClientMessage {
+        if msg.requires_host {
+            self.create_host_gated_client_message(msg)
+        } else {
+            self.create_client_message(msg)
         }
     }
 
@@ -663,8 +800,10 @@ impl SessionLogic {
     /// Handle an inbound packet from the client.
     ///
     /// Returns the action the transport should take.
-    /// Observer sessions can still send RTT and health packets but all media
-    /// data and KeyframeRequest packets are silently dropped.
+    /// An observer session may still send RTT (which the relay ECHOES back to
+    /// the sender and never fans out); everything that would reach another
+    /// participant — Data, Media, KeyframeRequest, Reaction, RaiseHand,
+    /// MeetingTimer, and Health — is silently dropped.
     ///
     /// This is the **inbound** half of the waiting-room isolation enforcement.
     /// The **outbound** half lives in `chat_server::handle_msg()` (a free
@@ -695,17 +834,56 @@ impl SessionLogic {
                 InboundAction::Echo(Arc::new(data.to_vec()))
             }
             PacketKind::Health => {
+                // WAITING-ROOM ISOLATION (#2095 review, MEDIUM). An observer sits
+                // in the waiting room and has NOT been admitted, so nothing it
+                // sends may reach the meeting. Every other `Forward` arm already
+                // guards on this (Data, Media, KeyframeRequest, Reaction); HEALTH
+                // did not, and #2095 turned that omission into a real leak:
+                //
+                //  * The relay now STAMPS the fanned-out envelope with the
+                //    sender's AUTHENTICATED `sub` (`stamp_wrapper_for_broadcast`),
+                //    so an observer's HEALTH disclosed its server-side identity —
+                //    email, or `guest:{uuid}` — to every participant. That is an
+                //    identity PARTICIPANT_JOINED deliberately does NOT broadcast
+                //    for observers: they are not tracked in `room_members`
+                //    (chat_server.rs, `Handler<JoinRoom>`).
+                //  * HEALTH is not in the client's
+                //    `suppresses_peer_creation_for_packet` allowlist, so the
+                //    forwarded packet calls `ensure_peer` in every admitted
+                //    participant's browser — a never-admitted client could mint
+                //    peer tiles and their decoder Workers room-wide.
+                //
+                // The guard belongs HERE, on the relay, not in the UI: the stock
+                // client already sets `enable_health_reporting: false` for
+                // observers, which is precisely why a MODIFIED client is the
+                // threat and why a client-side check enforces nothing. This is
+                // also the single site both transports share (`WsChatSession` and
+                // `WtChatSession` both delegate to `handle_inbound`).
+                //
+                // The return is BEFORE `process_health_packet_bytes`, so an
+                // observer's HEALTH is not fanned out AND does not feed the
+                // server-side Prometheus telemetry either. No legitimate observer
+                // sends HEALTH at all, so nothing real is lost; admitting one to
+                // the telemetry path would only let an unadmitted client write
+                // operator dashboards.
+                if self.observer {
+                    trace!(
+                        "Observer session {} dropping health packet from {}",
+                        self.id,
+                        self.user_id
+                    );
+                    return InboundAction::Processed;
+                }
+
                 trace!("Health packet from {}", self.user_id);
                 // #1482: process for server-side NATS telemetry AND forward to peers
                 // so each peer's client can read the sender's self-reported
                 // device/hardware metrics (peer_device_info). Previously returned
                 // Processed, which consumed the packet and starved the per-peer
                 // Device UI of data. HEALTH carries no media and is unencrypted; the
-                // outbound observer allowlist in chat_server::handle_msg still drops it
-                // for waiting-room observers, so isolation is preserved.
-                // No observer guard here (unlike Data/KeyframeRequest): an observer
-                // may publish HEALTH and it is forwarded — intentional, as HEALTH is
-                // non-media diagnostics, mirroring the RTT arm's observer policy.
+                // outbound observer allowlist in chat_server::handle_msg drops it on
+                // the RECEIVE side for waiting-room observers, and the guard above
+                // now closes the SEND side.
                 //
                 // #1543: the FULL packet goes to the server-side NATS telemetry path
                 // FIRST (operators rely on the heavy per-peer `peer_stats` map). Then
@@ -715,7 +893,26 @@ impl SessionLogic {
                 // scale. The trim parses + re-serializes ONCE here (O(1) per inbound
                 // HEALTH), BEFORE the relay's per-recipient fan-out, so it is never
                 // repeated per recipient.
-                health_processor::process_health_packet_bytes(data, self.nats_client.clone());
+                //
+                // Issue 2047 (SECURITY): the packet's self-declared
+                // meeting_id/session_id/reporting_user_id become Prometheus
+                // LABELS downstream, so the relay stamps them with THIS session's
+                // authenticated identity before publishing (mirrors the #1884
+                // REACTION stamp). Both transports reach this one arm
+                // (`WsChatSession` and `WtChatSession` both delegate inbound
+                // frames to `handle_inbound`), so there is a single stamping site.
+                //
+                // The identity comes from [`Self::authenticated_reporter`], which
+                // takes ONLY `&self` — the inbound `data` is not in scope inside
+                // it, so the reporter cannot be sourced from the packet even by
+                // accident. Do NOT inline a struct literal here: that is exactly
+                // the edit that would reintroduce the vulnerability while every
+                // stamping test still passed.
+                health_processor::process_health_packet_bytes(
+                    data,
+                    self.nats_client.clone(),
+                    self.authenticated_reporter(),
+                );
                 let trimmed = health_processor::trim_health_packet_for_peers(data);
                 InboundAction::Forward(Arc::new(trimmed))
             }
@@ -849,6 +1046,176 @@ impl SessionLogic {
                     Some(bytes) => InboundAction::Forward(Arc::new(bytes)),
                     None => InboundAction::Processed,
                 }
+            }
+            PacketKind::RaiseHand => {
+                // WAITING-ROOM ISOLATION (#2135). An observer sits in the
+                // waiting room and has NOT been admitted, so nothing it sends
+                // may reach the meeting. EVERY other `Forward` arm guards on
+                // this (Data, Media, KeyframeRequest, Reaction, and — since
+                // #2124 — Health), and RAISE_HAND is the arm most in need of it:
+                //
+                //  * It is re-broadcast on the media fan-out, so an
+                //    observer-sent one reaches every admitted participant.
+                //  * The relay STAMPS the fanned-out envelope with the sender's
+                //    AUTHENTICATED session_id and `sub`
+                //    (`stamp_wrapper_for_broadcast`, #2124), so it would
+                //    disclose an unadmitted client's server-side identity —
+                //    email, or `guest:{uuid}` — to the whole room. That is
+                //    exactly the leak the #2124 HEALTH guard closed, and it is
+                //    WORSE here: a raised hand is rendered as a named, durable
+                //    entry in the participants list rather than a transient
+                //    metric.
+                //  * The client-side `suppresses_peer_creation_for_packet` entry
+                //    added alongside this (videocall-client) stops an inbound
+                //    RAISE_HAND from minting a ghost TILE, but that is UI
+                //    hygiene, not isolation — it does nothing about the state
+                //    itself, which would still land in every participant's
+                //    raised-hands list. Only this guard prevents that, and it
+                //    must live on the relay: the stock client already refuses to
+                //    send while un-admitted, which is precisely why a MODIFIED
+                //    client is the threat and a client-side check enforces
+                //    nothing.
+                //
+                // The RECEIVE side is already fail-closed independently: the
+                // outbound observer allowlist in `chat_server::handle_msg`
+                // forwards only MEETING and SESSION_ASSIGNED to an observer, so
+                // a waiting-room client never SEES a raised hand either. This
+                // guard closes the SEND side, giving the same two-sided
+                // isolation the other packet types have.
+                if self.observer {
+                    trace!(
+                        "Observer session {} dropping raise-hand packet from {}",
+                        self.id,
+                        self.user_id
+                    );
+                    return InboundAction::Processed;
+                }
+                // Per-sender rate limit (#2135). Ingress validation (size cap +
+                // parse) already ran in `classify_packet` (an oversized or
+                // unparseable packet is `PacketKind::Dropped` and never reaches
+                // here), so this meters ONLY well-formed packets against this
+                // sender's window — a flood of garbage cannot consume the
+                // budget.
+                //
+                // A DROP HERE IS MORE COSTLY THAN A DROPPED REACTION, and that
+                // asymmetry is why the budget is sized generously (see
+                // `RAISE_HAND_MAX_PER_WINDOW`): a reaction is an ephemeral
+                // float, but a raise-hand carries persistent STATE and the relay
+                // keeps no hand registry to repair from, so a dropped transition
+                // leaves the room's view of this participant wrong until the
+                // client announces again. The packet is idempotent state, so the
+                // client's next re-announce (on the next peer-join) repairs it.
+                //
+                // `debug!` (not `warn!`), mirroring the REACTION arm: a
+                // well-behaved client self-throttles strictly below this ceiling
+                // and coalesces its join-wave re-announces, so a hit is only
+                // reachable by a misbehaving or forged client — logging every
+                // drop at warn would hand a flood a log-amplification lever.
+                if !self.raise_hand_limiter.allow() {
+                    debug!(
+                        "Rate-limiting RAISE_HAND from session {} (user {})",
+                        self.id, self.user_id
+                    );
+                    return InboundAction::Processed;
+                }
+                // SECURITY: like the REACTION arm, this MUST forward ONLY the
+                // output of `stamp_raise_hand_for_broadcast` — never the raw
+                // inbound `data`. Attribution for a raised hand IS the feature; a
+                // client-supplied envelope session_id would let a participant
+                // raise a VICTIM's hand, cleartext, with no E2EE backstop. We
+                // SHADOW `data` with the stamped `Option<Vec<u8>>` so the raw
+                // `&[u8]` is no longer reachable in this scope and an accidental
+                // passthrough will not compile.
+                //
+                // Fail-closed: a packet that will not re-serialize is dropped,
+                // never fanned out unstamped.
+                let data = stamp_raise_hand_for_broadcast(
+                    data,
+                    self.id,
+                    RAISE_HAND_DISPLAY_NAME_MAX_BYTES,
+                );
+                match data {
+                    Some(bytes) => InboundAction::Forward(Arc::new(bytes)),
+                    None => InboundAction::Processed,
+                }
+            }
+            PacketKind::MeetingTimer => {
+                // WAITING-ROOM ISOLATION (#2136). An observer sits in the
+                // waiting room and has NOT been admitted, so nothing it sends
+                // may reach the meeting. EVERY other forwarding arm guards on
+                // this (Data, Media, KeyframeRequest, Reaction, and — since
+                // #2124 — Health), and this arm is no exception.
+                //
+                // It is also NOT redundant with the host gate downstream, even
+                // though no observer should ever hold the host role. That
+                // coupling is an emergent property of how tokens are minted
+                // (a waiting-room token carries `observer = true`), not an
+                // invariant anything enforces, and a feature whose isolation
+                // depends on "the two flags can't both be set" is one policy
+                // change away from breaking silently. Guard explicitly, and
+                // guard FIRST so an unadmitted client's packet is discarded
+                // before it costs a limiter slot or reaches the fan-out actor
+                // at all.
+                if self.observer {
+                    trace!(
+                        "Observer session {} dropping meeting-timer packet from {}",
+                        self.id,
+                        self.user_id
+                    );
+                    return InboundAction::Processed;
+                }
+                // Per-sender rate limit (#2136). Ingress validation (size cap +
+                // parse + duration bound) already ran in `classify_packet` (an
+                // invalid packet is `PacketKind::Dropped` and never reaches
+                // here), so this meters ONLY well-formed packets against this
+                // sender's window — a flood of garbage cannot consume the
+                // budget.
+                //
+                // This runs BEFORE the host gate, because host-ness is not
+                // knowable here (see `InboundAction::ForwardHostOnly`). A
+                // non-host flood is therefore metered here and rejected at the
+                // funnel: bounded to `MEETING_TIMER_MAX_PER_WINDOW` packets of
+                // at most `MEETING_TIMER_PACKET_MAX_BYTES` per sender, none of
+                // which reach another participant.
+                //
+                // A DROP HERE IS COSTLY, which is why the budget is generous
+                // rather than tight: the relay keeps no timer registry, so a
+                // dropped transition leaves the room's view wrong until the
+                // host announces again. A dropped START self-repairs on the next
+                // ~5s heartbeat; a dropped CANCEL has no heartbeat behind it and
+                // relies on the client's transition repeat burst — which is
+                // exactly why `MEETING_TIMER_MAX_PER_WINDOW` is sized to admit
+                // that whole burst plus a heartbeat.
+                //
+                // `debug!` (not `warn!`), mirroring the REACTION arm: a
+                // well-behaved host stays far below this ceiling, so a hit means
+                // a misbehaving or forged client, and logging every drop at warn
+                // would hand a flood a log-amplification lever.
+                if !self.meeting_timer_limiter.allow() {
+                    debug!(
+                        "Rate-limiting MEETING_TIMER from session {} (user {})",
+                        self.id, self.user_id
+                    );
+                    return InboundAction::Processed;
+                }
+                // No stamp function, unlike REACTION and RAISE_HAND — a
+                // deliberate divergence, not an oversight. Those two carry a
+                // bounded, attacker-controlled cosmetic `display_name` that must
+                // be truncated before room-wide fan-out, and their whole feature
+                // is per-sender ATTRIBUTION ("who reacted", "whose hand"), so
+                // they re-stamp the envelope session_id themselves rather than
+                // depend on an invariant enforced in another module.
+                //
+                // A MeetingTimerPacket has neither property. It contains no
+                // string field at all, and a meeting timer is room-global state
+                // ("5:00 remaining"), not a per-participant attribution — the
+                // envelope session_id matters here only for the fan-out's
+                // self-skip. Adding a stamp would mean a parse + reserialize on
+                // every heartbeat for a guarantee `stamp_wrapper_for_broadcast`
+                // (#2124) already makes unconditionally on this exact path, and
+                // which is separately load-bearing for the host gate that
+                // follows. Forwarding the validated bytes is correct here.
+                InboundAction::ForwardHostOnly(Arc::new(data.to_vec()))
             }
             PacketKind::Data => {
                 if self.observer {
@@ -1585,9 +1952,18 @@ mod tests {
         assert!(!SessionLogic::should_activate_on_action(
             &InboundAction::Echo(Arc::new(vec![]))
         ));
-        // Forward, Processed, KeepAlive should activate.
+        // Forward, ForwardHostOnly, Processed, KeepAlive should activate.
         assert!(SessionLogic::should_activate_on_action(
             &InboundAction::Forward(Arc::new(vec![]))
+        ));
+        // #2136: `ForwardHostOnly` must activate exactly like `Forward`. The
+        // predicate is written as "everything except Echo", so a new variant
+        // inherits the right answer silently — this asserts that the silence was
+        // CORRECT rather than merely unnoticed. If it did not activate, the
+        // host's very first timer packet would be swallowed by the
+        // `ConnectionState::Testing` gate in `Handler<ClientMessage>`.
+        assert!(SessionLogic::should_activate_on_action(
+            &InboundAction::ForwardHostOnly(Arc::new(vec![]))
         ));
         assert!(SessionLogic::should_activate_on_action(
             &InboundAction::Processed
@@ -1595,6 +1971,44 @@ mod tests {
         assert!(SessionLogic::should_activate_on_action(
             &InboundAction::KeepAlive
         ));
+    }
+
+    /// Issue 2047: pins WHICH session field feeds WHICH telemetry identity label.
+    ///
+    /// The three values are all strings-or-ids of the same shape, so a
+    /// transposition (`room` into `user_id`, say) compiles cleanly and would
+    /// relabel every dashboard while every stamping test stayed green — those
+    /// tests hand-build their own reporter and never see this mapping.
+    ///
+    /// This calls the production mapping used by
+    /// [`SessionLogic::authenticated_reporter`]; it does NOT re-implement it.
+    ///
+    /// MUTATION PROOF: swap the `room` and `user_id` arms of
+    /// `reporter_from_session_fields` and the first two asserts fail.
+    ///
+    /// COVERAGE LIMIT (stated so no one over-reads this test): it pins the field
+    /// MAPPING, not the CALL SITE. Proving `handle_inbound` passes session state
+    /// rather than packet state needs a real `SessionLogic`, which needs a live
+    /// NATS connection — that is
+    /// `health_packet_publishes_under_session_identity_not_claimed_identity`
+    /// below, which SKIPS when no broker is reachable.
+    #[test]
+    fn authenticated_reporter_maps_session_fields_to_telemetry_labels() {
+        let reporter =
+            SessionLogic::reporter_from_session_fields("room-alpha", 4242, "alice@example.com");
+
+        assert_eq!(
+            reporter.meeting_id, "room-alpha",
+            "the session's room must become the telemetry meeting_id"
+        );
+        assert_eq!(
+            reporter.user_id, "alice@example.com",
+            "the session's user_id must become the telemetry reporting user"
+        );
+        assert_eq!(
+            reporter.session_id, 4242,
+            "the relay-assigned session id must be carried verbatim"
+        );
     }
 
     /// #1699 Phase 1: publisher-leg keyframe-arrival instrumentation must be
@@ -1696,6 +2110,19 @@ mod tests {
         nats_client: async_nats::client::Client,
         room: &str,
     ) -> SessionLogic {
+        build_test_logic(nats_client, room, false).await
+    }
+
+    /// Same, with the waiting-room `observer` flag under the caller's control.
+    /// The flag is the LAST positional `bool`-heavy argument of
+    /// `SessionLogic::new`'s middle block, so it is passed here by name rather
+    /// than duplicating the whole constructor at each call site.
+    #[cfg(test)]
+    async fn build_test_logic(
+        nats_client: async_nats::client::Client,
+        room: &str,
+        observer: bool,
+    ) -> SessionLogic {
         use crate::actors::chat_server::ChatServer;
         use crate::server_diagnostics::{TrackerMessage, TrackerSender};
         use actix::Actor;
@@ -1713,7 +2140,7 @@ mod tests {
             nats_client,
             tracker_sender,
             SessionManager::new(),
-            false,
+            observer,
             None,
             "websocket",
             false,
@@ -1843,6 +2270,702 @@ mod tests {
             DOWNLINK_EPOCH_NEVER,
             "#1481: a single sub-threshold drop must still stamp the epoch \
              (fails on gated code, passes on unconditional stamp)"
+        );
+    }
+
+    // =====================================================================
+    // Issue 2047 — the WIRING test: what `handle_inbound` actually publishes
+    // =====================================================================
+
+    /// End-to-end proof that a forged HEALTH packet is published to NATS under
+    /// THIS SESSION's identity — driven through the real production path
+    /// (`handle_inbound` -> `process_health_packet_bytes` ->
+    /// `build_health_payload_for_publish`) and asserted on the bytes that land on
+    /// the health subject.
+    ///
+    /// This is the one test that covers the CALL SITE rather than the stamping
+    /// function. Every other issue-2047 test hand-builds an
+    /// `AuthenticatedReporter`, so replacing
+    /// `self.authenticated_reporter()` in the HEALTH arm with a struct literal
+    /// fed from the parsed packet would leave them all green — and reintroduce
+    /// the vulnerability. Only this test observes which identity the relay
+    /// actually chose.
+    ///
+    /// MUTATION PROOF: build the reporter at the `PacketKind::Health` call site
+    /// from the inbound packet's own `meeting_id`/`session_id`/
+    /// `reporting_user_id`; the three "authenticated" asserts below fail because
+    /// the forged values reach NATS.
+    ///
+    /// Requires a broker (it subscribes to the health subject) and SKIPS when
+    /// none is reachable, like the #1219 tests above.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn health_packet_publishes_under_session_identity_not_claimed_identity() {
+        use futures::StreamExt;
+        use protobuf::Message as _;
+        use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
+        use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        // The relay publishes health on
+        // `health.diagnostics.{REGION}.{SERVICE_TYPE}.{SERVER_ID}`; subscribe to
+        // the whole tree so this does not depend on the env defaults.
+        let mut sub = nats_client
+            .subscribe("health.diagnostics.>")
+            .await
+            .expect("subscribe should succeed");
+        nats_client.flush().await.expect("flush should succeed");
+
+        let room = "identity_2047_room";
+        let logic = build_test_receiver_logic(nats_client.clone(), room).await;
+        let authenticated_session = logic.id;
+
+        // A health packet claiming a DIFFERENT meeting, session and user.
+        let mut hp = PbHealthPacket::new();
+        hp.meeting_id = "victim-boardroom".to_string();
+        hp.session_id = "9999999999999999999".to_string();
+        hp.reporting_user_id = b"ceo@example.com".to_vec();
+        hp.timestamp_ms = 1_700_000_000_000;
+        let mut wrapper = PacketWrapper::new();
+        wrapper.packet_type = PacketType::HEALTH.into();
+        wrapper.data = hp.write_to_bytes().expect("serialize inner health packet");
+        let bytes = wrapper.write_to_bytes().expect("serialize health wrapper");
+
+        // Drive the REAL inbound path.
+        let mut logic = logic;
+        let action = logic.handle_inbound(&bytes);
+        assert!(
+            matches!(action, InboundAction::Forward(_)),
+            "HEALTH must still be forwarded to peers (behavior neutrality)"
+        );
+
+        // The publish is spawned, so wait for it with a bound.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next())
+            .await
+            .expect("health publish should arrive within 5s")
+            .expect("subscription should yield a message");
+
+        let published =
+            PbHealthPacket::parse_from_bytes(&msg.payload).expect("published payload must parse");
+
+        assert_eq!(
+            published.meeting_id, room,
+            "meeting_id must be the session's authenticated room, not the claimed one"
+        );
+        assert_eq!(
+            published.session_id,
+            authenticated_session.to_string(),
+            "session_id must be the relay-assigned session, not the claimed one"
+        );
+        assert_eq!(
+            published.reporting_user_id,
+            b"receiver-user".to_vec(),
+            "reporting_user_id must be the session's authenticated user, not the claimed one"
+        );
+    }
+
+    /// #2095 review (MEDIUM): a waiting-room OBSERVER's HEALTH must not escape
+    /// the waiting room — not to peers, and not to the server-side telemetry.
+    ///
+    /// Before this guard the HEALTH arm was the only `Forward` arm with no
+    /// `self.observer` check, and #2095 made that omission load-bearing: the
+    /// relay now stamps the fan-out envelope with the sender's AUTHENTICATED
+    /// `sub`, so an unadmitted observer's HEALTH disclosed its server-side
+    /// identity to every participant (an identity PARTICIPANT_JOINED does not
+    /// broadcast for observers), and — HEALTH not being in the client's
+    /// `suppresses_peer_creation_for_packet` set — called `ensure_peer` in every
+    /// participant's browser, minting a tile and its decoder Workers.
+    ///
+    /// Both halves are asserted:
+    ///   1. the action is `Processed`, i.e. nothing is fanned out;
+    ///   2. nothing lands on `health.diagnostics.>`, i.e. the guard sits BEFORE
+    ///      `process_health_packet_bytes` and an unadmitted client cannot write
+    ///      operator dashboards either.
+    ///
+    /// A NON-observer session is then driven through the SAME code with the SAME
+    /// bytes and must still Forward AND publish. Without that control, deleting
+    /// the whole HEALTH arm would pass this test.
+    ///
+    /// MUTATION PROOF: remove the `if self.observer { .. }` guard from the
+    /// `PacketKind::Health` arm and the observer's packet becomes
+    /// `Forward(_)` -> assert 1 fails, and its telemetry lands -> assert 2 fails.
+    /// Move the guard to AFTER `process_health_packet_bytes` and assert 2 alone
+    /// fails.
+    ///
+    /// Requires a broker (a `SessionLogic` needs a real `ChatServer`) and SKIPS
+    /// when none is reachable, like the sibling above.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn observer_health_packet_is_neither_forwarded_nor_published() {
+        use futures::StreamExt;
+        use protobuf::Message as _;
+        use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
+        use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        let mut sub = nats_client
+            .subscribe("health.diagnostics.>")
+            .await
+            .expect("subscribe should succeed");
+        nats_client.flush().await.expect("flush should succeed");
+
+        let mut hp = PbHealthPacket::new();
+        hp.client_cores = Some(8);
+        hp.timestamp_ms = 1_700_000_000_000;
+        let mut wrapper = PacketWrapper::new();
+        wrapper.packet_type = PacketType::HEALTH.into();
+        wrapper.data = hp.write_to_bytes().expect("serialize inner health packet");
+        let bytes = wrapper.write_to_bytes().expect("serialize health wrapper");
+
+        // --- the observer: dropped on both legs ---------------------------------
+        let mut observer_logic =
+            build_test_logic(nats_client.clone(), "observer_2095_room", true).await;
+        assert!(
+            matches!(
+                observer_logic.handle_inbound(&bytes),
+                InboundAction::Processed
+            ),
+            "an observer's HEALTH must be consumed, never fanned out to the meeting"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), sub.next())
+                .await
+                .is_err(),
+            "an observer's HEALTH must not reach the server-side telemetry either: \
+             the guard belongs BEFORE process_health_packet_bytes"
+        );
+
+        // --- the admitted participant: unchanged (control) ----------------------
+        let mut member_logic =
+            build_test_logic(nats_client.clone(), "observer_2095_room", false).await;
+        assert!(
+            matches!(
+                member_logic.handle_inbound(&bytes),
+                InboundAction::Forward(_)
+            ),
+            "control: an admitted participant's HEALTH must still be forwarded"
+        );
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next())
+            .await
+            .expect("control: a participant's health publish should arrive within 5s")
+            .expect("control: subscription should yield a message");
+        let published =
+            PbHealthPacket::parse_from_bytes(&msg.payload).expect("published payload must parse");
+        assert_eq!(
+            published.reporting_user_id,
+            b"receiver-user".to_vec(),
+            "control: the participant's telemetry must still carry its authenticated identity"
+        );
+    }
+
+    /// Build the raw bytes of a `PacketWrapper{RAISE_HAND}` for the #2135
+    /// call-site tests below. `session_id` is what a (possibly malicious) client
+    /// put on the wire — the whole point is that the relay must not honour it.
+    #[cfg(test)]
+    fn raise_hand_bytes(session_id: u64, raised: bool, display_name: &[u8]) -> Vec<u8> {
+        use protobuf::Message as _;
+        use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+        use videocall_types::protos::raise_hand_packet::RaiseHandPacket;
+
+        let inner = RaiseHandPacket {
+            raised,
+            raised_at_ms: 1_700_000_000_000,
+            display_name: display_name.to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::RAISE_HAND.into(),
+            session_id,
+            data: inner.write_to_bytes().expect("serialize inner raise-hand"),
+            ..Default::default()
+        };
+        wrapper
+            .write_to_bytes()
+            .expect("serialize raise-hand wrapper")
+    }
+
+    /// #2135 (waiting-room isolation): an OBSERVER's RAISE_HAND must not escape
+    /// the waiting room.
+    ///
+    /// This mirrors the #2095 HEALTH guard directly above, and the stakes are the
+    /// same or higher. A RAISE_HAND is re-broadcast on the media fan-out and the
+    /// relay stamps the fanned-out envelope with the sender's AUTHENTICATED
+    /// session_id and `sub` (`stamp_wrapper_for_broadcast`, #2124) — so without
+    /// this guard an unadmitted waiting-room client could plant a NAMED, durable
+    /// entry in every participant's raised-hands list, disclosing its server-side
+    /// identity (email, or `guest:{uuid}`) in the process. That identity is
+    /// precisely what PARTICIPANT_JOINED deliberately does NOT broadcast for
+    /// observers.
+    ///
+    /// A NON-observer session is then driven through the SAME code with the SAME
+    /// bytes and must still Forward. Without that control, deleting the whole
+    /// `PacketKind::RaiseHand` arm would pass this test.
+    ///
+    /// MUTATION PROOF: remove the `if self.observer { .. }` guard from the
+    /// `PacketKind::RaiseHand` arm and the observer's packet becomes
+    /// `Forward(_)` -> the first assert fails. Delete the arm entirely and the
+    /// control assert fails instead.
+    ///
+    /// Requires a broker (a `SessionLogic` needs a real `ChatServer`) and SKIPS
+    /// when none is reachable, like the siblings above.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn observer_raise_hand_is_not_forwarded() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        let bytes = raise_hand_bytes(0, true, b"Waiting Wendy");
+
+        let mut observer_logic =
+            build_test_logic(nats_client.clone(), "raise_hand_2135_room", true).await;
+        assert!(
+            matches!(
+                observer_logic.handle_inbound(&bytes),
+                InboundAction::Processed
+            ),
+            "an observer's RAISE_HAND must be consumed, never fanned out to the meeting"
+        );
+
+        let mut member_logic =
+            build_test_logic(nats_client.clone(), "raise_hand_2135_room", false).await;
+        assert!(
+            matches!(
+                member_logic.handle_inbound(&bytes),
+                InboundAction::Forward(_)
+            ),
+            "control: an admitted participant's RAISE_HAND must still be forwarded"
+        );
+    }
+
+    /// #2135 (security): the RAISE_HAND arm must forward the STAMPED bytes, not
+    /// the raw inbound ones.
+    ///
+    /// This is a CALL-SITE test, deliberately. The pure-function tests in
+    /// `packet_handler` pin `stamp_raise_hand_for_broadcast` itself, but they
+    /// cannot catch the mistake that actually matters here: an arm that computes
+    /// the stamp and then forwards `data.to_vec()` anyway. The REACTION arm
+    /// documents that exact gap in its own comment ("the stamping test guards the
+    /// stamping fn, not this call site") and relies solely on a `let data =`
+    /// shadow to make it a compile error. The shadow is good, but a test that
+    /// reads the FORWARDED bytes is what proves the guarantee end to end — so
+    /// this closes for RAISE_HAND what is still only structural for REACTION.
+    ///
+    /// MUTATION PROOF: replace the arm's
+    /// `stamp_raise_hand_for_broadcast(..)` + `match` with
+    /// `InboundAction::Forward(Arc::new(data.to_vec()))` and the forged
+    /// `FORGED_VICTIM` session_id survives into the forwarded bytes -> fails.
+    /// Also fails if the display_name bound is dropped from the call (the second
+    /// assert), since an unbounded name reaches the fan-out.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn raise_hand_forward_carries_stamped_not_raw_bytes() {
+        use protobuf::Message as _;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+        use videocall_types::protos::raise_hand_packet::RaiseHandPacket;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        // A malicious participant claims a live peer's session and an oversized
+        // cosmetic name in the SAME packet — both must be neutralised on the way
+        // out.
+        const FORGED_VICTIM: u64 = 9999;
+        let overlong = vec![b'x'; RAISE_HAND_DISPLAY_NAME_MAX_BYTES + 200];
+        let bytes = raise_hand_bytes(FORGED_VICTIM, true, &overlong);
+
+        let mut logic = build_test_logic(nats_client.clone(), "raise_hand_2135_stamp", false).await;
+        let authenticated = logic.id;
+        assert_ne!(
+            authenticated, FORGED_VICTIM,
+            "sanity: the relay-assigned session must differ from the forged one"
+        );
+
+        let forwarded = match logic.handle_inbound(&bytes) {
+            InboundAction::Forward(b) => b,
+            other => panic!("expected a Forward for a valid RAISE_HAND, got {other:?}"),
+        };
+
+        let out = PacketWrapper::parse_from_bytes(&forwarded)
+            .expect("the forwarded bytes must be a parseable wrapper");
+        assert_eq!(
+            out.session_id, authenticated,
+            "the FORWARDED envelope must carry the relay-authenticated session, not the \
+             client-supplied one — otherwise a participant can raise a victim's hand"
+        );
+        let out_inner = RaiseHandPacket::parse_from_bytes(&out.data)
+            .expect("the forwarded inner packet must parse");
+        assert!(
+            out_inner.display_name.len() <= RAISE_HAND_DISPLAY_NAME_MAX_BYTES,
+            "the FORWARDED cosmetic display_name must be bounded before room-wide fan-out"
+        );
+        assert!(
+            out_inner.raised,
+            "the hand STATE must survive the stamp — a stamp that lost it would turn a \
+             RAISE into a LOWER for the whole room"
+        );
+    }
+
+    /// #2135: an over-budget RAISE_HAND is dropped, and the sender's budget
+    /// REFILLS — i.e. the limiter cannot wedge a participant's hand state.
+    ///
+    /// This is the recovery half of the rate limit, and it matters more here than
+    /// for reactions: the relay holds no hand registry, so a limiter that could
+    /// not refill would leave the room's view of this participant permanently
+    /// wrong. Driven through `handle_inbound` (not the limiter in isolation) so
+    /// it pins the ARM's use of the limiter, including that the arm meters at all.
+    ///
+    /// MUTATION PROOF: delete the `if !self.raise_hand_limiter.allow()` block and
+    /// the (MAX+1)th packet Forwards -> the second assert fails. Point the arm at
+    /// `self.reaction_limiter` instead and the budget changes from
+    /// RAISE_HAND_MAX_PER_WINDOW (6) to REACTION_MAX_PER_WINDOW (4) -> the
+    /// in-budget loop fails at i=4.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn raise_hand_over_budget_is_dropped_then_budget_refills() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        let bytes = raise_hand_bytes(0, true, b"Ada");
+        let mut logic = build_test_logic(nats_client.clone(), "raise_hand_2135_limit", false).await;
+
+        for i in 0..crate::constants::RAISE_HAND_MAX_PER_WINDOW {
+            assert!(
+                matches!(logic.handle_inbound(&bytes), InboundAction::Forward(_)),
+                "announce {i} within the per-sender budget must be forwarded"
+            );
+        }
+        assert!(
+            matches!(logic.handle_inbound(&bytes), InboundAction::Processed),
+            "the announce past RAISE_HAND_MAX_PER_WINDOW must be dropped, not fanned out"
+        );
+
+        // Rewind the limiter's window so the budget refills without a real sleep.
+        // A hand-state drop is only tolerable because this recovery exists.
+        logic
+            .raise_hand_limiter
+            .rewind_window_for_test(Duration::from_millis(
+                crate::constants::RAISE_HAND_WINDOW_MS + 50,
+            ));
+        assert!(
+            matches!(logic.handle_inbound(&bytes), InboundAction::Forward(_)),
+            "once the window slides the sender's budget must refill — a rate-limit drop \
+             must be recoverable, or a participant's hand state is wedged for the meeting"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #2136 — MEETING_TIMER call-site behaviour
+    // ---------------------------------------------------------------------
+
+    /// Build the raw bytes of a `PacketWrapper{MEETING_TIMER}` for the #2136
+    /// call-site tests below.
+    #[cfg(test)]
+    fn meeting_timer_bytes(running: bool, ends_at_ms: u64, duration_ms: u64) -> Vec<u8> {
+        use protobuf::Message as _;
+        use videocall_types::protos::meeting_timer_packet::MeetingTimerPacket;
+        use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+
+        let inner = MeetingTimerPacket {
+            running,
+            ends_at_ms,
+            duration_ms,
+            updated_at_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING_TIMER.into(),
+            data: inner
+                .write_to_bytes()
+                .expect("serialize inner meeting-timer"),
+            ..Default::default()
+        };
+        wrapper
+            .write_to_bytes()
+            .expect("serialize meeting-timer wrapper")
+    }
+
+    /// #2136 (SECURITY): `client_message_for` must PRESERVE `requires_host` in
+    /// both directions.
+    ///
+    /// This link had no test until a review pointed out that the suite bracketed
+    /// it on both sides: the `handle_inbound` tests stop at
+    /// `matches!(action, ForwardHostOnly(_))`, and the `chat_server` gate tests
+    /// start by hand-constructing a `ClientMessage { requires_host: true }`.
+    /// Nothing joined the two, so flipping the `true` in
+    /// `create_host_gated_client_message` to `false` left the entire suite green
+    /// — with the host gate silently disabled in production and any participant
+    /// able to drive the room's timer.
+    ///
+    /// Both transports route through this ONE function (rather than mirroring
+    /// the branch), so this also covers the WS and WT paths together — the
+    /// mirrored version could have been disabled on one transport only, which is
+    /// the harder failure to notice.
+    ///
+    /// MUTATION PROOF: flip either literal in
+    /// `create_host_gated_client_message` / `create_client_message`, or make
+    /// `client_message_for` ignore `msg.requires_host` and always take one
+    /// branch, and one of the two asserts fails.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn client_message_for_preserves_the_host_gate_flag() {
+        use crate::messages::server::Packet;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        let logic = build_test_logic(nats_client.clone(), "meeting_timer_2136_flag", false).await;
+
+        let gated = logic.client_message_for(Packet {
+            data: Arc::new(vec![]),
+            requires_host: true,
+        });
+        assert!(
+            gated.requires_host,
+            "a host-gated Packet must produce a host-gated ClientMessage — losing the flag \
+             here removes the relay's ONLY host authorization for MEETING_TIMER"
+        );
+        assert_eq!(
+            gated.session, logic.id,
+            "identity must come from the session, never the packet — the funnel resolves \
+             host-ness by this session id"
+        );
+
+        let plain = logic.client_message_for(Packet {
+            data: Arc::new(vec![]),
+            requires_host: false,
+        });
+        assert!(
+            !plain.requires_host,
+            "an ordinary Packet must NOT be host-gated — otherwise every media frame from a \
+             non-host would be dropped at the funnel"
+        );
+    }
+
+    /// #2136 (waiting-room isolation): an OBSERVER's MEETING_TIMER must not
+    /// escape the waiting room.
+    ///
+    /// This mirrors the #2095 HEALTH guard above. It is NOT made redundant by the
+    /// host gate downstream: no observer should hold the host role, but that is
+    /// an emergent property of how tokens are minted rather than an invariant
+    /// anything enforces, and this guard also stops an unadmitted client's packet
+    /// from consuming a limiter slot or reaching the fan-out actor at all.
+    ///
+    /// A NON-observer session is then driven through the SAME code with the SAME
+    /// bytes and must still forward. Without that control, deleting the whole
+    /// `PacketKind::MeetingTimer` arm would pass this test.
+    ///
+    /// MUTATION PROOF: remove the `if self.observer { .. }` guard from the
+    /// `PacketKind::MeetingTimer` arm and the observer's packet becomes
+    /// `ForwardHostOnly(_)` -> the first assert fails. Delete the arm entirely
+    /// and the control assert fails instead.
+    ///
+    /// Requires a broker (a `SessionLogic` needs a real `ChatServer`) and SKIPS
+    /// when none is reachable, like the siblings above.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn observer_meeting_timer_is_not_forwarded() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        let bytes = meeting_timer_bytes(true, 1_700_000_300_000, 300_000);
+
+        let mut observer_logic =
+            build_test_logic(nats_client.clone(), "meeting_timer_2136_room", true).await;
+        assert!(
+            matches!(
+                observer_logic.handle_inbound(&bytes),
+                InboundAction::Processed
+            ),
+            "an observer's MEETING_TIMER must be consumed, never handed to the fan-out"
+        );
+
+        let mut member_logic =
+            build_test_logic(nats_client.clone(), "meeting_timer_2136_room", false).await;
+        assert!(
+            matches!(
+                member_logic.handle_inbound(&bytes),
+                InboundAction::ForwardHostOnly(_)
+            ),
+            "control: an admitted participant's MEETING_TIMER must still reach the host gate"
+        );
+    }
+
+    /// #2136 (SECURITY, the load-bearing one): the arm must return
+    /// `ForwardHostOnly`, never a plain `Forward`.
+    ///
+    /// `ForwardHostOnly` is the ONLY thing that routes this packet through
+    /// `ChatServer`'s host authorization. A plain `Forward` looks harmless,
+    /// compiles, delivers the timer correctly in every manual test — and
+    /// silently removes the authority check entirely, letting ANY participant
+    /// drive the room's timer and trigger the expiry sound on every device. No
+    /// other test in this suite would notice: the `chat_server` gate tests would
+    /// still pass, because they construct their `ClientMessage` directly.
+    ///
+    /// The second half pins the other side of the same design decision. This
+    /// `SessionLogic` is built with `is_host = false` (see `build_test_logic`),
+    /// and it must STILL forward — because the arm deliberately does NOT consult
+    /// `self.is_host`, which is a JWT-claim snapshot that goes stale in both
+    /// directions across a transfer-host. If someone "hardens" the arm by adding
+    /// an `if !self.is_host { return Processed }`, this assert fails, and that is
+    /// the point: the promoted host would otherwise be locked out.
+    ///
+    /// MUTATION PROOF: change the arm's tail to
+    /// `InboundAction::Forward(Arc::new(data.to_vec()))` and the first assert
+    /// fails. Add a `self.is_host` guard to the arm and the same assert fails.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn meeting_timer_forwards_host_gated_and_ignores_the_stale_jwt_claim() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        let mut logic =
+            build_test_logic(nats_client.clone(), "meeting_timer_2136_gate", false).await;
+        assert!(
+            !logic.is_host,
+            "sanity: this fixture's JWT-claim snapshot is false — the assert below is only \
+             meaningful because the arm forwards ANYWAY, deferring authority to the live flag"
+        );
+
+        let action = logic.handle_inbound(&meeting_timer_bytes(true, 1_700_000_300_000, 300_000));
+        assert!(
+            matches!(action, InboundAction::ForwardHostOnly(_)),
+            "a valid MEETING_TIMER must return ForwardHostOnly — a plain Forward would bypass \
+             the relay's host authorization entirely, and a `self.is_host` guard here would \
+             lock out a host promoted by transfer-host. Got {action:?}"
+        );
+
+        // The forwarded bytes must be the validated packet, unchanged: unlike
+        // REACTION/RAISE_HAND this class carries no cosmetic string to bound, so
+        // there is deliberately no stamp step to lose the state in.
+        let forwarded = match action {
+            InboundAction::ForwardHostOnly(b) => b,
+            other => panic!("expected ForwardHostOnly, got {other:?}"),
+        };
+        use protobuf::Message as _;
+        use videocall_types::protos::meeting_timer_packet::MeetingTimerPacket;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+        let out = PacketWrapper::parse_from_bytes(&forwarded)
+            .expect("the forwarded bytes must be a parseable wrapper");
+        let out_inner =
+            MeetingTimerPacket::parse_from_bytes(&out.data).expect("inner packet must parse");
+        assert!(
+            out_inner.running,
+            "the timer STATE must survive the arm — dropping it would turn a START into a \
+             CANCEL for the whole room"
+        );
+        assert_eq!(
+            out_inner.ends_at_ms, 1_700_000_300_000,
+            "ends_at_ms must be forwarded VERBATIM: it is the countdown every peer computes \
+             its own remaining time from, and the relay must never rewrite it"
+        );
+    }
+
+    /// #2136: an over-budget MEETING_TIMER is dropped, and the sender's budget
+    /// REFILLS — the limiter cannot wedge a host out of its own room's timer.
+    ///
+    /// The recovery half matters more here than for reactions: the relay keeps no
+    /// timer registry, so a permanently-throttled host could neither cancel a
+    /// running timer nor start a new one.
+    ///
+    /// MUTATION PROOF: delete the `if !self.meeting_timer_limiter.allow()` block
+    /// from the arm and the over-budget assert fails. Make the window never reset
+    /// and the refill assert fails.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn meeting_timer_over_budget_is_dropped_then_refills() {
+        use crate::constants::{MEETING_TIMER_MAX_PER_WINDOW, MEETING_TIMER_WINDOW_MS};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        let mut logic =
+            build_test_logic(nats_client.clone(), "meeting_timer_2136_budget", false).await;
+        let bytes = meeting_timer_bytes(true, 1_700_000_300_000, 300_000);
+
+        for i in 0..MEETING_TIMER_MAX_PER_WINDOW {
+            assert!(
+                matches!(
+                    logic.handle_inbound(&bytes),
+                    InboundAction::ForwardHostOnly(_)
+                ),
+                "packet {i} must be within budget at the CALL SITE, not just in the limiter"
+            );
+        }
+        assert!(
+            matches!(logic.handle_inbound(&bytes), InboundAction::Processed),
+            "one packet past the budget must be dropped as Processed, never fanned out"
+        );
+
+        logic
+            .meeting_timer_limiter
+            .rewind_window_for_test(std::time::Duration::from_millis(
+                MEETING_TIMER_WINDOW_MS + 1,
+            ));
+        assert!(
+            matches!(
+                logic.handle_inbound(&bytes),
+                InboundAction::ForwardHostOnly(_)
+            ),
+            "the budget must REFILL: a host locked out permanently could neither cancel a \
+             running timer nor start a new one"
         );
     }
 }

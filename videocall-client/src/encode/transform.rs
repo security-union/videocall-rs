@@ -111,10 +111,11 @@ pub fn transform_video_chunk(
         // filtering without decrypting the inner MediaPacket (HCL issue #988).
         media_kind: MediaKind::VIDEO.into(),
         // Cleartext simulcast layer id (issue #989). Tag 5 serializes only when
-        // non-zero (see videocall-types packet_wrapper.rs), so layer 0 — the
-        // single-layer default and what every pre-simulcast publisher emits —
-        // is wire-identical to today. The relay (steps 6-8, future) and the
-        // receiver layer-select guard read this to forward/decode one layer.
+        // non-zero (see videocall-types packet_wrapper.rs), so layer 0 in
+        // explicitly configured single-layer mode — also what every
+        // pre-simulcast publisher emits — is wire-identical to that legacy
+        // envelope. The shipped relay layer filter and receiver layer-select
+        // guard read this to forward/decode the selected layer.
         simulcast_layer_id,
         ..Default::default()
     }
@@ -186,9 +187,10 @@ pub fn transform_screen_chunk(
         // filtering without decrypting the inner MediaPacket (HCL issue #988).
         media_kind: MediaKind::SCREEN.into(),
         // Cleartext simulcast layer id (issue #989, Phase 3b). Tag 5 serializes
-        // only when non-zero, so layer 0 — the single-layer default and what
-        // every pre-simulcast screen publisher emits — is wire-identical to
-        // today. The relay's per-(source, SCREEN) layer filter and the
+        // only when non-zero, so layer 0 in explicitly configured single-layer
+        // mode — also what every pre-simulcast screen publisher emits — is
+        // wire-identical to that legacy envelope. The relay's per-(source,
+        // SCREEN) layer filter and the
         // receiver's screen layer-select guard read this to forward/decode one
         // screen layer (mirrors transform_video_chunk).
         simulcast_layer_id,
@@ -207,9 +209,9 @@ mod tests {
     /// `PacketWrapper` — exactly the bytes the relay and the receiver
     /// layer-select guard read. These tests pin that behaviour:
     ///
-    ///   * `layer_id == 0` (single-layer default + every pre-simulcast
-    ///     publisher) MUST be wire-identical to a wrapper that never set the
-    ///     field — i.e. tag 5 is absent and parses back to 0.
+    ///   * `layer_id == 0` (explicit single-layer input + every pre-simulcast
+    ///     publisher) MUST be wire-identical to a wrapper that never set the field
+    ///     — i.e. tag 5 is absent and parses back to 0.
     ///   * `layer_id == 2` MUST round-trip to `2`.
     ///
     /// We build the wrapper with the same field assignment the function uses so

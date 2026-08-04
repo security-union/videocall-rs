@@ -1166,6 +1166,75 @@ pub struct ConnectionManagerOptions {
     /// and swaps in the fresh URLs before invoking
     /// [`ConnectionManager::start_reelection`].
     pub refresh_room_token_callback: Option<RefreshRoomTokenCallback>,
+
+    /// Every relay `session_id` this client has held during the current page
+    /// load (issue #625). Owned by `VideoCallClient::Inner` and shared here by
+    /// handle so it OUTLIVES this manager: `connect_with_rtt_testing` builds a
+    /// brand-new `ConnectionController` (and therefore a brand-new
+    /// `ConnectionManager`) when it recycles a `Failed` controller, while
+    /// `Inner` — and this history with it — keeps running. A manager-local copy
+    /// would be wiped on exactly the reconnect this issue is about.
+    ///
+    /// Written only by `VideoCallClient`'s `SESSION_ASSIGNED` arm; read here by
+    /// [`should_filter_self_packet`].
+    pub own_session_ids: Rc<RefCell<SessionIdHistory>>,
+}
+
+/// Maximum number of relay `session_id`s retained by [`SessionIdHistory`].
+///
+/// One id is recorded per SESSION_ASSIGNED, i.e. per successful election — cold
+/// start, in-manager re-election, and full controller recycle all funnel through
+/// that one arm. Sixteen therefore covers sixteen consecutive transport churns
+/// within a single page load; a packet still in flight from the session sixteen
+/// elections ago is not a case real networks produce (each election alone costs
+/// seconds of RTT probing, far beyond any plausible reordering window).
+pub const MAX_SESSION_ID_HISTORY: usize = 16;
+
+/// Bounded, insertion-ordered record of the relay `session_id`s this client has
+/// held during the current page load (issue #625).
+///
+/// The relay mints a fresh `session_id` on every reconnect and re-election, so a
+/// client that knows only its CURRENT id cannot recognise a packet stamped with
+/// an id it held moments earlier — in-flight self media that arrives after the
+/// switch is treated as a stranger's. Retaining the recent ids closes that
+/// window. Oldest ids are evicted first once [`MAX_SESSION_ID_HISTORY`] is
+/// reached.
+#[derive(Debug, Default)]
+pub struct SessionIdHistory {
+    ids: VecDeque<u64>,
+}
+
+impl SessionIdHistory {
+    /// Record `session_id` as one this client has held.
+    ///
+    /// Re-recording an id already present is a no-op — it does NOT refresh that
+    /// id's position, so eviction order stays "oldest first seen", which is what
+    /// makes the bound a window over transport churn rather than over traffic.
+    pub fn record(&mut self, session_id: u64) {
+        if self.ids.contains(&session_id) {
+            return;
+        }
+        if self.ids.len() >= MAX_SESSION_ID_HISTORY {
+            self.ids.pop_front();
+        }
+        self.ids.push_back(session_id);
+    }
+
+    /// Whether `session_id` is one this client has held.
+    ///
+    /// Makes NO judgement about the `0` sentinel (an unstamped packet): callers
+    /// that must treat `0` specially say so themselves. The one caller that
+    /// must — [`should_filter_self_packet`] — guards it explicitly before
+    /// consulting the history.
+    pub fn contains(&self, session_id: u64) -> bool {
+        self.ids.contains(&session_id)
+    }
+
+    /// Number of ids currently retained. Test-only observability for the bound.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
 }
 
 /// Action taken by [`ConnectionManager::run_post_rebase_retry`] when the
@@ -1429,12 +1498,40 @@ pub struct ConnectionManager {
     wt_audio_fallback_latched: bool,
 }
 
-fn should_filter_self_packet(packet: &PacketWrapper, own_session_id: Option<u64>) -> bool {
-    let Some(own_id) = own_session_id else {
+/// Whether an inbound packet is this client's own and must be dropped before it
+/// reaches `VideoCallClient`.
+///
+/// A packet counts as "ours" when its `session_id` is the one we hold now
+/// (`own_session_id`) OR any id we held earlier in this page load
+/// (`own_session_ids`, issue #625). The history arm is the whole point: the relay
+/// mints a new `session_id` on every reconnect and re-election, so without it a
+/// packet stamped moments before the switch is mistaken for a stranger's and
+/// echoed back into the decode path as a phantom peer. Both arms are kept
+/// because the history is populated by `VideoCallClient` one `emit` downstream of
+/// where `own_session_id` is set here, so consulting both makes this a strict
+/// superset of the pre-#625 behaviour — the change can only ADD filtering, never
+/// remove it.
+///
+/// The whitelist below applies identically to current and historical ids. That
+/// parity is deliberate and load-bearing: a self-addressed control packet
+/// carrying a superseded session id must fare exactly as one carrying the
+/// current id, otherwise a post-reconnect congestion signal would be silently
+/// dropped (or, before #625, silently privileged) purely by accident of timing.
+fn should_filter_self_packet(
+    packet: &PacketWrapper,
+    own_session_id: Option<u64>,
+    own_session_ids: &SessionIdHistory,
+) -> bool {
+    // `0` is the unstamped sentinel, never a real session — guard it here, ahead
+    // of both the identity match and the whitelist, so an unstamped packet is
+    // never self-filtered even if `0` somehow reached the history.
+    if packet.session_id == 0 {
         return false;
-    };
+    }
 
-    if packet.session_id == 0 || packet.session_id != own_id {
+    let is_own =
+        own_session_id == Some(packet.session_id) || own_session_ids.contains(packet.session_id);
+    if !is_own {
         return false;
     }
 
@@ -1448,6 +1545,23 @@ fn should_filter_self_packet(packet: &PacketWrapper, own_session_id: Option<u64>
     // that publisher's self-subject, so it too must survive this self-filter and
     // reach VideoCallClient (which re-checks self-targeting before applying the
     // cap). Whitelist it alongside CONGESTION.
+    //
+    // DOWNLINK_CONGESTION is deliberately NOT whitelisted here, even though the
+    // relay stamps it self-addressed too — see the rationale on
+    // `video_call_client::suppresses_peer_creation_for_packet`, which pins the
+    // two gates together, and open issue #1481, which tracks reconciling them.
+    //
+    // #625 does not merely extend that verdict to historical ids, it CLOSES the
+    // last way in. `VideoCallClient` records every id it adopts into the same
+    // history this filter reads, so its self-target test there
+    // (`own_session_id == sid || history.contains(sid)`) can only be true for an
+    // id this filter also sees as ours — and, not being whitelisted, drops.
+    // Self-targeted DOWNLINK_CONGESTION is therefore unreachable from the wire,
+    // and `seed_local_congestion_and_publish` (#1219 Half 2) is dead on that path.
+    // Pre-#625 its ONLY live route was the historical-id leak fixed here. That is
+    // defensible — a superseded session's downlink congestion is moot — but it is
+    // a real reachability change, and #1481 must reconcile the two gates knowing
+    // the accidental route is now gone rather than merely narrowed.
     packet.packet_type != PacketType::CONGESTION.into()
         && packet.packet_type != PacketType::LAYER_HINT.into()
 }
@@ -1816,6 +1930,7 @@ impl ConnectionManager {
         let on_inbound_media = self.options.on_inbound_media.clone();
         let rtt_responses = self.rtt_responses.clone();
         let own_session_id = self.own_session_id.clone();
+        let own_session_ids = self.options.own_session_ids.clone();
         let pending_session_ids = self.pending_session_ids.clone();
         let active_connection_id = self.active_connection_id.clone();
         let packets_received = self.packets_received.clone();
@@ -1883,10 +1998,26 @@ impl ConnectionManager {
                 }
             }
 
-            // Filter self-packets using session_id. Self-targeted CONGESTION is
+            // Filter self-packets using session_id — the one we hold now and any
+            // we held earlier this page load (#625). Self-targeted CONGESTION is
             // exempt because it is the server's feedback path telling this
             // sender to step down quality under relay backpressure.
-            if should_filter_self_packet(&packet, *own_session_id.borrow()) {
+            //
+            // The history's only mutable writer is `VideoCallClient`'s
+            // SESSION_ASSIGNED arm, which this path cannot re-enter: SESSION_ASSIGNED
+            // is intercepted at the top of this callback and returns there, so the
+            // `emit` below never carries one. The borrow is nonetheless scoped to
+            // this decision and `try_borrow`ed, and a momentary conflict fails OPEN
+            // (forward the packet) — the same outcome as the pre-SESSION_ASSIGNED
+            // window, where nothing is self-filtered, so a control packet is never
+            // silently dropped by a borrow race.
+            let is_self_packet = match own_session_ids.try_borrow() {
+                Ok(history) => {
+                    should_filter_self_packet(&packet, *own_session_id.borrow(), &history)
+                }
+                Err(_) => false,
+            };
+            if is_self_packet {
                 debug!(
                     "Rejecting packet from same session_id: {}",
                     packet.session_id
@@ -2636,7 +2767,7 @@ impl ConnectionManager {
                         // Order matters: emit *before* enabling outbound
                         // stamping on the connection. The emit synchronously
                         // updates VideoCallClient::own_session_id and populates
-                        // session_id_history, so when the connection
+                        // the shared `own_session_ids` history, so when the connection
                         // subsequently stamps outbound packets with `sid` and
                         // the server loops back a CONGESTION carrying that
                         // sid, VideoCallClient's is-self-targeted match will
@@ -5397,6 +5528,7 @@ mod tests {
             // AUTH-2 refresh path install a mock explicitly via
             // `mgr.options.refresh_room_token_callback = Some(...)`.
             refresh_room_token_callback: None,
+            own_session_ids: Rc::new(RefCell::new(SessionIdHistory::default())),
         };
 
         ConnectionManager {
@@ -5489,6 +5621,20 @@ mod tests {
         packet: PacketWrapper,
         own_session_id: Option<u64>,
     ) -> Vec<PacketWrapper> {
+        forwarded_packets_for_with_history(packet, own_session_id, &[])
+    }
+
+    /// Drive one packet through the REAL `create_inbound_media_callback` and
+    /// return whatever it forwarded to `on_inbound_media`.
+    ///
+    /// `prior_session_ids` seeds the shared history the way `VideoCallClient`'s
+    /// `SESSION_ASSIGNED` arm does in production, so a test can model "this
+    /// client held these ids before its current one".
+    fn forwarded_packets_for_with_history(
+        packet: PacketWrapper,
+        own_session_id: Option<u64>,
+        prior_session_ids: &[u64],
+    ) -> Vec<PacketWrapper> {
         let forwarded = Rc::new(RefCell::new(Vec::<PacketWrapper>::new()));
         let sink = forwarded.clone();
         let mut mgr = make_test_manager();
@@ -5497,12 +5643,30 @@ mod tests {
         });
         *mgr.own_session_id.borrow_mut() = own_session_id;
         *mgr.active_connection_id.borrow_mut() = Some("conn".to_string());
+        {
+            let mut history = mgr.options.own_session_ids.borrow_mut();
+            for id in prior_session_ids {
+                history.record(*id);
+            }
+            if let Some(current) = own_session_id {
+                history.record(current);
+            }
+        }
 
         let callback = mgr.create_inbound_media_callback("conn".to_string());
         callback.emit(packet);
 
         let packets = forwarded.borrow().clone();
         packets
+    }
+
+    /// Build a [`SessionIdHistory`] holding exactly `ids`, in order.
+    fn history_of(ids: &[u64]) -> SessionIdHistory {
+        let mut history = SessionIdHistory::default();
+        for id in ids {
+            history.record(*id);
+        }
+        history
     }
 
     // -----------------------------------------------------------------------
@@ -6080,11 +6244,19 @@ mod tests {
         );
     }
 
+    // The three below drive the `own_session_id` arm ALONE, against an EMPTY
+    // history, so they keep the pre-#625 sensitivity they had when
+    // `own_session_id` was the filter's only signal. Seeding `history_of(&[42])`
+    // here would be more production-faithful and strictly WEAKER: with the current
+    // id ALSO in the history, deleting the `own_session_id` arm outright leaves
+    // every one of them green. That arm is load-bearing — see
+    // `self_packet_filter_uses_own_session_id_when_history_missed_it` — so it has
+    // to be pinned by tests that fail without it.
     #[test]
     fn self_packet_filter_exempts_self_targeted_congestion() {
         let pkt = packet(PacketType::CONGESTION, 42);
         assert!(
-            !should_filter_self_packet(&pkt, Some(42)),
+            !should_filter_self_packet(&pkt, Some(42), &SessionIdHistory::default()),
             "self-targeted CONGESTION must reach VideoCallClient so AQ can step down"
         );
     }
@@ -6096,7 +6268,7 @@ mod tests {
         // must survive the self-filter exactly like CONGESTION.
         let pkt = packet(PacketType::LAYER_HINT, 42);
         assert!(
-            !should_filter_self_packet(&pkt, Some(42)),
+            !should_filter_self_packet(&pkt, Some(42), &SessionIdHistory::default()),
             "self-targeted LAYER_HINT must reach VideoCallClient so the AQ can cap the ladder"
         );
     }
@@ -6105,27 +6277,251 @@ mod tests {
     fn self_packet_filter_still_drops_non_congestion_self_packets() {
         let pkt = packet(PacketType::MEDIA, 42);
         assert!(
-            should_filter_self_packet(&pkt, Some(42)),
+            should_filter_self_packet(&pkt, Some(42), &SessionIdHistory::default()),
             "non-whitelisted self packets must still be filtered"
         );
     }
 
     #[test]
+    fn self_packet_filter_uses_own_session_id_when_history_missed_it() {
+        // The `own_session_id` arm is NOT redundant with the history, and this is
+        // the window that proves it. `create_inbound_media_callback` sets
+        // `own_session_id` and THEN emits the SESSION_ASSIGNED that makes
+        // `VideoCallClient` record it — and that emit can be DROPPED: the inbound
+        // callback in `video_call_client.rs` bails with "transient borrow conflict,
+        // dropping packet" when `Inner` is already mutably borrowed. That leaves
+        // the manager holding `own_session_id = Some(42)` while the shared history
+        // never learned 42. Self MEDIA arriving in that window must still be
+        // filtered, on the strength of `own_session_id` alone.
+        let pkt = packet(PacketType::MEDIA, 42);
+        assert!(
+            should_filter_self_packet(&pkt, Some(42), &SessionIdHistory::default()),
+            "self MEDIA must be filtered via own_session_id even when the shared \
+             history never recorded that id (dropped SESSION_ASSIGNED window)"
+        );
+    }
+
+    #[test]
     fn self_packet_filter_never_filters_without_own_session_id() {
-        // Before SESSION_ASSIGNED arrives there is no own_session_id, so nothing
-        // is self-filtered — CONGESTION (and everything else) must forward. Locks
-        // in that the None early-return precedes the CONGESTION type check.
+        // Before SESSION_ASSIGNED arrives there is no own_session_id AND no
+        // history, so nothing is self-filtered — CONGESTION (and everything else)
+        // must forward.
         let pkt = packet(PacketType::CONGESTION, 42);
-        assert!(!should_filter_self_packet(&pkt, None));
+        assert!(!should_filter_self_packet(
+            &pkt,
+            None,
+            &SessionIdHistory::default()
+        ));
     }
 
     #[test]
     fn self_packet_filter_never_filters_zero_session_id() {
         // session_id == 0 is the unstamped sentinel and is never treated as a
-        // self-match. Asserted with CONGESTION to lock in that the sentinel
-        // early-return precedes the CONGESTION type check.
-        let pkt = packet(PacketType::CONGESTION, 0);
-        assert!(!should_filter_self_packet(&pkt, Some(0)));
+        // self-match. The load-bearing assertion is the MEDIA one: MEDIA is NOT
+        // whitelisted, so with the sentinel guard deleted `is_own` would go true
+        // (via the history, and via `Some(0)`) and the packet would be FILTERED —
+        // this is the assertion that actually bites. 0 is seeded into the history
+        // as well as passed as `own_session_id` so that BOTH routes to `is_own`
+        // are exercised; #625 hoisting the guard ahead of the identity match is
+        // what stops a 0 that reached the history from matching.
+        let media = packet(PacketType::MEDIA, 0);
+        assert!(
+            !should_filter_self_packet(&media, Some(0), &history_of(&[0])),
+            "the unstamped sentinel must never be self-filtered, whitelist or not"
+        );
+
+        // CONGESTION additionally documents the ORDERING: the sentinel return
+        // precedes the whitelist check. NOTE this one passes with or without the
+        // guard (the whitelist would forward it anyway), so it is documentation,
+        // not a guard — the MEDIA assertion above is the real pin.
+        let congestion = packet(PacketType::CONGESTION, 0);
+        assert!(!should_filter_self_packet(
+            &congestion,
+            Some(0),
+            &history_of(&[0])
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #625: the self-filter must recognise session ids this client held
+    // EARLIER in the page load, not just the one it holds now. The relay mints a
+    // fresh session_id on every reconnect / re-election, so media still in flight
+    // when the switch happens arrives stamped with the superseded id.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn self_packet_filter_drops_media_stamped_with_a_prior_session_id() {
+        // Post-reconnect: we now hold session 99; session 42 was ours a moment
+        // ago. Our own in-flight MEDIA stamped 42 must still be recognised as
+        // ours and dropped — otherwise it is decoded back as a phantom peer.
+        let pkt = packet(PacketType::MEDIA, 42);
+        assert!(
+            should_filter_self_packet(&pkt, Some(99), &history_of(&[42, 99])),
+            "MEDIA stamped with a session id we held before the reconnect must be \
+             filtered as self (#625)"
+        );
+    }
+
+    #[test]
+    fn self_packet_filter_keeps_media_from_a_genuinely_different_peer() {
+        // Same post-reconnect state, but 77 was never ours. This is the guard
+        // against over-filtering: a real peer's media must still reach the
+        // decoder. Pairs with the test above — together they pin that the history
+        // lookup is a membership test, not a blanket accept.
+        let pkt = packet(PacketType::MEDIA, 77);
+        assert!(
+            !should_filter_self_packet(&pkt, Some(99), &history_of(&[42, 99])),
+            "media from a session id we never held is a real peer's and must NOT \
+             be filtered"
+        );
+    }
+
+    #[test]
+    fn self_packet_filter_exempts_congestion_on_a_prior_session_id() {
+        // The whitelist must hold for HISTORICAL ids exactly as for the current
+        // one. A relay CONGESTION addressed to the session we held before the
+        // reconnect is still our feedback signal; dropping it would leave this
+        // client unable to step down after a reconnect — a worse bug than the
+        // one #625 fixes.
+        let pkt = packet(PacketType::CONGESTION, 42);
+        assert!(
+            !should_filter_self_packet(&pkt, Some(99), &history_of(&[42, 99])),
+            "self-targeted CONGESTION on a PRIOR session id must still reach \
+             VideoCallClient (#625 must not break the #1219 feedback path)"
+        );
+    }
+
+    #[test]
+    fn self_packet_filter_exempts_layer_hint_on_a_prior_session_id() {
+        // Sibling of the CONGESTION case above: LAYER_HINT is whitelisted on the
+        // same rationale (#1108 Stage 3) and must get the same historical-id
+        // treatment, or a post-reconnect ladder cap is silently lost.
+        let pkt = packet(PacketType::LAYER_HINT, 42);
+        assert!(
+            !should_filter_self_packet(&pkt, Some(99), &history_of(&[42, 99])),
+            "self-targeted LAYER_HINT on a PRIOR session id must still reach \
+             VideoCallClient (#625 must not break the #1108 hint path)"
+        );
+    }
+
+    #[test]
+    fn self_packet_filter_treats_prior_and_current_session_ids_identically() {
+        // The core invariant #625 establishes: a session id we held earlier fares
+        // EXACTLY as the one we hold now. Deliberately asserted as a property over
+        // `PacketType::VALUES` — every type the protobuf defines — rather than a
+        // hand-picked list, so it keeps holding when the whitelist changes (#1481
+        // may add DOWNLINK_CONGESTION to it) and so a packet type added later is
+        // covered without anyone remembering to extend this test. It pins parity,
+        // NOT any particular verdict: which types are filtered is the whitelist's
+        // business and is pinned by the whitelist tests above.
+        let history = history_of(&[42, 99]);
+        let mut checked = 0;
+        for packet_type in <PacketType as protobuf::Enum>::VALUES {
+            let current = should_filter_self_packet(&packet(*packet_type, 99), Some(99), &history);
+            let prior = should_filter_self_packet(&packet(*packet_type, 42), Some(99), &history);
+            assert_eq!(
+                current, prior,
+                "{packet_type:?}: a PRIOR session id must be filtered exactly as \
+                 the CURRENT one (#625)"
+            );
+            checked += 1;
+        }
+
+        // Anti-vacuity: a property test over an empty set passes for the wrong
+        // reason. PacketType had 16 variants when this was written; the bound is
+        // deliberately a floor, not an equality, so adding a type does not fail
+        // here — emptying the set does.
+        assert!(
+            checked >= 16,
+            "expected to check every PacketType (>=16); checked {checked} — \
+             PacketType::VALUES looks empty or truncated"
+        );
+    }
+
+    #[test]
+    fn session_id_history_evicts_oldest_beyond_the_bound() {
+        // The bound is a window over transport churn: one id per SESSION_ASSIGNED,
+        // i.e. per successful election. Record one more than fits and the OLDEST
+        // must be the one evicted, so the ids from the most recent reconnects —
+        // the ones with packets plausibly still in flight — are the ones retained.
+        let ids: Vec<u64> = (1..=(MAX_SESSION_ID_HISTORY as u64 + 1)).collect();
+        let history = history_of(&ids);
+
+        assert_eq!(
+            history.len(),
+            MAX_SESSION_ID_HISTORY,
+            "history must stay bounded at MAX_SESSION_ID_HISTORY"
+        );
+        assert!(
+            !history.contains(1),
+            "the oldest id must be evicted once the bound is exceeded"
+        );
+        assert!(
+            history.contains(MAX_SESSION_ID_HISTORY as u64 + 1),
+            "the newest id must be retained"
+        );
+        assert!(
+            history.contains(2),
+            "the second-oldest id must survive a single eviction"
+        );
+    }
+
+    #[test]
+    fn session_id_history_ignores_duplicate_records() {
+        // SESSION_ASSIGNED for an id we already hold can be re-delivered (both
+        // transports carry it, and the election path re-emits a synthetic one).
+        // Re-recording must not consume a slot, or a stable session would evict
+        // the reconnect history it is supposed to sit alongside.
+        let mut history = SessionIdHistory::default();
+        history.record(42);
+        history.record(42);
+        history.record(99);
+
+        assert_eq!(
+            history.len(),
+            2,
+            "a duplicate record must not consume a slot"
+        );
+        assert!(history.contains(42));
+        assert!(history.contains(99));
+    }
+
+    #[test]
+    fn inbound_callback_filters_media_stamped_with_a_prior_session_id() {
+        // End-to-end through the REAL create_inbound_media_callback: the history
+        // is read from the shared handle the ConnectionManagerOptions carry, which
+        // is the plumbing #625 adds. Pins that the filter is actually WIRED, not
+        // merely correct in isolation.
+        let forwarded =
+            forwarded_packets_for_with_history(packet(PacketType::MEDIA, 42), Some(99), &[42]);
+
+        assert!(
+            forwarded.is_empty(),
+            "self MEDIA stamped with a prior session id must not be forwarded (#625)"
+        );
+    }
+
+    #[test]
+    fn inbound_callback_forwards_congestion_stamped_with_a_prior_session_id() {
+        // Whitelist parity through the real callback: the same prior-id packet
+        // that is dropped as MEDIA above must be FORWARDED as CONGESTION.
+        let forwarded =
+            forwarded_packets_for_with_history(packet(PacketType::CONGESTION, 42), Some(99), &[42]);
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].packet_type, PacketType::CONGESTION.into());
+        assert_eq!(forwarded[0].session_id, 42);
+    }
+
+    #[test]
+    fn inbound_callback_forwards_media_from_a_peer_after_a_reconnect() {
+        // The over-filtering guard, end-to-end: a real peer's media must survive
+        // the reconnect-aware filter.
+        let forwarded =
+            forwarded_packets_for_with_history(packet(PacketType::MEDIA, 77), Some(99), &[42]);
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].session_id, 77);
     }
 
     #[test]

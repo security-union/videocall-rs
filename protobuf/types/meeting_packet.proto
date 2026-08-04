@@ -56,5 +56,24 @@ message MeetingPacket {
   // authenticated JWT is_guest claim on the server. Default false
   // keeps the wire format backward-compatible with older peers.
   bool is_guest = 11;
+  // For PARTICIPANT_LIST_REQUEST: the requesting joiner's CLAIMED per-tab
+  // instance_id. Relay-internal — PARTICIPANT_LIST_REQUEST is consumed by
+  // the receiving relay and never forwarded to clients.
+  //
+  // NOT server-authoritative. The value originates as the client's own
+  // ?instance_id= connect parameter; the joiner's relay copies it onto the
+  // wire after a length/emptiness check only, and never checks it against
+  // the authenticated JWT sub. Treat it as a hint a client could forge.
+  //
+  // It lets a responding relay count one client's dual election candidate
+  // sessions (WS + WT, distinct session_id, same instance_id) as ONE
+  // distinct requester, which selects a unicast re-announce instead of a
+  // broadcast. That is the only decision keyed on it, and a false claim
+  // resolves toward broadcast — reaching more sessions, never fewer — so a
+  // forged value cannot withhold a presence answer from anyone. Empty when
+  // the joiner supplied no instance_id or the request came from an older
+  // relay; receivers then fall back to keying on session_id, which is the
+  // pre-#1600 behaviour.
+  string requester_instance_id = 12;
 }
 

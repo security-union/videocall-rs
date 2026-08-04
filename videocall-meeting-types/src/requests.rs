@@ -19,8 +19,24 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Placeholder substituted for every plaintext password field by the manual
+/// [`std::fmt::Debug`] impls in this module.
+///
+/// Meeting passwords are user secrets. `#[derive(Debug)]` on a struct holding
+/// one makes a single `tracing::debug!("{body:?}")` — or any panic message that
+/// formats a `Result` containing the request — enough to write the plaintext
+/// into a log aggregator forever. Every request type below that carries a
+/// password therefore hand-rolls `Debug` and prints this marker instead.
+///
+/// Field *presence* is still shown (`Some("<redacted>")` vs `None`) because
+/// that is what makes the impl useful for debugging, and presence is not a
+/// secret: `has_password` is already public on every meeting listing.
+const REDACTED: &str = "<redacted>";
+
 /// Request body for `POST /api/v1/meetings`.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// `Debug` is implemented manually to redact [`Self::password`]; see [`REDACTED`].
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CreateMeetingRequest {
     /// Meeting identifier. Auto-generated (12 chars) if omitted.
     #[serde(default)]
@@ -67,6 +83,22 @@ pub struct CreateMeetingRequest {
     pub chat_allowed_for_all: Option<bool>,
 }
 
+impl std::fmt::Debug for CreateMeetingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateMeetingRequest")
+            .field("meeting_id", &self.meeting_id)
+            .field("attendees", &self.attendees)
+            .field("password", &self.password.as_ref().map(|_| REDACTED))
+            .field("waiting_room_enabled", &self.waiting_room_enabled)
+            .field("admitted_can_admit", &self.admitted_can_admit)
+            .field("end_on_host_leave", &self.end_on_host_leave)
+            .field("allow_guests", &self.allow_guests)
+            .field("recording_allowed_for_all", &self.recording_allowed_for_all)
+            .field("chat_allowed_for_all", &self.chat_allowed_for_all)
+            .finish()
+    }
+}
+
 /// Request body for `PATCH /api/v1/meetings/{meeting_id}`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UpdateMeetingRequest {
@@ -96,21 +128,61 @@ pub struct UpdateMeetingRequest {
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/join`.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// `Debug` is implemented manually to redact [`Self::password`]; see [`REDACTED`].
+#[derive(Serialize, Deserialize, Clone)]
 pub struct JoinMeetingRequest {
     /// Display name shown in the meeting UI.
     #[serde(default)]
     pub display_name: Option<String>,
+
+    /// Plaintext meeting password, verified server-side against the meeting's
+    /// stored Argon2 hash (issue #1613).
+    ///
+    /// `Option` so that pre-#1613 callers keep compiling and keep working
+    /// against meetings that have no password. It is **required in practice**
+    /// whenever the target meeting reports `has_password: true` and the caller
+    /// is not the meeting owner — the server rejects such a join with
+    /// `403 MEETING_PASSWORD_REQUIRED`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for JoinMeetingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinMeetingRequest")
+            .field("display_name", &self.display_name)
+            .field("password", &self.password.as_ref().map(|_| REDACTED))
+            .finish()
+    }
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/join-guest`.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// `Debug` is implemented manually to redact [`Self::password`]; see [`REDACTED`].
+#[derive(Serialize, Deserialize, Clone)]
 pub struct GuestJoinRequest {
     /// Display name shown in the meeting UI. Must be provided by the caller.
     pub display_name: String,
     /// Optional stable guest identifier persisted in the client's sessionStorage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_session_id: Option<String>,
+
+    /// Plaintext meeting password, verified server-side against the meeting's
+    /// stored Argon2 hash (issue #1613). A guest is never the meeting owner, so
+    /// this is required whenever the meeting has a password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for GuestJoinRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuestJoinRequest")
+            .field("display_name", &self.display_name)
+            .field("guest_session_id", &self.guest_session_id)
+            .field("password", &self.password.as_ref().map(|_| REDACTED))
+            .finish()
+    }
 }
 
 /// Request body for `PUT /api/v1/meetings/{meeting_id}/display-name`.
@@ -244,4 +316,135 @@ pub struct KickParticipantRequest {
 pub struct TransferHostRequest {
     /// User ID of the admitted participant to transfer host to.
     pub user_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "hunter2-do-not-log-me";
+
+    /// Every request type carrying a plaintext password must keep it out of its
+    /// `Debug` output. Replacing any of these hand-written impls with
+    /// `#[derive(Debug)]` makes these assertions fail, which is the point:
+    /// `Debug` is what a stray `tracing::debug!("{body:?}")` or a panic message
+    /// reaches for, and a password in a log line survives long after the
+    /// request does.
+    #[test]
+    fn debug_never_prints_a_plaintext_password() {
+        let create = CreateMeetingRequest {
+            meeting_id: Some("standup".into()),
+            attendees: vec!["a@example.com".into()],
+            password: Some(SECRET.into()),
+            waiting_room_enabled: None,
+            admitted_can_admit: None,
+            end_on_host_leave: None,
+            allow_guests: None,
+            recording_allowed_for_all: None,
+            chat_allowed_for_all: None,
+        };
+        let join = JoinMeetingRequest {
+            display_name: Some("Alice".into()),
+            password: Some(SECRET.into()),
+        };
+        let guest = GuestJoinRequest {
+            display_name: "Guesty".into(),
+            guest_session_id: Some("guest:abc".into()),
+            password: Some(SECRET.into()),
+        };
+
+        for rendered in [
+            format!("{create:?}"),
+            format!("{join:?}"),
+            format!("{create:#?}"),
+            format!("{join:#?}"),
+            format!("{guest:?}"),
+            format!("{guest:#?}"),
+        ] {
+            assert!(
+                !rendered.contains(SECRET),
+                "Debug output leaked the plaintext password: {rendered}"
+            );
+            assert!(
+                rendered.contains(REDACTED),
+                "Debug output should mark the redacted field: {rendered}"
+            );
+        }
+    }
+
+    /// The non-secret fields must still be visible — a `Debug` impl that hides
+    /// everything is useless and would quietly get reverted.
+    #[test]
+    fn debug_still_shows_the_non_secret_fields() {
+        let join = JoinMeetingRequest {
+            display_name: Some("Alice".into()),
+            password: Some(SECRET.into()),
+        };
+        let rendered = format!("{join:?}");
+        assert!(rendered.contains("Alice"), "{rendered}");
+        assert!(rendered.contains("JoinMeetingRequest"), "{rendered}");
+    }
+
+    /// An absent password renders as `None`, not as a redaction marker, so
+    /// "no password was sent" stays distinguishable from "one was sent".
+    #[test]
+    fn debug_distinguishes_absent_from_redacted() {
+        let none = JoinMeetingRequest {
+            display_name: None,
+            password: None,
+        };
+        let rendered = format!("{none:?}");
+        assert!(
+            !rendered.contains(REDACTED),
+            "a None password must not render as redacted: {rendered}"
+        );
+        assert!(rendered.contains("password: None"), "{rendered}");
+    }
+
+    /// `password` must be omitted from the serialized body when absent, so
+    /// pre-#1613 clients and post-#1613 clients that have no password to send
+    /// put the identical bytes on the wire.
+    #[test]
+    fn absent_password_is_omitted_from_the_wire() {
+        let join = JoinMeetingRequest {
+            display_name: Some("Alice".into()),
+            password: None,
+        };
+        let wire = serde_json::to_string(&join).expect("serializing a join request");
+        assert_eq!(wire, r#"{"display_name":"Alice"}"#);
+
+        let guest = GuestJoinRequest {
+            display_name: "Guesty".into(),
+            guest_session_id: None,
+            password: None,
+        };
+        let wire = serde_json::to_string(&guest).expect("serializing a guest join request");
+        assert_eq!(wire, r#"{"display_name":"Guesty"}"#);
+    }
+
+    /// A pre-#1613 body (no `password` key at all) must still deserialize —
+    /// old clients keep working against meetings that have no password.
+    #[test]
+    fn legacy_bodies_without_a_password_field_still_deserialize() {
+        let join: JoinMeetingRequest =
+            serde_json::from_str(r#"{"display_name":"Alice"}"#).expect("legacy join body");
+        assert_eq!(join.display_name.as_deref(), Some("Alice"));
+        assert!(join.password.is_none());
+
+        let join: JoinMeetingRequest = serde_json::from_str("{}").expect("empty join body");
+        assert!(join.password.is_none());
+
+        let guest: GuestJoinRequest =
+            serde_json::from_str(r#"{"display_name":"Guesty"}"#).expect("legacy guest join body");
+        assert!(guest.password.is_none());
+    }
+
+    /// And a body that does carry one round-trips it verbatim — no trimming,
+    /// no case folding, no length cap on the way in.
+    #[test]
+    fn supplied_password_round_trips_verbatim() {
+        let raw = r#"{"display_name":"Alice","password":"  Mixed CASE ☂ "}"#;
+        let join: JoinMeetingRequest = serde_json::from_str(raw).expect("join body with password");
+        assert_eq!(join.password.as_deref(), Some("  Mixed CASE ☂ "));
+    }
 }

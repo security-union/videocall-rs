@@ -758,7 +758,10 @@ pub fn format_audio_send_layer_summary(
     layer_max: usize,
     source_active: bool,
 ) -> String {
-    let labels = send_layer_labels(PrefMediaKind::Audio, layer_max);
+    // AUDIO labels, so the camera top-rung argument is inert here — pass the
+    // shipped label rather than calling the config-reading wrapper, which would
+    // make this otherwise-pure fn browser-only and break its host tests.
+    let labels = send_layer_labels_with_top(PrefMediaKind::Audio, layer_max, "720p");
     if labels.is_empty() {
         return if source_active {
             "Sending audio".to_string()
@@ -1357,14 +1360,108 @@ pub fn tick_offsets(step_count: usize) -> Vec<f32> {
 // pure mappers convert between the stored count and the ceiling thumb position,
 // and are host-tested so a wording/positioning regression breaks a test.
 
+/// Label for a camera top-rung HEIGHT (issue #1768): `"720p"` for the shipped
+/// ladder, `"540p"` under `experimentalReducedLadder`.
+///
+/// Takes the height rather than reading the config so it stays a PURE, host-testable
+/// fn — `crate::constants::camera_ladder_variant()` touches `window.__APP_CONFIG`
+/// and panics on a native test target. Returns `&'static str` so
+/// [`send_layer_labels`]'s signature (and its 13 call sites) are unchanged.
+///
+/// An unrecognised height falls back to `"720p"` and `warn!`s. The fallback VALUE is
+/// silently wrong on its own — a future 480p rung would render a `"720p"` pip beside
+/// a `"180p–480p"` span, and `send_label_top_agrees_with_the_res_span…` would not
+/// catch it because that test derives its expectation through this same fallback — so
+/// the log line is what makes it visible. Add a match arm when a rung is added.
+pub(crate) fn camera_top_rung_label(max_height: u32) -> &'static str {
+    match max_height {
+        540 => "540p",
+        720 => "720p",
+        1080 => "1080p",
+        other => {
+            log::warn!(
+                "camera_top_rung_label: no label for a {other}px top rung — falling back to \
+                 \"720p\", which will MISLABEL the send rung pip. Add a match arm in \
+                 performance_settings.rs (issue 1768)."
+            );
+            "720p"
+        }
+    }
+}
+
+/// The active camera ladder's top-rung label, resolved from the AQ table for the
+/// deployment's [`LadderVariant`]. Browser-only (reads `window.__APP_CONFIG` via
+/// `camera_ladder_variant`); the pure half is [`camera_top_rung_label`].
+/// MEMOIZED, because this sits on the performance panel's 4 Hz render path.
+///
+/// `camera_ladder_variant()` → `app_config()` returns a CLONE of the ~32-field
+/// `RuntimeConfig` (27 of them heap `String`s): `memoize_ok` caches the PARSE, not
+/// the clone. The panel instantiates `SendLayerCell` three times per render at
+/// 250 ms, so calling through per render meant ~12 config clones/second — exactly
+/// the per-render deserialization cost #1492 was filed to remove.
+///
+/// A `OnceCell` is sound because ALL config layers apply before the wasm boots —
+/// `index.html` runs `config.js` (blocking `<head>` script) and the `config.local.js`
+/// sync-XHR loader, and only then does the deferred `type="module"` bootstrap run. So
+/// by the time any Rust code can call this, the value is final; a page load is the
+/// only way it changes, and that resets this cell with everything else.
+///
+/// (The Helm template additionally `Object.freeze`s `__APP_CONFIG`, which guards
+/// against later MUTATION — but that is not the load-bearing invariant here, and the
+/// committed `dioxus-ui/scripts/config.js` does NOT freeze, so the ordering argument
+/// above is the one that holds everywhere.)
+///
+/// Shared by BOTH directions since issue #2156: the SEND rung strip
+/// ([`send_layer_labels`]) and the RECEIVE rung labels
+/// ([`receive::index_label`]) — so a `Reduced` deployment can no longer render a
+/// "540p" send pip next to a "720p" receive slider end label.
+pub(crate) fn active_camera_top_rung_label() -> &'static str {
+    use std::cell::OnceCell;
+    thread_local! {
+        static TOP_LABEL: OnceCell<&'static str> = const { OnceCell::new() };
+    }
+    TOP_LABEL.with(|cell| {
+        *cell.get_or_init(|| {
+            use videocall_client::adaptive_quality_constants::{
+                simulcast_layers_for, SIMULCAST_MAX_LAYERS,
+            };
+            let ladder = simulcast_layers_for(
+                SIMULCAST_MAX_LAYERS,
+                crate::constants::camera_ladder_variant(),
+            );
+            camera_top_rung_label(ladder.last().map(|t| t.max_height).unwrap_or(720))
+        })
+    })
+}
+
+/// Per-kind SEND rung labels for the deployment's active camera ladder. See
+/// [`send_layer_labels_with_top`] for the pure, variant-explicit form.
+///
+/// The camera top-rung label is resolved ONLY for [`PrefMediaKind::Video`] — the
+/// Audio and Screen arms ignore it, so resolving it eagerly for them was pure waste
+/// on the panel's render path (the same trap `format_audio_send_layer_summary`
+/// already sidesteps by passing a literal).
+pub fn send_layer_labels(kind: PrefMediaKind, layer_max: usize) -> Vec<&'static str> {
+    let camera_top = match kind {
+        PrefMediaKind::Video => active_camera_top_rung_label(),
+        // Inert for these kinds; do not pay for the lookup.
+        PrefMediaKind::Audio | PrefMediaKind::Screen => "720p",
+    };
+    send_layer_labels_with_top(kind, layer_max, camera_top)
+}
+
+/// [`send_layer_labels`] with the camera top-rung label supplied explicitly.
+///
 /// The rung labels to render for a SEND layer slider, lowest layer first
-/// (index == `layer_id`), for an `layer_max`-rung ladder.
+/// (index == `layer_id`), for a `layer_max`-rung ladder.
 ///
 /// VIDEO mirrors the AQ camera ladder selection over `[low 180p, standard 360p,
-/// hd 720p]` (issue 1768): `[low]`, `[low, hd]`, `[low, standard, hd]` for
-/// n = 1/2/3 — note
-/// n=2 SKIPS the middle, matching the AQ `spaced_ladder_positions` rule — so we
-/// special-case the count rather than taking a naive prefix.
+/// top]` (issue 1768): `[low]`, `[low, top]`, `[low, standard, top]` for n = 1/2/3 —
+/// note n=2 SKIPS the middle, matching the AQ `spaced_ladder_positions` rule, so we
+/// special-case the count rather than taking a naive prefix. The TOP label is the
+/// `camera_top` argument (720p on the shipped ladder, 540p under
+/// `experimentalReducedLadder`) rather than a hardcoded string, so it cannot
+/// contradict the ladder-derived `send_layer_res_span`.
 ///
 /// SCREEN mirrors the AQ `simulcast_screen_layers` selection: 1→`[low]`,
 /// 2→`[low, high]` (skips medium), 3→`[low, medium, high]`. The screen tiers use
@@ -1374,13 +1471,21 @@ pub fn tick_offsets(step_count: usize) -> Vec<f32> {
 /// tier labels and read consistently.
 ///
 /// AUDIO mirrors the publisher's CONTIGUOUS audio ladder (`AUDIO_LAYER_KBPS =
-/// [12, 24, 48]` kbps, lowest-first — the mic encoder publishes layers
-/// `0..n` with NO skip, unlike the spaced video/screen ladders): 1→`[12k]`,
-/// 2→`[12k, 24k]`, 3→`[12k, 24k, 48k]`.
+/// [12, 24, 48]` kbps, lowest-first — the mic encoder publishes layers `0..n` with NO
+/// skip, unlike the spaced video/screen ladders): 1→`[12k]`, 2→`[12k, 24k]`,
+/// 3→`[12k, 24k, 48k]`. Both non-camera arms IGNORE `camera_top`.
 ///
-/// Kept in lockstep with the AQ / publisher ladders here (the AQ tables are behind
-/// a wasm-only crate); a reviewer must keep them in sync. Pure / host-tested.
-pub fn send_layer_labels(kind: PrefMediaKind, layer_max: usize) -> Vec<&'static str> {
+/// Kept in lockstep with the AQ / publisher ladders here (the AQ tables are behind a
+/// wasm-only crate); a reviewer must keep them in sync. Pure / host-tested.
+///
+/// Split out so the label logic stays PURE and host-testable: the wrapper's
+/// `camera_ladder_variant()` read needs a browser, which would have dragged this
+/// whole function (and its existing host tests) onto the wasm target.
+pub fn send_layer_labels_with_top(
+    kind: PrefMediaKind,
+    layer_max: usize,
+    camera_top: &'static str,
+) -> Vec<&'static str> {
     let n = layer_max.clamp(1, 3);
     match kind {
         PrefMediaKind::Screen => {
@@ -1402,13 +1507,17 @@ pub fn send_layer_labels(kind: PrefMediaKind, layer_max: usize) -> Vec<&'static 
             }
         }
         PrefMediaKind::Video => {
-            // Camera ladder via spaced_ladder_positions over [low, standard, hd]
-            // (issue 1768: 320×180 / 640×360 / 1280×720):
-            // 1→[low], 2→[low, hd] (skip standard), 3→[low, standard, hd].
+            // Camera ladder via spaced_ladder_positions over the ACTIVE variant's
+            // rungs (issue 1768): 1→[low], 2→[low, top] (skip standard),
+            // 3→[low, standard, top]. The top rung's label depends on the deployed
+            // ladder — 720p by default, 540p under `experimentalReducedLadder` — so
+            // it is resolved from the AQ table rather than hardcoded. Without this
+            // the panel would print a "720p" pip next to a ladder-derived
+            // "180p–540p" span (`send_layer_res_span`) and contradict itself.
             match n {
                 1 => vec!["180p"],
-                2 => vec!["180p", "720p"],
-                _ => vec!["180p", "360p", "720p"],
+                2 => vec!["180p", camera_top],
+                _ => vec!["180p", "360p", camera_top],
             }
         }
     }
@@ -3323,12 +3432,20 @@ pub mod receive {
     // Order is LOWEST-first: index 0 = lowest quality (left thumb), top index =
     // highest quality (right thumb).
 
-    /// Video receive layer labels, index 0 = lowest (180p) … 2 = highest (720p).
+    /// Video receive layer labels for the SHIPPED camera ladder, index 0 = lowest
+    /// (180p) … 2 = highest (720p).
     ///
     /// These mirror `videocall_aq::simulcast_layers(3)` = `[low, standard, hd]`,
     /// lowest-first (issue 1768): low = 320×180 (180p), standard = 640×360 (360p),
     /// hd = 1280×720 (720p). The middle "360p" is `simulcast_layers(3)[1]`, the
     /// "standard" tier at 640×360.
+    ///
+    /// **The TOP entry is variant-dependent** (issue #2156): under
+    /// `experimentalReducedLadder` the camera top rung is 960×540, so the top label
+    /// must read `"540p"`. Do NOT read this table directly for a top-rung label —
+    /// go through [`index_label`] (which resolves the deployment's ladder) or
+    /// [`index_label_with_top`] (pure, variant-explicit). Rungs 0 and 1 are
+    /// byte-identical across variants, deliberately: #1768 lowered only the top.
     pub const VIDEO_LAYER_LABELS: [&str; 3] = ["180p", "360p", "720p"];
 
     /// Screen receive layer labels, index 0 = lowest … 2 = highest.
@@ -3359,8 +3476,67 @@ pub mod receive {
     }
 
     /// Map a layer index to its label for a kind, or `"?"` if out of range.
+    ///
+    /// The VIDEO top rung's label is resolved from the DEPLOYMENT's camera ladder
+    /// (issue #2156), so a `experimentalReducedLadder` deployment reads `"540p"`
+    /// where the shipped ladder reads `"720p"`. Browser-only for that reason (it
+    /// calls [`super::active_camera_top_rung_label`], which reads
+    /// `window.__APP_CONFIG`); the pure, host-testable half is
+    /// [`index_label_with_top`]. The lookup is memoized, so this stays cheap on the
+    /// panel's ~4 Hz render path.
+    ///
+    /// The camera top-rung label is resolved ONLY for [`PrefMediaKind::Video`] — the
+    /// Audio and Screen arms ignore it, so resolving it eagerly for them would be pure
+    /// waste on the render path AND would make the Audio-only callers (the peer-row
+    /// audio label in `signal_quality.rs`) browser-bound for no reason. Same shape as
+    /// [`super::send_layer_labels`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on a non-wasm target when `kind` is [`PrefMediaKind::Video`], because
+    /// the implicit top-rung lookup reads browser runtime config. Native callers
+    /// should use [`index_label_with_top`].
     pub fn index_label(kind: PrefMediaKind, index: u32) -> &'static str {
-        labels_for(kind).get(index as usize).copied().unwrap_or("?")
+        let camera_top = match kind {
+            PrefMediaKind::Video => super::active_camera_top_rung_label(),
+            // Inert for these kinds; do not pay for the lookup.
+            PrefMediaKind::Audio | PrefMediaKind::Screen => "720p",
+        };
+        index_label_with_top(kind, index, camera_top)
+    }
+
+    /// [`index_label`] with the camera top-rung label supplied explicitly.
+    ///
+    /// PURE — no `window.__APP_CONFIG` read — so both ladder variants are testable on
+    /// the native host target with no browser. Mirrors the send side's
+    /// [`super::send_layer_labels`] / [`super::send_layer_labels_with_top`] pair
+    /// (issue #1768), which exists for the same reason.
+    ///
+    /// `camera_top` replaces the LAST entry of [`VIDEO_LAYER_LABELS`] and is IGNORED
+    /// for `Screen`/`Audio`: those ladders are variant-invariant (#1768 touched only
+    /// the camera ladder, and `simulcast_screen_layers` has no variant at all).
+    ///
+    /// Out-of-range indices still return `"?"`. The return stays `&'static str` (no
+    /// allocation) because `camera_top` is itself `&'static` — the labels come from
+    /// [`super::camera_top_rung_label`]'s fixed match arms.
+    ///
+    /// `layer_count` / `top_index` need no variant: the two camera ladders are the
+    /// same DEPTH, asserted at compile time in `videocall-aq`
+    /// (`SIMULCAST_VIDEO_LAYERS_REDUCED.len() == SIMULCAST_VIDEO_LAYERS.len()`).
+    pub fn index_label_with_top(
+        kind: PrefMediaKind,
+        index: u32,
+        camera_top: &'static str,
+    ) -> &'static str {
+        let labels = labels_for(kind);
+        let Some(label) = labels.get(index as usize).copied() else {
+            return "?";
+        };
+        // Only the camera ladder's TOP rung moves with the variant.
+        if matches!(kind, PrefMediaKind::Video) && index as usize == labels.len() - 1 {
+            return camera_top;
+        }
+        label
     }
 
     // ── dual-thumb range slider model (receive: left=low index) ────
@@ -3422,10 +3598,34 @@ pub mod receive {
         }
     }
 
-    /// Concrete span text for the slider readout. Pure.
+    /// Concrete span text for the slider readout, e.g. `"180p – 540p"`.
+    ///
+    /// Resolves the VIDEO top rung from the deployment's camera ladder (issue #2156),
+    /// so the visible band never contradicts the rung labels beside it. Browser-bound
+    /// for that reason; the pure, variant-explicit form is [`span_text_with_top`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on a non-wasm target when `kind` is [`PrefMediaKind::Video`], because
+    /// the implicit top-rung lookup reads browser runtime config. Native callers
+    /// should use [`span_text_with_top`].
     pub fn span_text(kind: PrefMediaKind, sel: RangeSel) -> String {
-        let low = index_label(kind, sel.min_pos);
-        let high = index_label(kind, sel.max_pos);
+        let camera_top = match kind {
+            PrefMediaKind::Video => super::active_camera_top_rung_label(),
+            PrefMediaKind::Audio | PrefMediaKind::Screen => "720p",
+        };
+        span_text_with_top(kind, sel, camera_top)
+    }
+
+    /// [`span_text`] with the camera top-rung label supplied explicitly. Pure /
+    /// host-tested for BOTH ladder variants.
+    pub fn span_text_with_top(
+        kind: PrefMediaKind,
+        sel: RangeSel,
+        camera_top: &'static str,
+    ) -> String {
+        let low = index_label_with_top(kind, sel.min_pos, camera_top);
+        let high = index_label_with_top(kind, sel.max_pos, camera_top);
         if sel.min_pos == sel.max_pos {
             low.to_string()
         } else {
@@ -4039,8 +4239,13 @@ pub mod receive {
             assert_eq!(top_index(PrefMediaKind::Audio), 2);
         }
 
+        /// Issue #2156: the public `index_label` reads `window.__APP_CONFIG` for the
+        /// camera top rung, so the host suite exercises the PURE form. `"720p"` here
+        /// is the shipped ladder's top — the same value
+        /// `active_camera_top_rung_label()` resolves with the flag OFF.
         #[test]
         fn index_label_receive_convention_not_inverted() {
+            let index_label = |kind, i| index_label_with_top(kind, i, "720p");
             // index 0 = LOWEST quality (left), top index = HIGHEST (right).
             assert_eq!(index_label(PrefMediaKind::Video, 0), "180p");
             assert_eq!(index_label(PrefMediaKind::Video, 2), "720p");
@@ -4050,6 +4255,122 @@ pub mod receive {
             assert_eq!(index_label(PrefMediaKind::Audio, 1), "mid (24k)");
             assert_eq!(index_label(PrefMediaKind::Audio, 2), "high (48k)");
             assert_eq!(index_label(PrefMediaKind::Audio, 5), "?");
+        }
+
+        /// Issue #2156 — the CORE of the fix. Under `experimentalReducedLadder` the
+        /// receive VIDEO top rung must read `"540p"`, and ONLY the top rung may move.
+        ///
+        /// The expected top labels are derived from the AQ tables via the SAME
+        /// production fn the browser half uses (`camera_top_rung_label` over
+        /// `simulcast_layers_for`), so this cannot drift from the real ladders — and
+        /// the two arms are asserted DIFFERENT, so a `index_label_with_top` that
+        /// ignored `camera_top` fails.
+        ///
+        /// MUTATION: drop the `index as usize == labels.len() - 1` branch from
+        /// `index_label_with_top` (returning the table entry unconditionally) and the
+        /// reduced-arm top assertion fails.
+        #[test]
+        fn reduced_ladder_moves_only_the_receive_video_top_label() {
+            use videocall_client::adaptive_quality_constants::{
+                simulcast_layers_for, LadderVariant, SIMULCAST_MAX_LAYERS,
+            };
+            let top_label_for = |variant| {
+                let ladder = simulcast_layers_for(SIMULCAST_MAX_LAYERS, variant);
+                super::super::camera_top_rung_label(
+                    ladder.last().map(|t| t.max_height).unwrap_or(720),
+                )
+            };
+            let shipped = top_label_for(LadderVariant::Default);
+            let reduced = top_label_for(LadderVariant::Reduced);
+            assert_eq!(shipped, "720p", "the shipped camera top rung is 1280x720");
+            assert_eq!(
+                reduced, "540p",
+                "issue 1768's reduced camera top rung is 960x540"
+            );
+            assert_ne!(
+                shipped, reduced,
+                "if these agree the whole issue 2156 fix is unobservable"
+            );
+
+            // TOP rung: follows the variant. This is the `720p`-vs-`540p` slider end
+            // label / aria-valuetext the issue reports.
+            assert_eq!(
+                index_label_with_top(PrefMediaKind::Video, 2, shipped),
+                "720p"
+            );
+            assert_eq!(
+                index_label_with_top(PrefMediaKind::Video, 2, reduced),
+                "540p"
+            );
+
+            // NON-top rungs: identical across variants (#1768 lowered only the top).
+            for idx in 0..2u32 {
+                assert_eq!(
+                    index_label_with_top(PrefMediaKind::Video, idx, shipped),
+                    index_label_with_top(PrefMediaKind::Video, idx, reduced),
+                    "video rung {idx} must not move with the ladder variant"
+                );
+            }
+
+            // SCREEN + AUDIO ignore `camera_top` entirely — their ladders are
+            // untouched by #1768. Guards the over-fix the issue explicitly warns off.
+            for kind in [PrefMediaKind::Screen, PrefMediaKind::Audio] {
+                for idx in 0..3u32 {
+                    assert_eq!(
+                        index_label_with_top(kind, idx, shipped),
+                        index_label_with_top(kind, idx, reduced),
+                        "{kind:?} rung {idx} must be variant-invariant"
+                    );
+                }
+            }
+
+            // Out-of-range still degrades to "?" under either variant.
+            assert_eq!(index_label_with_top(PrefMediaKind::Video, 9, reduced), "?");
+        }
+
+        /// The visible band readout must agree with the rung labels beside it under
+        /// BOTH variants (surface 4 in #2156). A partial fix that updated
+        /// `index_label` but left `span_text` reading the const table would render
+        /// "180p – 720p" next to a "540p" end label.
+        ///
+        /// MUTATION: make `span_text_with_top` call `index_label` (the const-table
+        /// path) instead of `index_label_with_top` and the reduced assertion fails.
+        #[test]
+        fn span_text_follows_the_camera_ladder_variant() {
+            let full = RangeSel {
+                min_pos: 0,
+                max_pos: 2,
+            };
+            assert_eq!(
+                span_text_with_top(PrefMediaKind::Video, full, "720p"),
+                "180p – 720p"
+            );
+            assert_eq!(
+                span_text_with_top(PrefMediaKind::Video, full, "540p"),
+                "180p – 540p"
+            );
+            // A collapsed span on the TOP rung renders the single variant-aware label.
+            let top_only = RangeSel {
+                min_pos: 2,
+                max_pos: 2,
+            };
+            assert_eq!(
+                span_text_with_top(PrefMediaKind::Video, top_only, "540p"),
+                "540p"
+            );
+            // A collapsed span BELOW the top is variant-invariant.
+            let mid = RangeSel {
+                min_pos: 1,
+                max_pos: 1,
+            };
+            assert_eq!(
+                span_text_with_top(PrefMediaKind::Video, mid, "540p"),
+                "360p"
+            );
+            assert_eq!(
+                span_text_with_top(PrefMediaKind::Video, mid, "720p"),
+                "360p"
+            );
         }
 
         #[test]
@@ -4140,8 +4461,14 @@ pub mod receive {
             );
         }
 
+        /// Issue #2156: `span_text` now reads the deployment config for the camera
+        /// top rung, so the host suite drives the pure `span_text_with_top`. `"720p"`
+        /// is what `active_camera_top_rung_label()` resolves with the flag OFF (the
+        /// production default); `span_text_follows_the_camera_ladder_variant` covers
+        /// the flag-ON arm.
         #[test]
         fn span_text_renders_concrete_endpoints() {
+            let span_text = |kind, sel| span_text_with_top(kind, sel, "720p");
             assert_eq!(
                 span_text(
                     PrefMediaKind::Video,
@@ -4854,7 +5181,7 @@ mod tests {
         );
         // Sanity: the summary's top label is exactly the top ACTIVE rung label, so
         // the summary can never drift from the rung strip.
-        let labels = send_layer_labels(Audio, 3);
+        let labels = send_layer_labels_with_top(Audio, 3, "720p");
         assert_eq!(labels.last().copied(), Some("48k"));
     }
 
@@ -5793,9 +6120,17 @@ mod tests {
         );
     }
 
+    /// Host-testable via `send_layer_labels_with_top` (the pure form): the public
+    /// `send_layer_labels` wrapper resolves the camera top rung from
+    /// `window.__APP_CONFIG`, which panics on a native target.
     #[test]
     fn send_layer_labels_match_per_kind_ladders() {
         use PrefMediaKind::{Audio, Screen, Video};
+        // Default camera ladder top rung (issue #1768: "540p" under
+        // experimentalReducedLadder — covered by
+        // `send_layer_labels_track_the_camera_top_rung` below).
+        const TOP: &str = "720p";
+        let send_layer_labels = |kind, n| super::send_layer_labels_with_top(kind, n, TOP);
         // VIDEO ladder (spaced, issue 1768): 1→[180p], 2→[180p,720p] (skip 360p),
         // 3→full.
         assert_eq!(send_layer_labels(Video, 1), vec!["180p"]);
@@ -5817,12 +6152,93 @@ mod tests {
         assert_eq!(send_layer_labels(Audio, 3), vec!["12k", "24k", "48k"]);
     }
 
+    /// Issue #1768: the SEND rung LABEL must track the deployed camera ladder's top
+    /// rung, so it cannot contradict `send_layer_res_span`, which derives its span
+    /// from the live snapshot. Before this, the label was hardcoded "720p" and a
+    /// reduced-ladder deployment showed a "720p" pip next to a "180p–540p" span.
+    ///
+    /// MUTATION: hardcode the Video arm's top label back to `"720p"` and the reduced
+    /// assertions fail; make `camera_top_rung_label` ignore its argument and the
+    /// 540p case fails.
+    #[test]
+    fn send_layer_labels_track_the_camera_top_rung() {
+        use PrefMediaKind::Video;
+        // Reduced ladder (540p top): both the n=2 skip form and the full ladder.
+        assert_eq!(
+            send_layer_labels_with_top(Video, 3, "540p"),
+            vec!["180p", "360p", "540p"]
+        );
+        assert_eq!(
+            send_layer_labels_with_top(Video, 2, "540p"),
+            vec!["180p", "540p"]
+        );
+        // The base rung is shared across variants and must NOT move.
+        assert_eq!(send_layer_labels_with_top(Video, 1, "540p"), vec!["180p"]);
+        // Non-camera kinds ignore the camera argument entirely.
+        assert_eq!(
+            send_layer_labels_with_top(PrefMediaKind::Audio, 3, "540p"),
+            vec!["12k", "24k", "48k"]
+        );
+        assert_eq!(
+            send_layer_labels_with_top(PrefMediaKind::Screen, 3, "540p"),
+            vec!["low", "medium", "high"]
+        );
+    }
+
+    /// The height→label mapping, including the fall-back for an unrecognised height
+    /// (visible-wrong rather than silently-wrong).
+    ///
+    /// MUTATION: change the `540` arm and the first assertion fails.
+    #[test]
+    fn camera_top_rung_label_maps_known_heights() {
+        assert_eq!(camera_top_rung_label(540), "540p");
+        assert_eq!(camera_top_rung_label(720), "720p");
+        assert_eq!(camera_top_rung_label(1080), "1080p");
+        // A future retune with no arm here falls back to the shipped label rather
+        // than rendering an empty or bogus pip.
+        assert_eq!(camera_top_rung_label(999), "720p");
+    }
+
+    /// The label and the ladder-derived SPAN must agree — the specific
+    /// self-contradiction this change fixes ("720p" pip beside a "180p–540p" span).
+    #[test]
+    fn send_label_top_agrees_with_the_res_span_under_the_reduced_ladder() {
+        use videocall_client::adaptive_quality_constants::{
+            simulcast_layers_for, LadderVariant, SIMULCAST_MAX_LAYERS,
+        };
+        use videocall_client::SimulcastLayerInfo;
+        // Build a snapshot from the REDUCED ladder exactly as the encoder would.
+        let ladder = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Reduced);
+        let snap = SimulcastSendSnapshot {
+            simulcast_active: true,
+            effective_layers: ladder.len() as u32,
+            active_layers: ladder.len() as u32,
+            layers: ladder
+                .iter()
+                .enumerate()
+                .map(|(i, t)| SimulcastLayerInfo {
+                    layer_id: i as u32,
+                    bitrate_kbps: t.ideal_bitrate_kbps,
+                    width: t.max_width,
+                    height: t.max_height,
+                })
+                .collect(),
+        };
+        let span = send_layer_res_span(&snap);
+        let top_label = camera_top_rung_label(ladder.last().expect("non-empty ladder").max_height);
+        assert!(
+            span.ends_with(top_label),
+            "the ladder-derived span {span:?} must end with the pip label {top_label:?} \
+             — a mismatch is the self-contradiction this test exists to prevent"
+        );
+    }
+
     #[test]
     fn layer_send_rungs_active_up_to_ceiling_base_always_active() {
         // The selection-driven strip: pips L0..=ceiling are active, the rest shed,
         // and L0 (base) is ALWAYS active (the pinned-floor invariant). On a 3-rung
         // video ladder with ceiling at pos 1: [L0 active, L1 active, L2 shed].
-        let labels = send_layer_labels(PrefMediaKind::Video, 3);
+        let labels = send_layer_labels_with_top(PrefMediaKind::Video, 3, "720p");
         let rungs = layer_send_rungs(&labels, 1);
         assert_eq!(rungs.len(), 3);
         assert!(rungs[0].active, "base layer always active");

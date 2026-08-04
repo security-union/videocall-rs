@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+import { api } from "../api/client";
 import { RemoteHostsPanel } from "../components/RemoteHostsPanel";
 
 interface StoredHost {
@@ -279,16 +280,12 @@ describe("RemoteHostsPanel", () => {
     expect(screen.getByTestId("remote-host-dialog-shell-sh")).toBeInTheDocument();
     expect(screen.getByTestId("remote-host-dialog-shell-custom")).toBeInTheDocument();
     // Default radio: bash. Default profileFile (hint): ~/.bash_profile.
-    expect(
-      (screen.getByTestId("remote-host-dialog-shell-bash") as HTMLInputElement).checked,
-    ).toBe(true);
-    const profileInput = screen.getByTestId(
-      "remote-host-dialog-profileFile",
-    ) as HTMLInputElement;
+    expect((screen.getByTestId("remote-host-dialog-shell-bash") as HTMLInputElement).checked).toBe(
+      true,
+    );
+    const profileInput = screen.getByTestId("remote-host-dialog-profileFile") as HTMLInputElement;
     expect(profileInput.value).toBe("~/.bash_profile");
-    const preCommandInput = screen.getByTestId(
-      "remote-host-dialog-preCommand",
-    ) as HTMLInputElement;
+    const preCommandInput = screen.getByTestId("remote-host-dialog-preCommand") as HTMLInputElement;
     expect(preCommandInput).toBeInTheDocument();
     expect(preCommandInput.value).toBe("");
   });
@@ -297,9 +294,7 @@ describe("RemoteHostsPanel", () => {
     renderPanel();
     fireEvent.click(screen.getByTestId("remote-hosts-add"));
     await screen.findByTestId("remote-host-dialog");
-    const profileInput = screen.getByTestId(
-      "remote-host-dialog-profileFile",
-    ) as HTMLInputElement;
+    const profileInput = screen.getByTestId("remote-host-dialog-profileFile") as HTMLInputElement;
     // First clear the bash default, then switch to zsh — the empty input
     // should re-hint to ~/.zshrc.
     fireEvent.change(profileInput, { target: { value: "" } });
@@ -313,9 +308,7 @@ describe("RemoteHostsPanel", () => {
     renderPanel();
     fireEvent.click(screen.getByTestId("remote-hosts-add"));
     await screen.findByTestId("remote-host-dialog");
-    const profileInput = screen.getByTestId(
-      "remote-host-dialog-profileFile",
-    ) as HTMLInputElement;
+    const profileInput = screen.getByTestId("remote-host-dialog-profileFile") as HTMLInputElement;
     fireEvent.change(profileInput, { target: { value: "/etc/profile" } });
     fireEvent.click(screen.getByTestId("remote-host-dialog-shell-zsh"));
     // The hint must NOT clobber the operator's manual value.
@@ -336,15 +329,15 @@ describe("RemoteHostsPanel", () => {
     await screen.findByTestId("remote-host-row-zsh-host");
     fireEvent.click(screen.getByTestId("remote-host-edit-zsh-host"));
     await screen.findByTestId("remote-host-dialog");
-    expect(
-      (screen.getByTestId("remote-host-dialog-shell-zsh") as HTMLInputElement).checked,
-    ).toBe(true);
-    expect(
-      (screen.getByTestId("remote-host-dialog-profileFile") as HTMLInputElement).value,
-    ).toBe("~/.zshrc");
-    expect(
-      (screen.getByTestId("remote-host-dialog-preCommand") as HTMLInputElement).value,
-    ).toBe(". ~/.nvm/nvm.sh && nvm use 22");
+    expect((screen.getByTestId("remote-host-dialog-shell-zsh") as HTMLInputElement).checked).toBe(
+      true,
+    );
+    expect((screen.getByTestId("remote-host-dialog-profileFile") as HTMLInputElement).value).toBe(
+      "~/.zshrc",
+    );
+    expect((screen.getByTestId("remote-host-dialog-preCommand") as HTMLInputElement).value).toBe(
+      ". ~/.nvm/nvm.sh && nvm use 22",
+    );
   });
 
   it("custom-path shell lands on the custom radio and exposes a free-form text input", async () => {
@@ -386,9 +379,7 @@ describe("RemoteHostsPanel", () => {
     // Wait for the profileFile hint to flip to ~/.zshrc (the hint only
     // fires when the slot is still empty; we cleared it explicitly to
     // avoid a race with the initial bash default).
-    const profileInput = screen.getByTestId(
-      "remote-host-dialog-profileFile",
-    ) as HTMLInputElement;
+    const profileInput = screen.getByTestId("remote-host-dialog-profileFile") as HTMLInputElement;
     fireEvent.change(profileInput, { target: { value: "~/.zshrc" } });
     fireEvent.change(screen.getByTestId("remote-host-dialog-preCommand"), {
       target: { value: ". ~/.nvm/nvm.sh && nvm use 22" },
@@ -530,9 +521,7 @@ describe("RemoteHostsPanel", () => {
     // Empty form → the preview surface should display the empty-state
     // hint (preview fetch is short-circuited until host+reposPath are
     // filled in).
-    expect(
-      screen.getByTestId("remote-host-dialog-sample-cmd-empty"),
-    ).toBeInTheDocument();
+    expect(screen.getByTestId("remote-host-dialog-sample-cmd-empty")).toBeInTheDocument();
     fireEvent.change(screen.getByTestId("remote-host-dialog-host"), {
       target: { value: "lab.intra" },
     });
@@ -543,9 +532,7 @@ describe("RemoteHostsPanel", () => {
     // rendered display string to appear in the card.
     await waitFor(
       () => {
-        expect(
-          screen.getByTestId("remote-host-dialog-sample-cmd-display"),
-        ).toBeInTheDocument();
+        expect(screen.getByTestId("remote-host-dialog-sample-cmd-display")).toBeInTheDocument();
       },
       { timeout: 2_000 },
     );
@@ -568,6 +555,25 @@ describe("RemoteHostsPanel", () => {
         // decision the launcher will, deterministically.
         forwardSsoState: true,
       }),
+    });
+  });
+
+  it("forwards launchSpec.videoMode through the unsaved-host preview API", async () => {
+    await api.previewSshHost({
+      host: {
+        label: "preview",
+        host: "lab.intra",
+        reposPath: "/home/alice/videocall",
+      },
+      launchSpec: {
+        videoMode: "clock",
+      },
+    });
+
+    expect(state.lastPreviewed).toMatchObject({
+      launchSpec: {
+        videoMode: "clock",
+      },
     });
   });
 });

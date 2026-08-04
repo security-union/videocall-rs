@@ -492,6 +492,91 @@ message HealthPacket {
   // browser left the queue un-age-capped or did not honor the setter; any finite
   // value near the requested cap confirms the staleness knob took effect.
   optional double wt_incoming_datagram_max_age_ms = 108; // (issue 2031)
+
+  // Actual frames/sec the SCREEN encoder's base layer is producing (issue 2147).
+  //
+  // WHY a separate field rather than reusing encoder_output_fps (field 29): that
+  // field is CAMERA-only and has no media_kind discriminator, so there was
+  // previously NO publisher-side screen-encoder fps signal anywhere in the
+  // system. In the #2143 run the camera gauge read a healthy 7-9 fps throughout a
+  // screen-share-triggered room-wide freeze (856 freshness_skip events,
+  // head_age up to 23s) because the camera encoder genuinely WAS healthy — the
+  // screen encoder, where the trouble was, was unobservable.
+  //
+  // HONESTY (deliberately NOT gated on `> 0`, unlike field 29 — see #2079): a
+  // screen encoder that has STOPPED producing must be distinguishable from one
+  // that never started. Field 29's `> 0` gate makes a genuine total stall absent
+  // from the wire and therefore indistinguishable from never-started; that
+  // conflation is exactly what made it useless as a freeze signal. This field is
+  // emitted whenever the screen encoder is WIRED, including an honest 0.
+  //
+  // ⚠️ THIS FIELD ALONE CANNOT SEE A FREEZE. It counts encoded CHUNKS, and the
+  // static/PLI synthetic retained-frame re-encodes share the same base-layer output
+  // callback as fresh captures, so during the #1899/#2143 stall it reads a small
+  // NONZERO while receivers sit on minutes-stale content. Pair it with
+  // `screen_encoder_stall_episodes` / `screen_encoder_max_stall_gap_ms`
+  // (fields 110/111), which count the tick-starvation episodes that produce exactly
+  // that symptom. This field answers "is the encoder emitting anything at all";
+  // those answer "is what it emits actually fresh".
+  //
+  // WHEN IS IT ABSENT? Only when no screen encoder has been bound to the health
+  // reporter at all. The dioxus-ui client constructs its ScreenEncoder eagerly at
+  // Host mount and binds it in the same pass, so in THAT client the field is
+  // effectively always present — absence is reserved for other/future consumers
+  // of this proto that never bind one (and for old clients predating this field).
+  // Do NOT read absence as "not sharing"; use screen_sharing_active for that.
+  //
+  // READING A 0: a legitimately static share reports 0 and that is CORRECT, not a
+  // fault — a static share emits ~4 synthetic keyframes on the 3s floor
+  // (SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET) over ~12s and then goes quiet by design.
+  // A 0 while NOT sharing is equally expected (the encoder is bound but idle, and
+  // stop() resets the atom to 0). So pair this with screen_sharing_active
+  // (field 28) to separate the states that matter:
+  //   * 0 with active=false → not sharing. Nothing to see.
+  //   * 0 with active=true  → sharing; static-and-fine OR stalled. Disambiguate
+  //                           with the receivers' rising content_staleness_ms /
+  //                           freshness_skip, which a static share does not show.
+  //   * >0 with active=true → sharing and producing.
+  // Screen fps also has a deliberately longer idle decay than camera
+  // (SCREEN_ENCODER_FPS_IDLE_DECAY_MS = 5000 vs 2000) precisely because static
+  // shares are expected.
+  optional uint32 screen_encoder_output_fps = 109; // (issue 2147)
+
+  // Screen encoder TICK-STARVATION stall signal (issue 2147; discussion 1960
+  // issue 2). These are the fields that can actually see a screen freeze — read
+  // them TOGETHER with screen_encoder_output_fps above, which on its own cannot.
+  //
+  // WHY fps ALONE IS NOT ENOUGH (the #2143 mechanism). `screen_encoder_output_fps`
+  // counts encoded CHUNKS, and the static/PLI synthetic retained-frame re-encodes
+  // go through the same base-layer output callback as fresh captures — the callback
+  // cannot tell them apart. So during the #1899/#2143 freeze (PLI answers
+  // collapsing while the encoder still emits some output) the fps field reads a
+  // small NONZERO — "sharing and producing" — while every receiver is frozen on
+  // minutes-stale content. `content_staleness_ms` does not rescue it either: that
+  // gauge is gated on `fps_received > 0`, so a no-arrivals stall reports its 0.0
+  // "at live" default.
+  //
+  // Each stall episode is one `'encode` loop-tick resume whose wall-clock gap since
+  // the previous tick exceeded SCREEN_ENCODER_STALL_GAP_MS — i.e. a main-thread
+  // freeze during which the encoder could not sample fresh capture and receivers
+  // saw `fps > 0` on stale re-encoded content. That is exactly the symptom, made
+  // countable.
+  //
+  // HOW TO READ THE PAIR:
+  //   * fps > 0, episodes FLAT      → genuinely healthy.
+  //   * fps > 0, episodes RISING    → THE FREEZE. Re-encoded stale content.
+  //   * fps == 0, sharing active    → idle/static share (honest, see field 109).
+  //
+  // Cumulative since PAGE LOAD (not since the last packet) and never reset, so
+  // consume with increase()/rate(). Emitted only once nonzero, matching the
+  // `screen_encoder_restarts_*` counters' convention: a 0 carries no information
+  // for a monotonic counter, unlike the fps gauge where 0 is a real reading.
+  optional uint64 screen_encoder_stall_episodes = 110; // (issue 2147)
+  // Largest single tick-starvation gap observed since page load (ms, rounded).
+  // The severity companion to the episode count: 3 episodes of 200ms is jitter,
+  // 3 episodes with a 23000ms max is the #2143 incident. Same emit-when-nonzero
+  // convention as the counter above.
+  optional uint64 screen_encoder_max_stall_gap_ms = 111; // (issue 2147)
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

@@ -6,7 +6,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { BotTask } from "../orchestrator";
 import { generateToken } from "./auth";
+import { applyNetemAction, buildNetemShapeArgs, NETEM_PROFILES, type NetemExec } from "./netem";
 import {
+  DEFAULT_BIND_ADDRESS,
+  isLoopbackBindAddress,
   type ControlServerHandle,
   type OrchestratorControlSurface,
   startControlServer,
@@ -1334,5 +1337,189 @@ pause_ms: 0
       headers: { authorization: `Bearer ${token}` },
     });
     expect(second.body).toEqual(first.body);
+  });
+});
+
+describe("isLoopbackBindAddress", () => {
+  it.each(["127.0.0.1", "127.0.0.2", "127.255.255.255", "::1", "[::1]", "localhost", "LOCALHOST"])(
+    "treats %s as loopback",
+    (addr) => {
+      expect(isLoopbackBindAddress(addr)).toBe(true);
+    },
+  );
+
+  it.each(["0.0.0.0", "::", "10.0.0.5", "192.168.1.10", "example.com", "0000"])(
+    "treats %s as non-loopback",
+    (addr) => {
+      expect(isLoopbackBindAddress(addr)).toBe(false);
+    },
+  );
+
+  it("the default bind address is loopback", () => {
+    expect(isLoopbackBindAddress(DEFAULT_BIND_ADDRESS)).toBe(true);
+  });
+});
+
+describe("control server bind address + token gate", () => {
+  it("starts on the loopback default even with an empty token (local-only convenience)", async () => {
+    // Proves the default is loopback: if DEFAULT_BIND_ADDRESS were
+    // non-loopback, an empty token would be refused below.
+    const handle = await startControlServer({ port: 0, token: "", surface: mockSurface() });
+    try {
+      expect(handle.port).toBeGreaterThan(0);
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("REFUSES to start on a non-loopback bind without a token", async () => {
+    await expect(
+      startControlServer({
+        port: 0,
+        token: "",
+        bindAddress: "0.0.0.0",
+        surface: mockSurface(),
+      }),
+    ).rejects.toThrow(/non-loopback address .* without a token/);
+  });
+
+  it("REFUSES a whitespace-only token on a non-loopback bind", async () => {
+    await expect(
+      startControlServer({
+        port: 0,
+        token: "   ",
+        bindAddress: "0.0.0.0",
+        surface: mockSurface(),
+      }),
+    ).rejects.toThrow(/without a token/);
+  });
+
+  it("starts on 0.0.0.0 when a token is supplied, and is reachable via loopback", async () => {
+    const tok = generateToken();
+    const handle = await startControlServer({
+      port: 0,
+      token: tok,
+      bindAddress: "0.0.0.0",
+      surface: mockSurface(),
+    });
+    try {
+      // Bound on all interfaces ⇒ reachable via 127.0.0.1 with the token.
+      const res = await fetchJson(handle.port, "/bots", {
+        headers: { authorization: `Bearer ${tok}` },
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      await handle.close();
+    }
+  });
+});
+
+describe("POST/DELETE /netem", () => {
+  /**
+   * Build a surface whose `setNetem` runs the REAL command-builder via a
+   * recording exec, so the endpoint is tested end-to-end (resolve →
+   * build → echo argv) without ever shelling `tc`.
+   */
+  function netemSurface(iface = "eth0"): {
+    surface: OrchestratorControlSurface;
+    calls: Array<{ file: string; args: string[] }>;
+  } {
+    const base = mockSurface();
+    const calls: Array<{ file: string; args: string[] }> = [];
+    const exec: NetemExec = async (file, args) => {
+      calls.push({ file, args });
+      return { stdout: "", stderr: "" };
+    };
+    base.setNetem = (action) => applyNetemAction(action, { iface, exec });
+    return { surface: base, calls };
+  }
+
+  it("replies 501 when the orchestrator has no netem capability", async () => {
+    // A plain mockSurface has NO setNetem (dashboard / operator-host mode).
+    const tok = generateToken();
+    const h = await startControlServer({ port: 0, token: tok, surface: mockSurface() });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "POST",
+        headers: { authorization: `Bearer ${tok}` },
+        body: { profile: "lossy_mobile" },
+      });
+      expect(res.status).toBe(501);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("applies a named profile and echoes the exact tc argv", async () => {
+    const tok = generateToken();
+    const { surface, calls } = netemSurface("eth0");
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "POST",
+        headers: { authorization: `Bearer ${tok}` },
+        body: { profile: "lossy_mobile" },
+      });
+      expect(res.status).toBe(200);
+      const expectedArgs = buildNetemShapeArgs("eth0", NETEM_PROFILES.lossy_mobile!);
+      expect(res.body).toEqual({
+        op: "shape",
+        label: "lossy_mobile",
+        argv: ["tc", ...expectedArgs],
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].args).toEqual(expectedArgs);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("clears shaping on DELETE /netem", async () => {
+    const tok = generateToken();
+    const { surface, calls } = netemSurface("eth0");
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${tok}` },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ op: "clear" });
+      expect(calls[0].args).toEqual(["qdisc", "del", "dev", "eth0", "root"]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("rejects an unknown profile with 400 (and never calls tc)", async () => {
+    const tok = generateToken();
+    const { surface, calls } = netemSurface("eth0");
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "POST",
+        headers: { authorization: `Bearer ${tok}` },
+        body: { profile: "turbo" },
+      });
+      expect(res.status).toBe(400);
+      expect(calls).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("requires auth", async () => {
+    const tok = generateToken();
+    const { surface } = netemSurface("eth0");
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "POST",
+        body: { profile: "clean" },
+      });
+      expect(res.status).toBe(401);
+    } finally {
+      await h.close();
+    }
   });
 });

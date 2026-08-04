@@ -295,26 +295,79 @@ test.describe("Action bar overflow menu", () => {
   //      recompute were gated on hover/interaction the trigger would linger.
   //  (b) Beyond the dead zone: widen to 1000px — well past the ~830px point
   //      where even the un-fixed arithmetic restores — so a *frozen viewport
-  //      signal* (a listener-lifecycle ratchet) would surface as the trigger
-  //      never clearing at any width. Deliberately no hover, no other input.
+  //      signal* (a listener-lifecycle ratchet) would surface as buttons never
+  //      coming back at any width. Deliberately no hover, no other input.
+  //  (c) FULL restoration at a reference desktop width.
+  //
+  // (b) is asserted as a strict INCREASE in the number of visible secondary
+  // slots rather than "the trigger is gone". Those are not the same claim, and
+  // the difference is what issue 2135 exposed: 1000px was chosen for the
+  // reactivity property, but "trigger gone" quietly also asserted that the
+  // whole default bar FITS in 1000px — an incidental property that held with
+  // ~35px to spare, i.e. half a button. Adding one default slot (RaiseHand)
+  // spent it, and a test about resize reactivity failed for a reason that had
+  // nothing to do with resize reactivity.
+  //
+  // Counting visible slots pins the reactivity property directly and does not
+  // care how many slots the default layout has. The "everything is back"
+  // claim keeps its own step (c) at a width the bar genuinely fits, which
+  // `default_action_bar_fits_entirely_at_the_e2e_wide_width` (attendants.rs)
+  // verifies in milliseconds so this spec cannot be blindsided again.
 
   test("widening restores buttons with no hover, well beyond the dead zone @bvt1", async ({
     page,
   }) => {
     await joinMeeting(page, "widen_no_hover");
 
+    // Overflowed slots stay in the DOM and are hidden by an `is-overflow-hidden`
+    // class, so `count()` is the FULL secondary set at every width and
+    // `isVisible()` is what distinguishes. That is what makes "visible === total"
+    // below a real assertion rather than a tautology.
+    const secondaryWrappers = page.locator(".action-bar-slot-wrapper.slot-secondary");
+    async function visibleSecondaryCount(): Promise<number> {
+      const total = await secondaryWrappers.count();
+      let shown = 0;
+      for (let i = 0; i < total; i++) {
+        if (await secondaryWrappers.nth(i).isVisible()) {
+          shown++;
+        }
+      }
+      return shown;
+    }
+
     // Narrow so the overflow trigger appears — no hover.
     await page.setViewportSize({ width: 540, height: 800 });
     await page.waitForTimeout(300); // let the rAF-throttled resize settle
     await expect(page.locator("#overflow-menu-trigger")).toBeVisible({ timeout: 5_000 });
+    const atNarrow = await visibleSecondaryCount();
 
-    // Widen far past the dead zone, WITHOUT hovering or any other interaction.
+    // (b) Widen far past the dead zone, WITHOUT hovering or any other input.
+    // The recompute alone must bring buttons back. A frozen viewport signal
+    // leaves this count exactly where it was.
     await page.setViewportSize({ width: 1000, height: 800 });
     await page.waitForTimeout(300);
+    const atWide = await visibleSecondaryCount();
+    expect(
+      atWide,
+      `widening 540px -> 1000px with no hover revealed no additional secondary buttons ` +
+        `(${atNarrow} -> ${atWide}); the overflow recompute is not tracking the resize`,
+    ).toBeGreaterThan(atNarrow);
 
-    // The recompute alone (no hover) must clear the overflow: trigger gone …
+    // (c) At a reference desktop width the bar must be FULLY restored. Asserting
+    // that every secondary wrapper is visible is strictly stronger than asserting
+    // the trigger is absent — the trigger is `display:none` exactly when nothing
+    // overflows, so an absent trigger is implied by, but does not imply, this.
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.waitForTimeout(300);
+    const total = await secondaryWrappers.count();
+    expect(total).toBeGreaterThan(0);
+    expect(
+      await visibleSecondaryCount(),
+      `not every secondary action-bar button is visible at 1280px (${total} rendered); ` +
+        `either the default layout outgrew a reference desktop viewport or a slot is stuck hidden`,
+    ).toBe(total);
     await expect(page.locator("#overflow-menu-trigger")).not.toBeVisible({ timeout: 5_000 });
-    // … and a representative overflowable button is shown again.
+    // … and the representative overflowable button is shown again.
     const chatSlot = page.locator('.action-bar-slot-wrapper[data-slot="chat"]');
     if ((await chatSlot.count()) > 0) {
       await expect(chatSlot).toBeVisible({ timeout: 5_000 });

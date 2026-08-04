@@ -30,6 +30,7 @@ use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
+use crate::password::ClientAddr;
 use crate::search;
 use crate::state::AppState;
 use crate::token::{generate_observer_token, generate_room_token};
@@ -104,10 +105,44 @@ async fn enforce_display_name_rate_limit(state: &AppState, user_id: &str) -> Res
 /// If the meeting doesn't exist, create it with the joining user as host.
 /// Hosts are auto-admitted and receive a room_token immediately.
 /// Attendees enter the waiting room.
+///
+/// # Meeting password (issue #1613)
+///
+/// When the meeting has a `password_hash`, every joiner **except the meeting
+/// owner** must supply the matching `password` in the request body. The
+/// verification itself lives in [`join_as_attendee`], which the non-owner branch
+/// below delegates to.
+///
+/// The owner exemption is deliberate. `creator_id` already carries strictly
+/// more authority over the meeting than the password does — the owner can
+/// `PATCH` its settings, `POST /end` it, or `DELETE` it outright without ever
+/// knowing the password — so demanding they re-type their own meeting password
+/// buys no access control, only friction.
+///
+/// For a meeting with a non-NULL `creator_id` — which is every meeting this
+/// service creates, since both `db_meetings::create` and `create_with_options`
+/// bind a `&str` — the exemption also leaves the owner a way back in if the
+/// stored hash is ever corrupted, which
+/// [`crate::password::MeetingPasswordGate::verify`] denies to everyone else by
+/// design. It does **not** rescue a legacy or manually-inserted row with a NULL
+/// `creator_id`: `None != Some(_)`, so every caller is a non-owner there and a
+/// corrupt hash makes such a meeting unjoinable by anyone. That is the correct
+/// direction to fail, but it is not recoverable in-band.
+///
+/// A transfer-host target is *not* the creator and therefore is *not* exempt:
+/// they take the attendee branch and are checked like anyone else. Note the
+/// exemption keys on `creator_id`, never on `is_host`, which is what stops a
+/// host transfer from handing out a bypass.
+///
+/// [`ClientAddr`] resolves the address the failed-attempt throttle is keyed on.
+/// It is infallible — an unattributable request is served but not throttled —
+/// so it can never turn into a 500 on a deployment that does not populate
+/// `ConnectInfo`.
 pub async fn join_meeting(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
     Path(meeting_id): Path<String>,
+    ClientAddr(client_ip): ClientAddr,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let display_name = body
@@ -116,6 +151,7 @@ pub async fn join_meeting(
         .map(|raw| validate_display_name(raw).map_err(|_| AppError::invalid_display_name()))
         .transpose()?;
     let display_name = display_name.as_deref();
+    let supplied_password = body.as_ref().and_then(|b| b.password.as_deref());
 
     // Rate-limit display-name changes via the join path to prevent
     // leave+rejoin bypass of the rename rate limiter.
@@ -232,6 +268,10 @@ pub async fn join_meeting(
         resp.host_user_id = meeting.creator_id;
         Ok(Json(APIResponse::ok(resp)))
     } else {
+        // Not the owner → the meeting password (if any) gates this join.
+        // `join_as_attendee` performs the check itself against the row it owns;
+        // see `crate::password` for why the verification lives there rather
+        // than here.
         join_as_attendee(
             &state,
             meeting,
@@ -240,6 +280,8 @@ pub async fn join_meeting(
             display_name,
             &user_id,
             false,
+            client_ip,
+            supplied_password,
         )
         .await
     }
@@ -250,6 +292,22 @@ pub async fn join_meeting(
 ///
 /// Handles the "waiting_for_meeting" early-return when the meeting is not yet
 /// active, the waiting-room / auto-admit flow, and observer-token generation.
+///
+/// # Meeting password (issue #1613)
+///
+/// The password check is the **first** thing this function does, against
+/// `meeting.password_hash` — the row it owns — rather than against a hash a
+/// caller passed in. That is deliberate: an earlier revision took a
+/// `PasswordCleared` proof token instead, which proved the verifier had run but
+/// not that it had run against *this* meeting's hash.
+///
+/// This is the sole entry point into every `meeting_participants` INSERT for a
+/// non-owner (`db_participants::join_attendee`, whose only two call sites are
+/// below); `admit`/`admit_all` are `UPDATE ... WHERE status = 'waiting'` and
+/// cannot create a row, so a waiting-room admit cannot smuggle in a participant
+/// who never cleared this gate. Keep it that way: a new join path that bypasses
+/// this function bypasses the password.
+#[allow(clippy::too_many_arguments)]
 async fn join_as_attendee(
     state: &AppState,
     meeting: MeetingRow,
@@ -258,7 +316,21 @@ async fn join_as_attendee(
     display_name: Option<&str>,
     fallback_display_name: &str,
     is_guest: bool,
+    client_ip: Option<std::net::IpAddr>,
+    supplied_password: Option<&str>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
+    // Meeting-password gate. Before any DB write, token mint, or NATS publish —
+    // a rejected join must leave no trace.
+    state
+        .password_gate
+        .verify(
+            client_ip,
+            meeting_id,
+            meeting.password_hash.as_deref(),
+            supplied_password,
+        )
+        .await?;
+
     let is_host = meeting.creator_id.as_deref() == Some(user_id);
     let current_state = meeting.state.as_deref().unwrap_or("idle");
     if current_state != "active" {
@@ -506,9 +578,18 @@ async fn join_as_attendee(
 /// POST /api/v1/meetings/{meeting_id}/join-guest
 ///
 /// Allows a guest user (non-authenticated) to join a meeting if guests are allowed.
+///
+/// A guest is never the meeting owner, so the meeting password (issue #1613) is
+/// enforced here unconditionally. The `allow_guests` gate is evaluated first and
+/// deliberately answers `GUESTS_NOT_ALLOWED` for both a missing meeting and a
+/// guest-disabled one (anti-enumeration, see
+/// [`crate::routes::meetings::get_meeting_guest_info`]), so an unauthenticated
+/// caller only ever reaches the password check for a meeting they already know
+/// exists and accepts guests.
 pub async fn join_meeting_as_guest(
     State(state): State<AppState>,
     Path(meeting_id): Path<String>,
+    ClientAddr(client_ip): ClientAddr,
     body: Json<GuestJoinRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let display_name = validate_display_name(&body.display_name)
@@ -549,6 +630,8 @@ pub async fn join_meeting_as_guest(
         Some(display_name),
         "Guest",
         true,
+        client_ip,
+        body.password.as_deref(),
     )
     .await
 }
@@ -1123,6 +1206,7 @@ mod tests {
             search: None,
             display_name_rate_limit_disabled: disabled,
             dev_user: None,
+            password_gate: std::sync::Arc::new(crate::password::MeetingPasswordGate::new()),
         }
     }
 

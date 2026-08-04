@@ -21,6 +21,7 @@ use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
+use crate::components::icons::raised_hand::RaisedHandIcon;
 use crate::components::icons::recording::RecordingIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
 use crate::components::icons::zoom::{
@@ -32,6 +33,10 @@ use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
 // SignalMeterMode is referenced via SignalInfo internally — no direct import
 // needed in this file (yet); attendants/peer_tile own the call-site values.
 use crate::constants::users_allowed_to_stream;
+// NOTE (issue 2135): `RaisedHandsCtx` is deliberately NOT imported here. This
+// file is a plain `fn`, so a context read would bind to `PeerTile`'s scope and
+// subscribe every tile to the room-wide roster; the raised state arrives as the
+// `hand_raised` parameter instead. See its doc on `generate_for_peer`.
 use crate::context::{
     AppearanceSettings, CroppedTilesCtx, DetachedShareCtx, HostSetCtx, RecordingSetCtx,
     ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState, VideoCallClientCtx,
@@ -791,6 +796,27 @@ pub fn generate_for_peer(
     // screen-share path. In the split-layout right panel, off-budget SS tiles
     // pass `true` just as the normal grid does.
     force_avatar: bool,
+    // Issue 2135: whether THIS peer's hand is up, as a plain `bool` resolved by
+    // the caller.
+    //
+    // A PARAMETER, not a `try_use_context::<RaisedHandsCtx>()` read in this body,
+    // and the distinction is load-bearing rather than stylistic. This function is
+    // a plain `fn`, NOT a `#[component]`, so it has no scope of its own: a
+    // context read here binds to the CALLER's scope (`PeerTile`), and `.read()`
+    // on the roster signal therefore subscribes THAT TILE to every hand in the
+    // room. A signal write marks subscribed scopes dirty directly in the runtime
+    // without ever consulting props, so such a subscription slips straight past
+    // the stable-props memoization of PR #2125: one person raising a hand
+    // re-rendered every mounted tile (N tiles x 2 renders per toggle), on a
+    // machine already software-decoding up to 30 streams.
+    //
+    // `PeerTile` now resolves this through a `use_memo`, which re-runs on every
+    // roster change but only dirties the ONE tile whose own hand moved. The queue
+    // ORDINAL is deliberately not threaded here at all: it changes for every peer
+    // behind a raiser, so memoizing it per tile would restore the same fan-out.
+    // It lives on the roster row (one component, one subscription) and in the
+    // banner.
+    hand_raised: bool,
 ) -> Element {
     let cropped_tiles: Option<Signal<HashMap<String, bool>>> =
         try_use_context::<CroppedTilesCtx>().map(|c| c.0);
@@ -1262,6 +1288,21 @@ pub fn generate_for_peer(
                         if is_recording {
                             RecordingIcon {}
                         }
+                        // Issue 2135. The label is the bare state ("Hand
+                        // raised") — no name, no ordinal. The badge is a child of
+                        // this same `.floating-name`, whose first child is the
+                        // peer's name, so naming the peer again made AT read
+                        // "Alice ... Alice raised their hand". The ordinal is
+                        // omitted for a second, harder reason: see `hand_raised`
+                        // on `generate_for_peer`.
+                        if hand_raised {
+                            span {
+                                class: "raised-hand-badge",
+                                "data-testid": "peer-raised-hand-badge",
+                                "data-session-id": "{key}",
+                                RaisedHandIcon { decorative: false }
+                            }
+                        }
                         if is_guest {
                             span { class: "guest-badge", "Guest" }
                         }
@@ -1727,6 +1768,16 @@ pub fn generate_for_peer(
                             }
                             if is_recording {
                                 RecordingIcon {}
+                            }
+                            // Issue 2135: bare state label, no name / ordinal —
+                            // see the split-view badge above.
+                            if hand_raised {
+                                span {
+                                    class: "raised-hand-badge",
+                                    "data-testid": "peer-raised-hand-badge",
+                                    "data-session-id": "{key}",
+                                    RaisedHandIcon { decorative: false }
+                                }
                             }
                             if is_guest {
                                 span { class: "guest-badge", "Guest" }
@@ -2873,6 +2924,14 @@ fn toggle_pinned_div(div_id: &str) {
     }
 }
 
+/// Is the viewport narrow enough to be treated as a phone?
+///
+/// WIDTH ONLY, by design for its callers here — all three are tap-to-spotlight
+/// handlers, where the question is whether tiles are small enough to want a tap
+/// affordance. It is therefore NOT a general "is this a phone" predicate: a
+/// landscape phone is 844x390 and classifies as desktop. Issue 2141 tried to
+/// borrow it to gate the emoji-search autofocus and had to stop; see
+/// `emoji_picker::should_autofocus_search_field` for a both-axes predicate.
 fn is_mobile_viewport() -> bool {
     if let Some(win) = window() {
         if let Ok(width) = win.inner_width() {

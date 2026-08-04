@@ -80,6 +80,164 @@ async function openAppearanceTab(
   await expect(page.locator("#settings-panel-appearance")).toBeVisible({ timeout: 5_000 });
 }
 
+/**
+ * The Decay explanation, pinned here independently of the Rust source
+ * (`DECAY_HELP_TEXT` in `dioxus-ui/src/components/appearance_settings_panel.rs`).
+ * Changing the copy on one side without the other turns this spec red.
+ */
+const DECAY_HELP_TEXT =
+  "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail.";
+
+/** `rgb()` / `rgba()` (the only forms `getComputedStyle` returns) → channels. */
+function parseCssColor(value: string): { r: number; g: number; b: number; a: number } {
+  const match = value.match(/rgba?\(([^)]+)\)/i);
+  if (!match) {
+    throw new Error(`Unsupported color format: ${value}`);
+  }
+  const parts = match[1].split(",").map((p) => Number(p.trim()));
+  return { r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1 };
+}
+
+/**
+ * Alpha-composite a color over an opaque backdrop.
+ *
+ * `getComputedStyle` reports the *declared* color, not the rendered pixel: a
+ * translucent value has to be flattened before a contrast ratio means anything.
+ */
+function compositeOver(
+  value: string,
+  backdrop: { r: number; g: number; b: number },
+): { r: number; g: number; b: number } {
+  const { r, g, b, a } = parseCssColor(value);
+  return {
+    r: r * a + backdrop.r * (1 - a),
+    g: g * a + backdrop.g * (1 - a),
+    b: b * a + backdrop.b * (1 - a),
+  };
+}
+
+const WHITE = { r: 255, g: 255, b: 255 };
+
+/**
+ * Flatten over opaque white — the lightest backdrop a light-theme surface can
+ * present. Used for the tooltip BUBBLE, whose 95%-opaque dark fill is barely
+ * moved by what sits behind it; white is the worst case for the light text that
+ * then goes on top, so the resulting ratio is a floor rather than a flattery.
+ */
+function compositeOverWhite(value: string): { r: number; g: number; b: number } {
+  return compositeOver(value, WHITE);
+}
+
+/**
+ * Flatten every `background-color` from `selector` up to `<html>` into an
+ * approximation of the opaque color the element is painted on, evaluated in the
+ * page. The settings surfaces are stacked translucent glass, so no single
+ * ancestor's `backgroundColor` is the answer.
+ *
+ * APPROXIMATION, and knowingly so: this walks `background-color` only. The
+ * settings panel also paints a `background-image` gradient and a
+ * `backdrop-filter`, neither of which is accounted for, so the value returned is
+ * DARKER than the true composited surface (measured rgb(10.6, 10.6, 11.4) here
+ * against a true panel nearer rgb(42, 42, 44)). For light text that error is
+ * generous, so a passing ratio is not by itself proof of the real-world margin —
+ * it is a regression tripwire. It is sound in that role because the pre-fix
+ * `--text-quaternary` glyph fails it (3.29 < 4.5) on the same approximation, and
+ * an independent hand-computation against rgb(42, 42, 44) puts the pre-fix glyph
+ * at 2.38:1 and the fixed one comfortably above 4.5.
+ */
+async function effectiveBackdrop(
+  page: import("@playwright/test").Page,
+  selector: string,
+): Promise<string> {
+  return page.evaluate((sel) => {
+    const parse = (v: string) => {
+      const m = v.match(/rgba?\(([^)]+)\)/i);
+      if (!m) return null;
+      const p = m[1].split(",").map((x) => Number(x.trim()));
+      return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+    };
+    const el = document.querySelector(sel);
+    if (!el) throw new Error(`effectiveBackdrop: no element for ${sel}`);
+
+    const layers: { r: number; g: number; b: number; a: number }[] = [];
+    let node: Element | null = el;
+    while (node) {
+      const c = parse(getComputedStyle(node).backgroundColor);
+      if (c && c.a > 0) layers.push(c);
+      node = node.parentElement;
+    }
+    // Composite far-to-near. The seed is opaque black; any fully opaque layer
+    // in the stack short-circuits it, and the app's root surface is dark.
+    let acc = { r: 0, g: 0, b: 0 };
+    for (let i = layers.length - 1; i >= 0; i--) {
+      const l = layers[i];
+      acc = {
+        r: l.r * l.a + acc.r * (1 - l.a),
+        g: l.g * l.a + acc.g * (1 - l.a),
+        b: l.b * l.a + acc.b * (1 - l.a),
+      };
+    }
+    return `rgb(${acc.r}, ${acc.g}, ${acc.b})`;
+  }, selector);
+}
+
+/** WCAG 2.1 relative luminance (sRGB linearisation, not a Rec.709 shortcut). */
+function relativeLuminance({ r, g, b }: { r: number; g: number; b: number }): number {
+  const channel = (c: number) => {
+    const s = c / 255;
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+}
+
+/** WCAG 2.1 contrast ratio between two opaque colors. */
+function contrastRatio(
+  fg: { r: number; g: number; b: number },
+  bg: { r: number; g: number; b: number },
+): number {
+  const l1 = relativeLuminance(fg);
+  const l2 = relativeLuminance(bg);
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+}
+
+/**
+ * Read an element's role, accessible name and accessible description straight
+ * out of the browser's accessibility tree (Chromium CDP — every project in
+ * playwright.config.ts runs Desktop Chrome).
+ *
+ * This is what a screen reader actually consumes. A DOM-level check of the
+ * `aria-describedby` attribute cannot tell you whether the reference resolves,
+ * and cannot tell you whether a `visibility: hidden` target still contributes
+ * its text — both of which are exactly what issue 1871 turns on.
+ */
+async function axInfo(
+  page: import("@playwright/test").Page,
+  selector: string,
+): Promise<{ role?: string; name?: string; description?: string; focusable?: boolean }> {
+  const client = await page.context().newCDPSession(page);
+  try {
+    await client.send("Accessibility.enable");
+    await client.send("DOM.enable");
+    const { root } = await client.send("DOM.getDocument", { depth: -1 });
+    const { nodeId } = await client.send("DOM.querySelector", { nodeId: root.nodeId, selector });
+    const { nodes } = await client.send("Accessibility.getPartialAXTree", {
+      nodeId,
+      fetchRelatives: false,
+    });
+    const node = nodes.find((n) => !n.ignored);
+    return {
+      role: node?.role?.value as string | undefined,
+      name: node?.name?.value as string | undefined,
+      description: node?.description?.value as string | undefined,
+      focusable: node?.properties?.find((p) => p.name === "focusable")?.value?.value as
+        | boolean
+        | undefined,
+    };
+  } finally {
+    await client.detach();
+  }
+}
+
 function speakerHighlightRow(page: import("@playwright/test").Page, label: string) {
   return page.locator(".speaker-highlight-controls .appearance-slider-row").filter({
     has: page.getByText(label, { exact: true }),
@@ -197,14 +355,142 @@ test.describe("Device settings modal", () => {
       "xpath=ancestor::div[contains(@class, 'appearance-slider-row')]//span[contains(@class, 'appearance-slider-value')]",
     );
     const decayHelpIcon = page.locator('[data-testid="speaker-highlight-decay-help"]');
+    const decayHelpText = page.locator('[data-testid="speaker-highlight-decay-help-text"]');
 
     await expect(decaySlider).toHaveValue("50");
     await expect(decayValue).toHaveText("50%");
     await expect(decayHelpIcon).toBeVisible();
-    await expect(decayHelpIcon).toHaveAttribute(
-      "data-tooltip",
-      "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail.",
+
+    // ── issue 1871: the Decay help affordance is exposed to assistive tech,
+    //    keyboard-reachable, revealed by focus, and Escape-dismissible. ──
+
+    // Discoverable before it is operable: a correct AX tree behind a glyph a
+    // low-vision user cannot locate is not accessible. The shared
+    // `.settings-info-icon` base paints `--text-quaternary`, which measures
+    // ~2.4:1 on the composited dark settings surface — authored for a purely
+    // decorative hover hint. Making this instance a focusable control attaches
+    // SC 1.4.11 (3:1), and SC 1.4.3 (4.5:1) applies regardless because "(?)" is
+    // literal text, not an icon. Revert `.speaker-highlight-help-icon`'s colour
+    // override and this fails.
+    const glyphColor = await decayHelpIcon.evaluate((el) => getComputedStyle(el).color);
+    const glyphBackdrop = await effectiveBackdrop(
+      page,
+      '[data-testid="speaker-highlight-decay-help"]',
     );
+    const glyphRatio = contrastRatio(
+      compositeOver(glyphColor, parseCssColor(glyphBackdrop)),
+      parseCssColor(glyphBackdrop),
+    );
+    expect(glyphRatio, `glyph ${glyphColor} on ${glyphBackdrop}`).toBeGreaterThanOrEqual(4.5);
+
+    // Exposed as a control rather than an anonymous decorative span.
+    await expect(decayHelpIcon).toHaveAttribute("role", "button");
+    await expect(decayHelpIcon).toHaveAttribute("aria-label", "About the Decay setting");
+
+    // The explanation is real DOM text (not CSS `content`), so it exists in the
+    // document and is merely hidden until revealed.
+    await expect(decayHelpText).toHaveCount(1);
+    await expect(decayHelpText).toHaveText(DECAY_HELP_TEXT);
+    await expect(decayHelpText).toBeHidden();
+
+    // The description association actually RESOLVES — asserting the
+    // `aria-describedby` attribute alone would still pass on a dangling id.
+    const describedText = await decayHelpIcon.evaluate((el) => {
+      const id = el.getAttribute("aria-describedby");
+      if (!id) return null;
+      return document.getElementById(id)?.textContent ?? null;
+    });
+    expect(describedText).toBe(DECAY_HELP_TEXT);
+
+    // ...and it reaches the accessibility tree, which is what a screen reader
+    // reads. This holds while the bubble is still `visibility: hidden`, because
+    // `aria-describedby` targets contribute to the description even unrendered.
+    // Drop `aria-describedby` and this description goes empty; drop `tabindex`
+    // and `focusable` goes false; drop `role` and it is no longer a button.
+    const ax = await axInfo(page, '[data-testid="speaker-highlight-decay-help"]');
+    expect(ax.role).toBe("button");
+    expect(ax.focusable).toBe(true);
+    expect(ax.name).toBe("About the Decay setting");
+    expect(ax.description).toBe(DECAY_HELP_TEXT);
+
+    // Keyboard-reachable: Shift+Tab off the Decay slider lands on the trigger.
+    // Without `tabindex` the browser skips straight past it.
+    await decaySlider.focus();
+    await page.keyboard.press("Shift+Tab");
+    await expect(decayHelpIcon).toBeFocused();
+
+    // Focus alone reveals the explanation — WCAG 2.1 SC 1.4.13. `toBeVisible()`
+    // ignores opacity, so the computed opacity is what proves the reveal.
+    await expect(decayHelpText).toBeVisible();
+    await expect
+      .poll(async () => decayHelpText.evaluate((el) => getComputedStyle(el).opacity), {
+        timeout: 3_000,
+      })
+      .toBe("1");
+
+    // The tap/click latch is real state driven from Rust. Remove the `onclick`
+    // handler and `--open` never appears.
+    await decayHelpIcon.click();
+    await expect(decayHelpIcon).toHaveClass(/speaker-highlight-help-icon--open/);
+
+    // ...and tapping again actually DISMISSES it. This is the assertion that
+    // matters: clearing `--open` alone is not a dismissal, because the trigger
+    // still holds focus after the click and `:focus-within` keeps the bubble on
+    // screen. Asserting only the absence of `--open` would pass on that broken
+    // behaviour. On touch there is no hover and no Escape key, so this re-tap is
+    // the ONLY dismissal that does not move focus, which is exactly what WCAG
+    // 2.1 SC 1.4.13 "Dismissible" requires.
+    await decayHelpIcon.click();
+    await expect(decayHelpIcon).not.toHaveClass(/speaker-highlight-help-icon--open/);
+    await expect(decayHelpIcon).toHaveClass(/speaker-highlight-help-icon--suppressed/);
+    await expect(decayHelpIcon).toBeFocused();
+    await expect(decayHelpText).toBeHidden();
+    // `toBeHidden()` is satisfied by `visibility: hidden` alone; poll the pair
+    // so a bubble left at full opacity cannot slip through. Polled rather than
+    // snapshotted because the hide is a 0.15s fade.
+    await expect
+      .poll(
+        async () =>
+          decayHelpText.evaluate((el) => {
+            const s = getComputedStyle(el);
+            return `${s.opacity}/${s.visibility}`;
+          }),
+        { timeout: 3_000 },
+      )
+      .toBe("0/hidden");
+
+    // Enter and Space drive the same latch through the keydown handler.
+    // Remove the `is_keyboard_activation_key` branch and both of these stall.
+    await decayHelpIcon.press("Enter");
+    await expect(decayHelpIcon).toHaveClass(/speaker-highlight-help-icon--open/);
+    await decayHelpIcon.press("Enter");
+    await expect(decayHelpIcon).not.toHaveClass(/speaker-highlight-help-icon--open/);
+    await decayHelpIcon.press("Space");
+    await expect(decayHelpIcon).toHaveClass(/speaker-highlight-help-icon--open/);
+
+    // Escape dismisses the explanation WITHOUT moving focus and WITHOUT
+    // closing the settings modal. The modal's own Escape handler
+    // (device_settings_modal.rs) closes it on any Escape that reaches it, so
+    // this only holds because the trigger calls `stop_propagation` first.
+    await page.keyboard.press("Escape");
+    await expect(decayHelpText).toBeHidden();
+    await expect(decayHelpIcon).toHaveClass(/speaker-highlight-help-icon--suppressed/);
+    await expect(decayHelpIcon).toBeFocused();
+    await expect(page.locator("#device-settings-dialog")).toBeVisible();
+
+    // Escape-suppression is per-visit, not permanent: leaving the trigger must
+    // re-arm it (`onfocusout`), so coming back reveals the explanation again.
+    // Drop the `onfocusout` reset and the affordance stays dead for the rest of
+    // the session.
+    await decaySlider.focus();
+    await expect(decayHelpIcon).not.toHaveClass(/speaker-highlight-help-icon--suppressed/);
+    await page.keyboard.press("Shift+Tab");
+    await expect(decayHelpIcon).toBeFocused();
+    await expect(decayHelpText).toBeVisible();
+
+    // Leave the trigger before continuing so its latch/suppression state cannot
+    // bleed into the slider assertions below.
+    await decaySlider.focus();
 
     await decaySlider.fill("20");
     await expect(decayValue).toHaveText("20%");
@@ -229,6 +515,149 @@ test.describe("Device settings modal", () => {
     );
     await expect(decaySliderAfterReload).toHaveValue("20");
     await expect(decayValueAfterReload).toHaveText("20%");
+  });
+
+  test("Decay help tooltip stays inside the settings panel on a 320px viewport", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_settings_decay_narrow_${Date.now()}`;
+
+    await openAppearanceTab(page, meetingId, "decay-narrow-user");
+
+    // Narrowest phone width the issue calls out (issue 1871).
+    await page.setViewportSize({ width: 320, height: 720 });
+    await page.waitForTimeout(300);
+
+    const decayHelpIcon = page.locator('[data-testid="speaker-highlight-decay-help"]');
+    const decayHelpText = page.locator('[data-testid="speaker-highlight-decay-help-text"]');
+    const settingsPanel = page.locator("#device-settings-dialog .settings-panel");
+    const dialog = page.locator("#device-settings-dialog");
+
+    await decayHelpIcon.scrollIntoViewIfNeeded();
+    // Touch devices have no hover, so a tap latches the tooltip open. Assert the
+    // latch itself: the click leaves Playwright's pointer resting ON the trigger,
+    // so `toBeVisible()`/`opacity === "1"` alone would also pass via `:hover`
+    // even if the `--open` latch were broken.
+    await decayHelpIcon.click();
+    await expect(decayHelpIcon).toHaveClass(/--open/);
+    await expect(decayHelpText).toBeVisible();
+    await expect
+      .poll(async () => decayHelpText.evaluate((el) => getComputedStyle(el).opacity), {
+        timeout: 3_000,
+      })
+      .toBe("1");
+
+    const iconBox = await decayHelpIcon.boundingBox();
+    const tipBox = await decayHelpText.boundingBox();
+    expect(iconBox).not.toBeNull();
+    expect(tipBox).not.toBeNull();
+
+    // The mobile override now falls back to the base below-the-trigger
+    // placement instead of keeping the desktop right-and-up one. Pre-fix the
+    // bubble sat ABOVE the trigger and to its RIGHT (`left: calc(100% + 10px);
+    // bottom: calc(100% + 10px)`), which is what marched it toward the clipped
+    // edge — at 300px wide it already overflowed. These two assertions are what
+    // fail if the old placement comes back.
+    expect(tipBox!.y).toBeGreaterThanOrEqual(iconBox!.y + iconBox!.height - 1);
+    expect(tipBox!.x).toBeLessThanOrEqual(iconBox!.x + 1);
+
+    // ...and the whole bubble is inside the panel. `.settings-panel` sets
+    // `overflow-x: hidden`, so anything outside that box is clipped away —
+    // `z-index` cannot escape an overflow box. Checked at 320px (the width the
+    // issue names) and again at 300px, where the old placement demonstrably
+    // overflowed. 1px of rounding slack.
+    const assertInsidePanel = async (label: string) => {
+      const tip = await decayHelpText.boundingBox();
+      const panel = await settingsPanel.boundingBox();
+      expect(tip, label).not.toBeNull();
+      expect(panel, label).not.toBeNull();
+      expect(tip!.x, `${label}: left edge`).toBeGreaterThanOrEqual(panel!.x - 1);
+      expect(tip!.x + tip!.width, `${label}: right edge`).toBeLessThanOrEqual(
+        panel!.x + panel!.width + 1,
+      );
+    };
+
+    await assertInsidePanel("320px viewport");
+
+    await page.setViewportSize({ width: 300, height: 720 });
+    await page.waitForTimeout(300);
+    await expect(decayHelpText).toBeVisible();
+    await assertInsidePanel("300px viewport");
+
+    await page.setViewportSize({ width: 320, height: 720 });
+    await page.waitForTimeout(300);
+
+    // Escape is only swallowed while there is a tooltip to dismiss: the first
+    // press closes the bubble, the second reaches the modal.
+    await page.keyboard.press("Escape");
+    await expect(decayHelpText).toBeHidden();
+    await expect(dialog).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+  });
+
+  test("Decay help tooltip text stays readable on its fixed dark bubble in light theme", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_settings_decay_light_${Date.now()}`;
+
+    await openAppearanceTab(page, meetingId, "decay-light-user");
+
+    // Real Appearance-panel Light toggle, the same mechanism theme-toggle.spec.ts
+    // and peer-toast-light-contrast.spec.ts use. It sets `html[data-theme]`
+    // synchronously; poll defensively.
+    await page.getByRole("button", { name: "Light", exact: true }).click();
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
+        timeout: 3_000,
+      })
+      .toBe("light");
+
+    const decayHelpIcon = page.locator('[data-testid="speaker-highlight-decay-help"]');
+    const decayHelpText = page.locator('[data-testid="speaker-highlight-decay-help-text"]');
+
+    await decayHelpIcon.scrollIntoViewIfNeeded();
+    // As above: assert the `--open` latch, not just visibility — the pointer is
+    // left hovering the trigger, which would reveal the bubble on its own.
+    await decayHelpIcon.click();
+    await expect(decayHelpIcon).toHaveClass(/--open/);
+    await expect(decayHelpText).toBeVisible();
+    await expect
+      .poll(async () => decayHelpText.evaluate((el) => getComputedStyle(el).opacity), {
+        timeout: 3_000,
+      })
+      .toBe("1");
+
+    // THE REGRESSION THIS PINS (issue 1871). The bubble paints on a FIXED dark
+    // surface (`--fixed-dark-strong`) in both themes, so its text must stay
+    // light. It used to be `.settings-info-icon::after`, and the light-theme
+    // blanket `html[data-theme="light"] .settings-panel *` cannot match a
+    // pseudo-element — so the old bubble was immune by accident. Promoting it to
+    // a real child `<span>` (required for `aria-describedby` to reach it) walked
+    // it into that blanket, where it resolved to dark navy on near-black at
+    // 1.15:1: revealed but completely unreadable. Dark theme was unaffected,
+    // which is why it slipped through.
+    const { color, background } = await decayHelpText.evaluate((el) => {
+      const s = getComputedStyle(el);
+      return { color: s.color, background: s.backgroundColor };
+    });
+
+    // Diagnostic: the exact token that must win. `--on-dark-text-secondary`.
+    expect(color).toBe("rgba(255, 255, 255, 0.7)");
+
+    // ...and the requirement itself, computed rather than asserted, against the
+    // SC 1.4.3 body-text threshold.
+    //
+    // The compositing order matters and is easy to get wrong: the text is
+    // translucent and sits on the BUBBLE, not on the page. Flattening both over
+    // white independently turns `rgba(255,255,255,0.7)` into pure white and
+    // reports 14.5:1 — a number the user never sees. Compositing the bubble over
+    // white (the lightest a light-theme panel can be, so the floor for light
+    // text) and then the text over that bubble gives the ratio that is actually
+    // rendered.
+    const bubble = compositeOverWhite(background);
+    const ratio = contrastRatio(compositeOver(color, bubble), bubble);
+    expect(ratio, `tooltip text ${color} on bubble ${background}`).toBeGreaterThanOrEqual(4.5);
   });
 
   test("Decay slider preview: low decay glow tail turns off quickly, high decay lingers", async ({
@@ -394,6 +823,27 @@ test.describe("Device settings modal", () => {
       return true;
     });
     expect(neverEnteredSilent).toBe(true);
+
+    // issue 1871: the Decay help bubble must not fade under reduced motion
+    // either. Checked in BOTH states because a media query adds no specificity:
+    // the resting rule is (0,1,0) but the reveal rules are (0,3,0), so a
+    // reduced-motion block that only restates the base selector silently leaves
+    // the fade-in animating. Pre-fix both read "0.15s, 0s".
+    const decayHelpIcon = page.locator('[data-testid="speaker-highlight-decay-help"]');
+    const decayHelpText = page.locator('[data-testid="speaker-highlight-decay-help-text"]');
+    await decayHelpIcon.scrollIntoViewIfNeeded();
+
+    expect(
+      await decayHelpText.evaluate((el) => getComputedStyle(el).transitionDuration),
+      "resting tooltip transition",
+    ).toBe("0s");
+
+    await decayHelpIcon.click();
+    await expect(decayHelpIcon).toHaveClass(/speaker-highlight-help-icon--open/);
+    expect(
+      await decayHelpText.evaluate((el) => getComputedStyle(el).transitionDuration),
+      "revealed tooltip transition",
+    ).toBe("0s");
   });
 
   test("Reset restores the speaker highlight defaults", async ({ page }) => {

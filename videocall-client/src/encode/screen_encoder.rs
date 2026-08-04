@@ -74,8 +74,9 @@ use videocall_aq::{fit_within_preserving_aspect, simulcast_layer_target_dims};
 
 /// Upper bound on SCREEN simulcast layers regardless of what the caller
 /// requests (issue #989, Phase 3b). Matches the 3-tier screen ladder the AQ
-/// crate defines (`simulcast_screen_layers`). The caller passes 1 by default
-/// (feature off → single layer, byte-identical to the pre-simulcast path).
+/// crate defines (`simulcast_screen_layers`). The UI passes its
+/// `min(runtime flag, sniffed capability)` ceiling; the flag defaults to 3
+/// (#1082), while capability can still clamp the value to 1 or 2.
 const SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = 3;
 
 /// Clamp a requested screen `max_layers` to the supported range. `0` (meaningless
@@ -579,6 +580,24 @@ pub fn screen_encoder_stall_episodes() -> u64 {
 /// "fps > 0 but content minutes stale" symptom.
 pub fn screen_encoder_max_stall_gap_ms() -> u64 {
     SCREEN_ENCODER_MAX_STALL_GAP_MS.load(Ordering::Relaxed)
+}
+
+/// **TEST-ONLY** seam for the two stall counters above (issue #2147).
+///
+/// The health reporter's emission of `screen_encoder_stall_episodes` /
+/// `screen_encoder_max_stall_gap_ms` is gated `> 0`, and these statics are only ever
+/// incremented by the encode loop's tick-starvation detector inside a `spawn_local`
+/// future. Without a setter both `if` blocks are unreachable from a host test, so
+/// DELETING the emission would leave every test green — the exact gap this closes.
+///
+/// Sets absolute values (not increments) so a test can assert the zero and nonzero
+/// arms deterministically. `#[cfg(test)]`-gated, so it cannot be reached in
+/// production. Note these are process-global and cumulative-since-page-load, so a
+/// test using this must restore what it changed if other tests read them.
+#[cfg(test)]
+pub(crate) fn set_screen_encoder_stall_counters_for_test(episodes: u64, max_gap_ms: u64) {
+    SCREEN_ENCODER_STALL_EPISODES.store(episodes, Ordering::Relaxed);
+    SCREEN_ENCODER_MAX_STALL_GAP_MS.store(max_gap_ms, Ordering::Relaxed);
 }
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
@@ -1192,6 +1211,27 @@ fn cause_hint_from_trigger(trigger: &str) -> &'static str {
     }
 }
 
+/// Apply the state changes a screen-share STOP must make to the shared atoms
+/// (issue #2147).
+///
+/// Extracted from the track `onended` closure — the path the browser's own "Stop
+/// sharing" button takes — because that closure lives inside a `spawn_local`
+/// future and is therefore unreachable from a unit test. Everything in it that
+/// touches shared state lives here so the transition is pinned.
+///
+/// The `current_fps` reset is the #2147 addition and the reason this exists: that
+/// atom is now exported as `screen_encoder_output_fps` → the deliberately
+/// ungated `videocall_screen_encoder_output_fps` gauge. `stop()`, `start()` and
+/// `start_with_stream()` already reset it, but this path did not, and it could not
+/// rely on the AQ loop's `SCREEN_ENCODER_FPS_IDLE_DECAY_MS` backstop because that
+/// loop exits once its liveness token drops (Host unmount) — leaving the gauge
+/// holding a stale NONZERO that asserts a live screen encoder which had stopped.
+fn apply_screen_share_stopped(enabled: &AtomicBool, sharing: &AtomicBool, current_fps: &AtomicU32) {
+    enabled.store(false, Ordering::Release);
+    sharing.store(false, Ordering::Release);
+    crate::encode::reset_output_fps(current_fps);
+}
+
 /// Sets `bitrateMode = "variable"` on a [`VideoEncoderConfig`].
 ///
 /// Variable bitrate lets the encoder burst above the target during high-motion
@@ -1539,8 +1579,9 @@ pub struct ScreenEncoder {
     quality_bounds: Rc<RefCell<SharedScreenQualityBounds>>,
     /// Maximum number of SCREEN simulcast layers to emit (issue #989, Phase 3b).
     /// Computed in the UI as `min(experimentalSimulcastMaxLayers, capability
-    /// ceiling)`, exactly like the camera. Defaults to 1 (feature off →
-    /// single-layer, byte-identical to the pre-simulcast screen path).
+    /// ceiling)`, exactly like the camera. The runtime flag defaults to 3
+    /// (#1082), but the capability sniff can still produce 1 or 2. An explicit
+    /// value of 1 preserves the pre-simulcast single-layer path.
     max_layers: u32,
     /// Number of screen layers currently active (encoded + sent), written by the
     /// screen AQ control loop and read by the encode loop. 1 in single-stream
@@ -1627,6 +1668,27 @@ pub struct ScreenEncoder {
 fn clear_screen_sharing_flags(rc: &Rc<AtomicBool>, arc: &Arc<AtomicBool>) {
     rc.store(false, Ordering::Release);
     arc.store(false, Ordering::Release);
+}
+
+/// Clear the sharing flags AND zero the output-fps atom (issue #2147).
+///
+/// Every "the share is over" path must land here rather than on
+/// [`clear_screen_sharing_flags`] alone. `current_fps` is exported as
+/// `screen_encoder_output_fps` → the deliberately ungated
+/// `videocall_screen_encoder_output_fps` gauge, so a path that clears the flags but
+/// leaves the atom nonzero makes the gauge assert a live screen encoder for a share
+/// that has ended.
+///
+/// The AQ loop's `SCREEN_ENCODER_FPS_IDLE_DECAY_MS` (5 s) is only a backstop, and it
+/// stops running once that loop's liveness token drops — while the `HealthReporter`
+/// holds an `Arc` clone of this atom and keeps publishing. Covers the paths
+/// `apply_screen_share_stopped` does not: `cleanup_on_error`, the MAX_RESTARTS
+/// give-up, and the encode loop's final cleanup — the last of which is the
+/// `stream_ended` route taken when a track dies WITHOUT `onended` firing (OS/source
+/// revoke, monitor unplug, Wayland portal revoke).
+fn clear_screen_sharing_state(rc: &Rc<AtomicBool>, arc: &Arc<AtomicBool>, current_fps: &AtomicU32) {
+    clear_screen_sharing_flags(rc, arc);
+    crate::encode::reset_output_fps(current_fps);
 }
 
 impl ScreenEncoder {
@@ -2674,6 +2736,22 @@ impl ScreenEncoder {
         self.current_fps.load(Ordering::Relaxed)
     }
 
+    /// Returns the SCREEN encoder output-FPS atomic (issue #2147).
+    ///
+    /// Mirrors `CameraEncoder::shared_encoder_output_fps`. Written by the base
+    /// layer's (`layer_id == 0`) chunk callback once per second, and decayed to 0
+    /// by the AQ control loop after `SCREEN_ENCODER_FPS_IDLE_DECAY_MS` (5000 ms —
+    /// deliberately longer than the camera's 2000 ms, because a static share
+    /// legitimately produces no frames).
+    ///
+    /// Cloned into the health reporter, which reads it each packet and emits it as
+    /// `screen_encoder_output_fps`. Before #2147 this value was log-only, leaving
+    /// the screen encoder — the one implicated in #1899 / #1574 / the #2143 freeze
+    /// — with no publisher-side fps signal at all.
+    pub fn shared_encoder_output_fps(&self) -> Arc<AtomicU32> {
+        self.current_fps.clone()
+    }
+
     /// Returns a shared reference to the force-keyframe flag.
     ///
     /// The `VideoCallClient` stores this and sets it to `true` when a
@@ -3179,6 +3257,13 @@ impl ScreenEncoder {
         shared_encoder_queue_depth: Rc<AtomicU32>,
     ) {
         let simulcast = n_layers > 1;
+        // #2147: clones for the two "share is over" cleanup paths below
+        // (`cleanup_on_error` and the encode loop's final cleanup), which must zero
+        // the output-fps atom via `clear_screen_sharing_state` so the ungated
+        // `videocall_screen_encoder_output_fps` gauge cannot keep asserting a live
+        // encoder. Bound here because `cleanup_on_error` is a move-closure.
+        let current_fps_cleanup = current_fps.clone();
+        let current_fps_final = current_fps.clone();
         // Per-layer sequence numbers persist across restarts so a receiver
         // decoding one screen layer sees a dense 0,1,2,… stream (no phantom
         // loss). N=1 is a single-element Vec behaving like the old scalar.
@@ -3207,7 +3292,11 @@ impl ScreenEncoder {
             // Reset enabled flag
             enabled.store(false, Ordering::Release);
             // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
-            clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
+            clear_screen_sharing_state(
+                &screen_sharing_active,
+                &screen_sharing_active_arc,
+                &current_fps_cleanup,
+            );
             // Emit Failed event
             if let Some(ref callback) = on_state_change {
                 callback.emit(ScreenShareEvent::Failed(error_msg));
@@ -3559,10 +3648,26 @@ impl ScreenEncoder {
                     let on_state_change_clone = on_state_change.clone();
                     let screen_sharing_flag_clone = screen_sharing_active.clone();
                     let client_onended = client_for_onended.clone();
+                    // Issue #2147: this path must ALSO zero the output-fps atom.
+                    // `stop()` / `start()` / `start_with_stream()` all call
+                    // `reset_output_fps`, but the BROWSER's own "Stop sharing"
+                    // button lands here instead, and this atom is now exported as
+                    // `screen_encoder_output_fps` → the ungated
+                    // `videocall_screen_encoder_output_fps` gauge. Leaving it alone
+                    // relied on the AQ loop's 5s idle decay, which stops running once
+                    // the loop's liveness token drops (Host unmount) — so the gauge
+                    // could hold a stale NONZERO and assert a live screen encoder
+                    // that had stopped. The error/give-up/final-cleanup paths get the
+                    // same treatment via `clear_screen_sharing_state`, so every
+                    // share-over route zeroes the atom.
+                    let current_fps_onended = current_fps.clone();
                     let handler = Closure::wrap(Box::new(move || {
                         log::info!("Screen share track ended (user stopped sharing)");
-                        enabled_clone.store(false, Ordering::Release);
-                        screen_sharing_flag_clone.store(false, Ordering::Release);
+                        apply_screen_share_stopped(
+                            &enabled_clone,
+                            &screen_sharing_flag_clone,
+                            &current_fps_onended,
+                        );
                         client_onended.set_screen_enabled(false);
                         if let Some(ref callback) = on_state_change_clone {
                             callback.emit(ScreenShareEvent::Stopped);
@@ -3625,10 +3730,26 @@ impl ScreenEncoder {
                     let on_state_change_clone = on_state_change.clone();
                     let screen_sharing_flag_clone = screen_sharing_active.clone();
                     let client_onended = client_for_onended.clone();
+                    // Issue #2147: this path must ALSO zero the output-fps atom.
+                    // `stop()` / `start()` / `start_with_stream()` all call
+                    // `reset_output_fps`, but the BROWSER's own "Stop sharing"
+                    // button lands here instead, and this atom is now exported as
+                    // `screen_encoder_output_fps` → the ungated
+                    // `videocall_screen_encoder_output_fps` gauge. Leaving it alone
+                    // relied on the AQ loop's 5s idle decay, which stops running once
+                    // the loop's liveness token drops (Host unmount) — so the gauge
+                    // could hold a stale NONZERO and assert a live screen encoder
+                    // that had stopped. The error/give-up/final-cleanup paths get the
+                    // same treatment via `clear_screen_sharing_state`, so every
+                    // share-over route zeroes the atom.
+                    let current_fps_onended = current_fps.clone();
                     let handler = Closure::wrap(Box::new(move || {
                         log::info!("Screen share track ended (user stopped sharing)");
-                        enabled_clone.store(false, Ordering::Release);
-                        screen_sharing_flag_clone.store(false, Ordering::Release);
+                        apply_screen_share_stopped(
+                            &enabled_clone,
+                            &screen_sharing_flag_clone,
+                            &current_fps_onended,
+                        );
                         client_onended.set_screen_enabled(false);
                         if let Some(ref callback) = on_state_change_clone {
                             callback.emit(ScreenShareEvent::Stopped);
@@ -5296,7 +5417,11 @@ impl ScreenEncoder {
         }
 
         // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
-        clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
+        clear_screen_sharing_state(
+            &screen_sharing_active,
+            &screen_sharing_active_arc,
+            &current_fps_final,
+        );
 
         // Emit Stopped event if we haven't already (onended handler might have already fired)
         // Check enabled flag - if it's still true, onended hasn't fired yet
@@ -6033,6 +6158,7 @@ mod tests {
             enable_webtransport: false,
             max_received_layer: None,
             skip_canvas_paint: false,
+            camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant::Default,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -6067,6 +6193,8 @@ mod tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_reaction: None,
+            on_raise_hand: None,
+            on_meeting_timer: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
@@ -6127,7 +6255,7 @@ mod tests {
 
     #[test]
     fn clamp_screen_layer_count_treats_zero_and_one_as_one() {
-        // 0 and 1 → single layer (feature off / byte-identical screen path).
+        // Explicit 0/1 inputs → single layer (feature-off / legacy screen path).
         assert_eq!(clamp_screen_layer_count(0), 1);
         assert_eq!(clamp_screen_layer_count(1), 1);
     }
@@ -6211,6 +6339,87 @@ mod tests {
         assert!(
             !encoder.congestion_step_down.load(Ordering::Acquire),
             "the screen congestion flag must be SEPARATE from the camera's"
+        );
+    }
+
+    /// #2147: the BROWSER's own "Stop sharing" button (the track `onended` path)
+    /// must zero the output-fps atom, not just clear the enabled/sharing flags.
+    ///
+    /// That atom is exported as `screen_encoder_output_fps` → the deliberately
+    /// ungated `videocall_screen_encoder_output_fps` gauge, so a leftover nonzero
+    /// makes the gauge assert a live screen encoder for a share that has stopped —
+    /// the exact stale-value class as #2145. It cannot rely on the AQ loop's
+    /// `SCREEN_ENCODER_FPS_IDLE_DECAY_MS` backstop, because that loop exits when its
+    /// liveness token drops (Host unmount) while the health reporter keeps an `Arc`
+    /// clone of the atom and keeps reporting.
+    ///
+    /// #2147: the ERROR / give-up / final-cleanup teardown paths must zero the
+    /// output-fps atom too, not just the `onended` path.
+    ///
+    /// The last of these is the `stream_ended` route — taken when a capture track
+    /// dies WITHOUT `onended` firing (OS/source revoke, monitor unplug, Wayland
+    /// portal revoke). All three route through `clear_screen_sharing_state`, so this
+    /// pins that chokepoint. Without it the ungated
+    /// `videocall_screen_encoder_output_fps` gauge keeps asserting a live screen
+    /// encoder for a share that has ended.
+    ///
+    /// MUTATION: change `clear_screen_sharing_state` back to calling only
+    /// `clear_screen_sharing_flags` (drop the `reset_output_fps`) and the fps
+    /// assertion fails (stays 17).
+    #[test]
+    fn clear_screen_sharing_state_zeroes_output_fps_and_both_flags() {
+        use super::clear_screen_sharing_state;
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let rc = Rc::new(AtomicBool::new(true));
+        let arc = Arc::new(AtomicBool::new(true));
+        let current_fps = AtomicU32::new(17);
+
+        clear_screen_sharing_state(&rc, &arc, &current_fps);
+
+        assert_eq!(
+            current_fps.load(Ordering::Relaxed),
+            0,
+            "#2147: an error/revoke teardown must report an honest 0, not a stale nonzero"
+        );
+        // The pre-existing #1611 dual-flag behaviour must be preserved.
+        assert!(
+            !rc.load(Ordering::Acquire),
+            "the Rc sharing flag must clear"
+        );
+        assert!(
+            !arc.load(Ordering::Acquire),
+            "the Arc sharing flag must clear (mic-side #1611)"
+        );
+    }
+
+    /// MUTATION: delete the `reset_output_fps(current_fps)` line from
+    /// `apply_screen_share_stopped` and the fps assertion fails (stays 24).
+    #[test]
+    fn screen_share_stopped_zeroes_output_fps_and_flags() {
+        use super::apply_screen_share_stopped;
+        use std::sync::atomic::AtomicU32;
+
+        let enabled = AtomicBool::new(true);
+        let sharing = AtomicBool::new(true);
+        let current_fps = AtomicU32::new(24);
+
+        apply_screen_share_stopped(&enabled, &sharing, &current_fps);
+
+        assert_eq!(
+            current_fps.load(Ordering::Relaxed),
+            0,
+            "#2147: a stopped share must report an honest 0, never a stale nonzero"
+        );
+        // The pre-existing flag behaviour must be preserved by the extraction.
+        assert!(
+            !enabled.load(Ordering::Acquire),
+            "the enabled flag must be cleared"
+        );
+        assert!(
+            !sharing.load(Ordering::Acquire),
+            "the screen-sharing flag must be cleared"
         );
     }
 

@@ -1,0 +1,128 @@
+# netem-preload-daemonset.yaml — kernel-module prereq for per-pod netem (#2072).
+#
+# WHAT THIS IS: the ONE privileged component in the bot fleet. Every bot pod
+# stays NON-privileged — it shapes only its OWN network namespace via `tc`
+# (iproute2 in the image) using a FILE capability on the `tc` binary
+# (`setcap cap_net_admin+eip`, see Dockerfile) plus the pod's `capabilities.add:
+# [NET_ADMIN]` (statefulset.yaml). That is deliberately the entire privilege
+# surface for the fleet's shaping.
+#
+# WHY THIS EXISTS: `tc qdisc ... netem` needs the kernel's `sch_netem` module.
+# On these nodes the module is PRESENT and loadable but NOT auto-loaded, and a
+# non-privileged bot pod cannot `modprobe` it (module loading is a host-global,
+# privileged kernel operation — it is not namespaced and setcap on `tc` does not
+# grant it). So a single privileged DaemonSet loads `sch_netem` once per node,
+# for every node a bot can land on, and the bots stay unprivileged. (This is
+# "Option B" — a privileged DaemonSet — chosen over granting the bots privilege.)
+#
+# HOW: privileged + hostPID lets `nsenter --target 1` enter host PID 1's
+# namespaces and run the HOST's `modprobe` against the HOST's /lib/modules. This
+# is the exact command validated in-cluster from a privileged host-namespace pod.
+#
+# APPLY ORDER (critical):
+#   1. namespace.yaml                (ns bot-load + ResourceQuota)
+#   2. THIS DaemonSet  → wait until every desired pod is READY
+#        kubectl -n bot-load rollout status ds/netem-preload
+#      Readiness is gated on a real check: the probe greps the host-global
+#      /proc/modules for `sch_netem`, so a Ready pod PROVES the module is loaded
+#      on that node. The bots must NOT run netem before this DaemonSet is Ready
+#      on the node they land on, or `tc ... netem` fails with
+#      "Error: Specified qdisc kind is unknown" / RTNETLINK.
+#   3. statefulset.yaml + service.yaml   (the bots)
+#   4. conductor-job.yaml                (drives the netem actions)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: netem-preload
+  namespace: bot-load
+  labels:
+    app.kubernetes.io/name: netem-preload
+    app.kubernetes.io/component: netem-prereq
+    app.kubernetes.io/part-of: videocall
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: netem-preload
+      app.kubernetes.io/component: netem-prereq
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: netem-preload
+        app.kubernetes.io/component: netem-prereq
+        app.kubernetes.io/part-of: videocall
+    spec:
+      # This pod loads a kernel module via the host namespaces; it never calls
+      # the K8s API — don't mount a ServiceAccount token into a privileged pod.
+      automountServiceAccountToken: false
+      # nsenter --target 1 must see the HOST's PID 1 (init) to enter its
+      # namespaces; hostPID makes PID 1 in this pod's view the host init.
+      hostPID: true
+      # Run on every schedulable WORKER node a bot could land on. No blanket
+      # tolerations on purpose: this is the fleet's ONLY privileged pod, and the
+      # bots carry no tolerations (they land only on untainted workers), so netem
+      # is only needed there. Omitting tolerations keeps this privileged +
+      # hostPID workload OFF control-plane / specially-tainted nodes.
+      # Small image; only `nsenter` is used from it (the actual modprobe binary
+      # and modules come from the HOST via nsenter --mount). Pinned tag, never
+      # :latest. NOTE: this pulls anonymously from Docker Hub — if these nodes
+      # cannot egress to Docker Hub, mirror it into Harbor
+      # (hclcr.io/hcllabs/busybox:1.37.0) and add the hclcr-io imagePullSecret
+      # (see bot-pod.yaml for the copy-into-namespace recipe).
+      containers:
+        - name: modprobe
+          # Pinned by DIGEST (not the mutable :1.37.0 tag): this is a privileged
+          # + hostPID pod, so a repointed tag would be root on every node. Digest
+          # for busybox:1.37.0. (Mirror into Harbor hclcr.io/hcllabs for full
+          # supply-chain control if Docker Hub egress is ever restricted.)
+          image: busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028
+          imagePullPolicy: IfNotPresent
+          # ONLY privileged workload in the fleet. Required for setns() into the
+          # host namespaces and for the privileged modprobe kernel operation.
+          securityContext:
+            privileged: true
+          env:
+            # For log attribution — which node this pod loaded the module on.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "netem-preload: loading sch_netem on node ${NODE_NAME:-unknown}"
+              # Idempotent: modprobe is a no-op if the module is already loaded.
+              # If it FAILS here (module genuinely absent), we exit non-zero and
+              # CrashLoop — a deliberate, visible signal that the prereq is unmet.
+              nsenter --target 1 --mount --uts --ipc --net --pid -- modprobe sch_netem
+              echo "netem-preload: sch_netem loaded on node ${NODE_NAME:-unknown}"
+              # A DaemonSet pod must not exit (it would CrashLoop). Stay alive,
+              # and idempotently re-assert the module every hour so an unload on
+              # the node self-heals. A failed re-check only warns (it was loaded
+              # once); it does not crash a node that is already serving bots.
+              while true; do
+                sleep 3600
+                nsenter --target 1 --mount --uts --ipc --net --pid -- modprobe sch_netem \
+                  || echo "netem-preload: WARN periodic modprobe re-check failed on ${NODE_NAME:-unknown}"
+              done
+          # Readiness = the module is actually loaded on THIS node. /proc/modules
+          # is host-global (kernel module state is NOT namespaced), so this grep
+          # reflects the node's real state and makes "DaemonSet Ready" a true
+          # gate for the apply order above.
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "grep -q '^sch_netem ' /proc/modules"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # The bot-load ResourceQuota REQUIRES requests AND limits on every pod.
+          # This pod is idle after the one-time modprobe (just an hourly re-check),
+          # so keep it tiny.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"

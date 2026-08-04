@@ -234,8 +234,21 @@ pub fn overlay_painted_fps_sample(metrics: &[Metric], peer_id: &str) -> Option<f
 /// Extracted as a pure, host-testable fn so the audio-on → kbps mapping is
 /// guarded by a unit test rather than re-implemented inline: `peer_tile.rs` routes
 /// BOTH the `peer_status` heartbeat write and the mount seed through this fn, so
-/// the test exercises the exact production mapping. Audio is single-layer by
-/// default, so the base rung is the exact received nominal the drawer shows.
+/// the test exercises the exact production mapping. Audio simulcast defaults to
+/// three rungs (#1082), so this layer-0 nominal (12 kbps) under-reports when the
+/// receiver selects layer 1 or 2 (24/48 kbps); issue #2132 tracks that readout bug.
+///
+/// The base-rung const is a deliberate #1769 choice: a plain `const fn` read with
+/// no borrow and no clock call. Note this fn is invoked at tile mount and on the
+/// `peer_status` heartbeat — not on every rebuild.
+///
+/// Fixing #2132 needs a PER-PEER source, and the obvious-looking accessor is the
+/// wrong one: `VideoCallClient::received_layer_snapshot(Audio)` is a per-KIND
+/// AGGREGATE (one needle per kind — the active talker for audio, with a
+/// highest-layer fallback), so driving per-peer tiles from it would paint the same
+/// representative bitrate on every tile. The per-peer feed is
+/// `VideoCallClient::per_peer_received_snapshots` (#1095), which returns one
+/// `PeerReceiveDiag` per peer carrying that peer's own decoded-layer snapshot.
 pub fn overlay_audio_kbps(audio_enabled: bool) -> f64 {
     if audio_enabled {
         videocall_client::decode::layer_chooser::base_audio_layer_kbps() as f64

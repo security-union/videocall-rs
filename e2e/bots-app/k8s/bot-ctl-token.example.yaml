@@ -1,0 +1,46 @@
+# bot-ctl-token.example.yaml — TEMPLATE ONLY. Contains a PLACEHOLDER, never a
+# real token.
+#
+# The single fleet-wide bearer token for the bots' control API (Increment 3,
+# #2072). Every bot pod mounts it as env BOT_CTL_TOKEN (statefulset.yaml,
+# secretKeyRef → key `token`); `bots-app run` reads it from that env var
+# (never on argv, so it stays out of `ps`/`/proc/<pid>/cmdline`). The
+# in-cluster conductor sends the SAME token as
+# `Authorization: Bearer <token>` on every request to
+#   videocall-bots-<ordinal>.videocall-bots.bot-load.svc.cluster.local:8080
+# A single shared token is sufficient because the control API is reachable ONLY
+# inside the cluster (headless Service DNS; no Ingress/LoadBalancer fronts it)
+# and the token still blocks any other in-cluster workload from driving the
+# fleet or its /netem shaping.
+#
+# ── PREFERRED: generate a strong random token at deploy time (never in git) ───
+# Generate the token and create the Secret in one step — the real value never
+# touches a file or the shell history in a reusable form:
+#
+#   kubectl -n bot-load create secret generic bot-ctl-token \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#
+# (`openssl rand -hex 32` = 256 bits of entropy. `head -c32 /dev/urandom |
+# base64` works too — any high-entropy random string the conductor also holds.)
+#
+# Rotate by re-creating the Secret and restarting the fleet:
+#   kubectl -n bot-load create secret generic bot-ctl-token \
+#     --from-literal=token="$(openssl rand -hex 32)" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n bot-load rollout restart statefulset/videocall-bots
+# (env-injected Secrets are captured at pod start, so a running pod keeps the
+# old token until it restarts — hand the conductor the new value too.)
+#
+# ── This manifest ─────────────────────────────────────────────────────────────
+# Exists only to document the Secret's SHAPE (the `token` key secretKeyRef
+# expects). If you must `apply` it instead of the imperative form above, replace
+# the placeholder in a LOCAL copy kept OUT of git — a committed real token is a
+# credential leak; rotate immediately if that happens.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bot-ctl-token
+  namespace: bot-load
+type: Opaque
+stringData:
+  token: "<BOT_CTL_TOKEN>"

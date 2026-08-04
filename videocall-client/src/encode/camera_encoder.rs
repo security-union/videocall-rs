@@ -162,8 +162,9 @@ use super::encoder_state::{
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    camera_periodic_keyframe_max_interval_ms, simulcast_layers, AUDIO_QUALITY_TIERS,
-    BITRATE_CHANGE_THRESHOLD, SIMULCAST_LAYER_FPS_THROTTLE_SLACK, VIDEO_QUALITY_TIERS,
+    camera_periodic_keyframe_max_interval_ms, simulcast_layers_for, LadderVariant,
+    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, SIMULCAST_LAYER_FPS_THROTTLE_SLACK,
+    VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -305,6 +306,49 @@ pub struct SimulcastSendSnapshot {
     /// #1095: shed rungs must stay visible rather than the ladder silently
     /// shrinking when the AQ drops the top layer under congestion.
     pub layers: Vec<SimulcastLayerInfo>,
+}
+
+/// Resolve one simulcast rung's ENCODE parameters from the camera ladder
+/// (issue #1768): `(layer_w, layer_h, tier_w, tier_h, init_bitrate_bps, layer_fps)`.
+///
+/// **This is the read that determines what is ACTUALLY ENCODED**, as distinct from
+/// `live_simulcast_snapshot` (observability) and the single-layer low-rung pin. It is
+/// extracted from the encode loop's `build_layer` closure specifically so it is
+/// TESTABLE: that closure lives inside a `spawn_local` future needing WebCodecs, so a
+/// mutation there — swapping `simulcast_layers_for(n, variant)` back to
+/// `simulcast_layers(n)`, i.e. encoding 720p while every panel and gauge reports
+/// 540p — could not be caught by any test. Pinned by
+/// `encode_path_geometry_follows_the_ladder_variant`.
+///
+/// `src_w`/`src_h` are the NATIVE capture dims. The rung's dims are a BOUNDING BOX,
+/// not a fixed output size (issue #1196): the source is fitted inside the box
+/// aspect-preserving, so a 4:3 webcam is never per-axis-squashed into a 16:9 rung.
+/// `tier_w`/`tier_h` are returned unfitted so the per-frame loop can re-fit against
+/// the same box when the source dims change.
+///
+/// `layer_idx` is clamped into the ladder, so an out-of-range rung degrades to the
+/// top rung rather than panicking a live call.
+fn simulcast_layer_encode_params(
+    n_layers: usize,
+    layer_idx: usize,
+    ladder_variant: LadderVariant,
+    src_w: u32,
+    src_h: u32,
+) -> (u32, u32, u32, u32, f64, Option<u32>) {
+    let tiers = simulcast_layers_for(n_layers, ladder_variant);
+    let idx = layer_idx.min(tiers.len().saturating_sub(1));
+    let tier = &tiers[idx];
+    // Seed the first GOP at the aspect-fitted dims, not the raw 16:9 tier dims.
+    let (fit_w, fit_h) =
+        fit_within_preserving_aspect(src_w, src_h, tier.max_width, tier.max_height);
+    (
+        fit_w,
+        fit_h,
+        tier.max_width,
+        tier.max_height,
+        tier.ideal_bitrate_kbps as f64 * 1000.0,
+        Some(tier.target_fps),
+    )
 }
 
 /// Build the per-EFFECTIVE-layer simulcast breakdown (issue #1095), lowest layer
@@ -537,10 +581,39 @@ pub struct CameraEncoder {
     /// `experimentalSimulcastMaxLayers` runtime flag and passed into the constructor.
     /// Clamped to [`SIMULCAST_MAX_SUPPORTED_LAYERS`] by [`effective_layer_count`].
     ///
-    /// **PR A always passes 1**, so [`effective_layer_count`] returns 1 and the
-    /// encode path is byte-identical to the pre-simulcast single-encoder path.
-    /// N>1 wiring (per-layer tiers, AQ layer-drop) lands in PR B.
+    /// The UI passes `min(runtime flag, sniffed capability)`. The flag defaults
+    /// to 3 (#1082), while the capability check can still clamp weak devices to
+    /// 1 or 2. An explicit ceiling of 1 preserves the pre-simulcast
+    /// single-encoder path; larger ceilings enable per-layer tiers and AQ shed.
     max_layers: u32,
+    /// Which CAMERA simulcast ladder this publisher encodes against (issue
+    /// #1768). Computed ONCE in the UI from the `experimentalReducedLadder`
+    /// runtime flag and passed into the constructor — the same pattern as
+    /// `max_layers` above, and deliberately NOT a process-global.
+    ///
+    /// The ladder is resolved from this field at three sites — two inside the
+    /// encode-loop future, one on the UI poll:
+    ///
+    /// 1. `build_layer` inside the encode loop's `'restart` (per-layer geometry),
+    /// 2. the `low_rung` single-layer >3-peer pin, also inside `'restart`,
+    /// 3. `live_simulcast_snapshot` (observability, polled by the UI).
+    ///
+    /// The two `spawn_local` sites (`set_encoder_control`, `start`) each COPY the
+    /// field into their future rather than resolving a ladder there. A
+    /// process-global would make "was the flag set yet?" a live question at every
+    /// one of those moments; a `Copy` field is unanswerable-by-construction — every
+    /// read in this encoder's lifetime returns the value it was built with,
+    /// including across a codec `'restart`, which re-reads the CAPTURED value
+    /// rather than the flag.
+    ///
+    /// **Both publisher halves must agree:** this same variant is handed to the
+    /// [`EncoderBitrateController`] (see `set_encoder_control`), which derives the
+    /// per-layer BITRATE TARGETS from it and hands them back to this encoder via
+    /// `shared_layer_bitrates_bps`. Gating only the geometry would configure this
+    /// encoder's rungs at the other ladder's bitrates (e.g. a 540p rung at
+    /// 1500 kbps). It would NOT shed a layer — see the controller's
+    /// `ladder_variant` docs for why that earlier framing was wrong.
+    ladder_variant: LadderVariant,
     /// Number of simulcast layers currently active (encoded + sent), written by
     /// the AQ control loop and read by the encode loop (issue #989, PR B).
     /// In single-stream mode (effective layers == 1) this stays 1 and the
@@ -1282,8 +1355,17 @@ impl CameraEncoder {
     /// * `max_layers` - the maximum number of simulcast layers to emit (issue
     ///   #989). The UI computes this from device capability and the
     ///   `experimentalSimulcastMaxLayers` runtime flag. Clamped to
-    ///   [`SIMULCAST_MAX_SUPPORTED_LAYERS`]; `0` is treated as `1`. **PR A
-    ///   always passes 1** (single layer, byte-identical to the legacy path).
+    ///   [`SIMULCAST_MAX_SUPPORTED_LAYERS`]; `0` is treated as `1`. The runtime
+    ///   flag defaults to 3 (#1082), but the device-capability ceiling may
+    ///   reduce the value. Passing 1 explicitly preserves the legacy path.
+    ///
+    /// * `ladder_variant` - which CAMERA simulcast ladder to encode against
+    ///   (issue #1768). The UI reads this ONCE from the `experimentalReducedLadder`
+    ///   runtime flag; [`LadderVariant::Default`] is the shipped 180p/360p/720p
+    ///   ladder and is byte-identical to the pre-#1768 behaviour. The same variant
+    ///   is forwarded to the AQ controller in
+    ///   [`set_encoder_control`](Self::set_encoder_control) so the uplink budget
+    ///   matches the rungs actually emitted.
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
@@ -1294,6 +1376,7 @@ impl CameraEncoder {
         on_encoder_settings_update: Callback<String>,
         on_error: Callback<String>,
         max_layers: u32,
+        ladder_variant: LadderVariant,
     ) -> Self {
         // Reset the WT uplink-saturation threshold to floor (250ms) to prevent
         // leaking a raised threshold from a prior CameraEncoder that was dropped
@@ -1350,6 +1433,11 @@ impl CameraEncoder {
             video_at_floor_flag: Arc::new(AtomicBool::new(false)),
             quality_bounds: Rc::new(RefCell::new(SharedQualityBounds::default())),
             max_layers,
+            // Camera ladder variant (issue #1768). Fixed for this encoder's
+            // lifetime: `start()` / `'restart` / the AQ loop all read THIS field,
+            // so a codec restart or a mid-call re-election cannot resolve a
+            // different ladder than the one the controller budgets against.
+            ladder_variant,
             // Simulcast ACTIVE-layer state (issue #989 / #1140 / #1141). Cold-start
             // at the BASE layer only (`initial_active_layer_count()` == 1), NOT the
             // device ceiling: the publisher's ENCODE/EGRESS OUTPUT is byte-identical
@@ -1405,9 +1493,9 @@ impl CameraEncoder {
     ///
     /// Clamps the caller-supplied `max_layers` to at least 1 (a `0` request is
     /// meaningless — there is always at least the base layer) and at most
-    /// [`SIMULCAST_MAX_SUPPORTED_LAYERS`]. In PR A the caller always passes 1,
-    /// so this returns 1 and the encode loop runs a single layer exactly as
-    /// before.
+    /// [`SIMULCAST_MAX_SUPPORTED_LAYERS`]. An explicit input of 1 makes the
+    /// encode loop run a single layer exactly as before; larger values permit
+    /// the runtime AQ ramp to activate upper rungs.
     fn effective_layer_count(&self) -> u32 {
         clamp_layer_count(self.max_layers)
     }
@@ -1456,6 +1544,11 @@ impl CameraEncoder {
         // encoder control loop — clone both sides' shared state.
         let quality_bounds = self.quality_bounds.clone();
         let n_layers = self.effective_layer_count() as usize;
+        // Camera ladder variant (issue #1768). Captured here, from the SAME field
+        // the encode loop reads, and handed to the controller at construction —
+        // this is the single wiring point that keeps the controller's uplink
+        // budget on the same rungs the encoder emits.
+        let ladder_variant = self.ladder_variant;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         // Sender encoder backpressure (issue #1108, Phase B): the control loop
@@ -1495,9 +1588,21 @@ impl CameraEncoder {
         let single_layer_low_pin = self.single_layer_low_pin.clone();
         let screen_ready_stall_tracker = self.screen_ready_stall_tracker.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderBitrateController::new(
+            // Issue #1768: build the controller on the SAME ladder variant the
+            // encode loop derives its per-layer geometry from. `new_with_ladder`
+            // (not `new`) is load-bearing — the controller derives the per-layer
+            // BITRATE TARGETS from this ladder and hands them back to the encode loop
+            // via `shared_layer_bitrates_bps` → `set_bitrate`. Passing the default
+            // here while the encoder emits reduced rungs would configure a 960×540
+            // rung at the 720p ladder's 1500 kbps: wasted uplink, and it corrupts the
+            // bitrate numbers of any run measuring this ladder.
+            //
+            // It would NOT shed a layer — see the controller's `ladder_variant` docs
+            // for why the earlier "phantom ceiling" framing was wrong.
+            let mut encoder_control = EncoderBitrateController::new_with_ladder(
                 current_bitrate.load(Ordering::Relaxed),
                 current_fps.clone(),
+                ladder_variant,
             );
             // Apply any user quality bounds set before the encoder started, and
             // track the generation we last applied so the loop only re-applies
@@ -2200,10 +2305,11 @@ impl CameraEncoder {
         }
         // Fixed per-layer resolutions for the FULL ladder (lowest layer first) —
         // resolvable for every effective layer, shed included.
-        let resolutions: Vec<(u32, u32)> = simulcast_layers(effective as usize)
-            .iter()
-            .map(|t| (t.max_width, t.max_height))
-            .collect();
+        let resolutions: Vec<(u32, u32)> =
+            simulcast_layers_for(effective as usize, self.ladder_variant)
+                .iter()
+                .map(|t| (t.max_width, t.max_height))
+                .collect();
         // Active layer count is shed-aware (the AQ loop drops the top layer under
         // congestion); clamp it to the ladder size defensively.
         let active = (self.shared_active_layer_count.load(Ordering::Relaxed))
@@ -2518,6 +2624,12 @@ impl CameraEncoder {
         // under congestion.
         let n_layers = self.effective_layer_count() as usize;
         let simulcast = n_layers > 1;
+        // Camera ladder variant (issue #1768) for the encode loop's per-layer
+        // geometry. Copied from the encoder field (fixed at construction), so the
+        // loop resolves the same rungs the AQ controller budgets against — on the
+        // initial spawn AND on every `'restart` codec rebuild, which re-reads this
+        // captured value rather than the runtime flag.
+        let ladder_variant = self.ladder_variant;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         // Sender encoder backpressure (issue #1108, Phase B): the encode loop
@@ -2679,8 +2791,8 @@ impl CameraEncoder {
             // Each simulcast layer (issue #989) carries its own monotonic
             // counter: a receiver decoding only one layer must see a dense
             // 0,1,2,… stream or its `SequenceTracker` reports phantom loss
-            // (~(N-1)/N) and storms PLIs. PR A has n_layers == 1 so this is a
-            // single-element Vec behaving exactly like the old scalar.
+            // (~(N-1)/N) and storms PLIs. Explicit single-layer mode makes this
+            // a one-element Vec behaving exactly like the old scalar.
             let mut sequence_numbers: Vec<u64> = vec![0; n_layers];
 
             let mut restart_count: u32 = 0;
@@ -2915,9 +3027,9 @@ impl CameraEncoder {
                         .unchecked_into::<VideoTrack>(),
                 );
 
-                // Get track settings to get actual width and height up front so
-                // every layer can be constructed with the native dimensions
-                // (PR A) — per-layer downscaled tiers land in PR B.
+                // Get track settings to establish the native source dimensions;
+                // each simulcast encoder then fits that source into its own
+                // fixed tier box via `simulcast_layer_target_dims`.
                 let media_track = video_track
                     .as_ref()
                     .clone()
@@ -2982,8 +3094,8 @@ impl CameraEncoder {
                 // base layer. See `should_teardown_shed_layer` + the per-frame
                 // dwell tracking in the encode loop.
                 //
-                // PR A: n_layers == 1, so only the base layer is ever built —
-                // byte-identical to the legacy single-encoder path.
+                // With an explicit one-layer ceiling only the base layer is ever
+                // built, preserving the legacy single-encoder path.
                 //
                 // `build_layer` constructs ONE `LayerEncoder` for `layer_idx`
                 // (seeded from its persisted sequence). It is a closure so both
@@ -3141,24 +3253,21 @@ impl CameraEncoder {
                     // `target_fps`, the dims from `fit_within_preserving_aspect`.
                     let (layer_w, layer_h, tier_w, tier_h, init_bitrate_bps, layer_fps) =
                         if simulcast {
-                            let tiers = simulcast_layers(n_layers);
-                            let tier = &tiers[layer_idx];
-                            // Seed the first GOP at the aspect-fitted dims, not the
-                            // raw 16:9 tier dims. `width`/`height` are the native
-                            // track dims read up front (the true source aspect).
-                            let (fit_w, fit_h) = fit_within_preserving_aspect(
+                            // Delegated to a pure fn so THE ENCODE-PATH LADDER READ IS
+                            // TESTABLE (issue #1768). This is the read that decides what
+                            // is ACTUALLY ENCODED — the other two sites are the
+                            // observability snapshot and the single-layer pin — and
+                            // inside this `spawn_local` future no test can reach it, so
+                            // swapping it back to `simulcast_layers(n_layers)` (shipping
+                            // 720p while the panel reports 540p) would leave every test
+                            // green. `simulcast_layer_encode_params` is pinned by
+                            // `encode_path_geometry_follows_the_ladder_variant`.
+                            simulcast_layer_encode_params(
+                                n_layers,
+                                layer_idx,
+                                ladder_variant,
                                 width,
                                 height,
-                                tier.max_width,
-                                tier.max_height,
-                            );
-                            (
-                                fit_w,
-                                fit_h,
-                                tier.max_width,
-                                tier.max_height,
-                                tier.ideal_bitrate_kbps as f64 * 1000.0,
-                                Some(tier.target_fps),
                             )
                         } else {
                             // Single-stream: native resolution; the tier_w/tier_h
@@ -3300,16 +3409,23 @@ impl CameraEncoder {
                 // `LayerEncoder` (local_bitrate / current_w / current_h) so each
                 // layer reconfigures independently. The tier-controlled caches
                 // below are shared across layers because they are driven by the
-                // single shared tier atomics (the AQ controller is per-publisher
-                // in PR A; per-layer AQ lands in PR B).
+                // publisher-wide tier atomics; fixed rung boxes and per-layer
+                // bitrate atomics provide the layer-specific targets.
 
                 // The `low` simulcast rung (320×180 / ideal 120 kbps, issue
                 // #1768), sourced from the AQ ladder's single source of truth —
-                // `simulcast_layers(1)` resolves to exactly `[low]`. Used by the
-                // single-layer >3-peer pin (issue #1136) below as the ceiling on
-                // the single stream; no magic numbers. Only meaningful for
-                // n_layers == 1.
-                let low_rung = &simulcast_layers(1)[0];
+                // `simulcast_layers_for(1, ..)` resolves to exactly `[low]`. Used
+                // by the single-layer >3-peer pin (issue #1136) below as the
+                // ceiling on the single stream; no magic numbers. Only meaningful
+                // for n_layers == 1.
+                //
+                // Resolved through THIS encoder's ladder variant for consistency.
+                // Both variants currently share an identical `low` rung — #1768
+                // lowered only the TOP, since the 180p floor is ~1.3% of the
+                // encode cost — so this is byte-identical today; going through the
+                // variant means a future floor retune can't silently desync the
+                // pin from the ladder the rest of the loop uses.
+                let low_rung = &simulcast_layers_for(1, ladder_variant)[0];
                 let low_rung_w = low_rung.max_width;
                 let low_rung_h = low_rung.max_height;
                 let low_rung_bitrate_bps = low_rung.ideal_bitrate_kbps * 1000;
@@ -3379,8 +3495,8 @@ impl CameraEncoder {
                     // --- Guard: check if any encoder has been closed externally ---
                     // This can happen if the browser closes the codec (e.g. due to
                     // GPU process crash, OOM, or an error callback we didn't intercept).
-                    // If ANY layer's encoder is closed we restart all layers (per-layer
-                    // restart is a future optimization, see plan PR B).
+                    // If ANY layer's encoder is closed we restart all layers;
+                    // per-layer restart remains an unimplemented optimization.
                     if layers
                         .iter()
                         .any(|l| l.encoder.state() == CodecState::Closed)
@@ -4242,8 +4358,8 @@ impl CameraEncoder {
                             // counter so transient errors don't accumulate toward
                             // MAX_RESTARTS across long-lived sessions. "Healthy" is
                             // base-layer success (see `frame_is_healthy`): a frame in
-                            // which only a higher layer encoded is NOT healthy, because
-                            // receivers decode the base layer only.
+                            // which only a higher layer encoded is NOT healthy because
+                            // it does not prove the invariant base encoder recovered.
                             let frame_healthy = frame_is_healthy(base_ok);
                             if frame_healthy && !encoded_ok_this_cycle && restart_count > 0 {
                                 log::info!(
@@ -4317,14 +4433,14 @@ mod tests {
         keyframe_tick_decision, layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin,
         periodic_keyframe_due, record_camera_restart, resolve_capture_dimensions,
         screen_ready_stall_threshold_update, shed_reason, should_encode_layer_frame,
-        should_pin_single_layer_low, should_teardown_shed_layer, video_at_floor_on_tick,
-        wt_drop_step_down_decision, wt_saturation_step_down_decision, KeyframeTickInput, LayerView,
-        ScreenReadyStallThresholdTracker, SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS,
-        SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        should_pin_single_layer_low, should_teardown_shed_layer, simulcast_layer_encode_params,
+        video_at_floor_on_tick, wt_drop_step_down_decision, wt_saturation_step_down_decision,
+        KeyframeTickInput, LayerView, ScreenReadyStallThresholdTracker, SimulcastLayerInfo,
+        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
         SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use crate::adaptive_quality_constants::{
-        CAMERA_WT_STALE_DROP_THRESHOLD, CAMERA_WT_STALE_DROP_WINDOW_MS,
+        LadderVariant, CAMERA_WT_STALE_DROP_THRESHOLD, CAMERA_WT_STALE_DROP_WINDOW_MS,
         WS_SELF_CONGESTION_DROP_THRESHOLD, WS_SELF_CONGESTION_WINDOW_MS,
         WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS, WT_SELF_CONGESTION_DROP_THRESHOLD,
         WT_SELF_CONGESTION_WINDOW_MS,
@@ -4338,6 +4454,7 @@ mod tests {
             enable_webtransport: false,
             max_received_layer: None,
             skip_canvas_paint: false,
+            camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant::Default,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -4372,6 +4489,8 @@ mod tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_reaction: None,
+            on_raise_hand: None,
+            on_meeting_timer: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
@@ -4401,7 +4520,8 @@ mod tests {
             500,
             Callback::from(|_: String| {}),
             Callback::from(|_: String| {}),
-            1, // max_layers (single layer)
+            1,                      // max_layers (single layer)
+            LadderVariant::Default, // shipped ladder (issue #1768)
         );
         // Simulate a live encoder that has produced layer-0 output.
         encoder.current_fps.store(30, Ordering::Relaxed);
@@ -4411,6 +4531,255 @@ mod tests {
             encoder.get_current_fps(),
             0,
             "#2060: CameraEncoder::stop() must reset current_fps to 0"
+        );
+    }
+
+    // --- reduced camera ladder gate (issue #1768) -------------------------
+    //
+    // These pin the ENCODER half of the gate. The controller half (its uplink
+    // budget summing the SAME rungs) is pinned in `videocall-aq`'s
+    // `test_reduced_ladder_controller_budgets_reduced_ideals`; the two together
+    // are the LADDER-GATE-DESIGN.md finding-#2 guard.
+    //
+    // `live_simulcast_snapshot()` is used as the observation point deliberately:
+    // it is the one geometry read reachable off-browser (the other three —
+    // AQ-loop spawn, encode-loop layer build, single-layer low pin — are inside
+    // `spawn_local` futures that need WebCodecs), and it resolves the ladder from
+    // `self.ladder_variant` exactly as they do.
+
+    fn encoder_with_ladder(max_layers: u32, variant: LadderVariant) -> CameraEncoder {
+        CameraEncoder::new(
+            build_test_client(),
+            "test-video-elem",
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: String| {}),
+            max_layers,
+            variant,
+        )
+    }
+
+    /// **The ENCODE-PATH guard.** The geometry actually handed to `VideoEncoder`
+    /// must follow the ladder variant.
+    ///
+    /// The other encoder tests observe `live_simulcast_snapshot()`, which is
+    /// OBSERVABILITY ONLY — reverting the encode loop's ladder read while leaving the
+    /// snapshot's alone would ship 720p while every panel and gauge reported 540p,
+    /// and every one of those tests would stay green. This closes that by testing
+    /// `simulcast_layer_encode_params`, which the encode loop's `build_layer` closure
+    /// now delegates to.
+    ///
+    /// MUTATION: change `simulcast_layer_encode_params` to call
+    /// `simulcast_layers(n_layers)` (dropping the variant) and the Reduced
+    /// assertions below fail.
+    #[test]
+    fn encode_path_geometry_follows_the_ladder_variant() {
+        use videocall_aq::constants::{SIMULCAST_VIDEO_LAYERS, SIMULCAST_VIDEO_LAYERS_REDUCED};
+
+        // A 16:9 source, so the aspect fit is an identity on the rung box and the
+        // assertion reads as the rung's own geometry.
+        const SRC_W: u32 = 1920;
+        const SRC_H: u32 = 1080;
+
+        for (variant, table) in [
+            (LadderVariant::Default, SIMULCAST_VIDEO_LAYERS),
+            (LadderVariant::Reduced, SIMULCAST_VIDEO_LAYERS_REDUCED),
+        ] {
+            for (idx, expected) in table.iter().enumerate().take(3) {
+                let (w, h, tier_w, tier_h, bitrate_bps, fps) =
+                    simulcast_layer_encode_params(3, idx, variant, SRC_W, SRC_H);
+                assert_eq!(
+                    (tier_w, tier_h),
+                    (expected.max_width, expected.max_height),
+                    "{variant:?} rung {idx}: the encode path must use THIS ladder's box"
+                );
+                // 16:9 source into a 16:9 box fits exactly.
+                assert_eq!((w, h), (expected.max_width, expected.max_height));
+                assert_eq!(fps, Some(expected.target_fps));
+                assert_eq!(bitrate_bps, expected.ideal_bitrate_kbps as f64 * 1000.0);
+            }
+        }
+
+        // The decisive contrast: the TOP rung the encoder is configured with differs
+        // between variants. If the encode path ignored the variant these would match.
+        let d_top = simulcast_layer_encode_params(3, 2, LadderVariant::Default, SRC_W, SRC_H);
+        let r_top = simulcast_layer_encode_params(3, 2, LadderVariant::Reduced, SRC_W, SRC_H);
+        assert_eq!(
+            (d_top.2, d_top.3),
+            (1280, 720),
+            "default top rung encodes 720p"
+        );
+        assert_eq!(
+            (r_top.2, r_top.3),
+            (960, 540),
+            "reduced top rung encodes 540p"
+        );
+        assert!(
+            r_top.4 < d_top.4,
+            "the reduced top rung must also be configured at a LOWER bitrate \
+             ({} vs {} bps) — a geometry-only gate would leave 540p at 1500 kbps",
+            r_top.4,
+            d_top.4
+        );
+    }
+
+    /// A non-16:9 source must be fitted INSIDE the rung box (issue #1196), never
+    /// per-axis-squashed to the box's aspect — and that must hold under both
+    /// variants. Guards the aspect fit the extraction moved.
+    ///
+    /// MUTATION: drop `fit_within_preserving_aspect` from
+    /// `simulcast_layer_encode_params` and return the raw box dims; the aspect
+    /// assertions fail (a 4:3 source would come back 16:9).
+    #[test]
+    fn encode_path_fits_a_non_16_9_source_inside_the_rung_box() {
+        // A 4:3 SD webcam (640x480) is SMALLER than both top-rung boxes on both axes,
+        // and the fit never UPSCALES (`scale.min(1.0)` in `fit_within_preserving_aspect`),
+        // so it passes through untouched — while the tier BOX still comes from the
+        // variant's ladder, which is what the per-frame re-fit keys off.
+        for (variant, box_dims) in [
+            (LadderVariant::Reduced, (960u32, 540u32)),
+            (LadderVariant::Default, (1280, 720)),
+        ] {
+            let (w, h, tier_w, tier_h, _, _) =
+                simulcast_layer_encode_params(3, 2, variant, 640, 480);
+            assert_eq!(
+                (tier_w, tier_h),
+                box_dims,
+                "{variant:?}: the box is the rung's"
+            );
+            assert_eq!(
+                (w, h),
+                (640, 480),
+                "{variant:?}: a smaller 4:3 source must pass through un-upscaled, \
+                 NOT be squashed to the 16:9 box"
+            );
+        }
+
+        // A LARGER 4:3 source (1600x1200) must be scaled DOWN into the box while
+        // keeping 4:3 — height is the binding axis, so 540*4/3 = 720 wide under the
+        // reduced ladder. This is the assertion a "return the raw box" mutation fails.
+        let (w, h, _, _, _, _) =
+            simulcast_layer_encode_params(3, 2, LadderVariant::Reduced, 1600, 1200);
+        assert_eq!(
+            (w, h),
+            (720, 540),
+            "a large 4:3 source must fit INSIDE the 540p box at 4:3 (720x540), \
+             not be squashed to 960x540"
+        );
+        let (dw, dh, _, _, _, _) =
+            simulcast_layer_encode_params(3, 2, LadderVariant::Default, 1600, 1200);
+        assert_eq!(
+            (dw, dh),
+            (960, 720),
+            "and to 960x720 inside the 720p box under the default ladder"
+        );
+    }
+
+    /// An out-of-range rung index degrades to the top rung rather than panicking a
+    /// live call.
+    #[test]
+    fn encode_path_clamps_an_out_of_range_rung_index() {
+        let (_, _, tier_w, tier_h, _, _) =
+            simulcast_layer_encode_params(3, 99, LadderVariant::Reduced, 1920, 1080);
+        assert_eq!((tier_w, tier_h), (960, 540), "clamped to the top rung");
+    }
+
+    /// A `Reduced`-ladder encoder must report the REDUCED rung geometry — a 540p
+    /// top rung, not 720p.
+    ///
+    /// The expected values are read from `SIMULCAST_VIDEO_LAYERS_REDUCED` itself
+    /// rather than hardcoded, so a future ladder retune moves the test with the
+    /// production table instead of pinning a stale copy.
+    ///
+    /// MUTATION: make any of the encoder's ladder resolutions ignore
+    /// `self.ladder_variant` (e.g. revert `live_simulcast_snapshot` to
+    /// `simulcast_layers(effective)`) and the top rung reverts to 1280×720,
+    /// failing here.
+    #[test]
+    fn reduced_ladder_encoder_emits_reduced_geometry() {
+        use videocall_aq::constants::SIMULCAST_VIDEO_LAYERS_REDUCED;
+
+        let encoder = encoder_with_ladder(3, LadderVariant::Reduced);
+        let snap = encoder.live_simulcast_snapshot();
+        assert!(snap.simulcast_active, "3 layers => simulcast active");
+        assert_eq!(snap.layers.len(), 3, "one entry per effective layer");
+
+        let expected: Vec<(u32, u32)> = SIMULCAST_VIDEO_LAYERS_REDUCED
+            .iter()
+            .map(|t| (t.max_width, t.max_height))
+            .collect();
+        let got: Vec<(u32, u32)> = snap.layers.iter().map(|l| (l.width, l.height)).collect();
+        assert_eq!(
+            got, expected,
+            "a Reduced encoder must resolve every rung from the REDUCED ladder"
+        );
+        // The decisive rung: 540p, NOT the shipped 720p.
+        assert_eq!(
+            (snap.layers[2].width, snap.layers[2].height),
+            (960, 540),
+            "the reduced top rung is 960x540 (issue #1768)"
+        );
+    }
+
+    /// The DEFAULT arm is inert: an encoder on `LadderVariant::Default` resolves
+    /// the shipped ladder, so the gate is byte-identical with the flag off.
+    ///
+    /// MUTATION: make `live_simulcast_snapshot` ignore `self.ladder_variant` and pass
+    /// `LadderVariant::Reduced` (or have `CameraEncoder::new` overwrite the field with
+    /// `Reduced`) and the top rung flips to 960×540, failing here. NOTE it is NOT
+    /// achievable by "defaulting the parameter to Reduced" — `ladder_variant` is a
+    /// required positional argument with no default to change.
+    #[test]
+    fn default_ladder_encoder_geometry_is_unchanged() {
+        use videocall_aq::constants::SIMULCAST_VIDEO_LAYERS;
+
+        let encoder = encoder_with_ladder(3, LadderVariant::Default);
+        let snap = encoder.live_simulcast_snapshot();
+        let expected: Vec<(u32, u32)> = SIMULCAST_VIDEO_LAYERS
+            .iter()
+            .map(|t| (t.max_width, t.max_height))
+            .collect();
+        let got: Vec<(u32, u32)> = snap.layers.iter().map(|l| (l.width, l.height)).collect();
+        assert_eq!(
+            got, expected,
+            "the Default arm must resolve the SHIPPED ladder unchanged"
+        );
+        // Pin the shipped top rung explicitly: this is the value #1768's gate must
+        // NOT move when the flag is off.
+        assert_eq!(
+            (snap.layers[2].width, snap.layers[2].height),
+            (1280, 720),
+            "flag-off must still publish a 720p top rung"
+        );
+    }
+
+    /// The two variants must actually DIFFER through the encoder — otherwise both
+    /// tests above could pass against one table and prove nothing. Compares the
+    /// production paths against each other rather than against constants.
+    #[test]
+    fn reduced_and_default_encoder_geometry_differ_at_the_top_rung() {
+        let reduced = encoder_with_ladder(3, LadderVariant::Reduced).live_simulcast_snapshot();
+        let default = encoder_with_ladder(3, LadderVariant::Default).live_simulcast_snapshot();
+        assert_eq!(
+            reduced.layers.len(),
+            default.layers.len(),
+            "both variants must be the same DEPTH (the layer-id space is shared)"
+        );
+        assert_ne!(
+            (reduced.layers[2].width, reduced.layers[2].height),
+            (default.layers[2].width, default.layers[2].height),
+            "the gate is pointless unless the top rung differs between variants"
+        );
+        assert!(
+            reduced.layers[2].height < default.layers[2].height,
+            "Reduced must be the CHEAPER variant (top rung lower, not higher)"
+        );
+        // The floor is deliberately shared — #1768 lowered only the top, since the
+        // 180p base is ~1.3% of the encode cost.
+        assert_eq!(
+            (reduced.layers[0].width, reduced.layers[0].height),
+            (default.layers[0].width, default.layers[0].height),
+            "the 180p base rung is intentionally identical across variants"
         );
     }
 
@@ -5169,8 +5538,8 @@ mod tests {
     #[test]
     fn single_layer_emits_layer_id_zero() {
         // The build loop assigns layer_id = layer_idx for idx in 0..n_layers.
-        // For n_layers == 1 (PR A) the only id is 0. This pins that invariant
-        // without needing a live camera/VideoEncoder.
+        // For an explicit n_layers == 1 input the only id is 0. This pins that
+        // invariant without needing a live camera/VideoEncoder.
         let n_layers = clamp_layer_count(1) as usize;
         let ids: Vec<u32> = (0..n_layers).map(|i| i as u32).collect();
         assert_eq!(ids, vec![0]);

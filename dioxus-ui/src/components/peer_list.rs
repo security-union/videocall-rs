@@ -19,7 +19,7 @@
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
 use crate::constants::meeting_api_client;
-use crate::context::{HostSetCtx, RecordingSetCtx, VideoCallClientCtx};
+use crate::context::{HostSetCtx, RaisedHandsCtx, RecordingSetCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
 use futures::future::{AbortHandle, Abortable};
 use std::cell::RefCell;
@@ -170,6 +170,24 @@ pub fn PeerList(
             .as_ref()
             .map(|rs| rs.is_recording(session_id))
             .unwrap_or(false)
+    };
+    // Issue 2135: the roster's raised-hand badge + its "position P of N" queue
+    // slot, keyed on `session_id` like recording (a hand belongs to a tab, not an
+    // account). The roster is the ONE surface that can show every raised hand at
+    // once, so it carries the ordinal — the banner collapses past the third name
+    // and a tile badge shows no order at all.
+    //
+    // The ordinal lives HERE and nowhere else, deliberately. This is a single
+    // component rendering all rows, so the closure's reads cost ONE subscription
+    // to the roster signal no matter how many rows exist. Resolving the same
+    // ordinal inside each `PeerTile` would instead cost N subscriptions to a
+    // value that moves for everyone whenever anyone lowers — the fan-out the
+    // #2135 perf review flagged.
+    let raised_hands_ctx = try_use_context::<RaisedHandsCtx>();
+    let hand_slot_of = move |session_id: &str| -> Option<(usize, usize)> {
+        raised_hands_ctx
+            .as_ref()
+            .and_then(|rh| rh.queue_slot(session_id))
     };
 
     rsx! {
@@ -392,7 +410,7 @@ pub fn PeerList(
                     div { class: "peer-list",
                         ul {
                             // show self as the first item with actual username
-                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_recording: is_recording_session(&current_session_id), is_self: true, is_guest: client_ctx.is_local_guest().unwrap_or(false), muted: self_muted, speaking: self_speaking, on_edit_name: on_edit_self_name } }
+                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_recording: is_recording_session(&current_session_id), is_self: true, is_guest: client_ctx.is_local_guest().unwrap_or(false), muted: self_muted, speaking: self_speaking, hand_slot: hand_slot_of(&current_session_id), on_edit_name: on_edit_self_name } }
 
                             for peer in filtered_peers.iter() {
                                 {
@@ -565,6 +583,7 @@ pub fn PeerList(
                                                 tooltip: tooltip_user_id,
                                                 is_host: is_peer_host,
                                                 is_recording: is_recording_session(sid),
+                                                hand_slot: hand_slot_of(sid),
                                                 is_guest: peer_is_guest,
                                                 muted: muted,
                                                 video_disabled: video_disabled,

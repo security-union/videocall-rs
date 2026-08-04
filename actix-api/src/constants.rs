@@ -860,6 +860,125 @@ pub const REACTION_DISPLAY_NAME_MAX_BYTES: usize = 256;
 /// See [`crate::actors::packet_handler::custom_emoji_is_valid`].
 pub const REACTION_CUSTOM_EMOJI_MAX_BYTES: usize = 32;
 
+// ---------------------------------------------------------------------------
+// RAISE_HAND Rate Limiting (issue #2135)
+// ---------------------------------------------------------------------------
+
+/// The relay's per-sender RAISE_HAND budget (issue #2135).
+///
+/// DEFINED IN `videocall-types`, not here, and re-exported so every
+/// `crate::constants::RAISE_HAND_*` call site is unchanged. The move is
+/// deliberate: the ceiling is a WIRE CONTRACT, not private server policy — the
+/// client is required to keep its own send interval strictly under it, and the
+/// test that pins that property lives in `videocall-client`, which cannot see
+/// this crate. While the value lived here, that test could only hand-copy the
+/// literals, so lowering the budget would not have failed anything.
+///
+/// See [`videocall_types::limits`] for the full rationale behind the values.
+pub use videocall_types::limits::{RAISE_HAND_MAX_PER_WINDOW, RAISE_HAND_WINDOW_MS};
+
+/// Maximum number of BYTES of a RAISE_HAND's cosmetic `display_name` the relay
+/// will RE-BROADCAST (issue #2135).
+///
+/// Same value and same rationale as [`REACTION_DISPLAY_NAME_MAX_BYTES`]: the
+/// field is attacker-controlled, fanned out room-wide, and generous enough
+/// (~4× the client's 64-char contract) that a legitimate multi-byte name is
+/// never truncated. Kept as a SEPARATE constant rather than aliasing the
+/// reaction one so the two wire contracts can diverge without a silent
+/// cross-feature regression; if you change one, changing the other must be a
+/// deliberate decision, not a side effect.
+///
+/// TRUNCATES (at a UTF-8 char boundary) rather than dropping, for the same
+/// reason as REACTION: the hand state itself is valid and the name is only a
+/// cosmetic fallback, so discarding a real state transition over an oversized
+/// cosmetic field would leave the room's view of that participant wrong.
+pub const RAISE_HAND_DISPLAY_NAME_MAX_BYTES: usize = 256;
+
+/// Maximum number of BYTES of the inner `RaiseHandPacket` payload
+/// (`PacketWrapper.data`) the relay will accept at ingress (issue #2135).
+///
+/// A legitimate RaiseHandPacket is tiny. Worst case, field by field: `raised`
+/// = 1 tag + 1 varint = 2 bytes; `raised_at_ms` = 1 tag + a 10-byte max u64
+/// varint = 11 bytes; `display_name` = 1 tag + a 2-byte length varint +
+/// [`RAISE_HAND_DISPLAY_NAME_MAX_BYTES`] (256) = 259 bytes. Total 272. 512
+/// leaves ~2× headroom for a future field while keeping the bound meaningful.
+///
+/// WHY THIS EXISTS AT ALL — it is not redundant with the `display_name` cap.
+/// rust-protobuf PRESERVES UNKNOWN FIELDS across parse/serialize (they live in
+/// `special_fields` and are re-emitted on `write_to_bytes`), which is exactly
+/// what we want for forward compatibility: a newer client's new field must
+/// survive an older relay rather than being silently stripped. But it means the
+/// `display_name` bound alone does NOT bound the packet — a forged RAISE_HAND
+/// carrying megabytes of unknown fields would be re-broadcast verbatim to every
+/// participant. This cap is the only thing that bounds that amplification, and
+/// it is checked on the RAW wire bytes BEFORE any parse, so an oversized payload
+/// costs the relay one length comparison rather than a full protobuf decode.
+///
+/// Over-cap DROPS (does not truncate): the bytes are opaque at this point, so
+/// there is no safe place to cut. A well-behaved client cannot reach this cap
+/// (its own display name is capped at 64 chars), so nothing legitimate is lost.
+pub const RAISE_HAND_PACKET_MAX_BYTES: usize = 512;
+
+// ---------------------------------------------------------------------------
+// MEETING_TIMER ingress validation + rate limiting (issue #2136)
+// ---------------------------------------------------------------------------
+
+/// The relay's per-sender MEETING_TIMER budget and the client-side
+/// `duration_ms` bound (issue #2136).
+///
+/// DEFINED IN `videocall-types`, not here, and re-exported so every
+/// `crate::constants::MEETING_TIMER_*` call site is unchanged. Same reasoning as
+/// the RAISE_HAND budget above: these are WIRE CONTRACT, not private server
+/// policy. The host client must keep its heartbeat + transition-repeat rate
+/// strictly under the ceiling, and must clamp `duration_ms` independently of
+/// whatever relay it happens to be connected to — and the tests that pin both
+/// live in `videocall-client`, which cannot see this crate. While the values
+/// lived here those tests could only hand-copy the literals, so lowering the
+/// budget would not have failed anything.
+///
+/// `MEETING_TIMER_PACKET_MAX_BYTES` deliberately does NOT move: it bounds an
+/// ingress payload the relay alone enforces, and no client behaviour depends on
+/// agreeing with it.
+///
+/// See [`videocall_types::limits`] for the full rationale behind the values.
+pub use videocall_types::limits::{
+    MEETING_TIMER_MAX_DURATION_MS, MEETING_TIMER_MAX_PER_WINDOW, MEETING_TIMER_WINDOW_MS,
+};
+
+/// Maximum number of BYTES of the inner `MeetingTimerPacket` payload
+/// (`PacketWrapper.data`) the relay accepts at ingress (issue #2136).
+///
+/// A legitimate MeetingTimerPacket is tiny. Worst case, field by field:
+/// `running` = 1 tag + 1 varint = 2 bytes; each of `ends_at_ms`, `duration_ms`
+/// and `updated_at_ms` = 1 tag + a 10-byte max u64 varint = 11 bytes. Total 35.
+/// 256 leaves ~7x headroom for future fields while keeping the bound meaningful.
+///
+/// WHY THIS EXISTS AT ALL — it is not redundant with the `duration_ms` cap, and
+/// unlike REACTION/RAISE_HAND this packet has no string field to bound either.
+/// rust-protobuf PRESERVES UNKNOWN FIELDS across parse/serialize (they live in
+/// `special_fields` and are re-emitted on `write_to_bytes`), which is what we
+/// want for forward compatibility: a newer client's new field must survive an
+/// older relay rather than being silently stripped. But it means the scalar
+/// bounds do NOT bound the payload — a forged MEETING_TIMER whose inner packet
+/// carries megabytes of unknown fields would be re-broadcast verbatim to every
+/// participant. This cap is what bounds that.
+///
+/// SCOPE, precisely (the earlier wording here overstated both halves and was
+/// corrected): the check is `packet_wrapper.data.len()`, i.e. the INNER payload,
+/// evaluated after `classify_packet` has already parsed the OUTER `PacketWrapper`
+/// — it is "before the inner parse", not "before any parse", and it does not
+/// save the outer decode. It also bounds the inner payload ONLY: unknown fields
+/// on the OUTER wrapper are equally round-tripped by
+/// `stamp_wrapper_for_broadcast` and are bounded only by `MAX_FRAME_SIZE`. That
+/// outer surface is not specific to this packet type (it predates it and applies
+/// to every class), and here it is reachable only by the authorized host, who
+/// can already send multi-MB media frames — so it is noted rather than addressed
+/// by this constant. Do not read this cap as a total-frame bound.
+///
+/// Over-cap DROPS (does not truncate): the bytes are opaque at this point, so
+/// there is no safe place to cut.
+pub const MEETING_TIMER_PACKET_MAX_BYTES: usize = 256;
+
 /// Maximum number of `session_ids` the relay will accept from a single
 /// VIEWPORT control packet (HCL issue #988).
 ///
@@ -1080,6 +1199,93 @@ pub const LAYER_HINT_RECOMPUTE_COALESCE_MS: u64 = 300;
 /// same 300 ms reasoning: long enough to swallow a wave's request cluster, short
 /// enough that a late joiner still learns every peer well within a second.
 pub const PARTICIPANT_REBROADCAST_COALESCE_MS: u64 = 300;
+
+/// Minimum interval between two consecutive re-announces of the SAME responder,
+/// enforced ACROSS coalescing windows (#1600 item 1).
+///
+/// [`PARTICIPANT_REBROADCAST_COALESCE_MS`] caps a responder at one re-announce
+/// *per window*, but places no floor *between* windows: a peer that re-publishes
+/// `PARTICIPANT_LIST_REQUEST` every ~300 ms could drive a chosen responder at
+/// ~3.3 Hz indefinitely. This constant is that floor, so #1039's "cannot be made
+/// to re-publish unboundedly" holds in the strict sense.
+///
+/// A re-announce that arrives while the responder is cooling down is **deferred,
+/// never dropped** — the flush keeps the pending entry and re-arms for the
+/// remaining cooldown, so no joiner loses its presence answer.
+///
+/// ## Why 1000 ms
+///
+/// * **Floor:** it must exceed [`PARTICIPANT_REBROADCAST_COALESCE_MS`] (300 ms),
+///   or it adds nothing the trailing debounce does not already do. 1000 ms is
+///   3.3× that window.
+/// * **Ceiling:** the deferral stays invisible to users only while it fits
+///   inside the joiner's own RTT election period — a joiner renders no peers
+///   until it elects a connection. That period is 2000 ms
+///   (`SERVER_ELECTION_PERIOD_MS:-2000` in `docker/start-dioxus.sh`, matching the
+///   `server_election_period_ms` default the UI falls back to). Budgeting 300 ms
+///   for the coalescing window plus ~400 ms for two 200 ms+ WAN/NATS legs
+///   (request out, re-announce back) leaves ~1300 ms of headroom; 1000 ms keeps
+///   ~300 ms of slack on top of that on a high-latency link.
+/// * **Adversarial worst case:** a request that lands the instant after its
+///   responder published waits the FULL cooldown, so the end-to-end worst case is
+///   300 ms (window) + 1000 ms (cooldown) + ~400 ms (two WAN/NATS legs) ≈
+///   **1700 ms** — still inside the 2000 ms election period, with ~300 ms of
+///   margin rather than the ~1300 ms the non-adversarial case enjoys.
+/// * **Effect:** a single requester looping requests at 300 ms drives a
+///   responder at ≤1 re-announce/s instead of ~3.3/s.
+///
+/// ## Operators: this is COUPLED to `SERVER_ELECTION_PERIOD_MS`
+///
+/// Nothing enforces the relationship at build or start time — there is no assert,
+/// no test reading both (the election period is a UI/runtime env var, not a Rust
+/// constant), and no startup warning. The invariant is therefore yours to keep:
+///
+/// > `PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS` ≤ `SERVER_ELECTION_PERIOD_MS` −
+/// > ~700 ms (the 300 ms coalescing window plus ~400 ms of WAN/NATS legs).
+///
+/// At the 2000 ms default that permits up to ~1300 ms and 1000 ms is comfortable.
+/// **If `SERVER_ELECTION_PERIOD_MS` is lowered below ~1700 ms, this constant MUST
+/// be lowered with it**, otherwise a deferred re-announce can land after the
+/// joiner has already elected its connection and the joiner renders a room that
+/// is missing a peer until something else re-announces.
+pub const PARTICIPANT_REBROADCAST_MIN_INTERVAL_MS: u64 = 1000;
+
+/// How many distinct requester SESSIONS a single deduped requester identity may
+/// be unicast to before the flush falls back to one broadcast (#1600 item 2).
+///
+/// One client's candidate sessions during RTT election share an `instance_id` but
+/// hold distinct `session_id`s, and the re-announce must reach **every** one of
+/// them: only the elected connection survives, the relay cannot know which that
+/// will be, and the client drops inbound packets from non-elected connections
+/// once election completes. So the flush unicasts per candidate session rather
+/// than picking one.
+///
+/// ## Where a fan of 2–4 actually comes from (post-#2045)
+///
+/// The fan is the client's candidate set — each configured WebSocket URL plus
+/// each WebTransport URL (`build_election_candidates` in `videocall-client`).
+/// Since #2045 made **WebSocket the default** transport, `resolve_transport_config`
+/// (`dioxus-ui/src/context.rs`) returns an EMPTY WebTransport list for the default
+/// preference, so a default-configuration client's candidate set is WS-only. The
+/// surviving driver of a fan ≥ 2 is therefore the **multi-URL WebSocket list**,
+/// not WebTransport: `helm/videocall-ui/values.yaml` ships two (`…-singapore`,
+/// `…-us-east`), giving 2 candidates per joiner. A user who opts into the
+/// experimental WebTransport preference — or carries a legacy `"auto"` value,
+/// which is honoured as WebTransport — gets both lists surfaced and can still
+/// reach 2×WS + 2×WT.
+///
+/// ## Why 4 is still the right cap
+///
+/// Capping only pays where a broadcast is genuinely cheaper. A broadcast is one
+/// NATS publish but `S` relay→client deliveries for a room of `S` sessions, while
+/// the unicast fan is `C` publishes to just the sessions that asked — so unicast
+/// wins while `C < S`. At `C = 4` that holds for every room larger than 4
+/// sessions, i.e. exactly the rooms where the O(N²) fan-out #1600 removes would
+/// hurt. Past the cap a single broadcast is both cheaper and safer than a growing
+/// fan, and it is exactly what the pre-#1600 code did — which is also what makes
+/// the cap fail SAFE: a broadcast reaches a superset of the recorded targets, so
+/// no requester is dropped by hitting it.
+pub const PARTICIPANT_REBROADCAST_MAX_UNICAST_TARGETS: usize = 4;
 
 /// Period of the [`ChatServer`](crate::actors::chat_server) sweep that publishes
 /// the DEMAND-side simulcast gauge `relay_layer_preference_sessions{room, kind,

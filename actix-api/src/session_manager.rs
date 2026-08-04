@@ -220,11 +220,25 @@ impl SessionManager {
     }
 
     /// Build PARTICIPANT_LIST_REQUEST packet.
-    pub fn build_participant_list_request(room_id: &str, requester_session: u64) -> Vec<u8> {
+    ///
+    /// `requester_instance` is the joiner's CLAIMED per-tab `instance_id` — the
+    /// client's own `?instance_id=` connect parameter, which this relay
+    /// length-checked at `JoinRoom` and does not otherwise verify — or `""` when
+    /// the joiner supplied none. A responding relay uses it to count one client's
+    /// dual election candidate sessions as ONE distinct requester (#1600 item 2);
+    /// an empty value makes the responder fall back to keying on `session_id`.
+    /// Because a forged value only ever resolves toward a broadcast, which
+    /// reaches more sessions than the unicast fan, it is safe to relay unbound.
+    pub fn build_participant_list_request(
+        room_id: &str,
+        requester_session: u64,
+        requester_instance: &str,
+    ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::PARTICIPANT_LIST_REQUEST.into(),
             room_id: room_id.to_string(),
             session_id: requester_session,
+            requester_instance_id: requester_instance.to_string(),
             ..Default::default()
         };
         let wrapper = PacketWrapper {
@@ -242,16 +256,21 @@ impl SessionManager {
     ///
     /// The request goes to the room system subject (`room.{room}.system`); the
     /// reply comes back addressed to `requester_session`.
+    ///
+    /// `requester_instance` carries the joiner's sanitised per-tab `instance_id`
+    /// (`""` when it has none) — see [`Self::build_participant_list_request`].
     pub fn participant_list_request_publication(
         observer: bool,
         room_id: &str,
         requester_session: u64,
+        requester_instance: &str,
     ) -> Option<(String, Vec<u8>)> {
         if observer {
             return None;
         }
         let subject = format!("room.{}.system", room_id.replace(' ', "_"));
-        let bytes = Self::build_participant_list_request(room_id, requester_session);
+        let bytes =
+            Self::build_participant_list_request(room_id, requester_session, requester_instance);
         Some((subject, bytes))
     }
 
@@ -454,7 +473,8 @@ mod tests {
         // The requesting joiner's session is carried in `session_id` so peers
         // can ignore their own request and address the reply back to it.
         let requester_session = 4242u64;
-        let packet = SessionManager::build_participant_list_request("my-room", requester_session);
+        let packet =
+            SessionManager::build_participant_list_request("my-room", requester_session, "tab-abc");
 
         let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
         // Must be a server-authoritative MEETING packet; `classify_packet`
@@ -469,6 +489,21 @@ mod tests {
         );
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.session_id, requester_session);
+        // #1600 item 2: the joiner's per-tab instance travels WITH the request,
+        // so the responding relay can dedupe one human's dual election candidate
+        // sessions. Without it the responder falls back to keying on session_id.
+        assert_eq!(inner.requester_instance_id, "tab-abc");
+
+        // A joiner with no instance_id leaves the field empty (proto3 default),
+        // which is also what an older relay's request looks like on the wire.
+        let no_instance =
+            SessionManager::build_participant_list_request("my-room", requester_session, "");
+        let wrapper_none = PacketWrapper::parse_from_bytes(&no_instance).unwrap();
+        let inner_none = MeetingPacket::parse_from_bytes(&wrapper_none.data).unwrap();
+        assert!(
+            inner_none.requester_instance_id.is_empty(),
+            "an instance-less joiner must leave the field empty so responders fall back"
+        );
     }
 
     #[tokio::test]
@@ -478,14 +513,15 @@ mod tests {
 
         // Observer sessions never request a peer list.
         assert!(
-            SessionManager::participant_list_request_publication(true, "my-room", 7).is_none(),
+            SessionManager::participant_list_request_publication(true, "my-room", 7, "tab-a")
+                .is_none(),
             "observers must not publish a PARTICIPANT_LIST_REQUEST"
         );
 
         // Non-observers publish to the room system subject (with spaces in the
         // room id sanitized to underscores) and carry their session as requester.
         let (subject, bytes) =
-            SessionManager::participant_list_request_publication(false, "my room", 7)
+            SessionManager::participant_list_request_publication(false, "my room", 7, "tab-a")
                 .expect("non-observer must produce a publication");
         assert_eq!(subject, "room.my_room.system");
 
@@ -496,6 +532,9 @@ mod tests {
             MeetingEventType::PARTICIPANT_LIST_REQUEST.into()
         );
         assert_eq!(inner.session_id, 7);
+        // The publication must carry the joiner's instance through to the wire,
+        // not drop it between the publication helper and the packet builder.
+        assert_eq!(inner.requester_instance_id, "tab-a");
     }
 
     #[tokio::test]

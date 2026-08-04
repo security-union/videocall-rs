@@ -6,6 +6,10 @@
 .mov
 .mp4
 .env
+# Any *.env file (e.g. bot-accounts.env for the k8s bot fleet, #2035) — a bare
+# `.env` matches only that exact name, so this catches local credential env-files
+# kept in-tree by mistake. Creds should live OUTSIDE the tree; this is a backstop.
+*.env
 #for jet brains products
 .idea/
 target/

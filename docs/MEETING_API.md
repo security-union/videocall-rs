@@ -188,6 +188,88 @@ sequenceDiagram
 | `rejected` | Denied entry by host. |
 | `left` | Previously in meeting, now left. |
 
+## Meeting passwords
+
+A meeting created with a `password` stores an Argon2 hash in `meetings.password_hash`
+and reports `has_password: true` on every listing. **The password is verified
+server-side on every join path** (issue #1613); it is not a client-side hint.
+
+| Endpoint | Enforced? | Notes |
+|----------|-----------|-------|
+| `POST /api/v1/meetings/{id}/join` — meeting owner (`creator_id`) | **Exempt** | Ownership already grants strictly more authority than the password (PATCH settings, end, delete), so the owner is not asked for it. This also keeps a meeting with a corrupt stored hash recoverable. |
+| `POST /api/v1/meetings/{id}/join` — anyone else | **Yes** | Includes a transfer-host target, who is not the `creator_id`. |
+| `POST /api/v1/meetings/{id}/join-guest` | **Yes** | Checked after the `allow_guests` gate. |
+| `POST /api/v1/meetings/{id}/admit`, `/admit-all` | Inherited | These are `UPDATE ... WHERE status = 'waiting'`; they cannot create a participant row, so they can only admit somebody who already cleared the gate on join. |
+| `GET /api/v1/meetings/{id}/status`, `/guest-status` | Inherited | Only mint a `room_token` for an existing `admitted` row, which only a cleared join can produce. |
+
+**Entry, not continued presence.** The password gates *becoming* a participant.
+Once a row is `admitted`, `GET /status` and `GET /guest-status` re-mint a
+`room_token` for it on demand without re-verifying the password, and the
+`PARTICIPANT_PRESENT` heal (`db_participants::mark_present_by_connect`) restores
+a `left` row to `admitted` — it mints no token itself, but it restores the state
+those endpoints mint from, and it too runs no password check. Neither is a
+bypass: both require a row that only a cleared join could have created, and the
+heal additionally requires `admitted_at IS NOT NULL` plus a live transport
+connection, which needs a valid room token.
+
+The consequence worth stating plainly is that adding or changing a password
+mid-meeting evicts nobody already inside. That is deliberate — the host has
+`POST /kick` — but "enforced on every join path" means exactly what it says and
+no more.
+
+**Client contract.** Send the plaintext in the `password` field of the join body.
+On mismatch the server answers `403` with one of two codes:
+
+| Status | Code | Meaning | Client action |
+|--------|------|---------|---------------|
+| 403 | `MEETING_PASSWORD_REQUIRED` | Meeting has a password; the request carried none | Prompt for a password, retry the same join |
+| 403 | `INVALID_MEETING_PASSWORD` | The supplied password did not verify | Re-prompt |
+| 429 | `TOO_MANY_PASSWORD_ATTEMPTS` | This client burned its failed-attempt budget for this meeting | Back off ~1 minute, then re-prompt |
+
+| 503 | `VERIFIER_OVERLOADED` | Server at its bounded verification capacity; request shed rather than queued | Retry after a short delay |
+
+> **Note:** a join that also carries a `display_name` passes through the older
+> per-user rename limiter first, so a client sending one may see
+> `429 RATE_LIMIT_EXCEEDED` instead of `429 TOO_MANY_PASSWORD_ATTEMPTS`. Both are
+> 429 and both reject before any hashing. `POST /join-guest` has no rename
+> limiter, so it is governed purely by the password throttle.
+
+Both are `403`, not `401` — the caller's identity is established; what they lack
+is a resource credential. (A `401` would also trip the UI's session-refresh
+retry.) Splitting the two codes discloses only that the meeting has a password,
+which `has_password` already publishes on every listing.
+
+**Fail closed.** If `password_hash` cannot be parsed as a PHC string (corrupt
+column, foreign algorithm, partial write), the join is **denied** with
+`INVALID_MEETING_PASSWORD` — never treated as "this meeting has no password".
+The two causes are deliberately indistinguishable on the wire; operators get the
+real reason from the server log.
+
+**Throttled and bounded.** Failed verifications are capped at 5 per 60 s per
+`(client IP, meeting)` pair — scoped that way so one attacker cannot lock a
+meeting for everybody. The client address is the rightmost `X-Forwarded-For`
+entry (appended by the nginx ingress, so entries an attacker prepends are
+ignored), falling back to the transport peer address. A request that cannot be
+attributed to an address is served but not throttled, because collapsing
+unattributable callers into one shared bucket would itself be a denial of
+service.
+
+Verification runs on tokio's blocking pool behind a semaphore sized to the CPU
+allocation (at most 4 concurrent, ~19 MiB each), so a burst of joins cannot
+stall the single-worker async runtime or exhaust the container's memory limit.
+Requests that wait more than 10 s for a permit are shed with
+`503 VERIFIER_OVERLOADED` rather than queueing without bound. A shed does **not**
+count against the failed-attempt budget — the password was never evaluated, so
+billing it would turn server overload into a client lockout.
+
+The window is **tumbling**, not sliding: the budget refills in one step at the
+boundary, so a client can spend two budgets in a short span straddling it. The
+semaphore, not this counter, is what bounds CPU.
+
+The throttle is **in-process**. That is sufficient at the current
+`replicaCount: 1`; scaling the service out multiplies the per-instance budget by
+the replica count and would need a shared store or an edge limiter.
+
 ## Timestamps
 
 Timestamps in API responses use two different units depending on the field:
@@ -287,7 +369,7 @@ POST /api/v1/meetings
 |-------|------|----------|-------------|
 | `meeting_id` | string | No | Meeting identifier. Auto-generated (12 chars) if omitted. |
 | `attendees` | string[] | No | Pre-registered attendee emails (max 100). |
-| `password` | string | No | Meeting password (hashed with Argon2 before storage). |
+| `password` | string | No | Meeting password (hashed with Argon2 before storage). Enforced server-side on every non-owner join — see [Meeting passwords](#meeting-passwords). An empty string is treated as "no password". |
 
 **Response (201 Created):**
 ```json
@@ -411,6 +493,8 @@ Request to join a meeting. If the meeting doesn't exist, it will be **automatica
 - **First user to join** becomes the host; the meeting is created and activated
 - **Hosts** are auto-admitted and receive a `room_token` immediately
 - **Attendees** (non-hosts) enter the waiting room (no `room_token` until admitted)
+- **Password-protected meetings** require `password` from every joiner except the
+  meeting owner — see [Meeting passwords](#meeting-passwords)
 
 ```
 POST /api/v1/meetings/{meeting_id}/join
@@ -419,9 +503,15 @@ POST /api/v1/meetings/{meeting_id}/join
 **Request Body (optional):**
 ```json
 {
-  "display_name": "Alice"
+  "display_name": "Alice",
+  "password": "secret123"
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `display_name` | string | No | Display name shown in the meeting UI. |
+| `password` | string | Conditional | Required when the meeting's `has_password` is `true` **and** the caller is not the meeting owner. Omitted or `null` otherwise. |
 
 **Response for hosts (200 OK):**
 ```json
@@ -486,6 +576,13 @@ The `room_token` is only present when `status` is `"admitted"`. Attendees receiv
 | Status | Code | Description |
 |--------|------|-------------|
 | 401 | `UNAUTHORIZED` | Invalid or missing session |
+| 403 | `MEETING_PASSWORD_REQUIRED` | Meeting has a password; request carried none |
+| 403 | `INVALID_MEETING_PASSWORD` | Supplied password did not verify |
+| 429 | `TOO_MANY_PASSWORD_ATTEMPTS` | Failed-password budget exhausted for this client + meeting |
+| 503 | `VERIFIER_OVERLOADED` | Password verifier at capacity; retry shortly |
+| 403 | `JOINING_NOT_ALLOWED` | Host has left and no one can admit new participants |
+| 400 | `MEETING_NOT_ACTIVE` | Meeting has ended and this caller cannot restart it |
+| 429 | `RATE_LIMIT_EXCEEDED` | Display-name change budget exhausted (only when `display_name` is sent) |
 
 > **Note:** If the meeting doesn't exist, it is created automatically with the joining user as the host.
 

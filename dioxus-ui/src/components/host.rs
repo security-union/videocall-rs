@@ -219,6 +219,14 @@ pub fn Host(
                 handler.call(err);
             }
         });
+        // Camera simulcast ladder variant (issue #1768). ONE read of the
+        // `experimentalReducedLadder` runtime flag per Host mount, threaded into
+        // the encoder — which forwards this same value into its AQ controller, so
+        // the geometry the encoder emits and the uplink budget the controller
+        // sums are always the SAME rungs. Defaults to the shipped ladder when the
+        // key is absent/falsy, so this is inert unless an operator opts in.
+        let ladder_variant = camera_ladder_variant();
+        log::info!("CameraEncoder: camera simulcast ladder = {ladder_variant:?}");
         let mut camera = CameraEncoder::new(
             client.clone(),
             VIDEO_ELEMENT_ID,
@@ -226,6 +234,7 @@ pub fn Host(
             camera_settings_cb,
             camera_error_cb,
             effective_max_layers,
+            ladder_variant,
         );
         let cam_perm_error_cell = camera_permission_error_handler.clone();
         let camera_permission_error_cb =
@@ -264,9 +273,9 @@ pub fn Host(
             Some(camera.shared_audio_tier_index()),
             // Audio simulcast layer ceiling (issue #989, Phase 3c → #1082):
             // decoupled from the VIDEO CPU ceiling (audio encodes off-main-thread
-            // and is cheap), but still gated by the SAME runtime flag so it stays
-            // OFF by default (single audio layer, byte-identical to the
-            // pre-simulcast mic path).
+            // and is cheap), but still gated by the SAME runtime flag. The flag
+            // defaults to 3 (audio simulcast ON); setting it to 1 collapses audio
+            // to a single layer too.
             audio_effective_max_layers,
         );
         let mic_perm_error_cell = mic_permission_error_handler.clone();
@@ -304,9 +313,10 @@ pub fn Host(
             screen_settings_cb,
             screen_state_cb,
             camera.screen_sharing_flag(),
-            // Screen simulcast layer ceiling (issue #989, Phase 3b) — same
-            // flag + capability gating as the camera, so it's OFF by default
-            // (single layer, byte-identical to the pre-simulcast screen path).
+            // Screen simulcast layer ceiling (issue #989, Phase 3b): the same
+            // `min(flag, sniffed capability)` as camera. The flag defaults to 3
+            // (#1082), so it no longer forces one layer; the sniff can still
+            // clamp to 1 for a marginal core count or the older-Intel-Mac rule.
             effective_max_layers,
         );
 
@@ -411,6 +421,10 @@ pub fn Host(
             screen.shared_screen_tier_index(),
             camera.screen_sharing_flag(),
             camera.shared_encoder_output_fps(),
+            // #2147: the SCREEN encoder's own output fps. Before this the screen
+            // encoder had NO publisher-side fps signal — the camera gauge read
+            // healthy right through the #2143 screen-share freeze.
+            screen.shared_encoder_output_fps(),
             camera.shared_tier_transitions(),
             screen.shared_tier_transitions(),
             camera.shared_climb_limiter_snapshot(),

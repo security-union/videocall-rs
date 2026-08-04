@@ -19,10 +19,16 @@
 
 FROM mcr.microsoft.com/playwright:v1.58.2-noble
 
-# iproute2 provides `tc`/`ip` for netem shaping in a LATER increment. Installed
-# now (as root, before the USER switch) so the image is ready; unused today.
+# iproute2 provides `tc`/`ip` for per-pod netem shaping (Increment 3, #2072).
+# libcap2-bin provides `setcap`: we grant the `tc` binary a FILE capability so
+# the non-root (uid 1000) bot process can shape eth0. NET_ADMIN granted via the
+# pod's `capabilities.add` lands only in the bounding set — NOT the ambient set
+# (Kubernetes sets no ambient caps) — so without this file cap a non-root `tc`
+# gets EPERM ("RTNETLINK answers: Operation not permitted"). The file cap
+# (permitted+effective) is honored because NET_ADMIN is in the bounding set.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 \
+    && apt-get install -y --no-install-recommends iproute2 libcap2-bin \
+    && setcap cap_net_admin+eip /usr/sbin/tc \
     && rm -rf /var/lib/apt/lists/*
 
 # The bundled browsers (correct revision for 1.58.2) live at /ms-playwright and

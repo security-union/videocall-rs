@@ -1,0 +1,58 @@
+# bot-accounts.example.yaml — TEMPLATE ONLY. PLACEHOLDERS, never real creds.
+#
+# The fleet-wide account pool for the videocall-bots StatefulSet (Increment 2,
+# #2035/#2072). One DISTINCT test account per replica ordinal:
+#   ordinal 0 → BOT_EMAIL_0 / BOT_PASSWORD_0   (in-meeting handle bot-0)
+#   ordinal 1 → BOT_EMAIL_1 / BOT_PASSWORD_1   (handle bot-1)
+#   …
+# The whole Secret is injected into every pod via `envFrom` (statefulset.yaml);
+# the entrypoint selects only its own ordinal's pair. Provision ordinals
+# 0..replicas-1 — a pod whose ordinal has no BOT_EMAIL_<N> fails fast at startup.
+# NEVER reuse one account across two ordinals (shared-identity → rename churn /
+# 429s in the meeting) — each ordinal must be a unique account.
+#
+# ── PREFERRED: create from a LOCAL env-file (creds never touch git) ───────────
+# Put the 20 real accounts (alice … tina) in an env-file OUTSIDE this repo. The
+# repo .gitignore now includes `*.env` (added by #2035) as a backstop, so a
+# stray `bot-accounts.env` in the tree would be ignored — but creds should still
+# live entirely outside the working tree, e.g. ~/bot-accounts.env, chmod 600:
+#
+#   # ~/bot-accounts.env  (KEY=VALUE per line; NOT committed; delete after use)
+#   BOT_EMAIL_0=alice@example.test
+#   BOT_PASSWORD_0=<alice-password>
+#   BOT_EMAIL_1=bob@example.test
+#   BOT_PASSWORD_1=<bob-password>
+#   # … carol, dave, eve, frank, grace, heidi, ivan, judy, karl, laura,
+#   #   mallory, niaj, olivia, peggy, quentin, rupert, sybil …
+#   BOT_EMAIL_19=tina@example.test
+#   BOT_PASSWORD_19=<tina-password>
+#
+# Then create the Secret from it (no creds on the command line or in git):
+#   kubectl -n bot-load create secret generic bot-accounts \
+#     --from-env-file="$HOME/bot-accounts.env"
+#   shred -u "$HOME/bot-accounts.env"   # or `rm -P` / secure-delete after apply
+#
+# Provision as many pairs as `replicas` in statefulset.yaml (default 3 → need
+# ordinals 0,1,2; the full pool of 20 supports scaling up to replicas: 20).
+#
+# ── This manifest ─────────────────────────────────────────────────────────────
+# Exists only to document the Secret's SHAPE (the keys envFrom expects). If you
+# must `apply` it instead of the imperative form above, replace the placeholders
+# in a LOCAL copy kept out of git. Accounts must be dedicated test identities.
+# Only ordinals 0–2 are shown (matches the default replicas: 3); extend the pair
+# pattern up to BOT_EMAIL_19/BOT_PASSWORD_19 to support scaling to 20 pods.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bot-accounts
+  namespace: bot-load
+type: Opaque
+stringData:
+  BOT_EMAIL_0: "<BOT_EMAIL_0>"
+  BOT_PASSWORD_0: "<BOT_PASSWORD_0>"
+  BOT_EMAIL_1: "<BOT_EMAIL_1>"
+  BOT_PASSWORD_1: "<BOT_PASSWORD_1>"
+  BOT_EMAIL_2: "<BOT_EMAIL_2>"
+  BOT_PASSWORD_2: "<BOT_PASSWORD_2>"
+  # … extend the pattern to BOT_EMAIL_19 / BOT_PASSWORD_19 for the full 20-bot
+  #   pool (alice … tina). One unique account per ordinal — never shared.

@@ -34,13 +34,15 @@
 mod test_helpers;
 
 use axum::body::Body;
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode};
+use meeting_api::db::meetings as db_meetings;
 use meeting_api::db::participants as db_participants;
 use serial_test::serial;
 use sqlx::PgPool;
 use test_helpers::*;
 use tower::ServiceExt;
 use videocall_meeting_types::responses::{APIResponse, ListFeedResponse};
+use videocall_meeting_types::APIError;
 
 /// Lower bound for any Unix epoch timestamp emitted as **milliseconds**.
 const MS_LOWER_BOUND: i64 = 1_000_000_000_000;
@@ -814,4 +816,98 @@ async fn test_user_last_attended_at_reflects_max_on_readmission() {
     );
 
     cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Scenario 13: unauthenticated → 401 ───────────────────────────────────
+
+/// Contract lock (issue #501): `GET /api/v1/meetings/feed` must reject a
+/// request carrying no session cookie and no `Authorization` header with
+/// **401** and the canonical `UNAUTHORIZED` error envelope.
+///
+/// Every row this endpoint returns is selected by the caller's identity —
+/// `routes::meetings::list_feed` takes the `user_id` out of the `AuthUser`
+/// extractor in its signature and passes it straight to
+/// `db_meetings::list_feed_for_user`. Because `AuthUser` is an extractor, its
+/// rejection is produced before the handler body runs, so an unauthenticated
+/// request can never reach the query. That holds today; this test exists so a
+/// refactor that drops the extractor — or re-mounts the route outside the
+/// authenticated set — fails loudly here instead of silently serving one
+/// user's meeting list to an anonymous caller.
+///
+/// The second half is a control against a **vacuous** pass, and on this route
+/// it is load-bearing rather than belt-and-braces. `/api/v1/meetings/{meeting_id}`
+/// is registered as a sibling GET route and is itself `AuthUser`-gated, so the
+/// literal `feed` segment is absorbed by it as a `{meeting_id}` the moment the
+/// static `/api/v1/meetings/feed` registration goes away. An unauthenticated
+/// caller would then still be answered with 401 — by `get_meeting`, not by the
+/// feed — and the assertion above would keep passing against a route that no
+/// longer exists. Requiring 200 for the SAME uri with a valid session cookie is
+/// what distinguishes the two: the deleted-route case answers the authenticated
+/// call with 404 (no meeting has the id `feed`).
+///
+/// That last clause is a real dependency on the shared DB fixture, so it is
+/// asserted below rather than assumed (issue #2114) — a future test that
+/// created a meeting named `feed` would make `get_meeting` answer 200 and
+/// silently disarm the control.
+#[tokio::test]
+#[serial]
+async fn test_feed_unauthenticated_returns_401() {
+    let pool = get_test_pool().await;
+    const URI: &str = "/api/v1/meetings/feed";
+
+    // ── No credentials: no `Cookie: session=…`, no `Authorization: Bearer …`.
+    let app = build_app(pool.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri(URI)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "unauthenticated GET {URI} must be 401 — the per-user feed must never \
+         be served without an authenticated principal"
+    );
+
+    let body: APIResponse<APIError> = response_json(resp).await;
+    assert!(!body.success, "a 401 must carry success = false");
+    assert_eq!(
+        body.result.code, "UNAUTHORIZED",
+        "error envelope must use the canonical UNAUTHORIZED code"
+    );
+
+    // ── Precondition for the control below: it can only detect a deleted route
+    // while `get_meeting` answers `feed` with 404, i.e. while no meeting owns
+    // that room_id. Checked through the very query `get_meeting` runs, so it
+    // tracks the real behaviour — including the `deleted_at IS NULL` filter,
+    // which is why a soft-deleted row would (correctly) not trip this.
+    assert!(
+        db_meetings::get_by_room_id(&pool, "feed")
+            .await
+            .expect("lookup of a meeting with room_id `feed` must succeed")
+            .is_none(),
+        "fixture invariant broken: a meeting with room_id `feed` exists, so \
+         `GET /api/v1/meetings/{{meeting_id}}` would answer the control below \
+         with 200 even if the static `/api/v1/meetings/feed` route were \
+         deleted — disarming the only assertion in this test able to detect \
+         that. Delete that meeting, or give it a room_id that is not also a \
+         static route segment."
+    );
+
+    // ── Control: the SAME uri, authenticated, must still be the feed route.
+    // This caller creates no rows, so the test leaves no state behind for the
+    // other tests sharing this DB fixture.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("GET", URI, "feed-unauth-control@example.com")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "control: authenticated GET {URI} must be 200. A 404 here means the feed \
+         route is gone and `feed` was absorbed by the `/api/v1/meetings/{{meeting_id}}` \
+         route, which would make the 401 asserted above a vacuous pass"
+    );
 }

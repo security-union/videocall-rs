@@ -392,10 +392,10 @@ fn cached_or_benchmark_capability_score(window: &web_sys::Window) -> u32 {
 /// ~100 ms main-thread busy loop. Two changes keep that cost off the hot path
 /// without altering the layer decision:
 ///
-/// 1. When [`should_skip_capability_sniff`] is true (feature OFF — the
-///    production default `experimentalSimulcastMaxLayers <= 1` — with no test
-///    override), return `1` immediately, doing ZERO benchmark and ZERO navigator
-///    work. This is behaviour-identical because every caller floors at
+/// 1. When [`should_skip_capability_sniff`] is true (feature explicitly OFF via
+///    `experimentalSimulcastMaxLayers <= 1`, with no test override), return `1`
+///    immediately, doing ZERO benchmark and ZERO navigator work. This is
+///    behaviour-identical because every caller floors at
 ///    `min(flag<=1, _) == 1` (see the helper's doc for the per-call-site proof).
 /// 2. Otherwise, READ the cached `window.__videocall_capability_score` (set by
 ///    the console-log collector's preamble path) instead of re-benchmarking, so

@@ -69,8 +69,8 @@ use web_time::SystemTime;
 /// (issue #989, Phase 3c → 3 rungs in #1082) because audio is ~1-3% of call
 /// bandwidth, so a deep ladder is not worth the per-layer Opus encode cost.
 ///
-/// - layer 0 = LOW (12 kbps) — the base the relay always forwards and a
-///   congested receiver pulls. Matches the AQ "low" tier (issue #1768).
+/// - layer 0 = LOW (12 kbps) — the base the relay's #989 layer filter never
+///   drops and a congested receiver pulls. Matches the AQ "low" tier (#1768).
 /// - layer 1 = MID (24 kbps) — an intermediate rung for moderate downlinks.
 /// - layer 2 = HIGH (48 kbps) — the upgrade layer a receiver with headroom
 ///   selects. Matches the AQ "high" tier.
@@ -93,8 +93,9 @@ const _: () = assert!(
 );
 
 /// Clamp a requested audio `max_layers` to `[1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS]`.
-/// `0`/`1` → single layer (feature off, byte-identical mic path). Free function
-/// so it is unit-testable without constructing a `MicrophoneEncoder`.
+/// Explicitly configured `0`/`1` → single layer (feature-off, byte-identical mic
+/// path). Free function so it is unit-testable without constructing a
+/// `MicrophoneEncoder`.
 fn clamp_audio_layer_count(max_layers: u32) -> u32 {
     max_layers.clamp(1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS)
 }
@@ -581,8 +582,8 @@ fn audio_detector_should_reseed(
 // Single-layer congestion BITRATE floor (issue #1398)
 // ===========================================================================
 //
-// A SINGLE-LAYER audio publisher (device capability-gated to 1 audio layer, or
-// audio simulcast disabled) has NO upper simulcast layer to shed, so the
+// A SINGLE-LAYER audio publisher (constructed with a runtime ceiling of 1, or
+// with audio simulcast otherwise disabled) has NO upper simulcast layer to shed, so the
 // layer-ceiling lever (#621) is a no-op for it: layer 0 always publishes. The
 // only way such a publisher can downshift audio under publisher-uplink distress
 // is to lower the bitrate of the ONE running Opus stream LIVE (via the #1578
@@ -960,8 +961,8 @@ pub fn transform_audio_chunk(
         // additionally lets the relay layer-filter AUDIO per receiver.
         media_kind: MediaKind::AUDIO.into(),
         // Cleartext simulcast layer id (issue #989, Phase 3c). Tag 5 serializes
-        // only when non-zero, so layer 0 — the single-layer default and what
-        // every pre-simulcast mic publisher emits — is wire-identical to today.
+        // only when non-zero, so layer 0 in explicitly single-layer mode — also
+        // what every pre-simulcast mic publisher emits — is wire-identical.
         // The relay's per-(source, AUDIO) layer filter and the receiver's audio
         // layer-select guard read this (mirrors transform_video/screen_chunk).
         simulcast_layer_id,
@@ -975,7 +976,7 @@ pub struct MicrophoneEncoder {
     _on_encoder_settings_update: Option<Callback<String>>,
     /// Per-layer Opus encoders, **lowest layer first** (index ==
     /// `simulcast_layer_id`). Always at least one element: index 0 is the BASE
-    /// layer, which in single-layer mode (the default) is the only encoder and
+    /// layer, which in explicitly configured single-layer mode is the only encoder and
     /// runs at the tier bitrate, byte-identical to the pre-simulcast mic path.
     /// In N-layer simulcast mode (issue #989 / #1082) indices `1..N` are
     /// additional `AudioWorkletNode`s on the SAME `AudioContext`, each fed the
@@ -994,14 +995,16 @@ pub struct MicrophoneEncoder {
     /// linearly with the active layer count. Opus is cheap relative to video, so
     /// this is acceptable — and it is flag-gated: higher layers are only
     /// instantiated when the effective audio layer count is > 1 (driven by
-    /// `experimentalSimulcastMaxLayers` × the device-capability ceiling), so a
-    /// weak device that gates audio to a single layer pays nothing. If a future
-    /// rollout sees audio-CPU pressure on low-power hardware, gate the higher
-    /// audio layers behind a higher capability tier than video.
+    /// `experimentalSimulcastMaxLayers`, capped by the audio ladder size).
+    /// Unlike video, audio is deliberately decoupled from the device-capability
+    /// ceiling in `dioxus-ui/src/components/host.rs`, so the runtime default of 3
+    /// instantiates the full audio ladder even when video is capability-gated
+    /// lower. If audio-CPU pressure appears on low-power hardware, add an
+    /// audio-specific capability gate.
     codecs: Vec<AudioWorkletCodec>,
     /// Maximum audio simulcast layers (issue #989, Phase 3c → up to 3 in #1082).
-    /// 1 = single layer (default, byte-identical). Clamped in `start` to
-    /// `[1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS]`.
+    /// 1 = single layer (byte-identical); the runtime default passes 3. Clamped
+    /// in `start` to `[1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS]`.
     max_layers: u32,
     on_error: Option<Callback<String>>,
     /// Classified callback fired ONLY at the real `getUserMedia` rejection site,
@@ -1109,8 +1112,8 @@ pub struct MicrophoneEncoder {
     /// `Arc` (not `Rc`) so it can cross into `VideoCallClient`, matching the
     /// camera's `Arc<AtomicBool>` congestion-flag wiring.
     ///
-    /// SINGLE-LAYER NOTE (#621 → CLOSED by #1398): when the device is
-    /// capability-gated to a SINGLE audio layer (or audio simulcast is disabled),
+    /// SINGLE-LAYER NOTE (#621 → CLOSED by #1398): when the runtime ceiling
+    /// constructs a SINGLE audio layer (or audio simulcast is otherwise disabled),
     /// THIS ceiling is a no-op — the base layer is always published and there is
     /// no upper layer to shed. For that case the single-layer congestion BITRATE
     /// floor below ([`Self::shared_congestion_bitrate_floor`], #1398) downshifts
@@ -1620,8 +1623,9 @@ impl MicrophoneEncoder {
 
         // Clone atomic values for use in different closures.
         // Audio simulcast layer count (issue #989, Phase 3c → up to 3 in #1082).
-        // 1 = single layer (default, byte-identical). N>1 = LOW base (layer 0)
-        // plus the higher rungs of AUDIO_SIMULCAST_LAYER_KBPS.
+        // 1 = explicitly configured single layer (byte-identical). N>1 = LOW
+        // base (layer 0) plus the higher rungs of AUDIO_SIMULCAST_LAYER_KBPS;
+        // the shipped runtime default supplies 3.
         let n_audio_layers = clamp_audio_layer_count(self.max_layers) as usize;
         log::info!(
             "MicrophoneEncoder: effective audio layers = {}",
@@ -2089,8 +2093,9 @@ impl MicrophoneEncoder {
             let initial_tier = &AUDIO_QUALITY_TIERS[0];
             // Base-layer bitrate: in single-layer mode use the tier default
             // (byte-identical to today). In simulcast mode the base layer IS the
-            // LOW layer (the relay always forwards it; a congested receiver pulls
-            // it), so it inits at the lowest rung AUDIO_SIMULCAST_LAYER_KBPS[0].
+            // LOW layer (the relay's #989 layer filter never drops it; a congested
+            // receiver pulls it), so it inits at the lowest rung
+            // AUDIO_SIMULCAST_LAYER_KBPS[0].
             let base_bitrate_bps = if audio_simulcast {
                 AUDIO_SIMULCAST_LAYER_KBPS[0] * 1000
             } else {
@@ -2802,7 +2807,7 @@ mod layer_count_tests {
 
     #[test]
     fn clamp_audio_layer_count_treats_zero_and_one_as_one() {
-        // 0 and 1 → single layer (feature off, byte-identical mic path).
+        // Explicitly configured 0/1 → single layer (feature-off, legacy mic path).
         assert_eq!(clamp_audio_layer_count(0), 1);
         assert_eq!(clamp_audio_layer_count(1), 1);
     }

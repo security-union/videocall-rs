@@ -11,43 +11,44 @@
  * Coerce a raw value read from the client's `window.__videocall_encoder_fps`
  * global (issue #2062 / #2057) into a usable fps reading.
  *
- * Once the client-side publisher ships (#2057, not yet merged), videocall-client
- * `health_reporter` sets a POSITIVE number when the camera encoder is active and
- * has produced a real sample, and clears the property (`undefined`) when the
- * camera is off / warming up / on teardown. Until #2057 is deployed the global
- * is absent, so every read coerces to `null` (no data) and the fps rule stays
- * dormant (CPU-only verdict) — no false readings in the interim. We treat:
+ * videocall-client `health_reporter` (#2057, SHIPPED) publishes the camera's
+ * layer-0 output fps once the encoder is active AND has produced at least one
+ * real sample, and CLEARS the property (`undefined`) when the camera is off /
+ * warming up / on teardown. We treat:
  *   - a finite number `> 0`  → a real reading (recorded; a low value like 1–4
  *                              is the partial-starvation signal the verdict
  *                              targets — see resource/verdict.ts).
- *   - `0`                    → "no data", NOT a starvation reading. This mirrors
- *                              the client's OWN convention: health_reporter.rs
- *                              gates the metric on `encoder_output_fps > 0`
- *                              because 0 means "the encoder hasn't started yet,
- *                              which isn't diagnostic". The window value alone
- *                              cannot distinguish not-started from active-stall,
- *                              so recording 0 would false-flag a cold-start bot
- *                              as `RESOURCE_STARVED` (min 0 < base rung). A
- *                              genuine total stall is backstopped by the CPU
- *                              rule; since #2060 the client emits 0 on a stall,
- *                              but this gate still maps 0 -> no-data (see the
- *                              #2060 COORDINATION note below).
+ *   - `0`                    → "no data" here, NOT a starvation reading.
  *   - anything else (`undefined`/absent, `null`, `NaN`, `Infinity`, negative,
  *                    non-number) → `null` = "no data".
- * Returning `null` (not `0`) for absent/zero data is what stops a cold-start /
- * idle bot from being mis-recorded as starved while still allowing the tracker
- * to reset a sustained-low run.
  *
- * #2060 COORDINATION: #2060 HAS LANDED — the camera_encoder now resets
- * current_fps to 0 on stop/start and decays it to 0 after a sustained layer-0
- * output gap, so the client (#2057) now DOES publish a literal `0` on a total
- * stall (health_reporter `encoder_fps_publish_value(true, 0, true) == Some(0)`).
- * This gate STILL maps that `0` to no-data on purpose: it cannot yet distinguish
- * "encoder total-stall (0)" from "no sample this poll", and treating every 0 as
- * starvation would false-flag the sub-1s re-enable/warmup window. Flagging a
- * total stall AS `RESOURCE_STARVED` — accepting `0` as a stall reading, e.g. via
- * an explicit stall signal distinct from no-data — is the remaining follow-up
- * (revisit this `> 0` gate). Until then, `0` stays not-diagnostic here.
+ * Why `0` is DISCARDED even though it is now meaningful (#2079, OPEN).
+ * Do not read this gate as "the client publishes 0 only when it has no data" —
+ * that was true before #2060 and is FALSE now. Since #2060 the producer resets
+ * `current_fps` to 0 on stop/start and decays it to 0 after a sustained layer-0
+ * output gap, so `Some(0)` IS published on a genuine total stall
+ * (`encoder_fps_publish_value(true, 0, true) == Some(0)`). A `0` arriving here
+ * therefore carries real information that this function throws away, and the
+ * verdict's CPU rule is the only backstop for a total stall.
+ *
+ * It is not simply flipped to accept `0` because the reachable failure modes of
+ * doing so are worse than the gap. `0` conflates a starved BOX (the verdict's
+ * subject) with a WEDGED ENCODER — a product bug that must not be relabelled as a
+ * confounded harness run. Attempts to separate them from fps VALUES alone each
+ * failed on a reachable path (all four verified against this code, see #2079):
+ *   1. accept `0` outright               → a wedged encoder (pure zeros, healthy
+ *                                          CPU) flags RESOURCE_STARVED
+ *   2. require a nonzero low in the run  → a LATER, longer pure-zero run erased an
+ *                                          earlier genuinely-starved run's verdict
+ *   3. track the eligible run separately → one low then N zeros reports N poll
+ *                                          intervals of "sustained" starvation
+ *                                          from a single poll of real evidence
+ *   4. tighten the run gap               → trades the false positive for a false
+ *                                          negative under genuine load
+ * The conclusion recorded on #2079 is that the ambiguity belongs at the SOURCE: a
+ * stall signal distinct from no-data, published by the client, rather than a
+ * heuristic in this consumer. Until that lands, `0` stays discarded HERE — which
+ * is a known gap, not a claim that `0` is meaningless.
  */
 export function coerceEncoderFps(raw: unknown): number | null {
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return null;

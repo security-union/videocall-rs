@@ -3,6 +3,8 @@ import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 
+import { reapChild, type ReapHandle } from "./reap-child";
+
 /**
  * SSH host registry. Stores a list of operator-curated remote hosts the
  * dashboard can launch bots against via the local `ssh` binary. The
@@ -318,6 +320,60 @@ export async function removeHost(runDir: string, label: string): Promise<void> {
 }
 
 /**
+ * Wall-clock bound (ms) on a single host probe, measured from `spawn` to
+ * resolution (issue 2133).
+ *
+ * `ConnectTimeout=5` bounds ONLY the TCP connect phase, so this budget
+ * covers post-connect work exclusively: SSH key exchange + auth, the
+ * remote login shell, `echo … && uname -a`, and teardown. Sizing:
+ *
+ *   - kex + auth + channel-open is ~10 round trips; on a 200ms+ WAN link
+ *     (which this project explicitly cares about) that alone is ~2s.
+ *   - PAM/NSS/LDAP lookups during login on a loaded box legitimately take
+ *     several seconds, and a login shell sourcing profiles adds 1-3s.
+ *   - {@link PROBE_KEEPALIVE_ARGS} makes `ssh` tear itself down after ~15s
+ *     of transport silence. 30s sits clearly ABOVE that so ssh's own
+ *     teardown (which yields a better diagnostic than "timed out") wins
+ *     the race whenever the transport is what broke; this timer is the
+ *     backstop for the case ServerAlive canNOT see — a session whose
+ *     transport keeps answering keepalives while the command never
+ *     produces output (hung PAM/LDAP, filesystem stall on login).
+ *   - 30s stays under the usual 60s+ HTTP proxy/client idle timeouts, so
+ *     `POST /hosts/:label/test` still returns a JSON error rather than
+ *     dropping the dashboard's socket.
+ */
+export const SSH_PROBE_TIMEOUT_MS = 30_000;
+
+/**
+ * Grace (ms) between the probe's `SIGTERM` and the follow-up `SIGKILL`.
+ * A responsive `ssh` exits on TERM well inside this window; one blocked
+ * in a syscall can ignore it, which is exactly the case that leaks an
+ * orphaned process, so the escalation is not optional. Kept short
+ * because nothing waits on it — the route has already responded.
+ */
+export const SSH_PROBE_KILL_GRACE_MS = 2_000;
+
+/**
+ * Keepalive options for the probe: `ssh` sends a probe every 5s and gives
+ * up after 3 unanswered ones (~15s), so an established session whose
+ * transport silently dies is torn down by ssh itself rather than hanging
+ * until {@link SSH_PROBE_TIMEOUT_MS}.
+ *
+ * Deliberately applied to the PROBE only (not {@link buildBaseSshArgs}),
+ * because the other two callers of the shared prefix must not inherit it:
+ * a bot launch holds its SSH session open for the bot's whole lifetime, so
+ * arming a ~15s transport-silence teardown there would kill live bots on a
+ * transient network blip — a regression well outside this fix's scope.
+ *
+ * The 5/3 values intentionally match `SSH_KEEPALIVE_ARGS` in
+ * `src/resource/session.ts`: both exist to notice a dropped transport in
+ * ~15s. They are separate declarations rather than one shared constant
+ * because the two sessions have independent lifetimes and either may be
+ * retuned without the other.
+ */
+export const PROBE_KEEPALIVE_ARGS = ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"];
+
+/**
  * Probe a host by running `ssh -o ConnectTimeout=5 ... 'echo bots-app-probe-ok && uname -a'`.
  * Resolves to `{ ok: true, latencyMs, output }` on success and
  * `{ ok: false, error }` on any failure (DNS, auth, timeout, unknown).
@@ -340,14 +396,27 @@ export async function testHost(
  * Dependency injection seam for `testHost`. Tests substitute a stub
  * `spawn` so they don't have to actually fork an `ssh` process. The
  * stub must implement the subset of `child_process.spawn` we use
- * (stdout/stderr streams + an `exit` event + an optional `error` event).
+ * (stdout/stderr streams + an `exit` event + an optional `error` event
+ * + `kill`).
+ *
+ * The timeout knobs exist so a test can bound the probe in
+ * milliseconds instead of waiting out the production default. Both are
+ * optional and both default to the production constants, so every
+ * existing caller — `testHost(runDir, label)` and the
+ * `POST /hosts/:label/test` route — is unaffected.
  */
 export interface TestHostDeps {
   spawn?: typeof spawn;
+  /** Overrides {@link SSH_PROBE_TIMEOUT_MS}. */
+  timeoutMs?: number;
+  /** Overrides {@link SSH_PROBE_KILL_GRACE_MS}. */
+  killGraceMs?: number;
 }
 
 export async function runSshProbe(host: SshHost, deps: TestHostDeps = {}): Promise<TestHostResult> {
   const spawnImpl = deps.spawn ?? spawn;
+  const timeoutMs = deps.timeoutMs ?? SSH_PROBE_TIMEOUT_MS;
+  const killGraceMs = deps.killGraceMs ?? SSH_PROBE_KILL_GRACE_MS;
   const args = buildSshArgsForProbe(host);
   const t0 = Date.now();
   return new Promise<TestHostResult>((resolveFn) => {
@@ -358,6 +427,33 @@ export async function runSshProbe(host: SshHost, deps: TestHostDeps = {}): Promi
       resolveFn({ ok: false, error: `spawn failed: ${(e as Error).message}` });
       return;
     }
+    // This promise has FOUR resolve paths — the `spawn` throw above (which
+    // returns before any of this runs), the `error` event, the `exit` event,
+    // and the deadline timer. Two invariants keep that safe:
+    //
+    //   1. `settled` — resolve exactly once. A killed child still emits
+    //      `exit` AFTER the timeout has resolved; without the guard that
+    //      would be a double-resolve (silently ignored by the Promise, but
+    //      it would also run the success branch on a timed-out probe).
+    //   2. Every exit path clears BOTH timers (the deadline here, and the
+    //      reaper's grace timer via `cancelReap`). A dangling `setTimeout`
+    //      keeps the Node event loop alive, which would hang the ctl
+    //      server on shutdown — as real a bug as the unbounded probe.
+    let settled = false;
+    let deadline: NodeJS.Timeout | undefined;
+    let cancelReap: ReapHandle["cancel"] | undefined;
+    const clearTimers = (): void => {
+      if (deadline !== undefined) clearTimeout(deadline);
+      if (cancelReap !== undefined) cancelReap();
+      deadline = undefined;
+      cancelReap = undefined;
+    };
+    const settle = (result: TestHostResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      resolveFn(result);
+    };
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", (b: Buffer) => {
@@ -367,28 +463,70 @@ export async function runSshProbe(host: SshHost, deps: TestHostDeps = {}): Promi
       stderr += b.toString("utf8");
     });
     child.on("error", (err: Error) => {
-      resolveFn({ ok: false, error: `spawn failed: ${err.message}` });
+      settle({ ok: false, error: `spawn failed: ${err.message}` });
     });
     child.on("exit", (code: number | null) => {
       const latencyMs = Date.now() - t0;
+      // Clear the kill escalation FIRST: on a normal exit that fires
+      // before the deadline `settle` handles it, but a child that exits
+      // in response to our SIGTERM arrives when `settled` is already
+      // true, so `settle` returns early and would leave the reaper's
+      // grace timer armed — then firing SIGKILL at a pid the OS may
+      // have recycled.
+      clearTimers();
+      if (settled) return;
       if (code === 0 && stdout.includes("bots-app-probe-ok")) {
-        resolveFn({ ok: true, latencyMs, output: stdout.trim() });
+        settle({ ok: true, latencyMs, output: stdout.trim() });
         return;
       }
       const error =
         stderr.trim() ||
         stdout.trim() ||
         `ssh exited with code ${code === null ? "(killed)" : code}`;
-      resolveFn({ ok: false, latencyMs, error });
+      settle({ ok: false, latencyMs, error });
     });
+    deadline = setTimeout(() => {
+      // Resolve the route FIRST, then reap. Ordering matters: `settle`
+      // runs `clearTimers`, so arming `killTimer` before it would cancel
+      // the SIGKILL escalation we are about to schedule.
+      settle({
+        ok: false,
+        latencyMs: Date.now() - t0,
+        error:
+          `ssh probe timed out after ${timeoutMs}ms (connected but the session never completed; ` +
+          `killed the ssh process). ConnectTimeout=5 bounds only the TCP connect phase — a host ` +
+          `that finishes the handshake then stalls (wedged sshd, hung PAM/LDAP, saturated box) ` +
+          `hits this bound instead.`,
+      });
+      // Reap the child, do not merely abandon it: repeated probes against a
+      // wedged host would otherwise pile up orphaned `ssh` processes on the
+      // bots-app host. `reapChild` does SIGTERM → grace → SIGKILL; if the
+      // child DOES exit on the TERM, the `exit` handler above calls
+      // `cancelReap` so we never signal a recycled pid.
+      //
+      // The grace timer is ref'd (see reapChild's note): this runs inside the
+      // long-lived ctl server, which outlives the window either way, and the
+      // `exit` handler's `cancelReap` clears it the moment the child dies —
+      // so it cannot delay a shutdown. Unlike `retrieve`, this caller has no
+      // `process.exit` to race, so it does not await `settled`.
+      cancelReap = reapChild(child, { graceMs: killGraceMs }).cancel;
+    }, timeoutMs);
   });
 }
 
 /**
  * Build the argv array for the probe command. Exported for unit tests.
+ *
+ * Carries {@link PROBE_KEEPALIVE_ARGS} so `ssh` itself tears down a
+ * session whose transport goes silent (~15s), independent of the
+ * wall-clock backstop in {@link runSshProbe}.
  */
 export function buildSshArgsForProbe(host: SshHost): string[] {
-  return [...buildBaseSshArgs(host, { connectTimeout: 5 }), "echo bots-app-probe-ok && uname -a"];
+  return [
+    ...buildBaseSshArgs(host, { connectTimeout: 5 }),
+    ...PROBE_KEEPALIVE_ARGS,
+    "echo bots-app-probe-ok && uname -a",
+  ];
 }
 
 /**

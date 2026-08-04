@@ -24,6 +24,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { reapChild, type ReapHandle } from "../control/reap-child";
 import { buildBaseSshArgs, shellEscape, type SshHost } from "../control/ssh-hosts";
 import { formatDerivedCsv } from "./csv";
 import { deriveSamples } from "./derive";
@@ -67,11 +68,50 @@ const DEFAULT_PROC_GREP = "chrome|chromium|node|tsx";
 
 /**
  * SSH keepalive options appended to every resource-sampler ssh invocation so a
- * mid-transfer stall (a wedged remote box, a silently dropped TCP connection)
- * cannot hang `finalizeAll` indefinitely: ssh probes every 5s and gives up
- * after 3 unanswered probes (~15s).
+ * dropped TRANSPORT cannot hang `finalizeAll` indefinitely: ssh probes every 5s
+ * and gives up after 3 unanswered probes (~15s).
+ *
+ * Scope correction (issue 2133 sweep): this bounds the transport ONLY. A remote
+ * box whose sshd keeps answering keepalives while `cat` never completes — a
+ * wedged filesystem, a saturated box, a hung NFS read on the CSV path — leaves
+ * the session alive and silent, and ServerAlive will never notice. That case is
+ * bounded separately by {@link RETRIEVE_STALL_TIMEOUT_MS} in `retrieve`.
  */
-const SSH_KEEPALIVE_ARGS = ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"];
+export const SSH_KEEPALIVE_ARGS = ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"];
+
+/**
+ * Inactivity (stall) bound for a remote CSV `retrieve`: the transfer is severed
+ * only after this long with NO new stdout bytes. Reset on every chunk.
+ *
+ * Why INACTIVITY and not an absolute deadline — this is the opposite call from
+ * the probe's {@link import("../control/ssh-hosts").SSH_PROBE_TIMEOUT_MS}, and
+ * the difference is the point:
+ *
+ *   - The probe runs a FIXED, tiny command (`echo && uname -a`). Its total
+ *     runtime has a known ceiling, so an absolute bound is both correct and
+ *     simpler.
+ *   - `retrieve` streams a file whose size scales with RUN LENGTH: one sampler
+ *     row every `intervalSec` (default 5s), so a multi-hour run's raw CSV is
+ *     orders of magnitude larger than a 10-minute run's. ANY absolute bound
+ *     would either be uselessly loose for short runs or would sever a large
+ *     transfer that is progressing perfectly well — losing the very artifact we
+ *     are trying to save. Progress, not elapsed time, is the health signal
+ *     here.
+ *
+ * 20s of total silence: comfortably above the ~15s ServerAlive teardown (so a
+ * broken TRANSPORT is reported by ssh, with its better diagnostic, rather than
+ * by this timer), and far above any plausible gap between TCP segments of a
+ * healthy `cat` even on a slow WAN link. A transfer that is merely SLOW is
+ * never severed — only one that has genuinely stopped.
+ */
+export const RETRIEVE_STALL_TIMEOUT_MS = 20_000;
+
+/**
+ * Grace between the retrieve's `SIGTERM` and the follow-up `SIGKILL`. Same
+ * rationale as the probe's: an `ssh` blocked in a syscall can ignore SIGTERM,
+ * and nothing waits on this window — `finalizeAll` already has its answer.
+ */
+export const RETRIEVE_KILL_GRACE_MS = 2_000;
 
 /**
  * A resource capture bound to one run. Construct, `startLocal()` before the
@@ -237,6 +277,14 @@ export interface RemoteSamplerOptions {
   /** Remote path the sampler writes its raw CSV to. Default under /tmp. */
   remoteCsvPath?: string;
   spawn?: typeof nodeSpawn;
+  /**
+   * Overrides {@link RETRIEVE_STALL_TIMEOUT_MS} for `retrieve`. Exists so tests
+   * can bound a stalled transfer in milliseconds instead of waiting out the
+   * production default; production callers omit it.
+   */
+  retrieveStallMs?: number;
+  /** Overrides {@link RETRIEVE_KILL_GRACE_MS} for `retrieve`. */
+  retrieveKillGraceMs?: number;
 }
 
 export interface RemoteSamplerHandle {
@@ -299,7 +347,18 @@ export function startRemoteSampler(
         ...SSH_KEEPALIVE_ARGS,
         `cat ${shellEscape(remoteCsvPath)}`,
       ];
-      return await new Promise<number>((resolve) => {
+      const stallMs = opts.retrieveStallMs ?? RETRIEVE_STALL_TIMEOUT_MS;
+      const killGraceMs = opts.retrieveKillGraceMs ?? RETRIEVE_KILL_GRACE_MS;
+      // `reapPending` holds the in-flight escalation (if any) so we can await
+      // it BEFORE this function returns. That await is load-bearing, not
+      // hygiene: the caller chain (`finalizeAll` → `orchestrator.ts:596` →
+      // `cli.ts:508`) hits `process.exit(0)` right after, and `process.exit`
+      // does not run pending timers — so without awaiting, the SIGKILL is cut
+      // off mid-flight and the wedged `ssh` is orphaned. The happy path never
+      // pays for this: `reapPending` stays undefined unless we actually killed
+      // something.
+      let reapPending: Promise<void> | undefined;
+      const bytes = await new Promise<number>((resolve) => {
         let child2: ChildProcess;
         try {
           child2 = spawnImpl("ssh", catArgs, { stdio: ["ignore", "pipe", "pipe"] });
@@ -309,19 +368,212 @@ export function startRemoteSampler(
           return;
         }
         const out = createWriteStream(localPath);
-        let bytes = 0;
+        let bytesSeen = 0;
+        // DRAIN stderr. `stdio` pipes it, and an unread pipe has a ~64 KB kernel
+        // buffer — once ssh fills it (host-key notices, banners, a verbose
+        // warning per line on a misconfigured host) the child BLOCKS on write and
+        // never finishes, so the transfer stalls out and the CSV is lost. That is
+        // a deadlock this issue's own new stall bound would merely time out
+        // rather than prevent. `startRemoteSampler` above already drains its
+        // stderr for this reason; `retrieve` did not. Measured: drained -> 16692
+        // bytes, exit 0, 64 ms; not drained -> 0 bytes and a stall timeout.
+        // Captured (bounded) so a failure message can name the actual ssh error
+        // instead of a bare exit code.
+        let stderrTail = "";
+        child2.stderr?.on("data", (b: Buffer) => {
+          if (stderrTail.length < 4096) stderrTail += b.toString("utf8");
+        });
+        // Settle-once + clear-every-timer, same discipline as the probe
+        // (`runSshProbe`): this promise has FIVE resolve paths (the spawn throw
+        // above, `error`, the stream's `error`, `close`, and the stall timer) and
+        // must resolve exactly once. A killed child still emits `close` after the
+        // stall timer has resolved, and a dangling `setTimeout` would keep the
+        // orchestrator's event loop alive at the very end of a run.
+        let settled = false;
+        let stallTimer: NodeJS.Timeout | undefined;
+        let cancelReap: ReapHandle["cancel"] | undefined;
+        // First GENUINE write failure seen on `out`, if any. Recorded because a
+        // late ENOSPC can land after `pipe` already ended the stream, in which
+        // case there is no `end()` callback left to carry it.
+        let writeError: Error | null = null;
+        const clearTimers = (): void => {
+          if (stallTimer !== undefined) clearTimeout(stallTimer);
+          if (cancelReap !== undefined) cancelReap();
+          stallTimer = undefined;
+          cancelReap = undefined;
+        };
+        /** Start the SIGTERM → grace → SIGKILL escalation and record it. */
+        const startReap = (): void => {
+          // `reapPending` is what makes the escalation survive this caller:
+          // it exits the process immediately after awaiting (cli.ts:508), and
+          // `process.exit` runs no pending timers — so the SIGKILL must be
+          // awaited, not merely scheduled. See reapChild's note.
+          const reap = reapChild(child2, { graceMs: killGraceMs });
+          cancelReap = reap.cancel;
+          reapPending = reap.settled;
+        };
+        /**
+         * Close `out` and report a GENUINE write failure, if any.
+         *
+         * The subtlety that makes this its own function: `stdout.pipe(out)`
+         * AUTO-ENDS `out` at source EOF. So on the NORMAL path — the child
+         * streams the whole CSV and exits — the stream is already ended (usually
+         * already finished) by the time we get here, and calling `end()` again
+         * hands the callback `ERR_STREAM_ALREADY_FINISHED`. That code means
+         * "already flushed successfully", NOT "flush failed": treating it as a
+         * failure discarded a COMPLETE CSV as 0 bytes on every successful
+         * transfer, which `finalizeAll` then dropped (`if (bytes === 0) continue`).
+         * That is strictly worse than the late-error bug this logic exists for,
+         * so the two cases are distinguished explicitly rather than by
+         * "truthy err".
+         *
+         * States, and what each needs:
+         *   - already FINISHED  → nothing to do; report any recorded error.
+         *   - already ENDED     → `pipe` started the flush; wait for `finish`.
+         *   - not ended (stall) → we must `end()` it ourselves: that is what
+         *     flushes buffered bytes and releases the fd, so skipping it leaks a
+         *     descriptor per wedged host.
+         */
+        const closeOut = (done: (err: Error | null) => void): void => {
+          let called = false;
+          const finish = (err: Error | null): void => {
+            if (called) return;
+            called = true;
+            done(err ?? writeError);
+          };
+          // A late failure surfacing during the flush must win over a clean
+          // finish, so listen for it regardless of which branch we take below.
+          out.once("error", finish);
+          if (out.writableFinished) {
+            finish(null);
+            return;
+          }
+          if (out.writableEnded) {
+            out.once("finish", () => finish(null));
+            return;
+          }
+          out.end((err?: Error | null) => finish(benignCloseError(err) ? null : (err ?? null)));
+        };
+        /**
+         * Resolve once, always closing the write stream first.
+         *
+         * A genuine flush failure downgrades the result to 0 ("no usable CSV"):
+         * the flush is where a late ENOSPC/EDQUOT surfaces, AFTER `exit` has
+         * already reported success, and reporting the byte count there would
+         * hand `finalizeAll` a truncated CSV it believes is complete.
+         */
+        const settle = (value: number): void => {
+          if (settled) return;
+          settled = true;
+          clearTimers();
+          closeOut((err) => {
+            if (err) {
+              console.warn(
+                `[resource] remote CSV write to ${localPath} failed while flushing: ` +
+                  `${err.message} — reporting 0 bytes rather than a truncated CSV`,
+              );
+              resolve(0);
+              return;
+            }
+            resolve(value);
+          });
+        };
+        // INACTIVITY bound, not absolute: rearmed on every chunk, so a large
+        // but progressing transfer is never severed (see
+        // RETRIEVE_STALL_TIMEOUT_MS for why this site differs from the probe).
+        const armStall = (): void => {
+          if (settled) return;
+          if (stallTimer !== undefined) clearTimeout(stallTimer);
+          stallTimer = setTimeout(() => {
+            console.warn(
+              `[resource] remote CSV retrieve from ${opts.host.label} stalled — no data for ` +
+                `${stallMs}ms (${bytesSeen} bytes received); killing the ssh session. The transport ` +
+                `was alive (ServerAlive kept answering), so the remote \`cat\` itself wedged.`,
+            );
+            // Resolve FIRST, then reap: `settle` runs `clearTimers`, so
+            // arming the reaper before it would cancel the escalation.
+            settle(0);
+            startReap();
+          }, stallMs);
+        };
         child2.stdout?.on("data", (b: Buffer) => {
-          bytes += b.length;
+          bytesSeen += b.length;
+          armStall();
         });
         child2.stdout?.pipe(out);
+        // A WriteStream `error` (unwritable path, disk full, EDQUOT) is emitted
+        // ASYNCHRONOUSLY, so it does NOT propagate to `finalizeAll`'s
+        // try/catch — with no listener it becomes an uncaughtException and
+        // takes down the orchestrator at run end. That is unacceptable on a
+        // path documented as best-effort, so handle it like every other
+        // failure: warn and report 0 bytes.
+        //
+        // A LATE error (after `exit` already settled) is carried by `writeError`
+        // / the `closeOut` listener instead — by then this listener's `settled`
+        // guard has already fired.
+        out.on("error", (e: Error) => {
+          if (writeError === null) writeError = e;
+          console.warn(`[resource] remote CSV write to ${localPath} failed: ${e.message}`);
+          if (settled) return;
+          settled = true;
+          clearTimers();
+          // Do NOT call `out.end()` on an errored stream; destroy it instead.
+          out.destroy();
+          resolve(0);
+          startReap();
+        });
         child2.on("error", (e: Error) => {
           console.warn(`[resource] remote CSV retrieve failed: ${e.message}`);
-          resolve(0);
+          settle(0);
         });
-        child2.on("exit", (code) => {
-          out.end(() => resolve(code === 0 ? bytes : 0));
+        // `close`, NOT `exit` — this is the ROOT-CAUSE fix for a whole class of
+        // silent CSV truncation, and the distinction is the entire bug:
+        //
+        //   * `exit`  fires when the child PROCESS dies. Its stdio may still be
+        //             draining.
+        //   * `close` fires when the process has died AND every stdio stream has
+        //             been fully consumed.
+        //
+        // Settling on `exit` meant `settle()` could run mid-pipe, so `closeOut`
+        // saw `writableEnded === false` and called `out.end()` on a stream the
+        // pipe was still writing to — TRUNCATING the CSV. The pipe's next write
+        // then raised `ERR_STREAM_WRITE_AFTER_END` into the pending `end`
+        // callback, which a benign-code whitelist happily reported as success.
+        // Net: a short file returned as complete, and `finalizeAll` deriving a
+        // verdict from partial data. Measured on a slow sink (which is what a
+        // real disk/NFS write is): at `exit`, 1,785,856 of 2,000,000 bytes were
+        // written, `writableEnded=false`. At `close`: all 2,000,000,
+        // `writableEnded=true`.
+        //
+        // On `close` the pipe has ALWAYS auto-ended the stream, so `closeOut`
+        // can only ever take its already-ended branch and the truncating path is
+        // now unreachable rather than merely guarded. That is why this is the
+        // correct fix and a wider whitelist was not: the whitelist suppressed the
+        // SYMPTOM of writing to a stream we should not have ended yet.
+        child2.on("close", (code) => {
+          // Cancel the reaper before the settled-check: a child exiting in
+          // response to our own SIGTERM arrives when `settled` is already
+          // true, and leaving the grace timer armed would fire SIGKILL at a
+          // pid the OS may have recycled.
+          clearTimers();
+          if (settled) return;
+          if (code !== 0) {
+            // Name the actual ssh failure rather than a bare exit code — this is
+            // why stderr is captured above and not just drained.
+            console.warn(
+              `[resource] remote CSV retrieve from ${opts.host.label} exited ${code}` +
+                (stderrTail.trim() ? `: ${stderrTail.trim()}` : ""),
+            );
+          }
+          settle(code === 0 ? bytesSeen : 0);
         });
+        armStall();
       });
+      // Let a started escalation run to completion before returning, so the
+      // caller's `process.exit` cannot cut the SIGKILL off. Bounded by
+      // `killGraceMs` (2s default) and only ever reached on a failure path.
+      if (reapPending !== undefined) await reapPending;
+      return bytes;
     },
   };
 }
@@ -349,6 +601,15 @@ export class RemoteResourceManager {
       spawn?: typeof nodeSpawn;
       /** Injected script text for tests; read from disk when omitted. */
       scriptText?: string;
+      /**
+       * Overrides {@link RETRIEVE_STALL_TIMEOUT_MS} for every host's `retrieve`.
+       * Threaded through to {@link startRemoteSampler} so a test can exercise
+       * the bound via `finalizeAll` — the real call site — rather than only via
+       * a hand-built handle. Production omits it and gets the default.
+       */
+      retrieveStallMs?: number;
+      /** Overrides {@link RETRIEVE_KILL_GRACE_MS}. */
+      retrieveKillGraceMs?: number;
     },
   ) {}
 
@@ -376,6 +637,8 @@ export class RemoteResourceManager {
         maxSeconds: this.opts.maxSeconds,
         label: this.opts.label,
         spawn: this.opts.spawn,
+        retrieveStallMs: this.opts.retrieveStallMs,
+        retrieveKillGraceMs: this.opts.retrieveKillGraceMs,
       });
       this.byHost.set(host.label, handle);
       console.log(`[resource] remote sampling ${host.label} (${host.user}@${host.host})`);
@@ -433,6 +696,43 @@ export class RemoteResourceManager {
     }
     return results;
   }
+}
+
+/**
+ * Codes that a redundant `end()` reports when the stream was ALREADY closed
+ * cleanly. They mean "already flushed successfully", not "the flush failed".
+ *
+ * `stdout.pipe(out)` auto-ends `out` at source EOF, so on every SUCCESSFUL
+ * transfer the stream is already ended/finished before `settle` runs — making
+ * these the NORMAL outcome of the belt-and-braces `end()`, not an edge case.
+ * Treating them as failures reported a complete CSV as 0 bytes, and
+ * `finalizeAll` dropped the host (`if (bytes === 0) continue`).
+ *
+ * Verified against Node 22:
+ *   - finished, then `end()` again        → ERR_STREAM_ALREADY_FINISHED
+ *   - ended-not-yet-finished, `end()`     → no error
+ *   - `write()` after `end()`             → ERR_STREAM_WRITE_AFTER_END
+ *
+ * A genuine ENOSPC/EDQUOT carries neither code and still downgrades to 0.
+ *
+ * ONLY `ERR_STREAM_ALREADY_FINISHED` is listed, and `ERR_STREAM_WRITE_AFTER_END`
+ * is DELIBERATELY EXCLUDED — adding it hid a real defect. It is a WRITE-path
+ * error, so it can only surface on a write callback or the `error` event, never
+ * in a first-`end()` callback (the sole place this predicate is consulted). It
+ * therefore cannot describe a redundant close at all; the only thing it could
+ * ever do here is mask a TRUNCATED file as success — which is exactly what it
+ * did when `retrieve` still settled on `exit` and could `end()` mid-pipe. That
+ * root cause is fixed (settle on `close`), so this predicate is now only ever
+ * reached with the stream genuinely finished. Do not re-add it: silently
+ * reporting a short CSV as complete is worse than reporting 0.
+ */
+const BENIGN_CLOSE_CODES = new Set(["ERR_STREAM_ALREADY_FINISHED"]);
+
+/** True when `err` only says the stream was already closed cleanly. */
+function benignCloseError(err: unknown): boolean {
+  if (err === null || err === undefined) return true;
+  const code = (err as NodeJS.ErrnoException).code;
+  return code !== undefined && BENIGN_CLOSE_CODES.has(code);
 }
 
 /** Sentinel occupying a host slot between reservation and a started handle. */

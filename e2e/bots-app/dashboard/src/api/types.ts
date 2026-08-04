@@ -559,12 +559,18 @@ export interface SshPreviewLaunchResponse {
  */
 export interface SshPreviewHostRequest {
   host: AddSshHostRequest;
+  /**
+   * `e2e/bots-app/src/control/server.ts` honors `videoMode` through
+   * `parseVideoModeField`. Today's `SampleCommandPreview` sends no `launchSpec`,
+   * so it renders placeholders; this shape lets future overrides retain the mode.
+   */
   launchSpec?: {
     meetingURL?: string;
     participant?: string;
     displayName?: string;
     ttl?: string;
     network?: string;
+    videoMode?: "costume" | "file" | "clock";
     authBackend?: string;
   };
 }

@@ -3967,6 +3967,120 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* ============================================================
+   Meeting password prompt (issue 1613)
+   ------------------------------------------------------------
+   Same full-viewport card family as the waiting-room / rejected /
+   error states above: the prompt REPLACES the joining view rather
+   than floating over it, which is what makes aria-modal="true" on
+   the card truthful.
+   ============================================================ */
+
+.password-prompt-container {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--bg);
+  background-image: var(--bg-image);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  padding: var(--space-4);
+  z-index: 1000;
+  /* The card is the only thing on screen and holds the one control the user
+     has to reach, so it must stay scrollable when the viewport shrinks — a
+     soft keyboard on a short phone, or a long/translated label growing the
+     button row (which the `min-height` below now permits). Without this the
+     fixed 100vh box simply clips. */
+  overflow-y: auto;
+}
+
+/* No `padding` here on purpose. `index.html` loads global.css AFTER style.css,
+   so `.card-apple { padding: var(--space-5) }` (same 0,1,0 specificity, later
+   source) wins over anything this rule declares — the `padding: 3rem` that the
+   sibling `.waiting-room-card` / `.error-card` rules carry is already inert for
+   exactly that reason. Declaring one here would be a line that looks like it
+   does something and does not; inheriting `--space-5` is also what those cards
+   actually render at, so this matches them. */
+.password-prompt-card {
+  text-align: center;
+  max-width: 400px;
+  width: 90%;
+}
+
+.password-prompt-icon {
+  color: var(--text-on-glass-muted);
+  margin-bottom: 1.5rem;
+}
+
+.password-prompt-card h2 {
+  margin: 0 0 var(--space-2) 0;
+  font-size: var(--fs-10);
+  font-weight: 600;
+}
+
+.password-prompt-message {
+  color: var(--text-on-glass-soft);
+  margin-bottom: var(--space-4);
+}
+
+/* Left-aligned: the label/field/error stack reads as a form, not as
+   more centred prose. */
+.password-prompt-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  text-align: left;
+}
+
+.password-prompt-label {
+  color: var(--text-on-glass-soft);
+  font-size: var(--fs-4);
+  font-weight: 500;
+}
+
+/* An opaque chip, not bare text on the glass. Error text laid directly on the
+   card is measured against a composited translucent surface; in light theme
+   that came out at ~1.2:1, and because the glass is mid-luminance NO red can
+   reach 4.5:1 against it. The chip gives the pair a surface of its own —
+   8.6:1 dark, 7.9:1 light. `.waiting-room-error` still has the old pairing;
+   changing it would alter a shipped screen and belongs in its own ticket. */
+.password-prompt-error {
+  background: var(--error-chip-bg);
+  color: var(--error-chip-text);
+  font-size: var(--fs-4);
+  margin: 0;
+  padding: var(--space-2);
+  border-radius: var(--radius-input);
+}
+
+.password-prompt-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+/* `min-height`, not the inherited fixed `height: 44px`. These two buttons are
+   `flex: 1` inside a 400px card, so each gets ~170px; `.btn-apple` sets
+   `white-space: normal` and `overflow: visible`, so a label that wraps to two
+   or three 22.5px lines spills out of a fixed 44px box, above and below the
+   rounded background. The sibling state cards never hit this because they
+   carry a single full-width button. Keeping 44px as a MINIMUM preserves the
+   touch target while letting a long or translated label grow the row instead
+   of escaping it. */
+.password-prompt-actions .btn-apple {
+  flex: 1;
+  height: auto;
+  min-height: 44px;
+  padding-top: var(--space-2);
+  padding-bottom: var(--space-2);
+}
+
+/* ============================================================
    Google Sign-In button
    ============================================================ */
 
@@ -4984,21 +5098,160 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   opacity: 1;
 }
 
+/* Decay help affordance (issue 1871).
+
+   The explanation is a real `role="tooltip"` element (`.speaker-highlight-help-tip`)
+   rather than `::after { content: attr(...) }`, because CSS-generated content is
+   not reliably exposed to assistive technology (Safari/VoiceOver in particular)
+   and cannot be the target of `aria-describedby`. The shared
+   `.settings-info-icon::after` bubble is therefore switched off for this icon —
+   without this it would still paint an empty bordered box on hover, since this
+   trigger carries no `title` for `content: attr(title)` to read. (The other
+   `.settings-info-icon` user, `meeting_options_controls.rs`, does set `title`
+   and is unaffected: it does not carry this modifier class.) */
 .speaker-highlight-help-icon::after {
-  content: attr(data-tooltip);
+  content: none;
+}
+
+/* Overrides of the shared `.settings-info-icon` base, which was authored for a
+   hover-only decorative hint. Turning this instance into a focusable control
+   (`role="button"`, `tabindex="0"`) changes what the base owes the user:
+
+   - `color`: the base `--text-quaternary` measures 2.38:1 against the composited
+     dark settings surface — below SC 1.4.11's 3:1 for a control, and well below
+     SC 1.4.3's 4.5:1, which applies because `(?)` is literal text, not an icon
+     font. (`--text-quaternary` is NOT among the tokens
+     `html[data-theme="dark"] .settings-modal` remaps, so inside the modal it is
+     the global `#636366`.) `--text-secondary` IS remapped there, to
+     `--settings-modal-text-secondary`, and clears both thresholds comfortably;
+     the exact ratio is measured by the settings-modal e2e spec rather than
+     asserted here, because the two token tiers resolve differently by context.
+     Light theme is unaffected: the `html[data-theme="light"] .settings-panel *`
+     blanket further down this file is (0,2,1) and already repaints the glyph
+     dark-on-light there.
+   - `cursor`: the base `help` cursor advertises "hover me", but click/tap is a
+     real, load-bearing action here — and the ONLY reveal on touch.
+   - `-webkit-tap-highlight-color`: without it Android Chrome paints a blue
+     rectangle over the 28px circle on every tap. Matches `.field-label__info`.
+
+   Same specificity as `.settings-info-icon` (0,1,0); wins on source order. */
+.speaker-highlight-help-icon {
+  color: var(--text-secondary);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The trigger is focusable (`role="button"`, `tabindex="0"`), so it needs a
+   visible focus indicator — the shared `.settings-info-icon` has none. The
+   glyph brightens too, matching the shipped `.field-label__info` precedent in
+   global.css. The brighten applies in DARK theme only: at (0,2,0) it loses to
+   the light-theme `.settings-panel *` blanket (0,2,1), which is harmless
+   because that blanket already paints the glyph near-black on a light panel. */
+.speaker-highlight-help-icon:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  color: var(--text-primary);
+}
+
+/* Visually identical to the pseudo-element bubble it replaces — same surface,
+   border, shadow, type scale and right-and-up placement. `visibility` is
+   toggled alongside `opacity` (its change delayed until the fade finishes)
+   so the collapsed bubble leaves the rendered accessibility tree instead of
+   lingering as a transparent box, matching `.field-label__tooltip` in
+   global.css. The explanation stays available to assistive technology while
+   hidden because `aria-describedby` targets are included in the accessible
+   description computation even when they are not rendered. */
+.speaker-highlight-help-tip {
+  position: absolute;
   left: calc(100% + 18px);
   right: auto;
   top: auto;
   bottom: calc(100% + 12px);
-  transform: none;
-  max-width: 220px;
-  width: min(220px, 52vw);
-  text-align: left;
   z-index: 30;
+
+  width: min(220px, 52vw);
+  max-width: 220px;
+  padding: var(--space-2) var(--space-3);
+
+  background: var(--fixed-dark-strong);
+  -webkit-backdrop-filter: blur(var(--effect-blur-surface));
+  backdrop-filter: blur(var(--effect-blur-surface));
+  border: 1px solid var(--settings-tooltip-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 4px 12px var(--settings-tooltip-shadow);
+
+  color: var(--on-dark-text-secondary);
+  font-size: var(--fs-3);
+  font-weight: 400;
+  line-height: 1.4;
+  text-align: left;
+  white-space: normal;
+
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 0.15s ease,
+    visibility 0s linear 0.15s;
 }
 
-.speaker-highlight-help-icon:hover::after {
+/* `:focus-within` (not just `:focus-visible`) so a touch tap or mouse click,
+   which focuses the trigger without matching `:focus-visible`, also reveals
+   the explanation. `--open` is the tap/click latch for touch. */
+.speaker-highlight-help-icon:hover .speaker-highlight-help-tip,
+.speaker-highlight-help-icon:focus-visible .speaker-highlight-help-tip,
+.speaker-highlight-help-icon:focus-within .speaker-highlight-help-tip,
+.speaker-highlight-help-icon--open .speaker-highlight-help-tip {
   opacity: 1;
+  visibility: visible;
+  transition:
+    opacity 0.15s ease,
+    visibility 0s linear 0s;
+}
+
+/* Escape-dismissal: hide the bubble while its trigger still holds keyboard
+   focus. The class is deliberately doubled — a single-class selector would be
+   0,2,0 and LOSE to the 0,3,0 `:hover` / `:focus-*` reveal rules above.
+   Doubled it ties them at 0,3,0 and wins on source order, which is stable here
+   because both rules live in this file with this ordering (unlike the
+   cross-file `.announce-help--suppressed` case, which needs `!important`). */
+.speaker-highlight-help-icon.speaker-highlight-help-icon--suppressed
+  .speaker-highlight-help-tip {
+  opacity: 0;
+  visibility: hidden;
+}
+
+/* issue 1871: honour a reduced-motion preference, as `.field-label__tooltip`
+   already does in global.css.
+
+   A media query adds NO specificity, so a lone `.speaker-highlight-help-tip`
+   here (0,1,0) would cancel only the resting/hide transition — the reveal rules
+   above run (0,2,0) to (0,3,0) and would keep animating the fade in. Both tiers are
+   therefore restated at their own specificity; each ties its counterpart and
+   wins on source order, which is stable because all of them live in this file
+   in this order. */
+@media (prefers-reduced-motion: reduce) {
+  .speaker-highlight-help-icon,
+  .speaker-highlight-help-tip {
+    transition: none;
+  }
+
+  .speaker-highlight-help-icon:hover .speaker-highlight-help-tip,
+  .speaker-highlight-help-icon:focus-visible .speaker-highlight-help-tip,
+  .speaker-highlight-help-icon:focus-within .speaker-highlight-help-tip,
+  .speaker-highlight-help-icon--open .speaker-highlight-help-tip {
+    transition: none;
+  }
+}
+
+/* Keeps "Decay" and its `(?)` trigger on one baseline inside the label column
+   of `.appearance-slider-row`'s grid, now that the trigger is a sibling of the
+   label rather than a child of it. */
+.appearance-slider-label-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
 }
 
 .settings-action-row {
@@ -5148,14 +5401,21 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     transform: translateX(-50%);
   }
 
-  .speaker-highlight-help-icon::after {
-    left: calc(100% + 10px);
+  /* issue 1871: drop the Decay tooltip below its trigger and grow it rightward
+     from the trigger's left edge on narrow viewports. The desktop right-and-up
+     placement (`left: calc(100% + 18px)`) pushes a 220px bubble past the right
+     edge of `.settings-panel`, which clips it (`overflow-x: hidden`, and
+     `z-index` cannot escape an overflow box). The trigger sits in the left-hand
+     label column, so left-anchoring can only ever spill rightward — capping the
+     width against the viewport keeps the whole bubble inside the panel at
+     320px. Mirrors the `.field-label__tooltip` treatment in global.css. */
+  .speaker-highlight-help-tip {
+    left: -8px;
     right: auto;
-    top: auto;
-    bottom: calc(100% + 10px);
-    transform: none;
-    width: min(180px, 58vw);
-    max-width: 180px;
+    top: calc(100% + 8px);
+    bottom: auto;
+    width: max-content;
+    max-width: min(180px, calc(100vw - 6rem));
   }
 
   .settings-field {
@@ -5377,6 +5637,288 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     font-size: var(--fs-3);
   }
 }
+
+/* ── Raised-hands banner (issue 2135) ──────────────────────────────────
+   The persistent, room-wide "who has a hand up" strip. This is the surface that
+   satisfies the issue's "peers see who has the hand raised EVEN IF THE TILE IS
+   NOT BEEN DISPLAYED" clause, so — unlike the decode-budget banner above — it is
+   NOT dismissible and NOT anti-flapped: it must stay on screen for exactly as
+   long as a hand is up, and a hand can be up for minutes.
+
+   That permanence drives every choice below:
+     * NO persistent animation (only a one-shot entrance). A looping pulse on a
+       long-lived element burns GPU continuously on exactly the low-power devices
+       this app already sheds video for.
+     * A hard max-width plus the "and N others" collapse in the copy, so a
+       20-hand meeting cannot grow this bar across the video.
+     * The surface is ALWAYS dark (--fixed-dark-heavy in both themes), so its
+       foreground uses --on-dark-* tokens — NOT theme-flipping ones like
+       --text-on-glass-strong, which go near-black in light theme and would
+       render the text invisible on the dark surface. Contrast on the near-opaque
+       dark surface: white text ~15:1 (text, AA needs 4.5:1) and the
+       --accent-hover icon ~4.6:1 (a non-text UI component, AA needs 3:1) — both
+       clear in BOTH themes. The icon deliberately does NOT carry the message:
+       the text does, so the icon's tint is decoration, not information. */
+
+/* Top-centre overlay stack geometry (issue 2135).
+   ------------------------------------------------------------------
+   Declared on `#grid-container` — the common ancestor of all three top-centre
+   overlays — and NOT on `.raised-hands-banner`, because a custom property set on
+   the banner is invisible to its SIBLINGS, which are the elements that have to
+   move out of its way.
+
+   `--raised-hands-banner-h` is EXACT, not an estimate. The banner can never wrap
+   (both text spans are `white-space: nowrap` + `text-overflow: ellipsis`), so its
+   height is fully determined by its own box model: the 2px border, the block
+   padding, and the taller of the fixed 18px icon and the 1.3 line box. Every
+   input below is the SAME declaration the banner rule itself consumes, so the
+   two cannot drift the way a hardcoded follower offset did — the `top: 64px`
+   this replaces was a snapshot of that arithmetic at a 16px root font size, and
+   `--space-2` is REM-based, so the banner grew with the root font size while the
+   follower stayed put. Measured: at a 32px root (a 200% OS text setting) the
+   banner reaches 52px, which puts its bottom edge at exactly the 64px the
+   follower was pinned to — gap zero — and anything past that overlaps. The
+   derived value moves the follower to 96px in the same conditions.
+
+   At the default root size this resolves to 12 + 36 + 16 = 64px — byte-identical
+   to the constant it replaces, so nothing moves on a default-configured client. */
+#grid-container {
+  --raised-hands-banner-top: 12px;
+  --raised-hands-banner-h: calc(
+    var(--space-2) * 2 + 2px + max(18px, calc(var(--fs-4) * 1.3))
+  );
+  /* Where a SECOND top-centre overlay has to start in order to clear the banner.
+     Every follower reads this one value, so adding another top-centre surface
+     means adding it to the sibling selectors below — not re-deriving a number. */
+  --raised-hands-stack-next-top: calc(
+    var(--raised-hands-banner-top) + var(--raised-hands-banner-h) +
+      var(--space-4)
+  );
+}
+
+.raised-hands-banner {
+  position: absolute;
+  top: var(--raised-hands-banner-top);
+  left: 50%;
+  transform: translateX(-50%);
+  /* One above the decode-budget banner: the two are separated by the sibling
+     rule below, and if that rule ever failed, the actionable social signal
+     should win over the advisory performance one. */
+  z-index: 61;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(560px, calc(100% - 24px));
+  padding: var(--space-2) 14px;
+  background: var(--fixed-dark-heavy);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 32px var(--shadow-card-deep);
+  color: var(--on-dark-text-high);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
+    sans-serif;
+  font-size: var(--fs-4);
+  font-weight: 500;
+  line-height: 1.3;
+  /* Purely informational — never eat a click meant for a tile beneath it. */
+  pointer-events: none;
+  animation: raised-hands-banner-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.raised-hands-banner-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: var(--accent-hover);
+}
+
+.raised-hands-banner-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.raised-hands-banner-text {
+  flex: 1;
+  min-width: 0;
+  /* Long names must not push the banner past its max-width. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The compact mobile form is hidden on wider viewports. It carries the first
+   raiser's NAME plus "+N" (see `compose_raised_hands_compact`), not a bare
+   count: the issue asks WHO has a hand raised, and a mobile-only "3 hands
+   raised" answers only how many — on the class of device where the roster
+   drawer and the tile badges are hardest to reach. Ellipsizes like the full
+   sentence so a long name still cannot widen the banner. */
+.raised-hands-banner-compact {
+  display: none;
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Every top-centre overlay that can share the screen with the raised-hands
+   banner is pushed below it here. The general-sibling combinator applies ONLY
+   while the banner is actually in the DOM (it renders nothing when no hand is
+   up), so each follower keeps its own position at all other times and no
+   component needs to know about the other. The banner is rendered FIRST in
+   `attendants.rs` for exactly this reason.
+
+   TWO followers, not one. The decode-budget banner is unconditionally
+   top-centre; the decode-paused pill is top-centre ONLY during a screen share
+   (in grid mode it is bottom-anchored above the controls dock and cannot
+   collide), which is why its rule carries the `.has-screen-share` scope and the
+   other does not. Omitting the pill was the issue-2135 defect this fixes: both
+   sat at `top: 12px`, the banner painted over the pill at z-index 61 vs 55, and
+   because the banner is `pointer-events: none` the pill's "Show all" button
+   stayed CLICKABLE while invisible — strictly worse than being either hidden or
+   visible, because a user cannot recover an affordance they cannot see.
+
+   The two never co-exist with each other (the pill suppresses while the budget
+   banner is on screen — see decode_paused_pill.rs), so at most ONE of these
+   rules is ever doing work at a time; they are written as separate selectors
+   only because their scopes differ. */
+.raised-hands-banner ~ .decode-budget-banner {
+  top: var(--raised-hands-stack-next-top);
+}
+
+/* Specificity: (1 id, 3 classes) beats the bare
+   `#grid-container.has-screen-share .decode-paused-pill` (1 id, 2 classes)
+   below, so the pill's screen-share `bottom: auto` still applies while this
+   overrides only its `top`. */
+#grid-container.has-screen-share .raised-hands-banner ~ .decode-paused-pill {
+  top: var(--raised-hands-stack-next-top);
+}
+
+@keyframes raised-hands-banner-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* Reduced motion: fade only, no vertical slide. */
+@media (prefers-reduced-motion: reduce) {
+  .raised-hands-banner {
+    animation: raised-hands-banner-enter-reduced 0.15s ease-out;
+  }
+  @keyframes raised-hands-banner-enter-reduced {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+}
+
+/* Mobile <=639px: icon + "Alice +2" (the head of the queue, plus how many are
+   behind them) replaces the full sentence, which does not fit. */
+@media (max-width: 639px) {
+  /* The banner's block padding and font-size both shrink here, so the derived
+     height has to shrink with them — otherwise every follower would clear a
+     banner taller than the one actually on screen and leave a visible gap.
+     Mirrors the desktop formula with this block's own padding/font-size; the
+     18px icon is NOT overridden here, so it still floors the content box. */
+  #grid-container {
+    --raised-hands-banner-h: calc(
+      6px * 2 + 2px + max(18px, calc(var(--fs-3) * 1.3))
+    );
+  }
+  .raised-hands-banner {
+    gap: var(--space-2);
+    padding: 6px var(--space-3);
+    font-size: var(--fs-3);
+  }
+  .raised-hands-banner-text {
+    display: none;
+  }
+  .raised-hands-banner-compact {
+    display: inline-block;
+  }
+}
+
+/* ── Raised-hand badge (issue 2135) ────────────────────────────────────
+   Shown next to a participant's name on their video tile and in the roster, and
+   in the self tile's chrome cluster. Sized and spaced like .recording-indicator
+   so the two read as one family when a participant is both recording and has a
+   hand up. Unlike the recording dot — whose entire meaning IS its red — this
+   glyph inherits currentColor so it works on a dark tile overlay, a light roster
+   row, and the accent-filled pressed button without three treatments. */
+   The `color: var(--accent-hover)` this rule used to carry DEFEATED the comment
+   above it, and did so on the surface where it mattered most. On a video tile
+   the badge sits inside `.floating-name`, whose background is a translucent
+   scrim over ARBITRARY VIDEO — against a bright frame the accent blue measured
+   1.50:1 (dark theme) / 2.27:1 (light), well under the 3:1 that WCAG 1.4.11
+   requires of a non-text UI component that carries meaning. It also dragged the
+   roster's ordinal — real 12px bold TEXT, so 4.5:1 under 1.4.3 — down to
+   3.47:1 in light theme. Inheriting currentColor as the comment always
+   prescribed gives ~16:1 on the roster row and the tile's own name contrast on
+   a tile, in both themes, and the glyph still reads as a hand.
+
+   The accent tint survives in exactly one place: `.raised-hands-banner-icon`,
+   whose surface is the banner's FIXED dark fill rather than live video, and was
+   independently verified there at ~4.6:1. */
+.raised-hand-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: var(--space-1);
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.raised-hand-badge svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Self tile: sits in the .host-tile-chrome flex row alongside the LED, the
+   transport badge and the quality pill, so it needs the same pill chrome those
+   have rather than the bare inline glyph the name row uses. */
+.raised-hand-badge--self {
+  margin-left: 0;
+  padding: 3px 5px;
+  border-radius: var(--radius-md);
+  background: var(--fixed-dark-strong);
+  border: 1px solid var(--glass-border);
+}
+
+.raised-hand-badge--self svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* Roster row: carries the visible queue ordinal next to the glyph. */
+.raised-hand-badge-position {
+  font-size: 0.75em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+/* NO `.raise-hand-button.raised` rule, deliberately.
+   `.video-control-button.active` (global.css) already supplies the pressed
+   treatment: a solid #0a84ff fill. The rule that used to live here set
+   `color: var(--accent-hover)` — which resolves to #0a84ff, the SAME value — so
+   the raised toggle rendered a blue stroke on a blue disc at 1.00:1: an
+   invisible icon in the one state the control exists to communicate (1.59:1 on
+   hover). The base `color: white` gives 3.65:1 on that fill, clearing 1.4.11's
+   3:1 and matching every other `.active` control in the bar. The RaiseHand
+   overflow item's raised treatment is in global.css beside `.overflow-item`. */
 
 /* ── Decode-paused pill (issue 1142 FINAL DESIGN) ──────────────────────
    The persistent "N videos paused" signpost. It is the steady-state counterpart
@@ -5812,8 +6354,12 @@ html[data-theme="light"] .decode-paused-pill-action {
 }
 
 .settings-panel {
+  /* No `z-index` here: the grouped rule further down this file
+     (`.settings-header, .settings-layout, .settings-panel, .settings-sidebar,
+     .device-settings-content`) has equal specificity and comes later, so it is
+     the authoritative stacking level for this element. A value declared here
+     is silently discarded — change it there instead (issue 1871). */
   position: relative;
-  z-index: 3;
 
   margin: var(--space-1);
   padding: 40px 54px 48px 44px;
@@ -5867,8 +6413,8 @@ html[data-theme="light"] .decode-paused-pill-action {
   flex-direction: column;
   gap: 2px;
 
+  /* No `z-index` here — see the note on `.settings-panel` above (issue 1871). */
   position: relative;
-  z-index: 1;
   overflow: hidden;
 }
 
@@ -8910,6 +9456,11 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   min-width: 200px;
   backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  /* issue 2091: this popover is NOT a fixed-dark surface — it paints the
+     theme-PAIRED --mock-popover-bg (light in light theme), and its children
+     keep the theme-aware text tokens accordingly. It borrows only the drop
+     shadow from the popover set, which before issue 2091 resolved to `none` in
+     light theme; it now renders in both. */
   box-shadow: var(--glass-popover-shadow);
 }
 
@@ -8990,6 +9541,15 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   box-shadow: var(--glass-popover-shadow);
 }
 
+/* issue 2091: .density-popover paints the fixed-dark --glass-popover-bg, so
+   every state below is on the --on-dark-* / --glass-popover-item-* set rather
+   than the theme-aware --text-secondary / --text-primary /
+   --settings-ghost-bg-*. Under html[data-theme="light"] those flip to #636366
+   (~2.3:1 here), #1a1a1a (~1.3:1) and black-tinted fills that are invisible on
+   dark glass — i.e. hover would become the LEAST legible state.
+   Dark theme is unchanged except the rest colour, which moves from #aeaeb2
+   (6.3:1) to rgba(255,255,255,0.7) (7.7:1) — the nearest value in the
+   prescribed fixed-dark family; the rest/hover hierarchy is preserved. */
 .density-option {
   display: flex;
   flex-direction: column;
@@ -8998,20 +9558,20 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-md);
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--on-dark-text-secondary);
   cursor: pointer;
   transition: all 0.15s ease;
   min-width: 72px;
 }
 
 .density-option:hover {
-  background: var(--settings-ghost-bg-hover);
-  color: var(--text-primary);
+  background: var(--glass-popover-item-hover-bg);
+  color: var(--on-dark-text);
 }
 
 .density-option.active {
-  background: var(--settings-ghost-bg-selected);
-  color: var(--text-primary);
+  background: var(--glass-popover-item-active-bg);
+  color: var(--on-dark-text);
 }
 
 /* Persistent indicator for the committed (aria-checked) density mode,
@@ -9019,7 +9579,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .density-option[aria-checked="true"] {
   border-left: 2px solid var(--accent, rgba(120, 160, 220, 0.55));
   /* @token-exempt: var() fallback */
-  color: var(--text-primary);
+  color: var(--on-dark-text);
 }
 
 /* The .active class highlights the keyboard-navigated option via
@@ -9059,6 +9619,20 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
      options rather than letting it sit top-aligned. */
   align-items: center;
   max-width: min(360px, calc(100% - 32px));
+  /* issue 2141: the palette grew a ~400px emoji-picker column, and it is
+     anchored to the BOTTOM, so it grows UPWARD without limit. On a short
+     viewport (landscape phone ~390px tall, or any viewport with the soft
+     keyboard open) it ran off the TOP of the screen and clipped the search
+     field — which, being first in the column, is exactly what gets lost.
+     Bounded here so the column scrolls instead of overflowing. 124px = the
+     104px bottom offset + 20px of top breathing room. The `dvh` line re-measures
+     when mobile browser chrome collapses (and, under
+     `interactive-widget=resizes-content`, when the keyboard opens); the `vh`
+     line above it is the fallback for engines without `dvh`. */
+  max-height: calc(100vh - 124px);
+  max-height: calc(100dvh - 124px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   z-index: 9100;
   backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
@@ -9084,12 +9658,16 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
 }
 
+/* issue 2091: fixed-dark surface — see .density-option above. The theme-aware
+   --settings-ghost-bg-* flip to rgba(0,0,0,0.04) / 0.05 in light theme, which
+   is invisible on this glass, so the palette would lose its hover/selected
+   affordance entirely. Values are the dark ghost tokens verbatim. */
 .reaction-option:hover {
-  background: var(--settings-ghost-bg-hover);
+  background: var(--glass-popover-item-hover-bg);
 }
 
 .reaction-option.active {
-  background: var(--settings-ghost-bg-selected);
+  background: var(--glass-popover-item-active-bg);
 }
 
 .reaction-option:active,
@@ -9113,8 +9691,9 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
    HANGS half off the palette's top-right corner (translate(50%,-50%)) rather
    than sitting inline. Absolutely positioned inside the palette (its transform /
    fixed position is the containing block); the palette has no overflow:hidden,
-   so the overhang is not clipped. Keeps the shared .close-button color + hover
-   tokens; adds a subtle ring/shadow from the popover token set. A 24px box is a
+   so the overhang is not clipped. Overrides the shared .close-button colour +
+   hover (see the issue 2091 note below) but keeps its backgrounds; adds a
+   subtle ring/shadow from the popover token set. A 24px box is a
    compact visual, and it stays keyboard-focusable with a visible ring. The
    interactive/touch hit target is enlarged to ~44px by the ::before below. */
 .reactions-close-badge {
@@ -9130,6 +9709,31 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   box-shadow: var(--glass-popover-shadow);
   font-size: var(--fs-2);
   z-index: 1;
+  /* issue 2091: the badge hangs off the fixed-dark palette corner, but the
+     shared .close-button (style.css) colours it with the theme-aware
+     --text-primary / --error-text, which under html[data-theme="light"] flip
+     to near-black and a dark red — about 1.3:1 and 2.1:1 here. Both are
+     re-based onto the fixed-dark set. Rest state is byte-identical in dark:
+     --on-dark-text is the same white as the dark --text-primary it replaces.
+
+     The HOVER backdrop is NOT the bare glass: .close-button:hover also paints
+     --error-bg-faint, a translucent red, so the glyph sits on a dark red wash.
+     Every hover figure is measured against THAT wash, not the surface:
+     --on-dark-error-text reads 5.18:1 dark / 5.39:1 light, clearing AA for
+     this 11px glyph, against 2.12:1 for the light --error-text it replaces. It
+     is deliberately a shade lighter than the dark --error-text, which lands at
+     4.49:1 on the wash and misses the 4.5 bar — so this is the one hover pixel
+     that changes in dark theme, and it changes to clear AA. The exact wash
+     values and the full derivation live with the token in global.css.
+
+     The .close-button BACKGROUNDS are left alone — --glass-bg-hover and
+     --error-bg-faint are translucent white/red in BOTH themes and read
+     correctly on dark. */
+  color: var(--on-dark-text);
+}
+
+.reactions-close-badge:hover {
+  color: var(--on-dark-error-text);
 }
 
 /* issue 1884: enlarge the touch/click target of the 24px visual badge to ~44px
@@ -9177,19 +9781,19 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
    remaining legible in a 44px box. Rendered only alongside the quick-picks, so it
    never appears with nothing to reset.
 
-   NEVER A LIGHT BACKDROP: the palette paints --glass-popover-bg, which global.css
-   defines ONLY inside html[data-theme="dark"] (the block at :338-719, definition
-   at :710) with no light-theme counterpart. So the theme system never repaints
-   this surface light: in dark theme it is dark glass, and in light theme the
-   background falls back to the initial value and the control sits over the video
-   grid behind it. (That light-theme fallback is a pre-existing palette-wide gap,
-   tracked separately — not introduced here.) Either way near-black text is wrong,
-   so the colours come from the theme-INDEPENDENT --on-dark-* set (global.css
-   "Fixed dark surfaces"). The theme-aware --text-secondary / --text-primary flip
-   to near-black under html[data-theme="light"], which would wash out the rest
-   state and make HOVER the least legible state of the three — the opposite of the
-   feedback a hover exists to give. `color` is in the transition so the hover
-   change fades with the background rather than snapping. */
+   NEVER A LIGHT BACKDROP: the palette paints --glass-popover-bg, which is a
+   FIXED-DARK surface — global.css defines it once in the theme-independent
+   :root block ("Dock popover surface", issue 2091), not per theme, so it is
+   dark-navy glass under both html[data-theme="dark"] and ="light". (Before
+   issue 2091 it was dark-only and the light-theme surface was unpainted, which
+   is the gap this comment used to describe; the conclusion below was right
+   either way.) Near-black text is therefore wrong in both themes, so the
+   colours come from the theme-INDEPENDENT --on-dark-* set (global.css "Fixed
+   dark surfaces"). The theme-aware --text-secondary / --text-primary flip to
+   near-black under html[data-theme="light"], which would wash out the rest
+   state and make HOVER the least legible state of the three — the opposite of
+   the feedback a hover exists to give. `color` is in the transition so the
+   hover change fades with the background rather than snapping. */
 .reaction-option--reset {
   font-family: inherit;
   font-size: var(--fs-8);
@@ -9221,6 +9825,150 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border-top: 1px solid var(--glass-popover-border);
 }
 
+/* ===== issue 2141: emoji search field =====
+   Everything below sits on the FIXED-DARK popover surface (.reactions-palette),
+   so it uses the --on-dark-* / --glass-popover-item-* contract from global.css
+   and never the theme-aware --text-* tokens (which flip to near-black in light
+   theme and vanish here). */
+.emoji-picker__search {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+}
+
+.emoji-picker__search-input {
+  flex: 1 1 auto;
+  /* Without this a flex item refuses to shrink below its content width and the
+     360px palette overflows once a long query is typed. */
+  min-width: 0;
+  height: 36px;
+  padding: 0 10px;
+  border-radius: var(--radius-md);
+  background: var(--glass-popover-item-active-bg);
+  color: var(--on-dark-text);
+  /* 16px, NOT 14px: iOS Safari zooms the layout viewport when a control with a
+     sub-16px font takes focus, and it does not zoom back out on blur — the
+     whole meeting grid stays magnified after one search. The viewport meta's
+     `user-scalable=no` does not suppress it (WebKit has ignored that directive
+     for accessibility since iOS 10), so the font size is the only lever. */
+  font-size: 16px;
+  line-height: 1;
+  /* BOUNDARY CONTRAST (WCAG 1.4.11, >=3:1): the popover's own
+     --glass-popover-border resolves to ~1.09:1 against --glass-popover-bg —
+     fine for the decorative divider above, invisible as an input boundary. The
+     0.5-alpha white token composites against the palette surface it sits on at
+     a MEASURED 5.17:1 over a black backdrop and 4.71:1 through the glass over a
+     white one (sampled from a rendered frame, not computed), so the field is
+     unambiguously a field on either. Do NOT "soften" this back to the popover
+     border. */
+  border: 1px solid var(--on-dark-text-muted);
+  /* Suppress the UA search chrome: Safari's pill shape and Chrome's built-in
+     cancel affordance (which is not in the tab order) would sit beside our own
+     keyboard-reachable clear button. */
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.emoji-picker__search-input::-webkit-search-cancel-button,
+.emoji-picker__search-input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* --on-dark-text-secondary (0.7a), NOT -muted (0.5a). The placeholder does not
+   sit on the popover surface — it sits on the input's own
+   --glass-popover-item-active-bg wash, which is lighter, so it is a HARDER
+   backdrop than the "~5.1:1" this comment used to quote (that figure is the
+   BORDER's, measured against the surface, and was copied here where the basis
+   differs). Measured on a rendered frame: 0.5a lands 5.35:1 over a black
+   backdrop but 4.70:1 through the glass over a white one — clearing the 4.5:1
+   text floor by 4%, which is the kind of margin a later reader "softens" away.
+   0.7a measures 8.04:1 / 6.86:1 on the same two frames, and stays clearly
+   subordinate to an entered value (--on-dark-text is pure white at ~12:1), so
+   the field still reads as empty rather than filled. */
+.emoji-picker__search-input::placeholder {
+  color: var(--on-dark-text-secondary);
+  opacity: 1;
+}
+
+.emoji-picker__search-input:focus-visible {
+  outline: 2px solid var(--accent);
+  /* -3px, not -2px. At -2px the 2px ring lands flush against the field's own
+     1px --on-dark-text-muted border, and the ring measures 1.44:1 against that
+     border — it reads as a thicker border, not as a focus indicator. -3px
+     leaves a 2px gap of the input's own fill on the outside, and the ring
+     against THAT measures 3.72:1 / 3.06:1 (black / white backdrop), clearing
+     the 3:1 non-text floor on both. (The old `var(--accent, rgba(...))`
+     fallback was dead code: --accent is #007aff in the dark AND light token
+     blocks, never unset.) */
+  outline-offset: -3px;
+}
+
+.emoji-picker__search-clear {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--on-dark-text-secondary);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  transition: background 0.15s ease;
+}
+
+.emoji-picker__search-clear:hover {
+  background: var(--glass-popover-item-hover-bg);
+  color: var(--on-dark-text);
+}
+
+.emoji-picker__search-clear:focus-visible {
+  outline: 2px solid var(--accent, rgba(120, 160, 220, 0.55));
+  /* @token-exempt: var() fallback */
+  outline-offset: -2px;
+}
+
+/* Visible result count. aria-hidden in the RSX — the debounced live region
+   carries the same text for screen readers. */
+.emoji-picker__status {
+  color: var(--on-dark-text-secondary);
+  font-size: 12px;
+  line-height: 1.3;
+  text-align: center;
+}
+
+/* Zero-match state. Fills the grid outright: a blank scroll area with no
+   explanation is the bug this exists to prevent. */
+.emoji-picker__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 20px 8px;
+  text-align: center;
+}
+
+.emoji-picker__empty-title {
+  margin: 0;
+  color: var(--on-dark-text);
+  font-size: 14px;
+  /* A pasted query is elided in Rust, but a single unbroken 24-char token can
+     still overflow the 360px palette without this. */
+  overflow-wrap: anywhere;
+}
+
+.emoji-picker__empty-hint {
+  margin: 0;
+  color: var(--on-dark-text-secondary);
+  font-size: 12px;
+}
+
 .emoji-picker__tabs {
   display: flex;
   flex-wrap: wrap;
@@ -9245,12 +9993,13 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
 }
 
+/* issue 2091: fixed-dark surface — same rationale as .reaction-option above. */
 .emoji-tab:hover {
-  background: var(--settings-ghost-bg-hover);
+  background: var(--glass-popover-item-hover-bg);
 }
 
 .emoji-tab.active {
-  background: var(--settings-ghost-bg-selected);
+  background: var(--glass-popover-item-active-bg);
 }
 
 .emoji-tab:focus-visible {
@@ -9263,9 +10012,51 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));
   gap: 2px;
+  /* PINNED height (min == max), not just a cap. The palette is anchored to the
+     BOTTOM of the viewport, so it grows upward: a grid that shrinks as results
+     narrow drags the search field UP, out from under the user's caret, between
+     one keystroke and the next. Measured at 1280x720 with min-height removed: a
+     60-option grid renders 220px and a 5-option grid 40px, moving the field
+     exactly 180px; with the pin, 0px. It costs a screenful of empty cells on a
+     narrow result set and buys a field that does not move while you type. */
+  min-height: 220px;
   max-height: 220px;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+/* The grid container stays MOUNTED with zero matches (the search field's
+   `aria-controls` names its id, so unmounting it would dangle that IDREF), but
+   it must stop being a 40px-track grid or the message is laid out inside one
+   40px column.
+   COMPOUND selector, and placed AFTER `.emoji-picker__grid`, on purpose: as a
+   lone `.emoji-picker__grid--empty` this tied on specificity (0,1,0) with the
+   `display: grid` above and lost on source order, so the modifier was INERT.
+   Measured on that version at 1280x720: the empty block rendered 44px wide and
+   320px tall and the title wrapped to EIGHT lines in a 28px column. Two classes
+   = (0,2,0), which wins wherever either rule is later moved to.
+   `flex` rather than `block` because the grid's height is now PINNED at 220px:
+   a block child leaves the message stranded against the top edge with ~140px of
+   dead space under it. Centring costs nothing and reads as a deliberate state
+   rather than a truncated list. */
+.emoji-picker__grid.emoji-picker__grid--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Short viewport — a landscape phone (~390px tall), or any viewport with the
+   soft keyboard open, since `interactive-widget=resizes-content` shrinks the
+   layout viewport and re-evaluates this query. Shrink the grid so the whole
+   picker column fits inside `.reactions-palette`'s max-height and only ONE
+   scroller is in play. 520px is kept in lockstep with
+   `AUTOFOCUS_MIN_VIEWPORT_HEIGHT_PX` in `emoji_picker.rs`, which suppresses the
+   field's focus-on-open at the same point. */
+@media (max-height: 520px) {
+  .emoji-picker__grid {
+    min-height: 120px;
+    max-height: 120px;
+  }
 }
 
 /* Denser than the 44px quick-row option so a category grid fits the panel. */
@@ -9865,6 +10656,20 @@ html[data-theme="light"] .settings-panel,
 html[data-theme="light"] .settings-panel * {
   color: rgba(22, 28, 38, 0.88);
   /* @token-exempt: theme variant */
+}
+
+/* issue 1871: the Decay tooltip paints on a FIXED dark surface
+   (`--fixed-dark-strong`, rgba(30, 30, 30, 0.95)) in both themes, so it must
+   keep its on-dark text colour and opt out of the light-theme blanket above.
+
+   The blanket's `*` is why this rule is needed at all: the bubble used to be
+   `.settings-info-icon::after`, and a `*` selector never matches a
+   pseudo-element, so the old bubble was immune by accident. Promoting it to a
+   real child `<span>` — required for `aria-describedby` to reach it — walked it
+   into the blanket's blast radius, where it resolves to dark navy on near-black
+   at 1.15:1. (0,3,1) beats the blanket's (0,2,1) on the class column. */
+html[data-theme="light"] .settings-panel .speaker-highlight-help-tip {
+  color: var(--on-dark-text-secondary);
 }
 
 html[data-theme="light"] .appearance-section-helper,
@@ -11151,4 +11956,373 @@ details.diag-device {
 
 .diag-device-row-value {
   font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+   Meeting timer (issue 2136)
+   ============================================================
+
+   A host-set countdown shown to EVERY participant. Anchored bottom-left
+   rather than joining the top-centre overlay stack, deliberately: that stack
+   (.raised-hands-banner / .decode-budget-banner / .decode-paused-pill) has
+   already produced two collision bugs, and its clearance arithmetic —
+   --raised-hands-stack-next-top — assumes exactly ONE banner above the
+   followers. A third member would need a chained "next-next" variable that
+   does not exist, so this surface stays out of that contention entirely.
+
+   Bottom-LEFT is the only free bottom corner: bottom-centre at the dock
+   clearance is the decode-paused pill (and .ss-zoom-controls), and
+   bottom-right is the self-view .host tile, which widens to 35% on mobile.
+   The one thing that does claim bottom-left is a VERTICAL controls dock, so
+   the chip carries its own dock-position modifier and shifts clear below.
+
+   FIXED-DARK surface, not a theme-aware one. The chip must read identically
+   in both themes over arbitrary video content, and the --fixed-dark family
+   exists for exactly that. Its contract requires the --on-dark-* text tokens:
+   theme-aware tokens like --text-primary flip to dark in light theme and go
+   invisible on this background. */
+
+/* Bottom-centre overlay stack geometry (issue 2136).
+   ------------------------------------------------------------------
+   Declared on `#grid-container` — the common ancestor of the chip and the
+   decode-paused pill — and NOT on `.meeting-timer-chip`, because a custom
+   property set on the chip is invisible to its SIBLINGS, which are the elements
+   that have to move out of its way. Same reasoning, and same shape, as
+   `--raised-hands-stack-next-top` for the top-centre stack.
+
+   `--meeting-timer-chip-h` is EXACT, not an estimate. The chip can never wrap
+   (its two spans are a fixed-size glyph and a tabular-numeric value), so its
+   height is fully determined by its own box model: the border, the block padding,
+   and the value's line box. The border term is 4px, not 2px — the expired state
+   (the tallest) declares `border-width: 2px` and a border has TWO sides. Measured
+   in a browser against the real stylesheets: 37.5px at rest, 39.5px expired, and
+   the formula now yields the latter. The earlier 2px allowance matched the
+   at-rest chip and left the follower 2px short of its intended 16px gap whenever
+   a timer had actually expired.
+   Every input below is the SAME declaration the chip rule itself consumes, so
+   the two cannot drift the way a hardcoded follower offset would — the
+   raised-hands stack has the post-mortem for exactly that failure. */
+/* Width of a VERTICAL controls dock. Issue 2136.
+
+   THREE inputs, all mirrored from global.css:
+     * `.video-controls-container.dock-left` inline padding `0.6rem`;
+     * the `.video-control-button` size, taken at its LARGEST declared value
+       (`3.1rem`; global.css steps it to `2.75rem` at 640px and this variable
+       deliberately does NOT follow — see below); and
+     * `.video-controls-container`'s `border: 1px solid`, which `.dock-left`
+       never resets — so both sides count. Omitting it is why an earlier revision
+       of this variable read 68.8px against a real 70.8px.
+
+   WHAT THIS DOES AND DOES NOT GUARANTEE, stated plainly because the earlier
+   comment here claimed it "cannot silently drift" and that was simply false.
+   These values are COPIES of declarations in another stylesheet; CSS cannot read
+   another element's box, so nothing enforces that they stay in step. Changing the
+   dock's padding, its border, or adding a breakpoint global.css has and this
+   block does not will silently desynchronise them.
+
+   Two things keep that safe. First, the error is BIASED in the harmless
+   direction: the button term is pinned to its largest value, so where global.css
+   shrinks the button this variable OVER-estimates the dock. Over-estimating only
+   pushes the consumers further away; under-estimating is what produces the
+   overlap this exists to prevent, so the asymmetry is deliberate rather than an
+   oversight. Second, `--action-bar-dock-gap` is a full `var(--space-4)` (16px),
+   which absorbs any plausible drift in these copies many times over.
+
+   Measured in a real browser against these stylesheets: dock 70.8px, chip left
+   edge 102.8px, clearance exactly 16.0px, unchanged across 400-1280px.
+
+   Declared on `html` because both consumers are `position: fixed` and share no
+   closer ancestor.
+
+   (For the record, since a stale figure was quoted here: the hardcoded 66px this
+   replaced was 2.8px short of the padding+button sum and 4.8px short of the real
+   bordered width — not the "1.8px" previously claimed.) */
+html {
+  --action-bar-dock-btn-w: 3.1rem;
+  --action-bar-dock-w: calc(0.6rem * 2 + var(--action-bar-dock-btn-w) + 2px);
+  /* Gap between the dock and anything anchored beside it. See above: this is the
+     term that actually absorbs drift. */
+  --action-bar-dock-gap: var(--space-4);
+}
+
+
+#grid-container {
+  --meeting-timer-chip-h: calc(
+    var(--space-2) * 2 + 4px + max(18px, calc(var(--fs-6) * 1.3))
+  );
+  /* Where a follower has to start in order to clear the chip. Every follower
+     reads this ONE value, so adding another bottom-centre surface means adding
+     it to the sibling selector below — not re-deriving a number. */
+  --meeting-timer-stack-next-bottom: calc(
+    var(--controls-dock-clearance) + var(--meeting-timer-chip-h) + var(--space-4)
+  );
+}
+
+.meeting-timer-chip {
+  position: fixed;
+  /* Clears the controls dock the same way the decode-paused pill does. */
+  bottom: var(--controls-dock-clearance);
+  left: clamp(0.75rem, 2vw, 1.25rem);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  /* Below the dock (9000) and its popovers so it can never cover a control, and
+     deliberately ONE BELOW the decode-paused pill (55) rather than equal to it.
+     The two share `bottom: var(--controls-dock-clearance)` in grid mode, and at
+     equal z-index DOM order decides — the chip renders later, so it would win.
+     The pill owns a real BUTTON ("Show all") while this chip is
+     `pointer-events: none`, so a chip painted over it leaves that button
+     CLICKABLE WHILE INVISIBLE: strictly worse than hidden or visible, because a
+     user cannot recover an affordance they cannot see. That is the issue 2135
+     defect recorded above at the raised-hands stack, and it is not repeated here.
+     The stacking rule below separates the two geometrically; this ordering is
+     the fallback if that rule is ever scoped wrong. */
+  z-index: 54;
+  padding: var(--space-2) 12px;
+  background: var(--fixed-dark-heavy);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 32px var(--shadow-card-deep);
+  color: var(--on-dark-text-high);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
+    sans-serif;
+  font-size: var(--fs-4);
+  font-weight: 500;
+  line-height: 1.3;
+  /* Purely informational — never eat a click meant for a tile beneath it. */
+  pointer-events: none;
+}
+
+/* The value is tabular so the chip does not resize on every tick: with
+   proportional digits the box would jitter horizontally once a second for the
+   whole life of the timer. */
+.meeting-timer-chip-value {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  font-size: var(--fs-6);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.meeting-timer-chip-icon {
+  display: inline-flex;
+  align-items: center;
+  line-height: 0;
+  opacity: 0.8;
+}
+
+/* ── Urgency states ───────────────────────────────────────────────────────
+   Colour is a SECONDARY cue only: the countdown value itself always carries
+   the information, and the accessible name spells it out, so nothing here is
+   conveyed by colour alone (WCAG 1.4.1).
+
+   Both accent values are non-flipping members of the palette, chosen because
+   this is a fixed-dark surface in BOTH themes. Ratios below are measured
+   against THIS chip's own composite (--fixed-dark-heavy over the page beneath)
+   in each theme -- NOT copied from the tokens' own docs, which quote the
+   fixed-dark POPOVER material and are a different surface:
+     * --warning, which resolves to the same value in dark and light alike
+       (unlike --warning-text, which darkens for light backgrounds and would sit
+       at ~3.0:1 here). Measured: 8.19:1 dark / 7.51:1 light.
+     * --on-dark-error-text rather than --error, which DOES flip between themes.
+       Measured: 7.63:1 dark / 7.00:1 light; --error would be ~4.8:1 dark and
+       worse in light.
+   The modifier rules follow the base rule in source order, so they win on
+   equal specificity -- an inert modifier defeated by source order is a bug
+   this repo has shipped before. */
+
+.meeting-timer-chip--warning {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.meeting-timer-chip--critical,
+.meeting-timer-chip--expired {
+  border-color: var(--on-dark-error-text);
+  color: var(--on-dark-error-text);
+}
+
+/* Expired is the terminal state and must be unmistakable without sound: the
+   border thickens so the chip still reads as "stopped" for anyone who cannot
+   hear the expiry tone or has the tab muted. */
+.meeting-timer-chip--expired {
+  border-width: 2px;
+  font-weight: 700;
+}
+
+/* ── Dock-position clearance ──────────────────────────────────────────────
+   A bottom or right dock leaves the bottom-left corner alone, so those keep
+   the default. A LEFT dock is a vertical bar at left:16px centred on the
+   viewport; with the 12 default slots that column is roughly 915px tall, so
+   its lower edge reaches the chip's row on essentially every laptop, not just
+   a short viewport. The modifier is therefore unconditional rather than
+   wrapped in a height media query: the chip steps right by the bar's derived
+   width plus a gap. */
+
+.meeting-timer-chip--dock-left {
+  left: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap));
+}
+
+/* Mobile: the self-view tile takes 35% of the width at bottom-right and the
+   dock shrinks, so the chip only needs to tighten its own padding. It stays
+   bottom-left, which is still clear. */
+/* 567px, NOT the 639px this block originally used. The chip anchors to
+   `--controls-dock-clearance` and to the dock's own width, and the dock/grid
+   breakpoint is `vw < 568.0` — over integer viewport widths that is exactly
+   `max-width: 567px`, so the chip now shrinks on the same widths its anchor
+   does rather than 72px earlier.
+
+   STATED CONSEQUENCE, because this was originally a silent rider: between 568
+   and 639px the chip keeps DESKTOP padding and font size where it previously
+   shrank. That is the intended direction — at those widths the dock and grid are
+   still in their desktop geometry, so a shrunken chip beside a full-size dock was
+   the inconsistency, not the fix. */
+@media (max-width: 567px) {
+  /* The chip's block padding and value font-size both shrink here, so the
+     derived height has to shrink with them — otherwise the pill would clear a
+     chip taller than the one actually on screen and leave a visible gap.
+     Mirrors the desktop formula with this block's own values. */
+  #grid-container {
+    --meeting-timer-chip-h: calc(6px * 2 + 4px + max(18px, calc(var(--fs-5) * 1.3)));
+  }
+
+  .meeting-timer-chip {
+    padding: 6px 10px;
+    font-size: var(--fs-3);
+    gap: 6px;
+  }
+
+  .meeting-timer-chip-value {
+    font-size: var(--fs-5);
+  }
+}
+
+/* The decode-paused pill shares the chip's row in GRID mode: both sit at
+   `bottom: var(--controls-dock-clearance)`, the pill centred at up to 420px wide
+   and the chip anchored left. They overlap below roughly a 446px viewport — i.e.
+   every phone in portrait, which is exactly where the decode budget bites
+   hardest — so the pill moves up to clear the chip.
+
+   `:has()` rather than a sibling combinator because the pill is rendered BEFORE
+   the chip in `#grid-container` (the chip is mounted last so it shifts no
+   `nth-child` index), and `~` only looks forward. The chip is self-gating, so
+   this matches only while a timer is actually on screen and the pill keeps its
+   own position at every other time.
+
+   `:not(.has-screen-share)` scopes this to GRID mode: in screen-share the pill
+   is top-anchored (`top: 12px; bottom: auto`) and cannot collide with a
+   bottom-anchored chip at all. It also lifts specificity to (1 id, 3 classes)
+   above that rule's (1 id, 2 classes), so the two can never fight. */
+#grid-container:not(.has-screen-share):has(.meeting-timer-chip)
+  .decode-paused-pill {
+  bottom: var(--meeting-timer-stack-next-bottom);
+}
+
+/* ============================================================
+   Meeting timer popover (issue 2136, host only)
+   ============================================================
+
+   Painted in the fixed-dark popover material so it matches the bar it belongs
+   to in both themes.
+
+   ANCHORING FOLLOWS `.action-bar-overflow-popover`, NOT the density popover or
+   the reactions palette. Those two are bottom-centre unconditionally, which is
+   correct only while the dock is on the bottom: with a side dock they open
+   roughly 400px away from the button that was just clicked. That is a known
+   wart there and is NOT worth copying here, because this popover is where a
+   host EXTENDS A RUNNING TIMER under time pressure — the one case where a
+   long mouse trip to find the panel actually costs something.
+
+   The dock position arrives as a modifier class from the component (it reads
+   `DockPositionCtx`), because these are `position: fixed` and share no
+   positioned ancestor with the dock to anchor against. */
+
+.meeting-timer-popover {
+  position: fixed;
+  bottom: 104px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9100;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: min(360px, calc(100vw - 24px));
+  padding: 12px;
+  background: var(--glass-popover-bg);
+  border: 1px solid var(--glass-popover-border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 32px var(--shadow-card-deep);
+  color: var(--on-dark-text-high);
+}
+
+/* Side docks: open BESIDE the bar, vertically centred on it, mirroring
+   `.action-bar-overflow-popover`'s `left/right: calc(100% + 12px); top: 50%`
+   idiom in absolute terms (the dock is at `top: 50%` with a
+   `translateY(-50%)`, so centring on the viewport centres on the bar). */
+.meeting-timer-popover--dock-left {
+  left: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap));
+  right: auto;
+  bottom: auto;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.meeting-timer-popover--dock-right {
+  right: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap));
+  left: auto;
+  bottom: auto;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.meeting-timer-popover-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.meeting-timer-popover-action {
+  flex: 1 1 auto;
+  min-width: 72px;
+  /* 44px minimum touch target (WCAG 2.5.5); the presets are a row of small
+     buttons and are the most likely thing to be tapped on a phone. */
+  min-height: 44px;
+  padding: 0 12px;
+  background: transparent;
+  border: 1px solid var(--glass-popover-border);
+  border-radius: var(--radius-md);
+  color: var(--on-dark-text-high);
+  font-family: inherit;
+  font-size: var(--fs-4);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.meeting-timer-popover-action:hover {
+  background: var(--glass-popover-item-hover-bg);
+}
+
+.meeting-timer-popover-action:active {
+  background: var(--glass-popover-item-active-bg);
+}
+
+.meeting-timer-popover-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Cancel is destructive, so it takes the on-dark error text token — the same
+   one the chip's critical state uses, and for the same reason: --error flips
+   between themes and this surface does not. */
+.meeting-timer-popover-action--cancel {
+  color: var(--on-dark-error-text);
+  border-color: var(--on-dark-error-text);
+}
+
+.meeting-timer-popover-hint {
+  margin: 0;
+  color: var(--on-dark-text-secondary);
+  font-size: var(--fs-3);
+  line-height: 1.4;
 }

@@ -2,6 +2,10 @@ import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
+// The join dance lived here until issue 2135 needed the same harness for the
+// raise-hand cross-peer specs. Moved verbatim to helpers/two-user-meeting.ts so
+// there is ONE implementation rather than two that drift.
+import { enterTwoUserMeeting, joinMeetingFromPage } from "../helpers/two-user-meeting";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 
@@ -20,10 +24,20 @@ async function createAuthenticatedContext(
   email: string,
   name: string,
   uiURL: string,
+  /**
+   * Extra `newContext` options. Only consumer so far is the issue-2141 touch
+   * spec, which needs `hasTouch: true` — that is what makes Chromium report
+   * `(pointer: coarse)`, and it can only be set at context creation, not with
+   * `setViewportSize` after the fact. Verified empirically before the spec was
+   * written: default context is `pointer: fine`, `hasTouch: true` flips it to
+   * `pointer: coarse` / `pointer: fine == false` at the SAME 1280x720 viewport.
+   */
+  extraOptions: Parameters<typeof browser.newContext>[0] = {},
 ) {
   const context = await browser.newContext({
     baseURL: uiURL,
     ignoreHTTPSErrors: true,
+    ...extraOptions,
   });
   const token = generateSessionToken(email, name);
   const url = new URL(uiURL);
@@ -39,112 +53,6 @@ async function createAuthenticatedContext(
     },
   ]);
   return context;
-}
-
-/**
- * From the meeting page, wait for the meeting UI to load and click through
- * "Start Meeting" / "Join Meeting" to enter the grid.
- *
- * The meeting page auto-joins the API when navigated to with a username
- * already set (from the home page). Users who lack a username see an inline
- * display name prompt on the meeting page itself.
- *
- * The auto-join shows a brief "Joining as [name]..." spinner while the API
- * call is in flight. Once the API responds the UI transitions to one of:
- *   - "Ready to join?" with Start/Join Meeting button (admitted)
- *   - "Waiting to be admitted" (waiting room)
- *   - "Waiting for meeting to start" (host hasn't started yet)
- *
- * Auth dropdown (user name/email, sign-out) is only shown on the home
- * page -- it no longer appears on this pre-meeting screen.
- */
-async function joinMeetingFromPage(
-  page: Page,
-): Promise<"in-meeting" | "waiting" | "waiting-for-meeting"> {
-  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-  const waitingRoom = page.getByText("Waiting to be admitted");
-  const waitingForMeeting = page.getByText("Waiting for meeting to start");
-  const grid = page.locator("#grid-container");
-
-  const result = await Promise.race([
-    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
-    waitingRoom.waitFor({ timeout: 30_000 }).then(() => "waiting" as const),
-    waitingForMeeting.waitFor({ timeout: 30_000 }).then(() => "waiting-for-meeting" as const),
-    grid.waitFor({ timeout: 30_000 }).then(() => "auto-joined" as const),
-  ]);
-
-  if (result === "waiting") {
-    return "waiting";
-  }
-
-  if (result === "waiting-for-meeting") {
-    return "waiting-for-meeting";
-  }
-
-  if (result === "auto-joined") {
-    return "in-meeting";
-  }
-
-  await page.waitForTimeout(1000);
-  await joinButton.click();
-  await page.waitForTimeout(3000);
-
-  await expect(grid).toBeVisible({ timeout: 15_000 });
-  return "in-meeting";
-}
-
-/**
- * Drive the full two-user join dance (host starts, guest joins + is admitted)
- * and resolve once BOTH participants see the grid and each other's peer canvas.
- * Extracted so the reaction specs below can reuse the exact harness the
- * existing @bvt1 test proves, without a new fixture (issue 1884).
- */
-async function enterTwoUserMeeting(
-  hostPage: Page,
-  guestPage: Page,
-  meetingId: string,
-): Promise<void> {
-  await fillAndSubmitJoinForm(hostPage, meetingId, "HostUser");
-  await hostPage.waitForTimeout(1500);
-  const hostResult = await joinMeetingFromPage(hostPage);
-  expect(hostResult).toBe("in-meeting");
-
-  await fillAndSubmitJoinForm(guestPage, meetingId, "GuestUser");
-  await guestPage.waitForTimeout(1500);
-  const guestResult = await joinMeetingFromPage(guestPage);
-
-  if (guestResult === "waiting") {
-    const admitButton = hostPage.getByTitle("Admit").first();
-    await expect(admitButton).toBeVisible({ timeout: 20_000 });
-    await hostPage.waitForTimeout(1000);
-    await admitButton.dispatchEvent("click");
-    await hostPage.waitForTimeout(3000);
-
-    const guestJoinButton = guestPage.getByRole("button", {
-      name: /Join Meeting|Start Meeting/,
-    });
-    const guestGrid = guestPage.locator("#grid-container");
-    const postAdmit = await Promise.race([
-      guestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),
-      guestGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
-    ]);
-    if (postAdmit === "join-button") {
-      await guestPage.waitForTimeout(1000);
-      await guestJoinButton.click();
-      await guestPage.waitForTimeout(3000);
-      await expect(guestGrid).toBeVisible({ timeout: 15_000 });
-    }
-  }
-
-  await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-  await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-  // Peer connectivity established (reactions ride the same media fan-out).
-  await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
-    timeout: 30_000,
-  });
-  await expect(guestPage.locator("#grid-container .canvas-container").first()).toBeVisible({
-    timeout: 30_000,
-  });
 }
 
 /**
@@ -197,8 +105,15 @@ async function hostInMeeting(
   browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
   uiURL: string,
   meetingId: string,
+  extraContextOptions: Parameters<typeof browser.newContext>[0] = {},
 ): Promise<Page> {
-  const ctx = await createAuthenticatedContext(browser, "host@videocall.rs", "HostUser", uiURL);
+  const ctx = await createAuthenticatedContext(
+    browser,
+    "host@videocall.rs",
+    "HostUser",
+    uiURL,
+    extraContextOptions,
+  );
   const page = await ctx.newPage();
   await fillAndSubmitJoinForm(page, meetingId, "HostUser");
   await page.waitForTimeout(1500);
@@ -755,10 +670,13 @@ test.describe("Two users in a meeting", () => {
     // `reactions-reset-recents` locator never becomes visible and the test stops
     // at that expect, before it ever presses Enter.
     //
-    // Runs in LIGHT theme throughout. The palette paints --glass-popover-bg, which
-    // global.css defines only under html[data-theme="dark"], so the theme system
-    // never gives this surface a light background — light theme is exactly where a
-    // theme-flipping colour token would wash the reset glyph out. Setting the theme
+    // Runs in LIGHT theme throughout. The palette paints --glass-popover-bg, a
+    // FIXED-DARK surface: issue 2091 moved it into global.css's theme-independent
+    // :root block, so it stays dark-navy glass under html[data-theme="light"]
+    // too. (Before that it was defined only under html[data-theme="dark"] and the
+    // light surface went unpainted — a different mechanism, same conclusion.)
+    // Either way light theme is exactly where a theme-flipping colour token would
+    // wash the reset glyph out. Setting the theme
     // first (before the palette opens) means every leg below exercises the risky
     // theme, and the luminance assertions catch a regression to
     // --text-secondary/--text-primary (~99 / ~26) against the fixed white (255).
@@ -821,6 +739,33 @@ test.describe("Two users in a meeting", () => {
       await reset.hover();
       const hoverColor = await reset.evaluate((el) => getComputedStyle(el).color);
       expect(luminance(hoverColor)).toBeGreaterThan(LIGHT_LUMINANCE_FLOOR);
+
+      // WAIT OUT THE PALETTE'S OWN AUTO-FOCUS BEFORE TOUCHING THE KEYBOARD.
+      // Opening the palette arms a deferred focus jump: a `use_effect` on
+      // `reactions_open` (attendants.rs) schedules
+      // `Timeout::new(100, focus_element_by_id("reaction-opt-thumbs_up"))` so a
+      // keyboard user lands inside the menu. 100ms is wall-clock from the OPEN
+      // click, and on a loaded runner the wasm main thread stalls long enough
+      // for it to land SECONDS later — in the middle of the Tab sequence below,
+      // yanking focus back to the first option.
+      //
+      // That is exactly how this spec failed on PR #2125's `Playwright bvt1`:
+      // "expected reactions-reset-recents, received reaction-recent-0" (the
+      // jump landed between two Tabs, so the next Tab stepped off thumbs_up
+      // instead of off recent-1) and "expected emoji-picker-open, received
+      // reaction-option-thumbs_up" (it landed after the Enter, stomping the
+      // reset control's focus handoff). Reproduced deliberately with a
+      // throwaway probe that ran the leg with no settling wait:
+      // `thumbs_up -> recent-0 -> recent-1 -> reactions-reset-recents ->
+      // reaction-option-thumbs_up`, the last hop being the timer arriving late.
+      //
+      // Polling for the jump instead of assuming it has landed closes the race
+      // AND pins the auto-focus-on-open behaviour, which nothing else asserted.
+      // No assertion below is relaxed by this — the Tab order and the focus
+      // handoff are checked exactly as before.
+      await expect
+        .poll(() => activeTestId(page), { timeout: 10_000 })
+        .toBe("reaction-option-thumbs_up");
 
       // KEYBOARD LEG: the documented Tab order (attendants.rs) runs
       // highlighted-reaction -> recents -> reset -> More emoji. The ten
@@ -1074,6 +1019,360 @@ test.describe("Two users in a meeting", () => {
       // Escape-close bumped the generation, so the stale timer no-ops.
       await hostPage.waitForTimeout(6500);
       await expect(palette).toBeVisible();
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  // ── issue 2141: emoji SEARCH inside the picker ──
+  // All four are palette-only (no peer needed) except where a send is asserted,
+  // which the sender's own local echo covers — so a single host in the grid is
+  // enough, matching the persistence specs above.
+
+  /** Open the picker and return its search input, waiting for the auto-focus. */
+  async function openEmojiSearch(page: Page) {
+    await openEmojiPicker(page);
+    const input = page.locator('[data-testid="emoji-search-input"]');
+    await expect(input).toBeVisible({ timeout: 5000 });
+    // The field focuses itself on mount. Poll rather than assert once: the
+    // palette ALSO arms a 100ms focus jump to `reaction-opt-thumbs_up` when it
+    // opens, and on a loaded runner that timer can land late (the exact race
+    // that broke this file's Tab-order spec on PR #2125). Waiting for the field
+    // to hold focus proves the guard added in attendants.rs actually kept it.
+    await expect(input).toBeFocused({ timeout: 10_000 });
+    return input;
+  }
+
+  test("emoji search filters the grid, caps broad queries, and announces the count @bvt1", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_emoji_search_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const page = await hostInMeeting(browser1, uiURL, meetingId);
+      const input = await openEmojiSearch(page);
+      const options = page.locator('[data-testid="emoji-picker-grid"] button');
+      const statusText = page.locator('[data-testid="emoji-search-status-text"]');
+      const live = page.locator('[data-testid="emoji-search-live"]');
+
+      // A real accessible name and the right control type. `type="search"`
+      // carries the implicit `searchbox` role — an explicit role attribute here
+      // would be redundant, so assert there is none rather than assert a value.
+      await expect(input).toHaveAttribute("type", "search");
+      await expect(input).toHaveAttribute("aria-label", "Search emoji by name or shortcode");
+      await expect(input).toHaveAttribute("aria-controls", "emoji-picker-grid");
+      await expect(input).not.toHaveAttribute("role", /.*/);
+      // NO aria-describedby. It used to name the live region below, which is a
+      // documented anti-pattern — a role=status node dual-purposed as an
+      // accessible DESCRIPTION is re-read in full (and stale) by NVDA/JAWS on
+      // every refocus, double-announces on the tick the region fires, and is
+      // EMPTY at mount, which is the one moment focus lands in the field. The
+      // count reaches screen readers through the live region instead.
+      await expect(input).not.toHaveAttribute("aria-describedby", /.*/);
+      // Soft-keyboard affordance for the touch devices whose autofocus the
+      // picker now suppresses.
+      await expect(input).toHaveAttribute("enterkeyhint", "search");
+      // The live region must not contradict itself (#2135: role=status +
+      // aria-live=off silences the region it claims to announce).
+      await expect(live).toHaveAttribute("role", "status");
+      await expect(live).toHaveAttribute("aria-live", "polite");
+
+      const unfiltered = await options.count();
+      expect(unfiltered).toBeGreaterThan(60);
+
+      // NARROW QUERY. Typed key-by-key so the debounce is exercised the way a
+      // human exercises it, and so a per-keystroke announcement would show up.
+      await page.evaluate(() => {
+        const el = document.querySelector('[data-testid="emoji-search-live"]');
+        (window as Window & { __liveWrites?: string[] }).__liveWrites = [];
+        if (!el) return;
+        new MutationObserver(() => {
+          (window as Window & { __liveWrites?: string[] }).__liveWrites?.push(el.textContent || "");
+        }).observe(el, { childList: true, characterData: true, subtree: true });
+      });
+      await input.pressSequentially("smile", { delay: 60 });
+
+      // ANCHOR ON THE ANNOUNCEMENT, which NAMES the query — it is the only DOM
+      // state that can belong to the finished word. Latching on "the grid got
+      // smaller" would accept a mid-word render: "smil" alone matches 19 emoji
+      // against "smile"'s 6, so every count-derived assertion below would then be
+      // measured against a query the user never finished typing.
+      await expect(live).toHaveText(/^\d+ emoji found for smile$/, { timeout: 10_000 });
+
+      // Filtered, non-empty, and strictly smaller than the unfiltered category.
+      const narrow = await options.count();
+      expect(narrow).toBeGreaterThan(0);
+      expect(narrow).toBeLessThan(unfiltered);
+      await expect(statusText).toHaveText(new RegExp(`^${narrow} emoji$`));
+      await expect(live).toHaveText(new RegExp(`^${narrow} emoji found for smile$`));
+
+      // FEWER WRITES THAN KEYSTROKES — the whole point of the debounce. Not
+      // pinned to exactly one: the timer restarts per keystroke, so a runner that
+      // stalls past the 350ms window mid-word legitimately flushes an extra
+      // utterance. An un-debounced build writes once per `input` event (five), so
+      // "< 5" still fails on it — and nothing else can inflate the count, because
+      // the live region is an isolated memoized child whose text node Dioxus
+      // rewrites only when the announcement string actually changes.
+      await page.waitForTimeout(700);
+      const writes = await page.evaluate(
+        () => (window as Window & { __liveWrites?: string[] }).__liveWrites || [],
+      );
+      expect(writes.length).toBeGreaterThanOrEqual(1);
+      expect(writes.length).toBeLessThan(5);
+
+      // BROAD QUERY: the cap is the issue-2141 invariant. "a" matches over a
+      // thousand emoji; the grid must still mount exactly 60, and the user must
+      // be TOLD the list was truncated rather than shown a silent slice.
+      await input.fill("a");
+      await expect.poll(async () => await options.count(), { timeout: 5000 }).toBe(60);
+      await expect(statusText).toHaveText(/^Showing first 60 of \d+ — refine your search$/);
+      const shownTotal = await statusText.textContent();
+      const total = Number(/of (\d+)/.exec(shownTotal || "")?.[1]);
+      expect(total).toBeGreaterThan(60);
+      await expect(live).toHaveText(
+        new RegExp(`^${total} emoji found for a, showing the first 60$`),
+        { timeout: 5000 },
+      );
+
+      // ZERO MATCHES: an explicit empty state, not a blank scroll area.
+      await input.fill("zzqqxx");
+      const empty = page.locator('[data-testid="emoji-search-empty"]');
+      await expect(empty).toBeVisible({ timeout: 5000 });
+      await expect(empty).toContainText("zzqqxx");
+      // The grid CONTAINER survives (the field's aria-controls names its id, so
+      // unmounting it would dangle that IDREF) but holds no options.
+      const gridEl = page.locator('[data-testid="emoji-picker-grid"]');
+      await expect(gridEl).toHaveCount(1);
+      await expect(options).toHaveCount(0);
+      await expect(page.locator("#emoji-picker-grid")).toHaveCount(1);
+
+      // ...and it must stop BEING a grid. `visible` + `contains text` is
+      // satisfied by a 40px sliver, which is exactly what shipped: the
+      // `--empty` modifier was a lone class, tied with `.emoji-picker__grid` on
+      // specificity (0,1,0), and lost on source order — so the container kept
+      // its `repeat(auto-fill, minmax(40px, 1fr))` tracks and the message was
+      // laid out inside ONE column (measured: 44px wide, 320px tall, title
+      // wrapped over eight lines in a 28px column). Both assertions below fail
+      // on that build and pass on the compound-selector fix.
+      await expect(gridEl).not.toHaveCSS("display", "grid");
+      const emptyBox = await empty.boundingBox();
+      const gridBox = await gridEl.boundingBox();
+      expect(emptyBox).not.toBeNull();
+      expect(gridBox).not.toBeNull();
+      expect(emptyBox!.width).toBeGreaterThan(gridBox!.width * 0.6);
+      await expect(live).toHaveText("No emoji found for zzqqxx", { timeout: 5000 });
+
+      // The clear control restores the unfiltered category grid and hands focus
+      // back to the field (it unmounts itself on click).
+      await page.locator('[data-testid="emoji-search-clear"]').click();
+      await expect.poll(async () => await options.count(), { timeout: 5000 }).toBe(unfiltered);
+      await expect(input).toBeFocused();
+      await expect(statusText).toHaveCount(0);
+      await expect(live).toHaveText("");
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  test("the search field does not steal focus on a touch-primary device @bvt1", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_emoji_search_touch_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      // `hasTouch` is the whole point: it is what makes Chromium report
+      // `(pointer: coarse)`, which is the signal the autofocus gate reads. The
+      // viewport is left at the default 1280x720 ON PURPOSE, so this test
+      // isolates the POINTER veto — a spec that also shrank the viewport would
+      // pass even if the pointer branch were deleted.
+      const page = await hostInMeeting(browser1, uiURL, meetingId, { hasTouch: true });
+      expect(
+        await page.evaluate(() => matchMedia("(pointer: coarse)").matches),
+        "premise: the emulated context must present a coarse primary pointer",
+      ).toBe(true);
+
+      await openEmojiPicker(page);
+      const input = page.locator('[data-testid="emoji-search-input"]');
+      await expect(input).toBeVisible({ timeout: 5000 });
+
+      // On touch, focusing the field raises the soft keyboard over a
+      // `position: fixed; bottom: 104px` palette — so the picker must open
+      // BROWSABLE, not with a keyboard covering it. Settle past the palette's
+      // own 100ms focus timer before judging, then confirm focus never landed
+      // in the field.
+      await page.waitForTimeout(600);
+      await expect(input).not.toBeFocused();
+
+      // ...and the field is still fully usable when the user actually asks for
+      // it. Suppressing autofocus must not suppress the field.
+      await input.click();
+      await expect(input).toBeFocused();
+      await input.fill("rocket");
+      await expect(page.locator('[data-testid="emoji-option-0"]')).toHaveAttribute(
+        "aria-label",
+        "React with rocket",
+        { timeout: 10_000 },
+      );
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  test("Escape peels one layer at a time: results, then query, then palette @bvt1", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_emoji_search_esc_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const page = await hostInMeeting(browser1, uiURL, meetingId);
+      const palette = page.locator('[data-testid="reactions-palette"]');
+      const input = await openEmojiSearch(page);
+
+      await input.fill("smile");
+      await expect(input).toHaveValue("smile");
+      // The clear control renders ONLY while the query signal is non-empty, so
+      // its appearance is the proof that the typed value reached Dioxus. Escape's
+      // tiering branches on that signal (`query.peek()`), not on the DOM value
+      // `fill` just wrote: pressing before the round-trip lands would take the
+      // "already empty" branch and close the whole palette.
+      await expect(page.locator('[data-testid="emoji-search-clear"]')).toBeVisible({
+        timeout: 5000,
+      });
+
+      // TIER 1 — from inside the RESULTS. Enter moves focus to the top result;
+      // Escape there must climb back to the field, keeping BOTH the palette and
+      // the typed query. Before the review fix this Escape bubbled straight to
+      // #main-container and tore the whole palette down, which contradicted the
+      // picker's own "peels EXACTLY ONE surface" comment.
+      const firstResult = page.locator('[data-testid="emoji-option-0"]');
+      await expect(firstResult).toBeVisible({ timeout: 5000 });
+      await page.keyboard.press("Enter");
+      await expect(firstResult).toBeFocused();
+      await page.keyboard.press("Escape");
+      await expect(input).toBeFocused();
+      await expect(input).toHaveValue("smile");
+      await expect(palette).toBeVisible();
+
+      // ArrowUp is the non-destructive way to make the same climb, mirroring
+      // the field's own ArrowDown-into-results.
+      await page.keyboard.press("ArrowDown");
+      await expect(firstResult).toBeFocused();
+      await page.keyboard.press("ArrowUp");
+      await expect(input).toBeFocused();
+      await expect(input).toHaveValue("smile");
+
+      // TIER 2 — from the FIELD with a query: peels the query and stays put.
+      await page.keyboard.press("Escape");
+      await expect(input).toHaveValue("");
+      await expect(palette).toBeVisible();
+      await expect(input).toBeFocused();
+
+      // TIER 3 — field now empty: bubbles to #main-container's popover chain
+      // exactly as before, closing the palette and restoring focus to the
+      // action-bar trigger.
+      await page.keyboard.press("Escape");
+      await expect(palette).toBeHidden({ timeout: 3000 });
+      await expect(page.locator('[data-testid="reactions-button"]')).toBeFocused();
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  test("category tabs report no selection while searching, and picking one leaves search @bvt1", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_emoji_search_tabs_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const page = await hostInMeeting(browser1, uiURL, meetingId);
+      const input = await openEmojiSearch(page);
+      const tabs = page.locator('[data-testid^="emoji-group-"]');
+      const smileys = page.locator('[data-testid="emoji-group-smileys-and-emotion"]');
+      const flags = page.locator('[data-testid="emoji-group-flags"]');
+
+      await expect(tabs).toHaveCount(9);
+      await expect(smileys).toHaveAttribute("aria-pressed", "true");
+
+      // While a query is active the grid shows RESULTS, not a category — so no
+      // tab may claim to be pressed. An `aria-pressed="true"` on a category that
+      // is not on screen is the inverted-state defect of #2123/#2135.
+      await input.fill("smile");
+      await expect(page.locator('[data-testid="emoji-search-status-text"]')).toBeVisible({
+        timeout: 5000,
+      });
+      const pressedWhileSearching = await tabs.evaluateAll((els) =>
+        els.map((el) => el.getAttribute("aria-pressed")),
+      );
+      expect(pressedWhileSearching).toEqual(new Array(9).fill("false"));
+      // The visual state must agree with the ARIA state, not drift from it.
+      const activeClassWhileSearching = await tabs.evaluateAll(
+        (els) => els.filter((el) => el.classList.contains("active")).length,
+      );
+      expect(activeClassWhileSearching).toBe(0);
+
+      // Clicking a category is the way OUT of search: the query clears and that
+      // category — the one the user actually pressed — is what renders.
+      await flags.click();
+      await expect(input).toHaveValue("");
+      await expect(flags).toHaveAttribute("aria-pressed", "true");
+      await expect(smileys).toHaveAttribute("aria-pressed", "false");
+      await expect(page.locator('[data-testid="emoji-search-status-text"]')).toHaveCount(0);
+      await expect(page.locator('[data-testid="emoji-picker-grid"]')).toHaveAttribute(
+        "aria-label",
+        "Flags emoji",
+      );
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  test("Enter moves into the results without sending; the result then sends @bvt1", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_emoji_search_enter_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const page = await hostInMeeting(browser1, uiURL, meetingId);
+      const input = await openEmojiSearch(page);
+
+      // Typing must not disturb the field: if the mount-time focus call re-fired
+      // on re-render, the caret/value would be clobbered mid-word.
+      await input.pressSequentially("rocket", { delay: 40 });
+      await expect(input).toHaveValue("rocket");
+      await expect(input).toBeFocused();
+
+      const first = page.locator('[data-testid="emoji-option-0"]');
+      await expect(first).toBeVisible({ timeout: 5000 });
+      // `emoji-option-0` exists in the CATEGORY grid too, so pin the label of
+      // THIS query's top hit ("rocket" is an exact name+shortcode match, and the
+      // only one in the table). That is what proves the results grid — not the
+      // pre-search category still on screen — is what Enter moves into; without
+      // it a late re-render could swap the button out from under the focus and
+      // the send below.
+      await expect(first).toHaveAttribute("aria-label", "React with rocket", {
+        timeout: 10_000,
+      });
+
+      // Enter FOCUSES the top result rather than sending it — activating a
+      // reaction broadcasts to every attendee, so a reflexive Enter after typing
+      // must not become an accidental all-hands emoji.
+      await page.keyboard.press("Enter");
+      await expect(first).toBeFocused();
+      await expect(page.locator('[data-testid="reaction-float"]')).toHaveCount(0);
+
+      // A SECOND Enter, now on the button, does send it — and the glyph that
+      // floats is the one the search result showed.
+      const glyph = ((await first.locator(".reaction-option__emoji").textContent()) || "").trim();
+      expect(glyph.length).toBeGreaterThan(0);
+      await page.keyboard.press("Enter");
+      await expect(
+        page.locator('[data-testid="reaction-float"]').filter({ hasText: glyph }).first(),
+      ).toBeVisible({ timeout: 10_000 });
     } finally {
       await browser1.close();
     }

@@ -37,6 +37,11 @@ struct SessionInfo {
     // #1561: (peer_session_id, media_kind) pairs we have published RECEIVED_LAYER for.
     // Diffed each packet to remove stale series when a constraint clears.
     received_layer_peers: HashSet<(String, String)>,
+    // Issue 2047: [direction, stream, from_tier, to_tier, trigger] tuples we have
+    // published TIER_TRANSITIONS_TOTAL for, so the session's series can be reaped
+    // on departure. Bounded by the label allowlist, so this set cannot grow with
+    // attacker-supplied strings.
+    tier_transition_labels: HashSet<[String; 5]>,
 }
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
@@ -61,13 +66,15 @@ use sec_api::metrics::{
     KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
     NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
-    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
-    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER, RTT_PROBE_DROPPED_TOTAL,
-    RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
-    SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS, SCREEN_VIDEO_PLAYOUT_LATENCY_MS,
-    SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS, SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS,
-    SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_TOTAL, UNISTREAM_BYTES_DRAINED_TOTAL, UNISTREAM_BYTES_OFFERED_TOTAL,
+    NETEQ_TARGET_DELAY_MS, NON_FINITE_SAMPLES_DROPPED_TOTAL, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
+    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER,
+    RTT_PROBE_DROPPED_TOTAL, RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_ENCODER_MAX_STALL_GAP_MS,
+    SCREEN_ENCODER_OUTPUT_FPS, SCREEN_ENCODER_STALL_EPISODES, SCREEN_SHARING_ACTIVE,
+    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS,
+    SCREEN_VIDEO_PLAYOUT_LATENCY_MS, SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS,
+    SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS, SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL, SELF_AUDIO_ENABLED,
+    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_DROPPED_TOTAL, TIER_TRANSITIONS_TOTAL,
+    UNISTREAM_BYTES_DRAINED_TOTAL, UNISTREAM_BYTES_OFFERED_TOTAL,
     UNISTREAM_STALE_DELTA_DROPS_TOTAL, VIDEOCALL_PEER_INFO, VIDEO_BITRATE_KBPS,
     VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS,
     VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE,
@@ -290,6 +297,14 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = ADAPTIVE_SCREEN_TIER.remove_label_values(&reporter_labels);
     let _ = SCREEN_SHARING_ACTIVE.remove_label_values(&reporter_labels);
     let _ = ENCODER_OUTPUT_FPS.remove_label_values(&reporter_labels);
+    // #2147: same per-reporter GC as its camera sibling, so the high-cardinality
+    // session_id label leaves no residual series on disconnect. Load-bearing here
+    // specifically because this gauge legitimately reports 0: without GC a
+    // disconnected publisher's last reading would persist and read as a live
+    // screen encoder producing nothing.
+    let _ = SCREEN_ENCODER_OUTPUT_FPS.remove_label_values(&reporter_labels);
+    let _ = SCREEN_ENCODER_STALL_EPISODES.remove_label_values(&reporter_labels);
+    let _ = SCREEN_ENCODER_MAX_STALL_GAP_MS.remove_label_values(&reporter_labels);
     let _ = ENCODER_TARGET_BITRATE_KBPS.remove_label_values(&reporter_labels);
     let _ = DECODE_BUDGET_EFFECTIVE_CAP.remove_label_values(&reporter_labels);
     let _ = DECODE_BUDGET_NATURAL.remove_label_values(&reporter_labels);
@@ -402,6 +417,25 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         let _ = PEER_CONNECTIONS_TOTAL.remove_label_values(&[&session_info.meeting_id, peer_id]);
     }
 
+    // Issue 2047: reap this session's TIER_TRANSITIONS_TOTAL series. Iterating
+    // the tuples actually published (rather than the cartesian product of the
+    // five bounded taxonomies, ~2k combinations) keeps departure O(emitted).
+    // Without this the counter never shed a departed session and grew for the
+    // process lifetime — the third multiplier in the issue-2047 finding.
+    for labels in &session_info.tier_transition_labels {
+        let [direction, stream, from_tier, to_tier, trigger] = labels;
+        let _ = TIER_TRANSITIONS_TOTAL.remove_label_values(&[
+            &session_info.meeting_id,
+            &session_info.session_id,
+            &session_info.reporting_user_id,
+            direction,
+            stream,
+            from_tier,
+            to_tier,
+            trigger,
+        ]);
+    }
+
     // Remove all to_peer series we set for this session
     for to_peer in &session_info.to_peers {
         remove_per_peer_metrics(
@@ -511,11 +545,201 @@ fn remove_per_peer_metrics(
     // of truth.
 }
 
+/// Bounded taxonomy for the client-supplied `active_server_type` label
+/// (issue 2047).
+///
+/// `active_server_type` arrives verbatim from the client and is used as a
+/// Prometheus LABEL on `CLIENT_ACTIVE_SERVER` and `CLIENT_ACTIVE_SERVER_RTT_MS`,
+/// so an unbounded value mints a new series per distinct string — the same
+/// cardinality lever issue 2031 already closed for the `transport` label on
+/// `CLIENT_AUDIO_CONCEALMENT_PCT` (which publishes only for
+/// `"webtransport"`/`"websocket"`). These are the only two transports a
+/// conformant client reports (`HealthReporter` folds the elected connection's
+/// type), so anything else is a stale or forged client.
+const KNOWN_ACTIVE_SERVER_TYPES: [&str; 2] = ["webtransport", "websocket"];
+
+/// Collapse an unrecognized `active_server_type` onto a fixed label set.
+///
+/// Returns the value unchanged when it is a known transport, `""` when the
+/// client did not populate the field at all (preserving the pre-existing
+/// "blank label = unknown source" convention the RTT gauge documents), and
+/// `"unknown"` for any other string. Total label cardinality is therefore at
+/// most three values, whatever a client sends.
+fn bounded_active_server_type(raw: &str) -> &str {
+    if raw.is_empty() || KNOWN_ACTIVE_SERVER_TYPES.contains(&raw) {
+        raw
+    } else {
+        "unknown"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded taxonomy for the `TierTransition` labels (issue 2047, security)
+// ---------------------------------------------------------------------------
+//
+// `TIER_TRANSITIONS_TOTAL` is a CounterVec carrying FIVE client-authored strings
+// (`direction`, `stream`, `from_tier`, `to_tier`, `trigger`) on top of the three
+// identity labels. Before this change all five were copied verbatim, which is a
+// strictly worse cardinality lever than the `active_server_type` one above:
+//
+//   * `tier_transitions` is a REPEATED field with no server-side length cap, so
+//     a single packet under `MAX_FRAME_SIZE` could carry tens of thousands of
+//     entries (see `MAX_TIER_TRANSITIONS_PER_PACKET`);
+//   * HEALTH has no per-sender rate limiter (only KEYFRAME_REQUEST and REACTION
+//     do — `SessionLogic::keyframe_limiter` / `reaction_limiter`), so packets can
+//     be sent in a tight loop; and
+//   * the series had no cleanup path, so they persisted for the process lifetime.
+//
+// Bounding all five collapses the per-session label space from unbounded to
+// `2 x 3 x N x N x 3` where `N` is the tier-label count — a few thousand series
+// worst case instead of unbounded growth.
+//
+// SOURCE OF TRUTH: the tier LABELS are read from `videocall_aq::constants`, the
+// same arrays the client indexes when it builds a `TierTransitionRecord`
+// (`videocall-aq/src/manager.rs` stores `video_tiers[i].label`). Deriving the
+// allowlist from the shared crate instead of hardcoding a copy means a new tier
+// cannot silently start reporting as "unknown".
+//
+// The direction/stream/trigger sets below were verified against the EMITTING
+// code, not the proto comments: `TierTransitionRecord`'s `direction`, `stream`
+// and `trigger` are `&'static str` and every construction site in
+// `videocall-aq/src/manager.rs` uses one of these literals, with
+// `screen_encoder.rs` overriding `stream` to "screen" for the screen buffer.
+//
+// NOTE: the proto comment on `TierTransition.trigger`
+// (`protobuf/types/health_packet.proto`) is STALE — it lists "fps"/"bitrate",
+// which no longer appear anywhere in the emitting code; the real third value is
+// "backpressure". Trusting that comment would have made every real
+// backpressure-triggered transition collapse to "unknown".
+const KNOWN_TIER_DIRECTIONS: [&str; 2] = ["up", "down"];
+const KNOWN_TIER_STREAMS: [&str; 3] = ["video", "audio", "screen"];
+const KNOWN_TIER_TRIGGERS: [&str; 3] = ["backpressure", "congestion", "coordination"];
+
+/// Placeholder every out-of-taxonomy `TierTransition` label collapses onto.
+const UNKNOWN_LABEL: &str = "unknown";
+
+/// Maximum `tier_transitions` entries ingested from ONE health packet.
+///
+/// The allowlist above bounds how many distinct SERIES a client can create; this
+/// bounds the per-packet WORK (label lookup + `.inc()` under the registry lock),
+/// which the allowlist does not. Without it, one ~4 MB frame
+/// (`MAX_FRAME_SIZE`) of minimal `TierTransition` messages is ~50k label
+/// operations per packet, repeatable in a loop.
+///
+/// 64 is ~8x the legitimate worst case. A client drains its transition buffers
+/// once per health packet (default interval 5000 ms — `VideoCallClientOptions::
+/// health_reporting_interval_ms`, the only configured value in the UI) from TWO
+/// `AdaptiveQualityManager` buffers (camera + screen), and each manager gates
+/// transitions behind `MIN_TIER_TRANSITION_INTERVAL_MS` (1500 ms) — so ~3 per
+/// stream, ~6-8 total per packet. The headroom absorbs a reconfigured interval up
+/// to ~48s without dropping real events.
+const MAX_TIER_TRANSITIONS_PER_PACKET: usize = 64;
+
+/// Collapse a client-supplied `TierTransition` label onto its fixed taxonomy,
+/// returning [`UNKNOWN_LABEL`] for anything outside it.
+fn bounded_tier_label<'a>(raw: &'a str, allowed: &[&str]) -> &'a str {
+    if allowed.contains(&raw) {
+        raw
+    } else {
+        UNKNOWN_LABEL
+    }
+}
+
+/// Is `raw` a tier label defined by the shared adaptive-quality constants?
+///
+/// Checks the video, screen and audio tier arrays — the three the client can
+/// index when recording a transition.
+fn is_known_tier_name(raw: &str) -> bool {
+    use videocall_aq::constants::{AUDIO_QUALITY_TIERS, SCREEN_QUALITY_TIERS, VIDEO_QUALITY_TIERS};
+    VIDEO_QUALITY_TIERS.iter().any(|t| t.label == raw)
+        || SCREEN_QUALITY_TIERS.iter().any(|t| t.label == raw)
+        || AUDIO_QUALITY_TIERS.iter().any(|t| t.label == raw)
+}
+
+/// Bound a `from_tier` / `to_tier` label to the shared tier taxonomy.
+fn bounded_tier_name(raw: &str) -> &str {
+    if is_known_tier_name(raw) {
+        raw
+    } else {
+        UNKNOWN_LABEL
+    }
+}
+
+/// Guard for every CLIENT-REPORTED floating-point telemetry sample (issue 2047).
+///
+/// Prometheus gauges and histograms accept any `f64`, including `NaN` and
+/// `±Inf`. A single non-finite sample is not a one-off blemish: it POISONS every
+/// aggregate a dashboard runs over that series (an `avg()` or `sum()` spanning a
+/// `NaN` returns `NaN`) and, for a histogram, latches its `_sum` to `NaN` for the
+/// process lifetime. Client telemetry is the one input
+/// here that is entirely attacker-controlled, and several of these values are
+/// computed client-side as ratios — so `0/0` reaches the wire without anyone
+/// being malicious.
+///
+/// Non-finite samples are SKIPPED, not clamped to `0.0`: a zero would be
+/// indistinguishable from a genuine "nothing happening" reading and would drag
+/// averages down, whereas skipping leaves the gauge at its last good value and
+/// lets the normal staleness/GC path retire it.
+///
+/// Applied to every sink fed by a `double`/`float` proto field. Sinks fed by
+/// integer fields, booleans, or literal constants cannot be non-finite by
+/// construction and keep plain `.set()`.
+///
+/// This predicate is the SINGLE gate — the gauge and histogram wrappers below
+/// both route through it, so the rule and its drop accounting are defined in
+/// exactly one place.
+fn is_publishable_sample(value: f64) -> bool {
+    if value.is_finite() {
+        true
+    } else {
+        NON_FINITE_SAMPLES_DROPPED_TOTAL.inc();
+        false
+    }
+}
+
+/// `set()` a gauge only when the client-reported sample is finite
+/// ([`is_publishable_sample`]).
+trait SetFinite {
+    fn set_finite(&self, value: f64);
+}
+
+impl SetFinite for prometheus::Gauge {
+    fn set_finite(&self, value: f64) {
+        if is_publishable_sample(value) {
+            self.set(value);
+        }
+    }
+}
+
+/// `observe()` a histogram sample only when it is finite
+/// ([`is_publishable_sample`]).
+///
+/// A non-finite observation corrupts `_sum` irrecoverably: buckets are integer
+/// counts, but the sum is a running `f64` with no way back from `NaN` short of
+/// restarting the process.
+trait ObserveFinite {
+    fn observe_finite(&self, value: f64);
+}
+
+impl ObserveFinite for prometheus::Histogram {
+    fn observe_finite(&self, value: f64) {
+        if is_publishable_sample(value) {
+            self.observe(value);
+        }
+    }
+}
+
 fn process_health_packet_to_metrics_pb(
     health_packet: &PbHealthPacket,
     session_tracker: &SessionTracker,
 ) -> anyhow::Result<()> {
     HEALTH_REPORTS_TOTAL.inc();
+    // Force registration of the issue-2047 rejection counter on the first health
+    // packet. `lazy_static` registers a metric on first DEREF, and the only other
+    // deref is inside `is_publishable_sample`'s failure branch — so without this
+    // the series would be missing from /metrics entirely until the first bad
+    // sample, and a dashboard panel would read "No data" instead of 0.
+    NON_FINITE_SAMPLES_DROPPED_TOTAL.inc_by(0.0);
 
     let meeting_id = if health_packet.meeting_id.is_empty() {
         "unknown"
@@ -567,6 +791,7 @@ fn process_health_packet_to_metrics_pb(
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                tier_transition_labels: HashSet::new(),
             });
         info.last_seen = Instant::now();
         if info.display_name != reporter_display_name {
@@ -612,11 +837,15 @@ fn process_health_packet_to_metrics_pb(
         // handles the legitimate "client didn't populate type" case. The
         // CLIENT_ACTIVE_SERVER gauge below keeps its "unknown" placeholder since it still
         // requires a URL.
-        let server_type_for_rtt = health_packet.active_server_type.as_str();
-        let server_type_for_active = if health_packet.active_server_type.is_empty() {
+        //
+        // Issue 2047: both labels are bounded to a fixed taxonomy first — the raw
+        // field is a free-form client string, so publishing it verbatim let a
+        // client mint one series per distinct value.
+        let server_type_for_rtt = bounded_active_server_type(&health_packet.active_server_type);
+        let server_type_for_active = if server_type_for_rtt.is_empty() {
             "unknown"
         } else {
-            &health_packet.active_server_type
+            server_type_for_rtt
         };
 
         // Publish RTT independently of active_server_url presence. The upstream scrub
@@ -632,7 +861,7 @@ fn process_health_packet_to_metrics_pb(
                     server_url_clean,
                     server_type_for_rtt,
                 ])
-                .set(health_packet.active_server_rtt_ms);
+                .set_finite(health_packet.active_server_rtt_ms);
 
             // Track the label set used for this RTT publish so cleanup can remove it
             // later, including the scrubbed empty-URL / empty-type case.
@@ -848,13 +1077,13 @@ fn process_health_packet_to_metrics_pb(
         if let Some(rx_pps) = health_packet.packets_received_per_sec {
             CLIENT_PACKETS_RECEIVED_PER_SEC
                 .with_label_values(&reporter_labels)
-                .set(rx_pps);
+                .set_finite(rx_pps);
         }
 
         if let Some(tx_pps) = health_packet.packets_sent_per_sec {
             CLIENT_PACKETS_SENT_PER_SEC
                 .with_label_values(&reporter_labels)
-                .set(tx_pps);
+                .set_finite(tx_pps);
         }
 
         CLIENT_TAB_THROTTLED
@@ -889,19 +1118,19 @@ fn process_health_packet_to_metrics_pb(
         if let Some(gap) = health_packet.wt_datagram_read_loop_max_gap_ms {
             CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS
                 .with_label_values(&reporter_labels)
-                .set(gap);
+                .set_finite(gap);
         }
         // Queue read-back: a one-shot per-browser constant, present only once the
         // WT queue was configured (absent for a WS-only client).
         if let Some(hwm) = health_packet.wt_incoming_datagram_high_water_mark {
             WT_INCOMING_DATAGRAM_HIGH_WATER_MARK
                 .with_label_values(&reporter_labels)
-                .set(hwm);
+                .set_finite(hwm);
         }
         if let Some(max_age) = health_packet.wt_incoming_datagram_max_age_ms {
             WT_INCOMING_DATAGRAM_MAX_AGE_MS
                 .with_label_values(&reporter_labels)
-                .set(max_age);
+                .set_finite(max_age);
         }
         // Per-client mean audio concealment, SPLIT BY the reporter's active
         // transport (the ground-truth WS-vs-WT severity gap). Only exported for a
@@ -909,27 +1138,33 @@ fn process_health_packet_to_metrics_pb(
         // junk `transport=""` series.
         if let Some(concealment) = health_packet.client_audio_concealment_pct {
             let transport = health_packet.active_server_type.as_str();
-            if transport == "webtransport" || transport == "websocket" {
+            // Issue 2047: routed through the shared taxonomy rather than a
+            // duplicated string comparison, so this gate and
+            // `bounded_active_server_type` cannot drift apart.
+            if KNOWN_ACTIVE_SERVER_TYPES.contains(&transport) {
                 CLIENT_AUDIO_CONCEALMENT_PCT
                     .with_label_values(&[meeting_id, session_id, reporting_user_id, transport])
-                    .set(concealment);
+                    .set_finite(concealment);
                 // Issue 2031: a live WT<->WS switch (routine once the issue-2029
                 // fallback ships) would otherwise leave the OLD transport's series
                 // for this same identity latched at its last value until session
-                // GC, misleading the by-transport panel. Clear the sibling series
-                // so only the currently-active transport reports. Ignore the
-                // not-found error (no prior sibling series is the common case).
-                let sibling = if transport == "webtransport" {
-                    "websocket"
-                } else {
-                    "webtransport"
-                };
-                let _ = CLIENT_AUDIO_CONCEALMENT_PCT.remove_label_values(&[
-                    meeting_id,
-                    session_id,
-                    reporting_user_id,
-                    sibling,
-                ]);
+                // GC, misleading the by-transport panel. Clear every OTHER
+                // transport's series so only the currently-active one reports.
+                // Ignore the not-found error (no prior sibling series is the
+                // common case). Issue 2047: iterating the shared taxonomy instead
+                // of hardcoding the two-way pairing keeps this correct if a third
+                // transport is ever added.
+                for sibling in KNOWN_ACTIVE_SERVER_TYPES
+                    .iter()
+                    .filter(|t| **t != transport)
+                {
+                    let _ = CLIENT_AUDIO_CONCEALMENT_PCT.remove_label_values(&[
+                        meeting_id,
+                        session_id,
+                        reporting_user_id,
+                        sibling,
+                    ]);
+                }
             }
         }
         if let Some(bytes) = health_packet.unistream_bytes_offered_total {
@@ -982,7 +1217,7 @@ fn process_health_packet_to_metrics_pb(
         if let Some(queue_depth) = health_packet.encoder_p75_peer_fps {
             ENCODER_QUEUE_DEPTH
                 .with_label_values(&reporter_labels)
-                .set(queue_depth);
+                .set_finite(queue_depth);
         }
         if let Some(tier) = health_packet.adaptive_screen_tier {
             ADAPTIVE_SCREEN_TIER
@@ -1001,10 +1236,45 @@ fn process_health_packet_to_metrics_pb(
                 .with_label_values(&reporter_labels)
                 .set(fps as f64);
         }
+        // #2147: SCREEN encoder output fps. The client sends an honest 0 whenever a
+        // screen encoder is BOUND but producing nothing, and omits the field only
+        // when none is bound at all, so `if let Some` is the whole gate — do NOT add
+        // a `> 0` filter here. Adding one would reproduce the #2079 blind spot this
+        // metric exists to close (a stalled screen encoder would become
+        // indistinguishable from an absent one).
+        //
+        // A 0 therefore does NOT mean "not sharing" — the dioxus-ui client binds its
+        // screen encoder eagerly at Host mount, so it reports 0 while merely idle.
+        // Join with `videocall_screen_sharing_active` to interpret it (see the gauge
+        // declaration in metrics.rs and the proto field's own doc).
+        if let Some(fps) = health_packet.screen_encoder_output_fps {
+            SCREEN_ENCODER_OUTPUT_FPS
+                .with_label_values(&reporter_labels)
+                .set(fps as f64);
+        }
+        // #2147: the stall pair — the half fps CANNOT show. `fps > 0` with these
+        // RISING is the #1899/#2143 freeze (synthetic re-encodes keep fps nonzero
+        // while receivers sit on stale content); `fps > 0` with these flat/absent is
+        // genuinely healthy. The CLIENT gates these `> 0` at the producer
+        // (`health_reporter.rs`) because they are monotonic counters where a 0 carries
+        // no information, so an absent field here means "no stalls yet" — do NOT add a
+        // server-side `> 0` gate, the `if let Some` is the whole gate. That is
+        // deliberately the OPPOSITE convention from the fps field above, where 0 IS a
+        // real reading and must not be gated at either end.
+        if let Some(episodes) = health_packet.screen_encoder_stall_episodes {
+            SCREEN_ENCODER_STALL_EPISODES
+                .with_label_values(&reporter_labels)
+                .set(episodes as f64);
+        }
+        if let Some(gap_ms) = health_packet.screen_encoder_max_stall_gap_ms {
+            SCREEN_ENCODER_MAX_STALL_GAP_MS
+                .with_label_values(&reporter_labels)
+                .set(gap_ms as f64);
+        }
         if let Some(kbps) = health_packet.encoder_target_bitrate_kbps {
             ENCODER_TARGET_BITRATE_KBPS
                 .with_label_values(&reporter_labels)
-                .set(kbps);
+                .set_finite(kbps);
         }
         // NOTE(#1184): encoder_bitrate_ratio removed (dead telemetry).
 
@@ -1193,7 +1463,7 @@ fn process_health_packet_to_metrics_pb(
         if let Some(max_mbps) = health_packet.client_network_downlink_max {
             CLIENT_NETWORK_DOWNLINK_MAX
                 .with_label_values(&[meeting_id, session_id, reporting_user_id])
-                .set(max_mbps);
+                .set_finite(max_mbps);
         }
 
         // #1556: CPU throttle flag
@@ -1203,20 +1473,66 @@ fn process_health_packet_to_metrics_pb(
                 .set(if throttled { 1.0 } else { 0.0 });
         }
 
-        // Tier transition events (P2): increment counter for each transition
-        for t in &health_packet.tier_transitions {
+        // Tier transition events (P2): increment counter for each transition.
+        //
+        // Issue 2047 (SECURITY): all five of these labels are client-authored
+        // strings. Each is collapsed onto its fixed taxonomy first, and the
+        // vector is truncated to `MAX_TIER_TRANSITIONS_PER_PACKET`, so neither
+        // the series count nor the per-packet work is attacker-controlled.
+        // Truncation is silent-but-counted rather than a hard error: a
+        // legitimate client never reaches the cap (see the const's rationale),
+        // and rejecting the whole packet would discard the reporter's unrelated
+        // telemetry along with it.
+        let transitions = &health_packet.tier_transitions;
+        if transitions.len() > MAX_TIER_TRANSITIONS_PER_PACKET {
+            debug!(
+                "Truncating {} tier_transitions to {} for meeting={} session={}",
+                transitions.len(),
+                MAX_TIER_TRANSITIONS_PER_PACKET,
+                meeting_id,
+                session_id
+            );
+            TIER_TRANSITIONS_DROPPED_TOTAL
+                .inc_by((transitions.len() - MAX_TIER_TRANSITIONS_PER_PACKET) as f64);
+        }
+        for t in transitions.iter().take(MAX_TIER_TRANSITIONS_PER_PACKET) {
+            let direction = bounded_tier_label(&t.direction, &KNOWN_TIER_DIRECTIONS);
+            let stream = bounded_tier_label(&t.stream, &KNOWN_TIER_STREAMS);
+            let trigger = bounded_tier_label(&t.trigger, &KNOWN_TIER_TRIGGERS);
+            let from_tier = bounded_tier_name(&t.from_tier);
+            let to_tier = bounded_tier_name(&t.to_tier);
+
             TIER_TRANSITIONS_TOTAL
                 .with_label_values(&[
                     meeting_id,
                     session_id,
                     reporting_user_id,
-                    &t.direction,
-                    &t.stream,
-                    &t.from_tier,
-                    &t.to_tier,
-                    &t.trigger,
+                    direction,
+                    stream,
+                    from_tier,
+                    to_tier,
+                    trigger,
                 ])
                 .inc();
+
+            // Track the exact label tuples published so `remove_session_metrics`
+            // can reap them when the session goes away. The ~40 sibling metrics
+            // are reaped there by fixed label shape; a CounterVec with five
+            // variable labels has no fixed shape to enumerate cheaply, so this
+            // mirrors the tracked-set pattern already used for `active_servers`
+            // and `received_layer_peers` — O(tuples actually emitted), not
+            // O(cartesian product). Without it these series would outlive every
+            // session for the process lifetime (the #1092 leak class).
+            let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(info) = tracker.get_mut(&session_key) {
+                info.tier_transition_labels.insert([
+                    direction.to_string(),
+                    stream.to_string(),
+                    from_tier.to_string(),
+                    to_tier.to_string(),
+                    trigger.to_string(),
+                ]);
+            }
         }
 
         // TELEM-7: client_info gauge (static metadata)
@@ -1300,7 +1616,7 @@ fn process_health_packet_to_metrics_pb(
             if let Some(battery) = health_packet.client_battery_level {
                 BATTERY_LEVEL
                     .with_label_values(&reporter_labels)
-                    .set(battery);
+                    .set_finite(battery);
             }
         }
 
@@ -1308,14 +1624,14 @@ fn process_health_packet_to_metrics_pb(
         for dur in &health_packet.longtask_durations_ms {
             CLIENT_LONGTASK_DURATION_MS
                 .with_label_values(&[meeting_id, session_id])
-                .observe(*dur);
+                .observe_finite(*dur);
         }
 
         // TELEM-9: render FPS gauge
         if let Some(fps) = health_packet.render_fps {
             CLIENT_RENDER_FPS
                 .with_label_values(&[meeting_id, session_id])
-                .set(fps);
+                .set_finite(fps);
         }
 
         // Per-packet prune of departed peers (issue #1092).
@@ -1408,15 +1724,16 @@ fn process_health_packet_to_metrics_pb(
 
                 // NetEQ metrics
                 if let Some(neteq_stats) = peer_data.neteq_stats.as_ref() {
-                    if neteq_stats.current_buffer_size_ms != 0.0 {
-                        NETEQ_AUDIO_BUFFER_MS
-                            .with_label_values(&peer_labels)
-                            .set(neteq_stats.current_buffer_size_ms);
-                    }
+                    // These are current snapshots, so 0 is a real reading: an empty buffer,
+                    // an empty decode queue, or no packets in the latest 1s window. Publish 0
+                    // so each gauge can recover instead of latching its last positive value.
+                    NETEQ_AUDIO_BUFFER_MS
+                        .with_label_values(&peer_labels)
+                        .set_finite(neteq_stats.current_buffer_size_ms);
 
                     NETEQ_TARGET_DELAY_MS
                         .with_label_values(&peer_labels)
-                        .set(neteq_stats.target_delay_ms);
+                        .set_finite(neteq_stats.target_delay_ms);
 
                     // Audio playout latency (#1299): how far behind live this peer's audio is
                     // (NetEQ filtered playout buffer level). Set UNCONDITIONALLY so the gauge
@@ -1424,48 +1741,77 @@ fn process_health_packet_to_metrics_pb(
                     // video playout gauge below. Audio sibling of videocall_video_playout_latency_ms.
                     AUDIO_PLAYOUT_LATENCY_MS
                         .with_label_values(&peer_labels)
-                        .set(neteq_stats.playout_latency_ms);
+                        .set_finite(neteq_stats.playout_latency_ms);
 
-                    if neteq_stats.packets_awaiting_decode != 0.0 {
-                        NETEQ_PACKETS_AWAITING_DECODE
-                            .with_label_values(&peer_labels)
-                            .set(neteq_stats.packets_awaiting_decode);
-                    }
+                    NETEQ_PACKETS_AWAITING_DECODE
+                        .with_label_values(&peer_labels)
+                        .set_finite(neteq_stats.packets_awaiting_decode);
 
-                    if neteq_stats.packets_per_sec != 0.0 {
-                        NETEQ_PACKETS_PER_SEC
-                            .with_label_values(&peer_labels)
-                            .set(neteq_stats.packets_per_sec);
-                    }
+                    NETEQ_PACKETS_PER_SEC
+                        .with_label_values(&peer_labels)
+                        .set_finite(neteq_stats.packets_per_sec);
 
                     // Core NetEQ operation counters (high diagnostic value only)
                     if let Some(network) = neteq_stats.network.as_ref() {
                         if let Some(ops) = network.operation_counters.as_ref() {
                             NETEQ_NORMAL_OPS_PER_SEC
                                 .with_label_values(&peer_labels)
-                                .set(ops.normal_per_sec);
+                                .set_finite(ops.normal_per_sec);
                             NETEQ_EXPAND_OPS_PER_SEC
                                 .with_label_values(&peer_labels)
-                                .set(ops.expand_per_sec);
+                                .set_finite(ops.expand_per_sec);
                             NETEQ_ACCELERATE_OPS_PER_SEC
                                 .with_label_values(&peer_labels)
-                                .set(ops.accelerate_per_sec);
+                                .set_finite(ops.accelerate_per_sec);
                         }
                     }
                 }
 
                 // Video metrics
                 if let Some(video_stats) = peer_data.video_stats.as_ref() {
-                    if video_stats.fps_received != 0.0 {
-                        VIDEO_FPS
-                            .with_label_values(&peer_labels)
-                            .set(video_stats.fps_received);
-                    }
-                    if video_stats.bitrate_kbps != 0 {
-                        VIDEO_BITRATE_KBPS
-                            .with_label_values(&peer_labels)
-                            .set(video_stats.bitrate_kbps as f64);
-                    }
+                    // Issue 2145: fps and bitrate are set UNCONDITIONALLY, so the gauges recover
+                    // to 0 when a still-connected receiver's camera stream stops or freezes —
+                    // deliberately IDENTICAL to the SCREEN_VIDEO_FPS / SCREEN_VIDEO_BITRATE_KBPS
+                    // block below, which has always set unconditionally. Do NOT re-add a
+                    // `!= 0` guard to either side: the camera/screen split here is not a
+                    // difference in meaning, and the guard that used to sit on camera was the bug.
+                    //
+                    // Why 0 is a REAL reading, not "not measured": both fields ride the SAME
+                    // per-heartbeat DiagEvent (`diagnostics_manager.rs::send_diagnostic_packets`),
+                    // which substitutes `(0.0, 0.0, 0.0)` for (fps, bitrate, decode_errors) once a
+                    // tracker has seen no frame for longer than its staleness window (a bare
+                    // `1000.0` ms literal there, not a named constant), and the client folds both
+                    // into the proto unconditionally (`health_reporter.rs`, camera video mapping).
+                    // So a genuine 0 reaches this line and MUST be published: the only removal of
+                    // these series is `remove_per_peer_metrics`, which is disconnect/peer-departure
+                    // GC (#1092), NOT a staleness sweep. Guarding on `!= 0` therefore did not make
+                    // the series go absent — it left it registered and scraped at its last HEALTHY
+                    // value (e.g. 30) while no frames were arriving, i.e. a gauge that actively lies.
+                    //
+                    // READ 0 AS "no frames are arriving", NOT as "this stream is broken". The client
+                    // applies no `video_enabled` / `can_see` / freshness gate before folding, so an
+                    // idle-BY-DESIGN receiver reports an honest 0 too: a peer whose camera is simply
+                    // off, or a hidden/DecodeBudget-paused tile once the #988 viewport filter stops
+                    // forwarding its video. The sibling comment on the playout gauges below says the
+                    // same thing from the other direction ("a paused/hidden tile reads 0 here rather
+                    // than a stale latch"). To separate expected idle from unexpected no-arrival,
+                    // read this alongside `videocall_peer_video_enabled` / `videocall_peer_can_see`.
+                    // `videocall_video_content_staleness_ms` cannot distinguish them once fps is 0:
+                    // the client deliberately publishes its 0 default when no frames arrive. It can
+                    // corroborate stale content only while frames continue arriving. Also note that,
+                    // after a tracker exists, the zero is not a one-heartbeat window: each
+                    // zero-substituted DiagEvent refreshes `last_camera_update_ms`, and
+                    // `last_camera_stats` is retained until frames resume or the peer is removed.
+                    //
+                    // `set_finite` still drops a NaN/inf sample (issue 2047) — that is a separate
+                    // concern from zero and is the reason a bare `.set()` is not used for fps.
+                    // `bitrate_kbps` is a `u64`, so its `as f64` cast is always finite.
+                    VIDEO_FPS
+                        .with_label_values(&peer_labels)
+                        .set_finite(video_stats.fps_received);
+                    VIDEO_BITRATE_KBPS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.bitrate_kbps as f64);
 
                     // Buffered video playout latency (#1252): how far behind live this peer's
                     // video is (jitter-buffer backlog + decoder queue), plus its stage-1
@@ -1475,17 +1821,17 @@ fn process_health_packet_to_metrics_pb(
                     // 0 here rather than a stale latch.
                     VIDEO_PLAYOUT_LATENCY_MS
                         .with_label_values(&peer_labels)
-                        .set(video_stats.playout_latency_ms);
+                        .set_finite(video_stats.playout_latency_ms);
                     VIDEO_PLAYOUT_STAGE1_SPAN_MS
                         .with_label_values(&peer_labels)
-                        .set(video_stats.playout_stage1_span_ms);
+                        .set_finite(video_stats.playout_stage1_span_ms);
                     // Stage-3 paint lag (#1252): decoded-but-unpainted backlog in the worker->main
                     // postMessage + paint queues. Set UNCONDITIONALLY (same rationale as above) so
                     // the gauge recovers to 0 when the paint path drains; the client reports a
                     // nonzero value only while fps_received > 0.
                     VIDEO_PLAYOUT_PAINT_LAG_MS
                         .with_label_values(&peer_labels)
-                        .set(video_stats.playout_paint_lag_ms);
+                        .set_finite(video_stats.playout_paint_lag_ms);
                     // Content staleness (#1641): the AGE of the video content being painted, as
                     // distinct from the queue-DEPTH gauges above. Set UNCONDITIONALLY (same
                     // recover-to-0 rationale as the playout gauges): the client reports a nonzero
@@ -1495,7 +1841,7 @@ fn process_health_packet_to_metrics_pb(
                     // hides from paint_lag.
                     VIDEO_CONTENT_STALENESS_MS
                         .with_label_values(&peer_labels)
-                        .set(video_stats.content_staleness_ms);
+                        .set_finite(video_stats.content_staleness_ms);
                     // Resync-to-live governor skips (#1252): cumulative COUNTER value held in a
                     // gauge. Set UNCONDITIONALLY (same recover-to-0 pattern as the gauges above): the
                     // client folds this field unconditionally, so an absent/idle stream reports its
@@ -1509,10 +1855,26 @@ fn process_health_packet_to_metrics_pb(
                 // Screen video metrics (separate from camera)
                 // Always set when present -- allows gauges to recover to 0.0
                 // when screen share stops or quality collapses.
+                //
+                // Issue 2145: the camera block above now does the SAME thing. These two paths are
+                // deliberately aligned — a receiver-observed 0 is a REPORTABLE reading for both
+                // kinds. Until 2145 the camera sibling carried a `!= 0.0` guard with no comment
+                // explaining the asymmetry; it was a bug, not a design choice. Do NOT re-add a
+                // zero guard to either block.
+                //
+                // As on camera, 0 means "no frames are arriving" — NOT "this stream is broken".
+                // For screen that distinction is even sharper: a LEGITIMATELY STATIC share is
+                // expected to read 0 once its keyframe-floor budget drains
+                // (`SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET`, issue 2147), so 0 here is frequently the
+                // healthy steady state. Receiver fps and content-staleness cannot by themselves
+                // distinguish static-and-fine from stalled once fps is 0: the client publishes a
+                // 0 content-staleness default in that state. Use the publisher's
+                // `videocall_screen_sharing_active` and
+                // `videocall_screen_encoder_stall_episodes_total` signals (2147).
                 if let Some(screen_stats) = peer_data.screen_video_stats.as_ref() {
                     SCREEN_VIDEO_FPS
                         .with_label_values(&peer_labels)
-                        .set(screen_stats.fps_received);
+                        .set_finite(screen_stats.fps_received);
                     SCREEN_VIDEO_BITRATE_KBPS
                         .with_label_values(&peer_labels)
                         .set(screen_stats.bitrate_kbps as f64);
@@ -1530,16 +1892,16 @@ fn process_health_packet_to_metrics_pb(
                     // unconditionally.
                     SCREEN_VIDEO_PLAYOUT_LATENCY_MS
                         .with_label_values(&peer_labels)
-                        .set(screen_stats.playout_latency_ms);
+                        .set_finite(screen_stats.playout_latency_ms);
                     SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS
                         .with_label_values(&peer_labels)
-                        .set(screen_stats.playout_stage1_span_ms);
+                        .set_finite(screen_stats.playout_stage1_span_ms);
                     SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS
                         .with_label_values(&peer_labels)
-                        .set(screen_stats.playout_paint_lag_ms);
+                        .set_finite(screen_stats.playout_paint_lag_ms);
                     SCREEN_VIDEO_CONTENT_STALENESS_MS
                         .with_label_values(&peer_labels)
-                        .set(screen_stats.content_staleness_ms);
+                        .set_finite(screen_stats.content_staleness_ms);
                     SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL
                         .with_label_values(&peer_labels)
                         .set(screen_stats.playout_skip_to_live_total as f64);
@@ -1549,7 +1911,7 @@ fn process_health_packet_to_metrics_pb(
                 if peer_data.frames_dropped_per_sec > 0.0 {
                     VIDEO_FRAMES_DROPPED
                         .with_label_values(&peer_labels)
-                        .set(peer_data.frames_dropped_per_sec);
+                        .set_finite(peer_data.frames_dropped_per_sec);
                 }
 
                 if let Some(total) = peer_data.decoder_errors_total {
@@ -1564,12 +1926,12 @@ fn process_health_packet_to_metrics_pb(
                 if let Some(loss) = peer_data.video_seq_loss_per_sec {
                     VIDEO_SEQ_LOSS_PER_SEC
                         .with_label_values(&peer_labels)
-                        .set(loss);
+                        .set_finite(loss);
                 }
                 if let Some(kf) = peer_data.keyframe_requests_per_sec {
                     KEYFRAME_REQUESTS_PER_SEC
                         .with_label_values(&peer_labels)
-                        .set(kf);
+                        .set_finite(kf);
                 }
 
                 // Receive-side audio DATAGRAM loss (#1878): audio sibling of the
@@ -1582,7 +1944,7 @@ fn process_health_packet_to_metrics_pb(
                 if let Some(loss) = peer_data.audio_datagram_loss_per_sec {
                     AUDIO_DATAGRAM_LOSS_PER_SEC
                         .with_label_values(&peer_labels)
-                        .set(loss);
+                        .set_finite(loss);
                 }
 
                 // Issue 2031: uncapped magnitude companion. Current clients fold
@@ -1593,30 +1955,30 @@ fn process_health_packet_to_metrics_pb(
                 if let Some(raw_loss) = peer_data.audio_datagram_raw_loss_per_sec {
                     AUDIO_DATAGRAM_RAW_LOSS_PER_SEC
                         .with_label_values(&peer_labels)
-                        .set(raw_loss);
+                        .set_finite(raw_loss);
                 }
 
                 // Audio concealment percentage (from NetEQ expand events)
                 // Always set — allows gauge to recover to 0.0 when concealment clears
                 AUDIO_CONCEALMENT_PCT
                     .with_label_values(&peer_labels)
-                    .set(peer_data.audio_concealment_pct);
+                    .set_finite(peer_data.audio_concealment_pct);
 
                 // Quality scores
                 if let Some(score) = peer_data.audio_quality_score {
                     AUDIO_QUALITY_SCORE
                         .with_label_values(&peer_labels)
-                        .set(score);
+                        .set_finite(score);
                 }
                 if let Some(score) = peer_data.video_quality_score {
                     VIDEO_QUALITY_SCORE
                         .with_label_values(&peer_labels)
-                        .set(score);
+                        .set_finite(score);
                 }
                 if let Some(score) = peer_data.call_quality_score {
                     CALL_QUALITY_SCORE
                         .with_label_values(&peer_labels)
-                        .set(score);
+                        .set_finite(score);
                 }
 
                 // Peer status flags
@@ -1791,7 +2153,7 @@ mod tests {
     use videocall_types::protos::health_packet::{
         HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
         NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
-        PeerStats as PbPeerStats, VideoStats as PbVideoStats,
+        PeerStats as PbPeerStats, TierTransition as PbTierTransition, VideoStats as PbVideoStats,
     };
 
     #[test]
@@ -1932,6 +2294,747 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Value of a labeled COUNTER series (issue 2047). `gauge_value` reads the
+    /// gauge union member and returns `None` for a CounterVec, so the
+    /// tier-transition assertions need this sibling.
+    fn counter_value(metric_name: &str, expected_labels: &[(&str, &str)]) -> Option<f64> {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == metric_name)
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        expected_labels.iter().all(|(lname, lval)| {
+                            metric.get_label().iter().any(|label| {
+                                label.get_name() == *lname && label.get_value() == *lval
+                            })
+                        })
+                    })
+                    .map(|metric| metric.get_counter().get_value())
+            })
+    }
+
+    /// Running `_sum` of a labeled histogram series (issue 2047): the field a
+    /// non-finite `observe()` would latch to `NaN` for the process lifetime.
+    fn histogram_sum(metric_name: &str, expected_labels: &[(&str, &str)]) -> Option<f64> {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == metric_name)
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        expected_labels.iter().all(|(lname, lval)| {
+                            metric.get_label().iter().any(|label| {
+                                label.get_name() == *lname && label.get_value() == *lval
+                            })
+                        })
+                    })
+                    .map(|metric| metric.get_histogram().get_sample_sum())
+            })
+    }
+
+    // ======================================================================
+    // Issue 2047: non-finite client telemetry must never reach a metric
+    // ======================================================================
+
+    /// A NaN gauge sample must be DROPPED, leaving the previous good value in
+    /// place — not written, and not clamped to 0.0.
+    ///
+    /// `active_server_rtt_ms` is the sharpest site to pin this: its pre-existing
+    /// `!= 0.0` guard does NOT stop a NaN (`NaN != 0.0` is `true`), so the value
+    /// reaches the sink and only the new finite check can reject it.
+    ///
+    /// Mutation coverage: revert this site's `.set_finite(...)` to `.set(...)`
+    /// and the gauge becomes NaN, so the `Some(41.5)` assert fails (NaN compares
+    /// unequal to everything, including itself). Delete the
+    /// `NON_FINITE_SAMPLES_DROPPED_TOTAL.inc()` from `is_publishable_sample` and
+    /// the counter assert fails.
+    #[test]
+    fn nan_gauge_sample_is_dropped_and_last_good_value_survives() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let labels = [
+            ("meeting_id", "m_nan_2047"),
+            ("session_id", "s_nan_2047"),
+            ("peer_id", "reporter_nan_2047"),
+        ];
+
+        // A good sample first, so the test can prove the NaN did not overwrite it.
+        let mut good = create_test_health_packet(
+            "s_nan_2047",
+            "m_nan_2047",
+            "reporter_nan_2047",
+            HashMap::new(),
+        );
+        good.active_server_type = "websocket".to_string();
+        good.active_server_rtt_ms = 41.5;
+        assert!(process_health_packet_to_metrics_pb(&good, &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_client_active_server_rtt_ms", &labels),
+            Some(41.5),
+            "baseline: the good RTT sample must publish"
+        );
+
+        let dropped_before = NON_FINITE_SAMPLES_DROPPED_TOTAL.get();
+
+        // Now the poisoned packet, same labels.
+        let mut poisoned = good.clone();
+        poisoned.active_server_rtt_ms = f64::NAN;
+        assert!(process_health_packet_to_metrics_pb(&poisoned, &tracker).is_ok());
+
+        assert_eq!(
+            gauge_value("videocall_client_active_server_rtt_ms", &labels),
+            Some(41.5),
+            "a NaN sample must be skipped, leaving the last good value intact"
+        );
+        assert!(
+            NON_FINITE_SAMPLES_DROPPED_TOTAL.get() > dropped_before,
+            "the rejection must be counted so operators can see a client emitting NaN"
+        );
+    }
+
+    /// ±Inf is rejected on the same path as NaN, asserted on a PER-PEER gauge so
+    /// the guard is pinned on both label shapes (reporter-level above,
+    /// peer-level here).
+    ///
+    /// Mutation coverage: revert `AUDIO_CONCEALMENT_PCT`'s `.set_finite(...)` to
+    /// `.set(...)` and the gauge holds `inf`, failing the `Some(12.5)` assert.
+    #[test]
+    fn infinite_peer_gauge_sample_is_dropped() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let peer_labels = [
+            ("meeting_id", "m_inf_2047"),
+            ("session_id", "s_inf_2047"),
+            ("from_peer", "reporter_inf_2047"),
+            ("to_peer", "peer_inf_2047"),
+        ];
+
+        let mut peer = PbPeerStats::new();
+        peer.audio_concealment_pct = 12.5;
+        let mut peer_stats = HashMap::new();
+        peer_stats.insert("peer_inf_2047".to_string(), peer);
+        let good = create_test_health_packet(
+            "s_inf_2047",
+            "m_inf_2047",
+            "reporter_inf_2047",
+            peer_stats.clone(),
+        );
+        assert!(process_health_packet_to_metrics_pb(&good, &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_audio_concealment_pct", &peer_labels),
+            Some(12.5),
+            "baseline: the good concealment sample must publish"
+        );
+
+        let mut poisoned_peer = PbPeerStats::new();
+        poisoned_peer.audio_concealment_pct = f64::INFINITY;
+        let mut poisoned_stats = HashMap::new();
+        poisoned_stats.insert("peer_inf_2047".to_string(), poisoned_peer);
+        let poisoned = create_test_health_packet(
+            "s_inf_2047",
+            "m_inf_2047",
+            "reporter_inf_2047",
+            poisoned_stats,
+        );
+        assert!(process_health_packet_to_metrics_pb(&poisoned, &tracker).is_ok());
+
+        assert_eq!(
+            gauge_value("videocall_audio_concealment_pct", &peer_labels),
+            Some(12.5),
+            "an infinite sample must be skipped, leaving the last good value intact"
+        );
+    }
+
+    /// A non-finite HISTOGRAM observation must be rejected too. A gauge poisoned
+    /// by NaN recovers on the next good sample; a histogram's `_sum` does NOT —
+    /// it stays NaN for the process lifetime, which is why `observe_finite`
+    /// exists alongside `set_finite`.
+    ///
+    /// Mutation coverage: revert `CLIENT_LONGTASK_DURATION_MS`'s
+    /// `.observe_finite(...)` to `.observe(...)` and the sum becomes NaN, failing
+    /// the finite assert below.
+    #[test]
+    fn non_finite_longtask_observation_does_not_poison_histogram_sum() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let labels = [("meeting_id", "m_hist_2047"), ("session_id", "s_hist_2047")];
+
+        let mut hp = create_test_health_packet(
+            "s_hist_2047",
+            "m_hist_2047",
+            "reporter_hist_2047",
+            HashMap::new(),
+        );
+        hp.longtask_durations_ms = vec![120.0, f64::NAN, f64::NEG_INFINITY, 80.0];
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let sum = histogram_sum("videocall_client_longtask_duration_ms", &labels)
+            .expect("longtask histogram series must exist");
+        assert!(
+            sum.is_finite(),
+            "a non-finite observation must never reach the histogram (_sum = {sum})"
+        );
+        assert_eq!(
+            sum, 200.0,
+            "only the two finite durations may contribute to _sum"
+        );
+    }
+
+    // --- #2147: screen-encoder fps must reach the gauge, INCLUDING a real 0 ------
+
+    /// A `screen_encoder_output_fps` of **0** must reach
+    /// `videocall_screen_encoder_output_fps`. This is the whole point of the field:
+    /// its camera sibling is `> 0`-gated at the SOURCE (#2079), which makes a
+    /// genuine stall absent and indistinguishable from never-started. If anyone
+    /// "makes it consistent" by adding a `> 0` filter on the server side, this
+    /// fails.
+    ///
+    /// MUTATION: wrap the `SCREEN_ENCODER_OUTPUT_FPS.set(...)` block in
+    /// `if fps > 0`, or delete the block entirely, and the 0 assertion fails
+    /// (`None` instead of `Some(0.0)`).
+    #[test]
+    fn screen_encoder_fps_zero_reaches_the_gauge() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let labels = [
+            ("meeting_id", "m_scrfps_2147"),
+            ("session_id", "s_scrfps_2147"),
+        ];
+
+        let mut hp = create_test_health_packet(
+            "s_scrfps_2147",
+            "m_scrfps_2147",
+            "reporter_scrfps_2147",
+            HashMap::new(),
+        );
+        // The freeze scenario: the CAMERA encoder is healthy while the SCREEN
+        // encoder produces nothing. Distinct values so a copy-paste of the camera
+        // source into the screen gauge is caught too.
+        hp.encoder_output_fps = Some(9);
+        hp.screen_encoder_output_fps = Some(0);
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_output_fps", &labels),
+            Some(0.0),
+            "#2147: a bound-but-idle/stalled screen encoder must publish an honest 0, \
+             not vanish the way the `> 0`-gated camera gauge does (#2079)"
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_output_fps", &labels),
+            Some(9.0),
+            "the camera gauge must carry the CAMERA value — the two must not be crossed"
+        );
+    }
+
+    /// An ABSENT `screen_encoder_output_fps` must leave the gauge unset — the
+    /// server must not fabricate a 0 for a client that binds no screen encoder.
+    ///
+    /// MUTATION: change the `if let Some(fps)` to
+    /// `.set(health_packet.screen_encoder_output_fps.unwrap_or(0) as f64)` and this
+    /// fails (`Some(0.0)` instead of `None`).
+    #[test]
+    fn absent_screen_encoder_fps_leaves_the_gauge_unset() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let labels = [
+            ("meeting_id", "m_scrfps_absent_2147"),
+            ("session_id", "s_scrfps_absent_2147"),
+        ];
+
+        let hp = create_test_health_packet(
+            "s_scrfps_absent_2147",
+            "m_scrfps_absent_2147",
+            "reporter_scrfps_absent_2147",
+            HashMap::new(),
+        );
+        assert!(hp.screen_encoder_output_fps.is_none(), "precondition");
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_output_fps", &labels),
+            None,
+            "#2147: an absent field must not mint a fabricated 0 series"
+        );
+    }
+
+    /// **The #2143 discrimination test.** The fps gauge alone CANNOT distinguish a
+    /// frozen screen share from a healthy one — it counts encoded chunks, and the
+    /// synthetic retained-frame re-encodes keep it nonzero while receivers sit on
+    /// stale content. The stall pair is what makes the two distinguishable, so this
+    /// asserts BOTH scenarios end-to-end through the production path with the SAME
+    /// fps value, proving fps is not what separates them.
+    ///
+    /// MUTATION: delete either `SCREEN_ENCODER_STALL_EPISODES.set(...)` or
+    /// `SCREEN_ENCODER_MAX_STALL_GAP_MS.set(...)` and the freeze case loses the only
+    /// signal that distinguishes it, failing here.
+    #[test]
+    fn stall_pair_distinguishes_a_frozen_share_from_a_healthy_one() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // --- FREEZE: fps looks fine (synthetic re-encodes) but ticks are starved.
+        let frozen = [
+            ("meeting_id", "m_stall_frozen"),
+            ("session_id", "s_stall_frozen"),
+        ];
+        let mut hp = create_test_health_packet(
+            "s_stall_frozen",
+            "m_stall_frozen",
+            "reporter_stall_frozen",
+            HashMap::new(),
+        );
+        hp.screen_encoder_output_fps = Some(3);
+        hp.screen_encoder_stall_episodes = Some(11);
+        hp.screen_encoder_max_stall_gap_ms = Some(23_150);
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        // --- HEALTHY: the SAME fps, no stall episodes at all.
+        let healthy = [
+            ("meeting_id", "m_stall_healthy"),
+            ("session_id", "s_stall_healthy"),
+        ];
+        let mut hp2 = create_test_health_packet(
+            "s_stall_healthy",
+            "m_stall_healthy",
+            "reporter_stall_healthy",
+            HashMap::new(),
+        );
+        hp2.screen_encoder_output_fps = Some(3);
+        // Counters absent — the client omits them while zero.
+        assert!(process_health_packet_to_metrics_pb(&hp2, &tracker).is_ok());
+
+        // fps is IDENTICAL across the two, so it cannot be the discriminator.
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_output_fps", &frozen),
+            gauge_value("videocall_screen_encoder_output_fps", &healthy),
+            "#2147 premise: fps alone must NOT distinguish these — if it does, this \
+             test has stopped testing the thing it names"
+        );
+
+        // The stall pair IS the discriminator.
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_stall_episodes_total", &frozen),
+            Some(11.0),
+            "#2147: the freeze must be visible as rising stall episodes"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_max_stall_gap_ms", &frozen),
+            Some(23150.0),
+            "#2147: the worst gap gives the freeze its severity"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_stall_episodes_total", &healthy),
+            None,
+            "a healthy share must mint no stall series (counters omitted while 0)"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_max_stall_gap_ms", &healthy),
+            None,
+            "likewise for the severity gauge"
+        );
+    }
+
+    /// The stall pair must be SWEPT on teardown alongside the fps gauge, or a
+    /// disconnected publisher's freeze evidence lingers as a live-looking series.
+    ///
+    /// MUTATION: delete either stall `remove_label_values` line from
+    /// `remove_session_metrics` and this fails.
+    #[test]
+    fn stall_pair_series_are_swept_on_session_teardown() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let labels = [("meeting_id", "m_stall_gc"), ("session_id", "s_stall_gc")];
+
+        let mut hp = create_test_health_packet(
+            "s_stall_gc",
+            "m_stall_gc",
+            "reporter_stall_gc",
+            HashMap::new(),
+        );
+        hp.screen_encoder_stall_episodes = Some(4);
+        hp.screen_encoder_max_stall_gap_ms = Some(900);
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_stall_episodes_total", &labels),
+            Some(4.0),
+            "precondition: the series exists before teardown"
+        );
+
+        {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let info = guard
+                .values()
+                .find(|i| i.session_id == "s_stall_gc")
+                .expect("the health packet must have registered a session");
+            remove_session_metrics(info);
+        }
+
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_stall_episodes_total", &labels),
+            None,
+            "#2147: the stall-episode series must be swept on teardown"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_max_stall_gap_ms", &labels),
+            None,
+            "#2147: the max-gap series must be swept on teardown"
+        );
+    }
+
+    /// The new gauge must be SWEPT on session teardown like its camera sibling.
+    /// Load-bearing precisely because this gauge reports real zeroes: an unswept
+    /// series would persist for a disconnected publisher and read as a live screen
+    /// encoder producing nothing.
+    ///
+    /// MUTATION: delete the `SCREEN_ENCODER_OUTPUT_FPS.remove_label_values(...)`
+    /// line from `remove_session_metrics` and this fails (series still present).
+    #[test]
+    fn screen_encoder_fps_series_is_swept_on_session_teardown() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let labels = [
+            ("meeting_id", "m_scrfps_gc_2147"),
+            ("session_id", "s_scrfps_gc_2147"),
+        ];
+
+        let mut hp = create_test_health_packet(
+            "s_scrfps_gc_2147",
+            "m_scrfps_gc_2147",
+            "reporter_scrfps_gc_2147",
+            HashMap::new(),
+        );
+        hp.screen_encoder_output_fps = Some(7);
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_output_fps", &labels),
+            Some(7.0),
+            "precondition: the series exists before teardown"
+        );
+
+        // Tear the session down through the production sweep path, using the
+        // SessionInfo the production path itself registered above (rather than a
+        // hand-built one, so the label set can never drift from reality).
+        {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let info = guard
+                .values()
+                .find(|i| i.session_id == "s_scrfps_gc_2147")
+                .expect("the health packet must have registered a session");
+            remove_session_metrics(info);
+        }
+
+        assert_eq!(
+            gauge_value("videocall_screen_encoder_output_fps", &labels),
+            None,
+            "#2147: the screen-fps series must be swept on teardown, or a \
+             disconnected publisher keeps asserting a live encoder at 0 fps"
+        );
+    }
+
+    /// `CLIENT_ACTIVE_SERVER`'s `server_type` label must be bounded to a fixed
+    /// taxonomy (issue 2047), the same treatment issue 2031 gave the `transport`
+    /// label. An unbounded label lets one client mint a new series per packet.
+    ///
+    /// Mutation coverage: revert `server_type_for_rtt` to
+    /// `health_packet.active_server_type.as_str()` and the forged value appears
+    /// as its own series, failing the first assert.
+    #[test]
+    fn unknown_active_server_type_is_collapsed_to_a_bounded_label() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let forged = "carrier-pigeon-\u{1F426}-build-4711";
+
+        let mut hp = create_test_health_packet(
+            "s_type_2047",
+            "m_type_2047",
+            "reporter_type_2047",
+            HashMap::new(),
+        );
+        hp.active_server_url = "wss://relay.example.com".to_string();
+        hp.active_server_type = forged.to_string();
+        hp.active_server_rtt_ms = 33.0;
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        for metric in [
+            "videocall_client_active_server",
+            "videocall_client_active_server_rtt_ms",
+        ] {
+            assert!(
+                !series_exists(
+                    metric,
+                    &[
+                        ("meeting_id", "m_type_2047"),
+                        ("session_id", "s_type_2047"),
+                        ("server_type", forged),
+                    ]
+                ),
+                "{metric} must not carry an unbounded client-supplied server_type"
+            );
+            assert!(
+                series_exists(
+                    metric,
+                    &[
+                        ("meeting_id", "m_type_2047"),
+                        ("session_id", "s_type_2047"),
+                        ("server_type", "unknown"),
+                    ]
+                ),
+                "{metric} must collapse an unrecognized server_type onto 'unknown'"
+            );
+        }
+    }
+
+    /// The bounding function itself: known transports pass through untouched (so
+    /// existing dashboards are unaffected), the empty string keeps the
+    /// pre-existing "blank = unknown source" convention the RTT gauge documents,
+    /// and everything else collapses to one placeholder.
+    #[test]
+    fn bounded_active_server_type_admits_only_the_known_taxonomy() {
+        assert_eq!(bounded_active_server_type("webtransport"), "webtransport");
+        assert_eq!(bounded_active_server_type("websocket"), "websocket");
+        assert_eq!(bounded_active_server_type(""), "");
+        assert_eq!(bounded_active_server_type("WebSocket"), "unknown");
+        assert_eq!(bounded_active_server_type("quic"), "unknown");
+        assert_eq!(bounded_active_server_type("../../etc/passwd"), "unknown");
+    }
+
+    // ======================================================================
+    // Issue 2047: TierTransition label allowlist + per-packet ingest cap
+    // ======================================================================
+
+    fn tier_transition(
+        direction: &str,
+        stream: &str,
+        from_tier: &str,
+        to_tier: &str,
+        trigger: &str,
+    ) -> PbTierTransition {
+        let mut t = PbTierTransition::new();
+        t.direction = direction.to_string();
+        t.stream = stream.to_string();
+        t.from_tier = from_tier.to_string();
+        t.to_tier = to_tier.to_string();
+        t.trigger = trigger.to_string();
+        t
+    }
+
+    /// Every one of the five client-authored `TierTransition` labels must be
+    /// collapsed onto its taxonomy. A forged value must NOT appear as its own
+    /// series, and the legitimate values must still pass through untouched so
+    /// existing dashboards keep working.
+    ///
+    /// Mutation coverage: revert any of the five to the raw `&t.<field>` and its
+    /// forged value appears as a series, failing that field's assert.
+    #[test]
+    fn forged_tier_transition_labels_collapse_to_the_bounded_taxonomy() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let mut hp = create_test_health_packet(
+            "s_tier_2047",
+            "m_tier_2047",
+            "reporter_tier_2047",
+            HashMap::new(),
+        );
+        // One legitimate transition (verified against videocall-aq: trigger
+        // "backpressure", NOT the stale proto comment's "fps"/"bitrate").
+        hp.tier_transitions.push(tier_transition(
+            "down",
+            "video",
+            "hd",
+            "medium",
+            "backpressure",
+        ));
+        // One fully forged transition — all five labels off-taxonomy.
+        hp.tier_transitions.push(tier_transition(
+            "sideways-\u{1F680}",
+            "hologram",
+            "tier-4711",
+            "tier-4712",
+            "solar-flare",
+        ));
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let base = [("meeting_id", "m_tier_2047"), ("session_id", "s_tier_2047")];
+        // The legitimate transition survives verbatim.
+        for (name, value) in [
+            ("direction", "down"),
+            ("stream", "video"),
+            ("from_tier", "hd"),
+            ("to_tier", "medium"),
+            ("trigger", "backpressure"),
+        ] {
+            let mut labels = base.to_vec();
+            labels.push((name, value));
+            assert!(
+                series_exists("videocall_tier_transition_total", &labels),
+                "the legitimate {name}={value} label must pass through unchanged"
+            );
+        }
+        // No forged value becomes a label.
+        for (name, value) in [
+            ("direction", "sideways-\u{1F680}"),
+            ("stream", "hologram"),
+            ("from_tier", "tier-4711"),
+            ("to_tier", "tier-4712"),
+            ("trigger", "solar-flare"),
+        ] {
+            let mut labels = base.to_vec();
+            labels.push((name, value));
+            assert!(
+                !series_exists("videocall_tier_transition_total", &labels),
+                "forged {name}={value} must not reach a Prometheus label"
+            );
+        }
+        // ...it collapses onto the sentinel instead.
+        assert!(
+            series_exists(
+                "videocall_tier_transition_total",
+                &[
+                    ("meeting_id", "m_tier_2047"),
+                    ("session_id", "s_tier_2047"),
+                    ("direction", "unknown"),
+                    ("stream", "unknown"),
+                    ("from_tier", "unknown"),
+                    ("to_tier", "unknown"),
+                    ("trigger", "unknown"),
+                ]
+            ),
+            "an off-taxonomy transition must collapse onto the bounded sentinel"
+        );
+    }
+
+    /// A `tier_transitions` vector far over the cap must ingest only up to the
+    /// cap, counting the remainder as dropped. This is the DoS half of the
+    /// finding: the allowlist bounds SERIES count, the cap bounds per-packet WORK.
+    ///
+    /// Mutation coverage: delete the `.take(MAX_TIER_TRANSITIONS_PER_PACKET)` and
+    /// all 400 entries ingest, so the distinct-series count exceeds the cap and
+    /// the drop-counter assert fails.
+    #[test]
+    fn over_cap_tier_transitions_are_truncated_and_counted() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let mut hp = create_test_health_packet(
+            "s_cap_2047",
+            "m_cap_2047",
+            "reporter_cap_2047",
+            HashMap::new(),
+        );
+
+        // 400 IDENTICAL, fully legitimate transitions. Identical is the point:
+        // they all land on ONE series, so the counter's VALUE is exactly the
+        // number of entries ingested. (Distinct-tuple variants make this test
+        // fake — the label allowlist already bounds the distinct-SERIES count, so
+        // a series-count assert passes with or without the cap.)
+        let total = 400usize;
+        for _ in 0..total {
+            hp.tier_transitions.push(tier_transition(
+                "down",
+                "video",
+                "hd",
+                "medium",
+                "backpressure",
+            ));
+        }
+        assert!(total > MAX_TIER_TRANSITIONS_PER_PACKET);
+
+        let dropped_before = TIER_TRANSITIONS_DROPPED_TOTAL.get();
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        // The load-bearing assert: the series was incremented exactly `cap`
+        // times, not 400. The labels are unique to this test, so the series
+        // starts at zero and no other test can perturb the count.
+        assert_eq!(
+            counter_value(
+                "videocall_tier_transition_total",
+                &[
+                    ("meeting_id", "m_cap_2047"),
+                    ("session_id", "s_cap_2047"),
+                    ("direction", "down"),
+                    ("stream", "video"),
+                    ("from_tier", "hd"),
+                    ("to_tier", "medium"),
+                    ("trigger", "backpressure"),
+                ]
+            ),
+            Some(MAX_TIER_TRANSITIONS_PER_PACKET as f64),
+            "exactly `cap` entries may be ingested from one packet, not {total}"
+        );
+
+        assert_eq!(
+            TIER_TRANSITIONS_DROPPED_TOTAL.get() - dropped_before,
+            (total - MAX_TIER_TRANSITIONS_PER_PACKET) as f64,
+            "every entry past the cap must be counted as dropped"
+        );
+    }
+
+    /// The session's tier-transition series must be reaped when the session is,
+    /// like their ~40 siblings — otherwise the counter grows for the process
+    /// lifetime as sessions come and go (the #1092 leak class).
+    ///
+    /// Mutation coverage: delete the `tier_transition_labels` loop from
+    /// `remove_session_metrics` and the post-reap assert fails.
+    #[test]
+    fn tier_transition_series_are_reaped_with_the_session() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let mut hp = create_test_health_packet(
+            "s_reap_2047",
+            "m_reap_2047",
+            "reporter_reap_2047",
+            HashMap::new(),
+        );
+        hp.tier_transitions.push(tier_transition(
+            "down",
+            "screen",
+            "high",
+            "low",
+            "congestion",
+        ));
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "m_reap_2047"),
+            ("session_id", "s_reap_2047"),
+            ("direction", "down"),
+            ("stream", "screen"),
+            ("trigger", "congestion"),
+        ];
+        assert!(
+            series_exists("videocall_tier_transition_total", &labels),
+            "baseline: the transition series must publish"
+        );
+
+        let info = {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.values().next().expect("session tracked").clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(
+            !series_exists("videocall_tier_transition_total", &labels),
+            "the session's tier-transition series must be removed on departure"
+        );
+    }
+
+    /// The tier-name allowlist is derived from `videocall-aq`, the same constants
+    /// the client indexes when recording a transition — so a tier added there is
+    /// accepted here automatically instead of silently collapsing to "unknown".
+    ///
+    /// Mutation coverage: drop any of the three arrays from `is_known_tier_name`
+    /// and that family's assert fails.
+    #[test]
+    fn tier_name_allowlist_tracks_the_shared_aq_constants() {
+        use videocall_aq::constants::{
+            AUDIO_QUALITY_TIERS, SCREEN_QUALITY_TIERS, VIDEO_QUALITY_TIERS,
+        };
+        for t in VIDEO_QUALITY_TIERS {
+            assert_eq!(bounded_tier_name(t.label), t.label);
+        }
+        for t in SCREEN_QUALITY_TIERS {
+            assert_eq!(bounded_tier_name(t.label), t.label);
+        }
+        for t in AUDIO_QUALITY_TIERS {
+            assert_eq!(bounded_tier_name(t.label), t.label);
+        }
+        assert_eq!(bounded_tier_name("hd_1080p_ultra"), "unknown");
+        assert_eq!(bounded_tier_name(""), "unknown");
     }
 
     #[test]
@@ -2126,6 +3229,7 @@ mod tests {
             client_info_labels: None,
             last_network_type: None,
             received_layer_peers: HashSet::new(),
+            tier_transition_labels: HashSet::new(),
         };
 
         assert_eq!(session_info.session_id, "session_123");
@@ -2154,6 +3258,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key.clone(), session_info);
             assert_eq!(tracker_guard.len(), 1);
@@ -2200,6 +3305,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
         }
@@ -2220,6 +3326,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                tier_transition_labels: HashSet::new(),
             };
             // Simulate old timestamp by subtracting 40 seconds
             session_info.last_seen -= Duration::from_secs(40);
@@ -2698,6 +3805,231 @@ mod tests {
     }
 
     #[test]
+    fn test_neteq_snapshot_gauges_recover_to_zero() {
+        // Regression test for the same zero-latching pattern as issue 2145. These fields are
+        // current NetEQ snapshots, not optional measurements: 0 means the playout buffer and
+        // decode queue are empty, or no packets arrived in the latest one-second window.
+        //
+        // The first packet establishes positive values and the second reports 0 on the same
+        // pair. Re-adding any old `!= 0.0` guard leaves that gauge latched at its first value,
+        // making each assertion independently mutation-sensitive.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let meeting_id = "meet_neteq0_2145";
+        let session_id = "sess_neteq0_2145";
+        let reporter = "alice_neteq0_2145";
+        let peer = "bob_neteq0_2145";
+        let labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("from_peer", reporter),
+            ("to_peer", peer),
+        ];
+
+        let make_peer_stats = |buffer_ms: f64, queued: f64, packets_per_sec: f64| {
+            let mut neteq = PbNetEqStats::new();
+            neteq.current_buffer_size_ms = buffer_ms;
+            neteq.packets_awaiting_decode = queued;
+            neteq.packets_per_sec = packets_per_sec;
+
+            let mut peer_stats = PbPeerStats::new();
+            peer_stats.can_listen = true;
+            peer_stats.audio_enabled = true;
+            peer_stats.neteq_stats = ::protobuf::MessageField::some(neteq);
+
+            let mut peers = HashMap::new();
+            peers.insert(peer.to_string(), peer_stats);
+            peers
+        };
+
+        let healthy = create_test_health_packet(
+            session_id,
+            meeting_id,
+            reporter,
+            make_peer_stats(120.0, 4.0, 50.0),
+        );
+        assert!(process_health_packet_to_metrics_pb(&healthy, &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_neteq_audio_buffer_ms", &labels),
+            Some(120.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_neteq_packets_awaiting_decode", &labels),
+            Some(4.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_neteq_packets_per_sec", &labels),
+            Some(50.0)
+        );
+
+        let idle = create_test_health_packet(
+            session_id,
+            meeting_id,
+            reporter,
+            make_peer_stats(0.0, 0.0, 0.0),
+        );
+        assert!(process_health_packet_to_metrics_pb(&idle, &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_neteq_audio_buffer_ms", &labels),
+            Some(0.0),
+            "an empty NetEQ buffer must overwrite the previous positive snapshot"
+        );
+        assert_eq!(
+            gauge_value("videocall_neteq_packets_awaiting_decode", &labels),
+            Some(0.0),
+            "an empty decode queue must overwrite the previous positive snapshot"
+        );
+        assert_eq!(
+            gauge_value("videocall_neteq_packets_per_sec", &labels),
+            Some(0.0),
+            "a silent one-second window must overwrite the previous packet rate"
+        );
+
+        let session_key = format!("{meeting_id}_{session_id}_{reporter}");
+        let info = {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+        assert!(!series_exists("videocall_neteq_audio_buffer_ms", &labels));
+        assert!(!series_exists(
+            "videocall_neteq_packets_awaiting_decode",
+            &labels
+        ));
+        assert!(!series_exists("videocall_neteq_packets_per_sec", &labels));
+    }
+
+    #[test]
+    fn test_camera_fps_and_bitrate_recover_to_zero_for_connected_peer() {
+        // Regression test for issue 2145. VIDEO_FPS / VIDEO_BITRATE_KBPS used to be wrapped in
+        // `if video_stats.fps_received != 0.0` / `if video_stats.bitrate_kbps != 0`, so a genuine
+        // 0 from a STILL-CONNECTED receiver was silently dropped. Because the only removal of
+        // these series is remove_per_peer_metrics (disconnect / peer-departure GC, #1092 — NOT a
+        // staleness sweep), the child series did not go absent: it stayed registered and kept
+        // being scraped at its last HEALTHY value while no frames were arriving. A gauge that
+        // lies is worse than one that is missing.
+        //
+        // The two-packet shape is load-bearing and is the whole point of the test: packet 1
+        // establishes a healthy 30 fps / 1200 kbps, packet 2 reports 0 from the SAME reporter→peer
+        // pair, and the asserts demand 0. A single-packet test that only fed 0 would also fail on
+        // the UNFIXED code, but with None because the guarded child would never be registered.
+        // The two-packet shape proves the real regression: an existing gauge is OVERWRITTEN
+        // instead of retaining its last healthy value. Re-adding either `!= 0` guard leaves the
+        // packet-1 value latched, so the corresponding assert fails with Some(30.0) /
+        // Some(1200.0) instead of Some(0.0).
+        //
+        // Reachability of the fps == 0 + Some(video_stats) state (not a synthetic case):
+        // diagnostics_manager.rs::send_diagnostic_packets substitutes (0.0, 0.0, 0.0) for
+        // (fps, bitrate, decode_errors) once a tracker has seen no frame for longer than its
+        // staleness window, and health_reporter.rs folds both fields into the proto
+        // unconditionally. After a tracker exists, that state persists while no frames arrive:
+        // `last_camera_stats` is retained, and folding each zero-substituted event refreshes
+        // `last_camera_update_ms`. It ends when frames resume or the peer is removed.
+        // (STATS_STALE_MS gates only the can_see/can_listen booleans and the quality-score guard,
+        // NOT this fold — do not read it as a 5s bound on the zeros.) So a frozen or camera-off
+        // sender in a live call emits exactly this packet repeatedly while no frames arrive.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let meeting_id = "meet_fps0_2145";
+        let session_id = "sess_fps0_2145";
+        let reporter = "alice_fps0_2145";
+        let peer = "bob_fps0_2145";
+
+        // from_peer = reporter (reporting_user_id); to_peer = the reported peer (peer_stats key).
+        // #1954: per-pair series are keyed only by the 4 stable ids.
+        let labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("from_peer", reporter),
+            ("to_peer", peer),
+        ];
+
+        // Packet 1: a healthy camera stream. This is what the gauge would latch at.
+        let mut healthy_vs = PbVideoStats::new();
+        healthy_vs.fps_received = 30.0;
+        healthy_vs.bitrate_kbps = 1200;
+
+        let mut healthy_ps = PbPeerStats::new();
+        healthy_ps.can_see = true;
+        healthy_ps.video_enabled = true;
+        healthy_ps.video_stats = ::protobuf::MessageField::some(healthy_vs);
+
+        let mut peer_stats_healthy = std::collections::HashMap::new();
+        peer_stats_healthy.insert(peer.to_string(), healthy_ps);
+        let hp_healthy =
+            create_test_health_packet(session_id, meeting_id, reporter, peer_stats_healthy);
+        assert!(process_health_packet_to_metrics_pb(&hp_healthy, &tracker).is_ok());
+
+        // Precondition: the healthy value is actually on the gauge, so a later Some(0.0) can only
+        // mean it was OVERWRITTEN — not that it was never written.
+        assert_eq!(
+            gauge_value("videocall_video_fps", &labels),
+            Some(30.0),
+            "precondition: the healthy 30 fps sample must be on the gauge before the zero packet"
+        );
+        assert_eq!(
+            gauge_value("videocall_video_bitrate_kbps", &labels),
+            Some(1200.0),
+            "precondition: the healthy 1200 kbps sample must be on the gauge before the zero packet"
+        );
+
+        // Packet 2: the sender's video has frozen but the receiver is STILL CONNECTED and still
+        // reporting this peer, so `peer` remains in peer_stats (no #1092 prune) and video_stats is
+        // still Some — only the values are 0.
+        let mut frozen_vs = PbVideoStats::new();
+        frozen_vs.fps_received = 0.0;
+        frozen_vs.bitrate_kbps = 0;
+
+        let mut frozen_ps = PbPeerStats::new();
+        frozen_ps.can_see = true;
+        frozen_ps.video_enabled = true;
+        frozen_ps.video_stats = ::protobuf::MessageField::some(frozen_vs);
+
+        let mut peer_stats_frozen = std::collections::HashMap::new();
+        peer_stats_frozen.insert(peer.to_string(), frozen_ps);
+        let hp_frozen =
+            create_test_health_packet(session_id, meeting_id, reporter, peer_stats_frozen);
+        assert!(process_health_packet_to_metrics_pb(&hp_frozen, &tracker).is_ok());
+
+        // The series must still EXIST (this is not a GC path — the peer never left) and must now
+        // read 0, not the stale 30 / 1200.
+        assert!(
+            series_exists("videocall_video_fps", &labels),
+            "the fps series must remain registered — the peer is still connected and still \
+             reported, so this is not the #1092 prune path"
+        );
+        assert_eq!(
+            gauge_value("videocall_video_fps", &labels),
+            Some(0.0),
+            "videocall_video_fps must express the genuine 0 from a still-connected receiver; \
+             Some(30.0) here means the `if video_stats.fps_received != 0.0` guard is back and the \
+             gauge is latched at its last healthy value while no frames are arriving (issue 2145)"
+        );
+        assert_eq!(
+            gauge_value("videocall_video_bitrate_kbps", &labels),
+            Some(0.0),
+            "videocall_video_bitrate_kbps must express the genuine 0 (same DiagEvent, same \
+             inactivity substitution as fps); Some(1200.0) here means the \
+             `if video_stats.bitrate_kbps != 0` guard is back (issue 2145)"
+        );
+
+        // Sweep this test's children out of the PROCESS-GLOBAL registry, matching the convention
+        // the sibling folding tests in this module follow. The unique `_fps0_2145` label suffix
+        // means a leak could not make another test pass or fail spuriously, but every
+        // `series_exists`/`gauge_value` helper calls `prometheus::gather()`, which is O(all
+        // registered series) — so leaked children tax every later test in the file.
+        let session_key = format!("{meeting_id}_{session_id}_{reporter}");
+        let info = {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+        assert!(
+            !series_exists("videocall_video_fps", &labels),
+            "remove_session_metrics must sweep the fps series (it is in remove_per_peer_metrics)"
+        );
+    }
+
+    #[test]
     fn test_screen_playout_family_gc_removes_series() {
         // Cleanup regression for #1660 — mirrors test_remove_session_metrics_removes_exported_series
         // and test_rtt_probe_resilience_metrics_exported_and_gc, but drives the screen playout
@@ -3119,6 +4451,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key1, session_info1);
 
@@ -3136,6 +4469,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                tier_transition_labels: HashSet::new(),
             };
             session_info2.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
@@ -3154,6 +4488,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key3, session_info3);
         }
@@ -3191,6 +4526,7 @@ mod tests {
             client_info_labels: None,
             last_network_type: None,
             received_layer_peers: HashSet::new(),
+            tier_transition_labels: HashSet::new(),
         };
 
         // This test verifies that remove_session_metrics doesn't panic
@@ -3219,6 +4555,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
         });
@@ -3360,6 +4697,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                tier_transition_labels: HashSet::new(),
             };
             // Set to exactly 30 seconds ago (timeout boundary)
             session_info.last_seen -= Duration::from_secs(30);

@@ -80,10 +80,22 @@ impl MockMediaDevicesProvider {
         }
     }
 
+    /// Replace what `enumerate_devices()` returns *without* dispatching a
+    /// `devicechange` event.
+    ///
+    /// This method never touches `device_change_handler`, so the hot-plug
+    /// listener installed by [`MediaDeviceList::load`] stays silent.  That lets
+    /// a test change the underlying device set and be certain the only thing
+    /// able to update the lists afterwards is an explicit re-enumeration call
+    /// such as [`MediaDeviceList::refresh_devices_safely`].
+    pub fn set_devices_without_event(&self, new_devices: Vec<MediaDeviceInfo>) {
+        *self.devices.borrow_mut() = new_devices;
+    }
+
     /// Simulate a device change event with a new set of devices
     pub fn simulate_device_change(&self, new_devices: Vec<MediaDeviceInfo>) {
         // Update the devices
-        *self.devices.borrow_mut() = new_devices;
+        self.set_devices_without_event(new_devices);
 
         // Trigger the event handler if it exists
         if let Some(handler) = self.device_change_handler.borrow().as_ref() {
@@ -673,6 +685,11 @@ mod tests {
         device.unchecked_into::<MediaDeviceInfo>()
     }
 
+    // Helper to compare device lists by id rather than by JS identity.
+    fn device_ids(devices: &[MediaDeviceInfo]) -> Vec<String> {
+        devices.iter().map(|d| d.device_id()).collect()
+    }
+
     // Basic functionality test for MediaDeviceList
     #[wasm_bindgen_test]
     fn test_basic_media_device_list_functionality() {
@@ -944,6 +961,200 @@ mod tests {
             mdl.audio_inputs.selected(),
             "mic-2",
             "selected device should persist when an unrelated device is added"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // refresh_devices_safely: re-enumerates, but emits NOTHING
+    //
+    // "NOTHING" is checked against all FIVE callbacks MediaDeviceList owns:
+    // `on_loaded`, `on_devices_changed`, and `on_selected` on each of
+    // audio_inputs / video_inputs / audio_outputs.
+    //
+    // This is the contract the in-meeting settings modal relies on:
+    // `dioxus-ui/src/components/host.rs` calls `refresh_devices_safely()` on
+    // the modal's rising edge so the user sees current devices *without* the
+    // encoder/device-switch side effects an emission would trigger.  Those
+    // side effects are real and live on BOTH kinds of callback: host.rs wires
+    // `on_devices_changed` to `microphone.select()` / `camera.select()` /
+    // `update_speaker_device()` plus a `Timeout::new(1000, .. camera.start())`
+    // restart, so an errant emission here would restart the encoder every time
+    // the settings modal opens.  Contrast `load()` and the hot-plug listener
+    // above, both of which deliberately DO emit -- each of the five counters
+    // below is sanity-checked against one of them before being reset to zero,
+    // so a trailing zero means "did not fire", never "cannot see it fire".
+    // -----------------------------------------------------------------------
+
+    #[wasm_bindgen_test]
+    async fn test_refresh_devices_safely_updates_lists_without_emitting_callbacks() {
+        let mic1 = create_mock_device("mic-1", MediaDeviceKind::Audioinput, "Mic 1");
+        let mic2 = create_mock_device("mic-2", MediaDeviceKind::Audioinput, "Mic 2");
+        let cam1 = create_mock_device("cam-1", MediaDeviceKind::Videoinput, "Camera 1");
+        let cam2 = create_mock_device("cam-2", MediaDeviceKind::Videoinput, "Camera 2");
+        let spk1 = create_mock_device("spk-1", MediaDeviceKind::Audiooutput, "Speaker 1");
+        let spk2 = create_mock_device("spk-2", MediaDeviceKind::Audiooutput, "Speaker 2");
+        let provider =
+            MockMediaDevicesProvider::new(vec![mic1.clone(), cam1.clone(), spk1.clone()]);
+        let mut mdl = MediaDeviceList::with_provider(provider.clone());
+
+        // Count every emission of all five callbacks.
+        let loaded_n = Rc::new(RefCell::new(0usize));
+        let changed_n = Rc::new(RefCell::new(0usize));
+        let audio_n = Rc::new(RefCell::new(0usize));
+        let video_n = Rc::new(RefCell::new(0usize));
+        let output_n = Rc::new(RefCell::new(0usize));
+
+        let loaded_c = loaded_n.clone();
+        mdl.on_loaded = Callback::from(move |_| *loaded_c.borrow_mut() += 1);
+        let changed_c = changed_n.clone();
+        mdl.on_devices_changed = Callback::from(move |_| *changed_c.borrow_mut() += 1);
+        let audio_c = audio_n.clone();
+        mdl.audio_inputs.on_selected = Callback::from(move |_| *audio_c.borrow_mut() += 1);
+        let video_c = video_n.clone();
+        mdl.video_inputs.on_selected = Callback::from(move |_| *video_c.borrow_mut() += 1);
+        let output_c = output_n.clone();
+        mdl.audio_outputs.on_selected = Callback::from(move |_| *output_c.borrow_mut() += 1);
+
+        // Reach a realistic starting state through the production load path.
+        mdl.load();
+        flush().await;
+
+        // Sanity part 1: load() emits four of the five.
+        assert_eq!(*loaded_n.borrow(), 1, "load() should emit on_loaded");
+        assert_eq!(*audio_n.borrow(), 1, "load() should emit audio on_selected");
+        assert_eq!(*video_n.borrow(), 1, "load() should emit video on_selected");
+        assert_eq!(
+            *output_n.borrow(),
+            1,
+            "load() should emit audio-output on_selected"
+        );
+
+        // Sanity part 2: load() does NOT emit on_devices_changed, so that
+        // counter has to be exercised through the hot-plug listener instead --
+        // otherwise its trailing zero would prove nothing.  Plugging in mic-2
+        // here also sets up the "selected device disappears" case below.
+        assert_eq!(
+            *changed_n.borrow(),
+            0,
+            "load() is not expected to emit on_devices_changed"
+        );
+        provider.simulate_device_change(vec![
+            mic1.clone(),
+            mic2.clone(),
+            cam1.clone(),
+            spk1.clone(),
+        ]);
+        flush().await;
+        assert_eq!(
+            *changed_n.borrow(),
+            1,
+            "the hot-plug listener should emit on_devices_changed, proving this \
+             counter observes emissions"
+        );
+
+        // Pin an explicit audio selection that is NOT the first device, so the
+        // refresh has to repair a selection whose device later disappears --
+        // exactly the case where the hot-plug listener DOES emit on_selected.
+        mdl.audio_inputs.select("mic-2");
+        assert_eq!(mdl.audio_inputs.selected(), "mic-2");
+        assert_eq!(mdl.audio_outputs.selected(), "spk-1");
+
+        // Everything after this point must leave all five counters at zero.
+        *loaded_n.borrow_mut() = 0;
+        *changed_n.borrow_mut() = 0;
+        *audio_n.borrow_mut() = 0;
+        *video_n.borrow_mut() = 0;
+        *output_n.borrow_mut() = 0;
+
+        // Swap the hardware set behind the provider *without* a devicechange
+        // event.  Every one of the three lists changes, and two of them lose
+        // the device that was selected: mic-2 and spk-1 are unplugged, cam-2
+        // and spk-2 are plugged in.
+        provider.set_devices_without_event(vec![
+            mic1.clone(),
+            cam1.clone(),
+            cam2.clone(),
+            spk2.clone(),
+        ]);
+
+        // Guard: the silent swap must not have updated anything by itself,
+        // otherwise the post-refresh assertions below would be vacuous.
+        assert_eq!(
+            device_ids(&mdl.audio_inputs.devices()),
+            ["mic-1", "mic-2"],
+            "a silent device swap must not update audio_inputs on its own"
+        );
+        assert_eq!(
+            device_ids(&mdl.video_inputs.devices()),
+            ["cam-1"],
+            "a silent device swap must not update video_inputs on its own"
+        );
+        assert_eq!(
+            device_ids(&mdl.audio_outputs.devices()),
+            ["spk-1"],
+            "a silent device swap must not update audio_outputs on its own"
+        );
+
+        mdl.refresh_devices_safely();
+        flush().await;
+
+        // Half 1 -- the refresh actually happened: every list re-enumerated ...
+        assert_eq!(
+            device_ids(&mdl.audio_inputs.devices()),
+            ["mic-1"],
+            "refresh should drop the unplugged mic-2 from audio_inputs"
+        );
+        assert_eq!(
+            device_ids(&mdl.video_inputs.devices()),
+            ["cam-1", "cam-2"],
+            "refresh should pick up the newly plugged cam-2"
+        );
+        assert_eq!(
+            device_ids(&mdl.audio_outputs.devices()),
+            ["spk-2"],
+            "refresh should swap the unplugged spk-1 for the new spk-2"
+        );
+
+        // ... and both now-dangling selections were repaired.
+        assert_eq!(
+            mdl.audio_inputs.selected(),
+            "mic-1",
+            "refresh should fall back to the first mic when the selected one disappears"
+        );
+        assert_eq!(
+            mdl.audio_outputs.selected(),
+            "spk-2",
+            "refresh should fall back to the first speaker when the selected one disappears"
+        );
+
+        // Half 2 -- and it did all of that silently, on all five callbacks.
+        assert_eq!(
+            *loaded_n.borrow(),
+            0,
+            "refresh_devices_safely must not emit on_loaded"
+        );
+        assert_eq!(
+            *changed_n.borrow(),
+            0,
+            "refresh_devices_safely must not emit on_devices_changed, even though \
+             all three device lists changed -- host.rs restarts the encoder on it"
+        );
+        assert_eq!(
+            *audio_n.borrow(),
+            0,
+            "refresh_devices_safely must not emit audio_inputs.on_selected, \
+             even when the selected device disappeared"
+        );
+        assert_eq!(
+            *video_n.borrow(),
+            0,
+            "refresh_devices_safely must not emit video_inputs.on_selected"
+        );
+        assert_eq!(
+            *output_n.borrow(),
+            0,
+            "refresh_devices_safely must not emit audio_outputs.on_selected, \
+             even when the selected device disappeared"
         );
     }
 }

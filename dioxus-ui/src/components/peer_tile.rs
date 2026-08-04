@@ -31,8 +31,8 @@ use crate::components::signal_quality::{
     SignalPopupState,
 };
 use crate::context::{
-    AppearanceSettingsCtx, MeetingTimeCtx, PeerSignalHistoryMap, SignalPopupStateMap,
-    VideoCallClientCtx,
+    AppearanceSettingsCtx, MeetingTimeCtx, PeerMetadataCtx, PeerSignalHistoryMap, RaisedHandsCtx,
+    SignalPopupStateMap, VideoCallClientCtx,
 };
 use dioxus::prelude::*;
 use futures::future::AbortHandle;
@@ -95,6 +95,74 @@ pub fn PeerTile(
     on_request_decode: EventHandler<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
+
+    // Issue 2103 follow-up (the #2125 e2e regression): the REACTIVE TRIGGER for
+    // this tile's IMPERATIVE peer-identity reads.
+    //
+    // `peer_uid_for_mute` below and `generate_for_peer` at the bottom resolve
+    // this peer's `user_id`, display name and guest flag through non-reactive
+    // `VideoCallClient` getters, which subscribe this scope to NOTHING. All
+    // three land asynchronously on `PARTICIPANT_JOINED`, which can arrive AFTER
+    // the first media packet has already created the peer and mounted this
+    // tile. Until issue 2103, the parent's unconditional `MeetingTimeCtx` write
+    // dirtied every tile on every parent render and refreshed those reads by
+    // ACCIDENT; change-guarding that write removed the accident and left the
+    // late-arriving name stranded, so the tile rendered the fallback `user_id`
+    // forever. Subscribing to the parent's change-guarded `PeerMetadataCtx`
+    // makes the refresh deliberate: this tile is dirtied when the metadata
+    // actually moves, and NOT merely because the parent re-rendered.
+    //
+    // `.read()`, not `()`: subscribing is the whole point, but cloning the
+    // snapshot once per tile per render is not. `try_use_context` because the
+    // provider is optional — isolated tests mount `PeerTile` without it, the
+    // same documented pattern `HostSetCtx` / `RecordingSetCtx` follow inside
+    // `generate_for_peer`.
+    let peer_metadata_ctx = try_use_context::<PeerMetadataCtx>();
+    if let Some(peer_metadata) = peer_metadata_ctx {
+        let _ = peer_metadata.0.read();
+    }
+
+    // Issue 2135: does THIS peer have a hand up?
+    //
+    // WHY A MEMO AND NOT A DIRECT READ. `RaisedHandsCtx` is a single room-wide
+    // `Signal<Vec<RaisedHand>>`, so ANY hand moving anywhere rewrites it. Reading
+    // it directly in this body (or, identically, inside the plain-`fn`
+    // `generate_for_peer`, whose context reads bind to THIS scope) subscribes
+    // this tile to all of them. That subscription is invisible to the
+    // stable-props memoization PR #2125 installed: props are compared only when
+    // a PARENT re-renders, whereas a signal write marks every subscribed scope
+    // dirty in the runtime directly. So the props gate never even runs, and a
+    // single hand wave in a 20-person Q&A re-rendered all N tiles — each one
+    // re-running this 1,200-line body plus the 1,155-line `generate_for_peer` —
+    // while the machine is already software-decoding up to 30 streams. The
+    // decode budget responds to that CPU by shedding tiles, so raising hands
+    // could itself trigger video shedding, in exactly the scenario the feature
+    // exists for.
+    //
+    // A `Memo` re-runs its closure on every roster change (an O(hands) scan,
+    // which is the cheap part) but only marks ITS subscribers dirty when the
+    // OUTPUT changes. The output here is one `bool` about one session, so a
+    // toggle dirties exactly the one tile whose own hand moved: N re-renders per
+    // toggle becomes 1, flat, regardless of queue depth or position.
+    //
+    // The queue ORDINAL is deliberately absent. It changes for every peer behind
+    // a raiser, so a per-tile memo of it would re-dirty most tiles and hand the
+    // fan-out straight back. It lives on the roster row instead — one component
+    // rendering all rows, one subscription — and in the banner.
+    //
+    // Capturing `peer_id` by value is safe because every `PeerTile` call site is
+    // keyed on the peer id (`key: "tile-{tile_id}"` / `"ss-active-{peer}"`), so a
+    // scope's `peer_id` prop never changes identity for the life of the scope.
+    let raised_hands_ctx = try_use_context::<RaisedHandsCtx>();
+    let hand_raised = {
+        let peer_id = peer_id.clone();
+        use_memo(move || {
+            raised_hands_ctx
+                .as_ref()
+                .map(|rh| rh.is_raised(&peer_id))
+                .unwrap_or(false)
+        })
+    };
 
     let mut audio_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
@@ -765,6 +833,9 @@ pub fn PeerTile(
         &appearance,
         on_request_decode,
         force_avatar,
+        // Reading the memo HERE (not the roster) is what keeps the subscription
+        // narrow: this scope depends on one `bool`, not on the whole roster.
+        hand_raised(),
     )
 }
 

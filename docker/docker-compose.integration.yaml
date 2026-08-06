@@ -1,3 +1,8 @@
+##
+## Middleware for the Rust integration tests. The tests themselves run
+## natively on the host (`make tests_run`) inside the pinned nix-shell —
+## there is no test container anymore.
+##
 services:
   postgres:
     image: postgres:12
@@ -5,6 +10,8 @@ services:
       POSTGRES_PASSWORD: "docker"
       PGPASSWORD: "docker"
       POSTGRES_DB: "actix-api-db"
+    ports:
+      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 2s
@@ -14,62 +21,5 @@ services:
   nats:
     image: nats:2.10-alpine
     command: ["-js", "--http_port", "8222"]
-
-  rust-tests:
-    build:
-      dockerfile: docker/Dockerfile.actix.dev
-      context: ../
-    working_dir: /app/actix-api
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-    environment:
-      - NIX_CONFIG=experimental-features = nix-command flakes
-      - RUST_LOG=info
-      - WEBTRANSPORT_URL=https://127.0.0.1:4433
-      - HEALTH_URL=http://127.0.0.1:5321/healthz
-      - NATS_URL=nats:4222
-      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
-      - DATABASE_ENABLED=true
-      - INSECURE=true
-      - LISTEN_URL=0.0.0.0:4433
-      - HEALTH_LISTEN_URL=0.0.0.0:5321
-      - CERT_PATH=certs/localhost.pem
-      - KEY_PATH=certs/localhost.key
-      - CARGO_TARGET_DIR=/app/actix-api/target
-      - CARGO_INCREMENTAL=1
-      - CARGO_NET_OFFLINE=false
-      - JWT_SECRET=test-secret-for-integration-tests
-    volumes:
-      - type: bind
-        source: ../
-        target: /app
-      - nix-store-it-tests:/nix
-      - rustlemania-it-tests-registry:/root/.cargo/registry
-      - rustlemania-it-tests-git:/root/.cargo/git
-      - rustlemania-it-tests-cache:/app/actix-api/target
-    depends_on:
-      postgres:
-        condition: service_healthy
-      nats:
-        condition: service_started
-    command: >
-      nix develop /app#backend-dev --command bash -c '
-        set -euo pipefail
-        echo "=== RUNNING DATABASE MIGRATIONS ==="
-        cd /app/dbmate && dbmate wait && dbmate up
-        cd /app/actix-api
-        echo "=== TESTING videocall-api ==="
-        cargo test -p videocall-api -- --nocapture --test-threads=1
-        echo "=== TESTING meeting-api ==="
-        cargo test -p meeting-api -- --nocapture --test-threads=1
-        echo "=== ALL TESTS FINISHED ==="
-      '
-
-volumes:
-  nix-store-it-tests:
-  rustlemania-it-tests-registry:
-  rustlemania-it-tests-git:
-  rustlemania-it-tests-cache:
-
-
+    ports:
+      - "4222:4222"

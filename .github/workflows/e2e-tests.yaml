@@ -13,6 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -23,6 +26,8 @@ jobs:
         working-directory: e2e
         run: npx playwright install --with-deps chromium
 
+      # e2e-build nix-builds the app images (natively — the runner is Linux)
+      # and docker-loads them; the e2e compose stack runs those images.
       - name: Run E2E pipeline
         run: make e2e-ci
 

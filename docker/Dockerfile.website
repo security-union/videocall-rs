@@ -1,21 +1,23 @@
+# Interim: the leptos website is the one image still built via Dockerfile
+# (Stage 3 of the nix migration turns it into a release.nix derivation like
+# the rest — see docs/nix-architecture.md). The builder uses the repo's native
+# Nix entry points (no flakes).
 FROM nixos/nix:2.33.2 AS builder
 
-ENV NIX_CONFIG="experimental-features = nix-command flakes"
+ENV NIX_CONFIG="experimental-features = nix-command"
 
 WORKDIR /app
 
-COPY flake.nix flake.lock ./
-
-RUN git init && git add flake.nix flake.lock
+COPY default.nix shell.nix release.nix ./
+COPY nix/ nix/
 
 # Downloads all tools from the Nix binary cache (~seconds).
-# This layer is cached by Docker as long as flake.nix/flake.lock are unchanged.
-RUN nix develop .#leptos-website --command true
+# This layer is cached by Docker as long as the nix/ pins are unchanged.
+RUN nix-shell default.nix -A shells.leptos-website --run true
 
 COPY leptos-website/ leptos-website/
-RUN git add leptos-website/
 
-RUN nix develop .#leptos-website --command bash -c "\
+RUN nix-shell default.nix -A shells.leptos-website --run "\
     cd leptos-website && \
     npm install && \
     cargo leptos build --release"

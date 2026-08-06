@@ -1,0 +1,43 @@
+// ┏┓╻+╻ ╱┏┳┓┏┓┏┳┓┏┓╻
+// ┃┃┃┃┗━┓╹┃╹┣┫┃┃┃┣┫┃   Read the manpage:
+// ╹┗┛╹╱ ╹ ╹ ╹╹╹ ╹╹╹┗┛  $ man nixtamal-manifest
+version "1.2.0"
+// All inputs are imported at Nix evaluation time (default.nix / shell.nix /
+// release.nix), so they must be fetched at eval via builtins.fetchTarball.
+default-fetch-time eval
+inputs {
+	nixpkgs {
+		archive {
+			url "https://github.com/NixOS/nixpkgs/archive/{{fresh_value}}.tar.gz"
+		}
+		hash algorithm=SHA-256
+		fresh-cmd {
+			$ git ls-remote "https://github.com/NixOS/nixpkgs.git" --refs "refs/heads/nixos-unstable"
+			| cut -f1
+		}
+	}
+	// Older nixpkgs tree that still carries cargo-leptos 0.2.42 — leptos 0.5.x
+	// requires cargo-leptos 0.2.x while newer trees ship 0.3.x. Frozen: this
+	// pin must never move on refresh; bumping it is a deliberate manifest edit.
+	nixpkgs-leptos frozen=#true {
+		archive {
+			url "https://github.com/NixOS/nixpkgs/archive/{{fresh_value}}.tar.gz"
+		}
+		hash algorithm=SHA-256
+		fresh-cmd {
+			$ echo "ee09932cedcef15aaf476f9343d1dea2cb77e261"
+		}
+	}
+	// Pinned Rust toolchains (stable 1.93.1, nightly 2024-11-01, musl + wasm
+	// targets) via the oxalica overlay.
+	rust-overlay {
+		archive {
+			url "https://github.com/oxalica/rust-overlay/archive/{{fresh_value}}.tar.gz"
+		}
+		hash algorithm=SHA-256
+		fresh-cmd {
+			$ git ls-remote "https://github.com/oxalica/rust-overlay.git" --refs "refs/heads/master"
+			| cut -f1
+		}
+	}
+}

@@ -10,8 +10,9 @@ on:
       - 'protobuf/**'
       - 'dioxus-ui/**'
       - '.github/workflows/wasm-test.yaml'
-      - 'flake.nix'
-      - 'flake.lock'
+      - 'default.nix'
+      - 'release.nix'
+      - 'nix/**'
   pull_request:
     paths:
       - 'videocall-client/**'
@@ -21,26 +22,22 @@ on:
       - 'protobuf/**'
       - 'dioxus-ui/**'
       - '.github/workflows/wasm-test.yaml'
-      - 'flake.nix'
-      - 'flake.lock'
+      - 'default.nix'
+      - 'release.nix'
+      - 'nix/**'
 
 jobs:
   wasm-test:
     name: WebAssembly Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: wasm32-unknown-unknown
-          override: true
-          profile: minimal
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Cache dependencies
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -50,23 +47,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-wasm-
 
-      - name: Install libvpx
-        run: sudo apt-get update && sudo apt-get install -y libvpx-dev
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
       - name: Run wasm-pack tests for videocall-client
-        run: cd videocall-client && wasm-pack test --node
+        run: nix-shell default.nix -A shells.wasm-tests --run "cd videocall-client && wasm-pack test --node"
 
       - name: Run tests for videocall-codecs (default, C-free)
-        run: cd videocall-codecs && cargo test
+        run: nix-shell default.nix -A shells.wasm-tests --run "cd videocall-codecs && cargo test"
 
       - name: Run oracle tests for videocall-codecs (libvpx)
-        run: cargo test -p videocall-codecs --features "libvpx test-utils"
+        run: nix-shell default.nix -A shells.wasm-tests --run 'cargo test -p videocall-codecs --features "libvpx test-utils"'
 
       - name: Run tests for neteq
-        run: cd neteq && cargo test --no-default-features --features web
+        run: nix-shell default.nix -A shells.wasm-tests --run "cd neteq && cargo test --no-default-features --features web"
 
   dioxus-ui-component-tests:
     name: Dioxus UI Component Tests
@@ -90,10 +81,10 @@ jobs:
 
       - name: Remove the runner's stock Chrome and chromedriver
         run: |
-          # The browser for the wasm component tests is pinned via the nix
-          # flake (google-chrome + matching chromedriver from nixpkgs).
-          # Delete the runner image's auto-updating Chrome/chromedriver so
-          # any fallback to them fails loudly instead of silently unpinning.
+          # The browser for the wasm component tests is nix-pinned
+          # (google-chrome + matching chromedriver from the nix/tamal nixpkgs
+          # pin). Delete the runner image's auto-updating Chrome/chromedriver
+          # so any fallback to them fails loudly instead of silently unpinning.
           sudo rm -rf /opt/google/chrome
           sudo rm -f /usr/bin/google-chrome /usr/bin/google-chrome-stable
           stock_driver="$(command -v chromedriver || true)"
@@ -104,5 +95,5 @@ jobs:
       - name: Run dioxus-ui component tests
         # All logic (pinned-browser verification, per-binary retry, wedged
         # Chrome cleanup) lives in nix/dioxus-ui-component-tests.sh, packaged
-        # and shellchecked by the flake.
-        run: nix develop .#frontend-tests --command dioxus-ui-component-tests
+        # and shellchecked via writeShellApplication (nix/shells.nix).
+        run: nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests

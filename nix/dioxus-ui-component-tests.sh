@@ -1,7 +1,7 @@
 # Dioxus UI wasm component tests, run against the nix-pinned headless
-# Chrome + chromedriver (see browserTestInputs in flake.nix). Invoke via:
+# Chrome + chromedriver (see browserTestInputs in nix/shells.nix). Invoke via:
 #
-#   nix develop .#frontend-tests --command dioxus-ui-component-tests
+#   nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests
 #
 # Packaged with writeShellApplication, so shellcheck gates the build and
 # `set -euo pipefail` is prepended automatically.
@@ -13,7 +13,7 @@
 # CI) kill leftover Chrome processes between attempts so a wedged renderer
 # can't starve later startups.
 
-if [ ! -f flake.nix ] || [ ! -d dioxus-ui ]; then
+if [ ! -f default.nix ] || [ ! -d dioxus-ui ]; then
   echo "error: must be run from the videocall-rs repo root" >&2
   exit 1
 fi

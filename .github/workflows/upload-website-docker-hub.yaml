@@ -7,6 +7,9 @@ on:
     paths:
       - 'leptos-website/**'
       - 'docker/Dockerfile.website'
+      # the builder stage uses the repo's nix shells
+      - 'default.nix'
+      - 'nix/**'
       
 jobs:
   build_and_push:

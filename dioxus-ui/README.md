@@ -148,7 +148,7 @@ window.__APP_CONFIG = Object.freeze({
 Or use the Nix devShell (includes all tools):
 
 ```bash
-nix develop .#frontend
+nix-shell default.nix -A shells.frontend
 ```
 
 ### Running Locally
@@ -271,7 +271,7 @@ CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --
 If you use the Nix devShell, all tooling is pre-installed:
 
 ```bash
-nix develop .#frontend
+nix-shell default.nix -A shells.frontend
 cd dioxus-ui
 CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown
 ```

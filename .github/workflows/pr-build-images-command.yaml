@@ -131,19 +131,31 @@ jobs:
         if: steps.check.outputs.authorized == 'false'
         run: exit 1
 
-  build-api:
-    name: Build API Docker image
+  build-images:
+    name: Build Docker images
     needs: check-permissions
     if: needs.check-permissions.outputs.authorized == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: media-server
+            attr: media-server
+            image: videocall-media-server
+          - name: meeting-api
+            attr: meeting-api
+            image: videocall-meeting-api
+          - name: dioxus-ui
+            attr: dioxus-ui
+            image: videocall-dioxus-ui
     steps:
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.check-permissions.outputs.pr_sha }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -152,93 +164,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push API Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.actix
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/videocall-media-server:pr-${{ needs.check-permissions.outputs.pr_number }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            GIT_SHA=${{ needs.check-permissions.outputs.pr_sha }}
-            GIT_BRANCH=${{ needs.check-permissions.outputs.pr_ref }}
-            BUILD_TIMESTAMP=${{ github.event.comment.created_at }}
-
-  build-meeting-api:
-    name: Build Meeting API Docker image
-    needs: check-permissions
-    if: needs.check-permissions.outputs.authorized == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout PR code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.check-permissions.outputs.pr_sha }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Meeting API Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.meeting-api
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/videocall-meeting-api:pr-${{ needs.check-permissions.outputs.pr_number }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            GIT_SHA=${{ needs.check-permissions.outputs.pr_sha }}
-            GIT_BRANCH=${{ needs.check-permissions.outputs.pr_ref }}
-            BUILD_TIMESTAMP=${{ github.event.comment.created_at }}
-
-  build-ui:
-    name: Build UI Docker image
-    needs: check-permissions
-    if: needs.check-permissions.outputs.authorized == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout PR code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.check-permissions.outputs.pr_sha }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push UI Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.dioxus
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/videocall-dioxus-ui:pr-${{ needs.check-permissions.outputs.pr_number }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            GIT_SHA=${{ needs.check-permissions.outputs.pr_sha }}
-            GIT_BRANCH=${{ needs.check-permissions.outputs.pr_ref }}
-            BUILD_TIMESTAMP=${{ github.event.comment.created_at }}
+      # nix.dev flow: docker load < $(nix-build …) — same release.nix attrs as
+      # the Docker Hub publish workflows and `make images` locally.
+      - name: Build and push ${{ matrix.name }}
+        run: |
+          script=$(nix-build release.nix -A images.${{ matrix.attr }} --no-out-link \
+            --argstr gitSha "${{ needs.check-permissions.outputs.pr_sha }}" \
+            --argstr gitBranch "${{ needs.check-permissions.outputs.pr_ref }}" \
+            --argstr buildTimestamp "${{ github.event.comment.created_at }}")
+          "$script" | docker load
+          docker tag videocall/${{ matrix.attr }}:dev ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:pr-${{ needs.check-permissions.outputs.pr_number }}
+          docker push ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:pr-${{ needs.check-permissions.outputs.pr_number }}
 
   comment-success:
     name: Comment with image tags
-    needs: [check-permissions, build-api, build-meeting-api, build-ui]
+    needs: [check-permissions, build-images]
     if: needs.check-permissions.outputs.authorized == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -283,11 +223,11 @@ jobs:
 
   comment-failure:
     name: Comment on failure
-    needs: [check-permissions, build-api, build-meeting-api, build-ui]
+    needs: [check-permissions, build-images]
     if: |
       always() &&
       needs.check-permissions.outputs.authorized == 'true' &&
-      (needs.build-api.result == 'failure' || needs.build-meeting-api.result == 'failure' || needs.build-ui.result == 'failure')
+      needs.build-images.result == 'failure'
     runs-on: ubuntu-latest
     steps:
       - name: React to comment (failure)

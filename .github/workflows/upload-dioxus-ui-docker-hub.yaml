@@ -12,10 +12,9 @@ on:
       - 'videocall-client/**'
       - 'videocall-codecs/**'
       - 'neteq/**'
-      - Dockerfile.dioxus
-      - nginx.conf
-      - flake.nix
-      - flake.lock
+      - default.nix
+      - release.nix
+      - 'nix/**'
 
 jobs:
   push_to_registry:
@@ -23,8 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         id: checkout
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Log in to Docker Hub
         uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
@@ -40,16 +42,16 @@ jobs:
         id: extract_branch
         run: echo "branch=$(echo ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}} | sed 's/\//-/g')" >> "$GITHUB_OUTPUT"
 
+      # nix.dev flow: docker load < $(nix-build …) — the same release.nix attr
+      # `make image-dioxus-ui` builds locally.
       - name: Build and push Dioxus UI Docker image
-        uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
-        with:
-          context: .
-          file: Dockerfile.dioxus
-          push: true
-          tags: |
-            securityunion/videocall-dioxus-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
-            securityunion/videocall-dioxus-ui:latest
-          build-args: |
-            GIT_SHA=${{ steps.extract_sha.outputs.sha8 }}
-            GIT_BRANCH=${{ steps.extract_branch.outputs.branch }}
-            BUILD_TIMESTAMP=${{ github.event.head_commit.timestamp }}
+        run: |
+          script=$(nix-build release.nix -A images.dioxus-ui --no-out-link \
+            --argstr gitSha "${{ steps.extract_sha.outputs.sha8 }}" \
+            --argstr gitBranch "${{ steps.extract_branch.outputs.branch }}" \
+            --argstr buildTimestamp "${{ github.event.head_commit.timestamp }}")
+          "$script" | docker load
+          docker tag videocall/dioxus-ui:dev securityunion/videocall-dioxus-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+          docker tag videocall/dioxus-ui:dev securityunion/videocall-dioxus-ui:latest
+          docker push securityunion/videocall-dioxus-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+          docker push securityunion/videocall-dioxus-ui:latest

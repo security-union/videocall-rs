@@ -5,13 +5,15 @@ on:
     branches: [ main ]
     paths:
       - 'leptos-website/**'
-      - 'flake.nix'
-      - 'flake.lock'
+      - 'default.nix'
+      - 'release.nix'
+      - 'nix/**'
   pull_request:
     paths:
       - 'leptos-website/**'
-      - 'flake.nix'
-      - 'flake.lock'
+      - 'default.nix'
+      - 'release.nix'
+      - 'nix/**'
 
 jobs:
   leptos-build:
@@ -36,7 +38,7 @@ jobs:
 
       - name: Build Leptos website
         run: |
-          nix develop .#leptos-website --command bash -c "\
+          nix-shell default.nix -A shells.leptos-website --run "\
             cd leptos-website && \
             npm install && \
             cargo leptos build --release"

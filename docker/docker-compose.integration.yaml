@@ -5,7 +5,7 @@
 ##
 services:
   postgres:
-    image: postgres:12
+    image: postgres:18
     environment:
       POSTGRES_PASSWORD: "docker"
       PGPASSWORD: "docker"

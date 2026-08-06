@@ -22,9 +22,14 @@ let
 
   postgresRun = pkgs.writeShellApplication {
     name = "dev-stack-postgres";
-    runtimeInputs = [ pkgs.postgresql_16 ];
+    runtimeInputs = [ pkgs.postgresql_18 ];
     text = ''
       PGDATA="$PWD/.data/postgres"
+      if [ -s "$PGDATA/PG_VERSION" ] && [ "$(cat "$PGDATA/PG_VERSION")" != "18" ]; then
+        echo "error: $PGDATA was initialized by postgres $(cat "$PGDATA/PG_VERSION"), but the dev stack runs 18." >&2
+        echo "       Dev data is disposable: rm -rf $PGDATA and rerun." >&2
+        exit 1
+      fi
       if [ ! -s "$PGDATA/PG_VERSION" ]; then
         initdb -D "$PGDATA" -U postgres --auth=trust --auth-host=trust --encoding=UTF8
       fi
@@ -39,7 +44,7 @@ let
   # POSTGRES_DB env var played in the postgres container)
   postgresInit = pkgs.writeShellApplication {
     name = "dev-stack-postgres-init";
-    runtimeInputs = [ pkgs.postgresql_16 ];
+    runtimeInputs = [ pkgs.postgresql_18 ];
     text = ''
       if ! psql -h 127.0.0.1 -U postgres -lqt | cut -d'|' -f1 | grep -qw actix-api-db; then
         createdb -h 127.0.0.1 -U postgres actix-api-db
@@ -270,7 +275,7 @@ pkgs.writeShellApplication {
   name = "dev-stack";
   runtimeInputs = [
     pkgs.process-compose
-    pkgs.postgresql_16 # pg_isready for the readiness probe
+    pkgs.postgresql_18 # pg_isready for the readiness probe
     pkgs.dbmate
   ];
   text = ''

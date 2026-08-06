@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # Usage:
-#   ./git-squash-all.sh [feature_branch] [base_branch] [squash_branch_name]
+#   ./scripts/git_squash_all.sh [feature_branch] [base_branch] [squash_branch_name]
 #
 # Example:
-#   ./git-squash-all.sh branch_a master branch_a_squashed
+#   ./scripts/git_squash_all.sh branch_a master branch_a_squashed
 #
 # Description:
 #   This script creates or resets a "squash branch" off the base branch

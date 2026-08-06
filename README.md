@@ -36,7 +36,6 @@ An open-source, ultra-low-latency video conferencing platform and API built with
   - [Prerequisites](#prerequisites)
   - [Docker Setup](#docker-setup)
   - [Nix Build System (WIP)](#nix-build-system-wip)
-  - [Manual Setup](#manual-setup)
 - [Runtime Configuration](#runtime-configuration-frontend-configjs)
   - [Local (no Docker)](#local-no-docker-create-dioxus-uiscriptsconfigjs)
   - [Local/Docker](#localdocker-start-dioxussh)
@@ -52,7 +51,6 @@ An open-source, ultra-low-latency video conferencing platform and API built with
   - [E2E Testing (Playwright)](#e2e-testing-playwright)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
-- [Project Structure](#project-structure)
 - [Demos and Media](#demos-and-media)
 - [Contributors](#contributors)
 - [License](#license)
@@ -111,7 +109,7 @@ For developers integrating videocall.rs, this means:
 - ✅ Less time spent debugging connectivity issues
 - ✅ A forward-looking technology investment
 
-Read our [Architecture Document](ARCHITECTURE.md) for a deep dive into how we implement WebTransport and the technical benefits it provides.
+Read our [Architecture Document](docs/ARCHITECTURE.md) for a deep dive into how we implement WebTransport and the technical benefits it provides.
 
 ## System Architecture
 
@@ -132,7 +130,7 @@ graph TD
 5. **videocall-cli:** Command-line interface for headless video streaming
 
 
-For a more detailed explanation of the system architecture, please see our [Architecture Document](ARCHITECTURE.md).
+For a more detailed explanation of the system architecture, please see our [Architecture Document](docs/ARCHITECTURE.md).
 
 ## Getting Started
 
@@ -200,8 +198,6 @@ The quickest way to get started is with our Docker-based setup:
 
 We are migrating the build infrastructure to [Nix](https://nixos.org/) for reproducible, fast builds. Currently the `leptos-website` is the first component being nixified.
 
-**Status:** Work in progress — see the `nixify-docker-build` branch.
-
 **What Nix replaces:** Previously, Docker builds spent 15-20 minutes compiling tools like `cargo-leptos` and `wasm-bindgen-cli` from source on every build. Nix provides these as pre-built binaries from the binary cache, reducing tool setup from minutes to seconds.
 
 **What's done so far:**
@@ -215,46 +211,13 @@ The integration is transparent to the user, and the development experience is th
 
 **What's next:** Nixifying additional components (actix-api, dioxus-ui) and evaluating [crane](https://github.com/ipetkov/crane) for full Nix-managed Rust dependency caching.
 
-### Manual Setup (Experimental)
-
-⚠️ **Warning**: This setup method is experimental and not as well maintained as the Docker approach. You may encounter issues that require manual debugging.
-
-For advanced users who prefer to run services directly on their machine:
-
-1. Create a PostgreSQL database:
-   ```
-   createdb actix-api-db
-   ```
-
-2. Install required tools:
-   ```
-   # Install NATS server
-   curl -L https://github.com/nats-io/nats-server/releases/download/v2.9.8/nats-server-v2.9.8-linux-amd64.tar.gz | tar xz
-   sudo mv nats-server-v2.9.8-linux-amd64/nats-server /usr/local/bin
-   
-   # Install trurl
-   cargo install trurl
-   ```
-
-3. Start the development environment:
-   ```
-   ./start_dev.sh
-   ```
-
-4. Connect to:
-   ```
-   http://localhost:8081/meeting/<meeting-id>
-   ```
-
-For detailed configuration options, see our [setup documentation](https://docs.videocall.rs/setup).
-
 ## Runtime Configuration (Frontend config.js)
 
 The frontend is configured at runtime via a `window.__APP_CONFIG` object provided by a `config.js` file. The file is copied by Trunk and loaded at `/config.js` by `dioxus-ui/index.html`.
 
 ### Local (no Docker): create dioxus-ui/scripts/config.js
 
-- Start services with `./start_dev.sh`.
+- Start services with `make up`.
 - Create `dioxus-ui/scripts/config.js` that assigns `window.__APP_CONFIG = Object.freeze({...})`.
 - Keep the keys in sync with the authoritative sources below. Trunk will copy the file and the app will pick it up on refresh.
 - Tip: `mkdir -p dioxus-ui/scripts` to ensure the directory exists.
@@ -389,7 +352,7 @@ Our server-side architecture is designed for efficiency at scale:
 - **Resource Governance:** Configurable limits for bandwidth, connections, and CPU utilization
 - **Container-Optimized:** Designed for efficient deployment in Kubernetes environments
 
-Performance metrics and tuning guidelines will be available in our [performance documentation](PERFORMANCE.md). (WIP)
+Performance metrics and tuning guidelines will be available in our [performance documentation](docs/PERFORMANCE.md). (WIP)
 
 ## Security
 
@@ -507,13 +470,30 @@ See the `e2e-*` targets in the `Makefile` for available commands.
 
 ## Roadmap
 
-| Version | Target Date | Key Features |
-|---------|------------|--------------|
-| 0.6.0   | Q3 2023    | ✅ Safari Browser Support |
-| 0.7.0   | Q4 2023    | ✅ Native Mobile SDKs |
-| 0.5.0   | Q2 2023    | ✅ JWT Authentication & SSO |
-| 0.8.0   | Q1 2024    | 🔄 Screen Sharing Improvements |
-| 1.0.0   | Q2 2024    | 🔄 Production Release with Full API Stability |
+| Quarter | Release | Deliverable |
+|---------|---------|-------------|
+| Q2 2023 | 0.5.0 | ✅ JWT authentication & SSO |
+| Q3 2023 | 0.6.0 | ✅ Safari browser support |
+| Q4 2023 | 0.7.0 | ✅ Native mobile SDKs |
+| Q3 2024 | — | ✅ videocall.rs website launched, with Matomo analytics for self-hosted usage insight ([#169](https://github.com/security-union/videocall-rs/pull/169), [#170](https://github.com/security-union/videocall-rs/pull/170)) |
+| Q3 2024 | — | ✅ Postgres made optional and a DigitalOcean deployment path documented, plus WebTransport connection fixes ([#163](https://github.com/security-union/videocall-rs/pull/163), [#165](https://github.com/security-union/videocall-rs/pull/165)) |
+| Q4 2024 | — | ✅ `videocall-daemon` released — headless streaming for robotics and embedded targets ([#176](https://github.com/security-union/videocall-rs/pull/176)) |
+| Q4 2024 | — | ✅ macOS builds for the daemon and Ubuntu 24 base images ([#177](https://github.com/security-union/videocall-rs/pull/177), [#173](https://github.com/security-union/videocall-rs/pull/173)) |
+| Q1 2025 | `videocall-client` 1.0.0 | ✅ Whole workspace published to crates.io at 1.0.0 with `release-plz` automation; daemon renamed to `videocall-cli` ([#222](https://github.com/security-union/videocall-rs/pull/222), [#212](https://github.com/security-union/videocall-rs/pull/212), [#185](https://github.com/security-union/videocall-rs/pull/185)) |
+| Q1 2025 | `videocall-client` 1.1.6 | ✅ In-call diagnostics panel, Yew UI redesign, and multi-peer bitrate control ([#206](https://github.com/security-union/videocall-rs/pull/206), [#196](https://github.com/security-union/videocall-rs/pull/196), [#242](https://github.com/security-union/videocall-rs/pull/242)) |
+| Q2 2025 | `videocall-sdk` 0.1.0 | ✅ iOS and Android bindings shipped as `videocall-sdk` ([#253](https://github.com/security-union/videocall-rs/pull/253)) |
+| Q2 2025 | `videocall-codecs` 0.1.1 | ✅ Full Safari support via a WASM Opus encoder, plus the `videocall-codecs` crate with a jitter-buffered decoder ([#266](https://github.com/security-union/videocall-rs/pull/266), [#282](https://github.com/security-union/videocall-rs/pull/282), [#285](https://github.com/security-union/videocall-rs/pull/285)) |
+| Q3 2025 | `neteq` 0.1.0 | ✅ NetEQ adaptive audio jitter buffer ported to Rust/WASM and rolled out to every browser through an AudioWorklet ([#305](https://github.com/security-union/videocall-rs/pull/305), [#310](https://github.com/security-union/videocall-rs/pull/310), [#315](https://github.com/security-union/videocall-rs/pull/315)) |
+| Q3 2025 | `videocall-cli` 3.0.0 | ✅ Prometheus + Grafana diagnostics and multi-region HA; CLI drops raw QUIC in favour of WebTransport ([#365](https://github.com/security-union/videocall-rs/pull/365), [#325](https://github.com/security-union/videocall-rs/pull/325), [#410](https://github.com/security-union/videocall-rs/pull/410)) |
+| Q4 2025 | `videocall-client` 1.1.28 | ✅ End-to-end OAuth / SSO sign-in with configurable cookie domain ([#471](https://github.com/security-union/videocall-rs/pull/471), [#485](https://github.com/security-union/videocall-rs/pull/485)) |
+| Q4 2025 | `videocall-client` 1.1.29 | ✅ Meeting ownership behind a feature flag, and a NetEQ overhaul with WebCodecs support ([#503](https://github.com/security-union/videocall-rs/pull/503), [#466](https://github.com/security-union/videocall-rs/pull/466)) |
+| Q1 2026 | `videocall-client` 4.0.5 | ✅ Dioxus UI became the sole frontend and Yew was removed; WebTransport server consolidated onto an actor model ([#646](https://github.com/security-union/videocall-rs/pull/646), [#788](https://github.com/security-union/videocall-rs/pull/788), [#551](https://github.com/security-union/videocall-rs/pull/551)) |
+| Q1 2026 | `videocall-types` 5.0.0 | ✅ Nix-based builds across backend, UI, and website; per-PR preview environments; Playwright E2E suite ([#639](https://github.com/security-union/videocall-rs/pull/639), [#672](https://github.com/security-union/videocall-rs/pull/672), [#714](https://github.com/security-union/videocall-rs/pull/714)) |
+| Q1 2026 | `videocall-client` 4.0.5 | ✅ Adaptive quality stack: PID-driven encoder adaptation, PLI keyframe requests, and decoder visibility skipping ([#758](https://github.com/security-union/videocall-rs/pull/758), [#761](https://github.com/security-union/videocall-rs/pull/761), [#762](https://github.com/security-union/videocall-rs/pull/762)) |
+| Q2 2026 | `videocall-cli` 4.0.0 | ✅ Pure-Rust audio — `audiopus-sys`/libopus removed workspace-wide in favour of `ropus` ([#872](https://github.com/security-union/videocall-rs/pull/872)) |
+| Q2 2026 | `videocall-types` 6.0.0 | ✅ Dioxus UI Helm chart with relay Prometheus annotations, reworked screen sharing, and audio-level re-render fixes ([#757](https://github.com/security-union/videocall-rs/pull/757), [#817](https://github.com/security-union/videocall-rs/pull/817), [#816](https://github.com/security-union/videocall-rs/pull/816)) |
+| Q3 2026 | unreleased | ✅ Pure-Rust VP9 encoder and decoder — C libvpx removed from `videocall-cli` and the bot ([#884](https://github.com/security-union/videocall-rs/pull/884)) |
+| Q3 2026 | unreleased | ✅ SQLite available as an optional database backend for `meeting-api`, alongside Postgres ([#802](https://github.com/security-union/videocall-rs/pull/802)) |
 
 
 ## Contributing
@@ -524,9 +504,7 @@ We welcome contributions from the community! Here's how to get involved:
 
 2. **Pull Requests:** Submit PRs for bug fixes or enhancements
 
-3. **RFC Process:** For significant changes, participate in our [RFC process](/rfc)
-
-4. **Community:** Join our [Discord server](https://discord.gg/JP38NRe4CJ) to discuss development
+3. **Community:** Join our [Discord server](https://discord.gg/JP38NRe4CJ) to discuss development
 
 See our [Contributing Guidelines](CONTRIBUTING.md) for more detailed information.
 
@@ -547,7 +525,7 @@ See our [Contributing Guidelines](CONTRIBUTING.md) for more detailed information
 - **Type Safety**: Extensive use of Rust's type system to prevent runtime errors
 - **Binary Protocol**: Efficient Protocol Buffer serialization for all messages
 
-For a more comprehensive technical overview, see the [Architecture Document](ARCHITECTURE.md).
+For a more comprehensive technical overview, see the [Architecture Document](docs/ARCHITECTURE.md).
 
 ### Git Hooks
 

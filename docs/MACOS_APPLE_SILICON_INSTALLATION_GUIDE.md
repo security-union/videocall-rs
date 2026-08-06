@@ -78,7 +78,7 @@ Wait for: `Serving on http://0.0.0.0:3001`
 
 ```bash
 # Launch Chrome with WebTransport support
-./launch_chrome.sh
+./scripts/launch_chrome.sh
 
 # Navigate to:
 http://localhost/meeting/<your-name>/<room-name>

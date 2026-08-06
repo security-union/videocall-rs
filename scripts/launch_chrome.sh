@@ -3,10 +3,12 @@
 set -e
 
 SCRIPTPATH="$( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )"
-CERTSPATH="$SCRIPTPATH/actix-api/certs"
+REPO_ROOT="$( dirname "$SCRIPTPATH" )"
+CERTSPATH="$REPO_ROOT/actix-api/certs"
 
 if ! [ -f "$CERTSPATH/localhost.der" ] ; then
     echo "Generating certificate in $CERTSPATH"
+    mkdir -p "$CERTSPATH"
     openssl req -x509 -newkey rsa:2048 -keyout "$CERTSPATH/localhost.key" -out "$CERTSPATH/localhost.pem" -days 365 -nodes -subj "/CN=127.0.0.1"
     openssl x509 -in "$CERTSPATH/localhost.pem" -outform der -out "$CERTSPATH/localhost.der"
     openssl rsa -in "$CERTSPATH/localhost.key" -outform DER -out "$CERTSPATH/localhost_key.der"

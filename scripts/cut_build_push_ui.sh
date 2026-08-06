@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+# Docker build context is the repo root; this script lives in scripts/
+SCRIPTPATH="$( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )"
+cd "$( dirname "$SCRIPTPATH" )"
+
 REGISTRY="${REGISTRY:-securityunion}"
 
 TAG="${1:-$(git rev-parse HEAD)}"

@@ -44,7 +44,7 @@ pub fn SolutionsSection() -> impl IntoView {
                         "Simpler server infrastructure".to_string(),
                     ]
                     link_text="Learn More"
-                    link_href="https://github.com/security-union/videocall-rs/blob/main/ARCHITECTURE.md"
+                    link_href="https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md"
                 />
 
                 <SolutionCard
@@ -56,7 +56,7 @@ pub fn SolutionsSection() -> impl IntoView {
                         "Real-time optimization".to_string(),
                     ]
                     link_text="See Performance"
-                    link_href="https://github.com/security-union/videocall-rs/blob/main/ARCHITECTURE.md"
+                    link_href="https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md"
                 />
 
                 <SolutionCard

@@ -266,6 +266,8 @@ pkgs.writeShellApplication {
       exit 1
     fi
     mkdir -p .data
-    exec process-compose up -f ${configFile} "$@"
+    # process-compose's own REST API defaults to :8080, which shadows the
+    # websocket server on 127.0.0.1 — park it well out of the way.
+    exec process-compose up -f ${configFile} --port 28080 "$@"
   '';
 }

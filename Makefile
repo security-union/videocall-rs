@@ -1,7 +1,9 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-interop e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
+.PHONY: tests_up tests_sqlite_run test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-interop e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
+
+SQLITE_TEST_DB := /tmp/meeting_api_test.sqlite3
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -19,6 +21,15 @@ tests_build:
 
 tests_down:
 	docker compose -f $(COMPOSE_IT) down -v
+
+# Run the meeting-api integration tests against a local SQLite database.
+# Requires the `dbmate` binary on PATH. Serialized (--test-threads=1) because
+# tests share the single SQLite file.
+tests_sqlite_run:
+	rm -f $(SQLITE_TEST_DB) $(SQLITE_TEST_DB)-wal $(SQLITE_TEST_DB)-shm
+	cd dbmate/sqlite && DATABASE_URL="sqlite:$(SQLITE_TEST_DB)" dbmate up
+	DATABASE_URL="sqlite:$(SQLITE_TEST_DB)" \
+		cargo test -p meeting-api --no-default-features --features sqlite -- --test-threads=1
 
 COMPOSE := docker compose --env-file .env -f docker/docker-compose.yaml
 

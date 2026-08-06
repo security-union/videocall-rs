@@ -16,14 +16,14 @@
 use std::sync::Arc;
 
 use crate::config::{Config, OAuthConfig};
+use crate::db::DbPool;
 use crate::oauth::JwksCache;
-use sqlx::PgPool;
 
 /// Application state shared across all request handlers.
 #[derive(Clone)]
 pub struct AppState {
-    /// PostgreSQL connection pool.
-    pub db: PgPool,
+    /// Database connection pool (PostgreSQL or SQLite depending on feature flag).
+    pub db: DbPool,
     /// JWT signing secret (shared with the Media Server).
     pub jwt_secret: String,
     /// Room access token time-to-live in seconds.
@@ -52,7 +52,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: PgPool, config: &Config, nats: Option<async_nats::Client>) -> Self {
+    pub fn new(db: DbPool, config: &Config, nats: Option<async_nats::Client>) -> Self {
         let jwks_cache = config
             .oauth
             .as_ref()

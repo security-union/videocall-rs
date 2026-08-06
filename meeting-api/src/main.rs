@@ -20,7 +20,6 @@ use axum::http;
 use meeting_api::config::Config;
 use meeting_api::routes;
 use meeting_api::state::AppState;
-use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
@@ -38,13 +37,42 @@ async fn main() {
         .await
         .expect("OIDC discovery failed");
 
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&config.database_url)
-        .await
-        .expect("failed to connect to PostgreSQL");
+    #[cfg(feature = "postgres")]
+    let pool = {
+        use sqlx::postgres::PgPoolOptions;
+        let pool = PgPoolOptions::new()
+            .max_connections(20)
+            .connect(&config.database_url)
+            .await
+            .expect("failed to connect to PostgreSQL");
+        tracing::info!("Connected to PostgreSQL");
+        pool
+    };
 
-    tracing::info!("Connected to PostgreSQL");
+    #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+    let pool = {
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+        use std::str::FromStr;
+        use std::time::Duration;
+
+        // Configure PRAGMAs on the connect options so every pooled connection
+        // gets them (a one-shot `PRAGMA` only affects a single connection), and
+        // enable foreign keys so `ON DELETE CASCADE` actually fires. No
+        // create_if_missing: dbmate provisions the file, so a missing database
+        // should fail fast rather than silently create an empty one.
+        let options = SqliteConnectOptions::from_str(&config.database_url)
+            .expect("invalid SQLite DATABASE_URL")
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .expect("failed to connect to SQLite");
+        tracing::info!("Connected to SQLite");
+        pool
+    };
 
     // Connect to NATS if configured. The server works without NATS (graceful degradation).
     let nats = match &config.nats_url {

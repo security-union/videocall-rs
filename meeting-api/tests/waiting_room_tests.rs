@@ -26,7 +26,7 @@ use videocall_meeting_types::{
 };
 
 /// Create a meeting, have host join, and add an attendee to the waiting room.
-async fn setup_with_waiting_attendee(pool: &sqlx::PgPool, room_id: &str) {
+async fn setup_with_waiting_attendee(pool: &meeting_api::db::DbPool, room_id: &str) {
     cleanup_test_data(pool, room_id).await;
 
     // Create meeting.

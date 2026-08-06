@@ -12,27 +12,18 @@
  */
 
 //! Meeting participant table queries.
+//!
+//! Shared across the PostgreSQL and SQLite backends. `$N` placeholders are
+//! parsed natively by both sqlx drivers, so the query strings are identical;
+//! the only backend-specific pieces come from [`crate::db`] helpers
+//! ([`SQL_NOW`], [`FOR_UPDATE`], [`begin_write_tx`], [`with_busy_retry`]).
+//!
+//! `updated_at` is written explicitly in every UPDATE / `DO UPDATE`. On
+//! PostgreSQL an AFTER-UPDATE trigger would also maintain it (harmless double
+//! write); the SQLite migration drops that trigger because SQLite computes
+//! `RETURNING` before AFTER-triggers fire.
 
-use chrono::{DateTime, Utc};
-use sqlx::PgPool;
-
-/// Row returned from the `meeting_participants` table.
-#[derive(Debug, sqlx::FromRow)]
-#[allow(dead_code)]
-pub struct ParticipantRow {
-    pub id: i32,
-    pub meeting_id: i32,
-    pub user_id: String,
-    pub status: String,
-    pub is_host: bool,
-    pub is_required: bool,
-    pub joined_at: DateTime<Utc>,
-    pub admitted_at: Option<DateTime<Utc>>,
-    pub left_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub display_name: Option<String>,
-}
+use crate::db::{begin_write_tx, with_busy_retry, DbPool, ParticipantRow, FOR_UPDATE, SQL_NOW};
 
 const PARTICIPANT_COLUMNS: &str = r#"
     id, meeting_id, user_id, status, is_host, is_required,
@@ -41,7 +32,7 @@ const PARTICIPANT_COLUMNS: &str = r#"
 
 /// Insert or update a participant as host (admitted immediately).
 pub async fn upsert_host(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
@@ -49,9 +40,10 @@ pub async fn upsert_host(
     let query = format!(
         r#"
         INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
-        VALUES ($1, $2, 'admitted', TRUE, $3, NOW())
+        VALUES ($1, $2, 'admitted', TRUE, $3, {SQL_NOW})
         ON CONFLICT (meeting_id, user_id)
-        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(), left_at = NULL,
+        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = {SQL_NOW}, left_at = NULL,
+                      updated_at = {SQL_NOW},
                       display_name = COALESCE($3, meeting_participants.display_name)
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -64,28 +56,44 @@ pub async fn upsert_host(
         .await
 }
 
-/// Atomically join a meeting as an attendee, respecting the current `waiting_room_enabled`
-/// setting. Locks the meeting row with `FOR UPDATE` to serialize against concurrent
-/// waiting room toggles via `update_waiting_room_enabled`.
+/// Atomically join a meeting as an attendee, respecting the current
+/// `waiting_room_enabled` setting.
 ///
-/// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where `auto_admitted`
-/// is `true` when the participant was immediately admitted (waiting room disabled).
-/// The third element is the `waiting_room_enabled` value observed under the row lock,
-/// which avoids stale reads from a pre-transaction fetch.
+/// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where
+/// `auto_admitted` is `true` when the participant was immediately admitted
+/// (waiting room disabled). The third element is the `waiting_room_enabled`
+/// value observed under the write lock, which avoids stale reads from a
+/// pre-transaction fetch.
+///
+/// The join is serialized against concurrent waiting-room toggles
+/// ([`crate::db::meetings::update_waiting_room_enabled`]): PostgreSQL locks the
+/// meeting row with `FOR UPDATE`; SQLite takes the database write lock up front
+/// via `BEGIN IMMEDIATE` and retries on `SQLITE_BUSY` (see [`with_busy_retry`]).
 pub async fn join_attendee(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    with_busy_retry(|| join_attendee_tx(pool, meeting_id, user_id, display_name)).await
+}
+
+async fn join_attendee_tx(
+    pool: &DbPool,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
+    let mut tx = begin_write_tx(pool).await?;
 
     // Lock the meeting row to serialize against concurrent waiting room toggles.
-    let (waiting_room_enabled,): (bool,) =
-        sqlx::query_as("SELECT waiting_room_enabled FROM meetings WHERE id = $1 FOR UPDATE")
-            .bind(meeting_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    // On SQLite `FOR_UPDATE` is empty (the BEGIN IMMEDIATE write lock suffices).
+    let lock_select =
+        format!("SELECT waiting_room_enabled FROM meetings WHERE id = $1{FOR_UPDATE}");
+    let (waiting_room_enabled,): (bool,) = sqlx::query_as(&lock_select)
+        .bind(meeting_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     let row = if waiting_room_enabled {
         let query = format!(
@@ -93,7 +101,7 @@ pub async fn join_attendee(
             INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name)
             VALUES ($1, $2, 'waiting', FALSE, $3)
             ON CONFLICT (meeting_id, user_id)
-            DO UPDATE SET status = 'waiting', left_at = NULL,
+            DO UPDATE SET status = 'waiting', left_at = NULL, updated_at = {SQL_NOW},
                           display_name = COALESCE($3, meeting_participants.display_name)
             RETURNING {PARTICIPANT_COLUMNS}
             "#
@@ -108,9 +116,10 @@ pub async fn join_attendee(
         let query = format!(
             r#"
             INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
-            VALUES ($1, $2, 'admitted', FALSE, $3, NOW())
+            VALUES ($1, $2, 'admitted', FALSE, $3, {SQL_NOW})
             ON CONFLICT (meeting_id, user_id)
-            DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
+            DO UPDATE SET status = 'admitted', admitted_at = {SQL_NOW}, left_at = NULL,
+                          updated_at = {SQL_NOW},
                           display_name = COALESCE($3, meeting_participants.display_name)
             RETURNING {PARTICIPANT_COLUMNS}
             "#
@@ -129,7 +138,7 @@ pub async fn join_attendee(
 
 /// Get all participants in 'waiting' status for a meeting.
 pub async fn get_waiting(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
 ) -> Result<Vec<ParticipantRow>, sqlx::Error> {
     let query = format!(
@@ -143,7 +152,7 @@ pub async fn get_waiting(
 
 /// Get all admitted (active) participants in a meeting.
 pub async fn get_admitted(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
 ) -> Result<Vec<ParticipantRow>, sqlx::Error> {
     let query = format!(
@@ -157,7 +166,7 @@ pub async fn get_admitted(
 
 /// Get a single participant's status.
 pub async fn get_status(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
@@ -173,14 +182,14 @@ pub async fn get_status(
 
 /// Admit a single participant.
 pub async fn admit(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'admitted', admitted_at = NOW()
+        SET status = 'admitted', admitted_at = {SQL_NOW}, updated_at = {SQL_NOW}
         WHERE meeting_id = $1 AND user_id = $2 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -193,11 +202,11 @@ pub async fn admit(
 }
 
 /// Admit all waiting participants at once.
-pub async fn admit_all(pool: &PgPool, meeting_id: i32) -> Result<Vec<ParticipantRow>, sqlx::Error> {
+pub async fn admit_all(pool: &DbPool, meeting_id: i32) -> Result<Vec<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'admitted', admitted_at = NOW()
+        SET status = 'admitted', admitted_at = {SQL_NOW}, updated_at = {SQL_NOW}
         WHERE meeting_id = $1 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -210,14 +219,14 @@ pub async fn admit_all(pool: &PgPool, meeting_id: i32) -> Result<Vec<Participant
 
 /// Reject a participant.
 pub async fn reject(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'rejected'
+        SET status = 'rejected', updated_at = {SQL_NOW}
         WHERE meeting_id = $1 AND user_id = $2 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -231,14 +240,14 @@ pub async fn reject(
 
 /// Leave a meeting (set status to 'left').
 pub async fn leave(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'left', left_at = NOW()
+        SET status = 'left', left_at = {SQL_NOW}, updated_at = {SQL_NOW}
         WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')
         RETURNING {PARTICIPANT_COLUMNS}
         "#
@@ -251,7 +260,7 @@ pub async fn leave(
 }
 
 /// Count admitted participants in a meeting.
-pub async fn count_admitted(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
+pub async fn count_admitted(pool: &DbPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1 AND status = 'admitted'",
     )
@@ -262,7 +271,7 @@ pub async fn count_admitted(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx:
 }
 
 /// Count waiting participants in a meeting.
-pub async fn count_waiting(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
+pub async fn count_waiting(pool: &DbPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1 AND status = 'waiting'",
     )
@@ -270,29 +279,4 @@ pub async fn count_waiting(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::
     .fetch_one(pool)
     .await?;
     Ok(row.0)
-}
-
-// -- Conversions to API response types --
-
-impl ParticipantRow {
-    /// Convert a database row into the API response type.
-    /// Optionally attach a `room_token` (only for the participant themselves).
-    pub fn into_participant_status(
-        self,
-        room_token: Option<String>,
-    ) -> videocall_meeting_types::responses::ParticipantStatusResponse {
-        videocall_meeting_types::responses::ParticipantStatusResponse {
-            user_id: self.user_id,
-            display_name: self.display_name,
-            status: self.status,
-            is_host: self.is_host,
-            joined_at: self.joined_at.timestamp(),
-            admitted_at: self.admitted_at.map(|t| t.timestamp()),
-            room_token,
-            observer_token: None,
-            waiting_room_enabled: None,
-            host_display_name: None,
-            host_user_id: None,
-        }
-    }
 }

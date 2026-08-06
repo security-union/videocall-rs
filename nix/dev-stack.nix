@@ -143,6 +143,14 @@ let
     nats.condition = "process_healthy";
   };
 
+  # Stop the cargo-watch trees with SIGINT (^C semantics — reaches the whole
+  # process group, which the servers handle gracefully) and give them a few
+  # seconds before process-compose escalates to SIGKILL.
+  rustShutdown = {
+    signal = 2;
+    timeout_seconds = 10;
+  };
+
   config = {
     version = "0.5";
     processes = {
@@ -184,6 +192,7 @@ let
       # ---------------- app services (cargo watch, hot reload) ----------------
       meeting-api = {
         namespace = "services";
+        shutdown = rustShutdown;
         command = "(cd dbmate && dbmate wait && dbmate up) && exec cargo watch -x 'run --bin meeting-api'";
         environment = commonEnv ++ [
           "LISTEN_ADDR=0.0.0.0:8081"
@@ -196,6 +205,7 @@ let
       };
       websocket = {
         namespace = "services";
+        shutdown = rustShutdown;
         command = "exec cargo watch -x 'run --bin websocket_server'";
         environment = commonEnv ++ [
           "ACTIX_PORT=8080"
@@ -207,6 +217,7 @@ let
       };
       webtransport = {
         namespace = "services";
+        shutdown = rustShutdown;
         working_dir = "actix-api";
         command = "exec cargo watch -x 'run --bin webtransport_server'";
         environment = commonEnv ++ [
@@ -221,6 +232,7 @@ let
       };
       metrics = {
         namespace = "services";
+        shutdown = rustShutdown;
         command = "exec cargo watch -x 'run --bin metrics_server'";
         environment = commonEnv ++ [
           "METRICS_PORT=9091"
@@ -230,6 +242,7 @@ let
       };
       server-stats = {
         namespace = "services";
+        shutdown = rustShutdown;
         command = "exec cargo watch -x 'run --bin metrics_server_snapshot'";
         environment = commonEnv ++ [
           "METRICS_PORT=9092"
@@ -239,6 +252,7 @@ let
       };
       dioxus-ui = {
         namespace = "services";
+        shutdown = rustShutdown;
         command = "exec ./docker/start-dioxus.sh";
         environment = [
           "API_BASE_URL=http://localhost:8081"

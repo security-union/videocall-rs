@@ -54,7 +54,22 @@
       "Bash(cargo clippy:*)",
       "Bash(openssl x509:*)",
       "Bash(docker exec:*)",
-      "WebFetch(domain:streams.spec.whatwg.org)"
+      "WebFetch(domain:streams.spec.whatwg.org)",
+      "Bash(swift build *)",
+      "Bash(rustup target *)",
+      "Bash(swift --version)",
+      "Bash(xcrun --sdk macosx --show-sdk-path)",
+      "Bash(xcrun --sdk iphoneos --show-sdk-path)",
+      "Bash(kubectl config *)",
+      "Bash(kubectl get *)",
+      "Bash(awk '$3!~/\\\\// || $3!=$3 {print} {split\\($3,a,\"/\"\\); if\\(a[1]!=a[2]\\) print \"NOT-READY: \"$0}')",
+      "Bash(kubectl top *)",
+      "Bash(awk '{print $8\"  \"$1\"/\"$2\"  \"$4}')",
+      "Bash(kubectl logs *)",
+      "Bash(python3 -c \"import sys,json;d=json.load\\(sys.stdin\\);print\\('last_pushed:',d.get\\('last_pushed'\\),'digest:',d['images'][0]['digest']\\)\")",
+      "Bash(python3 -c \"import sys,json;[print\\(t['name']\\) for t in json.load\\(sys.stdin\\)['results'] if 'debian' in t['name']]\")",
+      "Bash(python3 -c \"import sys,json;[print\\(t['name'],t['last_updated']\\) for t in json.load\\(sys.stdin\\)['results']]\")",
+      "Bash(echo \"exit: $?\")"
     ]
   }
 }

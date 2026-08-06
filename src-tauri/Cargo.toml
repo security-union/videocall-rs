@@ -3,7 +3,7 @@ name = "tauri-app"
 version = "0.1.0"
 description = "videocall-rs tauri app"
 authors = ["@videocall-rs-rs contributors"]
-license = ""
+license = "MIT OR Apache-2.0"
 repository = ""
 edition = "2021"
 

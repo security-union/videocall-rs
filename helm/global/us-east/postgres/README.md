@@ -4,12 +4,17 @@ This Helm chart deploys PostgreSQL with persistent storage for the videocall-rs 
 
 ## Installation
 
-### 1. Update Helm dependencies
+### 1. Build Helm dependencies
 
 ```bash
 cd helm/global/us-east/postgres
-helm dependency update
+helm dependency build
 ```
+
+> Use `helm dependency build`, **not** `helm dependency update`. `build` installs
+> exactly the versions recorded in `Chart.lock`. `update` re-resolves against
+> `charts.bitnami.com` and can pull a chart newer than the 18.1.3 that
+> `scripts/digitalocean-prod-setup-preview-infra.sh` validates against.
 
 ### 2. Install PostgreSQL
 

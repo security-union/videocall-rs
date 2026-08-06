@@ -103,16 +103,9 @@ Enhancement suggestions are tracked as GitHub issues. Create an issue and provid
 * Link related issues in the pull request description
 * Be prepared to address feedback and make changes if requested
 
-## RFC Process
+## Proposing Significant Changes
 
-For significant changes that require broader discussion, we use a Request for Comments (RFC) process:
-
-1. Check the [rfc directory](/rfc) for existing RFCs related to your proposal
-2. Create a new markdown file in the RFC directory following the naming convention: `rfc-XX-your-proposal-name.md`
-3. Use the template format from existing RFCs
-4. Submit a PR with your RFC
-5. The RFC will be discussed with the community and core team
-6. Once approved, the implementation can begin
+For changes that require broader discussion, open a [GitHub issue](https://github.com/security-union/videocall-rs/issues) describing the motivation, the proposed design, and the alternatives you considered. Discuss it with the community and core team on [Discord](https://discord.gg/JP38NRe4CJ) before starting implementation.
 
 ## Development Guidelines
 

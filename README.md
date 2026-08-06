@@ -36,7 +36,6 @@ An open-source, ultra-low-latency video conferencing platform and API built with
   - [Prerequisites](#prerequisites)
   - [Docker Setup](#docker-setup)
   - [Nix Build System (WIP)](#nix-build-system-wip)
-  - [Manual Setup](#manual-setup)
 - [Runtime Configuration](#runtime-configuration-frontend-configjs)
   - [Local (no Docker)](#local-no-docker-create-dioxus-uiscriptsconfigjs)
   - [Local/Docker](#localdocker-start-dioxussh)
@@ -52,7 +51,6 @@ An open-source, ultra-low-latency video conferencing platform and API built with
   - [E2E Testing (Playwright)](#e2e-testing-playwright)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
-- [Project Structure](#project-structure)
 - [Demos and Media](#demos-and-media)
 - [Contributors](#contributors)
 - [License](#license)
@@ -219,7 +217,7 @@ The frontend is configured at runtime via a `window.__APP_CONFIG` object provide
 
 ### Local (no Docker): create dioxus-ui/scripts/config.js
 
-- Start services with `./start_dev.sh`.
+- Start services with `make up`.
 - Create `dioxus-ui/scripts/config.js` that assigns `window.__APP_CONFIG = Object.freeze({...})`.
 - Keep the keys in sync with the authoritative sources below. Trunk will copy the file and the app will pick it up on refresh.
 - Tip: `mkdir -p dioxus-ui/scripts` to ensure the directory exists.
@@ -494,6 +492,8 @@ See the `e2e-*` targets in the `Makefile` for available commands.
 | Q1 2026 | `videocall-client` 4.0.5 | ✅ Adaptive quality stack: PID-driven encoder adaptation, PLI keyframe requests, and decoder visibility skipping ([#758](https://github.com/security-union/videocall-rs/pull/758), [#761](https://github.com/security-union/videocall-rs/pull/761), [#762](https://github.com/security-union/videocall-rs/pull/762)) |
 | Q2 2026 | `videocall-cli` 4.0.0 | ✅ Pure-Rust audio — `audiopus-sys`/libopus removed workspace-wide in favour of `ropus` ([#872](https://github.com/security-union/videocall-rs/pull/872)) |
 | Q2 2026 | `videocall-types` 6.0.0 | ✅ Dioxus UI Helm chart with relay Prometheus annotations, reworked screen sharing, and audio-level re-render fixes ([#757](https://github.com/security-union/videocall-rs/pull/757), [#817](https://github.com/security-union/videocall-rs/pull/817), [#816](https://github.com/security-union/videocall-rs/pull/816)) |
+| Q3 2026 | unreleased | ✅ Pure-Rust VP9 encoder and decoder — C libvpx removed from `videocall-cli` and the bot ([#884](https://github.com/security-union/videocall-rs/pull/884)) |
+| Q3 2026 | unreleased | ✅ SQLite available as an optional database backend for `meeting-api`, alongside Postgres ([#802](https://github.com/security-union/videocall-rs/pull/802)) |
 
 
 ## Contributing

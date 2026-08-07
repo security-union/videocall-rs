@@ -11,6 +11,12 @@
 let
   inherit (p) pkgs pkgsLinuxStatic;
 
+  # doCheck = false so the derivation is identical on every build platform:
+  # cross builds (macOS) skip Go tests anyway, but native-musl CI builds run
+  # caddy's full integration suite, which spins localhost TLS servers that
+  # fail in the build sandbox.
+  caddy = pkgsLinuxStatic.caddy.overrideAttrs (_: { doCheck = false; });
+
   htmlRoot = pkgs.runCommand "dioxus-ui-html" { } ''
     mkdir -p $out/usr/share/nginx/html
     cp -r ${packages.dioxus-ui-dist}/. $out/usr/share/nginx/html/
@@ -76,7 +82,7 @@ pkgs.dockerTools.streamLayeredImage {
   name = "videocall/dioxus-ui";
   tag = "dev";
   contents = [
-    pkgsLinuxStatic.caddy
+    caddy
     pkgsLinuxStatic.busybox
     htmlRoot
     caddyfile
@@ -88,7 +94,7 @@ pkgs.dockerTools.streamLayeredImage {
     Entrypoint = [ entrypoint ];
     ExposedPorts."80/tcp" = { };
     Env = [
-      "PATH=${pkgsLinuxStatic.caddy}/bin:/usr/bin:/bin"
+      "PATH=${caddy}/bin:/usr/bin:/bin"
       "XDG_CONFIG_HOME=/tmp"
       "XDG_DATA_HOME=/tmp"
       "HOME=/tmp"

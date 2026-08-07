@@ -15,7 +15,7 @@ let
   p = import ./nix/pkgs.nix { inherit inputs system; };
   rust = import ./nix/rust.nix { inherit p; };
   packages = import ./nix/packages.nix {
-    inherit p rust gitSha gitBranch buildTimestamp;
+    inherit p rust inputs gitSha gitBranch buildTimestamp;
   };
   images = import ./nix/images { inherit p packages; };
   devStack = import ./nix/dev-stack.nix { inherit p; };

@@ -1,7 +1,17 @@
-# Service binaries as Nix derivations. Each is a statically-linked musl ELF
-# built by rustPlatformCross (native on Linux hosts, cross from macOS).
+# Service binaries and the UI dist as Nix derivations, built with crane so
+# dependency compilation is a SEPARATE, cached derivation:
+#
+#   nativeDeps  — every workspace dependency compiled for musl Linux, once.
+#                 Shared by videocall-api-bins, meeting-api and bot; cached by
+#                 the CI nix cache and only rebuilt when Cargo.lock/toml move.
+#   wasmDeps    — dependencies of the three wasm crates (ui, codecs, neteq),
+#                 shared by the trunk build.
+#
+# Without this split every buildRustPackage recompiled the full dependency
+# graph per package (the role the old `actix-base` docker image played).
 { p
 , rust
+, inputs
   # Build metadata baked into /version endpoints. The build.rs files prefer
   # these env vars over shelling out to git (which is absent in the sandbox).
   # Fixed defaults keep derivations reproducible; CI overrides via release.nix.
@@ -10,8 +20,18 @@
 , buildTimestamp ? "unknown"
 }:
 let
-  inherit (p) pkgs pkgsLinuxStatic;
+  inherit (p) pkgs pkgsLinux pkgsLinuxStatic muslTarget;
   lib = pkgs.lib;
+
+  # crane, flake-free: default.nix is { pkgs ? … }: callPackage ./lib { }
+  mkCraneLib = pkgsForLib: import inputs.crane { pkgs = pkgsForLib; };
+
+  # Cross/native musl builds: crane over the Linux package set (so cc/stdenv
+  # are the musl cross toolchain) driving the host rustc that targets musl.
+  craneLibNative = (mkCraneLib pkgsLinux).overrideToolchain rust.rustCross;
+
+  # wasm builds run entirely on the host (arch-neutral output).
+  craneLibWasm = (mkCraneLib pkgs).overrideToolchain rust.frontendRustMinimal;
 
   # Workspace source, filtered to what cargo actually needs. Cargo resolves
   # every workspace member's manifest (and their path deps), so crate dirs
@@ -53,101 +73,131 @@ let
     BUILD_TIMESTAMP = buildTimestamp;
   };
 
-  # Build one workspace package's binaries.
-  #   crate — cargo package name (-p …)
-  #   bins  — bin targets to build; empty = every bin of the crate
-  mkServiceBinary = { pname, crate, bins ? [ ], mainProgram ? null }:
-    rust.rustPlatformCross.buildRustPackage (buildMetaEnv // {
-      inherit pname src;
-      version = "0.1.0";
+  # ---- native (musl) pipeline ----------------------------------------------
 
-      cargoLock.lockFile = ../Cargo.lock;
-      cargoBuildFlags = [ "-p" crate ]
-        ++ lib.concatMap (b: [ "--bin" b ]) bins;
+  # NOTE 1: buildMetaEnv is deliberately NOT part of these args — it changes
+  # per commit in the publish workflows (--argstr gitSha …) and would churn the
+  # deps-only derivation, defeating the dependency cache. It is applied only
+  # to the (cheap) member builds below.
+  # NOTE 2: no hand-rolled CARGO_BUILD_TARGET / CARGO_TARGET_*_LINKER here —
+  # craneLibNative sits on the musl cross set, so crane's cross-toolchain env
+  # supplies both (with an absolute store-path linker, immune to PATH games).
+  nativeCommonArgs = {
+    inherit src;
+    version = "0.1.0";
+    strictDeps = true;
+    doCheck = false; # integration tests need postgres/nats; `make tests_run`
 
-      # Integration tests need postgres/nats; covered by `make tests_run`.
-      doCheck = false;
+    nativeBuildInputs = [
+      pkgs.cmake # aws-lc-sys
+      pkgs.nasm
+      pkgs.perl # aws-lc-sys / openssl-sys
+      pkgs.pkg-config
+    ];
+    # Static openssl on purpose (not pkgsLinux.openssl): openssl-sys links the
+    # .a and the images ship no libssl.so. Same-arch pkg-config makes the
+    # cross-set reach safe here.
+    buildInputs = [ pkgsLinuxStatic.openssl ];
+  };
 
-      nativeBuildInputs = [
-        pkgs.cmake # aws-lc-sys
-        pkgs.nasm
-        pkgs.perl # aws-lc-sys / openssl-sys
-        pkgs.pkg-config
-      ];
-      buildInputs = [ pkgsLinuxStatic.openssl ];
+  # Dependencies of the three members we ship, compiled once for musl. THE
+  # cache unit. Scoped with -p on purpose: the full workspace would drag in
+  # videocall-cli's native capture stack (alsa/libvpx via cpal/nokhwa), which
+  # is never shipped in an image and doesn't cross-compile to musl.
+  nativeDeps = craneLibNative.buildDepsOnly (nativeCommonArgs // {
+    pname = "videocall-native-deps";
+    cargoExtraArgs = "-p videocall-api -p meeting-api -p bot";
+  });
 
-      meta = lib.optionalAttrs (mainProgram != null) { inherit mainProgram; };
+  # One workspace package's binaries on top of the shared dep artifacts.
+  mkNativePackage = { pname, cargoExtraArgs, mainProgram }:
+    craneLibNative.buildPackage (nativeCommonArgs // buildMetaEnv // {
+      inherit pname cargoExtraArgs;
+      cargoArtifacts = nativeDeps;
+      # only this member compiles here; deps come from nativeDeps
+      meta = { inherit mainProgram; };
     });
+
+  # ---- wasm pipeline --------------------------------------------------------
+
+  wasmCommonArgs = {
+    inherit src;
+    version = "0.1.0";
+    doCheck = false;
+    CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+    # Deps of the three crates index.html builds, with the SAME feature set the
+    # trunk build uses (workers are --no-default-features + wasm/web; default
+    # features would drag native-only deps like mio into a wasm32 compile).
+    cargoExtraArgs = lib.concatStringsSep " " [
+      "-p videocall-ui -p videocall-codecs -p neteq"
+      "--no-default-features"
+      "--features videocall-ui/media-server-jwt-auth,videocall-codecs/wasm,neteq/web"
+    ];
+  };
+
+  wasmDeps = craneLibWasm.buildDepsOnly (wasmCommonArgs // {
+    pname = "dioxus-wasm-deps";
+  });
 in
-rec {
+{
+  # The cache units, exposed so CI can warm them serially before fanning out
+  # (and so `nix-build release.nix -A packages.nativeDeps` works by hand).
+  inherit nativeDeps wasmDeps;
+
   # All four actix-api server binaries in one compile — mirrors the old
   # Dockerfile.actix, and lets the per-service images share one derivation:
   # websocket_server, webtransport_server, metrics_server, metrics_server_snapshot.
-  videocall-api-bins = mkServiceBinary {
+  videocall-api-bins = mkNativePackage {
     pname = "videocall-api-bins";
-    crate = "videocall-api";
+    cargoExtraArgs = "-p videocall-api";
     mainProgram = "websocket_server";
   };
 
-  meeting-api = mkServiceBinary {
+  meeting-api = mkNativePackage {
     pname = "meeting-api";
-    crate = "meeting-api";
-    bins = [ "meeting-api" ];
+    cargoExtraArgs = "-p meeting-api --bin meeting-api";
     mainProgram = "meeting-api";
   };
 
-  bot = mkServiceBinary {
+  bot = mkNativePackage {
     pname = "bot";
-    crate = "bot";
+    cargoExtraArgs = "-p bot";
     mainProgram = "bot";
   };
 
   # Dioxus UI static site: trunk build of the main crate + the two wasm worker
   # bins wired in index.html (videocall-codecs worker_decoder, neteq
   # neteq_worker), tailwind compile, and version.json — replicating the old
-  # Dockerfile.dioxus builder stage. wasm32 is arch-neutral, so this builds
-  # with the *host* toolchain on every platform; only nginx in the image layer
-  # is Linux-specific.
-  dioxus-ui-dist = pkgs.stdenv.mkDerivation (buildMetaEnv // {
+  # Dockerfile.dioxus builder stage on top of the shared wasm dep artifacts.
+  dioxus-ui-dist = craneLibWasm.mkCargoDerivation (buildMetaEnv // wasmCommonArgs // {
     pname = "dioxus-ui-dist";
-    version = "0.1.0";
-    inherit src;
-
-    cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ../Cargo.lock; };
+    cargoArtifacts = wasmDeps;
 
     nativeBuildInputs = [
-      pkgs.rustPlatform.cargoSetupHook
-      rust.frontendRustMinimal
       pkgs.trunk
       pkgs.wasm-bindgen-cli_0_2_108
       pkgs.binaryen
       pkgs.tailwindcss
     ];
 
-    # trunk 0.21.x reads NO_COLOR but chokes on the value "1" (same clash the
-    # dev shells work around); it also wants a writable HOME for its cache.
-    postPatch = ''
+    buildPhaseCargoCommand = ''
+      # trunk 0.21.x reads NO_COLOR but chokes on the value "1"; it also
+      # wants a writable HOME for its cache.
       unset NO_COLOR
-    '';
-
-    buildPhase = ''
-      runHook preBuild
       export HOME="$TMPDIR"
-      cd dioxus-ui
+      pushd dioxus-ui
       tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify
       trunk build --release --offline --skip-version-check --locked
       version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
       printf '{"service":"dioxus-ui","version":"%s","git_sha":"%s","git_branch":"%s","build_timestamp":"%s"}\n' \
         "$version" "$(echo "$GIT_SHA" | cut -c1-8)" "$GIT_BRANCH" "$BUILD_TIMESTAMP" \
         > dist/version.json
-      runHook postBuild
+      popd
     '';
 
-    installPhase = ''
-      runHook preInstall
+    installPhaseCommand = ''
       mkdir -p $out
-      cp -r dist/. $out/
-      runHook postInstall
+      cp -r dioxus-ui/dist/. $out/
     '';
   });
 }

@@ -92,8 +92,13 @@ let
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
   };
+
+  frontendDev = pkgs.mkShell {
+    nativeBuildInputs = [ rust.frontendRustDev ] ++ frontendBuildInputs;
+    shellHook = frontendHook;
+  };
 in
-rec {
+{
   leptos-website = pkgs.mkShell (leptosEnv // {
     nativeBuildInputs = [ rust.leptosRustMinimal ] ++ leptosBuildInputs;
   });
@@ -116,10 +121,7 @@ rec {
     shellHook = frontendHook;
   });
 
-  frontend-dev = pkgs.mkShell {
-    nativeBuildInputs = [ rust.frontendRustDev ] ++ frontendBuildInputs;
-    shellHook = frontendHook;
-  };
+  frontend-dev = frontendDev;
 
   backend = pkgs.mkShell (backendEnv // {
     nativeBuildInputs = [ rust.backendRustMinimal ] ++ backendBuildInputs;
@@ -159,5 +161,5 @@ rec {
     shellHook = frontendHook;
   });
 
-  default = frontend-dev;
+  default = frontendDev;
 }

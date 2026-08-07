@@ -2,6 +2,7 @@
 ,"i":{
 "nixpkgs":{"sn":"nixpkgs-src","kd":[1,{"ft":1,"ur":"https://github.com/NixOS/nixpkgs/archive/d1c15b7d5806069da59e819999d70e1cec0760bf.tar.gz","ms":[]}],"ha":{"al":0,"vl":"sha256-b9uG8yN50DRQ6A7JdZBfzq718ryYrlmGgqkRm9OOwCE="},"fv":"d1c15b7d5806069da59e819999d70e1cec0760bf","ps":[]}
 ,"nixpkgs-leptos":{"sn":"nixpkgs-leptos-src","kd":[1,{"ft":1,"ur":"https://github.com/NixOS/nixpkgs/archive/ee09932cedcef15aaf476f9343d1dea2cb77e261.tar.gz","ms":[]}],"ha":{"al":0,"vl":"sha256-9glbI7f1uU+yzQCq5LwLgdZqx6svOhZWkd4JRY265fc="},"fv":"ee09932cedcef15aaf476f9343d1dea2cb77e261","ps":[]}
+,"crane":{"sn":"crane-src","kd":[1,{"ft":1,"ur":"https://github.com/ipetkov/crane/archive/2c71e194474d13de031d729b729c968ddbe3507f.tar.gz","ms":[]}],"ha":{"al":0,"vl":"sha256-MPaRdVkf6zZP5fCPxYCi8Dr4pZzgmXzg8T9nVEbp3Mw="},"fv":"2c71e194474d13de031d729b729c968ddbe3507f","ps":[]}
 ,"rust-overlay":{"sn":"rust-overlay-src","kd":[1,{"ft":1,"ur":"https://github.com/oxalica/rust-overlay/archive/a1d4cc1f264c45d3745af0d2ca5e59d460e58777.tar.gz","ms":[]}],"ha":{"al":0,"vl":"sha256-PvytHcaYN5cPUll7FB70mXv1rRsIBRmu47fFfq3haxA="},"fv":"a1d4cc1f264c45d3745af0d2ca5e59d460e58777","ps":[]}
 }
 ,"p":{}

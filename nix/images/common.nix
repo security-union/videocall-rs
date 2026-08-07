@@ -9,7 +9,7 @@
 let
   inherit (p) pkgs pkgsLinux pkgsLinuxStatic;
 in
-rec {
+{
   # /app/dbmate — migrations + schema, used by meeting-api and media-server
   # (mirrors `COPY /app/dbmate /app/dbmate` from the old Dockerfiles).
   dbmateFiles = pkgs.runCommand "dbmate-files" { } ''

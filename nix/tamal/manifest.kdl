@@ -40,4 +40,15 @@ inputs {
 			| cut -f1
 		}
 	}
+	// Cargo dependency caching: deps-only derivations shared across builds
+	crane {
+		archive {
+			url "https://github.com/ipetkov/crane/archive/{{fresh_value}}.tar.gz"
+		}
+		hash algorithm=SHA-256
+		fresh-cmd {
+			$ git ls-remote "https://github.com/ipetkov/crane.git" --refs "refs/heads/master"
+			| cut -f1
+		}
+	}
 }

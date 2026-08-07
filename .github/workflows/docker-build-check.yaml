@@ -29,8 +29,12 @@ on:
       - 'nix/**'
 
 jobs:
-  build-images:
-    name: Build all Nix images
+  # Warm the crane deps-only derivations first: on a cold cache (first PR
+  # after a Cargo.lock/toml change) the expensive dependency compile happens
+  # exactly once here instead of once per matrix leg; on a warm cache this is
+  # a fast substitution.
+  warm-deps:
+    name: Warm dependency caches
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repo
@@ -39,5 +43,32 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build every image derivation (no push)
-        run: nix-build release.nix -A images.all --no-out-link
+      - name: Build deps-only derivations
+        run: nix-build release.nix -A packages.nativeDeps -A packages.wasmDeps --no-out-link
+
+  # Parallel matrix (like the old per-Dockerfile jobs): wall time = slowest
+  # leg; each leg substitutes the warmed deps and compiles only workspace
+  # crates.
+  build-images:
+    name: Build Nix images (${{ matrix.name }})
+    needs: warm-deps
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: actix-services
+            attrs: -A images.media-server -A images.websocket-server -A images.webtransport-server -A images.metrics-server -A images.server-stats
+          - name: meeting-api-and-bot
+            attrs: -A images.meeting-api -A images.bot
+          - name: dioxus-ui
+            attrs: -A images.dioxus-ui
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build image derivations (no push)
+        run: nix-build release.nix ${{ matrix.attrs }} --no-out-link

@@ -234,7 +234,8 @@ fn transform_audio_chunk(
     let user_id_bytes = email.as_bytes();
     Ok(PacketWrapper {
         packet_type: PacketType::MEDIA.into(),
-        user_id: user_id_bytes.to_vec(),
+        // Envelope user_id left empty; peer identity is delivered via the
+        // server-authored PARTICIPANT_JOINED roster, not the per-packet wire.
         data: MediaPacket {
             media_type: MediaType::AUDIO.into(),
             data,

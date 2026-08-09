@@ -61,6 +61,38 @@ fn monotonic_now_ms() -> f64 {
         .unwrap_or_else(js_sys::Date::now)
 }
 
+/// Detect whether `packet` is our own RTT probe echoed back by the server.
+///
+/// RTT probes are looped back by the server verbatim on the same socket
+/// (bypassing the broadcast path — see `session_logic.rs` `InboundAction::Echo`),
+/// so they are NEVER forwarded to other peers and can only ever arrive at their
+/// original sender. Ownership is therefore guaranteed by the loopback itself;
+/// the packet needs no identity field. Identity is deliberately NOT read from
+/// the envelope `user_id` (which no longer carries an email), it is established
+/// solely by the inner `media_type == RTT`.
+///
+/// The cheap envelope gate (`session_id == 0` + `PacketType::MEDIA`) short-
+/// circuits the hot path: real peer media is stamped by the relay with a
+/// non-zero session_id, so it never reaches the decrypt/parse below. This keeps
+/// per-packet cost off the fan-out path while still catching every RTT echo
+/// (probes are sent with an unset session_id and echoed verbatim, so the echo
+/// carries session_id == 0).
+///
+/// Note: like the rest of RTT, this only functions with E2EE off today — an
+/// existing property, unchanged here.
+fn decode_own_rtt_echo(packet: &PacketWrapper, aes: &Aes128State) -> Option<MediaPacket> {
+    if packet.session_id != 0 || packet.packet_type != PacketType::MEDIA.into() {
+        return None;
+    }
+    let decrypted = aes.decrypt(&packet.data).ok()?;
+    let media_packet = MediaPacket::parse_from_bytes(&decrypted).ok()?;
+    if media_packet.media_type == MediaType::RTT.into() {
+        Some(media_packet)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
     Testing {
@@ -393,7 +425,6 @@ impl ConnectionManager {
 
     /// Create callback for handling inbound media packets
     fn create_inbound_media_callback(&self, connection_id: String) -> Callback<PacketWrapper> {
-        let userid = self.options.userid.clone();
         let aes = self.aes.clone();
         let on_inbound_media = self.options.on_inbound_media.clone();
         let rtt_responses = self.rtt_responses.clone();
@@ -428,29 +459,21 @@ impl ConnectionManager {
                 return;
             }
 
-            // Handle RTT responses internally
-            if packet.user_id[..] == *userid.as_bytes() {
+            // Handle our own RTT probe echoes internally. Recognized by the
+            // inner media_type == RTT (loopback guarantees ownership), NOT by
+            // any envelope identity — the envelope no longer carries an email.
+            if let Some(media_packet) = decode_own_rtt_echo(&packet, &aes) {
                 let reception_time = monotonic_now_ms();
-                if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
-                    if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
-                        if media_packet.media_type == MediaType::RTT.into() {
-                            debug!(
-                                "RTT response received on connection {} at {}, sent at {}",
-                                connection_id, reception_time, media_packet.timestamp
-                            );
-                            if let Ok(mut responses) = rtt_responses.try_borrow_mut() {
-                                responses.push((
-                                    connection_id.clone(),
-                                    media_packet,
-                                    reception_time,
-                                ));
-                            } else {
-                                warn!("Unable to add RTT response to queue - queue is borrowed");
-                            }
-                            return;
-                        }
-                    }
+                debug!(
+                    "RTT response received on connection {} at {}, sent at {}",
+                    connection_id, reception_time, media_packet.timestamp
+                );
+                if let Ok(mut responses) = rtt_responses.try_borrow_mut() {
+                    responses.push((connection_id.clone(), media_packet, reception_time));
+                } else {
+                    warn!("Unable to add RTT response to queue - queue is borrowed");
                 }
+                return;
             }
 
             // Filter self-packets using session_id
@@ -599,9 +622,11 @@ impl ConnectionManager {
 
     /// Create an RTT probe packet
     fn create_rtt_packet(&self, timestamp: f64) -> Result<PacketWrapper> {
+        // No identity on the probe: the server echoes it verbatim to the sender
+        // (never to peers), so ownership is guaranteed by loopback and the inner
+        // media_type == RTT. Only the inner `timestamp` (the RTT clock) matters.
         let media_packet = MediaPacket {
             media_type: MediaType::RTT.into(),
-            user_id: self.options.userid.as_bytes().to_vec(),
             timestamp,
             ..Default::default()
         };
@@ -609,7 +634,6 @@ impl ConnectionManager {
         let data = self.aes.encrypt(&media_packet.write_to_bytes()?)?;
         Ok(PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
-            user_id: self.options.userid.as_bytes().to_vec(),
             data,
             ..Default::default()
         })
@@ -2650,6 +2674,87 @@ mod tests {
         // Should return Ok without changing state.
         assert!(mgr.start_reelection().is_ok());
         assert!(mgr.is_reelection_in_progress());
+    }
+
+    // -- RTT echo identification (envelope email removed) -----------------
+
+    /// Build the exact packet `create_rtt_packet` produces (empty envelope
+    /// user_id, empty inner user_id, session_id 0, inner media_type == RTT),
+    /// then echoed verbatim by the server.
+    fn make_rtt_echo(aes: &Aes128State, timestamp: f64) -> PacketWrapper {
+        let media_packet = MediaPacket {
+            media_type: MediaType::RTT.into(),
+            timestamp,
+            ..Default::default()
+        };
+        let data = aes
+            .encrypt(&media_packet.write_to_bytes().unwrap())
+            .unwrap();
+        PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            // Empty envelope: no email, no identity of any kind.
+            user_id: Vec::new(),
+            session_id: 0,
+            data,
+            ..Default::default()
+        }
+    }
+
+    /// An RTT echo with an EMPTY envelope user_id is still recognized as our own
+    /// via the inner `media_type == RTT`, and the decoded packet carries the
+    /// original probe timestamp so an RTT sample can be produced.
+    ///
+    /// FAILS on the un-fixed code, which matched `packet.user_id == self.userid`:
+    /// with the envelope email removed the match never fires and no RTT sample
+    /// is ever produced (breaking connection election).
+    #[test]
+    fn rtt_echo_with_empty_envelope_user_id_is_recognized_as_own() {
+        let aes = Aes128State::new(false); // RTT only works with E2EE off.
+        let timestamp = 12345.0_f64;
+        let echo = make_rtt_echo(&aes, timestamp);
+
+        let decoded = decode_own_rtt_echo(&echo, &aes)
+            .expect("RTT echo must be recognized by inner media_type, not envelope identity");
+        assert_eq!(decoded.media_type, MediaType::RTT.into());
+        assert_eq!(
+            decoded.timestamp, timestamp,
+            "the inner timestamp (RTT clock) must survive so a sample can be computed"
+        );
+    }
+
+    /// A normal peer MEDIA packet (non-zero session_id, stamped by the relay)
+    /// is NOT mistaken for an RTT echo — the cheap session_id gate short-circuits
+    /// before any decrypt/parse on the hot fan-out path.
+    #[test]
+    fn peer_media_is_not_treated_as_rtt_echo() {
+        let aes = Aes128State::new(false);
+        let mut echo = make_rtt_echo(&aes, 1.0);
+        echo.session_id = 555; // relay-stamped peer session
+        assert!(
+            decode_own_rtt_echo(&echo, &aes).is_none(),
+            "a packet with a non-zero (relay-stamped) session_id is never an RTT echo"
+        );
+    }
+
+    /// A non-RTT MEDIA packet with session_id 0 (e.g. pre-assignment) is not an
+    /// RTT echo either — the inner media_type is the authoritative check.
+    #[test]
+    fn non_rtt_media_with_session_zero_is_not_rtt_echo() {
+        let aes = Aes128State::new(false);
+        let inner = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            timestamp: 1.0,
+            ..Default::default()
+        };
+        let data = aes.encrypt(&inner.write_to_bytes().unwrap()).unwrap();
+        let packet = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: Vec::new(),
+            session_id: 0,
+            data,
+            ..Default::default()
+        };
+        assert!(decode_own_rtt_echo(&packet, &aes).is_none());
     }
 
     // ===================================================================

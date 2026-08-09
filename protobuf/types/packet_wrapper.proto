@@ -15,7 +15,10 @@ message PacketWrapper {
   }
   
   PacketType packet_type = 1;
-  bytes user_id = 2;
+  // DEPRECATED: never carries a user email. Retained only as the
+  // SYSTEM_USER_ID sentinel on server-authored control packets; peer identity
+  // comes from session_id + the PARTICIPANT_JOINED roster.
+  bytes user_id = 2 [deprecated = true];
   bytes data = 3;
   uint64 session_id = 4;
 }

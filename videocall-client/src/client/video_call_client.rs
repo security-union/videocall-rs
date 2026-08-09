@@ -298,12 +298,11 @@ impl VideoCallClient {
         {
             let client_for_pli = client.clone();
             if let Ok(mut inner) = client.inner.try_borrow_mut() {
-                inner.peer_decode_manager.set_send_packet_callback(
-                    Callback::from(move |packet: PacketWrapper| {
+                inner
+                    .peer_decode_manager
+                    .set_send_packet_callback(Callback::from(move |packet: PacketWrapper| {
                         client_for_pli.send_packet(packet);
-                    }),
-                    options.user_id.clone(),
-                );
+                    }));
             }
         }
 
@@ -866,7 +865,9 @@ impl VideoCallClient {
     pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
         let wrapper = PacketWrapper {
             packet_type: PacketType::DIAGNOSTICS.into(),
-            user_id: self.options.user_id.as_bytes().to_vec(),
+            // Envelope carries no email; the relay stamps the authenticated
+            // session_id. (Inner DiagnosticsPacket ids are a separate follow-up.)
+            user_id: Vec::new(),
             data: packet.write_to_bytes().unwrap(),
             ..Default::default()
         };
@@ -995,6 +996,25 @@ impl VideoCallClient {
     }
 }
 
+/// Decide whether an inbound packet should create/refresh a peer entry, and
+/// for which session.
+///
+/// Peer identity is keyed SOLELY by the server-assigned `session_id`. The
+/// envelope `user_id` is consulted ONLY to skip server-authored control packets
+/// (the `SYSTEM_USER_ID` sentinel) — it is NEVER used as peer identity, so a
+/// forged or empty envelope `user_id` on a MEDIA packet cannot impersonate a
+/// peer or suppress its tile. `session_id == 0` is reserved (MEETING/unassigned
+/// packets) and never creates a peer.
+///
+/// Returns `Some(session_id)` when a peer should be ensured, `None` otherwise.
+fn peer_session_to_ensure(packet: &PacketWrapper) -> Option<u64> {
+    if packet.user_id == SYSTEM_USER_ID.as_bytes() || packet.session_id == 0 {
+        None
+    } else {
+        Some(packet.session_id)
+    }
+}
+
 impl Inner {
     /// Returns `true` if this peer event was already seen recently (within 30 s).
     ///
@@ -1068,16 +1088,14 @@ impl Inner {
             String::from_utf8_lossy(&response.user_id),
             response.session_id
         );
-        // Skip creating peers for system messages (meeting info, meeting started/ended)
-        // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0)
-        let peer_status =
-            if response.user_id == SYSTEM_USER_ID.as_bytes() || response.session_id == 0 {
-                PeerStatus::NoChange
-            } else {
-                let peer_user_id = String::from_utf8_lossy(&response.user_id);
-                self.peer_decode_manager
-                    .ensure_peer(response.session_id, &peer_user_id)
-            };
+        // Identity is NOT taken from the envelope `user_id` (a forged or empty
+        // value is ignored). The peer is keyed by the server-assigned
+        // session_id; its email/display name come from the PARTICIPANT_JOINED
+        // roster. See `peer_session_to_ensure` for the exact gate.
+        let peer_status = match peer_session_to_ensure(&response) {
+            Some(session_id) => self.peer_decode_manager.ensure_peer(session_id),
+            None => PeerStatus::NoChange,
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 if !self.options.enable_e2ee {
@@ -1130,7 +1148,9 @@ impl Inner {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::AES_KEY.into(),
-                                    user_id: self.options.user_id.as_bytes().to_vec(),
+                                    // No email on the envelope; the relay stamps
+                                    // the authenticated session_id.
+                                    user_id: Vec::new(),
                                     data,
                                     ..Default::default()
                                 };
@@ -1257,6 +1277,16 @@ impl Inner {
                             } else {
                                 String::from_utf8_lossy(&meeting_packet.display_name).to_string()
                             };
+                            // Source the peer's identity (email) from the
+                            // server-authored roster, keyed by session_id. This
+                            // is the ONLY place peer.user_id is set now that the
+                            // media envelope carries no email. It MUST run before
+                            // the display-name backfill below, which matches on
+                            // peer.user_id.
+                            self.peer_decode_manager.set_peer_user_id_by_session_id(
+                                meeting_packet.session_id,
+                                target_str.clone(),
+                            );
                             // Store the display name on the peer so the UI can
                             // show it on tiles instead of the raw user_id/email.
                             self.peer_decode_manager.set_peer_display_name_by_user_id(
@@ -1417,7 +1447,10 @@ impl Inner {
                             if let Some(controller) = cc.as_ref() {
                                 let packet = PacketWrapper {
                                     packet_type: PacketType::RSA_PUB_KEY.into(),
-                                    user_id: userid.as_bytes().to_vec(),
+                                    // No email on the envelope; the relay stamps
+                                    // the authenticated session_id. (The inner
+                                    // RsaPacket.user_id is a separate follow-up.)
+                                    user_id: Vec::new(),
                                     data,
                                     ..Default::default()
                                 };
@@ -1466,4 +1499,74 @@ fn parse_rsa_packet(response_data: &[u8]) -> Result<RsaPacket> {
 fn parse_public_key(rsa_packet: RsaPacket) -> Result<RsaPublicKey> {
     RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
         .map_err(|e| anyhow!("Failed to parse rsa public key: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a real inbound MEDIA `PacketWrapper` the way a peer's encoder emits
+    /// one after this change: an EMPTY envelope `user_id`, carrying only the
+    /// server-assigned `session_id`.
+    fn media_packet(session_id: u64, envelope_user_id: &[u8]) -> PacketWrapper {
+        PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: envelope_user_id.to_vec(),
+            session_id,
+            data: vec![1, 2, 3],
+            ..Default::default()
+        }
+    }
+
+    /// The peer-ensure gate keys on the server-assigned `session_id` and is
+    /// independent of the envelope `user_id`. This is the exact decision
+    /// `on_inbound_media` makes before calling `ensure_peer`.
+    ///
+    /// FAILS on a regression that re-derived the ensured identity/peer from the
+    /// envelope `user_id` (e.g. returning a peer keyed by the forged email, or
+    /// dropping the packet because the envelope is empty).
+    #[test]
+    fn ensure_gate_keys_on_session_id_ignoring_forged_envelope() {
+        // A forged envelope email must not change WHICH session is ensured, and
+        // must not suppress peer creation.
+        let forged = media_packet(4242, b"attacker@evil.com");
+        assert_eq!(
+            peer_session_to_ensure(&forged),
+            Some(4242),
+            "peer must be ensured by session_id regardless of the envelope user_id"
+        );
+
+        // An empty envelope (the new normal) still ensures the peer by session.
+        let empty = media_packet(4242, b"");
+        assert_eq!(peer_session_to_ensure(&empty), Some(4242));
+
+        // Two different peers forging the SAME envelope email are still kept
+        // distinct — they are keyed by session_id, not the (forgeable) email.
+        let a = media_packet(100, b"victim@corp.com");
+        let b = media_packet(200, b"victim@corp.com");
+        assert_ne!(
+            peer_session_to_ensure(&a),
+            peer_session_to_ensure(&b),
+            "session_id, not the envelope email, distinguishes peers"
+        );
+    }
+
+    /// Server-authored control packets (SYSTEM_USER_ID sentinel) and reserved
+    /// session_id 0 never create a peer.
+    #[test]
+    fn ensure_gate_skips_system_sentinel_and_session_zero() {
+        let system = media_packet(4242, SYSTEM_USER_ID.as_bytes());
+        assert_eq!(
+            peer_session_to_ensure(&system),
+            None,
+            "server-authored SYSTEM_USER_ID packets must not create a peer"
+        );
+
+        let session_zero = media_packet(0, b"someone@corp.com");
+        assert_eq!(
+            peer_session_to_ensure(&session_zero),
+            None,
+            "reserved session_id 0 must not create a peer"
+        );
+    }
 }

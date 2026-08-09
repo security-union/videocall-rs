@@ -293,7 +293,10 @@ fn build_heartbeat_packet(
         .ok()?;
     let mut packet_wrapper = PacketWrapper {
         data,
-        user_id: userid.as_bytes().to_vec(),
+        // Envelope carries no email; the relay stamps the authenticated
+        // session_id (set below). The inner MediaPacket.user_id above is left
+        // as-is (separate follow-up).
+        user_id: Vec::new(),
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     };

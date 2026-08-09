@@ -54,7 +54,8 @@ impl WebTransportClient {
         };
         let packet = PacketWrapper {
             packet_type: PacketType::CONNECTION.into(),
-            user_id: self.options.user_id.as_bytes().to_vec(),
+            // Envelope user_id intentionally left empty: identity comes from the
+            // authenticated /lobby/{user_id}/{room} connect URL, not the payload.
             data: connection_packet.write_to_bytes()?,
             ..Default::default()
         };
@@ -110,7 +111,8 @@ impl WebTransportClient {
                 };
 
                 let packet = PacketWrapper {
-                    user_id: email.as_bytes().to_vec(),
+                    // Envelope user_id left empty; peer identity is delivered
+                    // via the server-authored PARTICIPANT_JOINED roster.
                     packet_type: PacketType::MEDIA.into(),
                     data: actual_heartbeat.write_to_bytes().unwrap(),
                     ..Default::default()

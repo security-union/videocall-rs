@@ -431,12 +431,15 @@ impl SessionLogic {
             );
 
             // Build a CONGESTION PacketWrapper targeted at the sender.
-            // The `user_id` is set to our session's user_id so the sender
-            // knows which receiver is congested. The `session_id` is set to
-            // the sender's session_id so NATS routing delivers it there.
+            // `session_id` is the sender's session, which is BOTH the NATS routing
+            // key and the value the consumer keys off: the client acts on the
+            // signal only when `own_session_id == packet.session_id`
+            // (`video_call_client.rs` CONGESTION handler). The envelope `user_id`
+            // was previously the congested receiver's email, but the consumer
+            // never reads it for logic (only a cosmetic log label), so it is left
+            // empty to keep the email off the wire.
             let congestion_packet = PacketWrapper {
                 packet_type: PacketType::CONGESTION.into(),
-                user_id: self.user_id.as_bytes().to_vec(),
                 session_id: sender_sid,
                 ..Default::default()
             };

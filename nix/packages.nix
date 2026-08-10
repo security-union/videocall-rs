@@ -198,6 +198,11 @@ let
     cargoArtifacts = null;
     cargoVendorDir = craneLibLeptos.vendorCargoDeps { src = websiteSrc; };
     doCheck = false;
+    # mkCargoDerivation defaults to tarring target/ into $out (target.tar.zst),
+    # which bloats the output by hundreds of MB and drags the whole cargo
+    # vendor dir into the image closure. This output is terminal — nothing
+    # chains off its artifacts.
+    doInstallCargoArtifacts = false;
 
     nativeBuildInputs = [
       p.pkgsLeptos.cargo-leptos
@@ -207,6 +212,7 @@ let
       pkgs.nasm
       pkgs.perl
       pkgs.pkg-config
+      pkgs.nukeReferences
     ];
     buildInputs = [ pkgsLinuxStatic.openssl ];
 
@@ -238,6 +244,10 @@ let
       # the exact triple path — a loose `find` once grabbed a host-built stray
       cp target/${muslTarget}/release/leptos_website $out/bin/leptos_website
       cp -r target/site/. $out/site/
+      # rustc embeds vendor-dir paths in panic-location strings, which nix
+      # scans into the runtime closure — dragging every vendored crate into
+      # the image. This output needs no closure; scrub the refs.
+      find $out -type f -exec nuke-refs {} +
     '';
   };
 
@@ -303,12 +313,16 @@ in
   dioxus-ui-dist = craneLibWasm.mkCargoDerivation (buildMetaEnv // wasmCommonArgs // {
     pname = "dioxus-ui-dist";
     cargoArtifacts = wasmDeps;
+    # terminal output (static site) — don't install target.tar.zst; see the
+    # website derivation note.
+    doInstallCargoArtifacts = false;
 
     nativeBuildInputs = [
       pkgs.trunk
       pkgs.wasm-bindgen-cli_0_2_108
       pkgs.binaryen
       pkgs.tailwindcss
+      pkgs.nukeReferences
     ];
 
     buildPhaseCargoCommand = ''
@@ -329,6 +343,9 @@ in
     installPhaseCommand = ''
       mkdir -p $out
       cp -r dioxus-ui/dist/. $out/
+      # wasm panic-location strings embed the vendor dir path; scrub so the
+      # static site has zero runtime closure (see the website note).
+      find $out -type f -exec nuke-refs {} +
     '';
   });
 }

@@ -6,18 +6,16 @@ description = "14 Dockerfiles to zero, CI wall time halved, browser tests 13:19 
 tags = ["nix", "docker", "ci", "rust", "devops", "dx"]
 authors = ["Dario Lencina Talarico"]
 [extra]
-remote_image = "/images/we-deleted-docker-hero.svg"
+remote_image = "/images/friendship-ended-with-docker.png"
 +++
 
 # We Deleted Docker (and the Flakes Too)
 
-<div style="font-size:6rem;line-height:1;margin:0.5rem 0;">🔪</div>
+![Friendship ended with DOCKER — now NIX is my best friend](/images/friendship-ended-with-docker.png)
 
 Not the images. The Dockerfiles. All 14 of them.
 
 The old setup ran Nix *inside* Docker. A nixos container per service, bind-mounting the repo, each with its own private Nix store volume. We were paying container tax to run a build system whose whole point is not needing containers. Peak cosplay.
-
-![Friendship ended with DOCKER — now NIX is my best friend](/images/friendship-ended-with-docker.png)
 
 [Last time](/posts/nixify-your-leptos-website-and-stop-compiling-your-tools/) we flaked the website and went 19→5 minutes. This time we went further and deleted the flakes too. Classic Nix: `default.nix`, `release.nix`, `shell.nix`. Inputs pinned with [nixtamal](https://nixtamal.toast.al/) — a plain KDL manifest, evaluable by any Nix since forever. Docker images are just derivations:
 

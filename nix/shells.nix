@@ -169,5 +169,10 @@ in
     nativeBuildInputs = [ pkgs.protobuf packages.protobufCodegen ];
   };
 
+  # `make vlog`: serve the engineering vlog with the same zola the image uses
+  vlog = pkgs.mkShell {
+    nativeBuildInputs = [ pkgs.zola ];
+  };
+
   default = frontendDev;
 }

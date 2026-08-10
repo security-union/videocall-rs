@@ -61,7 +61,7 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/install-nix-action@v31
       - uses: cachix/cachix-action@v16
         with:
           name: videocall-rs

@@ -146,12 +146,12 @@ Dockerfiles in the dev workflow (see [docs/nix-architecture.md](docs/nix-archite
 ### Prerequisites
 
 - Modern Linux distribution, macOS, or Windows 10/11 (WSL2)
-- [Nix](https://install.determinate.systems/nix) — provides the dev stack, toolchains, and image builds
+- [Nix](https://nixos.org/download/) — provides the dev stack, toolchains, and image builds
   - One-time on multi-user installs: add yourself to `trusted-users` so builds can pull the
     project's public binary cache instead of compiling everything locally. Until then nix prints
     `ignoring untrusted substituter 'https://videocall-rs.cachix.org'` (harmless, but slow):
     ```bash
-    echo "trusted-users = root $USER" | sudo tee -a /etc/nix/nix.conf   # Determinate installer: /etc/nix/nix.custom.conf
+    echo "trusted-users = root $USER" | sudo tee -a /etc/nix/nix.conf
     sudo pkill nix-daemon
     ```
 - [Docker](https://docs.docker.com/engine/install/) — only needed to run the nix-built images (`make up`, e2e)
@@ -243,7 +243,8 @@ cp docker/.env-sample .env
 The build system is **native Nix, no flakes**: `default.nix` (entry point), `shell.nix` (dev
 shells), `release.nix` (CI artifacts — packages and Docker images). Dependency pins live in
 `nix/tamal/` and are managed by [nixtamal](https://nixtamal.toast.al/); evaluating them needs
-plain Nix only. Full design: [docs/nix-architecture.md](docs/nix-architecture.md).
+plain Nix only. Full design: [docs/nix-architecture.md](docs/nix-architecture.md). Coming from
+the old Docker dev environment? See [docs/migrating-from-docker.md](docs/migrating-from-docker.md).
 
 ```
 nix-shell                                  # default dev shell (frontend toolchain)

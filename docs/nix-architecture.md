@@ -215,7 +215,7 @@ Runners are Linux, so `pkgsLinux` evaluates **natively** — CI never cross-comp
 use the same tutorial flow as `make image-*`:
 
 ```yaml
-- uses: DeterminateSystems/nix-installer-action@main   # flake-agnostic
+- uses: cachix/install-nix-action@v31                  # upstream Nix, official installer
 - uses: cachix/cachix-action@v16
   with: { name: videocall-rs, authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}" }
 - run: $(nix-build release.nix -A images.meeting-api --no-out-link) | docker load

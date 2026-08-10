@@ -1,6 +1,23 @@
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 COMPOSE := docker compose --env-file .env -f docker/docker-compose.yaml
 
+# Every nix-backed target depends on this: if Nix is missing, install it with
+# the official installer (nixos.org — macOS, Linux, and Windows via WSL2).
+# Linux without systemd (e.g. default WSL2) gets the single-user install.
+ensure-nix:
+	@if ! command -v nix-shell >/dev/null 2>&1; then \
+		echo "Nix not found — installing via the official installer (nixos.org)..."; \
+		if [ "$$(uname -s)" = "Linux" ] && [ ! -d /run/systemd/system ]; then \
+			curl -L https://nixos.org/nix/install | sh -s -- --no-daemon; \
+		else \
+			curl -L https://nixos.org/nix/install | sh -s -- --daemon; \
+		fi; \
+		echo ""; \
+		echo "Nix installed. Open a NEW terminal (so PATH picks it up) and re-run your make command."; \
+		exit 1; \
+	fi
+.PHONY: ensure-nix
+
 # Integration-test middleware: native process-compose (no docker), own API
 # port so it coexists with a running `make dev`, throwaway data dir so every
 # run starts from a fresh database (what `docker compose down -v` used to do).
@@ -34,7 +51,7 @@ SQLITE_TEST_DB := /tmp/meeting_api_test.sqlite3
 # ---------------------------------------------------------------------------
 
 # Build + load every app image
-images:
+images: ensure-nix
 	@out=$$(nix-build release.nix -A images.all --no-out-link); \
 	for img in $$out/*; do \
 		echo "==> loading $$(basename $$img)"; \
@@ -42,7 +59,7 @@ images:
 	done
 
 # Build + load one image: make image-websocket-server
-image-%:
+image-%: ensure-nix
 	@script=$$(nix-build release.nix -A images.$* --no-out-link); \
 	"$$script" | docker load
 
@@ -51,11 +68,11 @@ image-%:
 # ---------------------------------------------------------------------------
 
 # Pinned toolchain shell (optional for dev; rustup works too)
-shell:
+shell: ensure-nix
 	nix-shell
 
 # Refresh nixtamal pins (nix/tamal/) — refreshes non-frozen inputs and relocks
-pins-update:
+pins-update: ensure-nix
 	nix-shell -p nixtamal git --run "nixtamal refresh"
 
 # ---------------------------------------------------------------------------
@@ -70,16 +87,20 @@ pins-update:
 # THE dev loop: the whole stack native under process-compose — postgres, nats,
 # prometheus, grafana from nixpkgs, every service under cargo-watch, trunk on
 # :3001. Zero Docker. Health-gated deps, TUI. State in .data/ (gitignored).
-dev:
+dev: ensure-nix
 	nix-shell default.nix -A shells.dev --run dev-stack
 
 # Just the native middleware (hack on a single service with `make dev-<svc>`)
-dev-middleware:
+dev-middleware: ensure-nix
 	nix-shell default.nix -A shells.dev --run "dev-stack postgres postgres-init nats prometheus grafana"
 
 # Stop a running `make dev` stack from another terminal (same as quitting the TUI)
-dev-down:
+dev-down: ensure-nix
 	nix-shell default.nix -A shells.dev --run "process-compose down -p $${PC_PORT_NUM:-28080}"
+
+# Serve the engineering vlog locally with live reload (pinned zola)
+vlog: ensure-nix
+	nix-shell default.nix -A shells.vlog --run "cd engineering-vlog && zola serve --interface 127.0.0.1 --port 1111"
 
 # Full stack from Nix-built images (Docker)
 up: .env images
@@ -140,7 +161,7 @@ dev-website:
 # Integration tests — middleware AND tests native, zero docker
 # ---------------------------------------------------------------------------
 
-tests_run:
+tests_run: ensure-nix
 	rm -rf $(IT_DATA) && mkdir -p $(IT_DATA)
 	DEV_STACK_DATA_DIR=$(IT_DATA) PC_PORT_NUM=$(IT_PC_PORT) \
 	DEV_STACK_PG_PORT=$(IT_PG_PORT) DEV_STACK_NATS_PORT=$(IT_NATS_PORT) DEV_STACK_NATS_MON_PORT=$(IT_NATS_MON_PORT) \
@@ -165,14 +186,14 @@ tests_run:
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
 		cargo test -p meeting-api -- --nocapture --test-threads=1"
 
-tests_down:
+tests_down: ensure-nix
 	-nix-shell default.nix -A shells.dev --run "process-compose down -p $(IT_PC_PORT)"
 	rm -rf $(IT_DATA)
 
 # Run the meeting-api integration tests against a local SQLite database.
 # Requires the `dbmate` binary on PATH. Serialized (--test-threads=1) because
 # tests share the single SQLite file.
-tests_sqlite_run:
+tests_sqlite_run: ensure-nix
 	rm -f $(SQLITE_TEST_DB) $(SQLITE_TEST_DB)-wal $(SQLITE_TEST_DB)-shm
 	cd dbmate/sqlite && DATABASE_URL="sqlite:$(SQLITE_TEST_DB)" dbmate up
 	DATABASE_URL="sqlite:$(SQLITE_TEST_DB)" \
@@ -189,13 +210,13 @@ connect_to_nats: .env
 	$(COMPOSE) exec nats-box sh
 
 # Lint/format natively in the pinned shell (same toolchain as CI)
-clippy-fix:
+clippy-fix: ensure-nix
 	nix-shell default.nix -A shells.backend-dev --run "cargo clippy --all --fix --allow-dirty --allow-staged"
 
-fmt:
+fmt: ensure-nix
 	nix-shell default.nix -A shells.backend-dev --run "cargo fmt --all"
 
-check:
+check: ensure-nix
 	nix-shell default.nix -A shells.backend-dev --run "cargo clippy --all -- --deny warnings && cargo fmt --all --check"
 
 clean: .env

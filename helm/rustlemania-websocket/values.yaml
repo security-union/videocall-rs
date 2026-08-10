@@ -9,7 +9,7 @@ replicaCount: 1
 image:
   repository: securityunion/videocall-media-server
   pullPolicy: Always
-  tag: high-availability-cf63fcce
+  tag: main-330bc5e8
 env:
   - name: RUST_LOG
     value: info

@@ -36,23 +36,24 @@ let
   '';
   # Single entry point for the dioxus-ui wasm component tests:
   #   nix-shell -A shells.frontend-tests --run dioxus-ui-component-tests
-  # writeShellApplication shellchecks the script at build time.
+  # writeShellApplication shellchecks the script at build time. The pinned
+  # browser is Linux-only, so on darwin the script ships without it and is
+  # run with DIOXUS_UI_TESTS_SYSTEM_BROWSER=1 against the system Chrome
+  # (see the script header).
   dioxusUiComponentTests = pkgs.writeShellApplication {
     name = "dioxus-ui-component-tests";
-    runtimeInputs = [
+    runtimeInputs = [ pkgs.jq ] ++ lib.optionals chromePinned [
       pkgs.google-chrome
       googleChromeAlias
       pkgs.chromedriver
-      pkgs.jq
     ];
     text = builtins.readFile ./dioxus-ui-component-tests.sh;
   };
 
-  browserTestInputs = lib.optionals chromePinned [
+  browserTestInputs = [ dioxusUiComponentTests ] ++ lib.optionals chromePinned [
     pkgs.google-chrome
     googleChromeAlias
     pkgs.chromedriver
-    dioxusUiComponentTests
   ];
   browserTestEnv = lib.optionalAttrs chromePinned {
     CHROMEDRIVER = "${pkgs.chromedriver}/bin/chromedriver";

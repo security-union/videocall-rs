@@ -12,8 +12,10 @@ taxonomies = [
 ]
 
 [markdown]
-highlight_code = true
-highlight_theme = "ayu-dark"
+
+[markdown.highlighting]
+enabled = true
+theme = "ayu-dark"
 
 [extra]
 toc = true

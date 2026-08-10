@@ -1,38 +1,19 @@
 SHELL := /bin/bash
-UID := $(shell id -u)
-USER := $(shell id -un)
-
-ifeq ($(UID), 0)
-$(error Do not run as root)
-endif
 
 SRC_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-IMAGE := protobuf-types-build-env
-IMAGE_RUST := protobuf-types-build-env-rust
-DOCKER_NETWORK ?= bridge
-DOCKER_RUN_CMD := docker run -it -v $(SRC_DIR):$(SRC_DIR) -w $(SRC_DIR) -u $(USER):$(USER) --network $(DOCKER_NETWORK) $(IMAGE)
-DOCKER_RUN_RUST_CMD := docker run -it -v $(SRC_DIR):$(SRC_DIR) -w $(SRC_DIR) -u $(USER):$(USER) --network $(DOCKER_NETWORK) $(IMAGE_RUST)
+REPO_ROOT := $(abspath $(SRC_DIR)/..)
 
-export DOCKER_BUILDKIT = 1
-
+# Rust protobuf codegen, natively via nix (no containers): protoc + the
+# pinned protoc-gen-rs plugin (protobuf-codegen 3.7.1) come from the repo's
+# nix shell, so regenerated files are byte-stable across machines.
 build/rust:
 	mkdir -p build/rust
 
 .PHONY: generate_rust
 generate_rust: build/rust
-	protoc --rs_out=build/rust types/*.proto
-
-.PHONY: build-env-rust
-build-env-rust:
-	# We don't tag so that we can use generate `latest` tag which makes
-	# referencing easier
-	docker build -t $(IMAGE_RUST) --build-arg USER=$(USER) --build-arg UID=$(UID) -f build-env-rust.Dockerfile .
-
-build-env-generate-rust:
-	$(DOCKER_RUN_RUST_CMD) make generate_rust
-	mv build/rust/* ../videocall-types/src/protos
+	nix-shell $(REPO_ROOT)/default.nix -A shells.protobuf \
+		--run "cd $(SRC_DIR) && protoc --rs_out=build/rust types/*.proto"
 
 .PHONY: build
-build:
-	make build-env-rust
-	make build-env-generate-rust
+build: generate_rust
+	mv build/rust/* ../videocall-types/src/protos

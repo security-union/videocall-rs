@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 150" font-family="ui-monospace, Menlo, Consolas, monospace">
+  <text fill="#8a8f98" font-size="11" x="0" y="12">ci wall clock, image build gate</text>
+  <text fill="#8a8f98" font-size="12" x="140" y="48" text-anchor="end">docker, typical</text>
+  <rect fill="#8a8f98" x="150" y="36" width="209" height="18"/>
+  <text fill="#8a8f98" font-size="12" font-weight="bold" x="367" y="50">10:00</text>
+  <text fill="#8a8f98" font-size="12" x="140" y="90" text-anchor="end">docker, worst leg</text>
+  <rect fill="#8a8f98" x="150" y="78" width="460" height="18"/>
+  <text fill="#1a1a1a" font-size="12" font-weight="bold" x="600" y="92" text-anchor="end">22:00</text>
+  <text fill="#8a8f98" font-size="12" x="140" y="132" text-anchor="end">nix + crane + cachix</text>
+  <rect fill="#f5a623" x="150" y="120" width="106" height="18"/>
+  <text fill="#f5a623" font-size="12" font-weight="bold" x="264" y="134">5:05</text>
+</svg>

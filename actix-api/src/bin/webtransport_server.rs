@@ -119,7 +119,7 @@ async fn main() {
     });
 
     // Start WebTransport server with ChatServer
-    let _ = actix_rt::spawn(async move {
+    let server_task = actix_rt::spawn(async move {
         if let Err(e) = webtransport::start(
             opt,
             chat_server,
@@ -131,6 +131,18 @@ async fn main() {
         {
             error!("WebTransport server error: {}", e);
         }
-    })
-    .await;
+    });
+
+    // Graceful shutdown: exit on SIGINT (docker STOPSIGNAL, ^C, process-compose)
+    // or SIGTERM (kubernetes, compose default) instead of dying via the default
+    // signal disposition mid-write. Returning from main unwinds the actors and
+    // the NATS client through Drop.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!("Received SIGINT, shutting down"),
+        _ = sigterm.recv() => info!("Received SIGTERM, shutting down"),
+        _ = server_task => error!("WebTransport server task exited unexpectedly"),
+    }
+    info!("WebTransport server shut down");
 }

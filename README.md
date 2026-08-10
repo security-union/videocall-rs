@@ -34,10 +34,12 @@ An open-source, ultra-low-latency video conferencing platform and API built with
 - [System Architecture](#system-architecture)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
-  - [Docker Setup](#docker-setup)
-  - [Nix Build System (WIP)](#nix-build-system-wip)
+  - [Dev loop](#dev-loop-everything-native-hot-reload-zero-docker)
+  - [Full stack from Nix-built images](#full-stack-from-nix-built-images)
+  - [OAuth (optional)](#oauth-optional)
+  - [Nix build system](#nix-build-system)
 - [Runtime Configuration](#runtime-configuration-frontend-configjs)
-  - [Local (no Docker)](#local-no-docker-create-dioxus-uiscriptsconfigjs)
+  - [Local](#local-generated-for-you)
   - [Local/Docker](#localdocker-start-dioxussh)
   - [Kubernetes/Helm](#kuberneteshelm-configmap-configjsyaml)
 - [Usage](#usage)
@@ -123,64 +125,107 @@ graph TD
     WebTransportServer --> NATS
 ```
 
-1. **actix-api:** Rust-based backend server using Actix Web framework
-2. **dioxus-ui:** Web frontend built with the Dioxus framework and compiled to WebAssembly
-3. **videocall-types:** Shared data types and protocol definitions
-4. **videocall-client:** Client library for native integration
-5. **videocall-cli:** Command-line interface for headless video streaming
+1. **actix-api:** streaming servers (websocket_server, webtransport_server, metrics) built on Actix Web
+2. **meeting-api:** REST/auth API (login, meetings, host controls) — Axum + dbmate migrations
+3. **dioxus-ui:** Web frontend built with the Dioxus framework and compiled to WebAssembly
+4. **videocall-types:** Shared data types and protocol definitions
+5. **videocall-client:** Client library for native integration
+6. **videocall-cli:** Command-line interface for headless video streaming
 
 
 For a more detailed explanation of the system architecture, please see our [Architecture Document](docs/ARCHITECTURE.md).
 
 ## Getting Started
 
-**⭐ RECOMMENDED: Docker is the only fully supported development method ⭐**
-
-We strongly recommend using the Docker-based setup for development, as it's well-maintained and provides consistent behavior across platforms. The manual setup described below is not as well maintained and may require additional troubleshooting.
+Development is **fully native**: the entire dev stack — postgres, NATS, prometheus, grafana AND
+the Rust services — runs as host processes supervised by
+[process-compose](https://github.com/F1bonacc1/process-compose), with hot reload everywhere.
+Docker only appears when you want to run the *images*, which are built by **Nix** — there are no
+Dockerfiles in the dev workflow (see [docs/nix-architecture.md](docs/nix-architecture.md)).
 
 ### Prerequisites
 
-- Modern Linux distribution, macOS, or Windows 10/11
-- [Docker](https://docs.docker.com/engine/install/) and Docker Compose (for containerized setup)
-- [Rust toolchain](https://rustup.rs/) 1.89+ (for manual setup)
+- Modern Linux distribution, macOS, or Windows 10/11 (WSL2)
+- [Nix](https://nixos.org/download/) — provides the dev stack, toolchains, and image builds
+  - One-time on multi-user installs: add yourself to `trusted-users` so builds can pull the
+    project's public binary cache instead of compiling everything locally. Until then nix prints
+    `ignoring untrusted substituter 'https://videocall-rs.cachix.org'` (harmless, but slow):
+    ```bash
+    echo "trusted-users = root $USER" | sudo tee -a /etc/nix/nix.conf
+    sudo pkill nix-daemon
+    ```
+- [Docker](https://docs.docker.com/engine/install/) — only needed to run the nix-built images (`make up`, e2e)
 - Chromium-based browser (Chrome, Edge, Brave) for frontend access - Firefox is not supported
 - Safari both in iOS and macOS are supported for frontend access
 
-### Docker Setup
+### Dev loop (everything native, hot reload, zero Docker)
 
-The quickest way to get started is with our Docker-based setup:
+```
+git clone https://github.com/security-union/videocall-rs.git
+cd videocall-rs
+make dev
+```
 
-1. Clone the repository:
-   ```
-   git clone https://github.com/security-union/videocall-rs.git
-   cd videocall-rs
-   ```
+That's it. `make dev` opens the process-compose TUI running the whole stack as native processes:
 
-2. Create a `.env` file from the sample and fill in your OAuth credentials:
-   ```
-   cp docker/.env-sample .env
-   ```
-   Edit `.env` and set `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`.
+| Process | What | Port |
+|---|---|---|
+| `postgres` | postgresql from nixpkgs, state in `.data/postgres` | 5432 |
+| `nats` | nats-server with JetStream, state in `.data/nats` | 4222 / 8222 |
+| `meeting-api` | dbmate migrations, then `cargo watch` | 8081 |
+| `websocket` / `webtransport` | `cargo watch` | 8080 / 4433 udp |
+| `metrics` / `server-stats` | `cargo watch` | 9091 / 9092 |
+| `dioxus-ui` | tailwind watch + `trunk serve` | 3001 |
+| `prometheus` / `grafana` | native, same dashboards/config as the container stack | 9090 / 3000 |
 
-   **Getting Google OAuth credentials:**
-   - Go to [Google Cloud Console → APIs & Credentials](https://console.cloud.google.com/apis/credentials)
-   - Create an OAuth 2.0 Client ID (Web application type)
-   - Add `http://localhost:8081/login/callback` as an Authorized redirect URI
-   - Copy the Client ID and Secret into your `.env`
+Services wait for middleware health (compose-style `depends_on`), saves recompile and restart
+instantly, and the TUI can restart individual processes on demand. Open `http://localhost:3001`
+and navigate to a meeting: `http://localhost:3001/meeting/<username>/<meeting-id>`.
 
-   > **Note:** `make up` will auto-create `.env` from the sample if it does not exist, but you must still edit it to add your credentials before the app will work.
+To stop: quit the TUI (`F10`/`Ctrl-C`), or `make dev-down` from another terminal. (`make down`
+stops the *Docker* stack, not this one.) The TUI needs an interactive terminal; for scripted or
+headless use run `nix-shell default.nix -A shells.dev --run "dev-stack -t=false"`.
 
-3. Start the stack:
-   ```
-   make up
-   ```
-   The first run compiles Rust/WASM inside the containers — this takes several minutes. Watch the `dioxus-ui` logs; it's ready when Trunk prints `server listening on http://0.0.0.0:<port>`.
+Prefer one service per terminal? `make dev-middleware` starts just
+postgres/nats/prometheus/grafana; then `make dev-websocket`, `make dev-meeting-api`,
+`make dev-ui`, … run a single watcher each (those also work with plain rustup + cargo-watch).
 
-4. Access the application at:
-   ```
-   http://localhost
-   ```
-   Then navigate to a meeting: `http://localhost/meeting/<username>/<meeting-id>`
+**Overriding environment variables:** every process in `make dev` sees env layered as
+*built-in defaults* < **`.env`** < **`.env.local`** — both untracked. Copy
+`docker/.env-sample` to `.env` for documented knobs (OAuth, service URLs, JWT secret); put
+personal or secret overrides in `.env.local`, which is gitignored and never checked in.
+
+### Full stack from Nix-built images
+
+The same images CI publishes can run the whole stack locally in Docker:
+
+```
+make images       # nix-build every app image and docker-load it
+make up           # start everything in docker compose
+```
+
+On Linux the images build natively; on macOS the service binaries are **cross-compiled** to
+`aarch64-unknown-linux-musl` — no VM, no remote builder, Docker only runs the result. The first
+macOS build compiles a musl cross-toolchain (one-time, tens of minutes); after that it's cached in
+the Nix store. `make image-<name>` (e.g. `make image-websocket-server`) builds a single image.
+
+### OAuth (optional)
+
+Both stacks read the same files: `make dev` layers `.env` then `.env.local` into every
+process, and `make up` passes `.env` to docker-compose. To enable Google login, create a
+`.env` from the sample and fill in credentials (or keep secrets in `.env.local`):
+
+```
+cp docker/.env-sample .env
+```
+
+- Go to [Google Cloud Console → APIs & Credentials](https://console.cloud.google.com/apis/credentials)
+- Create an OAuth 2.0 Client ID (Web application type)
+- Add `http://localhost:8081/login/callback` as an Authorized redirect URI
+- Copy the Client ID and Secret into your `.env`
+
+> **Note:** `make up` auto-creates `.env` from the sample if it does not exist. Without OAuth
+> credentials the app runs with auth bypassed for local development.
 
 **Platform notes:**
 
@@ -192,37 +237,33 @@ The quickest way to get started is with our Docker-based setup:
   ```
   Then access the app at `http://localhost:8088`.
 - **Shell environment variables:** If you have `API_BASE_URL`, `OAUTH_REDIRECT_URL`, or similar variables exported in your shell profile (`~/.bashrc`, `~/.zshrc`), they will override `.env` values. Remove them from your profile before running `make up`.
-- **Slow first run:** WASM compilation inside Docker can take 5–15 minutes on a cold cache. Subsequent runs reuse the build cache and start in seconds.
 
-### Nix Build System (WIP)
+### Nix build system
 
-We are migrating the build infrastructure to [Nix](https://nixos.org/) for reproducible, fast builds. Currently the `leptos-website` is the first component being nixified.
+The build system is **native Nix, no flakes**: `default.nix` (entry point), `shell.nix` (dev
+shells), `release.nix` (CI artifacts — packages and Docker images). Dependency pins live in
+`nix/tamal/` and are managed by [nixtamal](https://nixtamal.toast.al/); evaluating them needs
+plain Nix only. Full design: [docs/nix-architecture.md](docs/nix-architecture.md). Coming from
+the old Docker dev environment? See [docs/migrating-from-docker.md](docs/migrating-from-docker.md).
 
-**What Nix replaces:** Previously, Docker builds spent 15-20 minutes compiling tools like `cargo-leptos` and `wasm-bindgen-cli` from source on every build. Nix provides these as pre-built binaries from the binary cache, reducing tool setup from minutes to seconds.
-
-**What's done so far:**
-- `flake.nix` at the repo root provides dev shells with pinned versions of the Rust nightly toolchain, `cargo-leptos`, `wasm-bindgen-cli`, `binaryen`, Node.js, and system dependencies
-- `docker/Dockerfile.website` and `docker/Dockerfile.website.dev` use `nixos/nix` as a builder image
-- `.github/workflows/leptos-website-build.yaml` uses `DeterminateSystems/nix-installer-action` with `magic-nix-cache-action` for cached CI builds
-
-**Quick start (requires [Nix](https://install.determinate.systems/nix)):**
-
-The integration is transparent to the user, and the development experience is the same as with Docker.
-
-**What's next:** Nixifying additional components (actix-api, dioxus-ui) and evaluating [crane](https://github.com/ipetkov/crane) for full Nix-managed Rust dependency caching.
+```
+nix-shell                                  # default dev shell (frontend toolchain)
+nix-shell default.nix -A shells.backend-dev            # backend toolchain + cargo-watch + dbmate
+nix-build release.nix -A packages.websocket-server   # a single service binary (static musl)
+make image-websocket-server                # its Docker image, loaded into the daemon
+make pins-update                           # refresh nixtamal pins (nix/tamal/)
+```
 
 ## Runtime Configuration (Frontend config.js)
 
 The frontend is configured at runtime via a `window.__APP_CONFIG` object provided by a `config.js` file. The file is copied by Trunk and loaded at `/config.js` by `dioxus-ui/index.html`.
 
-### Local (no Docker): create dioxus-ui/scripts/config.js
+### Local: generated for you
 
-- Start services with `make up`.
-- Create `dioxus-ui/scripts/config.js` that assigns `window.__APP_CONFIG = Object.freeze({...})`.
-- Keep the keys in sync with the authoritative sources below. Trunk will copy the file and the app will pick it up on refresh.
-- Tip: `mkdir -p dioxus-ui/scripts` to ensure the directory exists.
-
-Authoritative keys and defaults: see `docker/start-dioxus.sh` and the Helm template referenced below.
+`make dev` and `make dev-ui` run `docker/start-dioxus.sh`, which writes
+`dioxus-ui/scripts/config.js` from the environment before trunk starts — no manual step.
+To point the UI somewhere custom, override the relevant env vars in `.env.local` (see
+`docker/start-dioxus.sh` for the keys) rather than editing the generated file.
 
 ### Voice Activity Detection (VAD) Threshold
 
@@ -246,7 +287,7 @@ The threshold can also be set via the `VAD_THRESHOLD` environment variable when 
 
 ### Local/Docker: start-dioxus.sh
 
-`docker/start-dioxus.sh` generates `/app/dioxus-ui/scripts/config.js` from environment variables at container startup. For the current list of supported variables and defaults, refer directly to `docker/start-dioxus.sh`. Restart the container to apply changes.
+`docker/start-dioxus.sh` (used by `make dev-ui`) generates `dioxus-ui/scripts/config.js` from environment variables before starting trunk. The Nix-built `videocall/dioxus-ui` image does the same at container startup via its entrypoint. For the current list of supported variables and defaults, refer directly to `docker/start-dioxus.sh`.
 
 ### Kubernetes/Helm: configmap-configjs.yaml
 
@@ -422,7 +463,7 @@ API, and the mock device vs real fake device strategy — see
 ### Backend Testing (actix-api)
 
 The `actix-api` crate contains unit and integration tests that run against real
-PostgreSQL and NATS instances, spun up via Docker Compose. Tests cover:
+PostgreSQL and NATS instances, started natively by `make tests_run`. Tests cover:
 
 - **Session management** — meeting creation, multi-user join/leave, host
   controls, system email rejection
@@ -434,20 +475,19 @@ PostgreSQL and NATS instances, spun up via Docker Compose. Tests cover:
 - **Feature flags** — behavior with `FEATURE_MEETING_MANAGEMENT` on and off
 
 Tests use `#[serial_test::serial]` because they share a database, and each test
-cleans up its own data. The infrastructure is defined in
-`docker/docker-compose.integration.yaml`, which provides:
-
-| Service | Purpose |
-|---------|---------|
-| `postgres:12` | Database for meetings and sessions |
-| `nats:2.10-alpine` | Message broker with JetStream |
-| `rust-tests` | Test runner (runs `dbmate` migrations, then `cargo test`) |
+cleans up its own data. Everything runs natively — no Docker: `make tests_run`
+starts postgres 18 + NATS (JetStream) from nixpkgs under process-compose in a
+throwaway data dir (fresh database every run), then runs `dbmate` migrations,
+clippy, fmt and `cargo test` in the pinned nix-shell.
 
 ```bash
-# Build + run all backend tests (PostgreSQL + NATS in Docker)
+# Run all backend tests (native postgres/NATS, fresh state per run)
 make tests_run
 
-# Tear down test containers
+# Same, against the SQLite meeting-api backend
+make tests_sqlite_run
+
+# Stop the test middleware and delete its state
 make tests_down
 ```
 
@@ -462,9 +502,10 @@ Full browser-based end-to-end tests using [Playwright](https://playwright.dev/).
 Tests run against the **Dioxus UI**, verifying meeting flows with real browsers.
 Authentication is bypassed via JWT cookie injection — no OAuth setup needed.
 
-The E2E stack is defined in `docker/docker-compose.e2e.yaml` and uses the same
-Nix-based dev Dockerfiles as CI. Tests run automatically on pushes to `main` and
-can be triggered manually from the GitHub Actions page.
+The E2E stack is defined in `docker/docker-compose.e2e.yaml` and runs the same
+Nix-built images CI publishes (`make e2e-build` builds and loads them). Tests run
+automatically on pushes to `main` and can be triggered manually from the GitHub
+Actions page.
 
 See the `e2e-*` targets in the `Makefile` for available commands.
 
@@ -529,57 +570,12 @@ For a more comprehensive technical overview, see the [Architecture Document](doc
 
 ### Git Hooks
 
-This repository includes Git hooks to ensure code quality:
-
-1. **Pre-commit Hook**: Automatically runs `cargo fmt` before each commit to ensure consistent code formatting.
-2. **Post-commit Hook**: Runs `cargo clippy` after each commit to check for potential code improvements.
-
-To install these hooks, run the following commands from the project root:
+The repo ships its hooks in `githooks/` (currently `pre-push`: `cargo clippy -D warnings`
+and `cargo fmt --check` before every push). Enable them once per clone:
 
 ```bash
-# Create the hooks directory if it doesn't exist
-mkdir -p .git/hooks
-
-# Create the pre-commit hook
-cat > .git/hooks/pre-commit << 'EOF'
-#!/bin/sh
-
-# Run cargo fmt and check if there are changes
-echo "Running cargo fmt..."
-cargo fmt --all -- --check
-
-# Check the exit code of cargo fmt
-if [ $? -ne 0 ]; then
-    echo "cargo fmt found formatting issues. Please fix them before committing."
-    exit 1
-fi
-
-exit 0
-EOF
-
-# Create the post-commit hook
-cat > .git/hooks/post-commit << 'EOF'
-#!/bin/sh
-
-# Run cargo clippy after the commit
-echo "Running cargo clippy..."
-ACTIX_UI_BACKEND_URL="" WEBTRANSPORT_HOST="" LOGIN_URL="" WEBTRANSPORT_URL="" ACTIX_API_URL="" cargo clippy -- -D warnings
-
-# Check the exit code of cargo clippy
-if [ $? -ne 0 ]; then
-    echo "Cargo clippy found issues in your code. Please fix them."
-    # We can't abort the commit since it's already done, but we can inform the user
-    echo "The commit was successful, but please consider fixing the clippy issues before pushing."
-fi
-
-exit 0
-EOF
-
-# Make the hooks executable
-chmod +x .git/hooks/pre-commit .git/hooks/post-commit
+git config core.hooksPath githooks
 ```
-
-These hooks help maintain code quality by ensuring proper formatting and checking for common issues.
 
 ## Demos and Media
 
@@ -609,7 +605,7 @@ These hooks help maintain code quality by ensuring proper formatting and checkin
 
 Start your journey with videocall.rs today. Whether you're building a robot, a drone, or a next-gen video app, we have the tools you need.
 
-[**Get Started with Docker**](#docker-setup) or [**Download the CLI**](https://crates.io/crates/videocall-cli)
+[**Get Started**](#getting-started) or [**Download the CLI**](https://crates.io/crates/videocall-cli)
 
 ## License
 

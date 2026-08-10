@@ -77,3 +77,7 @@ e2e/node_modules/**
 # claude code — per-developer state (shared agent definitions in .claude/agents/ stay tracked)
 .claude/worktrees/
 .claude/settings.local.json
+
+# native dev-stack state (make dev)
+.data/
+.env.local

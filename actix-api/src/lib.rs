@@ -30,3 +30,6 @@ pub mod session_manager;
 pub mod token_validator;
 pub mod version;
 pub mod webtransport;
+
+// CI warm-path benchmark probe: trivial comment, exercises the member-only
+// rebuild path (deps + runtime payloads must all substitute from cache).

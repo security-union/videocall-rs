@@ -11,10 +11,10 @@ image:
 resources:
   limits:
     cpu: "50m"
-    memory: "10Mi"
+    memory: "64Mi"
   requests:
     cpu: "20m"
-    memory: "10Mi"
+    memory: "64Mi"
 
 podAnnotations: {}
 podSecurityContext: {}

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Docker build context is the repo root; this script lives in scripts/
+# This script lives in scripts/; run from the repo root
 SCRIPTPATH="$( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )"
 cd "$( dirname "$SCRIPTPATH" )"
 
@@ -14,15 +14,16 @@ GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 IMAGE_URL="${REGISTRY}/videocall-meeting-api:${TAG}"
-echo "Building image ${IMAGE_URL}"
+echo "Building image ${IMAGE_URL} via nix (release.nix -A images.meeting-api)"
 
-if ! docker build -t "$IMAGE_URL" \
-    --build-arg GIT_SHA="$GIT_SHA" \
-    --build-arg GIT_BRANCH="$GIT_BRANCH" \
-    --build-arg BUILD_TIMESTAMP="$BUILD_TIMESTAMP" \
-    -f Dockerfile.meeting-api .; then
-    echo "Failed to build meeting-api"
-else
-    docker push "$IMAGE_URL"
-    echo "New image uploaded to ${IMAGE_URL}"
-fi
+# nix.dev flow: docker load < $(nix-build …). NOTE: on macOS the payload is
+# cross-compiled for the *host* Docker arch (arm64 on Apple silicon) — build
+# from a Linux/amd64 host or CI for amd64 clusters.
+script=$(nix-build release.nix -A images.meeting-api --no-out-link \
+    --argstr gitSha "$GIT_SHA" \
+    --argstr gitBranch "$GIT_BRANCH" \
+    --argstr buildTimestamp "$BUILD_TIMESTAMP")
+"$script" | docker load
+docker tag videocall/meeting-api:dev "$IMAGE_URL"
+docker push "$IMAGE_URL"
+echo "New image uploaded to ${IMAGE_URL}"

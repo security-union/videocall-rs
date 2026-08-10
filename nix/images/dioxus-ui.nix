@@ -11,11 +11,8 @@
 let
   inherit (p) pkgs pkgsLinuxStatic;
 
-  # doCheck = false so the derivation is identical on every build platform:
-  # cross builds (macOS) skip Go tests anyway, but native-musl CI builds run
-  # caddy's full integration suite, which spins localhost TLS servers that
-  # fail in the build sandbox.
-  caddy = pkgsLinuxStatic.caddy.overrideAttrs (_: { doCheck = false; });
+  # shared definition (also in the CI warm set) — see nix/pkgs.nix
+  caddy = p.caddyStatic;
 
   htmlRoot = pkgs.runCommand "dioxus-ui-html" { } ''
     mkdir -p $out/usr/share/nginx/html

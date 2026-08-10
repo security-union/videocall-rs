@@ -52,7 +52,13 @@ let
   # cargo-leptos 0.2.42 for the leptos-website shell lives in an older nixpkgs
   # tree (0.2.x required by leptos 0.5.x; newer trees ship 0.3.x).
   pkgsLeptos = import inputs.nixpkgs-leptos { inherit system; };
+
+  # Shared static caddy for the UI image and the CI warm set. doCheck = false
+  # so the derivation is identical on every build platform: cross builds skip
+  # Go tests anyway, but native-musl CI builds run caddy's integration suite,
+  # which spins localhost TLS servers that fail in the build sandbox.
+  caddyStatic = pkgsLinuxStatic.caddy.overrideAttrs (_: { doCheck = false; });
 in
 {
-  inherit pkgs pkgsLinux pkgsLinuxStatic pkgsLeptos linuxSystem muslTarget;
+  inherit pkgs pkgsLinux pkgsLinuxStatic pkgsLeptos linuxSystem muslTarget caddyStatic;
 }

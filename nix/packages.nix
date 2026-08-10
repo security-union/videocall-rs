@@ -153,6 +153,21 @@ in
   # (and so `nix-build release.nix -A packages.nativeDeps` works by hand).
   inherit nativeDeps wasmDeps;
 
+  # EVERYTHING the image legs need except the per-commit member builds: the
+  # crane deps artifacts plus the image runtime payloads. The audit of leg
+  # job 93372834164 showed the legs otherwise rebuild go-1.25.5 (for static
+  # dbmate), busybox, caddy, musl tzdata/cacert on EVERY run — and never save
+  # them, because they exact-hit the warm cache key and skip their own save.
+  ciWarm = pkgs.linkFarm "ci-warm" [
+    { name = "native-deps"; path = nativeDeps; }
+    { name = "wasm-deps"; path = wasmDeps; }
+    { name = "caddy"; path = p.caddyStatic; }
+    { name = "busybox"; path = pkgsLinuxStatic.busybox; }
+    { name = "dbmate"; path = pkgsLinuxStatic.dbmate; }
+    { name = "tzdata"; path = pkgsLinux.tzdata; }
+    { name = "cacert"; path = pkgsLinux.dockerTools.caCertificates; }
+  ];
+
   # All four actix-api server binaries in one compile — mirrors the old
   # Dockerfile.actix, and lets the per-service images share one derivation:
   # websocket_server, webtransport_server, metrics_server, metrics_server_snapshot.

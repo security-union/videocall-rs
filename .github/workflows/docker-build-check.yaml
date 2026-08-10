@@ -29,12 +29,34 @@ on:
       - 'nix/**'
 
 jobs:
-  # Warm the crane deps-only derivations first: on a cold cache (first PR
-  # after a Cargo.lock/toml change) the expensive dependency compile happens
-  # exactly once here instead of once per matrix leg; on a warm cache this is
-  # a fast substitution.
+  # 10-second probe: is the warm cache already seeded for this pins+lockfile
+  # state? On warm runs the expensive warm job is skipped entirely and the
+  # matrix starts immediately.
+  cache-probe:
+    name: Probe warm cache
+    runs-on: ubuntu-latest
+    outputs:
+      hit: ${{ steps.probe.outputs.hit }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          KEY="nix-images-${{ runner.os }}-${{ hashFiles('nix/tamal/lock.json', 'Cargo.lock', '**/*.nix') }}"
+          COUNT=$(gh api "repos/${{ github.repository }}/actions/caches?key=$KEY" --jq '.total_count')
+          echo "key=$KEY count=$COUNT"
+          [ "$COUNT" != "0" ] && echo "hit=true" >> "$GITHUB_OUTPUT" || echo "hit=false" >> "$GITHUB_OUTPUT"
+
+  # Cold path only (first PR after a pins/lockfile change): build the full
+  # non-member closure — crane deps artifacts AND image runtime payloads
+  # (static caddy/busybox/dbmate, go toolchain, musl tzdata/cacert) — exactly
+  # once, and save it. Without ciWarm the legs rebuilt go-1.25.5 & friends on
+  # every run and never saved them (exact-key hit skips their save).
   warm-deps:
     name: Warm dependency caches
+    needs: cache-probe
+    if: needs.cache-probe.outputs.hit != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repo
@@ -49,15 +71,16 @@ jobs:
           restore-prefixes-first-match: nix-images-${{ runner.os }}-
           gc-max-store-size-linux: 5G
 
-      - name: Build deps-only derivations
-        run: nix-build release.nix -A packages.nativeDeps -A packages.wasmDeps --no-out-link
+      - name: Build the full non-member closure
+        run: nix-build release.nix -A packages.ciWarm --no-out-link
 
   # Parallel matrix (like the old per-Dockerfile jobs): wall time = slowest
-  # leg; each leg substitutes the warmed deps and compiles only workspace
+  # leg; each leg substitutes the warmed closure and compiles only workspace
   # crates.
   build-images:
     name: Build Nix images (${{ matrix.name }})
-    needs: warm-deps
+    needs: [cache-probe, warm-deps]
+    if: ${{ !cancelled() && needs.cache-probe.result == 'success' && (needs.warm-deps.result == 'success' || needs.warm-deps.result == 'skipped') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

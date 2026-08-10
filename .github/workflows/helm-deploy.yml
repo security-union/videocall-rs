@@ -130,7 +130,10 @@ jobs:
         run: |
           # Get kubeconfigs for both clusters
           doctl kubernetes cluster kubeconfig save videocall-us-east
-          doctl kubernetes cluster kubeconfig save videocall-singapore
+          # singapore was decommissioned; keep the save tolerant so single-region
+          # us-east deploys work, and it picks the cluster back up if recreated
+          doctl kubernetes cluster kubeconfig save videocall-singapore || \
+            echo "singapore cluster not found - skipping"
           
       - name: 🔍 Validate Prerequisites
         run: |
@@ -143,8 +146,7 @@ jobs:
           fi
           
           if ! kubectl config get-contexts | grep -q "do-sgp1-videocall-singapore"; then
-            echo "❌ Singapore context not available"
-            exit 1
+            echo "Singapore context not available (cluster decommissioned) - us-east only"
           fi
           
           # Validate deployment script
@@ -188,7 +190,10 @@ jobs:
         run: |
           # Get kubeconfigs for both clusters
           doctl kubernetes cluster kubeconfig save videocall-us-east
-          doctl kubernetes cluster kubeconfig save videocall-singapore
+          # singapore was decommissioned; keep the save tolerant so single-region
+          # us-east deploys work, and it picks the cluster back up if recreated
+          doctl kubernetes cluster kubeconfig save videocall-singapore || \
+            echo "singapore cluster not found - skipping"
           
       - name: Create DigitalOcean DNS Secret
         run: |
@@ -347,7 +352,10 @@ jobs:
         run: |
           # Get kubeconfigs for both clusters
           doctl kubernetes cluster kubeconfig save videocall-us-east
-          doctl kubernetes cluster kubeconfig save videocall-singapore
+          # singapore was decommissioned; keep the save tolerant so single-region
+          # us-east deploys work, and it picks the cluster back up if recreated
+          doctl kubernetes cluster kubeconfig save videocall-singapore || \
+            echo "singapore cluster not found - skipping"
           
       - name: 🔍 Cross-Region Validation
         run: |

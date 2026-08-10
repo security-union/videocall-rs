@@ -55,6 +55,8 @@ jobs:
             attrs: -A images.meeting-api -A images.bot
           - name: dioxus-ui
             attrs: -A images.dioxus-ui
+          - name: website-and-vlog
+            attrs: -A images.website -A images.engineering-vlog
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4

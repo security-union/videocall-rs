@@ -80,3 +80,4 @@ e2e/node_modules/**
 
 # native dev-stack state (make dev)
 .data/
+.env.local

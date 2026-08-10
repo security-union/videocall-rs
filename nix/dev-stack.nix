@@ -136,15 +136,11 @@ let
 
   # --- shared app env (native: middleware on localhost) ----------------------
 
-  dbUrl = "postgres://postgres:docker@localhost:5432/actix-api-db?sslmode=disable";
-  commonEnv = [
-    "NATS_URL=localhost:4222"
-    "DATABASE_URL=${dbUrl}"
-    "JWT_SECRET=dev-jwt-secret-change-me"
-    "RUST_LOG=debug,async_nats=info"
-    "REGION=us-east"
-    "SERVER_ID=server-1"
-  ];
+  # Shared/overridable env (DATABASE_URL, NATS_URL, JWT_SECRET, RUST_LOG,
+  # OAUTH_*, UI config …) is NOT listed here — processes inherit it from the
+  # dev-stack wrapper, which layers: built-in defaults < .env < .env.local
+  # (both untracked). Per-process lists keep only per-service identity.
+  commonEnv = [ ];
 
   middlewareUp = {
     postgres-init.condition = "process_completed_successfully";
@@ -202,25 +198,14 @@ let
         namespace = "services";
         shutdown = rustShutdown;
         command = "(cd dbmate && dbmate wait && dbmate up) && exec cargo watch -x 'run --bin meeting-api'";
-        environment = commonEnv ++ [
-          "LISTEN_ADDR=0.0.0.0:8081"
-          "TOKEN_TTL_SECS=60"
-          "COOKIE_SECURE=false"
-          "AFTER_LOGIN_URL=http://localhost:3001"
-          "ALLOWED_REDIRECT_URLS=http://localhost:3001"
-        ];
+        environment = [ "LISTEN_ADDR=0.0.0.0:8081" ];
         depends_on = middlewareUp;
       };
       websocket = {
         namespace = "services";
         shutdown = rustShutdown;
         command = "exec cargo watch -x 'run --bin websocket_server'";
-        environment = commonEnv ++ [
-          "ACTIX_PORT=8080"
-          "UI_ENDPOINT=http://localhost:3001"
-          "DATABASE_ENABLED=false"
-          "SERVICE_TYPE=websocket"
-        ];
+        environment = [ "ACTIX_PORT=8080" "DATABASE_ENABLED=false" "SERVICE_TYPE=websocket" ];
         depends_on.nats.condition = "process_healthy";
       };
       webtransport = {
@@ -228,13 +213,12 @@ let
         shutdown = rustShutdown;
         working_dir = "actix-api";
         command = "exec cargo watch -x 'run --bin webtransport_server'";
-        environment = commonEnv ++ [
+        environment = [
           "LISTEN_URL=0.0.0.0:4433"
           "HEALTH_LISTEN_URL=0.0.0.0:5321"
           "CERT_PATH=certs/localhost.pem"
           "KEY_PATH=certs/localhost.key"
           "SERVICE_TYPE=webtransport"
-          "RUST_LOG=info"
         ];
         depends_on.nats.condition = "process_healthy";
       };
@@ -242,32 +226,21 @@ let
         namespace = "services";
         shutdown = rustShutdown;
         command = "exec cargo watch -x 'run --bin metrics_server'";
-        environment = commonEnv ++ [
-          "METRICS_PORT=9091"
-          "SERVICE_TYPE=client-metrics"
-        ];
+        environment = [ "METRICS_PORT=9091" "SERVICE_TYPE=client-metrics" ];
         depends_on = middlewareUp;
       };
       server-stats = {
         namespace = "services";
         shutdown = rustShutdown;
         command = "exec cargo watch -x 'run --bin metrics_server_snapshot'";
-        environment = commonEnv ++ [
-          "METRICS_PORT=9092"
-          "SERVICE_TYPE=server-stats"
-        ];
+        environment = [ "METRICS_PORT=9092" "SERVICE_TYPE=server-stats" ];
         depends_on.nats.condition = "process_healthy";
       };
       dioxus-ui = {
         namespace = "services";
         shutdown = rustShutdown;
         command = "exec ./docker/start-dioxus.sh";
-        environment = [
-          "API_BASE_URL=http://localhost:8081"
-          "ACTIX_UI_BACKEND_URL=ws://localhost:8080"
-          "WEBTRANSPORT_HOST=https://127.0.0.1:4433"
-          "TRUNK_SERVE_PORT=3001"
-        ];
+        environment = [ "TRUNK_SERVE_PORT=3001" ];
       };
     };
   };
@@ -288,6 +261,29 @@ pkgs.writeShellApplication {
       exit 1
     fi
     mkdir -p "''${DEV_STACK_DATA_DIR:-.data}"
+    # Env layering for every process in the stack (children inherit):
+    #   built-in defaults  <  .env  <  .env.local   (both untracked)
+    # Put secrets/overrides (OAUTH_*, JWT_SECRET, bitrates, …) in .env.local.
+    set -a
+    # shellcheck disable=SC1091
+    [ -f .env ] && . ./.env
+    # shellcheck disable=SC1091
+    [ -f .env.local ] && . ./.env.local
+    set +a
+    export NATS_URL="''${NATS_URL:-localhost:4222}"
+    export DATABASE_URL="''${DATABASE_URL:-postgres://postgres:docker@localhost:5432/actix-api-db?sslmode=disable}"
+    export JWT_SECRET="''${JWT_SECRET:-dev-jwt-secret-change-me}"
+    export RUST_LOG="''${RUST_LOG:-debug,async_nats=info}"
+    export REGION="''${REGION:-us-east}"
+    export SERVER_ID="''${SERVER_ID:-server-1}"
+    export UI_ENDPOINT="''${UI_ENDPOINT:-http://localhost:3001}"
+    export API_BASE_URL="''${API_BASE_URL:-http://localhost:8081}"
+    export ACTIX_UI_BACKEND_URL="''${ACTIX_UI_BACKEND_URL:-ws://localhost:8080}"
+    export WEBTRANSPORT_HOST="''${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}"
+    export TOKEN_TTL_SECS="''${TOKEN_TTL_SECS:-60}"
+    export COOKIE_SECURE="''${COOKIE_SECURE:-false}"
+    export AFTER_LOGIN_URL="''${AFTER_LOGIN_URL:-http://localhost:3001}"
+    export ALLOWED_REDIRECT_URLS="''${ALLOWED_REDIRECT_URLS:-http://localhost:3001}"
     # process-compose's own REST API defaults to :8080, which shadows the
     # websocket server on 127.0.0.1 — park it well out of the way.
     # PC_PORT_NUM is process-compose's native env knob; overridable so a

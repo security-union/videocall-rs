@@ -159,8 +159,8 @@ jobs:
         with:
           # one cache entry per pins+lockfile state — a single tar, immune to
           # the per-path API throttling that killed magic-nix-cache
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('nix/tamal/lock.json', 'Cargo.lock', '**/*.nix') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
+          primary-key: nix-images-${{ runner.os }}-${{ hashFiles('nix/tamal/lock.json', 'Cargo.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-images-${{ runner.os }}-
           gc-max-store-size-linux: 5G
 
       - name: Login to GitHub Container Registry

@@ -29,64 +29,21 @@ on:
       - 'nix/**'
 
 jobs:
-  # 10-second probe: is the warm cache already seeded for this pins+lockfile
-  # state? On warm runs the expensive warm job is skipped entirely and the
-  # matrix starts immediately.
-  cache-probe:
-    name: Probe warm cache
-    runs-on: ubuntu-latest
-    outputs:
-      hit: ${{ steps.probe.outputs.hit }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: probe
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          KEY="nix-images-${{ runner.os }}-${{ hashFiles('nix/tamal/lock.json', 'Cargo.lock', '**/*.nix') }}"
-          COUNT=$(gh api "repos/${{ github.repository }}/actions/caches?key=$KEY" --jq '.total_count')
-          echo "key=$KEY count=$COUNT"
-          [ "$COUNT" != "0" ] && echo "hit=true" >> "$GITHUB_OUTPUT" || echo "hit=false" >> "$GITHUB_OUTPUT"
-
-  # Cold path only (first PR after a pins/lockfile change): build the full
-  # non-member closure — crane deps artifacts AND image runtime payloads
-  # (static caddy/busybox/dbmate, go toolchain, musl tzdata/cacert) — exactly
-  # once, and save it. Without ciWarm the legs rebuilt go-1.25.5 & friends on
-  # every run and never saved them (exact-key hit skips their save).
-  warm-deps:
-    name: Warm dependency caches
-    needs: cache-probe
-    if: needs.cache-probe.outputs.hit != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out the repo
-        uses: actions/checkout@v4
-
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: cachix/cachix-action@v16
-        with:
-          name: videocall-rs
-          # pull works tokenless (public cache); push activates once the
-          # CACHIX_AUTH_TOKEN repo secret exists
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - uses: nix-community/cache-nix-action@v6
-        with:
-          # one cache entry per pins+lockfile state — a single tar, immune to
-          # the per-path API throttling that killed magic-nix-cache
-          primary-key: nix-images-${{ runner.os }}-${{ hashFiles('nix/tamal/lock.json', 'Cargo.lock', '**/*.nix') }}
-          restore-prefixes-first-match: nix-images-${{ runner.os }}-
-          gc-max-store-size-linux: 5G
-
-      - name: Build the full non-member closure
-        run: nix-build release.nix -A packages.ciWarm --no-out-link
-
-  # Parallel matrix (like the old per-Dockerfile jobs): wall time = slowest
-  # leg; each leg substitutes the warmed closure and compiles only workspace
-  # crates.
+  # Three self-sufficient legs. Dependencies, toolchains and runtime payloads
+  # substitute from cachix (videocall-rs.cachix.org) — pushed once, org-wide —
+  # so each leg compiles ONLY the workspace crates the PR touched, then
+  # assembles layers. Measured: 2m24s-4m50s per leg on a warm cache vs ~10m
+  # wall for the docker-era 4-job matrix.
+  #
+  # No warm-up job and no GHA store snapshot on purpose:
+  # - nix-community/cache-nix-action restored files under the RUNNING nix
+  #   daemon, whose open SQLite db never saw them — nix planned 1566-drv full
+  #   rebuilds right after "successful" 1.6GB restores, on every run.
+  # - with cachix substitution a warm-up job only serializes the matrix; on a
+  #   cold cache (lockfile/pin bump) the legs race-build deps redundantly, but
+  #   that is rare and does not extend wall time.
   build-images:
     name: Build Nix images (${{ matrix.name }})
-    needs: [cache-probe, warm-deps]
-    if: ${{ !cancelled() && needs.cache-probe.result == 'success' && (needs.warm-deps.result == 'success' || needs.warm-deps.result == 'skipped') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -109,13 +66,6 @@ jobs:
           # pull works tokenless (public cache); push activates once the
           # CACHIX_AUTH_TOKEN repo secret exists
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - uses: nix-community/cache-nix-action@v6
-        with:
-          # one cache entry per pins+lockfile state — a single tar, immune to
-          # the per-path API throttling that killed magic-nix-cache
-          primary-key: nix-images-${{ runner.os }}-${{ hashFiles('nix/tamal/lock.json', 'Cargo.lock', '**/*.nix') }}
-          restore-prefixes-first-match: nix-images-${{ runner.os }}-
-          gc-max-store-size-linux: 5G
 
       - name: Build image derivations (no push)
         run: nix-build release.nix ${{ matrix.attrs }} --no-out-link

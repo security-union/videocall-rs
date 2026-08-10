@@ -64,6 +64,14 @@ let
         "leptos-website"
         "src-tauri"
         "scripts"
+        # the nix build system itself: cargo never reads it, and including it
+        # would rebuild every member derivation on any nix refactor
+        "nix"
+        "default.nix"
+        "release.nix"
+        "shell.nix"
+        "Makefile"
+        ".gitignore"
       ]);
   };
 

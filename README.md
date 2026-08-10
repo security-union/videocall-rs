@@ -176,6 +176,11 @@ Prefer one service per terminal? `make dev-middleware` starts just
 postgres/nats/prometheus/grafana; then `make dev-websocket`, `make dev-meeting-api`,
 `make dev-ui`, … run a single watcher each (those also work with plain rustup + cargo-watch).
 
+**Overriding environment variables:** every process in `make dev` sees env layered as
+*built-in defaults* < **`.env`** < **`.env.local`** — both untracked. Copy
+`docker/.env-sample` to `.env` for documented knobs (OAuth, ports, bitrates); put personal
+or secret overrides in `.env.local`, which is gitignored and never checked in.
+
 ### Full stack from Nix-built images
 
 The same images CI publishes can run the whole stack locally in Docker:
@@ -192,7 +197,9 @@ the Nix store. `make image-<name>` (e.g. `make image-websocket-server`) builds a
 
 ### OAuth (optional)
 
-To enable Google login, create a `.env` from the sample and fill in credentials:
+Both stacks read the same files: `make dev` layers `.env` then `.env.local` into every
+process, and `make up` passes `.env` to docker-compose. To enable Google login, create a
+`.env` from the sample and fill in credentials (or keep secrets in `.env.local`):
 
 ```
 cp docker/.env-sample .env

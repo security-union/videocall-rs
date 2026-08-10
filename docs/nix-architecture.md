@@ -172,6 +172,9 @@ container); the Rust services run under `cargo watch`; the UI runs under `trunk 
 and grafana run natively with the *same* configs as the container stack, rewritten from container
 DNS to localhost at nix build time so they can't drift.
 
+Env for every process is layered *built-in defaults* < `.env` < `.env.local` (both
+untracked; `.env.local` for secrets/personal overrides).
+
 ```console
 $ make dev               # everything: TUI, health-gated deps, hot reload, zero Docker
 $ make dev-middleware    # only postgres/nats/prometheus/grafana …

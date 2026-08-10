@@ -5,9 +5,13 @@ description = "14 Dockerfiles to zero, CI wall time halved, browser tests 13:19 
 [taxonomies]
 tags = ["nix", "docker", "ci", "rust", "devops", "dx"]
 authors = ["Dario Lencina Talarico"]
+[extra]
+remote_image = "/images/we-deleted-docker-hero.svg"
 +++
 
 # We Deleted Docker (and the Flakes Too)
+
+<div style="font-size:6rem;line-height:1;margin:0.5rem 0;">🔪</div>
 
 Not the images. The Dockerfiles. All 14 of them.
 
@@ -20,6 +24,12 @@ nix-build release.nix -A images.websocket-server | docker load
 ```
 
 The Dockerfile never comes back. macOS cross-compiles aarch64-musl natively — no VM, no Linux builder. Your laptop emits ELF.
+
+## Why kill flakes?
+
+Because flakes are not Nix. They're a framework bolted onto Nix, and after eight years the bolt is still marked **experimental** — every command starts with a flag ritual acknowledging you're off the supported path. And what does the framework buy you? Rigidity. The `inputs` block is a dead mini-DSL: you can't type real Nix in it — no functions, no conditionals, no computing an input from another input. It's a config file cosplaying as a programming language, inside a programming language. Then the evaluator copies your whole repo into the store on every eval to enforce a purity you already had.
+
+Classic Nix is just a language. `default.nix` is a function; you call it with `import`, compose it, override it, parameterize it — the full language, everywhere, including the pins. The one thing flakes genuinely gave us — a lockfile — nixtamal provides in ~40 lines of KDL without taking the language away. Stability, power, and the lock. Pick three.
 
 ## The scoreboard
 

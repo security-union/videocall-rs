@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360">
+  <rect fill="#16181a" width="640" height="360"/>
+  <text x="320" y="215" font-size="160" text-anchor="middle">🔪</text>
+  <text x="320" y="320" font-size="28" text-anchor="middle" fill="#f5a623" font-family="ui-monospace, Menlo, Consolas, monospace" font-weight="bold">docker: deleted</text>
+</svg>

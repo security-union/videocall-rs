@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 200" font-family="ui-monospace, Menlo, Consolas, monospace">
+  <text fill="#8a8f98" font-size="11" x="0" y="12">dioxus-ui browser test job (wasm, headless chrome)</text>
+  <text fill="#8a8f98" font-size="12" x="140" y="46" text-anchor="end">serial, typical</text>
+  <rect fill="#8a8f98" x="150" y="34" width="266" height="18"/>
+  <text fill="#8a8f98" font-size="12" font-weight="bold" x="424" y="48">13:19</text>
+  <text fill="#8a8f98" font-size="12" x="140" y="88" text-anchor="end">serial, 4 wedges</text>
+  <rect fill="#8a8f98" x="150" y="76" width="457" height="18"/>
+  <text fill="#1a1a1a" font-size="12" font-weight="bold" x="600" y="90" text-anchor="end">≈22:50</text>
+  <text fill="#8a8f98" font-size="12" x="140" y="130" text-anchor="end">parallel, 4 wedges</text>
+  <rect fill="#f5a623" x="150" y="118" width="267" height="18"/>
+  <text fill="#8a8f98" font-size="12" font-weight="bold" x="425" y="132">13:22</text>
+  <text fill="#8a8f98" font-size="12" x="140" y="172" text-anchor="end">parallel, clean</text>
+  <rect fill="#f5a623" x="150" y="160" width="47" height="18"/>
+  <text fill="#f5a623" font-size="12" font-weight="bold" x="205" y="174">2:21</text>
+</svg>

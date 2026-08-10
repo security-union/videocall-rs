@@ -1,5 +1,5 @@
-# Dev shells, ported verbatim from the old flake.nix. Optional for day-to-day
-# dev (rustup works too) — they provide the *pinned* toolchains used by CI.
+# Dev shells. Optional for day-to-day dev (rustup works too) — they provide
+# the *pinned* toolchains used by CI.
 #
 #   nix-shell                                            -> default (frontend-dev)
 #   nix-shell default.nix -A shells.backend-dev --run …  -> named shell

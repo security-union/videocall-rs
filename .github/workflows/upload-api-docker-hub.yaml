@@ -49,8 +49,7 @@ jobs:
         run: echo "branch=$(echo ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}} | sed 's/\//-/g')" >> "$GITHUB_OUTPUT"
 
       # nix.dev flow: docker load < $(nix-build …) — the same release.nix attr
-      # `make image-media-server` builds locally. The runner is Linux, so the
-      # musl payload builds natively (no cross-compilation in CI).
+      # `make image-media-server` builds locally.
       - name: Build and push API Docker image
         run: |
           script=$(nix-build release.nix -A images.media-server --no-out-link \

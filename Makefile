@@ -77,6 +77,10 @@ dev:
 dev-middleware:
 	nix-shell default.nix -A shells.dev --run "dev-stack postgres postgres-init nats prometheus grafana"
 
+# Stop a running `make dev` stack from another terminal (same as quitting the TUI)
+dev-down:
+	nix-shell default.nix -A shells.dev --run "process-compose down -p $${PC_PORT_NUM:-28080}"
+
 # Full stack from Nix-built images (Docker)
 up: .env images
 	$(COMPOSE) up

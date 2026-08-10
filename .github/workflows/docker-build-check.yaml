@@ -29,7 +29,7 @@ on:
       - 'nix/**'
 
 jobs:
-  # Three self-sufficient legs. Dependencies, toolchains and runtime payloads
+  # Four self-sufficient legs. Dependencies, toolchains and runtime payloads
   # substitute from cachix (videocall-rs.cachix.org) — pushed once, org-wide —
   # so each leg compiles ONLY the workspace crates the PR touched, then
   # assembles layers. Measured: 2m24s-4m50s per leg on a warm cache vs ~10m

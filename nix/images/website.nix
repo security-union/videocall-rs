@@ -1,5 +1,4 @@
 # Leptos marketing site: musl server binary + prerendered site assets.
-# Replaces docker/Dockerfile.website (nixos/nix builder -> debian-slim).
 # Docker Hub: securityunion/video-call-rs-website -> helm website charts.
 { common, packages, p }:
 let

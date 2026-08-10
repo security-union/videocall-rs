@@ -8,7 +8,7 @@ common.mkServiceImage {
     packages.meeting-api
     pkgsLinuxStatic.dbmate
     common.dbmateFiles
-    # the old image shipped /usr/bin/meeting-api and /usr/bin/dbmate
+    # keep /usr/bin/{meeting-api,dbmate} for tools that exec absolute paths
     (common.usrBinCompat [ packages.meeting-api pkgsLinuxStatic.dbmate ])
   ] ++ common.shellUtils;
   config = {

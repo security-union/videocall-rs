@@ -1,5 +1,4 @@
 # Engineering vlog: zola-built static site served by static Caddy.
-# Replaces docker/Dockerfile.engineering-vlog (zola:v0.19.1 -> nginx:1.27).
 # Docker Hub: securityunion/videocall-engineering-vlog -> helm engineering-vlog chart.
 { common, p }:
 let

@@ -74,8 +74,6 @@ jobs:
       - uses: cachix/cachix-action@v16
         with:
           name: videocall-rs
-          # pull works tokenless (public cache); push activates once the
-          # CACHIX_AUTH_TOKEN repo secret exists
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Cache cargo dependencies

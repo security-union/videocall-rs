@@ -146,10 +146,7 @@ let
   # One derivation, three builds into one target dir. NOT a chain of
   # buildDepsOnly calls: buildDepsOnly hard-codes `cargoArtifacts = null`
   # (crane lib/buildDepsOnly.nix), so chained stages silently discard their
-  # predecessor and only the last invocation's graph survives — verified by
-  # fingerprint archaeology (final tar held 77 of the 291 units trunk needs;
-  # the one shared variant hash matched exactly, proving dummy-src builds
-  # produce trunk-identical unit hashes when the invocation matches).
+  # predecessor and only the last invocation's graph survives.
   wasmDeps = craneLibWasm.buildDepsOnly (wasmCommonArgs // {
     pname = "wasm-deps";
     doCheck = false;
@@ -265,10 +262,9 @@ in
   inherit nativeDeps wasmDeps;
 
   # EVERYTHING the image legs need except the per-commit member builds: the
-  # crane deps artifacts plus the image runtime payloads. The audit of leg
-  # job 93372834164 showed the legs otherwise rebuild go-1.25.5 (for static
-  # dbmate), busybox, caddy, musl tzdata/cacert on EVERY run — and never save
-  # them, because they exact-hit the warm cache key and skip their own save.
+  # crane deps artifacts plus the image runtime payloads (go/dbmate, busybox,
+  # caddy, musl tzdata/cacert). Without warming these, every leg rebuilds them
+  # on each run and never saves them (they exact-hit the warm key, skipping save).
   ciWarm = pkgs.linkFarm "ci-warm" [
     { name = "native-deps"; path = nativeDeps; }
     { name = "wasm-deps"; path = wasmDeps; }

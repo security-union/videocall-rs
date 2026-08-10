@@ -155,6 +155,12 @@ jobs:
           ref: ${{ needs.check-permissions.outputs.pr_sha }}
 
       - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/cachix-action@v16
+        with:
+          name: videocall-rs
+          # pull works tokenless (public cache); push activates once the
+          # CACHIX_AUTH_TOKEN repo secret exists
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: nix-community/cache-nix-action@v6
         with:
           # one cache entry per pins+lockfile state — a single tar, immune to

@@ -17,6 +17,8 @@ Not the images. The Dockerfiles. All 14 of them.
 
 The old setup ran Nix *inside* Docker. A nixos container per service, bind-mounting the repo, each with its own private Nix store volume. We were paying container tax to run a build system whose whole point is not needing containers. Peak cosplay.
 
+![Friendship ended with DOCKER — now NIX is my best friend](/images/friendship-ended-with-docker.png)
+
 [Last time](/posts/nixify-your-leptos-website-and-stop-compiling-your-tools/) we flaked the website and went 19→5 minutes. This time we went further and deleted the flakes too. Classic Nix: `default.nix`, `release.nix`, `shell.nix`. Inputs pinned with [nixtamal](https://nixtamal.toast.al/) — a plain KDL manifest, evaluable by any Nix since forever. Docker images are just derivations:
 
 ```bash

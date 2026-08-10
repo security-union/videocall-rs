@@ -24,7 +24,6 @@ spec:
           image: "{{ .Values.serverStats.image.repository }}:{{ .Values.serverStats.image.tag }}"
           imagePullPolicy: {{ .Values.serverStats.image.pullPolicy }}
           command: {{ .Values.serverStats.command }}
-          workingDir: /app/actix-api
           ports:
             - name: http
               containerPort: {{ .Values.serverStats.service.targetPort }}

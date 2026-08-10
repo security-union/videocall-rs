@@ -125,18 +125,27 @@ let
     version = "0.1.0";
     doCheck = false;
     CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-    # Deps of the three crates index.html builds, with the SAME feature set the
-    # trunk build uses (workers are --no-default-features + wasm/web; default
-    # features would drag native-only deps like mio into a wasm32 compile).
-    cargoExtraArgs = lib.concatStringsSep " " [
-      "-p videocall-ui -p videocall-codecs -p neteq"
-      "--no-default-features"
-      "--features videocall-ui/media-server-jwt-auth,videocall-codecs/wasm,neteq/web"
-    ];
   };
 
+  # Trunk runs THREE cargo invocations (index.html: the UI crate + two worker
+  # bins), each resolving features per-invocation. A single union deps build
+  # produces artifacts whose fingerprints match none of them — cargo silently
+  # recompiles web-sys and friends inside the dist build. So: chain one
+  # deps-only derivation per invocation, each with that invocation's exact
+  # feature set, accumulating into one artifacts dir the dist build inherits.
+  wasmDepsUi = craneLibWasm.buildDepsOnly (wasmCommonArgs // {
+    pname = "wasm-deps-ui";
+    cargoExtraArgs = "-p videocall-ui";
+  });
+  wasmDepsCodecs = craneLibWasm.buildDepsOnly (wasmCommonArgs // {
+    pname = "wasm-deps-codecs";
+    cargoArtifacts = wasmDepsUi;
+    cargoExtraArgs = "-p videocall-codecs --no-default-features --features wasm";
+  });
   wasmDeps = craneLibWasm.buildDepsOnly (wasmCommonArgs // {
-    pname = "dioxus-wasm-deps";
+    pname = "wasm-deps";
+    cargoArtifacts = wasmDepsCodecs;
+    cargoExtraArgs = "-p neteq --no-default-features --features web";
   });
 in
 {

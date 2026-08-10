@@ -1,6 +1,20 @@
-COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 COMPOSE := docker compose --env-file .env -f docker/docker-compose.yaml
+
+# Integration-test middleware: native process-compose (no docker), own API
+# port so it coexists with a running `make dev`, throwaway data dir so every
+# run starts from a fresh database (what `docker compose down -v` used to do).
+IT_PC_PORT := 28081
+IT_PG_PORT := 15432
+IT_NATS_PORT := 14222
+IT_NATS_MON_PORT := 18222
+IT_DATA := /tmp/videocall-it-data
+
+# On macOS the nokhwa capture crates shell out to Swift/Xcode, which the pinned
+# nix-shell's Apple-SDK env breaks. Exclude them from the workspace clippy
+# there (the pre-push hook still lints them with the system toolchain); Linux
+# CI keeps full --workspace coverage.
+CLIPPY_EXCLUDES := $(shell [ "$$(uname -s)" = "Darwin" ] && echo "--exclude videocall-cli --exclude videocall-nokhwa --exclude videocall-nokhwa-bindings-macos --exclude videocall-nokhwa-core")
 
 # Images the Playwright E2E stack needs (subset of release.nix images.*)
 E2E_IMAGES := meeting-api websocket-server dioxus-ui
@@ -119,13 +133,16 @@ dev-website:
 	cd leptos-website && npm install && LEPTOS_SITE_ADDR=0.0.0.0:4600 cargo leptos watch
 
 # ---------------------------------------------------------------------------
-# Integration tests — middleware in compose, tests native in the pinned shell
+# Integration tests — middleware AND tests native, zero docker
 # ---------------------------------------------------------------------------
 
 tests_run:
-	docker compose -f $(COMPOSE_IT) up -d --wait postgres nats
-	NATS_URL=localhost:4222 \
-	DATABASE_URL="postgres://postgres:docker@localhost:5432/actix-api-db?sslmode=disable" \
+	rm -rf $(IT_DATA) && mkdir -p $(IT_DATA)
+	DEV_STACK_DATA_DIR=$(IT_DATA) PC_PORT_NUM=$(IT_PC_PORT) \
+	DEV_STACK_PG_PORT=$(IT_PG_PORT) DEV_STACK_NATS_PORT=$(IT_NATS_PORT) DEV_STACK_NATS_MON_PORT=$(IT_NATS_MON_PORT) \
+		nix-shell default.nix -A shells.dev --run "dev-stack -D postgres postgres-init nats"
+	NATS_URL=localhost:$(IT_NATS_PORT) \
+	DATABASE_URL="postgres://postgres:docker@localhost:$(IT_PG_PORT)/actix-api-db?sslmode=disable" \
 	DATABASE_ENABLED=true \
 	WEBTRANSPORT_URL=https://127.0.0.1:4433 \
 	HEALTH_URL=http://127.0.0.1:5321/healthz \
@@ -139,13 +156,14 @@ tests_run:
 	nix-shell default.nix -A shells.backend-dev --run "\
 		set -euo pipefail && \
 		(cd dbmate && dbmate wait && dbmate up) && \
-		cargo clippy --all -- -D warnings && \
+		cargo clippy --workspace $(CLIPPY_EXCLUDES) -- -D warnings && \
 		cargo fmt --all --check && \
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
 		cargo test -p meeting-api -- --nocapture --test-threads=1"
 
 tests_down:
-	docker compose -f $(COMPOSE_IT) down -v
+	-nix-shell default.nix -A shells.dev --run "process-compose down -p $(IT_PC_PORT)"
+	rm -rf $(IT_DATA)
 
 # Run the meeting-api integration tests against a local SQLite database.
 # Requires the `dbmate` binary on PATH. Serialized (--test-threads=1) because

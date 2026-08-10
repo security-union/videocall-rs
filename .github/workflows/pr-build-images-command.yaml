@@ -155,7 +155,13 @@ jobs:
           ref: ${{ needs.check-permissions.outputs.pr_sha }}
 
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          # one cache entry per pins+lockfile state — a single tar, immune to
+          # the per-path API throttling that killed magic-nix-cache
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('nix/tamal/lock.json', 'Cargo.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5G
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3

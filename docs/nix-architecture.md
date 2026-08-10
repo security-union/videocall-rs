@@ -229,7 +229,19 @@ use the same tutorial flow as `make image-*`:
 | 0 | This document | — |
 | 1 | tamal pins, `default.nix`/`release.nix`/`shell.nix`, all app images, compose rewiring, Makefile, README | `docker/Dockerfile.{actix,dioxus,website}.dev` |
 | 2 | GitHub Actions: publish from `release.nix`, tests via `nix-shell` | `Dockerfile.actix`, `Dockerfile.meeting-api`, `Dockerfile.dioxus`, `docker/Dockerfile.website` |
-| 3 | Fringe: videocall-cli, engineering-vlog, video-daemon, protobuf codegen, bot legacy, neteq example | the rest — after this, zero Dockerfiles in the repo |
+| 3 | Fringe: videocall-cli, engineering-vlog, protobuf codegen, neteq example, leptos website image | the rest — after this, zero Dockerfiles in the repo |
+
+### Where Docker still legitimately lives
+
+Dev and integration testing are now **zero-docker** (`make dev`, `make tests_run` — middleware
+comes from nixpkgs under process-compose). Docker remains only where containers *are* the
+deliverable:
+
+- `docker/docker-compose.e2e.yaml` — Playwright certifies the exact images we ship, DB topology
+  included; running e2e against native processes would stop testing the artifact.
+- `docker/docker-compose.yaml` (`make up`) — prod-parity full-container smoke run.
+- CI publish (`docker load`/`push` of nix-built images) — could go daemon-less with skopeo later.
+- Stage-3 stragglers above, each still Dockerfile-built until nixified.
 
 ## Risks & mitigations
 

@@ -156,6 +156,7 @@ in
       # and the trunk-built UI alike.
       rust.frontendRustMinimal
       pkgs.cargo-watch
+      pkgs.process-compose # attach/list/down against a running dev-stack
       devStack
     ] ++ backendBuildInputs ++ frontendBuildInputs;
     shellHook = frontendHook;

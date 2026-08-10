@@ -455,17 +455,16 @@ PostgreSQL and NATS instances, spun up via Docker Compose. Tests cover:
 - **Feature flags** — behavior with `FEATURE_MEETING_MANAGEMENT` on and off
 
 Tests use `#[serial_test::serial]` because they share a database, and each test
-cleans up its own data. The middleware is defined in
-`docker/docker-compose.integration.yaml` (`postgres:12` and `nats:2.10-alpine`
-with JetStream); the tests themselves run natively on the host inside the
-pinned nix-shell — `make tests_run` starts the middleware, runs `dbmate`
-migrations, clippy, fmt and `cargo test`.
+cleans up its own data. Everything runs natively — no Docker: `make tests_run`
+starts postgres 18 + NATS (JetStream) from nixpkgs under process-compose in a
+throwaway data dir (fresh database every run), then runs `dbmate` migrations,
+clippy, fmt and `cargo test` in the pinned nix-shell.
 
 ```bash
-# Run all backend tests (PostgreSQL + NATS in Docker, cargo native)
+# Run all backend tests (native postgres/NATS, fresh state per run)
 make tests_run
 
-# Tear down test containers
+# Stop the test middleware and delete its state
 make tests_down
 ```
 

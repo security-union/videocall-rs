@@ -24,7 +24,7 @@ let
     name = "dev-stack-postgres";
     runtimeInputs = [ pkgs.postgresql_18 ];
     text = ''
-      PGDATA="$PWD/.data/postgres"
+      PGDATA="''${DEV_STACK_DATA_DIR:-$PWD/.data}/postgres"
       if [ -s "$PGDATA/PG_VERSION" ] && [ "$(cat "$PGDATA/PG_VERSION")" != "18" ]; then
         echo "error: $PGDATA was initialized by postgres $(cat "$PGDATA/PG_VERSION"), but the dev stack runs 18." >&2
         echo "       Dev data is disposable: rm -rf $PGDATA and rerun." >&2
@@ -35,7 +35,7 @@ let
       fi
       exec postgres -D "$PGDATA" \
         -c listen_addresses=127.0.0.1 \
-        -c port=5432 \
+        -c port="''${DEV_STACK_PG_PORT:-5432}" \
         -c unix_socket_directories="$PGDATA"
     '';
   };
@@ -46,6 +46,8 @@ let
     name = "dev-stack-postgres-init";
     runtimeInputs = [ pkgs.postgresql_18 ];
     text = ''
+      PGPORT="''${DEV_STACK_PG_PORT:-5432}"
+      export PGPORT
       if ! psql -h 127.0.0.1 -U postgres -lqt | cut -d'|' -f1 | grep -qw actix-api-db; then
         createdb -h 127.0.0.1 -U postgres actix-api-db
       fi
@@ -56,8 +58,9 @@ let
     name = "dev-stack-nats";
     runtimeInputs = [ pkgs.nats-server ];
     text = ''
-      mkdir -p "$PWD/.data/nats"
-      exec nats-server -js -sd "$PWD/.data/nats" -m 8222
+      DATA="''${DEV_STACK_DATA_DIR:-$PWD/.data}/nats"
+      mkdir -p "$DATA"
+      exec nats-server -js -sd "$DATA" -p "''${DEV_STACK_NATS_PORT:-4222}" -m "''${DEV_STACK_NATS_MON_PORT:-8222}"
     '';
   };
 
@@ -164,7 +167,7 @@ let
         namespace = "middleware";
         command = lib.getExe postgresRun;
         readiness_probe = {
-          exec.command = "pg_isready -h 127.0.0.1 -p 5432 -U postgres";
+          exec.command = ''pg_isready -h 127.0.0.1 -p "''${DEV_STACK_PG_PORT:-5432}" -U postgres'';
           initial_delay_seconds = 2;
           period_seconds = 2;
           failure_threshold = 30;
@@ -179,7 +182,7 @@ let
         namespace = "middleware";
         command = lib.getExe natsRun;
         readiness_probe = {
-          http_get = { host = "127.0.0.1"; port = 8222; path = "/healthz"; };
+          exec.command = ''curl -sf "http://127.0.0.1:''${DEV_STACK_NATS_MON_PORT:-8222}/healthz"'';
           initial_delay_seconds = 1;
           period_seconds = 2;
           failure_threshold = 30;
@@ -284,9 +287,13 @@ pkgs.writeShellApplication {
       echo "error: dev-stack must be run from the videocall-rs repo root" >&2
       exit 1
     fi
-    mkdir -p .data
+    mkdir -p "''${DEV_STACK_DATA_DIR:-.data}"
     # process-compose's own REST API defaults to :8080, which shadows the
     # websocket server on 127.0.0.1 — park it well out of the way.
-    exec process-compose up -f ${configFile} --port 28080 "$@"
+    # PC_PORT_NUM is process-compose's native env knob; overridable so a
+    # second instance (e.g. `make tests_run` middleware) can coexist.
+    : "''${PC_PORT_NUM:=28080}"
+    export PC_PORT_NUM
+    exec process-compose up -f ${configFile} "$@"
   '';
 }

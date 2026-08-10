@@ -14,6 +14,8 @@ let
     bot = import ./bot.nix { inherit common packages; };
     media-server = import ./media-server.nix { inherit common packages pkgsLinuxStatic; };
     dioxus-ui = import ./dioxus-ui.nix { inherit common packages p; };
+    engineering-vlog = import ./engineering-vlog.nix { inherit common p; };
+    website = import ./website.nix { inherit common packages p; };
   };
 in
 images // {

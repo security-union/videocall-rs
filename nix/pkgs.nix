@@ -58,7 +58,16 @@ let
   # Go tests anyway, but native-musl CI builds run caddy's integration suite,
   # which spins localhost TLS servers that fail in the build sandbox.
   caddyStatic = pkgsLinuxStatic.caddy.overrideAttrs (_: { doCheck = false; });
+
+  # Source of the protoc plugin for rust-protobuf v3 — built with crane in
+  # packages.nix (nixpkgs' fetchCargoVendor gets 403'd by crates.io's api
+  # endpoint; crane vendors from the static.crates.io CDN instead).
+  protobufCodegenSrc = pkgs.fetchCrate {
+    pname = "protobuf-codegen";
+    version = "3.7.1";
+    hash = "sha256-HNsva4Idd054PQq27kNCZC9aUNktZQwTYc1YeLCAS4o=";
+  };
 in
 {
-  inherit pkgs pkgsLinux pkgsLinuxStatic pkgsLeptos linuxSystem muslTarget caddyStatic;
+  inherit pkgs pkgsLinux pkgsLinuxStatic pkgsLeptos linuxSystem muslTarget caddyStatic protobufCodegenSrc;
 }

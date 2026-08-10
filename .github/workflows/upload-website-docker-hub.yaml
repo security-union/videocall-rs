@@ -6,40 +6,41 @@ on:
       - main
     paths:
       - 'leptos-website/**'
-      - 'docker/Dockerfile.website'
-      # the builder stage uses the repo's nix shells
-      - 'default.nix'
+      - 'nix/images/website.nix'
+      - 'nix/packages.nix'
       - 'nix/**'
-      
+      - default.nix
+      - release.nix
+
 jobs:
   build_and_push:
     name: Build and Push Website Docker image
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v3
-        id: checkout
+        uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/cachix-action@v16
+        with:
+          name: videocall-rs
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Log in to Docker Hub
         uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-      
-      - name: Extract SHA
-        id: extract_sha
-        run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA::8})"
 
-      - name: Extract branch name
-        id: extract_branch
-        run: echo "::set-output name=branch::${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
-
+      # nix.dev flow: docker load < $(nix-build …) — same release.nix attr as
+      # `make image-website` locally.
       - name: Build and push Website Docker image
-        uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
-        with:
-          context: .
-          file: docker/Dockerfile.website
-          push: true
-          tags: |
-            securityunion/video-call-rs-website:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
-            securityunion/video-call-rs-website:latest
+        run: |
+          script=$(nix-build release.nix -A images.website --no-out-link)
+          "$script" | docker load
+          sha8=$(echo ${GITHUB_SHA::8})
+          branch=$(echo ${GITHUB_REF#refs/heads/} | sed 's/\//-/g')
+          docker tag videocall/website:dev securityunion/video-call-rs-website:$branch-$sha8
+          docker tag videocall/website:dev securityunion/video-call-rs-website:latest
+          docker push securityunion/video-call-rs-website:$branch-$sha8
+          docker push securityunion/video-call-rs-website:latest

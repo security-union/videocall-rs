@@ -33,6 +33,9 @@ let
   # wasm builds run entirely on the host (arch-neutral output).
   craneLibWasm = (mkCraneLib pkgs).overrideToolchain rust.frontendRustMinimal;
 
+  # plain host builds (native tools), default nixpkgs rustc
+  craneLibHost = mkCraneLib pkgs;
+
   # Workspace source, filtered to what cargo actually needs. Cargo resolves
   # every workspace member's manifest (and their path deps), so crate dirs
   # stay; only build outputs, VCS state and non-Rust trees are dropped.
@@ -156,8 +159,107 @@ let
       cargoWithProfile build --locked -p neteq --no-default-features --features web
     '';
   });
+  # ---- videocall-cli --------------------------------------------------------
+
+  # Native capture client (camera/audio) — a host binary, not a container:
+  # there is no docker anywhere in its path anymore. Linux-only under nix
+  # (alsa/v4l); on macOS the AVFoundation capture layer shells out to the
+  # system Swift toolchain, which the nix sandbox cannot use — build with
+  # `cargo build -p videocall-cli` there. Pure-Rust VP9 is the default; the
+  # C libvpx backend stays opt-in via the crate's `libvpx` feature.
+  videocall-cli =
+    if pkgs.stdenv.isLinux then
+      craneLibHost.buildPackage {
+        pname = "videocall-cli";
+        version = "4.0.0";
+        inherit src;
+        cargoExtraArgs = "-p videocall-cli";
+        doCheck = false;
+        nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake pkgs.nasm pkgs.perl ];
+        buildInputs = [ pkgs.alsa-lib pkgs.openssl ];
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        meta.mainProgram = "videocall-cli";
+      }
+    else
+      throw "videocall-cli under nix is Linux-only; on macOS run `cargo build -p videocall-cli` (needs the system Xcode toolchain for AVFoundation)";
+
+  # ---- leptos website -------------------------------------------------------
+
+  # cargo-leptos drives its own cargo invocations (wasm lib + musl server bin),
+  # so this is one mkCargoDerivation over the website's OWN workspace/lockfile.
+  # Tailwind runs as a pre-step with the pinned binary (3.4.17, exactly what
+  # package.json asked npm for) — the tailwind-* metadata keys are stripped so
+  # cargo-leptos does not try to download its own tailwind in the sandbox.
+  craneLibLeptos = (mkCraneLib pkgsLinux).overrideToolchain rust.leptosRustBuild;
+
+  websiteSrc = lib.cleanSource ../leptos-website;
+
+  website = craneLibLeptos.mkCargoDerivation {
+    pname = "leptos-website";
+    version = "0.1.0";
+    src = websiteSrc;
+    cargoArtifacts = null;
+    cargoVendorDir = craneLibLeptos.vendorCargoDeps { src = websiteSrc; };
+    doCheck = false;
+
+    nativeBuildInputs = [
+      p.pkgsLeptos.cargo-leptos
+      pkgs.tailwindcss
+      pkgs.binaryen
+      pkgs.cmake
+      pkgs.nasm
+      pkgs.perl
+      pkgs.pkg-config
+    ];
+    buildInputs = [ pkgsLinuxStatic.openssl ];
+
+    LEPTOS_HASH_FILES = "false";
+    # tree-sitter's C (via femark) compiles with gcc's outline-atomics helpers
+    # (__aarch64_ldadd4_sync), which rustc's musl link cannot satisfy without
+    # libgcc — compile the C without them instead (aarch64-musl only).
+    "CFLAGS_${builtins.replaceStrings ["-"] ["_"] muslTarget}" =
+      lib.optionalString (muslTarget == "aarch64-unknown-linux-musl") "-mno-outline-atomics";
+
+    postPatch = ''
+      # tailwind runs below with the pinned binary, not via cargo-leptos
+      sed -i -e '/^tailwind-input-file/d' -e '/^tailwind-config-file/d' Cargo.toml
+      # cross-target the server bin to musl so the image works from any build
+      # host. cargo-leptos 0.2.x only reads this from Cargo.toml metadata —
+      # a LEPTOS_BIN_TARGET_TRIPLE env var is silently ignored (verified: the
+      # server came out Mach-O on a darwin host without this).
+      sed -i 's|^\[package.metadata.leptos\]|[package.metadata.leptos]\nbin-target-triple = "${muslTarget}"|' Cargo.toml
+    '';
+
+    buildPhaseCargoCommand = ''
+      export HOME="$TMPDIR"
+      tailwindcss -i input.css --config tailwind.config.js --minify -o style/output.css
+      cargo-leptos build --release
+    '';
+
+    installPhaseCommand = ''
+      mkdir -p $out/bin $out/site
+      # the exact triple path — a loose `find` once grabbed a host-built stray
+      cp target/${muslTarget}/release/leptos_website $out/bin/leptos_website
+      cp -r target/site/. $out/site/
+    '';
+  };
+
+  # protoc plugin for `protoc --rs_out=…` — exactly the version the old
+  # protobuf codegen container cargo-installed, so regenerated files stay
+  # byte-identical to the checked-in ones. The crate tarball ships no
+  # Cargo.lock; ours is generated once and checked in.
+  protobufCodegen = craneLibHost.buildPackage {
+    pname = "protobuf-codegen";
+    version = "3.7.1";
+    src = p.protobufCodegenSrc;
+    cargoLock = ./protobuf-codegen.Cargo.lock;
+    postPatch = "cp ${./protobuf-codegen.Cargo.lock} Cargo.lock";
+    doCheck = false;
+  };
 in
 {
+  inherit protobufCodegen website videocall-cli;
+
   # The cache units, exposed so CI can warm them serially before fanning out
   # (and so `nix-build release.nix -A packages.nativeDeps` works by hand).
   inherit nativeDeps wasmDeps;

@@ -4,7 +4,7 @@
 #   nix-shell                                            -> default (frontend-dev)
 #   nix-shell default.nix -A shells.backend-dev --run …  -> named shell
 #   nix-shell default.nix -A shells.dev --run dev-stack  -> whole native stack (make dev)
-{ p, rust, devStack }:
+{ p, rust, devStack, packages }:
 let
   inherit (p) pkgs pkgsLeptos;
   lib = pkgs.lib;
@@ -161,6 +161,12 @@ in
     ] ++ backendBuildInputs ++ frontendBuildInputs;
     shellHook = frontendHook;
   });
+
+  # Protobuf codegen: `protoc --rs_out=…` with the pinned protoc-gen-rs
+  # plugin (replaces the old docker build-env container; see protobuf/Makefile)
+  protobuf = pkgs.mkShell {
+    nativeBuildInputs = [ pkgs.protobuf packages.protobufCodegen ];
+  };
 
   default = frontendDev;
 }

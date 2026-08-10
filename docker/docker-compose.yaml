@@ -24,8 +24,12 @@ services:
     ports:
       - "${DIOXUS_SERVE_PORT:-3001}:80"
 
-  # NOTE: the leptos marketing site has no nix image yet (Stage 3 of the nix
-  # migration); hack on it natively with `make dev-website` (port 4600).
+  website:
+    image: videocall/website:dev
+    environment:
+      - LEPTOS_SITE_ADDR=0.0.0.0:4600
+    ports:
+      - "4600:4600"
 
   meeting-api:
     image: videocall/meeting-api:dev

@@ -19,7 +19,7 @@ let
   };
   images = import ./nix/images { inherit p packages; };
   devStack = import ./nix/dev-stack.nix { inherit p; };
-  shells = import ./nix/shells.nix { inherit p rust devStack; };
+  shells = import ./nix/shells.nix { inherit p rust devStack packages; };
 in
 {
   inherit shells packages images devStack;

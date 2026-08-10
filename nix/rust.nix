@@ -31,6 +31,12 @@ let
     extensions = [ "rust-src" "rust-analyzer" ];
   };
 
+  # cargo-leptos build toolchain: nightly (leptos 0.5.x requirement) able to
+  # target both the browser (wasm) and the image payload (musl).
+  leptosRustBuild = pkgs.rust-bin.nightly.${nightlyVersion}.minimal.override {
+    targets = [ "wasm32-unknown-unknown" muslTarget ];
+  };
+
   # Host-run toolchain that can *target* Linux musl — feeds rustPlatformCross.
   rustCross = pkgs.rust-bin.stable.${stableVersion}.minimal.override {
     targets = [ muslTarget ];
@@ -59,6 +65,7 @@ in
     backendRustDev
     leptosRustMinimal
     leptosRustDev
+    leptosRustBuild
     rustCross
     rustPlatformCross;
 }

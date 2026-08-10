@@ -556,7 +556,9 @@ deploy_chart() {
     log_info "Switched to context: ${context}"
     
     # Standard local chart deployment for all regional charts
-    if ! (cd "${chart_path}" && helm upgrade --install "${release_name}" . -f values.yaml --timeout 300s --force); then
+    # No --force: force-replace recreates every object even when unchanged,
+    # which is illegal for bound PVCs (matomo) and causes needless restarts.
+    if ! (cd "${chart_path}" && helm upgrade --install "${release_name}" . -f values.yaml --timeout 300s); then
         error_exit "Failed to deploy ${chart}"
     fi
     

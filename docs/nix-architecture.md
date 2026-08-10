@@ -213,14 +213,44 @@ use the same tutorial flow as `make image-*`:
 
 ```yaml
 - uses: DeterminateSystems/nix-installer-action@main   # flake-agnostic
+- uses: cachix/cachix-action@v16
+  with: { name: videocall-rs, authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}" }
 - run: $(nix-build release.nix -A images.meeting-api --no-out-link) | docker load
 - run: docker tag … && docker push …                   # same :branch-sha8 / :latest / :pr-N scheme
 ```
 
-- `docker-build-check` (PR gate): `nix-build release.nix -A images.all` — build, no push.
-- Test workflows run through the pinned shells: `nix-shell default.nix -A shells.backend --run 'cargo test …'`,
-  `nix-shell default.nix -A shells.frontend-tests --run dioxus-ui-component-tests`.
-- Path filters watch `default.nix`, `release.nix`, `nix/**` instead of `flake.*`.
+### Caching: crane + cachix, nothing else
+
+Dependency compilation is split from member compilation by [crane](https://github.com/ipetkov/crane)
+(nixtamal-pinned, flake-free import):
+
+- `packages.nativeDeps` — deps of the three shipped native crates, compiled for musl once.
+  Its drv hash is immune to source edits and `gitSha`/`buildTimestamp` (probe-verified), so it
+  only rebuilds on `Cargo.lock`/manifest/toolchain changes.
+- `packages.wasmDeps` — deps of the three trunk invocations (UI + two workers), each with that
+  invocation's exact feature set, in ONE derivation. Not a chain: crane's `buildDepsOnly`
+  hard-codes `cargoArtifacts = null`, silently discarding chained predecessors. Verified at the
+  cargo unit-hash level: the artifact holds all three web-sys variants trunk requests, and the
+  trunk build compiles zero dependencies.
+- `packages.ciWarm` — the two deps artifacts plus every static runtime payload (caddy, busybox,
+  dbmate + its Go toolchain, musl tzdata/cacert) that public caches don't carry.
+
+All of it is served by **cachix** (`videocall-rs.cachix.org`, public reads, token-gated writes):
+`cachix-action` pushes every path a job builds *or restores*, and nix substitutes naturally
+during any build — CI on any branch, PRs, and developer machines share one org-wide cache. The
+member crates a commit touches are the only compilation a warm run performs.
+
+Measured: image legs 23-38 min (before) → **2m24s-4m50s** (warm cachix), vs ~10 min wall for the
+docker-era 4-job matrix.
+
+Two dead ends, documented so they stay dead:
+- **magic-nix-cache**: throttled by the GitHub cache API and self-disabling; zero uploads.
+- **GHA store snapshots (cache-nix-action)**: restored files under the *running* nix daemon,
+  whose open SQLite db never registered them — nix planned full 1566-drv rebuilds right after
+  "successful" 1.6 GB restores. Every leg was secretly cold until cachix replaced it.
+
+Test workflows run through the pinned shells (`nix-shell default.nix -A shells.…`); path filters
+watch `default.nix`, `release.nix`, `nix/**` instead of `flake.*`.
 
 ## Staged migration
 

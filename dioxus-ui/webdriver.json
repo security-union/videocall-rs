@@ -8,5 +8,9 @@
       "--no-sandbox",
       "--disable-dev-shm-usage"
     ]
+  },
+  "timeouts": {
+    "pageLoad": 45000,
+    "script": 60000
   }
 }

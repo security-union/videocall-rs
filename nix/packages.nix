@@ -128,24 +128,25 @@ let
   };
 
   # Trunk runs THREE cargo invocations (index.html: the UI crate + two worker
-  # bins), each resolving features per-invocation. A single union deps build
-  # produces artifacts whose fingerprints match none of them — cargo silently
-  # recompiles web-sys and friends inside the dist build. So: chain one
-  # deps-only derivation per invocation, each with that invocation's exact
-  # feature set, accumulating into one artifacts dir the dist build inherits.
-  wasmDepsUi = craneLibWasm.buildDepsOnly (wasmCommonArgs // {
-    pname = "wasm-deps-ui";
-    cargoExtraArgs = "-p videocall-ui";
-  });
-  wasmDepsCodecs = craneLibWasm.buildDepsOnly (wasmCommonArgs // {
-    pname = "wasm-deps-codecs";
-    cargoArtifacts = wasmDepsUi;
-    cargoExtraArgs = "-p videocall-codecs --no-default-features --features wasm";
-  });
+  # bins), each resolving features per-invocation — so the deps artifacts must
+  # contain each invocation's exact dependency variants (e.g. three different
+  # web-sys feature sets) or cargo recompiles them inside the dist build.
+  #
+  # One derivation, three builds into one target dir. NOT a chain of
+  # buildDepsOnly calls: buildDepsOnly hard-codes `cargoArtifacts = null`
+  # (crane lib/buildDepsOnly.nix), so chained stages silently discard their
+  # predecessor and only the last invocation's graph survives — verified by
+  # fingerprint archaeology (final tar held 77 of the 291 units trunk needs;
+  # the one shared variant hash matched exactly, proving dummy-src builds
+  # produce trunk-identical unit hashes when the invocation matches).
   wasmDeps = craneLibWasm.buildDepsOnly (wasmCommonArgs // {
     pname = "wasm-deps";
-    cargoArtifacts = wasmDepsCodecs;
-    cargoExtraArgs = "-p neteq --no-default-features --features web";
+    doCheck = false;
+    buildPhaseCargoCommand = ''
+      cargoWithProfile build --locked -p videocall-ui
+      cargoWithProfile build --locked -p videocall-codecs --no-default-features --features wasm
+      cargoWithProfile build --locked -p neteq --no-default-features --features web
+    '';
   });
 in
 {

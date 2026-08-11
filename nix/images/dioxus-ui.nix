@@ -50,8 +50,10 @@ let
     #!/bin/sh
     set -eu
     CONFIG=/usr/share/nginx/html/config.js
-    if [ ! -e "$CONFIG" ] || [ -w "$CONFIG" ]; then
-    cat > "$CONFIG" <<EOF
+    # A configmap may be mounted read-only over $CONFIG. Don't trust [ -w ]:
+    # the container runs as root, which passes the permission-bit test even on
+    # a read-only mount. Probe by attempting the write itself.
+    if ! { cat > "$CONFIG"; } 2>/dev/null <<EOF
     window.__APP_CONFIG = Object.freeze({
       apiBaseUrl: "''${API_BASE_URL:-http://localhost:8081}",
       wsUrl: "''${ACTIX_UI_BACKEND_URL:-ws://localhost:8080}",
@@ -69,8 +71,8 @@ let
       vadThreshold: ''${VAD_THRESHOLD:-0.02}
     });
     EOF
-    else
-      echo "config.js is not writable; keeping the mounted config"
+    then
+      echo "config.js is read-only (mounted); keeping the mounted config"
     fi
     exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
   '';

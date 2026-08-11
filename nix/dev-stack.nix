@@ -76,8 +76,8 @@ let
     mkdir -p $out
     sed -e 's/metrics-api:9091/127.0.0.1:9091/' \
         -e 's/server-stats-api:9092/127.0.0.1:9092/' \
-        ${../docker/monitoring/prometheus/prometheus.yml} > $out/prometheus.yml
-    cp ${../docker/monitoring/prometheus/alert_rules.yml} $out/alert_rules.yml
+        ${../monitoring/prometheus/prometheus.yml} > $out/prometheus.yml
+    cp ${../monitoring/prometheus/alert_rules.yml} $out/alert_rules.yml
   '';
 
   prometheusRun = pkgs.writeShellApplication {
@@ -126,7 +126,7 @@ let
           updateIntervalSeconds: 10
           allowUiUpdates: true
           options:
-            path: $PWD/docker/monitoring/grafana/dashboards
+            path: $PWD/monitoring/grafana/dashboards
       EOF
       export GF_PATHS_DATA="$GF/data"
       export GF_PATHS_PLUGINS="$GF/plugins"
@@ -245,7 +245,7 @@ let
       dioxus-ui = {
         namespace = "services";
         shutdown = rustShutdown;
-        command = "exec ./docker/start-dioxus.sh";
+        command = "exec ./scripts/start-dioxus.sh";
         environment = [ "TRUNK_SERVE_PORT=3001" ];
       };
     };

@@ -4,7 +4,7 @@
 #   make            -> help (nothing builds implicitly)
 #   make all        -> build every artifact (nix packages + docker images)
 #   make check      -> lint + backend + UI test suites (see check-* for pieces)
-#   make clean      -> remove disposable state; distclean -> pristine tree
+#   make clean      -> remove disposable state; distclean -> pristine tree (no Docker anywhere)
 # Configuration variables below are ?=-assignable: `make check-backend IT_PG_PORT=6543`.
 
 SHELL := bash
@@ -14,8 +14,6 @@ SHELL := bash
 # ---------------------------------------------------------------------------
 # Configuration (override with make VAR=… or environment)
 # ---------------------------------------------------------------------------
-
-COMPOSE ?= docker compose --env-file .env -f docker/docker-compose.yaml
 
 # Each native stack owns a process-compose instance on its own port and a
 # disposable data dir, so dev / integration / e2e can all run at once.
@@ -36,13 +34,13 @@ SQLITE_TEST_DB   ?= /tmp/meeting_api_test.sqlite3
 CLIPPY_EXCLUDES := $(shell [ "$$(uname -s)" = "Darwin" ] && echo "--exclude videocall-cli --exclude videocall-nokhwa --exclude videocall-nokhwa-bindings-macos --exclude videocall-nokhwa-core")
 
 .PHONY: help all ensure-nix images shell pins-update \
-	dev dev-middleware dev-down status vlog up down \
+	dev dev-middleware dev-down status vlog \
 	dev-websocket dev-webtransport dev-meeting-api dev-metrics dev-server-stats dev-ui dev-website \
 	check lint lint-fix fmt \
 	check-backend check-backend-down check-backend-sqlite check-ui check-e2e \
 	e2e e2e-headed e2e-debug e2e-interop e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build \
-	db-shell nats-shell clean clean-docker distclean \
-	tests_run tests_down tests_sqlite_run connect_to_db connect_to_nats clippy-fix e2e-ci
+	db-shell clean distclean \
+	tests_run tests_down tests_sqlite_run connect_to_db clippy-fix e2e-ci
 
 ##@ General
 
@@ -50,7 +48,7 @@ help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"} \
 		/^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } \
 		/^[a-zA-Z0-9_%-]+:.*?##/ { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
-	@printf "\nDeprecated aliases still work but warn: tests_run, tests_down, tests_sqlite_run,\nconnect_to_db, connect_to_nats, clippy-fix, e2e-ci.\n"
+	@printf "\nDeprecated aliases still work but warn: tests_run, tests_down, tests_sqlite_run,\nconnect_to_db, clippy-fix, e2e-ci.\n"
 
 all: images ## Build every artifact (all nix packages + docker images)
 
@@ -138,25 +136,12 @@ dev-server-stats: ## Watch the server-stats server (:9092)
 # Frontend with hot reload (trunk serve on :3001). Needs trunk + tailwindcss
 # (nix-shell default.nix -A shells.frontend provides the pinned versions).
 dev-ui: ## Watch the Dioxus UI (trunk serve, :3001)
-	./docker/start-dioxus.sh
+	./scripts/start-dioxus.sh
 
 dev-website: ## Watch the leptos marketing site (:4600) — not part of `make dev`
 	cd leptos-website && npm install && LEPTOS_SITE_ADDR=0.0.0.0:4600 cargo leptos watch
 
-##@ Containers (Docker — the one remaining use)
-
-# Auto-create .env from sample on first run so --env-file never fails
-.env:
-	@echo "No .env found — creating from docker/.env-sample. Edit it before running make up."
-	cp docker/.env-sample .env
-
-up: .env images ## Prod-parity smoke: run the nix-built images via docker-compose
-	$(COMPOSE) up
-
-down: .env ## Stop the container stack (NOT `make dev` — that's dev-down)
-	$(COMPOSE) down
-
-##@ Images & shells
+##@ Images & shells (images are the k8s deliverable; docker daemon needed only to load them)
 
 # Each image attr is a streamLayeredImage script: running it streams the
 # tarball into `docker load`. Same flow locally and in CI.
@@ -280,21 +265,14 @@ fmt: ensure-nix ## cargo fmt --all
 
 ##@ Utilities
 
-db-shell: .env ## psql into the container stack's postgres (needs `make up`)
-	$(COMPOSE) run postgres bash -c "psql -h postgres -d actix-api-db -U postgres"
-
-nats-shell: .env ## Shell into the container stack's nats-box (needs `make up`)
-	$(COMPOSE) exec nats-box sh
+db-shell: ensure-nix ## psql into the dev stack's postgres (needs `make dev` or dev-middleware)
+	nix-shell default.nix -A shells.dev --run "psql -h 127.0.0.1 -p $${DEV_STACK_PG_PORT:-5432} -U postgres actix-api-db"
 
 ##@ Cleaning
 
-clean: ## Remove disposable test/e2e state (safe; keeps dev data and images)
+clean: ## Remove disposable test/e2e state (safe; keeps dev data)
 	rm -rf $(IT_DATA) $(E2E_DATA)
 	rm -f $(SQLITE_TEST_DB) $(SQLITE_TEST_DB)-wal $(SQLITE_TEST_DB)-shm
-
-clean-docker: .env ## Tear down the container stack, its volumes, images, and stale networks
-	$(COMPOSE) down --remove-orphans --volumes --rmi all
-	docker network prune -f
 
 distclean: clean ## Pristine: also delete dev-stack data (.data/) — your dev DB!
 	rm -rf .data
@@ -316,10 +294,6 @@ tests_sqlite_run: ## (deprecated) use check-backend-sqlite
 connect_to_db: ## (deprecated) use db-shell
 	@echo "warning: 'make connect_to_db' is deprecated; use 'make db-shell'" >&2
 	@$(MAKE) db-shell
-
-connect_to_nats: ## (deprecated) use nats-shell
-	@echo "warning: 'make connect_to_nats' is deprecated; use 'make nats-shell'" >&2
-	@$(MAKE) nats-shell
 
 clippy-fix: ## (deprecated) use lint-fix
 	@echo "warning: 'make clippy-fix' is deprecated; use 'make lint-fix'" >&2

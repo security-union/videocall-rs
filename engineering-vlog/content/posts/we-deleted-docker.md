@@ -57,7 +57,7 @@ Headless Chrome sometimes wedges its renderer at session startup for exactly 300
 
 **You don't need Docker Desktop anymore.** That's the headline. `make dev` runs postgres, NATS, prometheus, grafana, and every server as native processes with hot reload — no VM eating 4GB of your Mac's RAM, no license nag, no whale in the menu bar. Don't even have Nix? `make dev` installs it (official installer) and pulls the exact toolchain CI uses from the binary cache. Clone, `make dev`, hack.
 
-Docker survives for exactly one job, and it's optional: running the production images locally (`make up`). Even the Playwright e2e suite runs against native processes now. Nothing in your edit-compile-test loop touches a container.
+Docker survives for exactly zero local jobs. Dev, integration tests, e2e — all native. The container images still exist, but only CI builds them, for Kubernetes. Uninstall Docker Desktop; nothing on your machine will notice.
 
 And your machine stops being a snowflake: rustc, trunk, postgres 18, protoc — all pinned in `nix/tamal`, identical for every contributor and CI. No rustup drift, no brew archaeology, no "works on my machine."
 

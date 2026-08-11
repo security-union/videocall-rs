@@ -1,7 +1,7 @@
 # Dioxus UI: Caddy serving the trunk dist, with an entrypoint that regenerates
 # /usr/share/nginx/html/config.js from env at container start (runtime config —
-# the same contract docker/start-dioxus.sh provides in native dev and the helm
-# configmap provides in k8s). Compose services: dioxus-ui (dev + e2e). Port 80.
+# the same contract scripts/start-dioxus.sh provides in native dev and the helm
+# configmap provides in k8s). Port 80.
 #
 # Caddy (static Go binary) instead of nginx deliberately: cross-nginx drags in
 # cross-perl, which does not build at the current nixpkgs pin. The Caddyfile

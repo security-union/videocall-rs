@@ -30,10 +30,10 @@ seconds. Works on macOS, Linux, and Windows via WSL2.
 | integration tests via compose | `make check-backend` (native, throwaway state) |
 | `docker compose logs -f <svc>` | the TUI shows per-process logs; `F` to follow |
 
-Docker itself is now only needed for two things: running the *production*
-images locally (`make up`, built by Nix and loaded into Docker) and the e2e
-Playwright stack (`make check-e2e`). If you don't use those, you don't need
-Docker running at all.
+Docker is not needed at all anymore — dev, integration tests, and the
+Playwright e2e stack all run native. You can uninstall Docker Desktop once
+you've cleaned up the old containers below. (The container images still
+exist, but only CI builds them, for Kubernetes.)
 
 ## One-time setup
 
@@ -61,7 +61,7 @@ The old setup left heavy residue — per-service Nix stores were multi-GB
 volumes. Once you're on `make dev`:
 
 ```bash
-docker compose -f docker/docker-compose.yaml down --remove-orphans
+docker ps -q | xargs -r docker stop      # the compose file is gone from the repo; stop by hand
 docker volume ls | grep nix-store        # the old per-service stores
 docker system prune -a --volumes         # reclaims tens of GB — removes ALL unused images/volumes
 ```
@@ -83,7 +83,7 @@ you actually care about, `pg_dump` it from the old container before pruning.
   terminal. Headless/scripted: `nix-shell default.nix -A shells.dev --run
   "dev-stack -t=false"`.
 - **Port already in use (5432/4222/8080/…)** — the old Docker stack is still
-  running. `docker compose -f docker/docker-compose.yaml down` first.
+  running. `docker ps` and stop the old containers.
 - **`websocket` can't bind / UI can't connect on 8080** — something else owns
   the port; the process-compose API deliberately sits on 28080 to stay out of
   the way.

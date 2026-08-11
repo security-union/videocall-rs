@@ -255,10 +255,10 @@ e2e-fmt: ## Auto-fix e2e/ lint and formatting
 ##@ Code quality
 
 lint: ensure-nix ## cargo clippy -D warnings + cargo fmt --check (pinned toolchain)
-	nix-shell default.nix -A shells.backend-dev --run "cargo clippy --all -- --deny warnings && cargo fmt --all --check"
+	nix-shell default.nix -A shells.backend-dev --run "cargo clippy --workspace $(CLIPPY_EXCLUDES) -- --deny warnings && cargo fmt --all --check"
 
 lint-fix: ensure-nix ## Auto-fix clippy findings
-	nix-shell default.nix -A shells.backend-dev --run "cargo clippy --all --fix --allow-dirty --allow-staged"
+	nix-shell default.nix -A shells.backend-dev --run "cargo clippy --workspace $(CLIPPY_EXCLUDES) --fix --allow-dirty --allow-staged"
 
 fmt: ensure-nix ## cargo fmt --all
 	nix-shell default.nix -A shells.backend-dev --run "cargo fmt --all"

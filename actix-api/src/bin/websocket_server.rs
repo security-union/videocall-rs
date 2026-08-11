@@ -18,6 +18,7 @@
 
 use actix::Actor;
 use actix_cors::Cors;
+use actix_web::http::header::LOCATION;
 use actix_web::{
     cookie::{
         time::{Duration, OffsetDateTime},
@@ -25,7 +26,6 @@ use actix_web::{
     },
     error, get, web, App, Error, HttpRequest, HttpResponse, HttpServer,
 };
-use reqwest::header::LOCATION;
 use sec_api::{
     actors::chat_server::ChatServer,
     auth::{

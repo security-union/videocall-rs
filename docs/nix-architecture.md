@@ -266,7 +266,7 @@ watch `default.nix`, `release.nix`, `nix/**` instead of `flake.*`.
 
 ### Where Docker still legitimately lives
 
-Dev and integration testing are now **zero-docker** (`make dev`, `make tests_run` — middleware
+Dev and integration testing are now **zero-docker** (`make dev`, `make check-backend` — middleware
 comes from nixpkgs under process-compose). Docker remains only where containers *are* the
 deliverable:
 

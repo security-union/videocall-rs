@@ -35,7 +35,7 @@ jobs:
       # nix-built binaries (substituted from cachix) and the UI is the
       # nix-built release dist served by caddy.
       - name: Run E2E pipeline
-        run: make e2e-ci
+        run: make check-e2e
 
       - name: Upload test report
         uses: actions/upload-artifact@v4

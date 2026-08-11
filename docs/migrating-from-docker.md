@@ -27,12 +27,12 @@ seconds. Works on macOS, Linux, and Windows via WSL2.
 | `docker compose up postgres nats …` | `make dev-middleware` |
 | `docker compose build` | nothing — no dev images exist anymore |
 | shell inside a service container | `make shell` (pinned toolchain, on your host) |
-| integration tests via compose | `make tests_run` (native, throwaway state) |
+| integration tests via compose | `make check-backend` (native, throwaway state) |
 | `docker compose logs -f <svc>` | the TUI shows per-process logs; `F` to follow |
 
 Docker itself is now only needed for two things: running the *production*
 images locally (`make up`, built by Nix and loaded into Docker) and the e2e
-Playwright stack (`make e2e-ci`). If you don't use those, you don't need
+Playwright stack (`make check-e2e`). If you don't use those, you don't need
 Docker running at all.
 
 ## One-time setup

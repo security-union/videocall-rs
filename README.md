@@ -463,7 +463,7 @@ API, and the mock device vs real fake device strategy — see
 ### Backend Testing (actix-api)
 
 The `actix-api` crate contains unit and integration tests that run against real
-PostgreSQL and NATS instances, started natively by `make tests_run`. Tests cover:
+PostgreSQL and NATS instances, started natively by `make check-backend`. Tests cover:
 
 - **Session management** — meeting creation, multi-user join/leave, host
   controls, system email rejection
@@ -475,20 +475,20 @@ PostgreSQL and NATS instances, started natively by `make tests_run`. Tests cover
 - **Feature flags** — behavior with `FEATURE_MEETING_MANAGEMENT` on and off
 
 Tests use `#[serial_test::serial]` because they share a database, and each test
-cleans up its own data. Everything runs natively — no Docker: `make tests_run`
+cleans up its own data. Everything runs natively — no Docker: `make check-backend`
 starts postgres 18 + NATS (JetStream) from nixpkgs under process-compose in a
 throwaway data dir (fresh database every run), then runs `dbmate` migrations,
 clippy, fmt and `cargo test` in the pinned nix-shell.
 
 ```bash
 # Run all backend tests (native postgres/NATS, fresh state per run)
-make tests_run
+make check-backend
 
 # Same, against the SQLite meeting-api backend
-make tests_sqlite_run
+make check-backend-sqlite
 
 # Stop the test middleware and delete its state
-make tests_down
+make check-backend-down
 ```
 
 CI runs these tests automatically via `.github/workflows/cargo-test.yaml`,

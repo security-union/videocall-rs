@@ -270,15 +270,11 @@ mod tests {
             generate_room_token(TEST_SECRET, ttl, "a@b.com", "r", false, "X").expect("should sign");
         let after = Utc::now().timestamp();
 
-        let mut validation = Validation::default();
-        validation.insecure_disable_signature_validation();
-        validation.validate_exp = false;
-        let data = decode::<RoomAccessTokenClaims>(
-            &token,
-            &DecodingKey::from_secret(b"ignored"),
-            &validation,
-        )
-        .expect("should decode");
+        // Decode without signature or expiry validation to inspect the raw
+        // `exp` claim. v10 replaced `Validation::insecure_disable_signature_validation`
+        // with the explicit `dangerous::insecure_decode` entry point.
+        let data = jsonwebtoken::dangerous::insecure_decode::<RoomAccessTokenClaims>(&token)
+            .expect("should decode");
 
         assert!(data.claims.exp >= before + ttl);
         assert!(data.claims.exp <= after + ttl);

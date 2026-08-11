@@ -64,8 +64,8 @@ let
   # endpoint; crane vendors from the static.crates.io CDN instead).
   protobufCodegenSrc = pkgs.fetchCrate {
     pname = "protobuf-codegen";
-    version = "3.7.1";
-    hash = "sha256-HNsva4Idd054PQq27kNCZC9aUNktZQwTYc1YeLCAS4o=";
+    version = "3.7.2";
+    hash = "sha256-0d+xjYXpl87Sq/DdE8K2olnKa5bNpEHX7RTjp/2xza4=";
   };
 in
 {

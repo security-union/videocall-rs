@@ -251,13 +251,13 @@ let
     '';
   };
 
-  # protoc plugin for `protoc --rs_out=…` — exactly the version the old
-  # protobuf codegen container cargo-installed, so regenerated files stay
-  # byte-identical to the checked-in ones. The crate tarball ships no
-  # Cargo.lock; ours is generated once and checked in.
+  # protoc plugin for `protoc --rs_out=…` — must match the protobuf runtime
+  # crate version pinned in videocall-types (generated files assert the
+  # runtime version). The crate tarball ships no Cargo.lock; ours is
+  # generated once per bump and checked in.
   protobufCodegen = craneLibHost.buildPackage {
     pname = "protobuf-codegen";
-    version = "3.7.1";
+    version = "3.7.2";
     src = p.protobufCodegenSrc;
     cargoLock = ./protobuf-codegen.Cargo.lock;
     postPatch = "cp ${./protobuf-codegen.Cargo.lock} Cargo.lock";

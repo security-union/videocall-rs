@@ -502,8 +502,10 @@ Full browser-based end-to-end tests using [Playwright](https://playwright.dev/).
 Tests run against the **Dioxus UI**, verifying meeting flows with real browsers.
 Authentication is bypassed via JWT cookie injection — no OAuth setup needed.
 
-The E2E stack is defined in `docker/docker-compose.e2e.yaml` and runs the same
-Nix-built images CI publishes (`make e2e-build` builds and loads them). Tests run
+The E2E stack runs **natively, no Docker** (`e2eStack` in `nix/dev-stack.nix`):
+postgres + NATS from nixpkgs, the meeting-api and websocket servers (nix-built
+binaries on Linux, cargo builds on macOS), and the Nix-built release UI dist
+served by caddy — the same payloads the production images ship. Tests run
 automatically on pushes to `main` and can be triggered manually from the GitHub
 Actions page.
 

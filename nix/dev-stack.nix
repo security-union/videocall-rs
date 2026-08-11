@@ -11,7 +11,13 @@
 #
 # State lives in .data/ (gitignored). Toolchains (cargo, cargo-watch, trunk,
 # tailwind, dbmate) come from the surrounding shells.dev nix-shell.
-{ p }:
+#
+# Also exports e2eStack: the Playwright stack (postgres, nats, meeting-api,
+# websocket, static UI) as native processes — no Docker. Servers run the
+# nix-built binaries on Linux (CI substitutes them from cachix) and cargo
+# builds on darwin; the UI is the release dist served by caddy with the same
+# env-generated config.js contract as the image entrypoint.
+{ p, packages }:
 let
   inherit (p) pkgs;
   lib = pkgs.lib;
@@ -246,8 +252,97 @@ let
   };
 
   configFile = yamlFormat.generate "process-compose.yaml" config;
-in
-pkgs.writeShellApplication {
+
+  # --- e2e stack -------------------------------------------------------------
+
+  # Linux runs the nix-built musl binaries (CI pulls them straight from
+  # cachix — no compile); darwin cross-builds Linux-only packages, so it
+  # builds the servers with the host cargo instead (make e2e-build warms them).
+  e2eServerCmd = bin: pkg:
+    if pkgs.stdenv.isLinux
+    then "exec ${pkg}/bin/${bin}"
+    else "exec cargo run --bin ${bin}";
+
+  e2eCaddyfile = pkgs.writeText "Caddyfile-e2e" ''
+    {
+      admin off
+      auto_https off
+      persist_config off
+    }
+    :3001 {
+      root * {$E2E_UI_ROOT}
+      encode gzip
+      try_files {path} /index.html
+      file_server
+      header Cache-Control "no-store"
+    }
+  '';
+
+  # Same runtime-config contract as the dioxus-ui image entrypoint, minus the
+  # container: copy the release dist somewhere writable, generate config.js
+  # from env, serve with caddy.
+  e2eUiRun = pkgs.writeShellApplication {
+    name = "e2e-stack-ui";
+    runtimeInputs = [ pkgs.caddy ];
+    text = ''
+      ROOT="''${DEV_STACK_DATA_DIR:-/tmp/videocall-e2e-data}/ui-root"
+      rm -rf "$ROOT"
+      mkdir -p "$ROOT"
+      cp -r ${packages.dioxus-ui-dist}/. "$ROOT"/
+      chmod -R u+w "$ROOT"
+      cat > "$ROOT/config.js" <<EOF
+      window.__APP_CONFIG = Object.freeze({
+        apiBaseUrl: "''${API_BASE_URL:-http://localhost:8081}",
+        wsUrl: "''${ACTIX_UI_BACKEND_URL:-ws://localhost:8080}",
+        webTransportHost: "''${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}",
+        oauthEnabled: "''${ENABLE_OAUTH:-false}",
+        e2eeEnabled: "''${E2EE_ENABLED:-false}",
+        webTransportEnabled: "''${WEBTRANSPORT_ENABLED:-false}",
+        firefoxEnabled: "''${FIREFOX_ENABLED:-false}",
+        usersAllowedToStream: "''${USERS_ALLOWED_TO_STREAM:-}",
+        serverElectionPeriodMs: ''${SERVER_ELECTION_PERIOD_MS:-2000},
+        audioBitrateKbps: ''${AUDIO_BITRATE_KBPS:-65},
+        videoBitrateKbps: ''${VIDEO_BITRATE_KBPS:-100},
+        screenBitrateKbps: ''${SCREEN_BITRATE_KBPS:-100},
+        oauthProvider: "''${OAUTH_PROVIDER:-google}",
+        vadThreshold: ''${VAD_THRESHOLD:-0.02}
+      });
+      EOF
+      E2E_UI_ROOT="$ROOT" exec caddy run --config ${e2eCaddyfile} --adapter caddyfile
+    '';
+  };
+
+  e2eConfig = {
+    version = "0.5";
+    # single combined log so CI can dump the whole stack on failure
+    log_location = "/tmp/videocall-e2e-stack.log";
+    processes = {
+      inherit (config.processes) postgres postgres-init nats;
+      meeting-api = {
+        namespace = "services";
+        shutdown = rustShutdown;
+        command = "(cd dbmate && dbmate wait && dbmate up) && "
+          + e2eServerCmd "meeting-api" packages.meeting-api;
+        environment = [ "LISTEN_ADDR=0.0.0.0:8081" ];
+        depends_on = middlewareUp;
+      };
+      websocket = {
+        namespace = "services";
+        shutdown = rustShutdown;
+        command = e2eServerCmd "websocket_server" packages.videocall-api-bins;
+        environment = [ "ACTIX_PORT=8080" "DATABASE_ENABLED=false" "SERVICE_TYPE=websocket" ];
+        depends_on.nats.condition = "process_healthy";
+      };
+      dioxus-ui = {
+        namespace = "services";
+        command = lib.getExe e2eUiRun;
+      };
+    };
+  };
+
+  e2eConfigFile = yamlFormat.generate "process-compose-e2e.yaml" e2eConfig;
+
+  devStack = pkgs.writeShellApplication {
   name = "dev-stack";
   runtimeInputs = [
     pkgs.process-compose
@@ -292,4 +387,55 @@ pkgs.writeShellApplication {
     export PC_PORT_NUM
     exec process-compose up -f ${configFile} "$@"
   '';
+  };
+
+  # Hermetic by design: no .env layering — e2e runs must be reproducible.
+  # Everything is still ''${VAR:-default} so CI can override via real env.
+  # Postgres/NATS sit on dedicated ports so the stack coexists with `make dev`
+  # middleware; the app-facing ports (3001/8080/8081) are the ones Playwright
+  # and the UI's config.js contract expect, same as the old compose stack.
+  e2eStack = pkgs.writeShellApplication {
+    name = "e2e-stack";
+    runtimeInputs = [
+      pkgs.process-compose
+      pkgs.postgresql_18 # pg_isready for the readiness probe
+      pkgs.dbmate
+    ];
+    text = ''
+      if [ ! -f default.nix ] || [ ! -d e2e ]; then
+        echo "error: e2e-stack must be run from the videocall-rs repo root" >&2
+        exit 1
+      fi
+      export DEV_STACK_DATA_DIR="''${E2E_DATA_DIR:-/tmp/videocall-e2e-data}"
+      mkdir -p "$DEV_STACK_DATA_DIR"
+      export DEV_STACK_PG_PORT="''${DEV_STACK_PG_PORT:-25432}"
+      export DEV_STACK_NATS_PORT="''${DEV_STACK_NATS_PORT:-24222}"
+      export DEV_STACK_NATS_MON_PORT="''${DEV_STACK_NATS_MON_PORT:-28223}"
+      export DATABASE_URL="''${DATABASE_URL:-postgres://postgres:docker@localhost:$DEV_STACK_PG_PORT/actix-api-db?sslmode=disable}"
+      export NATS_URL="''${NATS_URL:-localhost:$DEV_STACK_NATS_PORT}"
+      export JWT_SECRET="''${JWT_SECRET:-dev-jwt-secret-change-me}"
+      export TOKEN_TTL_SECS="''${TOKEN_TTL_SECS:-60}"
+      export SESSION_TTL_SECS="''${SESSION_TTL_SECS:-315360000}"
+      export COOKIE_SECURE="''${COOKIE_SECURE:-false}"
+      export AFTER_LOGIN_URL="''${AFTER_LOGIN_URL:-http://localhost:3001}"
+      export ALLOWED_REDIRECT_URLS="''${ALLOWED_REDIRECT_URLS:-http://localhost:3001}"
+      export UI_ENDPOINT="''${UI_ENDPOINT:-http://localhost:3001}"
+      export API_BASE_URL="''${API_BASE_URL:-http://localhost:8081}"
+      export ACTIX_UI_BACKEND_URL="''${ACTIX_UI_BACKEND_URL:-ws://localhost:8080}"
+      export WEBTRANSPORT_HOST="''${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}"
+      export FEATURE_MEETING_MANAGEMENT="''${FEATURE_MEETING_MANAGEMENT:-true}"
+      export ENABLE_OAUTH="''${ENABLE_OAUTH:-false}"
+      export WEBTRANSPORT_ENABLED="''${WEBTRANSPORT_ENABLED:-false}"
+      export E2EE_ENABLED="''${E2EE_ENABLED:-false}"
+      export RUST_LOG="''${RUST_LOG:-info}"
+      export REGION="''${REGION:-us-east}"
+      export SERVER_ID="''${SERVER_ID:-server-1}"
+      : "''${PC_PORT_NUM:=28082}"
+      export PC_PORT_NUM
+      exec process-compose up -f ${e2eConfigFile} "$@"
+    '';
+  };
+in
+{
+  inherit devStack e2eStack;
 }

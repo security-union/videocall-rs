@@ -24,7 +24,7 @@ cargo check --target wasm32-unknown-unknown -p videocall-client
 Browser-based end-to-end tests in `e2e/` using Playwright. Tests run against the Dioxus UI (port 3001). Auth is bypassed via JWT cookie injection. See the `e2e-*` targets in the `Makefile` for available commands.
 
 Key files:
-- `docker/docker-compose.e2e.yaml` — Stack definition (Dioxus UI + shared backend)
+- `nix/dev-stack.nix` (`e2eStack`) — native process-compose stack the tests run against (no Docker)
 - `e2e/playwright.config.ts` — Project configuration
 - `e2e/helpers/auth.ts` — JWT session cookie injection
 

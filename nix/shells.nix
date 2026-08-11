@@ -4,7 +4,7 @@
 #   nix-shell                                            -> default (frontend-dev)
 #   nix-shell default.nix -A shells.backend-dev --run …  -> named shell
 #   nix-shell default.nix -A shells.dev --run dev-stack  -> whole native stack (make dev)
-{ p, rust, devStack, packages }:
+{ p, rust, devStack, e2eStack, packages }:
 let
   inherit (p) pkgs pkgsLeptos;
   lib = pkgs.lib;
@@ -173,6 +173,15 @@ in
   vlog = pkgs.mkShell {
     nativeBuildInputs = [ pkgs.zola ];
   };
+
+  # Playwright e2e stack, no Docker. Linux runs the nix-built server binaries
+  # so this shell stays slim; darwin builds them with cargo and needs the
+  # backend toolchain.
+  e2e = pkgs.mkShell (backendEnv // {
+    nativeBuildInputs = [ e2eStack pkgs.process-compose ]
+      ++ lib.optionals (!pkgs.stdenv.isLinux)
+        ([ rust.backendRustMinimal ] ++ backendBuildInputs);
+  });
 
   default = frontendDev;
 }

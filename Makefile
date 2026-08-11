@@ -1,5 +1,9 @@
-COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 COMPOSE := docker compose --env-file .env -f docker/docker-compose.yaml
+
+# E2E stack: native process-compose (no docker) — own API port + data dir so
+# it coexists with `make dev` middleware and `make tests_run`.
+E2E_PC_PORT := 28082
+E2E_DATA := /tmp/videocall-e2e-data
 
 # Every nix-backed target depends on this: if Nix is missing, install it with
 # the official installer (nixos.org — macOS, Linux, and Windows via WSL2).
@@ -33,8 +37,6 @@ IT_DATA := /tmp/videocall-it-data
 # CI keeps full --workspace coverage.
 CLIPPY_EXCLUDES := $(shell [ "$$(uname -s)" = "Darwin" ] && echo "--exclude videocall-cli --exclude videocall-nokhwa --exclude videocall-nokhwa-bindings-macos --exclude videocall-nokhwa-core")
 
-# Images the Playwright E2E stack needs (subset of release.nix images.*)
-E2E_IMAGES := meeting-api websocket-server dioxus-ui
 
 SQLITE_TEST_DB := /tmp/meeting_api_test.sqlite3
 
@@ -235,21 +237,25 @@ clean-docker: .env
 e2e-install:
 	cd e2e && npm ci && npx playwright install chromium
 
-# Build + load the Nix images the E2E stack runs (same derivations CI publishes)
-e2e-build:
-	@for name in $(E2E_IMAGES); do \
-		echo "==> building image $$name"; \
-		script=$$(nix-build release.nix -A images.$$name --no-out-link) || exit 1; \
-		"$$script" | docker load || exit 1; \
-	done
+# Warm everything the native E2E stack needs: the nix-built UI dist (and, on
+# Linux, the server binaries — CI substitutes them from cachix); darwin runs
+# the servers from cargo, so prebuild them there.
+e2e-build: ensure-nix
+	nix-shell default.nix -A shells.e2e --run true
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "==> prebuilding server binaries (darwin runs them via cargo)"; \
+		nix-shell default.nix -A shells.e2e --run "cargo build --bin meeting-api --bin websocket_server"; \
+	fi
 
-# Start the E2E stack (postgres, nats, meeting-api, websocket-api, dioxus-ui)
-e2e-up:
-	$(COMPOSE_E2E) up -d
+# Start the native E2E stack detached (postgres, nats, meeting-api, websocket, UI)
+e2e-up: ensure-nix
+	rm -rf $(E2E_DATA)
+	nix-shell default.nix -A shells.e2e --run "e2e-stack -D"
 
-# Tear down the E2E stack and remove volumes
-e2e-down:
-	$(COMPOSE_E2E) down -v
+# Tear down the E2E stack and delete its state (what `compose down -v` used to do)
+e2e-down: ensure-nix
+	-nix-shell default.nix -A shells.e2e --run "process-compose down -p $(E2E_PC_PORT)"
+	rm -rf $(E2E_DATA)
 
 # Run e2e tests headless (assumes stack is already up)
 #   make e2e                        — all tests
@@ -273,10 +279,10 @@ e2e-interop:
 	cargo run -p videocall-codecs --example dump_vp9_ivf --features test-utils -- e2e/fixtures/pure_rust_vp9.ivf
 	cd e2e && E2E_SKIP_SERVICE_WAIT=1 npx playwright test tests/webcodecs-vp9-interop.spec.ts
 
-# Full CI pipeline: build images, start stack, run tests, tear down
+# Full CI pipeline: warm builds, start native stack, run tests, tear down
 e2e-ci: e2e-build e2e-install
-	$(COMPOSE_E2E) up -d
-	cd e2e && npx playwright test; E2E_EXIT=$$?; cd .. && $(COMPOSE_E2E) down -v; exit $$E2E_EXIT
+	$(MAKE) e2e-up
+	cd e2e && npx playwright test; E2E_EXIT=$$?; cd .. && $(MAKE) e2e-down; exit $$E2E_EXIT
 
 # Lint + format check + typecheck (same as CI)
 e2e-lint:

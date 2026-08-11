@@ -270,9 +270,11 @@ Dev and integration testing are now **zero-docker** (`make dev`, `make tests_run
 comes from nixpkgs under process-compose). Docker remains only where containers *are* the
 deliverable:
 
-- `docker/docker-compose.e2e.yaml` — Playwright certifies the exact images we ship, DB topology
-  included; running e2e against native processes would stop testing the artifact.
-- `docker/docker-compose.yaml` (`make up`) — prod-parity full-container smoke run.
+- `docker/docker-compose.yaml` (`make up`) — prod-parity full-container smoke run. This is now
+  the only image-runtime check: e2e went native (`e2eStack` in `nix/dev-stack.nix`), which tests
+  the same nix-built payloads (release dist, server binaries) but no longer exercises image
+  assembly or entrypoints — that residual risk is carried by `docker-build-check` (assembly)
+  and `make up` (runtime).
 - CI publish (`docker load`/`push` of nix-built images) — could go daemon-less with skopeo later.
 - Stage-3 stragglers above, each still Dockerfile-built until nixified.
 

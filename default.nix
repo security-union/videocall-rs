@@ -18,10 +18,11 @@ let
     inherit p rust inputs gitSha gitBranch buildTimestamp;
   };
   images = import ./nix/images { inherit p packages; };
-  devStack = import ./nix/dev-stack.nix { inherit p; };
-  shells = import ./nix/shells.nix { inherit p rust devStack packages; };
+  stacks = import ./nix/dev-stack.nix { inherit p packages; };
+  inherit (stacks) devStack e2eStack;
+  shells = import ./nix/shells.nix { inherit p rust devStack e2eStack packages; };
 in
 {
-  inherit shells packages images devStack;
+  inherit shells packages images devStack e2eStack;
   inherit (p) pkgs pkgsLinux pkgsLinuxStatic muslTarget;
 }

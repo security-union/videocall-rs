@@ -26,7 +26,7 @@ sqlite = ["sqlx/sqlite"]
 videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.2.0" }
 videocall-types = { path = "../videocall-types", version = "6.0.0" }
 
-async-nats = "0.42.0"
+async-nats = "0.50.0"
 protobuf = "3.3.0"
 
 axum = { version = "0.8", features = ["macros"] }
@@ -44,7 +44,7 @@ regex = "1"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 base64 = "0.22"
-oauth2 = "4"
+oauth2 = { version = "5", default-features = false }
 url = "2"
 
 futures = "0.3"

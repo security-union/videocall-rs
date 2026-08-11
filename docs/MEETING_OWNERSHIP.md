@@ -112,7 +112,7 @@ This allows the meeting management system to be deployed incrementally. Once the
 
 ### Local Development Setup
 
-For local development, `docker-compose.yaml` spins up two separate services:
+For local development, `make dev` runs these as separate native services:
 
 - **meeting-api (port 8081)**: Handles OAuth login, session JWTs, and all Meeting REST API routes (`/api/v1/meetings/*`)
 - **websocket-api (port 8080)**: Handles WebSocket media connections (`/lobby`)

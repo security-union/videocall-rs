@@ -175,13 +175,11 @@ trunk build --release
 
 Output goes to `dioxus-ui/dist/`.
 
-### Docker (Development)
+### Dev stack
 
 ```bash
-docker compose -f docker/docker-compose.yaml up dioxus-ui
+make dev-ui        # trunk watch mode on :3001 (or `make dev` for the whole stack)
 ```
-
-This mounts the source code and runs Trunk in watch mode.
 
 ## Testing
 

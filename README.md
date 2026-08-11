@@ -35,7 +35,7 @@ An open-source, ultra-low-latency video conferencing platform and API built with
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Dev loop](#dev-loop-everything-native-hot-reload-zero-docker)
-  - [Full stack from Nix-built images](#full-stack-from-nix-built-images)
+  - [Container images](#container-images-the-k8s-deliverable)
   - [OAuth (optional)](#oauth-optional)
   - [Nix build system](#nix-build-system)
 - [Runtime Configuration](#runtime-configuration-frontend-configjs)
@@ -154,7 +154,7 @@ Dockerfiles in the dev workflow (see [docs/nix-architecture.md](docs/nix-archite
     echo "trusted-users = root $USER" | sudo tee -a /etc/nix/nix.conf
     sudo pkill nix-daemon
     ```
-- [Docker](https://docs.docker.com/engine/install/) — only needed to run the nix-built images (`make up`, e2e)
+- Docker — **not needed**. Optional, only if you want to `docker run` a published image locally.
 - Chromium-based browser (Chrome, Edge, Brave) for frontend access - Firefox is not supported
 - Safari both in iOS and macOS are supported for frontend access
 
@@ -182,9 +182,9 @@ Services wait for middleware health (compose-style `depends_on`), saves recompil
 instantly, and the TUI can restart individual processes on demand. Open `http://localhost:3001`
 and navigate to a meeting: `http://localhost:3001/meeting/<username>/<meeting-id>`.
 
-To stop: quit the TUI (`F10`/`Ctrl-C`), or `make dev-down` from another terminal. (`make down`
-stops the *Docker* stack, not this one.) The TUI needs an interactive terminal; for scripted or
-headless use run `nix-shell default.nix -A shells.dev --run "dev-stack -t=false"`.
+To stop: quit the TUI (`F10`/`Ctrl-C`), or `make dev-down` from another terminal. The TUI
+needs an interactive terminal; for scripted or headless use run
+`nix-shell default.nix -A shells.dev --run "dev-stack -t=false"`.
 
 Prefer one service per terminal? `make dev-middleware` starts just
 postgres/nats/prometheus/grafana; then `make dev-websocket`, `make dev-meeting-api`,
@@ -192,31 +192,32 @@ postgres/nats/prometheus/grafana; then `make dev-websocket`, `make dev-meeting-a
 
 **Overriding environment variables:** every process in `make dev` sees env layered as
 *built-in defaults* < **`.env`** < **`.env.local`** — both untracked. Copy
-`docker/.env-sample` to `.env` for documented knobs (OAuth, service URLs, JWT secret); put
+`.env-sample` to `.env` for documented knobs (OAuth, service URLs, JWT secret); put
 personal or secret overrides in `.env.local`, which is gitignored and never checked in.
 
-### Full stack from Nix-built images
+### Container images (the k8s deliverable)
 
-The same images CI publishes can run the whole stack locally in Docker:
+Nothing local needs Docker — development, tests, and e2e all run native. The container images
+exist for Kubernetes: CI builds and publishes them from `release.nix` on every merge. To build
+one locally (e.g. to debug an image's entrypoint with `docker run`):
 
 ```
-make images       # nix-build every app image and docker-load it
-make up           # start everything in docker compose
+make image-websocket-server   # nix-build one image and docker-load it
+make images                   # all of them
 ```
 
 On Linux the images build natively; on macOS the service binaries are **cross-compiled** to
-`aarch64-unknown-linux-musl` — no VM, no remote builder, Docker only runs the result. The first
-macOS build compiles a musl cross-toolchain (one-time, tens of minutes); after that it's cached in
-the Nix store. `make image-<name>` (e.g. `make image-websocket-server`) builds a single image.
+`aarch64-unknown-linux-musl` — no VM, no remote builder. The first macOS build compiles a musl
+cross-toolchain (one-time, tens of minutes); after that it's cached in the Nix store.
 
 ### OAuth (optional)
 
 Both stacks read the same files: `make dev` layers `.env` then `.env.local` into every
-process, and `make up` passes `.env` to docker-compose. To enable Google login, create a
+process. To enable Google login, create a
 `.env` from the sample and fill in credentials (or keep secrets in `.env.local`):
 
 ```
-cp docker/.env-sample .env
+cp .env-sample .env
 ```
 
 - Go to [Google Cloud Console → APIs & Credentials](https://console.cloud.google.com/apis/credentials)
@@ -224,8 +225,7 @@ cp docker/.env-sample .env
 - Add `http://localhost:8081/login/callback` as an Authorized redirect URI
 - Copy the Client ID and Secret into your `.env`
 
-> **Note:** `make up` auto-creates `.env` from the sample if it does not exist. Without OAuth
-> credentials the app runs with auth bypassed for local development.
+> **Note:** without OAuth credentials the app runs with auth bypassed for local development.
 
 **Platform notes:**
 
@@ -236,7 +236,7 @@ cp docker/.env-sample .env
   ALLOWED_REDIRECT_URLS=http://localhost:8088
   ```
   Then access the app at `http://localhost:8088`.
-- **Shell environment variables:** If you have `API_BASE_URL`, `OAUTH_REDIRECT_URL`, or similar variables exported in your shell profile (`~/.bashrc`, `~/.zshrc`), they will override `.env` values. Remove them from your profile before running `make up`.
+- **Shell environment variables:** If you have `API_BASE_URL`, `OAUTH_REDIRECT_URL`, or similar variables exported in your shell profile (`~/.bashrc`, `~/.zshrc`), they will override `.env` values. Remove them from your profile before running `make dev`.
 
 ### Nix build system
 
@@ -260,10 +260,10 @@ The frontend is configured at runtime via a `window.__APP_CONFIG` object provide
 
 ### Local: generated for you
 
-`make dev` and `make dev-ui` run `docker/start-dioxus.sh`, which writes
+`make dev` and `make dev-ui` run `scripts/start-dioxus.sh`, which writes
 `dioxus-ui/scripts/config.js` from the environment before trunk starts — no manual step.
 To point the UI somewhere custom, override the relevant env vars in `.env.local` (see
-`docker/start-dioxus.sh` for the keys) rather than editing the generated file.
+`scripts/start-dioxus.sh` for the keys) rather than editing the generated file.
 
 ### Voice Activity Detection (VAD) Threshold
 
@@ -283,11 +283,11 @@ window.__APP_CONFIG = Object.freeze({
 | `0.05` | Low — only triggers on louder speech | Noisy environments, reduces false positives |
 | `0.10` | Very low — requires loud/close speech | Very noisy environments |
 
-The threshold can also be set via the `VAD_THRESHOLD` environment variable when running in Docker (see `docker/start-dioxus.sh`), or via `runtimeConfig.vadThreshold` in Helm values.
+The threshold can also be set via the `VAD_THRESHOLD` environment variable when running in Docker (see `scripts/start-dioxus.sh`), or via `runtimeConfig.vadThreshold` in Helm values.
 
 ### Local/Docker: start-dioxus.sh
 
-`docker/start-dioxus.sh` (used by `make dev-ui`) generates `dioxus-ui/scripts/config.js` from environment variables before starting trunk. The Nix-built `videocall/dioxus-ui` image does the same at container startup via its entrypoint. For the current list of supported variables and defaults, refer directly to `docker/start-dioxus.sh`.
+`scripts/start-dioxus.sh` (used by `make dev-ui`) generates `dioxus-ui/scripts/config.js` from environment variables before starting trunk. The Nix-built `videocall/dioxus-ui` image does the same at container startup via its entrypoint. For the current list of supported variables and defaults, refer directly to `scripts/start-dioxus.sh`.
 
 ### Kubernetes/Helm: configmap-configjs.yaml
 
@@ -463,7 +463,7 @@ API, and the mock device vs real fake device strategy — see
 ### Backend Testing (actix-api)
 
 The `actix-api` crate contains unit and integration tests that run against real
-PostgreSQL and NATS instances, started natively by `make tests_run`. Tests cover:
+PostgreSQL and NATS instances, started natively by `make check-backend`. Tests cover:
 
 - **Session management** — meeting creation, multi-user join/leave, host
   controls, system email rejection
@@ -475,20 +475,20 @@ PostgreSQL and NATS instances, started natively by `make tests_run`. Tests cover
 - **Feature flags** — behavior with `FEATURE_MEETING_MANAGEMENT` on and off
 
 Tests use `#[serial_test::serial]` because they share a database, and each test
-cleans up its own data. Everything runs natively — no Docker: `make tests_run`
+cleans up its own data. Everything runs natively — no Docker: `make check-backend`
 starts postgres 18 + NATS (JetStream) from nixpkgs under process-compose in a
 throwaway data dir (fresh database every run), then runs `dbmate` migrations,
 clippy, fmt and `cargo test` in the pinned nix-shell.
 
 ```bash
 # Run all backend tests (native postgres/NATS, fresh state per run)
-make tests_run
+make check-backend
 
 # Same, against the SQLite meeting-api backend
-make tests_sqlite_run
+make check-backend-sqlite
 
 # Stop the test middleware and delete its state
-make tests_down
+make check-backend-down
 ```
 
 CI runs these tests automatically via `.github/workflows/cargo-test.yaml`,
@@ -502,8 +502,10 @@ Full browser-based end-to-end tests using [Playwright](https://playwright.dev/).
 Tests run against the **Dioxus UI**, verifying meeting flows with real browsers.
 Authentication is bypassed via JWT cookie injection — no OAuth setup needed.
 
-The E2E stack is defined in `docker/docker-compose.e2e.yaml` and runs the same
-Nix-built images CI publishes (`make e2e-build` builds and loads them). Tests run
+The E2E stack runs **natively, no Docker** (`e2eStack` in `nix/dev-stack.nix`):
+postgres + NATS from nixpkgs, the meeting-api and websocket servers (nix-built
+binaries on Linux, cargo builds on macOS), and the Nix-built release UI dist
+served by caddy — the same payloads the production images ship. Tests run
 automatically on pushes to `main` and can be triggered manually from the GitHub
 Actions page.
 

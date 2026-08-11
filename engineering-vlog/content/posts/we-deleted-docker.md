@@ -53,10 +53,14 @@ The trick isn't Nix, it's caching done honestly. [crane](https://crane.dev) spli
 
 Headless Chrome sometimes wedges its renderer at session startup for exactly 300 seconds. The browser tests ran serially, so one wedged renderer blocked the line for 5 minutes, about twice per run. We don't fight the timeout — we overlap it: prebuild every test binary once, then drive `wasm-bindgen-test-runner` directly, 3 sessions at a time. You can't get this through `cargo test` — parallel invocations serialize on the target-dir lock and your parallelism is fake. Clean run: **2:21**. The worst measured run had four wedges and still matched the old baseline's *best* day.
 
-## Lessons
+## What this actually means for you
 
-1. If your build needs a Dockerfile, your build has state you haven't admitted to. Derivations force the confession.
-2. Measure the cache at the derivation-hash level or you don't have a cache, you have a vibe.
-3. The 300-second timeout was never the bug. The serialism was.
+**You don't need Docker Desktop anymore.** That's the headline. `make dev` runs postgres, NATS, prometheus, grafana, and every server as native processes with hot reload — no VM eating 4GB of your Mac's RAM, no license nag, no whale in the menu bar. Don't even have Nix? `make dev` installs it (official installer) and pulls the exact toolchain CI uses from the binary cache. Clone, `make dev`, hack.
 
-17/17 e2e green. All numbers from CI logs on [PR #897](https://github.com/security-union/videocall-rs/pull/897).
+Docker survives for exactly zero local jobs. Dev, integration tests, e2e — all native. The container images still exist, but only CI builds them, for Kubernetes. Uninstall Docker Desktop; nothing on your machine will notice.
+
+And your machine stops being a snowflake: rustc, trunk, postgres 18, protoc — all pinned in `nix/tamal`, identical for every contributor and CI. No rustup drift, no brew archaeology, no "works on my machine."
+
+One engineering lesson for the road: measure your cache at the derivation-hash level or you don't have a cache, you have a vibe.
+
+17/17 e2e green. All numbers from CI logs on [PR #897](https://github.com/security-union/videocall-rs/pull/897). Migration guide for existing contributors: [docs/migrating-from-docker.md](https://github.com/security-union/videocall-rs/blob/main/docs/migrating-from-docker.md).

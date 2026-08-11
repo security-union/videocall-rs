@@ -5,7 +5,7 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'dioxus-ui/**'
-      - 'docker/**'
+      - 'monitoring/**'
       - 'neteq/**'
       - 'videocall-client/**'
       - 'meeting-api/**'
@@ -17,7 +17,7 @@ name: check backend
 
 jobs:
   test:
-    name: cargo tests_run
+    name: cargo check-backend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,11 +31,11 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       # Middleware (postgres/nats) AND tests run natively — zero docker
-      - run: make tests_run
+      - run: make check-backend
 
       - name: Teardown
         if: always()
-        run: make tests_down
+        run: make check-backend-down
 
   meeting-api-sqlite:
     name: meeting-api (sqlite)

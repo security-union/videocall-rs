@@ -13,7 +13,7 @@ scrape_configs:
   # Client health metrics (sessions, NetEQ, video quality, etc.)
   - job_name: 'videocall-client-metrics'
     static_configs:
-      - targets: ['metrics-api:9091']
+      - targets: ['127.0.0.1:9091']
     metrics_path: '/metrics'
     scrape_interval: 5s
     scrape_timeout: 4s
@@ -21,7 +21,7 @@ scrape_configs:
   # Server connection tracking (with session_id, stale cleanup, etc.)
   - job_name: 'videocall-server-stats'
     static_configs:
-      - targets: ['server-stats-api:9092']
+      - targets: ['127.0.0.1:9092']
     metrics_path: '/metrics'
     scrape_interval: 5s
     scrape_timeout: 4s

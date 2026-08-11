@@ -70,8 +70,7 @@ flowchart LR
     inputs --> pkgsnix["nix/pkgs.nix\npkgs + pkgsLinux"]
     pkgsnix --> packages["nix/packages.nix\nbuildRustPackage (musl, static)"]
     packages --> images["nix/images/*.nix\ndockerTools.streamLayeredImage"]
-    images -->|"nix-build release.nix -A images.X | docker load"| docker[(Docker daemon)]
-    docker --> compose["docker-compose\n(image: lines only)"]
+    images -->|"nix-build release.nix -A images.X | docker load"| docker[(Docker daemon, CI)]
     docker -->|docker push| hub["Docker Hub / GHCR"]
     hub --> helm["Helm / k8s"]
 
@@ -185,14 +184,15 @@ Dependency semantics match compose exactly: `meeting-api` waits for
 `postgres-init: process_completed_successfully` + `nats: process_healthy` (readiness probes:
 `pg_isready`, NATS `/healthz`), like `depends_on: condition: service_healthy`.
 
-Full stack from the real images (this is where Docker comes in):
+Building the real images locally (the one optional use of a docker daemon — to load and
+`docker run` an image while debugging it):
 
 ```console
-$ make images            # nix-build all image derivations, docker load each
-$ make up                # docker compose up (image: lines only)
+$ make image-websocket-server   # nix-build one image derivation, docker load it
+$ make images                   # all of them
 ```
 
-Sequence for a full-stack run on a Mac:
+Sequence for an image build on a Mac:
 
 ```mermaid
 sequenceDiagram
@@ -200,13 +200,12 @@ sequenceDiagram
     participant Make
     participant Nix as nix-build (host)
     participant Docker as Docker Desktop
-    Dev->>Make: make up
+    Dev->>Make: make images
     Make->>Nix: release.nix -A images.all
     Note over Nix: rustc (darwin) --target aarch64-unknown-linux-musl<br/>static ELF binaries, no VM
     Nix-->>Make: stream scripts
     Make->>Docker: stream | docker load  (per image)
-    Make->>Docker: docker compose up
-    Docker-->>Dev: UI :3001, ws :8080, wt :4433/udp, api :8081
+    Docker-->>Dev: videocall/*:dev images, ready to docker run
 ```
 
 ## CI
@@ -266,13 +265,15 @@ watch `default.nix`, `release.nix`, `nix/**` instead of `flake.*`.
 
 ### Where Docker still legitimately lives
 
-Dev and integration testing are now **zero-docker** (`make dev`, `make tests_run` — middleware
+Dev and integration testing are now **zero-docker** (`make dev`, `make check-backend` — middleware
 comes from nixpkgs under process-compose). Docker remains only where containers *are* the
 deliverable:
 
-- `docker/docker-compose.e2e.yaml` — Playwright certifies the exact images we ship, DB topology
-  included; running e2e against native processes would stop testing the artifact.
-- `docker/docker-compose.yaml` (`make up`) — prod-parity full-container smoke run.
+- CI publish (`docker load`/`push` of nix-built images) — the only remaining docker anywhere,
+  and it never runs on a dev machine. e2e is native (`e2eStack` in `nix/dev-stack.nix`) and tests
+  the same nix-built payloads (release dist, server binaries); image assembly is checked by
+  `docker-build-check`, and image *runtime* (entrypoints, env plumbing) is verified by
+  `make image-<name>` + `docker run` when images change, and by health-gated prod rollouts.
 - CI publish (`docker load`/`push` of nix-built images) — could go daemon-less with skopeo later.
 - Stage-3 stragglers above, each still Dockerfile-built until nixified.
 

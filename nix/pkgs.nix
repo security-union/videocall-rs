@@ -50,7 +50,9 @@ let
   };
 
   # cargo-leptos 0.2.42 for the leptos-website shell lives in an older nixpkgs
-  # tree (0.2.x required by leptos 0.5.x; newer trees ship 0.3.x).
+  # tree. It builds leptos 0.8 fine and, crucially, bundles
+  # wasm-bindgen-cli-support 0.2.100 — which is why the crate pins
+  # wasm-bindgen = "=0.2.100". Newer trees ship 0.3.x with a different bindgen.
   pkgsLeptos = import inputs.nixpkgs-leptos { inherit system; };
 
   # Shared static caddy for the UI image and the CI warm set. doCheck = false

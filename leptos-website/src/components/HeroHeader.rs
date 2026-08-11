@@ -16,8 +16,8 @@
  * conditions.
  */
 
-use leptos::*;
-use leptos_router::A;
+use leptos::prelude::*;
+use leptos_router::components::A;
 
 #[component]
 pub fn HeroHeader() -> impl IntoView {
@@ -34,7 +34,7 @@ pub fn HeroHeader() -> impl IntoView {
             <nav class="sticky top-0 z-50 backdrop-blur-xl bg-background/70 border-b border-white/[0.06]">
                 <div class="max-w-6xl mx-auto px-6">
                     <div class="flex justify-between items-center h-14">
-                        <A href="/" class="flex-shrink-0 transition-opacity hover:opacity-80">
+                        <A href="/" attr:class="flex-shrink-0 transition-opacity hover:opacity-80">
                             <img class="h-10 w-auto" src="/images/videocall_logo.svg" alt="VideoCall.rs" />
                         </A>
 
@@ -145,21 +145,24 @@ fn MobileMenuProvider(children: Children) -> impl IntoView {
 
 #[island]
 fn MobileMenuButton() -> impl IntoView {
-    let (menu_open, set_menu_open) = expect_context::<RwSignal<bool>>().split();
+    // `RwSignal` is `Copy` in Leptos 0.7+, so the island can share the context
+    // signal directly. Reads use `.get()` now that the `nightly` call-sugar
+    // (`menu_open()`) is gone.
+    let menu_open = expect_context::<RwSignal<bool>>();
     view! {
         <button
             class="md:hidden p-2 text-white/50 hover:text-white transition-colors"
-            on:click=move |_| set_menu_open.update(|n| *n = !*n)
+            on:click=move |_| menu_open.update(|n| *n = !*n)
             aria-label="Toggle navigation menu"
         >
             <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path
-                    class=move || if menu_open() { "hidden" } else { "" }
+                    class=move || if menu_open.get() { "hidden" } else { "" }
                     stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
                     d="M4 6h16M4 12h16M4 18h16"
                 />
                 <path
-                    class=move || if menu_open() { "" } else { "hidden" }
+                    class=move || if menu_open.get() { "" } else { "hidden" }
                     stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
                     d="M6 18L18 6M6 6l12 12"
                 />
@@ -170,18 +173,17 @@ fn MobileMenuButton() -> impl IntoView {
 
 #[island]
 fn MobileMenu() -> impl IntoView {
-    let menu_open = expect_context::<RwSignal<bool>>().read_only();
-    let set_menu_open = expect_context::<RwSignal<bool>>().write_only();
+    let menu_open = expect_context::<RwSignal<bool>>();
     view! {
         <div class=move || format!(
             "md:hidden absolute top-full left-0 right-0 bg-[#0d0d0f]/95 backdrop-blur-xl border-b border-white/[0.06] transition-all duration-300 ease-out {}",
-            if menu_open() { "opacity-100 translate-y-0" } else { "opacity-0 -translate-y-2 pointer-events-none" }
+            if menu_open.get() { "opacity-100 translate-y-0" } else { "opacity-0 -translate-y-2 pointer-events-none" }
         )>
             <div class="px-6 py-5 space-y-4">
-                <MobileNavLink href="#supported-platforms" text="Platforms" on_click=move || set_menu_open.set(false) />
-                <MobileNavLink href="#developers" text="Developers" on_click=move || set_menu_open.set(false) />
-                <MobileNavLink href="#company" text="Company" on_click=move || set_menu_open.set(false) />
-                <MobileNavLink href="#pricing" text="Pricing" on_click=move || set_menu_open.set(false) />
+                <MobileNavLink href="#supported-platforms" text="Platforms" on_click=move || menu_open.set(false) />
+                <MobileNavLink href="#developers" text="Developers" on_click=move || menu_open.set(false) />
+                <MobileNavLink href="#company" text="Company" on_click=move || menu_open.set(false) />
+                <MobileNavLink href="#pricing" text="Pricing" on_click=move || menu_open.set(false) />
             </div>
         </div>
     }
@@ -189,7 +191,9 @@ fn MobileMenu() -> impl IntoView {
 
 #[component]
 fn MobileNavLink<F>(href: &'static str, text: &'static str, on_click: F) -> impl IntoView
-where F: Fn() + 'static {
+where
+    F: Fn() + 'static,
+{
     view! {
         <a href=href class="block text-white/50 hover:text-white transition-colors text-base font-medium py-1" on:click=move |_| on_click()>
             {text}

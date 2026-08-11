@@ -18,7 +18,7 @@
 
 #![allow(dead_code)]
 
-use leptos::*;
+use leptos::prelude::*;
 
 #[component]
 pub fn DigitalOceanIcon() -> impl IntoView {

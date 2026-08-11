@@ -17,7 +17,7 @@
  */
 
 use crate::components::CTAButton::{ButtonSize, ButtonVariant, CTAButton};
-use leptos::*;
+use leptos::prelude::*;
 
 #[component]
 pub fn PricingSection() -> impl IntoView {
@@ -104,17 +104,13 @@ fn PricingCard(
 
     view! {
         <div class=format!("{} group hover:shadow-lg transition-all duration-300", card_class)>
-            {if highlighted {
-                view! {
-                    <div class="absolute -top-4 left-1/2 transform -translate-x-1/2">
-                        <span class="bg-primary text-white px-4 py-1 rounded-full text-sm font-medium">
-                            "Most Popular"
-                        </span>
-                    </div>
-                }.into_view()
-            } else {
-                view! {}.into_view()
-            }}
+            {highlighted.then(|| view! {
+                <div class="absolute -top-4 left-1/2 transform -translate-x-1/2">
+                    <span class="bg-primary text-white px-4 py-1 rounded-full text-sm font-medium">
+                        "Most Popular"
+                    </span>
+                </div>
+            })}
 
             <div class="text-center mb-8">
                 <h3 class="text-subheadline text-foreground mb-2">

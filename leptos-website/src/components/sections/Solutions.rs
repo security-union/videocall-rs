@@ -17,7 +17,7 @@
  */
 
 use crate::components::CTAButton::{ButtonSize, ButtonVariant, CTAButton};
-use leptos::*;
+use leptos::prelude::*;
 
 // TODO: put back when we have a use case for it
 #[allow(dead_code)]

@@ -17,7 +17,7 @@
  */
 
 use crate::components::CTAButton::{ButtonSize, ButtonVariant, CTAButton};
-use leptos::*;
+use leptos::prelude::*;
 
 #[component]
 pub fn CompanySection() -> impl IntoView {

@@ -17,26 +17,24 @@
  */
 
 #![allow(non_snake_case)]
+// Leptos 0.7+ builds statically-typed view trees; this page nests deeply enough
+// that computing the SSR `AnyView` layout overflows the default recursion limit
+// (128). Raise it so the whole document type resolves.
+#![recursion_limit = "512"]
 
-use cfg_if::cfg_if;
 pub mod app;
 pub mod components;
 pub mod error_template;
 pub mod errors;
-pub mod fallback;
 pub mod icons;
 pub mod pages;
 
-cfg_if! {
-    if #[cfg(feature = "hydrate")] {
-        use leptos::*;
-
-        use wasm_bindgen::prelude::wasm_bindgen;
-
-        #[wasm_bindgen]
-        pub fn hydrate() {
-            console_error_panic_hook::set_once();
-            leptos::leptos_dom::HydrationCtx::stop_hydrating();
-        }
-    }
+// Islands hydration entry point. In Leptos 0.7+ islands mode, only the
+// interactive `#[island]` components are hydrated on the client; the rest of the
+// server-rendered DOM stays static. `hydrate_islands()` wires up exactly those.
+#[cfg(feature = "hydrate")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn hydrate() {
+    console_error_panic_hook::set_once();
+    leptos::mount::hydrate_islands();
 }

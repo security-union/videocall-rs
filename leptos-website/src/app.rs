@@ -16,10 +16,36 @@
  * conditions.
  */
 
-use crate::pages::Home::*;
-use leptos::*;
-use leptos_meta::*;
-use leptos_router::*;
+use crate::error_template::ErrorTemplate;
+use crate::pages::Home::Home;
+use leptos::prelude::*;
+use leptos_meta::{provide_meta_context, Meta, MetaTags, Stylesheet, Title};
+use leptos_router::{
+    components::{Route, Router, Routes},
+    SsrMode, StaticSegment,
+};
+
+/// The full HTML document shell. Leptos 0.7+ renders the entire document from
+/// Rust: `HydrationScripts islands=true` wires up islands hydration and
+/// `MetaTags` is where leptos_meta injects the `<Title>`/`<Meta>`/`<Stylesheet>`
+/// declared inside `App` during SSR.
+pub fn shell(options: LeptosOptions) -> impl IntoView {
+    view! {
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="utf-8"/>
+                <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                <AutoReload options=options.clone() />
+                <HydrationScripts options islands=true/>
+                <MetaTags/>
+            </head>
+            <body>
+                <App/>
+            </body>
+        </html>
+    }
+}
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -48,7 +74,6 @@ pub fn App() -> impl IntoView {
     "#;
 
     view! {
-        <Html lang="en"/>
         <Stylesheet id="leptos" href="/pkg/leptos_website.css"/>
         <Title formatter/>
         <Meta
@@ -59,7 +84,7 @@ pub fn App() -> impl IntoView {
             name="keywords"
             content="video conferencing api, rust video streaming, webtransport, websocket, low latency video, robotics video control, embedded video streaming, open source video platform, software professionals, video robotics"
         />
-        
+
         // Open Graph / Facebook
         <Meta property="og:type" content="website"/>
         <Meta property="og:site_name" content="videocall.rs"/>
@@ -78,8 +103,8 @@ pub fn App() -> impl IntoView {
         <Meta property="twitter:image" content="https://videocall.rs/images/og-image.png"/>
 
         <Router>
-            <Routes>
-                <Route path="" view=Home ssr=SsrMode::Async/>
+            <Routes fallback=|| view! { <ErrorTemplate/> }>
+                <Route path=StaticSegment("") view=Home ssr=SsrMode::Async/>
             </Routes>
         </Router>
         <script type="application/ld+json">

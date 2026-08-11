@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use leptos::*;
+use leptos::prelude::*;
 
 struct SpeedStat {
     name: String,

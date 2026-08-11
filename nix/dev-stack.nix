@@ -70,13 +70,9 @@ let
     '';
   };
 
-  # prometheus config for host networking: same file as the docker stack, with
-  # container DNS rewritten to localhost so the two never drift semantically.
   prometheusConfig = pkgs.runCommand "dev-prometheus-config" { } ''
     mkdir -p $out
-    sed -e 's/metrics-api:9091/127.0.0.1:9091/' \
-        -e 's/server-stats-api:9092/127.0.0.1:9092/' \
-        ${../monitoring/prometheus/prometheus.yml} > $out/prometheus.yml
+    cp ${../monitoring/prometheus/prometheus.yml} $out/prometheus.yml
     cp ${../monitoring/prometheus/alert_rules.yml} $out/alert_rules.yml
   '';
 

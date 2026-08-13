@@ -18,7 +18,7 @@
 
 use crate::components::Footer::*;
 // use crate::components::Header::*;
-use leptos::*;
+use leptos::prelude::*;
 use leptos_meta::Style;
 
 #[component]

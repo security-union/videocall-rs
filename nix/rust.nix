@@ -9,7 +9,6 @@ let
   inherit (p) pkgs pkgsLinux muslTarget;
 
   stableVersion = "1.93.1";
-  nightlyVersion = "2024-11-01"; # required by cargo-leptos 0.2.x (leptos-website)
 
   # Native toolchains for dev shells.
   frontendRustMinimal = pkgs.rust-bin.stable.${stableVersion}.minimal.override {
@@ -23,17 +22,19 @@ let
   backendRustDev = pkgs.rust-bin.stable.${stableVersion}.default.override {
     extensions = [ "rust-src" "rust-analyzer" ];
   };
-  leptosRustMinimal = pkgs.rust-bin.nightly.${nightlyVersion}.minimal.override {
+  # Leptos 0.8 targets stable Rust, so the leptos-website toolchains ride the
+  # same stable channel as everything else (no nightly needed anymore).
+  leptosRustMinimal = pkgs.rust-bin.stable.${stableVersion}.minimal.override {
     targets = [ "wasm32-unknown-unknown" ];
   };
-  leptosRustDev = pkgs.rust-bin.nightly.${nightlyVersion}.default.override {
+  leptosRustDev = pkgs.rust-bin.stable.${stableVersion}.default.override {
     targets = [ "wasm32-unknown-unknown" ];
     extensions = [ "rust-src" "rust-analyzer" ];
   };
 
-  # cargo-leptos build toolchain: nightly (leptos 0.5.x requirement) able to
-  # target both the browser (wasm) and the image payload (musl).
-  leptosRustBuild = pkgs.rust-bin.nightly.${nightlyVersion}.minimal.override {
+  # cargo-leptos build toolchain: stable, able to target both the browser (wasm)
+  # and the image payload (musl).
+  leptosRustBuild = pkgs.rust-bin.stable.${stableVersion}.minimal.override {
     targets = [ "wasm32-unknown-unknown" muslTarget ];
   };
 
@@ -58,7 +59,6 @@ in
 {
   inherit
     stableVersion
-    nightlyVersion
     frontendRustMinimal
     frontendRustDev
     backendRustMinimal

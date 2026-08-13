@@ -25,10 +25,10 @@ use crate::components::sections::SupportedPlatforms::SupportedPlatformsSection;
 // Removed unused import
 use crate::components::HeroHeader::*;
 use crate::components::Page::*;
-use leptos::*;
-use leptos_meta::*;
+use leptos::prelude::*;
+use leptos_meta::Title;
 
-#[server(PerformMarkdownCodeToHtml, "/api", "GetJSON")]
+#[server(PerformMarkdownCodeToHtml)]
 pub async fn perform_markdown_code_to_html(markdown: String) -> Result<String, ServerFnError> {
     use femark::{process_markdown_to_html, HTMLOutput};
 

@@ -16,9 +16,11 @@ inputs {
 			| cut -f1
 		}
 	}
-	// Older nixpkgs tree that still carries cargo-leptos 0.2.42 — leptos 0.5.x
-	// requires cargo-leptos 0.2.x while newer trees ship 0.3.x. Frozen: this
-	// pin must never move on refresh; bumping it is a deliberate manifest edit.
+	// Older nixpkgs tree that still carries cargo-leptos 0.2.42 — it builds
+	// leptos 0.8 and bundles wasm-bindgen-cli-support 0.2.100 (the crate pins
+	// wasm-bindgen = "=0.2.100" to match); newer trees ship 0.3.x with a
+	// different bindgen. Frozen: this pin must never move on refresh; bumping
+	// it is a deliberate manifest edit.
 	nixpkgs-leptos frozen=#true {
 		archive {
 			url "https://github.com/NixOS/nixpkgs/archive/{{fresh_value}}.tar.gz"
@@ -28,8 +30,8 @@ inputs {
 			$ echo "ee09932cedcef15aaf476f9343d1dea2cb77e261"
 		}
 	}
-	// Pinned Rust toolchains (stable 1.93.1, nightly 2024-11-01, musl + wasm
-	// targets) via the oxalica overlay.
+	// Pinned Rust toolchains (stable 1.93.1, musl + wasm targets) via the
+	// oxalica overlay.
 	rust-overlay {
 		archive {
 			url "https://github.com/oxalica/rust-overlay/archive/{{fresh_value}}.tar.gz"

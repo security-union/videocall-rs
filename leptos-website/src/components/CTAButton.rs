@@ -16,7 +16,8 @@
  * conditions.
  */
 
-use leptos::*;
+use leptos::either::Either;
+use leptos::prelude::*;
 
 /// Apple-style button variants
 #[derive(Clone, PartialEq)]
@@ -62,28 +63,27 @@ pub fn CTAButton(
         base_classes, variant_classes, size_classes, class
     );
 
-    let content = children();
-
-    view! {
-        {move || match &href {
-            Some(href) => view! {
-                <a
-                    href=href
-                    class=&combined_class
-                    class:pointer-events-none=disabled
-                >
-                    {content.clone()}
-                </a>
-            }.into_view(),
-            None => view! {
-                <button
-                    class=&combined_class
-                    disabled=disabled
-                >
-                    {content.clone()}
-                </button>
-            }.into_view()
-        }}
+    // `href` is not reactive, so branch once. Leptos 0.7+ replaced the
+    // type-erasing `.into_view()` on mismatched branches with `Either`, which
+    // also lets us consume `children()` exactly once in the taken branch.
+    match href {
+        Some(href) => Either::Left(view! {
+            <a
+                href=href
+                class=combined_class
+                class:pointer-events-none=disabled
+            >
+                {children()}
+            </a>
+        }),
+        None => Either::Right(view! {
+            <button
+                class=combined_class
+                disabled=disabled
+            >
+                {children()}
+            </button>
+        }),
     }
 }
 
@@ -107,7 +107,7 @@ pub fn ButtonWithIcon(
             <div class="flex items-center space-x-2">
                 <div
                     class="w-5 h-5 flex-shrink-0"
-                    inner_html=&icon_svg
+                    inner_html=icon_svg
                 ></div>
                 <span>{text}</span>
             </div>

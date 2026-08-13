@@ -17,7 +17,7 @@
  */
 
 use crate::components::CTAButton::{ButtonSize, ButtonVariant, CTAButton};
-use leptos::*;
+use leptos::prelude::*;
 // removed: use leptos::html::Div;
 #[cfg(feature = "hydrate")]
 use std::cell::RefCell;
@@ -119,11 +119,13 @@ fn PlatformsCarousel() -> impl IntoView {
 
     #[cfg(feature = "hydrate")]
     {
-        create_effect(move |_| {
+        Effect::new(move |_| {
             if let Some(win) = window() {
                 if let Some(doc) = win.document() {
                     if let Some(el) = doc.get_element_by_id(TRACK_ID) {
-                        let Ok(track_el) = el.dyn_into::<HtmlElement>() else { return; };
+                        let Ok(track_el) = el.dyn_into::<HtmlElement>() else {
+                            return;
+                        };
                         if let Ok(Some(mql)) = win.match_media("(prefers-reduced-motion: reduce)") {
                             if mql.matches() {
                                 return;
@@ -145,14 +147,19 @@ fn PlatformsCarousel() -> impl IntoView {
 
                         let prev_time = Rc::new(RefCell::new(None::<f64>));
                         let offset = Rc::new(RefCell::new(0.0_f64));
-                        let f: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
+                        let f: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> =
+                            Rc::new(RefCell::new(None));
                         let g = f.clone();
                         let win_clone = win.clone();
                         let track_clone = track_el.clone();
                         *g.borrow_mut() = Some(Closure::wrap(Box::new(move |t: f64| {
                             let dt = {
                                 let mut p = prev_time.borrow_mut();
-                                let dt = if let Some(prev) = *p { (t - prev) / 1000.0 } else { 0.0 };
+                                let dt = if let Some(prev) = *p {
+                                    (t - prev) / 1000.0
+                                } else {
+                                    0.0
+                                };
                                 *p = Some(t);
                                 dt
                             };
@@ -173,9 +180,10 @@ fn PlatformsCarousel() -> impl IntoView {
                                             if *off > w {
                                                 let _ = track_clone.append_child(&first_el);
                                                 *off -= w;
-                                                let _ = track_clone
-                                                    .style()
-                                                    .set_property("transform", &format!("translateX(-{}px)", *off));
+                                                let _ = track_clone.style().set_property(
+                                                    "transform",
+                                                    &format!("translateX(-{}px)", *off),
+                                                );
                                                 continue;
                                             }
                                         }
@@ -184,12 +192,15 @@ fn PlatformsCarousel() -> impl IntoView {
                                 }
                             }
 
-                            let _ = win_clone
-                                .request_animation_frame(f.borrow().as_ref().unwrap().as_ref().unchecked_ref());
-                        }) as Box<dyn FnMut(f64)>));
+                            let _ = win_clone.request_animation_frame(
+                                f.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
+                            );
+                        })
+                            as Box<dyn FnMut(f64)>));
 
-                        let _ = win
-                            .request_animation_frame(g.borrow().as_ref().unwrap().as_ref().unchecked_ref());
+                        let _ = win.request_animation_frame(
+                            g.borrow().as_ref().unwrap().as_ref().unchecked_ref(),
+                        );
                     }
                 }
             }

@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use leptos::*;
+use leptos::prelude::*;
 
 #[component]
 pub fn FeatureListItem(text: String) -> impl IntoView {

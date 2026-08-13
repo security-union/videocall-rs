@@ -12,7 +12,7 @@
 #   BOT_AUTH           auth backend             (default: form-login; overridable)
 #   BOT_EMAIL          login email  — REQUIRED for form-login (single mode; from the bot-creds Secret)
 #   BOT_PASSWORD       login password — REQUIRED for form-login (single mode; from the bot-creds Secret)
-#   BOT_HW_CONCURRENCY navigator.hardwareConcurrency cap → simulcast layer cap (default: 6 → 2 layers; "" omits)
+#   BOT_HW_CONCURRENCY navigator.hardwareConcurrency cap → simulcast layer cap (default: 10 → 3 layers; "" omits)
 #   BOT_IDENTITY_MODE  single | ordinal | auto (default: auto — see "Identity resolution" below)
 #   BOT_EMAIL_<N> /    per-ordinal creds for ordinal mode, injected via `envFrom` from the
 #   BOT_PASSWORD_<N>     `bot-accounts` Secret (see k8s/bot-accounts.example.yaml)
@@ -64,15 +64,19 @@ BOT_PARTICIPANT="${BOT_PARTICIPANT:-k8s-bot-1}"
 TTL="${TTL:-infinite}"
 BOT_AUTH="${BOT_AUTH:-form-login}"
 BOT_RUN_DIR="${BOT_RUN_DIR:-/tmp/bots-run}"
-# navigator.hardwareConcurrency cap → simulcast-layer cap. Fewer cores → fewer
-# layers (6 → 2). This default applies to BOTH wirings INTENTIONALLY: a bot on a
-# 32-core node would otherwise sniff a 3-layer ceiling and over-commit encode CPU
-# (the #2035 field finding), so every bot — the Increment 1 single pod included —
-# defaults to the realistic 2-layer cap unless overridden. Note the `-` (NOT
-# `:-`): an UNSET var defaults to 6, but an explicitly EMPTY value (e.g.
-# BOT_HW_CONCURRENCY="") is kept empty so it OMITS the flag entirely and the bot
-# uses the browser's real core count — the per-pod escape hatch.
-BOT_HW_CONCURRENCY="${BOT_HW_CONCURRENCY-6}"
+# navigator.hardwareConcurrency cap → simulcast-layer cap (10 → 3). Pinned rather
+# than left to the node's real core count, which a container reports unchanged
+# (the #2035 field finding), so a bot's ladder depth is a choice and not a
+# property of whichever node scheduled it. Three rungs, not two: this is a
+# PUBLISH-side cap, and applying it fleet-wide is what gives every receiver a
+# middle rung for the #1256 tile lid to land on — but only at >= 7 decoded
+# tiles; below that both ladders pick the top rung and the extra rung is pure
+# encode cost (#2248).
+# Applies to BOTH wirings intentionally. Note the `-` (NOT `:-`): an UNSET var
+# defaults to 10, but an explicitly EMPTY value (e.g. BOT_HW_CONCURRENCY="") is
+# kept empty so it OMITS the flag entirely and the bot uses the browser's real
+# core count — the per-pod escape hatch.
+BOT_HW_CONCURRENCY="${BOT_HW_CONCURRENCY-10}"
 BOT_IDENTITY_MODE="${BOT_IDENTITY_MODE:-auto}"
 
 # ── Control server (Increment 3, #2072) ──────────────────────────────────────
@@ -325,7 +329,7 @@ echo "docker-entrypoint: launching bot — url=${MEETING_URL} participant=${BOT_
 
 # Capability cap. `--hardware-concurrency <N>` (added by the parallel frontend
 # task on the `run` command) sets the fake navigator.hardwareConcurrency the bot
-# advertises, which caps how many simulcast layers it encodes (6 → 2). Built as
+# advertises, which caps how many simulcast layers it encodes (10 → 3). Built as
 # an array so BOT_HW_CONCURRENCY="" cleanly omits the flag; expanded below with
 # the `${arr[@]+...}` guard so an empty array is safe under `set -u` on every
 # bash version (see the exec NOTE).

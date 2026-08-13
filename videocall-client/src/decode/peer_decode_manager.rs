@@ -249,6 +249,124 @@ impl Display for PeerDecodeError {
     }
 }
 
+/// Which of a peer's three decoders, if any, has to be rebuilt after a
+/// [`PeerDecodeError`].
+///
+/// See [`decoder_reset_scope`] for why this is per-kind rather than "all three".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderResetScope {
+    /// Nothing to rebuild: the packet failed before any decoder was invoked.
+    None,
+    Video,
+    Screen,
+    Audio,
+}
+
+/// Map a decode failure to the decoder that actually failed (issue 2225).
+///
+/// # Why this is not "rebuild everything"
+///
+/// A peer owns three fully independent decoders: two `VideoPeerDecoder`s
+/// (camera + screen, each its own codec worker and canvas renderer) and one
+/// `NetEqAudioPeerDecoder` (its own Web Worker, jitter buffer, AudioWorklet, and
+/// blob URL). They share no state, so a failure in one says nothing about the
+/// health of the others — and rebuilding the audio decoder is *expensive*:
+/// a fresh NetEQ worker, worklet init and message plumbing per rebuild.
+///
+/// Before this mapping existed, the decode-error arm called `Peer::reset`, which
+/// rebuilt all three unconditionally. On a lossy link that repeated for as long
+/// as the errors did, respawning the NetEQ worker every time — with the audio
+/// path interrupted on each respawn even though audio was never the thing that
+/// failed.
+///
+/// # Why the pre-decode errors rebuild nothing
+///
+/// `AesDecryptError`, `PacketParseError`, `NoMediaType`, `NoPacketType`,
+/// `IncorrectPacketType`, `UnknownMediaType` and `UnknownPacketType` are all
+/// raised by `Peer::decode` **before** it reaches any `decoder.decode(..)` call
+/// — they are envelope, crypto and protobuf failures. No decoder was invoked, so
+/// no decoder holds state that a rebuild could recover; rebuilding is pure churn.
+///
+/// `NoSuchPeer` and `SameUserPacket` never reach a peer's reset path at all
+/// (they are raised by the manager, not by `Peer::decode`); they map to `None`
+/// for completeness.
+///
+/// # Which arms fire today
+///
+/// The pre-decode group is, as of this change, the ONLY group that reaches the
+/// decode-error arm: neither concrete decoder currently propagates a failure.
+/// `VideoPeerDecoder::decode` (`peer_decoder.rs`) returns `Ok` on every path —
+/// `push_frame` is fire-and-forget and an unknown codec returns a non-rendered
+/// `Ok` — so `VideoDecodeError`/`ScreenDecodeError` cannot be produced; and
+/// `NetEqAudioPeerDecoder::decode` posts to the worker and likewise always
+/// returns `Ok` (`StandardAudioPeerDecoder`, which *can* fail, is never
+/// constructed — `create_audio_peer_decoder` always builds the NetEQ one).
+///
+/// That is precisely why the pre-2225 blanket reset was so damaging: every
+/// rebuild it performed was churn, and a receiver holding a stale AES key fails
+/// EVERY packet, respawning the NetEQ worker tens of times a second for as long
+/// as the mismatch lasts. The three per-kind arms below are therefore currently
+/// latent. They are kept — rather than collapsed into "rebuild nothing" —
+/// because they encode the correct recovery for the day a decoder does start
+/// propagating errors, and because a per-kind mapping is what makes that future
+/// change safe by construction.
+///
+/// # PRECONDITION for making any decoder fallible on peer input
+///
+/// Do not accept that invitation without first adding a per-peer, per-kind
+/// rebuild budget. The rebuild here is unmetered — no cooldown, no backoff, no
+/// cap — so the moment a decoder starts returning `Err` for attacker-shaped
+/// input, a hostile sender gets the whole issue-2225 storm back, now aimed at
+/// whichever decoder it can make fail. Two specific hazards:
+///
+///  * `create_audio_peer_decoder` spawns a Web Worker, a worklet and a blob URL
+///    per call. At packet rate that is a remote resource lever.
+///  * `NetEqAudioPeerDecoder::create_neteq_worker` `.expect()`s on FOUR
+///    DOM/window lookups (window, document, the `neteq-worker` link tag, its
+///    href). A peer-triggered rebuild racing teardown or navigation would panic
+///    rather than return `Err`. Make those fallible in the same change.
+///
+/// [`crate::decode::pli_budget::PliBudget`] is the template: a pure `allow`
+/// decision over (peer, kind, now), already used to meter the other
+/// peer-triggered work on this path.
+///
+/// The match is deliberately exhaustive with no wildcard arm: a new
+/// `PeerDecodeError` variant must then be classified here explicitly rather than
+/// silently inheriting a default.
+fn decoder_reset_scope(error: &PeerDecodeError) -> DecoderResetScope {
+    match error {
+        PeerDecodeError::VideoDecodeError => DecoderResetScope::Video,
+        PeerDecodeError::ScreenDecodeError => DecoderResetScope::Screen,
+        PeerDecodeError::AudioDecodeError => DecoderResetScope::Audio,
+
+        PeerDecodeError::AesDecryptError
+        | PeerDecodeError::IncorrectPacketType
+        | PeerDecodeError::NoSuchPeer(_)
+        | PeerDecodeError::NoMediaType
+        | PeerDecodeError::NoPacketType
+        | PeerDecodeError::PacketParseError
+        | PeerDecodeError::SameUserPacket(_)
+        | PeerDecodeError::UnknownMediaType
+        | PeerDecodeError::UnknownPacketType => DecoderResetScope::None,
+    }
+}
+
+fn diagnostic_media_type_for_decode_error(
+    packet: &PacketWrapper,
+    error: &PeerDecodeError,
+) -> MediaType {
+    match packet.media_kind.enum_value() {
+        Ok(MediaKind::VIDEO) => MediaType::VIDEO,
+        Ok(MediaKind::SCREEN) => MediaType::SCREEN,
+        Ok(MediaKind::AUDIO) => MediaType::AUDIO,
+        _ => match error {
+            PeerDecodeError::ScreenDecodeError => MediaType::SCREEN,
+            PeerDecodeError::AudioDecodeError => MediaType::AUDIO,
+            _ => MediaType::VIDEO,
+        },
+    }
+}
+
 /// Tracks sequence numbers with a reorder-tolerant sliding window.
 ///
 /// WebTransport sends each video packet on a separate unidirectional QUIC
@@ -1245,15 +1363,33 @@ fn age_ms_since(now: u64, last_frame_ms: u64) -> i64 {
 }
 
 /// Resolve a CONTINUOUS live-stream (audio / camera-video) enabled flag
-/// against a heartbeat, using the short [`LIVE_STREAM_FRESH_WINDOW_MS`] so a
-/// real mute / camera-off reflects on remote peers sub-second.
+/// against a heartbeat, using the short [`LIVE_STREAM_FRESH_WINDOW_MS`]
+/// (500ms) rather than the screen-sized [`MEDIA_FRESH_WINDOW_MS`] (5000ms).
+///
+/// # What this window does and does not buy
+///
+/// The window bounds how long a *stale* heartbeat can be overridden by live
+/// frames — it does NOT set how fast a mute propagates. Propagation speed is
+/// the heartbeat's: a mute/camera-off triggers an immediate edge-triggered
+/// heartbeat (`Connection::send_immediate_heartbeat`), and if that datagram is
+/// lost the state is only corrected by the next keepalive, up to
+/// `HEARTBEAT_KEEPALIVE_INTERVAL_MS` (5000ms) later. So the honest worst-case
+/// bound for the `audio_enabled`/`video_enabled` glyph flip is ~5s, not
+/// sub-second.
+///
+/// What the short window prevents is the *additional* lag of ignoring a fresh
+/// off-heartbeat because frames are still arriving: with the screen-sized
+/// window, a peer who stopped 4s ago could still read as enabled. For the
+/// speaking glow specifically the fast signal is not this path at all — it is
+/// the decoder-side VAD's `peer_speaking` events (see
+/// `neteq_audio_decoder::handle_pcm_data` and its terminal zero on teardown).
 ///
 /// Thin wrapper over [`apply_heartbeat_enabled_flag`] that BAKES IN the
-/// correct window. The window is the security-/correctness-critical knob here:
-/// a future "simplify by sharing one window" edit at the call site could
-/// silently widen audio/video back to the screen-sized window and reintroduce
-/// the ~5s mute/camera-off lag. Routing audio and camera-video through this
-/// wrapper makes that window non-passable at the call site.
+/// correct window. The window is the correctness-critical knob here: a future
+/// "simplify by sharing one window" edit at the call site could silently widen
+/// audio/video back to the screen-sized window and reintroduce that extra
+/// staleness. Routing audio and camera-video through this wrapper makes the
+/// window non-passable at the call site.
 pub(crate) fn apply_live_stream_heartbeat_flag(
     current: bool,
     heartbeat_value: bool,
@@ -1463,24 +1599,13 @@ impl Peer {
         ),
         JsValue,
     > {
-        // Create decoders without canvas (will be set later via set_canvas)
-        // We still keep the canvas IDs for backward compatibility with existing code
-        let video_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA, skip_canvas_paint)?;
-        let screen_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN, skip_canvas_paint)?;
-
-        // Attempt to set canvas immediately if available in DOM
-        if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-            if let Some(canvas_element) = document.get_element_by_id(video_canvas_id) {
-                if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-                    let _ = video_decoder.set_canvas(canvas);
-                }
-            }
-            if let Some(canvas_element) = document.get_element_by_id(screen_canvas_id) {
-                if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-                    let _ = screen_decoder.set_canvas(canvas);
-                }
-            }
-        }
+        // Construction order matches the pre-2225 inline version exactly (both
+        // video-like decoders, then audio), so a partial failure drops the same
+        // set of half-built decoders it always did.
+        let video_decoder =
+            Self::new_video_like_decoder(video_canvas_id, MEDIA_TYPE_CAMERA, skip_canvas_paint)?;
+        let screen_decoder =
+            Self::new_video_like_decoder(screen_canvas_id, MEDIA_TYPE_SCREEN, skip_canvas_paint)?;
 
         Ok((
             create_audio_peer_decoder(None, peer_id.to_string(), vad_threshold)?,
@@ -1489,37 +1614,154 @@ impl Peer {
         ))
     }
 
-    fn reset(&mut self, from_peer: &str) -> Result<(), JsValue> {
-        let sid_str = self.session_id.to_string();
-        let (mut audio, video, screen) = Self::new_decoders(
-            &self.video_canvas_id,
-            &self.screen_canvas_id,
-            &sid_str,
-            self.vad_threshold,
-            self.skip_canvas_paint,
-        )?;
+    /// Build one `VideoPeerDecoder` (camera or screen) and wire its canvas.
+    ///
+    /// Extracted from [`Self::new_decoders`] (issue 2225) so a single stream's
+    /// decoder can be rebuilt on its own after a decode error, without dragging
+    /// the peer's other two decoders — in particular the NetEQ audio worker —
+    /// along with it. Cold start is unchanged: `new_decoders` calls this twice
+    /// with the same arguments it used to pass inline.
+    ///
+    /// The decoder is created without a canvas (`set_canvas` may run later, when
+    /// the tile mounts) and then opportunistically wired to whatever element
+    /// currently carries `canvas_id`. Looking the element up fresh on every
+    /// build is what lets a rebuilt decoder re-attach to a tile that is already
+    /// on screen.
+    fn new_video_like_decoder(
+        canvas_id: &str,
+        media_type: &'static str,
+        skip_canvas_paint: bool,
+    ) -> Result<VideoPeerDecoder, JsValue> {
+        let decoder = VideoPeerDecoder::new(None, media_type, skip_canvas_paint)?;
 
+        if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+            if let Some(canvas_element) = document.get_element_by_id(canvas_id) {
+                if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+                    let _ = decoder.set_canvas(canvas);
+                }
+            }
+        }
+
+        Ok(decoder)
+    }
+
+    /// Swap in a freshly built audio decoder for this peer, retiring the
+    /// outgoing one first.
+    ///
+    /// Issue 2174 follow-up: `NetEqAudioPeerDecoder::drop` broadcasts a
+    /// terminal `speaking: 0` so a glow left lit by the edge-triggered VAD is
+    /// cleared when the worker dies — but `Drop` also fires here, on
+    /// REPLACEMENT, where the peer has not stopped speaking at all. Left
+    /// unguarded, one AUDIO decode error blanks the peer's speaking indicator
+    /// (tile level forced to 0.0, roster dot darkened, the UI's speaking deadman
+    /// cancelled) until the replacement NetEQ worker finishes worklet init.
+    ///
+    /// Issue 2225 narrowed the trigger: a VIDEO or SCREEN decode error no longer
+    /// reaches this function at all (`decoder_reset_scope` routes those to
+    /// `Video`/`Screen`), so the "lossy link, repeated decode errors, blinking
+    /// glow" framing no longer applies. The surviving trigger is a
+    /// decoder-propagated AUDIO failure, which no concrete decoder currently
+    /// produces — see `decoder_reset_scope`'s "Which arms fire today".
+    ///
+    /// [`AudioPeerDecoderTrait::retire_for_replacement`] makes the outgoing
+    /// decoder's `Drop` silent, so the indicator simply carries over: the new
+    /// decoder starts from a cleared VAD and re-emits from its first speech
+    /// frame, and the deadman — which the spurious zero would have cancelled —
+    /// stays armed as the backstop for the case where the peer really did go
+    /// quiet across the reset.
+    ///
+    /// Genuine teardown (peer removal via `delete_peer_at` /
+    /// `run_peer_monitor`, which drop the whole `Peer`) never calls this, so it
+    /// keeps the terminal zero that issue 2174 added.
+    fn replace_audio_decoder(&mut self, mut audio: Box<dyn AudioPeerDecoderTrait>) {
         // Preserve the current mute state after reset
         audio.set_muted(!self.audio_enabled);
-        debug!(
-            "Reset peer {} with audio muted: {}",
-            self.session_id, !self.audio_enabled
-        );
-
+        self.audio.retire_for_replacement();
         self.audio = audio;
+    }
+
+    /// Swap in a freshly built camera decoder, giving it stream attribution
+    /// immediately.
+    ///
+    /// Issue #1640: the new codec worker starts with empty context, and
+    /// `context_initialized` stays `true` across a rebuild, so the one-time
+    /// install in `PeerDecodeManager::decode` will not re-run — the `SetContext`
+    /// has to be sent here or the worker's diagnostics are unattributed for the
+    /// rest of the call.
+    ///
+    /// Shaped like [`Self::replace_audio_decoder`] (build outside, swap inside)
+    /// so the swap is one auditable unit and is reachable from host tests, which
+    /// cannot construct a real `VideoPeerDecoder`.
+    fn replace_video_decoder(&mut self, video: VideoPeerDecoder, from_peer: &str) {
         self.video = video;
-        self.screen = screen;
-        // Issue #1640: immediately send SetContext to the new workers so they
-        // have attribution from their first frame (fixes post-reset race where
-        // `context_initialized` stays true but new workers have empty context).
         self.video
-            .set_stream_context(from_peer.to_owned(), sid_str.clone());
+            .set_stream_context(from_peer.to_owned(), self.session_id.to_string());
+    }
+
+    /// SCREEN sibling of [`Self::replace_video_decoder`].
+    fn replace_screen_decoder(&mut self, screen: VideoPeerDecoder, from_peer: &str) {
+        self.screen = screen;
         self.screen
-            .set_stream_context(from_peer.to_owned(), sid_str);
-        // Intentionally keep `has_received_heartbeat` and `*_enabled` flags:
-        // the peer's last-known media state is still the best information we
-        // have.  Resetting the flag would let straggler frames through until
-        // the next heartbeat, which is the opposite of what we want.
+            .set_stream_context(from_peer.to_owned(), self.session_id.to_string());
+    }
+
+    /// Rebuild only the decoder that the failure `error` implicates (issue
+    /// 2225).
+    ///
+    /// This replaces a blanket `reset` that rebuilt all three of the peer's
+    /// decoders on ANY decode failure. See [`decoder_reset_scope`] for the
+    /// classification and the reasoning; the short version is that the three
+    /// decoders are independent, rebuilding the NetEQ audio worker is expensive
+    /// and audible, and the errors that actually reach this path today never
+    /// touched a decoder at all.
+    ///
+    /// `has_received_heartbeat` and the `*_enabled` flags are intentionally
+    /// preserved (as they were by `reset`): the peer's last-known media state is
+    /// still the best information we have, and clearing it would let straggler
+    /// frames through until the next heartbeat.
+    fn reset_for_decode_error(
+        &mut self,
+        from_peer: &str,
+        error: &PeerDecodeError,
+    ) -> Result<(), JsValue> {
+        match decoder_reset_scope(error) {
+            DecoderResetScope::None => {
+                debug!(
+                    "Peer {} decode error {error} touched no decoder; nothing to rebuild",
+                    self.session_id
+                );
+            }
+            DecoderResetScope::Video => {
+                debug!("Rebuilding VIDEO decoder for peer {}", self.session_id);
+                let video = Self::new_video_like_decoder(
+                    &self.video_canvas_id,
+                    MEDIA_TYPE_CAMERA,
+                    self.skip_canvas_paint,
+                )?;
+                self.replace_video_decoder(video, from_peer);
+            }
+            DecoderResetScope::Screen => {
+                debug!("Rebuilding SCREEN decoder for peer {}", self.session_id);
+                let screen = Self::new_video_like_decoder(
+                    &self.screen_canvas_id,
+                    MEDIA_TYPE_SCREEN,
+                    self.skip_canvas_paint,
+                )?;
+                self.replace_screen_decoder(screen, from_peer);
+            }
+            DecoderResetScope::Audio => {
+                debug!(
+                    "Rebuilding AUDIO decoder for peer {} with audio muted: {}",
+                    self.session_id, !self.audio_enabled
+                );
+                let audio = create_audio_peer_decoder(
+                    None,
+                    self.session_id.to_string(),
+                    self.vad_threshold,
+                )?;
+                self.replace_audio_decoder(audio);
+            }
+        }
         Ok(())
     }
 
@@ -2153,6 +2395,15 @@ impl Peer {
         self.selected_audio_layer
     }
 
+    /// The audio rung to SHOW for this peer (#2132) — see [`displayed_audio_rung`].
+    pub fn displayed_audio_layer(&self, now_ms: u64) -> Option<u32> {
+        displayed_audio_rung(
+            self.selected_audio_layer,
+            self.audio_layer_availability
+                .layer_available_peek(self.selected_audio_layer, now_ms),
+        )
+    }
+
     /// AUDIO-kind sibling of [`Self::set_selected_video_layer`] (issue #1695):
     /// select which audio simulcast layer this receiver decodes for this peer.
     /// AUDIO packets tagged with a different `simulcast_layer_id` are dropped
@@ -2269,42 +2520,84 @@ impl Peer {
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
     /// can update peer tiles.
     fn broadcast_peer_status(&self) {
+        let _ = global_sender().try_broadcast(self.peer_status_event());
+    }
+
+    /// Build the `peer_status` event this peer currently reports.
+    ///
+    /// Split out from [`Self::broadcast_peer_status`] so the emitted shape is
+    /// unit-testable on the host target: the global bus keeps no live receiver
+    /// on native and closes itself on first use, so the broadcast itself is
+    /// unobservable there.
+    fn peer_status_event(&self) -> DiagEvent {
+        let now = now_ms();
         let transport_str = match self.transport_type {
             TransportType::TRANSPORT_WEBTRANSPORT => "webtransport",
             TransportType::TRANSPORT_WEBSOCKET => "websocket",
             TransportType::TRANSPORT_UNKNOWN => "unknown",
         };
-        let evt = DiagEvent {
+        DiagEvent {
             subsystem: "peer_status",
             stream_id: None,
-            ts_ms: now_ms(),
-            metrics: vec![
-                metric!("to_peer", self.sid_str.clone()),
-                metric!(
-                    "audio_enabled",
-                    if self.audio_enabled { 1u64 } else { 0u64 }
-                ),
-                metric!(
-                    "video_enabled",
-                    if self.video_enabled { 1u64 } else { 0u64 }
-                ),
-                metric!(
-                    "screen_enabled",
-                    if self.screen_enabled { 1u64 } else { 0u64 }
-                ),
-                metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
-                metric!("audio_level", self.audio_level as f64),
-                // Zero-alloc per emit: `transport_str` is a `&'static str` from
-                // a literal match, so route it through the borrowing path
-                // (`Cow::Borrowed`) instead of the allocating `From<&str>`.
-                // This is the ~2 Hz/peer hot path from issue #1421.
-                Metric {
-                    name: "peer_transport",
-                    value: MetricValue::text_static(transport_str),
-                },
-            ],
-        };
-        let _ = global_sender().try_broadcast(evt);
+            ts_ms: now,
+            metrics: {
+                let mut m = vec![
+                    metric!("to_peer", self.sid_str.clone()),
+                    metric!(
+                        "audio_enabled",
+                        if self.audio_enabled { 1u64 } else { 0u64 }
+                    ),
+                    metric!(
+                        "video_enabled",
+                        if self.video_enabled { 1u64 } else { 0u64 }
+                    ),
+                    metric!(
+                        "screen_enabled",
+                        if self.screen_enabled { 1u64 } else { 0u64 }
+                    ),
+                    // Issue 2174: audio-off dominates the speaking flag. A peer
+                    // whose audio is disabled cannot be audibly speaking, so never
+                    // report `is_speaking: 1` alongside `audio_enabled: 0` — a
+                    // stale `true` here would re-light the tile glow right after
+                    // the decoder's terminal `speaking: 0`. Callers that force
+                    // audio off also clear the field (see `force_media_off`); this
+                    // guard is the backstop that makes any future forced path safe
+                    // by construction.
+                    metric!(
+                        "is_speaking",
+                        if self.is_speaking && self.audio_enabled {
+                            1u64
+                        } else {
+                            0u64
+                        }
+                    ),
+                    metric!("audio_level", self.audio_level as f64),
+                    // Zero-alloc per emit: `transport_str` is a `&'static str` from
+                    // a literal match, so route it through the borrowing path
+                    // (`Cow::Borrowed`) instead of the allocating `From<&str>`.
+                    //
+                    // Issue #1421: the dominant caller is the HEARTBEAT arm below,
+                    // which broadcasts once per received heartbeat per peer. The
+                    // sender's keepalive is `HEARTBEAT_KEEPALIVE_INTERVAL_MS` =
+                    // 5000 (videocall-aq/src/constants.rs, driven by the `Interval`
+                    // in connection/connection.rs), so this is ~0.2 Hz per peer at
+                    // rest — plus an edge-triggered immediate heartbeat on every
+                    // mute / camera / screen transition (`send_immediate_heartbeat`),
+                    // and it scales with participant count.
+                    Metric {
+                        name: "peer_transport",
+                        value: MetricValue::text_static(transport_str),
+                    },
+                ];
+                // Only when the selected rung is actually arriving (#2132): an
+                // absent metric renders as "—" rather than a nominal bitrate the
+                // receiver is not getting.
+                if let Some(rung) = self.displayed_audio_layer(now) {
+                    m.push(metric!(METRIC_SELECTED_AUDIO_LAYER, rung as u64));
+                }
+                m
+            },
+        }
     }
 
     /// Authoritatively force *this* peer's audio and/or video to the *off*
@@ -2334,6 +2627,15 @@ impl Peer {
             // emitting expand/hiss packets after the stream is gone.
             self.audio.set_muted(true);
             self.audio.flush();
+            // Issue 2174: clear the tracked speaking state too, mirroring the
+            // heartbeat audio-off arm. Without this the peer stays recorded as
+            // speaking, and the next `broadcast_peer_status()` would re-light
+            // the tile glow moments after the decoder emitted its terminal
+            // `speaking: 0`. `audio_level` is reset for the same reason (it is
+            // 0.0 on every current path, so this is future-proofing rather than
+            // a live fix).
+            self.is_speaking = false;
+            self.audio_level = 0.0;
             changed = true;
             debug!(
                 "force_media_off: muted audio for peer {} (host command)",
@@ -2929,8 +3231,22 @@ impl Peer {
                     self.video_enabled = resolved_video;
                     self.audio_enabled = resolved_audio;
                     self.screen_enabled = resolved_screen;
-                    self.is_speaking = metadata.is_speaking;
-                    if !metadata.is_speaking {
+                    // Issue 2174 (security carry-over): resolve the peer's
+                    // self-reported speaking claim against its resolved audio
+                    // state before storing it. A peer that announces
+                    // `audio_enabled = 0` while claiming `is_speaking = 1`
+                    // would otherwise hold the #1557 active-speaker exemption
+                    // from the local-CPU layer-drop cascade on EVERY receiver
+                    // (see the `exempt_speakers && peer.is_speaking` skip in
+                    // `seed_downlink_congestion`) without ever sending audio —
+                    // a resource lever a peer should not control unilaterally.
+                    //
+                    // This is #1557's own definition, not a new policy: that
+                    // exemption is documented as keying off the INSTANTANEOUS
+                    // VAD bool, and a peer with no audio is by definition not
+                    // instantaneously speaking.
+                    self.is_speaking = metadata.is_speaking && resolved_audio;
+                    if !self.is_speaking {
                         self.audio_level = 0.0;
                     }
                     // Capture peer's announced transport. Unknown enum
@@ -3156,6 +3472,22 @@ fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> 
     Ok(Arc::new(
         MediaPacket::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)?,
     ))
+}
+
+/// Metric on the `peer_status` event carrying the audio rung this receiver is
+/// actually decoding for the peer (#2132). Absent when the selected rung is not
+/// currently arriving, so the readout shows "—" instead of a fabricated number.
+pub const METRIC_SELECTED_AUDIO_LAYER: &str = "selected_audio_layer";
+
+/// The audio rung to display for a peer: the selected one when it is actually
+/// arriving, otherwise `None`. Selection is bandwidth-safe and can sit on a rung
+/// the publisher has since shed; reporting that rung's nominal would overstate
+/// what is being received.
+///
+/// Note this keys off packet arrival, and DTX is on for every audio tier — a peer
+/// silent past the availability window reads "—" until they speak again.
+pub fn displayed_audio_rung(selected: u32, selected_is_arriving: bool) -> Option<u32> {
+    selected_is_arriving.then_some(selected)
 }
 
 #[derive(Debug)]
@@ -4615,7 +4947,7 @@ impl PeerDecodeManager {
         // double-borrowing `self`. `Rc::clone` is cheap; all routes share one budget.
         let pli_budget_for_route = self.pli_budget.clone();
         // Issue #1640: capture local session_id before the mutable borrow for
-        // use in set_stream_context and peer.reset().
+        // use in set_stream_context and peer.reset_for_decode_error().
         let local_sid_for_context = self.local_session_id.clone().unwrap_or_default();
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             let was_screen_enabled = peer.screen_enabled;
@@ -4646,28 +4978,33 @@ impl PeerDecodeManager {
                     );
                 }
                 peer.context_initialized = true;
-            } else if send_packet_for_route.is_some() && !peer.video.has_keyframe_request_route() {
+            } else if send_packet_for_route.is_some()
+                && (!peer.video.has_keyframe_request_route()
+                    || !peer.screen.has_keyframe_request_route())
+            {
                 // Issue 1899 / discussion 1960 — self-healing route re-install. The proactive
                 // keyframe-request route is installed exactly once above (the one-time
                 // `context_initialized` latch), but it is DESTROYED later in the peer lifecycle:
-                // `Peer::reset` (decode-error path) rebuilds the video+screen decoders with empty
-                // route slots, and `clear_send_packet_callback` nulls them on teardown. Because the
-                // latch never re-runs, a reset leaves the route `None` FOREVER — the worker's
-                // keyframe-less eviction PLIs (issue #1025) then post to a no-op main-thread route,
-                // so a keyframe-starved tile can never recover (field: minutes-long screen freeze
-                // after a reset while PLIs fired into the void). Here media is flowing again AND the
-                // transport is wired (`send_packet` set — so this cannot fire during a disconnect
-                // teardown, where it is intentionally `None`), so re-install the route on the fresh
-                // decoders. Transport-agnostic: the same route serves WebTransport and WebSocket.
-                // The `has_keyframe_request_route` probe is a RefCell-borrow `Option` check that runs
-                // on EVERY packet while the transport is wired (the probe itself never stops); only the
-                // install BODY below is skipped once the route is present, so on the common healthy path
-                // this costs just that one borrow-and-check per packet. Probing VIDEO alone is valid
-                // because routes are only ever dropped in PAIRS — both `Peer::reset` and
-                // `clear_send_packet_callback` drop the VIDEO and SCREEN routes together — so a missing
-                // screen route always implies a missing video route. (A future change that dropped the
-                // SCREEN route alone would evade this VIDEO-keyed probe; keep the pair-drop invariant
-                // or probe both.)
+                // `Peer::reset_for_decode_error` (decode-error path) rebuilds a video or screen
+                // decoder with an empty route slot, and `clear_send_packet_callback` nulls them on
+                // teardown. Because the latch never re-runs, a rebuild leaves the route `None`
+                // FOREVER — the worker's keyframe-less eviction PLIs (issue #1025) then post to a
+                // no-op main-thread route, so a keyframe-starved tile can never recover (field:
+                // minutes-long screen freeze after a reset while PLIs fired into the void). Here
+                // media is flowing again AND the transport is wired (`send_packet` set — so this
+                // cannot fire during a disconnect teardown, where it is intentionally `None`), so
+                // re-install the route on the fresh decoder. Transport-agnostic: the same route
+                // serves WebTransport and WebSocket.
+                //
+                // Issue 2225: BOTH slots are probed. The old code probed VIDEO alone and justified
+                // it with a "routes are only ever dropped in PAIRS" invariant — true while
+                // `Peer::reset` rebuilt video and screen together, and explicitly flagged in that
+                // comment as something a future single-stream rebuild would break. Per-kind resets
+                // break it exactly that way: a SCREEN decode error now rebuilds the screen decoder
+                // alone, and a VIDEO-keyed probe would never notice the missing screen route — the
+                // very freeze this self-heal exists to prevent. Both probes are RefCell-borrow
+                // `Option` checks; the install BODY is still skipped once both routes are present,
+                // so the healthy path costs two borrow-and-checks per packet.
                 if let Some(send_packet) = &send_packet_for_route {
                     install_keyframe_request_routes(
                         peer,
@@ -4696,10 +5033,49 @@ impl PeerDecodeManager {
                     // counts toward liveness, not just heartbeats.
                     peer.on_activity();
                     if let Some(diagnostics) = &self.diagnostics {
+                        // Issue #2190: pass whether the packet was actually DECODED, so
+                        // `fps_received` counts decodes rather than arrivals.
+                        //
+                        // `decode_status.rendered` is the discriminator. Precisely, it
+                        // means NOT-SKIPPED, not "a frame reached the screen": every early
+                        // return in `Peer::decode` that declines to decode yields
+                        // `DecodeStatus::SKIPPED` (`rendered: false`), and the real paths
+                        // yield `true`. It is deliberately NOT claimed to be exact —
+                        // `VideoPeerDecoder::decode` wraps its whole body in
+                        // `if let Some(video_metadata)` and still falls through to
+                        // `_rendered: true`, so a packet carrying no video metadata
+                        // decodes nothing yet reports `true`; and `true` marks the frame as
+                        // handed to `push_frame` (async, fire-and-forget), not painted.
+                        // "Not skipped" is nonetheless a large improvement over "arrived" —
+                        // it removes the whole wrong-rung population below. For the
+                        // paint-truthful number, use `fps_painted` (#1656).
+                        //
+                        // The dominant SKIPPED path here is the EXACT-MATCH simulcast
+                        // guard. A receiver that is NOT constraining its layer advertises
+                        // no `LAYER_PREFERENCE` at all (`tick_layer_choosers` omits the
+                        // entry when it already tracks the top), so the relay fails OPEN
+                        // and forwards every rung — each non-selected one arrived here and
+                        // was counted, making an 8fps 3-rung camera read ~52 fps (7+15+30,
+                        // the ladder sum) instead of 8. Field-confirmed across three
+                        // meetings on two clusters. NOTE the inflation is therefore a
+                        // HEALTHY-receiver phenomenon: once this receiver constrains below
+                        // the top, the relay filters server-side and there is little left
+                        // to skip — so pre-fix series are inflated for unconstrained
+                        // receivers, NOT uniformly. The other SKIPPED paths (tile not
+                        // visible, straggler frame after a heartbeat says camera/mic off,
+                        // unknown codec) are equally correct to exclude: in none of them
+                        // did a frame reach the screen or the speaker.
+                        //
+                        // Bytes are still reported regardless — a skipped packet still
+                        // consumed downlink — and bitrate is gated on its OWN arrival
+                        // freshness clock (see `FpsTracker`), so it stays live for a
+                        // receiving-but-not-decoding stream instead of being zeroed with
+                        // fps.
                         diagnostics.track_frame(
                             &peer.sid_str,
                             media_type,
                             packet.data.len() as u64,
+                            decode_status.rendered,
                         );
                     }
 
@@ -4743,13 +5119,33 @@ impl PeerDecodeManager {
                     Ok(())
                 }
                 Err(e) => {
-                    // Track decode errors (codec failures: keyframe miss, parse error, decoder reset).
-                    // Media type is not available in the error arm; default to VIDEO since that
-                    // is where the vast majority of decode errors occur in practice.
+                    // Track decode errors (codec failures: keyframe miss, parse error, decoder
+                    // reset). The failed packet still arrived and consumed downlink, so record it
+                    // as a non-decoded arrival too. Without this, an all-error stream never
+                    // refreshes the arrival clock and falsely reports both bitrate and decode
+                    // errors as zero after one second.
+                    //
+                    // Prefer the cleartext outer media-kind hint because failures such as AES
+                    // decryption happen before the inner media packet is available. Older
+                    // wrappers can leave the hint unspecified, so typed decode errors provide
+                    // the fallback; otherwise retain the historical VIDEO default.
                     if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.track_decode_error(&peer.sid_str, MediaType::VIDEO);
+                        let diagnostic_media_type =
+                            diagnostic_media_type_for_decode_error(&packet, &e);
+                        diagnostics.track_decode_error(&peer.sid_str, diagnostic_media_type);
+                        diagnostics.track_frame(
+                            &peer.sid_str,
+                            diagnostic_media_type,
+                            packet.data.len() as u64,
+                            false,
+                        );
                     }
-                    peer.reset(&local_sid_for_context).map_err(|_| e)
+                    // Issue 2225: rebuild ONLY the decoder this error implicates
+                    // — a video failure must not respawn the peer's NetEQ audio
+                    // worker, and an envelope/crypto failure (which never
+                    // reached a decoder) must rebuild nothing at all.
+                    let rebuilt = peer.reset_for_decode_error(&local_sid_for_context, &e);
+                    rebuilt.map_err(|_| e)
                 }
             }
         } else {
@@ -4956,8 +5352,17 @@ impl PeerDecodeManager {
         // would never be registered unless we attempt it here too.
         //
         // The canvas element id is the bare `session_id` string — see the
-        // UserVideo RSX `canvas { id: "{id}", ... }`.  The `video_canvas_id`
-        // field uses a "video-" prefix (legacy) that no longer matches the DOM.
+        // UserVideo RSX `canvas { id: "{id}", ... }` — which is why this block
+        // looks up `sid_str` directly.
+        //
+        // The "video-{key}" prefix lives ONLY in `PeerDecodeManager::new`'s
+        // DEFAULT `get_video_canvas_id` callback, which nothing in this
+        // workspace ships with: every UI construction site injects the identity
+        // callback (`get_peer_video_canvas_id: VcCallback::from(|id| id)` in
+        // dioxus-ui's meeting / attendants / waiting_room / guest_join, wired
+        // through `VideoCallClient::new`). So in production `video_canvas_id`
+        // IS the bare session id and does match the DOM; the legacy prefix is
+        // reached only by tests that build a manager directly.
         if let Some(peer_ref) = self.connected_peers.get(&session_id) {
             if let Some(window) = web_sys::window() {
                 if let Some(document) = window.document() {
@@ -5550,24 +5955,46 @@ impl PeerDecodeManager {
 // build. `mod tests` re-imports them via its `use super::*;`, so every existing
 // bare-name call site there keeps working unchanged.
 
+/// Ordered log of the lifecycle calls a [`MockAudioDecoder`] received, shared
+/// by every mock in one test. Entries are `"<tag>:<op>"`, so a test can observe
+/// both WHICH decoder was called and in WHAT ORDER — which is the whole point
+/// for decoder replacement (issue 2174 follow-up), where `retire_for_replacement`
+/// must land strictly before the `Drop` it disarms.
+#[cfg(test)]
+type MockAudioLog = Rc<RefCell<Vec<String>>>;
+
 /// No-op audio decoder for unit tests.
 /// Muted state is stored in an `Rc<Cell<bool>>` so tests can inspect it
 /// after handing ownership to `Peer`.
 #[cfg(test)]
 struct MockAudioDecoder {
     muted: Rc<std::cell::Cell<bool>>,
+    tag: &'static str,
+    log: MockAudioLog,
 }
 
 #[cfg(test)]
 impl MockAudioDecoder {
     fn new() -> (Self, Rc<std::cell::Cell<bool>>) {
+        Self::tagged("mock", Rc::new(RefCell::new(Vec::new())))
+    }
+
+    /// A mock that records its lifecycle calls into a caller-owned log under
+    /// `tag`, so several mocks can be told apart in one test.
+    fn tagged(tag: &'static str, log: MockAudioLog) -> (Self, Rc<std::cell::Cell<bool>>) {
         let muted = Rc::new(std::cell::Cell::new(true));
         (
             Self {
                 muted: muted.clone(),
+                tag,
+                log,
             },
             muted,
         )
+    }
+
+    fn record(&self, op: &str) {
+        self.log.borrow_mut().push(format!("{}:{op}", self.tag));
     }
 }
 
@@ -5579,6 +6006,21 @@ impl AudioPeerDecoderTrait for MockAudioDecoder {
     fn flush(&mut self) {}
     fn set_muted(&mut self, muted: bool) {
         self.muted.set(muted);
+        self.record(if muted { "mute" } else { "unmute" });
+    }
+    fn retire_for_replacement(&mut self) {
+        self.record("retire");
+    }
+}
+
+/// Stands in for `NetEqAudioPeerDecoder::drop`, which broadcasts the terminal
+/// `speaking: 0`. Recording the drop is what lets a test distinguish
+/// replacement (retire, then a disarmed drop) from teardown (a drop that still
+/// has to announce silence).
+#[cfg(test)]
+impl Drop for MockAudioDecoder {
+    fn drop(&mut self) {
+        self.record("drop");
     }
 }
 
@@ -5678,6 +6120,87 @@ fn make_zero_loss_top_peer(session_id: u64) -> Peer {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
+    /// Guards the WIRING, not the leaf fn: deleting the emission from
+    /// `peer_status_event` left every other test in both crates green.
+    #[test]
+    fn peer_status_carries_the_arriving_audio_rung_and_omits_a_stale_one() {
+        let now = videocall_diagnostics::now_ms();
+        let (mut peer, _muted) = make_test_peer(2132);
+        peer.audio_layer_availability.observe(1, now);
+        peer.set_selected_audio_layer(1);
+        let evt = peer.peer_status_event();
+        let got = evt
+            .metrics
+            .iter()
+            .find(|m| m.name == METRIC_SELECTED_AUDIO_LAYER)
+            .map(|m| m.value.clone());
+        assert!(
+            matches!(got, Some(MetricValue::U64(1))),
+            "arriving rung 1 must be emitted, got {got:?}"
+        );
+
+        // Same selection, but the observation is now older than the availability
+        // window: the metric must be ABSENT so the readout falls back to "—"
+        // rather than claiming a bitrate the receiver is not getting.
+        let (mut stale, _m2) = make_test_peer(2133);
+        stale.audio_layer_availability.observe(1, 0);
+        stale.set_selected_audio_layer(1);
+        let stale_evt = stale.peer_status_event();
+        assert!(
+            !stale_evt
+                .metrics
+                .iter()
+                .any(|m| m.name == METRIC_SELECTED_AUDIO_LAYER),
+            "a rung outside the availability window must not be emitted"
+        );
+    }
+
+    /// The peek must agree with the pruning sibling about the window boundary;
+    /// replacing it with a bare `contains_key` left every test green.
+    #[test]
+    fn layer_available_peek_respects_the_window() {
+        use crate::decode::layer_chooser::LayerAvailability;
+        let w = LayerAvailability::DEFAULT_WINDOW_MS;
+        let mut a = LayerAvailability::new();
+        a.observe(1, 1_000);
+        assert!(
+            a.layer_available_peek(1, 1_000),
+            "same instant is available"
+        );
+        assert!(
+            a.layer_available_peek(1, 1_000 + w),
+            "boundary is inclusive"
+        );
+        assert!(
+            !a.layer_available_peek(1, 1_000 + w + 1),
+            "one ms past the window must be unavailable"
+        );
+        assert!(
+            !a.layer_available_peek(2, 1_000),
+            "unobserved layer is never available"
+        );
+    }
+
+    #[test]
+    fn displayed_audio_rung_hides_a_selected_rung_that_is_not_arriving() {
+        assert_eq!(
+            crate::decode::peer_decode_manager::displayed_audio_rung(2, true),
+            Some(2)
+        );
+        assert_eq!(
+            crate::decode::peer_decode_manager::displayed_audio_rung(0, true),
+            Some(0)
+        );
+        assert_eq!(
+            crate::decode::peer_decode_manager::displayed_audio_rung(2, false),
+            None
+        );
+        assert_eq!(
+            crate::decode::peer_decode_manager::displayed_audio_rung(0, false),
+            None
+        );
+    }
+
     use super::*;
     use protobuf::Message;
     use std::cell::Cell;
@@ -5693,7 +6216,7 @@ mod tests {
     ///
     /// `make_zero_loss_top_peer` / `make_congested_top_peer` record layer
     /// availability at `t == 1000`, and `LayerAvailability::highest_available`
-    /// prunes any entry older than `DEFAULT_WINDOW_MS` (4000ms). Ticking a
+    /// prunes any entry older than `DEFAULT_WINDOW_MS`. Ticking a
     /// chooser with the real wall clock (`now_ms()` ≈ 1.7e12) therefore prunes
     /// the entire learned ladder and collapses `highest_available` from 2 to 0,
     /// silently defeating both the size lid and the #1079 advertise gate — the
@@ -6708,20 +7231,23 @@ mod tests {
     }
 
     /// Issue 1899 / discussion 1960 — self-healing keyframe-request route. The route is installed
-    /// once (the `context_initialized` latch), but `Peer::reset` (decode-error path) rebuilds the
-    /// video+screen decoders with EMPTY route slots and the latch never re-runs — so without
-    /// self-healing the route stays `None` forever after a reset and the worker's keyframe-less
+    /// once (the `context_initialized` latch), but `Peer::reset_for_decode_error` (decode-error
+    /// path) rebuilds a video or screen decoder with an EMPTY route slot and the latch never
+    /// re-runs — so without self-healing the route stays `None` forever after a rebuild and the
+    /// worker's keyframe-less
     /// eviction PLIs (issue #1025) become permanent no-ops, freezing a keyframe-starved tile for
     /// minutes (the field symptom). `decode()` must re-install a dropped route on the next media
     /// packet whenever the transport is wired.
     ///
-    /// Noop decoders stand in for the fresh (route-less) decoders `Peer::reset` mints — their route
+    /// Noop decoders stand in for the fresh (route-less) decoders a rebuild mints — their route
     /// slot supports `set`/`has`/`clear` exactly like the real `VideoPeerDecoder` — so the invariant
     /// is exercised through the REAL `decode()` path without a browser worker (which the harness
     /// cannot construct).
     ///
     /// Mutation coverage: deleting the `else if send_packet.is_some() && !has_keyframe_request_route`
-    /// re-install branch leaves BOTH routes `None` after decode → both asserts fail. The outer
+    /// re-install branch leaves BOTH routes `None` after decode → both asserts fail. Narrowing the
+    /// probe back to VIDEO alone (issue 2225) is caught by
+    /// `decode_reinstalls_a_screen_only_route_drop`, which drops ONLY the screen route. The outer
     /// `send_packet.is_some()` in the condition is only a cheap short-circuit; the LOAD-BEARING
     /// teardown guard is the inner `if let Some(send_packet)` inside the branch body — during a
     /// disconnect teardown `send_packet` is `None`, so even if the branch is entered the install body
@@ -6735,7 +7261,7 @@ mod tests {
         );
 
         let (mut peer, _muted) = make_test_peer(42);
-        // Past the one-time install latch, with the route dropped exactly as Peer::reset() leaves it.
+        // Past the one-time install latch, with the routes dropped exactly as a rebuild leaves them.
         peer.context_initialized = true;
         peer.has_received_heartbeat = true;
         peer.video.clear_keyframe_request_route();
@@ -6769,6 +7295,65 @@ mod tests {
         assert!(
             peer.screen.has_keyframe_request_route(),
             "decode must re-install a dropped SCREEN keyframe-request route (issue 1899 / discussion 1960)"
+        );
+    }
+
+    /// Issue 2225: the self-heal probe must notice a SCREEN-ONLY route drop.
+    ///
+    /// Per-kind resets made this reachable. Before 2225, `Peer::reset` rebuilt
+    /// the video and screen decoders together, so the routes were only ever
+    /// dropped in pairs — which is why the probe keyed on VIDEO alone, with a
+    /// comment warning that a future single-stream rebuild would evade it. A
+    /// `ScreenDecodeError` now rebuilds the screen decoder on its own, leaving
+    /// the VIDEO route intact and the SCREEN route `None`.
+    ///
+    /// The consequence of missing it is not cosmetic: the codec worker's
+    /// keyframe-less eviction PLIs (issue #1025) post into a no-op route, so a
+    /// keyframe-starved screen tile freezes for minutes — the exact field
+    /// symptom the self-heal exists to prevent.
+    ///
+    /// Mutation: narrow the probe back to `!peer.video.has_keyframe_request_route()`
+    /// and this fails while `decode_reinstalls_dropped_keyframe_request_route`
+    /// (which drops both) still passes.
+    #[wasm_bindgen_test]
+    fn decode_reinstalls_a_screen_only_route_drop() {
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(
+            Callback::from(|_p: PacketWrapper| {}),
+            "me@test.com".to_string(),
+        );
+
+        let (mut peer, _muted) = make_test_peer(2225);
+        peer.context_initialized = true;
+        peer.has_received_heartbeat = true;
+        // Exactly what a SCREEN-only rebuild leaves behind: VIDEO still wired,
+        // SCREEN route-less.
+        peer.video.set_keyframe_request_route(Box::new(|_| {}));
+        peer.screen.clear_keyframe_request_route();
+        assert!(peer.video.has_keyframe_request_route());
+        assert!(!peer.screen.has_keyframe_request_route());
+        manager.connected_peers.insert(2225, peer);
+
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: b"test@test.com".to_vec(),
+            heartbeat_metadata: Some(HeartbeatMetadata {
+                video_enabled: true,
+                audio_enabled: true,
+                screen_enabled: true,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        manager
+            .decode(packet_wrapper(&media, 2225), "test@test.com")
+            .expect("heartbeat should decode");
+
+        let peer = manager.connected_peers.get(&2225).expect("peer present");
+        assert!(
+            peer.screen.has_keyframe_request_route(),
+            "decode must re-install a SCREEN route dropped on its own by a per-kind rebuild"
         );
     }
 
@@ -7749,6 +8334,63 @@ mod tests {
         );
     }
 
+    /// Issue 2174 (security carry-over): a peer must not be able to claim the
+    /// #1557 active-speaker layer-drop exemption while declaring its audio off.
+    ///
+    /// `seed_downlink_congestion` skips any peer whose stored `is_speaking` is
+    /// true under local-CPU pressure, so a peer that could park that flag at
+    /// `true` with no audio would hold a receiver-side resource exemption on
+    /// every participant indefinitely. The stored field must be resolved
+    /// against the peer's audio state.
+    ///
+    /// Fails if the `&& resolved_audio` guard is dropped from the heartbeat arm.
+    #[wasm_bindgen_test]
+    fn heartbeat_cannot_claim_speaking_while_audio_is_disabled() {
+        let (mut peer, _muted) = make_test_peer(2174);
+        peer.audio_level = 0.4;
+
+        let claim = |audio_enabled: bool| {
+            let media = MediaPacket {
+                media_type: MediaType::HEARTBEAT.into(),
+                user_id: "test@test.com".into(),
+                heartbeat_metadata: Some(HeartbeatMetadata {
+                    video_enabled: false,
+                    audio_enabled,
+                    screen_enabled: false,
+                    is_speaking: true,
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            };
+            wrap(&media, 2174)
+        };
+
+        // Audio declared OFF while claiming to speak — the claim must not stick.
+        let _ = peer.decode(&claim(false), "");
+        assert!(
+            !peer.audio_enabled,
+            "precondition: heartbeat declared audio off"
+        );
+        assert!(
+            !peer.is_speaking,
+            "a peer with audio disabled must not be stored as speaking (#1557 exemption lever)"
+        );
+        assert_eq!(
+            peer.audio_level, 0.0,
+            "audio_level must be cleared alongside the rejected speaking claim"
+        );
+
+        // Control: with audio genuinely enabled the same claim IS honoured, so
+        // the guard suppresses only the contradictory combination.
+        let _ = peer.decode(&claim(true), "");
+        assert!(peer.audio_enabled, "precondition: heartbeat enabled audio");
+        assert!(
+            peer.is_speaking,
+            "an audio-enabled peer's speaking claim must still be honoured"
+        );
+    }
+
     /// Full sequence: enable → legitimate frame → disable → straggler dropped.
     #[wasm_bindgen_test]
     fn video_enable_frame_disable_straggler_full_sequence() {
@@ -8304,6 +8946,21 @@ mod tests {
             user_id: b"test@test.com".to_vec(),
             video_metadata: Some(VideoMetadata {
                 sequence: seq,
+                // A REAL codec, matching what the encoders actually stamp. Without
+                // this the proto3 default is `VIDEO_CODEC_UNSPECIFIED`, and
+                // `VideoPeerDecoder::decode` takes its "unknown codec" early return
+                // (`_rendered: false`) — so a packet built by this helper never reached
+                // the decoder at all, silently diverging from the "mirrors the real
+                // wire shape" contract in this doc comment, and making any test that
+                // asserts on decode OUTCOME (e.g. #2190's frame-counting regression) read
+                // a false negative.
+                //
+                // Effect on the pre-existing seq-tracker tests below: their ASSERTIONS are
+                // unaffected (`track_sequence` runs before the decoder call), but they do
+                // now execute materially more code — the real `push_frame` path instead of
+                // stopping at the unknown-codec early return. That is strictly closer to
+                // production, not a no-op; calling it out so nobody reads this as inert.
+                codec: videocall_types::protos::media_packet::VideoCodec::VP8.into(),
                 ..Default::default()
             })
             .into(),
@@ -8477,6 +9134,155 @@ mod tests {
             matches!(result, Err(PeerDecodeError::AesDecryptError)),
             "base layer (N=1) must fall through the gate to decrypt unchanged \
              (got {result:?})"
+        );
+    }
+
+    /// Issue #2190: a wrong-rung packet the EXACT-MATCH simulcast guard SKIPPED must
+    /// NOT be counted as a received frame.
+    ///
+    /// This is the defect that made `videocall_video_fps` read the simulcast LADDER
+    /// SUM instead of the decoded rung: the relay fails OPEN and forwards ALL of a
+    /// publisher's rungs to a healthy receiver, the guard drops the non-selected ones
+    /// as `DecodeStatus::SKIPPED`, but `track_frame` was called on the whole `Ok(..)`
+    /// arm regardless — so every dropped rung still bumped the fps counter. Field
+    /// measurement: an 8fps publisher with 3 active camera rungs (7+15+30) read
+    /// **~52 fps** on the receiver, i.e. HEALTHIER than the publisher's real output,
+    /// during a call that was visibly stalled 21% of the time.
+    ///
+    /// Driven through `PeerDecodeManager::decode` — the real production entry point
+    /// that owns the `track_frame` call site — NOT through `Peer::decode` directly,
+    /// because the call site is precisely what the fix changes.
+    ///
+    /// MUTATION: reverting the call site's 4th argument to a literal `true` makes the
+    /// two `decoded` assertions below fail (the skipped rung reads counted, and
+    /// `frames_decoded` reads 2 instead of 1). Deleting the `if decoded` guard in
+    /// `track_frame` fails the `frames_decoded_for_test` assertion on its own.
+    ///
+    /// `#[wasm_bindgen_test]`: `DiagnosticManager::new` starts a real `HeartbeatTimer`
+    /// (Worker, falling back to `setInterval`) and the trackers live on a
+    /// `spawn_local` task, so this needs a browser. The seam it asserts on is written
+    /// synchronously at the call site, so no executor yield is required.
+    #[wasm_bindgen_test]
+    fn skipped_wrong_rung_packet_is_not_counted_as_a_received_frame() {
+        let diagnostics = Rc::new(crate::diagnostics::DiagnosticManager::new(
+            "local@test.com".to_string(),
+        ));
+        let mut manager = PeerDecodeManager::new_with_diagnostics(diagnostics.clone());
+
+        // A peer whose VIDEO is flowing and visible, so the ONLY thing that can
+        // skip a packet below is the simulcast rung guard.
+        let session_id = 2190u64;
+        let (mut peer, _muted) = make_test_peer(session_id);
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        peer.visible = true;
+        manager.connected_peers.insert(session_id, peer);
+
+        // Receiver is decoding the base rung (the N=1 default).
+        assert_eq!(
+            manager.selected_video_layer_for_test(session_id),
+            Some(0),
+            "precondition: receiver decodes rung 0"
+        );
+
+        // Rung 0 — the SELECTED rung. Decoded, so it must count.
+        manager
+            .decode(
+                Arc::try_unwrap(video_layer_wrap(0, 1, session_id))
+                    .expect("sole owner of the wrapper"),
+                "local@test.com",
+            )
+            .expect("selected-rung packet must decode");
+
+        // Rung 2 — a rung this receiver is NOT decoding, which the relay forwarded
+        // anyway (fail-open). The guard SKIPs it pre-decrypt.
+        manager
+            .decode(
+                Arc::try_unwrap(video_layer_wrap(2, 1, session_id))
+                    .expect("sole owner of the wrapper"),
+                "local@test.com",
+            )
+            .expect("a skipped wrong-rung packet is not an error");
+
+        let calls = diagnostics.take_track_frame_calls_for_test();
+        assert_eq!(
+            calls.len(),
+            2,
+            "both packets still reach track_frame (bytes must be counted for \
+             bitrate_kbps either way): {calls:?}"
+        );
+        assert!(
+            calls[0].2,
+            "the SELECTED rung was decoded and must be counted as a frame: {calls:?}"
+        );
+        assert!(
+            !calls[1].2,
+            "the wrong-rung packet was SKIPPED and must NOT be counted as a frame — \
+             counting it is what made fps read the ladder sum (#2190): {calls:?}"
+        );
+
+        // The cumulative counter named `frames_decoded` must likewise count only
+        // real decodes.
+        assert_eq!(
+            diagnostics.frames_decoded_for_test(),
+            1,
+            "frames_decoded must advance once (the decoded rung), not twice"
+        );
+    }
+
+    /// Issue #2190 follow-up: a packet that reaches the decoder but errors is still an
+    /// arrival. It must refresh the arrival clock and count its bytes without incrementing
+    /// decoded FPS.
+    ///
+    /// Driven through `PeerDecodeManager::decode`, the production owner of the error arm.
+    /// The invalid AES payload deterministically reaches that arm.
+    ///
+    /// MUTATION: removing the `track_frame(..., false)` call from the error arm leaves the
+    /// recorded call list empty and fails this test.
+    #[wasm_bindgen_test]
+    fn decode_errors_are_recorded_as_non_decoded_arrivals_by_media_type() {
+        ensure_decoder_worker_link_tags();
+        let diagnostics = Rc::new(crate::diagnostics::DiagnosticManager::new(
+            "local@test.com".to_string(),
+        ));
+        let mut manager = PeerDecodeManager::new_with_diagnostics(diagnostics.clone());
+
+        let mut expected_calls = Vec::new();
+        for (session_id, media_kind, expected_media_type) in [
+            (2191u64, MediaKind::VIDEO, MediaType::VIDEO),
+            (2192u64, MediaKind::SCREEN, MediaType::SCREEN),
+        ] {
+            let (mut peer, _muted) = make_test_peer(session_id);
+            peer.video_enabled = true;
+            peer.screen_enabled = true;
+            peer.has_received_heartbeat = true;
+            peer.visible = true;
+            peer.aes = Some(Aes128State::new(true));
+            manager.connected_peers.insert(session_id, peer);
+
+            let packet = cleartext_kind_wrap(media_kind, 0, session_id);
+            let packet_len = packet.data.len() as u64;
+            let result = manager.decode(
+                Arc::try_unwrap(packet).expect("sole owner of the wrapper"),
+                "local@test.com",
+            );
+            assert!(
+                result.is_ok(),
+                "the production error arm resets the peer and returns the reset result, got \
+                 {result:?}"
+            );
+            expected_calls.push((expected_media_type, packet_len, false));
+        }
+
+        assert_eq!(
+            diagnostics.take_track_frame_calls_for_test(),
+            expected_calls,
+            "each failed packet must count against its own media arrival clock, not decoded FPS"
+        );
+        assert_eq!(
+            diagnostics.frames_decoded_for_test(),
+            0,
+            "a decode error must not increment decoded FPS"
         );
     }
 
@@ -12750,6 +13556,12 @@ mod tests {
         peer.has_received_heartbeat = true;
         // Peer's audio is already on (unmuted) before the host acts.
         peer.audio_enabled = true;
+        // Issue 2174: the peer is mid-sentence when the host force-mutes.
+        // Both fields must be seeded non-default, or the "cleared" assertions
+        // below would pass trivially on un-fixed code (`make_test_peer` starts
+        // at `is_speaking: false, audio_level: 0.0`).
+        peer.is_speaking = true;
+        peer.audio_level = 0.7;
         muted.set(false);
         manager.connected_peers.insert(1001, peer);
 
@@ -12783,8 +13595,319 @@ mod tests {
             muted.get(),
             "audio decoder must be muted after force-off so no expand/hiss packets play"
         );
+        // Issue 2174: the tracked speaking state must be cleared too, or the
+        // next status broadcast re-lights the glow the decoder just cleared.
+        // Fails if `force_media_off` stops resetting `is_speaking`.
+        assert!(
+            !peer.is_speaking,
+            "force_peer_media_off must clear the peer's speaking state"
+        );
+        assert_eq!(peer.audio_level, 0.0, "force-off must clear audio_level");
+        // And the event the UI actually consumes must report silence.
+        assert!(
+            matches!(
+                metric_value(&peer.peer_status_event(), "is_speaking"),
+                MetricValue::U64(0)
+            ),
+            "peer_status after force-off must report is_speaking: 0"
+        );
         // Video untouched.
         assert!(!peer.video_enabled);
+    }
+
+    // ---- Issue 2225: a decode error rebuilds ONLY the decoder that failed ----
+    //
+    // The decode-error arm used to call a blanket `Peer::reset`, rebuilding all
+    // three of a peer's decoders — including the NetEQ audio worker (fresh Web
+    // Worker, worklet init, blob URL, message plumbing) — no matter what had
+    // actually failed. These pin the replacement scoping.
+
+    /// Every `PeerDecodeError` must be classified explicitly, and only the three
+    /// per-kind decode failures may rebuild anything.
+    ///
+    /// The expectations are written out per variant rather than derived, so this
+    /// is a specification of the mapping and not a copy of it. `decoder_reset_scope`
+    /// has no wildcard arm, so a new variant fails to compile until it is
+    /// classified — and adding it here is then a deliberate act.
+    ///
+    /// Mutation: map `VideoDecodeError` to `Audio` (the pre-2225 behaviour for a
+    /// video failure), or any pre-decode error to anything but `None`, and this
+    /// fails.
+    #[test]
+    fn every_error_variant_has_an_explicit_reset_scope() {
+        use DecoderResetScope as S;
+
+        let expected = [
+            (PeerDecodeError::VideoDecodeError, S::Video),
+            (PeerDecodeError::ScreenDecodeError, S::Screen),
+            (PeerDecodeError::AudioDecodeError, S::Audio),
+            // Everything below fails BEFORE `Peer::decode` reaches any
+            // `decoder.decode(..)` call, so there is no decoder state to recover.
+            (PeerDecodeError::AesDecryptError, S::None),
+            (PeerDecodeError::IncorrectPacketType, S::None),
+            (PeerDecodeError::NoMediaType, S::None),
+            (PeerDecodeError::NoPacketType, S::None),
+            (PeerDecodeError::PacketParseError, S::None),
+            (PeerDecodeError::UnknownMediaType, S::None),
+            (PeerDecodeError::UnknownPacketType, S::None),
+            (PeerDecodeError::NoSuchPeer(7), S::None),
+            (PeerDecodeError::SameUserPacket(7), S::None),
+        ];
+
+        for (error, want) in expected {
+            assert_eq!(
+                decoder_reset_scope(&error),
+                want,
+                "{error} must map to {want:?}"
+            );
+        }
+    }
+
+    /// THE issue-2225 regression. A decode failure that never reached a decoder
+    /// must rebuild nothing at all — above all not the peer's NetEQ audio
+    /// worker.
+    ///
+    /// These are the errors that actually reach this path in production: a
+    /// receiver holding a stale AES key fails EVERY packet, so under the old
+    /// blanket `Peer::reset` the audio worker was respawned tens of times a
+    /// second for as long as the key mismatch lasted.
+    ///
+    /// Mutation: restore the blanket reset (have `reset_for_decode_error` call
+    /// `Self::new_decoders` unconditionally) and this fails — `new_decoders`
+    /// builds a real `VideoPeerDecoder`, whose `js_sys` calls abort on the host
+    /// target, so the test never even reaches its assertions. On the fixed code
+    /// nothing is constructed, which is the whole point.
+    #[test]
+    fn a_decode_error_that_never_reached_a_decoder_rebuilds_nothing() {
+        for error in [
+            PeerDecodeError::AesDecryptError,
+            PeerDecodeError::PacketParseError,
+            PeerDecodeError::NoMediaType,
+            PeerDecodeError::NoPacketType,
+            PeerDecodeError::IncorrectPacketType,
+        ] {
+            let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+            let (mut peer, _) = make_test_peer(22250);
+
+            // The peer is unmuted and mid-sentence when the bad packet lands.
+            peer.audio_enabled = true;
+            let (audio, _) = MockAudioDecoder::tagged("live", log.clone());
+            peer.audio = Box::new(audio);
+            log.borrow_mut().clear();
+
+            peer.reset_for_decode_error("local-session", &error)
+                .unwrap_or_else(|e| panic!("{error} must not fail the rebuild: {e:?}"));
+
+            assert!(
+                log.borrow().is_empty(),
+                "{error} touched no decoder, so the audio decoder must be left \
+                 completely alone — got {:?}",
+                log.borrow()
+            );
+        }
+    }
+
+    /// The other side of the scoping: rebuilding the camera decoder must leave
+    /// the audio decoder in place (no retire, no drop, no re-mute), and must
+    /// give the fresh decoder its stream attribution (#1640) — the peer's
+    /// `context_initialized` latch has already fired, so nothing else will.
+    ///
+    /// Mutation: add `self.replace_audio_decoder(..)` to the VIDEO arm of
+    /// `reset_for_decode_error` (the pre-2225 behaviour) and the log assertion
+    /// fails; delete the `set_stream_context` call from `replace_video_decoder`
+    /// and the attribution assertion fails.
+    #[test]
+    fn rebuilding_the_video_decoder_leaves_the_audio_decoder_untouched() {
+        let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+        let (mut peer, _) = make_test_peer(22251);
+
+        peer.audio_enabled = true;
+        let (audio, muted) = MockAudioDecoder::tagged("live", log.clone());
+        peer.audio = Box::new(audio);
+        // A live decoder for an unmuted peer: the mock starts muted, so put it
+        // in the state the peer is actually in before the rebuild lands.
+        muted.set(false);
+        log.borrow_mut().clear();
+
+        peer.replace_video_decoder(VideoPeerDecoder::noop(), "local-session");
+
+        assert!(
+            log.borrow().is_empty(),
+            "a VIDEO rebuild must not retire, drop or re-mute the audio decoder — got {:?}",
+            log.borrow()
+        );
+        assert!(
+            !muted.get(),
+            "the surviving audio decoder must keep the peer's live unmuted state"
+        );
+        assert_eq!(
+            peer.video.stream_context_for_test(),
+            Some(("local-session".to_string(), "22251".to_string())),
+            "the fresh camera decoder must be given its stream attribution (#1640)"
+        );
+    }
+
+    /// SCREEN sibling of the above.
+    ///
+    /// Mutation: have `replace_screen_decoder` write `self.video` instead of
+    /// `self.screen` (a plausible copy-paste) and the attribution lands on the
+    /// wrong decoder, failing both assertions.
+    #[test]
+    fn rebuilding_the_screen_decoder_leaves_the_audio_and_camera_decoders_untouched() {
+        let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+        let (mut peer, _) = make_test_peer(22252);
+
+        peer.audio_enabled = true;
+        let (audio, _) = MockAudioDecoder::tagged("live", log.clone());
+        peer.audio = Box::new(audio);
+        log.borrow_mut().clear();
+
+        peer.replace_screen_decoder(VideoPeerDecoder::noop(), "local-session");
+
+        assert!(
+            log.borrow().is_empty(),
+            "a SCREEN rebuild must not touch the audio decoder — got {:?}",
+            log.borrow()
+        );
+        assert_eq!(
+            peer.screen.stream_context_for_test(),
+            Some(("local-session".to_string(), "22252".to_string())),
+            "the fresh screen decoder must be given its stream attribution (#1640)"
+        );
+        assert_eq!(
+            peer.video.stream_context_for_test(),
+            None,
+            "a SCREEN rebuild must not write the CAMERA decoder's context"
+        );
+    }
+
+    // -- Issue 2174 follow-up: Drop fires on REPLACEMENT, not just teardown --
+    //
+    // `NetEqAudioPeerDecoder::drop` broadcasts a terminal `speaking: 0`. That
+    // is right when the peer is going away and wrong when the decoder is merely
+    // being rebuilt for a peer who is still mid-sentence. These two tests pin
+    // the asymmetry from the manager side; the decoder side (that a retired VAD
+    // makes the drop silent) is pinned in `neteq_audio_decoder.rs`.
+
+    /// Swap in a peer's audio decoder the way `Peer::reset_for_decode_error`
+    /// does after an AUDIO decode error: the outgoing decoder must be retired
+    /// BEFORE the assignment drops it, and the replacement must inherit the
+    /// peer's live mute state.
+    ///
+    /// Mutation: delete the `self.audio.retire_for_replacement()` line in
+    /// `replace_audio_decoder` — or move it after the assignment, where it
+    /// would retire the *incoming* decoder instead — and the `old:retire`
+    /// lookup finds nothing.
+    #[test]
+    fn replacing_a_peers_audio_decoder_retires_the_outgoing_one_before_dropping_it() {
+        let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+        let (mut peer, _) = make_test_peer(21741);
+
+        // The peer is unmuted and talking when the audio decode error lands.
+        peer.audio_enabled = true;
+        let (outgoing, _) = MockAudioDecoder::tagged("old", log.clone());
+        peer.audio = Box::new(outgoing);
+        log.borrow_mut().clear();
+
+        let (incoming, incoming_muted) = MockAudioDecoder::tagged("new", log.clone());
+        peer.replace_audio_decoder(Box::new(incoming));
+
+        let ops = log.borrow().clone();
+        let retired_at = ops
+            .iter()
+            .position(|op| op == "old:retire")
+            .unwrap_or_else(|| {
+                panic!("the outgoing decoder must be retired for replacement, got {ops:?}")
+            });
+        let dropped_at = ops
+            .iter()
+            .position(|op| op == "old:drop")
+            .unwrap_or_else(|| panic!("the outgoing decoder must be dropped, got {ops:?}"));
+        assert!(
+            retired_at < dropped_at,
+            "retire must run BEFORE the drop it disarms, got {ops:?}"
+        );
+
+        assert!(
+            !incoming_muted.get(),
+            "the replacement decoder must inherit the peer's live audio state (unmuted)"
+        );
+    }
+
+    /// The other half: removing a peer is genuine teardown, so its decoder must
+    /// reach `Drop` **without** a retire — that terminal `speaking: 0` is issue
+    /// 2174's actual fix and must survive this change.
+    ///
+    /// Mutation: call `retire_for_replacement` from the removal path (or from a
+    /// `Drop for Peer`) and this fails.
+    #[test]
+    fn removing_a_peer_drops_its_audio_decoder_without_retiring_it() {
+        let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _) = make_test_peer(21742);
+
+        peer.audio_enabled = true;
+        let (departing, _) = MockAudioDecoder::tagged("gone", log.clone());
+        peer.audio = Box::new(departing);
+        manager.connected_peers.insert(21742, peer);
+        log.borrow_mut().clear();
+
+        manager.delete_peer_at(21742, 50_000);
+
+        let ops = log.borrow().clone();
+        assert_eq!(
+            ops,
+            vec!["gone:drop".to_string()],
+            "peer removal must reach Drop with no retire, so the terminal speaking:0 \
+             still clears the glow (issue 2174)"
+        );
+    }
+
+    /// Read a named metric out of a `DiagEvent`, panicking if absent.
+    fn metric_value<'a>(evt: &'a DiagEvent, name: &str) -> &'a MetricValue {
+        &evt.metrics
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("peer_status event is missing the `{name}` metric"))
+            .value
+    }
+
+    /// Issue 2174 backstop: `audio_enabled == false` must dominate a stale
+    /// `is_speaking == true`, independently of any caller remembering to clear
+    /// the field. A muted peer cannot be audibly speaking, and reporting
+    /// otherwise re-lights the tile glow after the decoder's terminal zero.
+    ///
+    /// Fails if the `&& self.audio_enabled` guard is dropped from
+    /// `peer_status_event`.
+    #[test]
+    fn peer_status_never_reports_speaking_while_audio_is_disabled() {
+        let (mut peer, _muted) = make_test_peer(2002);
+
+        // Stale speaking flag with audio off — the exact state a forced path
+        // that forgot to reset would leave behind.
+        peer.is_speaking = true;
+        peer.audio_enabled = false;
+
+        let evt = peer.peer_status_event();
+        assert!(
+            matches!(metric_value(&evt, "audio_enabled"), MetricValue::U64(0)),
+            "precondition: audio must be reported disabled"
+        );
+        assert!(
+            matches!(metric_value(&evt, "is_speaking"), MetricValue::U64(0)),
+            "is_speaking must be suppressed while audio_enabled is false"
+        );
+
+        // Control: with audio back on, a speaking peer still reports speaking,
+        // so the guard suppresses only the contradictory combination.
+        peer.audio_enabled = true;
+        assert!(
+            matches!(
+                metric_value(&peer.peer_status_event(), "is_speaking"),
+                MetricValue::U64(1)
+            ),
+            "an audio-enabled speaking peer must still report is_speaking: 1"
+        );
     }
 
     /// No permanent latch: after a host force-off, a later legitimate

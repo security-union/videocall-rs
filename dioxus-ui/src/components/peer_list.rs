@@ -25,7 +25,7 @@ use futures::future::{AbortHandle, Abortable};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
+use videocall_diagnostics::{recv_loop_action, subscribe, DiagEvent, MetricValue, RecvLoopAction};
 
 /// One row in the peer-list sidebar.
 ///
@@ -108,7 +108,18 @@ pub fn PeerList(
 
         let fut = async move {
             let mut rx = subscribe();
-            while let Ok(evt) = rx.recv().await {
+            loop {
+                // Issue 2174: a bare `while let Ok(..)` here died permanently on
+                // the first `Overflowed`, which is recoverable — see
+                // `videocall_diagnostics::recv_loop_action`. The roster's mic /
+                // camera / speaking dots then froze at their last value.
+                let evt = match rx.recv().await {
+                    Ok(evt) => evt,
+                    Err(e) => match recv_loop_action(&e) {
+                        RecvLoopAction::Continue => continue,
+                        RecvLoopAction::Break => break,
+                    },
+                };
                 handle_peer_list_diagnostics(
                     &evt,
                     &mut peer_audio_states,
@@ -432,16 +443,23 @@ pub fn PeerList(
                                     // session of the host's user_id renders with the host
                                     // indicator. Read from `is_host_uid`.
                                     let is_peer_host = is_host_uid(&user_id);
-                                    let muted = audio_states
-                                        .get(sid)
-                                        .copied()
-                                        .map(|enabled| !enabled)
-                                        .unwrap_or(true);
-                                    let video_disabled = video_states
-                                        .get(sid)
-                                        .copied()
-                                        .map(|enabled| !enabled)
-                                        .unwrap_or(true);
+                                    // Issue 2174 follow-up: an absent map entry
+                                    // means "no heartbeat yet", not "off" —
+                                    // resolve it from the client's live
+                                    // snapshot so a peer who joined, or a panel
+                                    // opened, less than one heartbeat ago does
+                                    // not render as muted with video off AND
+                                    // does not withhold the host's mute /
+                                    // disable-video controls, which are gated
+                                    // on these two flags below.
+                                    let muted = !resolve_roster_media_flag(
+                                        audio_states.get(sid).copied(),
+                                        || client_ctx.is_audio_enabled_for_peer(sid),
+                                    );
+                                    let video_disabled = !resolve_roster_media_flag(
+                                        video_states.get(sid).copied(),
+                                        || client_ctx.is_video_enabled_for_peer(sid),
+                                    );
                                     let speaking = speaking_states
                                         .get(sid)
                                         .copied()
@@ -630,6 +648,95 @@ where
         .collect()
 }
 
+/// Resolve a roster media flag (audio-on / video-on) for one peer: the
+/// diagnostics map wins whenever it holds an entry, otherwise fall back to the
+/// client's live snapshot.
+///
+/// Issue 2174 follow-up: these maps start empty and are only ever filled by
+/// `peer_status`, so defaulting an absent peer to "off" mis-rendered live
+/// participants for up to one 5 s keepalive after the panel was opened — and
+/// not only cosmetically. The host's per-row controls are gated on these same
+/// two flags (`on_mute` on `!muted`, `on_disable_video` on `!video_disabled`),
+/// so an unreported peer offered the host NO mute and NO disable-video button
+/// at all — precisely when a host is most likely to reach for them, in the
+/// first seconds after opening the roster. The snapshot reads the same
+/// `peer_decode_manager` fields the heartbeat is built from
+/// (`is_audio_enabled_for_peer` / `is_video_enabled_for_peer`), so the fallback
+/// cannot disagree with the event that later replaces it.
+///
+/// Both client calls themselves return `false` when the peer is absent from the
+/// decode manager or its `inner` is momentarily borrowed, so a genuinely
+/// unknown peer still degrades to the previous "off" rendering. The fallback
+/// upgrades the *known-live* case; it does not invent state.
+///
+/// The map still owns reactivity — it is the signal whose writes re-render the
+/// row. The snapshot only supplies a better value than "off" while the map has
+/// nothing to say, which is also why it is taken lazily: in the steady state
+/// every peer has an entry and the client is never consulted.
+fn resolve_roster_media_flag(known: Option<bool>, client_snapshot: impl FnOnce() -> bool) -> bool {
+    known.unwrap_or_else(client_snapshot)
+}
+
+/// Resolve a `peer_speaking` claim for the roster against the last known
+/// `audio_enabled` for that peer.
+///
+/// Issue 2174 follow-up: the roster's two speaking sources are asymmetric. The
+/// `is_speaking` flag on a `peer_status` heartbeat is already audio-gated at
+/// the producer (`self.is_speaking = metadata.is_speaking && resolved_audio` in
+/// `peer_decode_manager.rs`), but a `peer_speaking` event carries the decoder's
+/// raw VAD result with no `audio_enabled` field at all — nothing in the event
+/// says whether the peer is still allowed to be speaking.
+///
+/// This veto is defense-in-depth at the STATE layer; it is NOT what prevents a
+/// visible contradiction. `PeerListItem` builds both `mic_class` and
+/// `mic_style` under `speaking && !muted`, and `muted` derives from the same
+/// `peer_audio_states` map this fn consults, so a row whose glyph reads muted
+/// structurally cannot show a lit dot with or without the veto. What the veto
+/// buys is that `peer_speaking_states` itself stays honest: a stale `true` for
+/// a muted peer is what a future consumer — or any relaxation of that render
+/// guard — would trust, and nothing else would correct the entry until the next
+/// real VAD transition.
+///
+/// On today's code paths it never actually fires, which is worth stating rather
+/// than implying otherwise. The producer gate added alongside it suppresses the
+/// input: `VadState::observe` in `neteq_audio_decoder.rs` early-returns while
+/// `suppressed`, which `set_muted(true)` sets, so no `speaking: 1` is emitted
+/// after a mute at all. And unlike the tile, the roster has no optimistic local
+/// write that could run ahead of that gate — `peer_audio_states` moves only in
+/// the `peer_status` arm below — so `Some(false)` here always implies the local
+/// decoder is already suppressed. The veto is kept for the producer that does
+/// not carry that suppression.
+///
+/// Consequence for testing, which is a trap for the next author: the roster
+/// half is NOT e2e-observable. Because the render guard already couples the dot
+/// to `!muted`, every case emits identical DOM with and without the veto. The
+/// unit test below is therefore the only guard this rule can have, and must not
+/// be swapped for a Playwright spec.
+///
+/// `None` means the roster has not seen a `peer_status` for this peer yet, and
+/// must NOT veto. That state stays reachable here — [`resolve_roster_media_flag`]
+/// improves what the row *renders* for an unreported peer, it does not populate
+/// this map — so a genuinely unmuted peer speaking before their first heartbeat
+/// reaches this fn as `None`, passes through, and now really does light the dot
+/// because the row no longer resolves them as muted.
+///
+/// Note this is the same rule as `effective_level` at the FUNCTION level (only
+/// an explicit `Some(false)` vetoes) but the OPPOSITE default at the SYSTEM
+/// level, deliberately. The tile passes `Some(*audio_enabled.peek())` off a
+/// `Signal<bool>` that has no unknown state, so its unknown has already
+/// collapsed to `false` at the seed and fails CLOSED — it suppresses. The
+/// roster keeps a real tri-state and fails OPEN. Each is the conservative
+/// choice for its own consumer: the tile is guarding a full-tile glow it can
+/// re-light within one heartbeat, while the roster would otherwise blank the
+/// only speaking indicator the host has for a peer it simply has not heard
+/// about yet.
+fn resolve_roster_speaking(speaking: bool, audio_enabled: Option<bool>) -> bool {
+    if audio_enabled == Some(false) {
+        return false;
+    }
+    speaking
+}
+
 fn handle_peer_list_diagnostics(
     evt: &DiagEvent,
     peer_audio_states: &mut Signal<HashMap<String, bool>>,
@@ -682,22 +789,39 @@ fn handle_peer_list_diagnostics(
             }
         }
         "peer_speaking" => {
-            let mut to_peer: Option<String> = None;
+            // Borrow the peer id rather than allocating: `peer_speaking` is by
+            // far the highest-rate subsystem on this bus (the decoder VAD emits
+            // on every level change > 0.02 while anyone talks) and the vast
+            // majority of events end at the unchanged-state check below. Only
+            // the rare edge that actually writes the map needs an owned key.
+            let mut to_peer: Option<&str> = None;
             let mut speaking: Option<bool> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.as_ref()),
                     ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
                     _ => {}
                 }
             }
             if let (Some(peer), Some(speaking_val)) = (to_peer, speaking) {
+                // Issue 2174 follow-up: veto the raw VAD claim against the last
+                // known audio state, mirroring `effective_level` in
+                // `peer_tile.rs`. Without this a straggler from the decoder
+                // pipeline lights the roster's speaking dot on a row whose mic
+                // glyph already reads muted.
+                let audio_known = match peer_audio_states.try_peek() {
+                    Ok(map) => map.get(peer).copied(),
+                    Err(_) => return,
+                };
+                let speaking_val = resolve_roster_speaking(speaking_val, audio_known);
                 let current = match peer_speaking_states.try_peek() {
-                    Ok(map) => map.get(&peer).copied(),
+                    Ok(map) => map.get(peer).copied(),
                     Err(_) => return,
                 };
                 if current != Some(speaking_val) {
-                    peer_speaking_states.write().insert(peer, speaking_val);
+                    peer_speaking_states
+                        .write()
+                        .insert(peer.to_string(), speaking_val);
                 }
             }
         }
@@ -709,6 +833,82 @@ fn handle_peer_list_diagnostics(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Issue 2174 follow-up: a peer with no `peer_status` yet must render from
+    /// the client's live snapshot rather than defaulting to off, which is what
+    /// made a freshly-opened roster show live participants as muted with their
+    /// camera off for up to one 5 s heartbeat. Once diagnostics has reported
+    /// the peer the map wins — it is the fresher of the two from then on.
+    ///
+    /// Mutation sensitivity: dropping the fallback (`known.unwrap_or(false)`)
+    /// fails the unknown-but-live case; ignoring the map and always taking the
+    /// snapshot fails the two map-wins cases.
+    #[test]
+    fn an_unknown_roster_peer_falls_back_to_the_client_snapshot() {
+        assert!(
+            resolve_roster_media_flag(None, || true),
+            "an unreported peer that the client says is live must render as live"
+        );
+        assert!(
+            !resolve_roster_media_flag(None, || false),
+            "an unreported peer the client says is off stays off"
+        );
+        assert!(
+            resolve_roster_media_flag(Some(true), || false),
+            "a peer the map reports as on ignores a stale off snapshot"
+        );
+        assert!(
+            !resolve_roster_media_flag(Some(false), || true),
+            "a peer the map reports as off ignores a stale on snapshot"
+        );
+    }
+
+    /// Issue 2174 follow-up: a straggler `peer_speaking` from the decoder
+    /// pipeline must not leave `peer_speaking_states` latched at `true` for a
+    /// muted peer. `PeerListItem` gates the rendered dot on `speaking &&
+    /// !muted`, so this is map hygiene rather than a pixel guard — the stale
+    /// entry would otherwise survive until the next real VAD transition.
+    ///
+    /// Do NOT retire this in favour of an E2E spec: the render guard makes the
+    /// roster emit identical DOM with and without the veto, so this unit test
+    /// is the only guard the rule can have. See `resolve_roster_speaking`.
+    ///
+    /// Mutation sensitivity: dropping the `Some(false)` guard from
+    /// `resolve_roster_speaking` returns `true` for the first case and fails
+    /// this test.
+    #[test]
+    fn a_muted_peer_cannot_latch_the_roster_speaking_state() {
+        assert!(
+            !resolve_roster_speaking(true, Some(false)),
+            "a muted peer's speaking claim must be suppressed"
+        );
+        assert!(
+            !resolve_roster_speaking(false, Some(false)),
+            "a muted peer that is not speaking stays dark"
+        );
+    }
+
+    /// The veto must never suppress a legitimate speaker. `None` is "no
+    /// heartbeat seen yet", and thanks to the snapshot fallback in
+    /// `resolve_roster_media_flag` such a peer no longer renders as muted — so
+    /// a peer already talking when the panel opens really can light the dot,
+    /// and the veto must let the claim through.
+    ///
+    /// Mutation sensitivity: widening the guard to `!= Some(true)` (treating
+    /// unknown as muted) fails the `None` case.
+    #[test]
+    fn an_unmuted_or_unknown_peer_keeps_its_speaking_claim() {
+        assert!(
+            resolve_roster_speaking(true, Some(true)),
+            "an audio-enabled peer's speaking claim passes through"
+        );
+        assert!(
+            resolve_roster_speaking(true, None),
+            "an unknown audio state must not suppress a speaking claim"
+        );
+        assert!(!resolve_roster_speaking(false, Some(true)));
+        assert!(!resolve_roster_speaking(false, None));
+    }
 
     /// Escape in the search box clears a non-empty query first (staying open),
     /// and only bubbles to close the panel once the query is empty. A regression

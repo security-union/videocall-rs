@@ -139,7 +139,7 @@ program
   )
   .option(
     "--hardware-concurrency <N>",
-    "Spoof navigator.hardwareConcurrency to N inside each bot's browser (env: BOT_HW_CONCURRENCY; CLI flag wins). In a container Chrome reports the node's core count (e.g. 32) regardless of the pod's CPU limit, so the served videocall-client would sniff a 3-layer simulcast ceiling and over-commit encode CPU. Set N to the pod's CPU budget (e.g. 2 → 1 layer, 6-9 → 2 layers, 10+ → 3 layers) so each bot caps its encoded simulcast layers realistically (issue #2035). When unset (or <= 0) the browser's real value is used.",
+    "Spoof navigator.hardwareConcurrency to N inside each bot's browser (env: BOT_HW_CONCURRENCY; CLI flag wins). In a container Chrome reports the node's core count (e.g. 32) regardless of the pod's CPU limit, so the served videocall-client sniffs an unrealistic ceiling. Set N to model a real client's ladder depth (2 → 1 layer, 6-9 → 2 layers, 10+ → 3 layers). This caps what THIS bot PUBLISHES. It does not lower this bot's own decode cost — that is set by the ladders of the REMOTE publishers it receives. The decode saving in #2248 is therefore a fleet-wide effect: at >= 7 decoded tiles (below that both ladders pick the top rung and this is pure encode cost), when every bot publishes 3 rungs each receiver's #1256 tile-lid selection at index 1 lands on standard 480x360@15 instead of hd 640x480@30, and the receiver then advertises a preference so the relay forwards one rung instead of failing open. Raising this for ONE bot in a room of 2-rung publishers adds encode load and saves nothing. The fleet manifests set 10 (issues #2035, #2248). When unset (or <= 0) the browser's real value is used.",
   )
   .option(
     "--max-received-layer <N>",
@@ -314,7 +314,8 @@ program
 
     // Issue #2035 (increment 2): resolve the optional hardwareConcurrency spoof.
     // The CLI flag wins over the BOT_HW_CONCURRENCY env var (K8s pods set the
-    // env from the pod's CPU budget). Parsing/validation live in
+    // env to a modelled client's ladder depth, NOT the pod's CPU budget — see
+    // the flag help and #2248). Parsing/validation live in
     // resolveHardwareConcurrency (unit-tested): unset/empty or <= 0 => no spoof
     // (real cores); a strict positive integer => spoof; malformed => fail fast.
     const hwResult = resolveHardwareConcurrency(
@@ -948,7 +949,8 @@ program
     join(repoRoot(), "bot/conversation/manifest.yaml"),
   )
   .action(async (opts: DashboardCommandOptions) => {
-    const { startDashboardServer, resolveCtlConfig, spawnViteDev } = await import("./dashboard");
+    const { startDashboardServer, resolveCtlConfig, spawnViteDev, resolveCtlProxyIdleTimeout } =
+      await import("./dashboard");
     const port = Number.parseInt(opts.port, 10);
     if (!Number.isFinite(port) || port < 0 || port > 65535) {
       console.error(
@@ -1061,12 +1063,23 @@ program
       );
     }
 
+    // The resolver is fail-safe by design (anything unusable keeps the bound armed),
+    // but silence would leave an operator believing a typo'd override took effect.
+    const rawIdleTimeout = process.env.BOT_CTL_PROXY_IDLE_TIMEOUT_MS;
+    const idleTimeout = resolveCtlProxyIdleTimeout(rawIdleTimeout);
+    if (idleTimeout.ignored) {
+      console.warn(
+        `bots-app dashboard: ignoring BOT_CTL_PROXY_IDLE_TIMEOUT_MS="${rawIdleTimeout}" (must be a non-negative integer in ms); using ${idleTimeout.value}`,
+      );
+    }
+
     const handle = await startDashboardServer({
       port,
       ctl,
       distDir: builtMode ? distDir : undefined,
       assetsDir: opts.runDir,
       daemonMode,
+      ctlProxyIdleTimeoutMs: idleTimeout.value,
       onListen: ({ port: actual }) => {
         const url = `http://127.0.0.1:${actual}/`;
         if (builtMode) {

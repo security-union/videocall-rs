@@ -269,7 +269,7 @@ impl LayerAvailability {
     /// cadence so a momentary gap (a few dropped frames, a keyframe-only lull)
     /// does not retract a layer, but short enough that a genuinely-shed top
     /// layer is forgotten within a few seconds.
-    pub const DEFAULT_WINDOW_MS: u64 = 4000;
+    pub const DEFAULT_WINDOW_MS: u64 = videocall_aq::constants::LAYER_AVAILABILITY_WINDOW_MS;
 
     pub fn new() -> Self {
         Self::with_window(Self::DEFAULT_WINDOW_MS)
@@ -295,6 +295,15 @@ impl LayerAvailability {
         self.last_seen_ms
             .retain(|_, &mut seen| now_ms.saturating_sub(seen) <= window);
         self.last_seen_ms.keys().copied().max().unwrap_or(0)
+    }
+
+    /// Whether `layer_id` is within the availability window as of `now_ms`,
+    /// without pruning. Read-only so `&self` diagnostic paths can ask; the
+    /// pruning variant above stays the one selection uses.
+    pub fn layer_available_peek(&self, layer_id: u32, now_ms: u64) -> bool {
+        self.last_seen_ms
+            .get(&layer_id)
+            .is_some_and(|&seen| now_ms.saturating_sub(seen) <= self.window_ms)
     }
 }
 
@@ -1060,6 +1069,13 @@ pub const fn audio_layer_kbps_len() -> usize {
 /// per peer. Issue #2132 tracks the overlay correction that needs this.
 pub const fn base_audio_layer_kbps() -> u32 {
     AUDIO_LAYER_KBPS[0]
+}
+
+/// Nominal kbps of a SPECIFIC received-audio rung, or `None` if `layer` is off
+/// the ladder. This is what a per-peer readout needs (#2132); the base-only
+/// accessor above under-reports whenever the receiver selected rung 1 or 2.
+pub fn audio_layer_kbps(layer: u32) -> Option<u32> {
+    AUDIO_LAYER_KBPS.get(layer as usize).copied()
 }
 
 /// Receiver-side per-kind layer ceilings (issue #1082). Video and Screen are
@@ -2308,10 +2324,22 @@ mod tests {
         assert!(base.kbps < s.kbps, "base bitrate < top bitrate");
     }
 
+    /// The SCREEN receive ladder's top rung is 1440p since issue #2179 (it was
+    /// 1080p, which capped how sharp a simulcast receiver could ever get). The
+    /// middle rung is the 1080p `high` rung and the base is the 720p `low` rung,
+    /// so the ladder is spaced by RESOLUTION rather than repeating 720p twice.
+    ///
+    /// Mutation guard: reverting `simulcast_screen_layers(3)` to
+    /// `[low, medium, high]` makes rung 2 read 1920x1080 and rung 1 read
+    /// 1280x720, failing both asserts.
     #[test]
-    fn snapshot_screen_top_layer_is_1080p() {
-        let s = received_layer_snapshot(PrefMediaKind::Screen, 2, 3);
-        assert_eq!((s.width, s.height), (1920, 1080));
+    fn snapshot_screen_ladder_is_spaced_by_resolution() {
+        let base = received_layer_snapshot(PrefMediaKind::Screen, 0, 3);
+        let mid = received_layer_snapshot(PrefMediaKind::Screen, 1, 3);
+        let top = received_layer_snapshot(PrefMediaKind::Screen, 2, 3);
+        assert_eq!((base.width, base.height), (1280, 720));
+        assert_eq!((mid.width, mid.height), (1920, 1080));
+        assert_eq!((top.width, top.height), (2560, 1440));
     }
 
     #[test]

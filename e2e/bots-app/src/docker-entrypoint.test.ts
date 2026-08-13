@@ -1,5 +1,13 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,6 +138,35 @@ describe("docker-entrypoint.sh — ordinal identity resolution (#2035)", () => {
     expect(stdout).toContain("--participant k8s-bot-1");
     // Must NOT have re-derived a bot-<N> handle from the hostname.
     expect(stdout).not.toContain("--participant bot-9");
+  });
+
+  it("defaults the simulcast cap to 3 rungs, matching what the k8s manifests declare", () => {
+    // UNSET is the case the manifests rely on if the env is ever dropped, and it was
+    // unpinned: the default could drift from statefulset.yaml/bot-pod.yaml silently.
+    // 10 is the client's >=10 -> 3-layer threshold. Three rungs is deliberate — the cap
+    // governs BOTH directions, and a 2-rung [low, hd] ladder leaves the #1256 tile lid
+    // no middle rung, so a healthy mid-size grid decodes hd per peer (#2248).
+    const { status, stdout } = runEntrypoint({
+      BOT_IDENTITY_MODE: "ordinal",
+      BOT_AUTH: "form-login",
+      HOSTNAME: "videocall-bots-0",
+      ...ORDINAL_ACCOUNTS,
+    });
+    expect(status).toBe(0);
+    // Parsed, not substring-matched, so a drift to 100 cannot pass.
+    const args = /^STUB_ARGS=(.*)$/m.exec(stdout)?.[1].split(/\s+/) ?? [];
+    const flagIdx = args.indexOf("--hardware-concurrency");
+    expect(flagIdx, "the entrypoint must pass the flag").toBeGreaterThan(-1);
+    expect(args[flagIdx + 1]).toBe("10");
+
+    // And the manifests must agree with that default, or a pod gets a different
+    // ladder depth than a bare container and the fleet measurement is not reproducible.
+    for (const manifest of ["k8s/statefulset.yaml", "k8s/bot-pod.yaml"]) {
+      const yaml = readFileSync(fileURLToPath(new URL(`../${manifest}`, import.meta.url)), "utf8");
+      const declared = /name:\s*BOT_HW_CONCURRENCY\s*\n\s*value:\s*"(\d+)"/.exec(yaml);
+      expect(declared, `${manifest} must declare BOT_HW_CONCURRENCY`).not.toBeNull();
+      expect(declared![1], `${manifest} must match the entrypoint default`).toBe("10");
+    }
   });
 
   it("passes --hardware-concurrency through when BOT_HW_CONCURRENCY is set, omits it when empty", () => {

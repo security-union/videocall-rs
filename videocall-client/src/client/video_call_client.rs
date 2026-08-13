@@ -1138,10 +1138,22 @@ fn freshness_skip_within_switch_window(now_ms: u64, last_switch_ms: u64) -> bool
 /// the skip's own timestamp is the cleanest correlation point.
 #[cfg(target_arch = "wasm32")]
 fn spawn_layer_switch_freshness_observer(inner: &Rc<RefCell<Inner>>) {
+    use videocall_diagnostics::{recv_loop_action, RecvLoopAction};
+
     let inner_weak = Rc::downgrade(inner);
     wasm_bindgen_futures::spawn_local(async move {
         let mut receiver = subscribe_global_diagnostics();
-        while let Ok(event) = receiver.recv().await {
+        loop {
+            // Issue 2174: a bare `while let Ok(..)` here died permanently on the
+            // first `Overflowed`, which is recoverable — see
+            // `videocall_diagnostics::recv_loop_action`.
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(e) => match recv_loop_action(&e) {
+                    RecvLoopAction::Continue => continue,
+                    RecvLoopAction::Break => break,
+                },
+            };
             if event.subsystem != "video" {
                 continue;
             }
@@ -2795,6 +2807,34 @@ impl VideoCallClient {
         false
     }
 
+    /// Is this client currently DECODING the peer's video/screen? (issue #2190)
+    ///
+    /// Reads `Peer::visible`, the exact flag `set_active_decode_set` writes and that
+    /// `should_decode_visible_peer` gates decode on — so this is decode-set membership, not
+    /// a render-mode guess. `false` for a peer the decode budget has parked, in which case
+    /// `Peer::decode` returns `SKIPPED` for both VIDEO and SCREEN and (since #2190) no frame
+    /// is counted, so the receive-side fps for that peer legitimately reads 0.
+    ///
+    /// The UI needs this to avoid scoring an unmeasured stream: a signal meter that averaged
+    /// in a 0 for a peer WE chose not to decode badged a healthy participant as
+    /// "connection lost". The render-mode flag (`force_avatar`) is NOT a substitute — the
+    /// active screen sharer is force-inserted into the decode set regardless of its ranking
+    /// bucket, so a ranked-out sharer renders as an avatar tile while genuinely decoding.
+    ///
+    /// Unknown peer (not yet in the manager) reads `false`: nothing is being decoded for it.
+    pub fn is_decoding_peer(&self, key: &str) -> bool {
+        let sid: u64 = match key.parse() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(&sid) {
+                return peer.visible;
+            }
+        }
+        false
+    }
+
     pub fn is_screen_share_enabled_for_peer(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
@@ -2828,6 +2868,26 @@ impl VideoCallClient {
         false
     }
 
+    /// The peer's last known audio level.
+    ///
+    /// **Always returns `0.0` in production.** It reads `Peer::audio_level`,
+    /// whose only three non-test writes all assign `0.0` (`Peer::new`, the
+    /// heartbeat arm of `Peer::decode`, and `Peer::force_media_off`); the
+    /// decoder's measured intensity lives in `VadState` and is broadcast on the
+    /// `peer_speaking` diagnostics event instead, never copied back here.
+    ///
+    /// Issue 2224 removed this crate's last caller — `dioxus-ui`'s `PeerTile`
+    /// seeded its glow signals from it, which could only ever write a zero and
+    /// did so ungated. Subscribe to `peer_speaking` for a real level.
+    ///
+    /// Retained rather than deleted because `videocall-client` is a published
+    /// library and this is public API; removing it is a semver-major change
+    /// that wants its own version bump. The attribute is what stops it being
+    /// silently dead: internal callers are gone, so it warns nobody here, but
+    /// any external consumer gets told at compile time.
+    #[deprecated(
+        note = "always returns 0.0 — `Peer::audio_level` has no non-zero producer;                 subscribe to the `peer_speaking` diagnostics event for a measured level"
+    )]
     pub fn audio_level_for_peer(&self, key: &str) -> f32 {
         if let Ok(inner) = self.inner.try_borrow() {
             return inner.peer_decode_manager.peer_audio_level(key);
@@ -3314,6 +3374,7 @@ impl VideoCallClient {
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
+        camera_layer_metrics: crate::encode::CameraLayerMetricSource,
         // #1561: screen + audio layer metrics
         effective_screen_layers: u32,
         active_screen_layers: Rc<AtomicU32>,
@@ -3337,6 +3398,7 @@ impl VideoCallClient {
                         dwell_samples,
                         effective_video_layers,
                         active_video_layers,
+                        camera_layer_metrics,
                         effective_screen_layers,
                         active_screen_layers,
                         effective_audio_layers,

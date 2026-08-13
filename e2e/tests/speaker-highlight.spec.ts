@@ -1,6 +1,7 @@
 import path from "node:path";
 import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { continuousToneWavPath } from "../helpers/audio-fixtures";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
@@ -22,7 +23,6 @@ import { waitForServices } from "../helpers/wait-for-services";
  * checks plus Rust-level unit coverage.
  */
 
-const DEFAULT_TILE_BORDER_COLOR = "rgba(100, 100, 100, 0.30)";
 const SPEAKING_AUDIO_FIXTURE = path.resolve(__dirname, "../../dioxus-ui/assets/hi.wav");
 
 function browserArgs(fakeAudioFile?: string) {
@@ -269,6 +269,129 @@ async function waitForTileToSpeak(page: Page) {
   return peerTile;
 }
 
+/** One rendered state of the tracked tile's glow-bearing attributes. */
+interface GlowSample {
+  style: string;
+  cls: string;
+  missing: boolean;
+}
+
+/**
+ * True when a tile's inline style is `speak_style`'s SILENT output (the glow is
+ * off), false when it is either of the glowing outputs.
+ *
+ * Keyed on the transition DIRECTION rather than a colour literal, because
+ * neither alone is reliable:
+ *  - `speak_style`'s silent branches emit the tile's default border colour,
+ *    which is themed and whose rendered text has already drifted (this spec
+ *    used to hard-code `rgba(100, 100, 100, 0.30)`, which current builds never
+ *    emit — an assertion on it could only ever time out).
+ *  - `box-shadow: none` is emitted by a GLOWING tile too when
+ *    `inner_glow_strength` is 0, so the shadow alone cannot mean "silent".
+ * Both silent branches fade with `ease-out` and both glowing branches fade in
+ * with `ease-in`, in every version of `canvas_generator.rs` that has shipped —
+ * so the pair below identifies the silent state exactly.
+ */
+function isSilentGlowStyle(style: string): boolean {
+  return style.includes("box-shadow: none") && style.includes("ease-out");
+}
+
+/**
+ * Start recording every rendered state of the tile with id `tileId`.
+ *
+ * Two capture paths run together, because the failure they guard has two
+ * possible shapes.
+ *
+ * The MutationObserver catches a glow that drops and is restored between polls.
+ * It records each mutation's `oldValue` rather than re-reading the element,
+ * which matters: observer callbacks are batched to a microtask, so if the glow
+ * were switched off and back on within one batch, re-reading the DOM would see
+ * only the restored value and miss the drop entirely. The recorded `oldValue`
+ * chain preserves every intermediate style the tile ever held. It watches the
+ * CONTAINER subtree rather than the tile node, so it keeps reporting if Dioxus
+ * re-creates the tile element.
+ *
+ * The interval re-queries the id from scratch each tick, so it keeps reporting
+ * even if the tile is rebuilt outside the observed subtree, and it records the
+ * "tile is missing" case that would otherwise make a clean result meaningless.
+ *
+ * THROWS if `#grid-container` is absent. The two paths are not interchangeable
+ * — falling back to interval-only sampling would still collect enough samples
+ * to satisfy every non-vacuity check in the test while quietly losing the
+ * sub-poll capture, so the degraded mode must be an error, not a default.
+ */
+async function startGlowRecorder(page: Page, tileId: string): Promise<void> {
+  await page.evaluate((id) => {
+    const w = window as unknown as {
+      __glowSamples?: GlowSample[];
+      __glowStop?: () => void;
+    };
+    const samples: GlowSample[] = [];
+    w.__glowSamples = samples;
+
+    const sample = () => {
+      const el = document.getElementById(id);
+      samples.push({
+        style: el?.getAttribute("style") || "",
+        cls: el?.getAttribute("class") || "",
+        missing: el === null,
+      });
+    };
+
+    sample();
+
+    const container = document.getElementById("grid-container");
+    if (!container) {
+      // Fail loudly rather than degrading to interval-only sampling: without
+      // the observer a glow drop shorter than the poll interval goes
+      // unrecorded, and the test would still collect enough samples to look
+      // healthy while having lost the capture it exists to perform.
+      throw new Error(
+        "#grid-container not found — cannot install the glow MutationObserver, so sub-poll " +
+          "glow drops would go unrecorded and a pass would be meaningless",
+      );
+    }
+
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        if (record.attributeName === "style" && (record.target as Element).id === id) {
+          samples.push({
+            style: record.oldValue || "",
+            cls: "",
+            missing: false,
+          });
+        }
+      }
+      sample();
+    });
+    observer.observe(container, {
+      subtree: true,
+      attributes: true,
+      attributeOldValue: true,
+      attributeFilter: ["style", "class"],
+    });
+
+    const timer = window.setInterval(sample, 50);
+
+    w.__glowStop = () => {
+      observer.disconnect();
+      window.clearInterval(timer);
+    };
+  }, tileId);
+}
+
+/** Stop the recorder started by {@link startGlowRecorder} and drain its samples. */
+async function stopGlowRecorder(page: Page): Promise<GlowSample[]> {
+  return page.evaluate(() => {
+    const w = window as unknown as {
+      __glowSamples?: GlowSample[];
+      __glowStop?: () => void;
+    };
+    w.__glowStop?.();
+    return w.__glowSamples ?? [];
+  });
+}
+
 test.describe("Speaker highlight glow on video tiles", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -335,11 +458,15 @@ test.describe("Speaker highlight glow on video tiles", () => {
 
       await muteMicrophone(guestPage);
 
+      // Asserted via `isSilentGlowStyle` rather than a border-colour literal:
+      // the tile's default border colour is themed and its rendered text has
+      // already drifted from the literal this spec used to hard-code, which
+      // left this assertion unsatisfiable on current builds.
       await expect
         .poll(
           async () => ({
             className: (await peerTile.getAttribute("class")) || "",
-            style: (await peerTile.getAttribute("style")) || "",
+            silent: isSilentGlowStyle((await peerTile.getAttribute("style")) || ""),
           }),
           {
             timeout: 30_000,
@@ -348,11 +475,147 @@ test.describe("Speaker highlight glow on video tiles", () => {
         )
         .toMatchObject({
           className: expect.not.stringContaining("speaking-tile"),
-          style: expect.stringContaining(`border-color: ${DEFAULT_TILE_BORDER_COLOR}`),
+          silent: true,
         });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
 
-      const clearedStyle = (await peerTile.getAttribute("style")) || "";
-      expect(clearedStyle).toContain("box-shadow: none");
+  // ──────────────────────────────────────────────────────────────────────
+  // 1b. The glow SURVIVES a heartbeat while the peer is STILL talking —
+  //     regression for issue 2174.
+  //
+  // Bug: `resolve_audio_level` (peer_tile.rs) used to prefer the float
+  // `audio_level` metric and fall back to the `is_speaking` boolean only when
+  // the float was absent. On the heartbeat path the float is NEVER absent —
+  // `broadcast_peer_status` (peer_decode_manager.rs) always emits it, and the
+  // `Peer::audio_level` field behind it is only ever assigned 0.0 (initialised
+  // to 0.0, reset to 0.0 on a not-speaking heartbeat, never written non-zero in
+  // production). So every heartbeat for a TALKING peer resolved to Some(0.0)
+  // and drove the tile's glow to zero, discarding the genuinely fresh
+  // `is_speaking = true` the sender had just put in the packet. The fix makes
+  // the boolean authoritative and the float a refinement.
+  //
+  // WHY THE TONE FIXTURE: the speech clip the tests above use is intermittent,
+  // so a dropped glow cannot be distinguished from a natural pause between
+  // words. `continuousToneWavPath()` renders audio that never falls silent —
+  // its RMS stays between 0.060 and 0.42, three times clear of the 0.02 VAD
+  // threshold at its quietest — so the peer counts as speaking for the whole
+  // run and any moment the tile is NOT glowing is unambiguously the bug.
+  //
+  // WHY THE AMPLITUDE MOVES: a constant loud tone would pin the decoder's
+  // reported intensity at a saturated 1.0, and its VAD is edge-triggered
+  // (`handle_pcm_data` re-broadcasts only when the speaking boolean flips or
+  // the level moves past AUDIO_LEVEL_DELTA_THRESHOLD = 0.02). The fast path
+  // would emit once and then go quiet for the rest of the run — which the
+  // resolver cannot distinguish from a dead peer, and its no-events deadline
+  // (12.5s) would put the glow out on CORRECT code, failing this spec for a
+  // reason unrelated to the bug. The fixture sweeps its amplitude through the
+  // sub-saturation band every 2s so genuine level updates keep arriving.
+  //
+  // WHAT THE FAILURE LOOKS LIKE: on the un-fixed code each heartbeat writes the
+  // silent style, and the glow stays out until the next fast-path update
+  // re-lights it — a gap of up to about a second, repeated every heartbeat. The
+  // recorder captures each mutation's `oldValue`, so even a gap shorter than
+  // the sampling interval is recorded rather than sampled over.
+  //
+  // NON-VACUITY: a "the glow never dropped" pass would be worthless if no
+  // heartbeat actually reached the host during the window. The guest toggles
+  // their camera, which fires `Connection::set_speaking`'s sibling
+  // `send_immediate_heartbeat`, and the test waits for the host tile to render
+  // a <canvas> — proof that the host PROCESSED a heartbeat carrying the new
+  // media state. The window then runs on past two more 5s keepalives.
+  //
+  // Mutation sensitivity: reverting `resolve_audio_level` to the float-first
+  // rule makes that forced heartbeat resolve to Some(0.0) and the tile falls
+  // back to `speak_style`'s silent branch. VERIFIED against an un-fixed build.
+  //
+  // Deliberately asserts only glow PRESENCE (not the silent style), never a
+  // brightness or box-shadow magnitude: a heartbeat-sourced level and a
+  // fast-path level legitimately differ, so pinning a specific intensity would
+  // make this spec fail on a resolver tuning change that is not a regression.
+  // ──────────────────────────────────────────────────────────────────────
+  test("remote peer glow stays lit across a heartbeat while they keep speaking", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_glow_heartbeat_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "HbGlowHost",
+      "HbGlowGuest",
+      {
+        guestFakeAudioFile: continuousToneWavPath(),
+      },
+    );
+
+    try {
+      await ensureMicrophoneEnabled(guestPage);
+
+      // Presence before measurement: the tile must be glowing before we can
+      // assert anything about the glow being held.
+      const peerTile = await waitForTileToSpeak(hostPage);
+      const tileId = await peerTile.getAttribute("id");
+      expect(tileId, "the guest tile needs a stable id to track across renders").toBeTruthy();
+
+      // Baseline: with the tone running the glow must be settled, not a
+      // transient that `waitForTileToSpeak` happened to catch on its way out.
+      await expect
+        .poll(async () => isSilentGlowStyle((await peerTile.getAttribute("style")) || ""), {
+          timeout: 20_000,
+          message: "expected a settled glow on the tile before recording",
+        })
+        .toBe(false);
+
+      await startGlowRecorder(hostPage, tileId as string);
+
+      // Force an immediate heartbeat from the guest (a media-state transition
+      // sends one straight away rather than waiting for the 5s keepalive).
+      await guestPage.locator('[data-testid="camera-toggle-button"]').click();
+
+      // Liveness receipt: the host renders the guest's video only after
+      // processing a heartbeat carrying video_enabled = true. Without this the
+      // assertion below could pass simply because no heartbeat ever arrived.
+      await expect
+        .poll(async () => hostPage.locator(`#${tileId} canvas`).count(), {
+          timeout: 60_000,
+          message:
+            "expected the host to render the guest's camera — proof a heartbeat was processed",
+        })
+        .toBeGreaterThan(0);
+
+      // Keep watching across at least two more keepalive heartbeats.
+      await hostPage.waitForTimeout(13_000);
+
+      const samples = await stopGlowRecorder(hostPage);
+
+      // Non-vacuity: the recorder must actually have observed a live tile.
+      expect(samples.length).toBeGreaterThan(50);
+      expect(
+        samples.filter((s) => s.missing).length,
+        "the tracked tile disappeared mid-window — the recording is not meaningful",
+      ).toBe(0);
+      // ...and it must have seen the glow at least once, or "never silent"
+      // would be trivially true for a tile that rendered nothing at all.
+      expect(
+        samples.filter((s) => !isSilentGlowStyle(s.style)).length,
+        "no glowing sample was recorded at all",
+      ).toBeGreaterThan(0);
+
+      // The regression assertion: while the peer talks without pause, no
+      // rendered frame may show the tile in the silent style.
+      const unglowed = samples.filter((s) => isSilentGlowStyle(s.style));
+      expect(
+        unglowed.length,
+        `tile glow dropped in ${unglowed.length}/${samples.length} samples while the peer was ` +
+          `continuously speaking (issue 2174: a heartbeat zeroed the level despite is_speaking=true).` +
+          ` First silent sample: ${unglowed[0]?.style ?? "n/a"}`,
+      ).toBe(0);
     } finally {
       await browser1.close();
       await browser2.close();
@@ -610,7 +873,7 @@ test.describe("Speaker highlight glow on video tiles", () => {
       const hostParticipantTile = await waitForTileToSpeak(guestPage);
       const highlightedStyle = (await hostParticipantTile.getAttribute("style")) || "";
 
-      expect(highlightedStyle).not.toContain(`border-color: ${DEFAULT_TILE_BORDER_COLOR}`);
+      expect(isSilentGlowStyle(highlightedStyle)).toBe(false);
     } finally {
       await browser1.close();
       await browser2.close();

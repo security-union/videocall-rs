@@ -82,8 +82,8 @@ runtimeConfig:
   # native capture dims driven by VIDEO_QUALITY_TIERS and is completely unaffected.
   # That includes devices below MIN_CORES_FOR_MULTILAYER (6 cores), which the
   # capability sniff clamps to 1 layer -- i.e. some of the weak devices the CPU
-  # rationale cites. (Not an issue for the #2143 bot fleet: BOT_HW_CONCURRENCY=6
-  # yields 2 layers.)
+  # rationale cites. (Not an issue for the bot fleet: BOT_HW_CONCURRENCY=10
+  # yields 3 layers -- see e2e/bots-app/k8s/statefulset.yaml.)
   #
   # RECEIVER-SIDE WIN (the number that matters for weak clients): a peer decoding the
   # TOP rung gets 960x540 instead of 1280x720 = 0.5625x the pixels, i.e. ~43.8% less

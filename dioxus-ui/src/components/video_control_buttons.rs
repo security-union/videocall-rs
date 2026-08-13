@@ -983,6 +983,83 @@ pub fn js_state_to_record_button_state(s: &str) -> RecordButtonState {
 mod tests {
     use super::*;
 
+    // ── is_busy ────────────────────────────────────────────────────────────
+    // `is_busy()` governs whether the RecordButton is disabled mid-transition —
+    // locking it in prevents regressions where a state is accidentally excluded
+    // from the busy set and lets the user double-click while a transition is in
+    // flight.
+    //
+    // These were `#[wasm_bindgen_test]`s in `dioxus-ui/tests/record_button_state.rs`,
+    // which was compiled by `cargo test --no-run` but named in NO workflow, so it had
+    // never executed (found while adding the run step for issue 2170's own wasm test).
+    // Rather than spend a Chrome launch + a 3-attempt flake budget on pure enum logic,
+    // they run natively here via `cargo test -p videocall-ui --lib`, which already gates
+    // every PR. Nothing here touches the DOM, so the browser bought no fidelity.
+
+    #[test]
+    fn is_busy_false_for_idle() {
+        assert!(
+            !RecordButtonState::Idle.is_busy(),
+            "Idle is not a transition state — button must be enabled"
+        );
+    }
+
+    #[test]
+    fn is_busy_false_for_recording() {
+        assert!(
+            !RecordButtonState::Recording.is_busy(),
+            "Recording is stable — button must be enabled so the user can stop"
+        );
+    }
+
+    #[test]
+    fn is_busy_true_for_activating() {
+        assert!(
+            RecordButtonState::Activating.is_busy(),
+            "Activating is a transition — button must be disabled"
+        );
+    }
+
+    #[test]
+    fn is_busy_true_for_stopping() {
+        assert!(
+            RecordButtonState::Stopping.is_busy(),
+            "Stopping is a transition — button must be disabled"
+        );
+    }
+
+    #[test]
+    fn is_busy_true_for_saving() {
+        assert!(
+            RecordButtonState::Saving.is_busy(),
+            "Saving is a transition — button must be disabled"
+        );
+    }
+
+    // ── PartialEq / Clone sanity ───────────────────────────────────────────
+
+    #[test]
+    fn clone_and_eq_roundtrip() {
+        for state in [
+            RecordButtonState::Idle,
+            RecordButtonState::Activating,
+            RecordButtonState::Recording,
+            RecordButtonState::Stopping,
+            RecordButtonState::Saving,
+        ] {
+            assert_eq!(state.clone(), state, "{state:?} must equal its own clone");
+        }
+    }
+
+    #[test]
+    fn idle_ne_recording() {
+        assert_ne!(
+            RecordButtonState::Idle,
+            RecordButtonState::Recording,
+            "Idle and Recording must be distinct variants"
+        );
+    }
+
     // ── js_state_to_record_button_state ────────────────────────────────────
     // Each arm of the JS→Rust mapping must round-trip correctly.
     // These tests FAIL if any arm is removed or mistyped — a rename in

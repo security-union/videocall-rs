@@ -46,5 +46,27 @@ if (window.__APP_CONFIG) {
     // Hide git commit/branch in the About modal + diagnostics build info
     // (production behavior). Omit or set "false" to hide; "true" shows them.
     // showBuildGitInfo: "false",
+
+    // Smatter chat integration local setup:
+    // keep these meet.localhost/id.localhost values out of config.js so the
+    // committed default remains generic for normal local dev and CI. Enable
+    // them only in your gitignored config.local.js when running the same-origin
+    // Caddy edge described in docs/Smatter-Integrate-Testing.md.
+    // apiBaseUrl: "https://meet.localhost",
+    // wsUrl: "wss://meet.localhost",
+    // oauthEnabled: "true",
+    // webTransportEnabled: "false",
+    // oauthProvider: "google",
+    // oauthAuthUrl: "https://id.localhost/oauth/authorize",
+    // oauthClientId: "<your-videocall-client-id>",
+    // oauthRedirectUrl: "https://meet.localhost/auth/callback",
+    // oauthIssuer: "https://id.localhost",
+    // oauthFlow: "pkce",
+
+    // Base URL prefix for the JMAP chat endpoints (/jmap, /sse/session, /sse).
+    // Leave empty (the default) for same-origin via the Caddy edge — required
+    // for the first-party SameSite=Lax SSE cookie. Set to an absolute origin
+    // only when chat is served from a different origin.
+    // jmapBaseUrl: "",
   });
 }

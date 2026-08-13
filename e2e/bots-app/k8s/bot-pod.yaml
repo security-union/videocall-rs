@@ -69,11 +69,13 @@ spec:
         - name: BOT_AUTH
           value: "form-login"
         # Per-pod simulcast-layer cap, declared explicitly (the entrypoint would
-        # default this to 6 -> 2 layers anyway; stating it here makes the cap
+        # default this to 10 -> 3 layers anyway; stating it here makes the cap
         # visible at the manifest rather than implied). Set "" to advertise the
-        # node's real core count instead.
+        # node's real core count instead. Kept equal to the fleet value so a pod sharing
+        # a room with the fleet publishes the same ladder; the decode saving is
+        # COLLECTIVE and does not apply to a pod running alone (#2248).
         - name: BOT_HW_CONCURRENCY
-          value: "6"
+          value: "10"
         - name: BOT_EMAIL
           valueFrom:
             secretKeyRef:

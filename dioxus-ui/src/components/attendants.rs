@@ -2626,6 +2626,12 @@ pub fn AttendantsComponent(
     /// the owner opens it up in the meeting-options controls.
     #[props(default = false)]
     recording_allowed_for_all: bool,
+    /// Whether every admitted participant may SEND chat messages. Defaults to
+    /// `true` so normal meetings keep chat open for everyone; a host turns it
+    /// off for an all-hands-style meeting so only hosts can post, and can flip
+    /// it back on live (e.g. to open the floor for end-of-meeting questions).
+    #[props(default = true)]
+    chat_allowed_for_all: bool,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -2641,6 +2647,11 @@ pub fn AttendantsComponent(
     // overflow-menu placement stale until an unrelated effect dependency (e.g.
     // a resize) happened to re-trigger this effect.
     let mut recording_allowed_for_all_toggle = use_signal(move || recording_allowed_for_all);
+    // Live mirror of the `chat_allowed_for_all` prop. Seeded from the prop's
+    // initial snapshot and updated in place when a host toggles chat mid-meeting
+    // (via the `on_meeting_settings_updated` push below), so the chat send gate
+    // reflects the CURRENT value, not the value frozen at mount.
+    let mut chat_allowed_for_all_toggle = use_signal(move || chat_allowed_for_all);
     let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
     let screen_share_toast_state: Signal<Option<ScreenShareToastState>> = use_signal(|| None);
     let screen_share_toast_timer: Signal<Option<Timeout>> = use_signal(|| None);
@@ -4434,6 +4445,10 @@ pub fn AttendantsComponent(
                                 recording_allowed_for_all_toggle
                                     .set(status.recording_allowed_for_all);
                             }
+
+                            if chat_allowed_for_all_toggle() != status.chat_allowed_for_all {
+                                chat_allowed_for_all_toggle.set(status.chat_allowed_for_all);
+                            }
                         }
                         Err(e) => {
                             log::warn!("Failed to refresh meeting settings after push update: {e}");
@@ -6164,8 +6179,22 @@ pub fn AttendantsComponent(
     use_effect(move || {
         let bump_pending = bump_pending_for_effect.clone();
         let task = spawn(async move {
+            use videocall_diagnostics::{recv_loop_action, RecvLoopAction};
+
             let mut rx = videocall_diagnostics::subscribe();
-            while let Ok(evt) = rx.recv().await {
+            loop {
+                // Issue 2174: a bare `while let Ok(..)` here died permanently on
+                // the first `Overflowed`, which is recoverable — see
+                // `videocall_diagnostics::recv_loop_action`. This is the SHARED
+                // subscriber behind every tile's media state, so its death froze
+                // the whole grid (speaking glow included) at its last value.
+                let evt = match rx.recv().await {
+                    Ok(evt) => evt,
+                    Err(e) => match recv_loop_action(&e) {
+                        RecvLoopAction::Continue => continue,
+                        RecvLoopAction::Break => break,
+                    },
+                };
                 if evt.subsystem == "peer_speaking" {
                     // Track speech activity for priority sorting.
                     // Only update the map (and trigger a re-sort) when the
@@ -6315,7 +6344,9 @@ pub fn AttendantsComponent(
     // A single lifecycle-scoped async task subscribes to the videocall
     // diagnostics bus and drives the decode-budget actuator. It is modelled on
     // the shared `peer_status` subscriber above: `subscribe()` inside a
-    // `spawn`, then `while let Ok(evt) = rx.recv().await`.
+    // `spawn`, then a `loop` whose `recv()` errors are routed through
+    // `videocall_diagnostics::recv_loop_action` (issue 2174: overflow is
+    // recoverable and must not end the subscription).
     //
     // It consumes exactly two `client_perf` metrics (see
     // `videocall-client/src/{render_fps,long_tasks}.rs`):
@@ -6365,7 +6396,7 @@ pub fn AttendantsComponent(
                 ProtectiveTransition, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
             };
             use crate::context::ProtectiveModeReport;
-            use videocall_diagnostics::{now_ms, MetricValue};
+            use videocall_diagnostics::{now_ms, recv_loop_action, MetricValue, RecvLoopAction};
 
             /// Rolling window length (~5 s at 1 Hz). Must be >= SUSTAIN_SAMPLES so
             /// `decide_step` always has a full sustain window once warmed up.
@@ -6452,7 +6483,19 @@ pub fn AttendantsComponent(
             // peers already present does not spuriously fire on the first tick.
             let mut prev_natural = *decode_budget_natural.peek();
 
-            while let Ok(evt) = rx.recv().await {
+            loop {
+                // Issue 2174: a bare `while let Ok(..)` here died permanently on
+                // the first `Overflowed`, which is recoverable — see
+                // `videocall_diagnostics::recv_loop_action`. Losing this loop
+                // strands the decode budget (and protective mode) at whatever cap
+                // was latched when the overflow hit.
+                let evt = match rx.recv().await {
+                    Ok(evt) => evt,
+                    Err(e) => match recv_loop_action(&e) {
+                        RecvLoopAction::Continue => continue,
+                        RecvLoopAction::Break => break,
+                    },
+                };
                 // Issue #1558: the protective-mode predicate needs a per-peer
                 // audio-buffer signal. The NetEQ audio decoder broadcasts
                 // `audio_buffer_ms` on the SAME diagnostics bus, under subsystem
@@ -7636,6 +7679,16 @@ pub fn AttendantsComponent(
     // production.
     use_hook(
         crate::components::screen_first_render_inject::register_screen_first_render_inject_hooks,
+    );
+
+    // Register `window.__videocall_inject_server_rtt` so an E2E spec can drive
+    // the connection-quality indicator's tri-state hysteresis (#367). The RTT it
+    // keys off is an application-level probe round-trip through the media
+    // transport, which no browser-level network emulation can shape — see the
+    // module docs for the rejected alternatives. Also gated on
+    // `MOCK_PEERS_ENABLED`, so a no-op in production.
+    use_hook(
+        crate::components::connection_quality_inject::register_connection_quality_inject_hooks,
     );
 
     // Host self-view speaking glow — update DOM directly to avoid re-rendering
@@ -9144,6 +9197,7 @@ pub fn AttendantsComponent(
                             end_on_host_leave_toggle,
                             allow_guests_toggle,
                             recording_allowed_for_all_toggle,
+                            chat_allowed_for_all_toggle,
                             saving,
                             toggle_error,
                             connection_error,
@@ -12938,6 +12992,7 @@ pub fn AttendantsComponent(
                                 end_on_host_leave_toggle,
                                 allow_guests_toggle,
                                 recording_allowed_for_all_toggle,
+                                chat_allowed_for_all_toggle,
                                 saving,
                                 toggle_error,
                             }
@@ -13296,10 +13351,12 @@ pub fn AttendantsComponent(
                 // the roving highlight across the 11 fixed reaction buttons ONLY;
                 // Enter/Space is native <button> activation; Tab is NOT
                 // intercepted, so it flows highlighted-option -> recents -> reset
-                // (issue 2086) -> More emoji -> X -> (picker grid, when open) -> out
+                // (issue 2086) -> More emoji -> (picker grid, when open) -> X -> out
                 // of the toolbar (the roving is keyed on ReactionType, so the
                 // recents/reset/More/X sit outside it; the accepted fallback is to
-                // let Tab reach them).
+                // let Tab reach them). X moved AFTER the picker in issue 2173, when
+                // it became a sibling of the scroll wrapper rather than an inline
+                // child; with the picker closed the order is unchanged.
                 // Escape bubbles to #main-container's popover-tier chain. NOT gated
                 // on `has_screen_share`: reacting must work while someone presents.
                 if reactions_open() {
@@ -13347,157 +13404,196 @@ pub fn AttendantsComponent(
                             }
                             // No Tab branch (UX B2): a toolbar does not trap Tab.
                             // Letting it through moves focus highlighted-option ->
-                            // recents -> reset -> More emoji -> X -> out, which is
-                            // how those non-roving controls become keyboard
-                            // reachable. Escape still closes (via #main-container).
+                            // recents -> reset -> More emoji -> (picker grid, when
+                            // open) -> X -> out, which is how those non-roving
+                            // controls become keyboard reachable. X moved AFTER the
+                            // picker in issue 2173, when it became a sibling of the
+                            // scroll wrapper; with the picker closed the order is
+                            // unchanged. Escape still closes (via #main-container).
                         },
-                        for reaction in REACTIONS {
-                            {
-                                match reaction_glyph(reaction) {
-                                    Some((emoji, label, slug)) => rsx! {
-                                        button {
-                                            key: "{slug}",
-                                            id: "reaction-opt-{slug}",
-                                            class: {
-                                                let active = reaction_highlight() == reaction;
-                                                let pressed = reaction_pressed() == Some(reaction);
-                                                match (active, pressed) {
-                                                    (true, true) => "reaction-option active is-pressed",
-                                                    (true, false) => "reaction-option active",
-                                                    (false, true) => "reaction-option is-pressed",
-                                                    (false, false) => "reaction-option",
+                        // Issue 2173: scroll wrapper. Issue 2141 bounded the tall
+                        // picker column by putting `overflow-y: auto` on the palette
+                        // itself, which (per CSS overflow, `overflow-x` computes from
+                        // `visible` to `auto` when the other axis is not `visible`)
+                        // silently made the palette a scroll container on BOTH axes —
+                        // clipping the top overhang of the close (X) badge and turning
+                        // its right overhang into horizontal scrollable overflow. So
+                        // ALL the palette content lives in this wrapper, which does the
+                        // scrolling, and the badge below stays a direct child of the
+                        // overflow-visible palette. Purely a layout box: it carries no
+                        // id/handlers, so the toolbar semantics, the palette's
+                        // `stop_propagation`, and the arrow-key handler above are
+                        // untouched (keydown still bubbles from the options to the
+                        // palette, and both focus helpers use `Node.contains`, which is
+                        // depth-agnostic). `role="none"` makes that claim true in the
+                        // ACCESSIBILITY tree too: a bare div would otherwise surface as
+                        // a `generic` node between role=toolbar and its buttons. The
+                        // role applies cleanly because this element is not focusable and
+                        // carries no global ARIA attribute (either would make a browser
+                        // ignore it), and it drops only THIS element's semantics — a
+                        // generic has no required owned elements, so every button below
+                        // keeps its own role and stays an accessible descendant of the
+                        // toolbar.
+                        div { class: "reactions-palette__scroll",
+                            role: "none",
+                            for reaction in REACTIONS {
+                                {
+                                    match reaction_glyph(reaction) {
+                                        Some((emoji, label, slug)) => rsx! {
+                                            button {
+                                                key: "{slug}",
+                                                id: "reaction-opt-{slug}",
+                                                class: {
+                                                    let active = reaction_highlight() == reaction;
+                                                    let pressed = reaction_pressed() == Some(reaction);
+                                                    match (active, pressed) {
+                                                        (true, true) => "reaction-option active is-pressed",
+                                                        (true, false) => "reaction-option active",
+                                                        (false, true) => "reaction-option is-pressed",
+                                                        (false, false) => "reaction-option",
+                                                    }
+                                                },
+                                                "data-testid": "reaction-option-{slug}",
+                                                r#type: "button",
+                                                // UX B2: plain toolbar buttons, not
+                                                // role=menuitem. Roving tabindex keeps
+                                                // arrow-key navigation; the accessible
+                                                // name stays "React with {label}".
+                                                tabindex: if reaction_highlight() == reaction { "0" } else { "-1" },
+                                                "aria-label": "React with {label}",
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    reaction_highlight.set(reaction);
+                                                    send_reaction.call(reaction);
+                                                },
+                                                span {
+                                                    class: "reaction-option__emoji",
+                                                    "aria-hidden": "true",
+                                                    "{emoji}"
                                                 }
-                                            },
-                                            "data-testid": "reaction-option-{slug}",
+                                            }
+                                        },
+                                        None => rsx! {},
+                                    }
+                                }
+                            }
+                            // Issue 1884: recent CUSTOM emojis as quick-picks — the last
+                            // <=3 picker emojis, most-recent-first, grouped AFTER the
+                            // fixed reactions and adjacent to "More emoji". A thin
+                            // divider (aria-hidden) sets them apart only when non-empty;
+                            // an empty recents list renders nothing (no placeholders).
+                            // Clicking one sends it as a CUSTOM reaction, identical to
+                            // picking it from the picker (palette stays open).
+                            if show_recents_group(&recent_custom_emojis.read()) {
+                                span {
+                                    class: "reactions-recent-sep",
+                                    "aria-hidden": "true",
+                                }
+                            }
+                            for (i, recent) in recent_custom_emojis().iter().enumerate() {
+                                {
+                                    let glyph = recent.clone();
+                                    let name = emojis::get(&glyph)
+                                        .map(|e| e.name().to_string())
+                                        .unwrap_or_else(|| "reaction".to_string());
+                                    rsx! {
+                                        button {
+                                            key: "recent-{glyph}",
+                                            class: "reaction-option reaction-recent",
                                             r#type: "button",
-                                            // UX B2: plain toolbar buttons, not
-                                            // role=menuitem. Roving tabindex keeps
-                                            // arrow-key navigation; the accessible
-                                            // name stays "React with {label}".
-                                            tabindex: if reaction_highlight() == reaction { "0" } else { "-1" },
-                                            "aria-label": "React with {label}",
+                                            "data-testid": "reaction-recent-{i}",
+                                            "aria-label": "React with {name}",
+                                            title: "{name}",
                                             onclick: move |e: MouseEvent| {
                                                 e.stop_propagation();
-                                                reaction_highlight.set(reaction);
-                                                send_reaction.call(reaction);
+                                                send_custom_reaction.call(glyph.clone());
                                             },
                                             span {
                                                 class: "reaction-option__emoji",
                                                 "aria-hidden": "true",
-                                                "{emoji}"
+                                                "{glyph}"
                                             }
-                                        }
-                                    },
-                                    None => rsx! {},
-                                }
-                            }
-                        }
-                        // Issue 1884: recent CUSTOM emojis as quick-picks — the last
-                        // <=3 picker emojis, most-recent-first, grouped AFTER the
-                        // fixed reactions and adjacent to "More emoji". A thin
-                        // divider (aria-hidden) sets them apart only when non-empty;
-                        // an empty recents list renders nothing (no placeholders).
-                        // Clicking one sends it as a CUSTOM reaction, identical to
-                        // picking it from the picker (palette stays open).
-                        if show_recents_group(&recent_custom_emojis.read()) {
-                            span {
-                                class: "reactions-recent-sep",
-                                "aria-hidden": "true",
-                            }
-                        }
-                        for (i, recent) in recent_custom_emojis().iter().enumerate() {
-                            {
-                                let glyph = recent.clone();
-                                let name = emojis::get(&glyph)
-                                    .map(|e| e.name().to_string())
-                                    .unwrap_or_else(|| "reaction".to_string());
-                                rsx! {
-                                    button {
-                                        key: "recent-{glyph}",
-                                        class: "reaction-option reaction-recent",
-                                        r#type: "button",
-                                        "data-testid": "reaction-recent-{i}",
-                                        "aria-label": "React with {name}",
-                                        title: "{name}",
-                                        onclick: move |e: MouseEvent| {
-                                            e.stop_propagation();
-                                            send_custom_reaction.call(glyph.clone());
-                                        },
-                                        span {
-                                            class: "reaction-option__emoji",
-                                            "aria-hidden": "true",
-                                            "{glyph}"
                                         }
                                     }
                                 }
                             }
-                        }
-                        // Issue 2086: reset the recent-CUSTOM quick-picks. Shares
-                        // `show_recents_group` with the divider above, so it appears
-                        // and disappears with the row it clears — there is never a
-                        // reset control with nothing to reset. Sits at the END of the
-                        // recents group (after the quick-picks, before "More emoji")
-                        // so Tab reaches it right after the buttons it acts on. Like
-                        // its siblings it is a plain toolbar button outside the
-                        // ReactionType roving (default tabindex 0) and stops click
-                        // propagation — the palette's own `stop_propagation` above
-                        // already shields every child from #main-container's onclick
-                        // (which sets `reactions_open` false), so this is the same
-                        // defence-in-depth its siblings carry, not the thing that
-                        // keeps the palette open.
-                        if show_recents_group(&recent_custom_emojis.read()) {
-                            button {
-                                class: "reaction-option reaction-option--reset",
-                                r#type: "button",
-                                "data-testid": "reactions-reset-recents",
-                                "aria-label": "Clear recent emoji",
-                                title: "Clear recent emoji",
-                                onclick: move |e: MouseEvent| {
-                                    e.stop_propagation();
-                                    // Focus FIRST: this button unmounts with the rest of
-                                    // the recents group on the render that follows, and a
-                                    // focused element removed from the DOM drops focus to
-                                    // <body>. "More emoji" is the nearest control that
-                                    // survives the reset, so a keyboard user lands beside
-                                    // where they were. Same synchronous-focus idiom the
-                                    // close (X) uses to return focus to its trigger.
-                                    focus_element_by_id("reaction-more-emoji");
-                                    clear_saved_recent_custom_emojis();
-                                    clear_recent_custom_emojis(&mut recent_custom_emojis.write());
-                                    // Deliberately does NOT call `arm_reaction_autohide`:
-                                    // that helper STARTS the 5s window when none is armed,
-                                    // so resetting on a freshly-opened palette would begin
-                                    // auto-hiding it. Reset is not a send — "More emoji"
-                                    // and the close X leave the timer alone too.
-                                },
-                                span {
-                                    "aria-hidden": "true",
-                                    "\u{21ba}"
+                            // Issue 2086: reset the recent-CUSTOM quick-picks. Shares
+                            // `show_recents_group` with the divider above, so it appears
+                            // and disappears with the row it clears — there is never a
+                            // reset control with nothing to reset. Sits at the END of the
+                            // recents group (after the quick-picks, before "More emoji")
+                            // so Tab reaches it right after the buttons it acts on. Like
+                            // its siblings it is a plain toolbar button outside the
+                            // ReactionType roving (default tabindex 0) and stops click
+                            // propagation — the palette's own `stop_propagation` above
+                            // already shields every child from #main-container's onclick
+                            // (which sets `reactions_open` false), so this is the same
+                            // defence-in-depth its siblings carry, not the thing that
+                            // keeps the palette open.
+                            if show_recents_group(&recent_custom_emojis.read()) {
+                                button {
+                                    class: "reaction-option reaction-option--reset",
+                                    r#type: "button",
+                                    "data-testid": "reactions-reset-recents",
+                                    "aria-label": "Clear recent emoji",
+                                    title: "Clear recent emoji",
+                                    onclick: move |e: MouseEvent| {
+                                        e.stop_propagation();
+                                        // Focus FIRST: this button unmounts with the rest of
+                                        // the recents group on the render that follows, and a
+                                        // focused element removed from the DOM drops focus to
+                                        // <body>. "More emoji" is the nearest control that
+                                        // survives the reset, so a keyboard user lands beside
+                                        // where they were. Same synchronous-focus idiom the
+                                        // close (X) uses to return focus to its trigger.
+                                        focus_element_by_id("reaction-more-emoji");
+                                        clear_saved_recent_custom_emojis();
+                                        clear_recent_custom_emojis(&mut recent_custom_emojis.write());
+                                        // Deliberately does NOT call `arm_reaction_autohide`:
+                                        // that helper STARTS the 5s window when none is armed,
+                                        // so resetting on a freshly-opened palette would begin
+                                        // auto-hiding it. Reset is not a send — "More emoji"
+                                        // and the close X leave the timer alone too.
+                                    },
+                                    span {
+                                        "aria-hidden": "true",
+                                        "\u{21ba}"
+                                    }
                                 }
                             }
-                        }
-                        // Issue 1884: "More emoji" affordance — opens the standard
-                        // emoji picker panel (CUSTOM reaction). A plain toolbar
-                        // button after the quick row; Tab-reachable (default
-                        // tabindex 0). `aria-expanded` reflects the picker state.
-                        // Carries an `id` (issue 2086) so the reset control can hand
-                        // focus to it as the recents group unmounts.
-                        button {
-                            id: "reaction-more-emoji",
-                            class: if emoji_picker_open() { "reaction-option reaction-option--more active" } else { "reaction-option reaction-option--more" },
-                            r#type: "button",
-                            "data-testid": "emoji-picker-open",
-                            "aria-label": "More emoji",
-                            "aria-expanded": if emoji_picker_open() { "true" } else { "false" },
-                            onclick: move |e: MouseEvent| {
-                                e.stop_propagation();
-                                let opening = !emoji_picker_open();
-                                emoji_picker_open.set(opening);
-                            },
-                            span {
-                                class: "reaction-option__emoji",
-                                "aria-hidden": "true",
-                                "\u{2795}"
+                            // Issue 1884: "More emoji" affordance — opens the standard
+                            // emoji picker panel (CUSTOM reaction). A plain toolbar
+                            // button after the quick row; Tab-reachable (default
+                            // tabindex 0). `aria-expanded` reflects the picker state.
+                            // Carries an `id` (issue 2086) so the reset control can hand
+                            // focus to it as the recents group unmounts.
+                            button {
+                                id: "reaction-more-emoji",
+                                class: if emoji_picker_open() { "reaction-option reaction-option--more active" } else { "reaction-option reaction-option--more" },
+                                r#type: "button",
+                                "data-testid": "emoji-picker-open",
+                                "aria-label": "More emoji",
+                                "aria-expanded": if emoji_picker_open() { "true" } else { "false" },
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    let opening = !emoji_picker_open();
+                                    emoji_picker_open.set(opening);
+                                },
+                                span {
+                                    class: "reaction-option__emoji",
+                                    "aria-hidden": "true",
+                                    "\u{2795}"
+                                }
+                            }
+                            // Issue 1884: the standard-emoji picker panel (CUSTOM
+                            // reaction), extracted into its own child so an unrelated
+                            // attendants re-render while it sits open does NOT rebuild
+                            // its ~388-button category grid — the child is memoized on
+                            // `emoji_group` (perf review). It reads/writes `emoji_group`
+                            // and calls `send_custom_reaction`; the recents row above
+                            // stays in the palette (parent). Mounted only while open.
+                            if emoji_picker_open() {
+                                EmojiPicker { emoji_group, send_custom_reaction }
                             }
                         }
                         // Issue 1884: manual close (X), corner control (UX B2).
@@ -13506,6 +13602,17 @@ pub fn AttendantsComponent(
                         // hanging off the palette's top-right corner (style.css);
                         // keyboard-reachable via Tab (default tabindex 0) now that
                         // the toolbar does not trap Tab.
+                        //
+                        // Issue 2173: a DIRECT child of the palette and a SIBLING of
+                        // the scroll wrapper above — deliberately not inside it, so
+                        // the badge is not a descendant of any scroll container and
+                        // its corner overhang is neither clipped nor turned into
+                        // scrollable overflow. It is also the LAST child now, where
+                        // it used to sit between "More emoji" and the picker. With
+                        // the picker closed — the common case — Tab order is
+                        // unchanged (... -> More emoji -> X); with the picker open,
+                        // X now follows the picker's stops instead of preceding
+                        // them. Escape closes from anywhere either way.
                         button {
                             class: "close-button reactions-close-badge",
                             r#type: "button",
@@ -13517,16 +13624,6 @@ pub fn AttendantsComponent(
                                 focus_element_by_id("reactions-trigger");
                             },
                             "\u{00d7}"
-                        }
-                        // Issue 1884: the standard-emoji picker panel (CUSTOM
-                        // reaction), extracted into its own child so an unrelated
-                        // attendants re-render while it sits open does NOT rebuild
-                        // its ~388-button category grid — the child is memoized on
-                        // `emoji_group` (perf review). It reads/writes `emoji_group`
-                        // and calls `send_custom_reaction`; the recents row above
-                        // stays in the palette (parent). Mounted only while open.
-                        if emoji_picker_open() {
-                            EmojiPicker { emoji_group, send_custom_reaction }
                         }
                     }
                 }
@@ -13616,6 +13713,22 @@ fn parse_peer_status_event(
 /// Parse a `peer_speaking` diagnostics event. Returns `Some(peer_id)` when
 /// the event indicates the peer is actively speaking (audio_level > 0 or
 /// speaking flag set).
+/// Issue 2174 follow-up — this is the one `peer_speaking` consumer with NO
+/// audio gate. `is_speaking` below is a bare `audio_level > 0.0 || speaking`,
+/// and the peer it returns feeds `peer_speech_priority`, which drives video
+/// GRID ordering (`promote_speakers`) and auto-density escalation — layout, not
+/// just an indicator. The tile glow (`effective_level` in `peer_tile.rs`) and the
+/// roster dot (`resolve_roster_speaking` in `peer_list.rs`) both veto a
+/// speaking claim against the peer's `audio_enabled`; this path does not, so a
+/// straggler that reached it would promote a just-muted peer in the grid.
+///
+/// That is safe only because the producer now gates it: `VadState` in
+/// `neteq_audio_decoder.rs` sets its `suppressed` flag on the mute teardown and
+/// `observe` early-returns while suppressed, so no `speaking: 1` is emitted
+/// after a mute at all. If a future `peer_speaking` producer is added that does
+/// NOT carry that suppression (or the flag is relaxed), grid ordering becomes
+/// the unguarded consumer — add the `audio_enabled` veto here rather than
+/// assuming the producer still filters.
 fn parse_speaking_peer(evt: &videocall_diagnostics::DiagEvent) -> Option<String> {
     use videocall_diagnostics::MetricValue;
 
@@ -15395,7 +15508,7 @@ mod tests {
         // deliberate test update. Clip-safety depends on these exact values, so
         // a silent few-px drift must not ship unnoticed.
         //
-        // Derivation at vw=620px, root 16px, 3 sacred + 6 secondary:
+        // Derivation at vw=620px, root 16px, 3 sacred + 7 secondary:
         //   available    = 620 - 40                    = 580.0
         //   btn_size     = 3.1rem                       =  49.6
         //   gap          = 1.2rem                       =  19.2
@@ -15404,19 +15517,19 @@ mod tests {
         //   trigger      = 49.6 + 19.2                  =  68.8
         //   budget       = 580 - 256.4 - 68.8           = 254.8
         //   fit: 49.6, 118.4, 187.2 all ≤ 254.8 (3 fit); 4th needs 256.0 > 254.8
-        //   → 3 fit, 3 hidden
+        //   → 3 fit, 4 hidden
         let secondary = overflow_test_secondary();
         assert_eq!(
             action_bar_overflow_hidden(620.0, 800.0, false, 16.0, 3, &secondary).len(),
-            3,
-            "at 620px exactly 3 of 6 secondary slots fit (3 hidden) with the current \
+            4,
+            "at 620px exactly 3 of 7 secondary slots fit (4 hidden) with the current \
              spacing constants; a change here means btn/gap/pad drifted",
         );
     }
 
     // ── The DEFAULT bar must fit at the width the E2E calls "wide" (issue 2135) ──
     //
-    // `action_bar_overflow_hidden` is exercised above against a FIXED 6-slot
+    // `action_bar_overflow_hidden` is exercised above against a FIXED 7-slot
     // list, which says nothing about the layout users actually get. The tests
     // below run it against `DEFAULT_SLOTS` itself, because that is the input
     // that silently changed and turned CI red.
@@ -15432,19 +15545,19 @@ mod tests {
     /// The narrowest viewport width, in CSS px at a 16px root, that fits the
     /// WHOLE default action bar with nothing behind the overflow trigger.
     ///
-    /// Derived from `action_bar_overflow_hidden`'s constants at 10 secondary
+    /// Derived from `action_bar_overflow_hidden`'s constants at 11 secondary
     /// slots (`DEFAULT_SLOTS` minus Mic/Camera, as an owner sees it):
     ///   sacred 3.49.6 + 3.19.2 + 48 + 2 = 256.4 ; trigger 49.6 + 19.2 = 68.8
-    ///   secondary 49.6 + 9.68.8 = 668.8 ; so vw >= 668.8 + 256.4 + 68.8 + 40
+    ///   secondary 49.6 + 10.68.8 = 737.6 ; so vw >= 737.6 + 256.4 + 68.8 + 40
     /// Pinned rather than recomputed here so the test cannot drift with the
     /// production formula it is supposed to be watching.
     ///
-    /// Issue 2136 added the host-only MeetingTimer slot — one more button+gap
-    /// for an owner, exactly as this pin is designed to surface. 1034 leaves
-    /// 246px of headroom under `ACTION_BAR_E2E_WIDE_WIDTH` (1280), so the E2E
-    /// fixture still shows the whole bar with nothing behind the overflow
-    /// trigger.
-    const DEFAULT_ACTION_BAR_MIN_FIT_WIDTH: f64 = 1034.0;
+    /// Moved 1034 -> 1103 in issue 2136, which added the host-only MeetingTimer
+    /// slot: one more button+gap for an owner, exactly as this pin is designed
+    /// to surface. 1103 still leaves 177px of headroom under
+    /// `ACTION_BAR_E2E_WIDE_WIDTH` (1280), so the E2E fixture still shows the
+    /// whole bar with nothing behind the overflow trigger.
+    const DEFAULT_ACTION_BAR_MIN_FIT_WIDTH: f64 = 1103.0;
 
     /// The fresh-install secondary set, built by the PRODUCTION filter: every
     /// `DEFAULT_SLOTS` entry a non-iOS meeting OWNER sees, minus the sacred
@@ -15474,10 +15587,10 @@ mod tests {
     /// the overflow trigger — at the width the E2E suite calls wide.
     ///
     /// This is the invariant issue 2135 broke. Adding `RaiseHand` to
-    /// `DEFAULT_SLOTS` grew the default secondary set by one slot — a whole
-    /// button+gap (68.8px) — while the spec was still widening to only 1000px.
-    /// The extra slot did not fit, the trigger stayed on screen, and the spec
-    /// went red in CI with no local signal.
+    /// `DEFAULT_SLOTS` took the default secondary set from 9 slots to 10, and
+    /// the spec was widening to 1000px where the budget had ~35px of slack —
+    /// half of one button+gap (68.8px). The tenth slot did not fit, the trigger
+    /// stayed on screen, and the spec went red in CI with no local signal.
     ///
     /// ADVERSARIAL (mutation): set `ACTION_BAR_E2E_WIDE_WIDTH` back to 1000.0
     /// and this goes red, naming the slot that would overflow.

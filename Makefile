@@ -61,6 +61,8 @@ clippy-ci:
 		cargo clippy -p videocall-codecs --tests -- -D warnings
 		cargo clippy -p videocall-ui --tests -- -D warnings
 		cargo clippy -p neteq --no-default-features --features web --tests -- -D warnings
+		cargo clippy -p videocall-diagnostics --tests -- -D warnings
+		cargo clippy -p bot --tests -- -D warnings
 
 fmt:
 		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo fmt --all"

@@ -96,10 +96,12 @@ type SampleTimerClosure = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
 
 /// Issue #1784: diagnostics subsystem + metric for per-peer PAINTED fps — the rate
 /// of frames actually drawn to the canvas at the rAF paint site, as opposed to the
-/// arrival-rate `video` / `fps_received` bucket (`diagnostics_manager.rs`) that
-/// counts packets the instant they are dispatched into the decode pipeline, before
-/// the jitter buffer drops/holds/skips and before #1783 coalesces a burst of late
-/// frames to a single draw. The media-metrics overlay's "↓ fps" reads THIS.
+/// decode-call `video` / `fps_received` bucket (`diagnostics_manager.rs`) that counts
+/// packets the instant they are dispatched into the decode pipeline, before the jitter
+/// buffer drops/holds/skips and before #1783 coalesces a burst of late frames to a
+/// single draw. (Since #2190 that bucket excludes packets the simulcast rung guard
+/// SKIPPED, so it is a decode-call count, not an arrival count — but it still counts
+/// dispatches, not draws.) The media-metrics overlay's "↓ fps" reads THIS.
 ///
 /// A dedicated subsystem (not a new metric on the existing `video` event) because
 /// the two are produced at different sites: `fps_received` is emitted by the
@@ -121,9 +123,9 @@ const PAINTED_FPS_SAMPLE_INTERVAL_MS: i32 = 1000;
 /// rAF paint site in [`VideoPeerDecoder`], right where `render_to_canvas_cached`
 /// reports it drew — and `sample` rolls the count into an fps value on the ~1 Hz
 /// tick that emits the [`SUBSYSTEM_VIDEO_PAINTED`] event. This is deliberately
-/// distinct from the arrival-rate `FpsTracker` (`fps_received`): a burst of late
-/// frames that #1783 coalesces to a single draw counts as ONE paint here, so the
-/// value never exceeds the source frame rate.
+/// distinct from the decode-call `FpsTracker` (`fps_received`, an arrival count until
+/// #2190): a burst of late frames that #1783 coalesces to a single draw counts as ONE
+/// paint here, so the value never exceeds the source frame rate.
 ///
 /// A window with zero paints (a stopped or hidden tile — no `record_paint` calls)
 /// samples to exactly `0.0`, so the overlay's snap-down reverts the readout to the
@@ -2241,7 +2243,7 @@ mod tests {
 
     /// The painted-fps event carries the painted rate + peer routing + media_type
     /// under the dedicated subsystem, so the overlay can source "↓ fps" from it and
-    /// distinguish it from the arrival-rate `video`/`fps_received` event.
+    /// distinguish it from the decode-call `video`/`fps_received` event.
     #[test]
     fn build_painted_fps_event_shape() {
         let evt = build_painted_fps_event(

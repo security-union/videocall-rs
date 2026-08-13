@@ -36,7 +36,7 @@
  * (`navigator.hardwareConcurrency`) and the UA platform — with NO CPU benchmark:
  *   - `< 6` cores OR unknown → 1 layer
  *   - older Intel Mac        → 1 layer
- *   - `6..10` cores          → 2 layers
+ *   - `6..9` cores           → 2 layers
  *   - `>= 10` cores          → 3 layers
  * (The runtime `videocall-aq` loop then earns layers up to that ceiling.)
  *

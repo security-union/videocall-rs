@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use url::Url;
+use videocall_aq::constants::SIMULCAST_MAX_LAYERS;
 
 use crate::netsim::NetworkProfile;
 use videocall_netsim::{list_profiles, resolve_profile};
@@ -177,6 +178,24 @@ pub struct ClientConfig {
     pub meeting_id: String,
     pub enable_audio: bool,
     pub enable_video: bool,
+}
+
+/// Reject a pin layer that is not on the simulcast ladder.
+///
+/// The relay accepts ids up to `LAYER_PREFERENCE_MAX_LAYER_ID` (7) while the ladder is
+/// only [`SIMULCAST_MAX_LAYERS`] deep, so an off-ladder pin is RECORDED, every non-base
+/// layer is dropped, and nothing on-ladder ever equals the pin — the bot then reports
+/// `fps_received = 0` forever, so a typo reads as total starvation (#2206).
+fn validate_pin_layer(layer: Option<u32>) -> anyhow::Result<()> {
+    match layer {
+        Some(l) if l as usize >= SIMULCAST_MAX_LAYERS => Err(anyhow!(
+            "pin layer must be 0..{} (the simulcast ladder depth); got {}. \
+             Set via --pin-layer, BOT_PIN_LAYER, or the config file.",
+            SIMULCAST_MAX_LAYERS,
+            l
+        )),
+        _ => Ok(()),
+    }
 }
 
 impl BotConfig {
@@ -392,6 +411,9 @@ impl BotConfig {
                     .map_err(|_| anyhow!("BOT_PIN_LAYER must be a u32 layer index"))?,
             );
         }
+        // Checked on the RESOLVED value, so ONE check covers all three sources (CLI,
+        // BOT_PIN_LAYER, config file) rather than only the flag.
+        validate_pin_layer(config.pin_layer)?;
         if let Some(kind) = pin_layer_kind {
             config.pin_layer_kind = Some(kind);
         } else if let Ok(env_kind) = std::env::var("BOT_PIN_LAYER_KIND") {
@@ -782,10 +804,13 @@ fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{evaluate_costume_memory, help_text, BotConfig, CostumeMemoryDecision};
+    use super::{
+        evaluate_costume_memory, help_text, validate_pin_layer, BotConfig, CostumeMemoryDecision,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use videocall_aq::constants::SIMULCAST_MAX_LAYERS;
 
     fn write_temp_config() -> PathBuf {
         let unique = SystemTime::now()
@@ -796,6 +821,21 @@ mod tests {
         fs::write(
             &path,
             "meeting_id: test-room\nws_url: wss://example.invalid/lobby\n",
+        )
+        .unwrap();
+        path
+    }
+
+    /// `write_temp_config` plus extra YAML lines, for exercising file-sourced knobs.
+    fn write_temp_config_with(extra: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bot-config-extra-{unique}.yaml"));
+        fs::write(
+            &path,
+            format!("meeting_id: test-room\nws_url: wss://example.invalid/lobby\n{extra}"),
         )
         .unwrap();
         path
@@ -997,6 +1037,61 @@ mod tests {
             evaluate_costume_memory(101, 100, false),
             CostumeMemoryDecision::AbortExceedsAvailable
         );
+    }
+
+    #[test]
+    fn pin_layer_rejects_a_rung_off_the_ladder() {
+        // The bound itself. `validate_pin_layer` is called on the RESOLVED value, so this
+        // one check governs all three sources (CLI, BOT_PIN_LAYER, config file) — which is
+        // why the integration cases below only need to prove the wiring, and why no test
+        // has to mutate process-global env.
+        for bad in [SIMULCAST_MAX_LAYERS as u32, 7, 99] {
+            let err = validate_pin_layer(Some(bad))
+                .expect_err("an off-ladder pin must be rejected")
+                .to_string();
+            assert!(
+                err.contains("simulcast ladder depth"),
+                "the error must name the real bound; got {}",
+                err
+            );
+        }
+        for good in 0..SIMULCAST_MAX_LAYERS as u32 {
+            assert!(validate_pin_layer(Some(good)).is_ok());
+        }
+        assert!(validate_pin_layer(None).is_ok(), "unset must stay valid");
+
+        // Wiring, CLI source.
+        let path = write_temp_config();
+        let mut args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--pin-layer".to_string(),
+            "7".to_string(),
+        ];
+        assert!(
+            BotConfig::from_args_inner(&args, None).is_err(),
+            "the CLI flag must reach the check"
+        );
+        args.truncate(3);
+        args.push("--pin-layer".to_string());
+        args.push("1".to_string());
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert_eq!(config.pin_layer, Some(1));
+        let _ = fs::remove_file(path);
+
+        // Wiring, config-file source — the path a CLI-only check silently missed.
+        let file_path = write_temp_config_with("pin_layer: 7\n");
+        let file_args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            file_path.display().to_string(),
+        ];
+        assert!(
+            BotConfig::from_args_inner(&file_args, None).is_err(),
+            "a config-file pin must reach the check too"
+        );
+        let _ = fs::remove_file(file_path);
     }
 
     #[test]

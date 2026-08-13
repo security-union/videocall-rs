@@ -54,6 +54,7 @@ enum GuestStatus {
         admitted_can_admit: bool,
         allow_guests: bool,
         recording_allowed_for_all: bool,
+        chat_allowed_for_all: bool,
     },
     Rejected,
     Error(String),
@@ -86,6 +87,7 @@ fn guest_status_from_join_response(
                     admitted_can_admit: response.admitted_can_admit,
                     allow_guests: response.allow_guests,
                     recording_allowed_for_all: response.recording_allowed_for_all,
+                    chat_allowed_for_all: response.chat_allowed_for_all,
                 }
             } else {
                 GuestStatus::Error("Admitted but no room token".to_string())
@@ -142,6 +144,7 @@ fn handle_admitted(
         admitted_can_admit: response.admitted_can_admit,
         allow_guests: response.allow_guests,
         recording_allowed_for_all: response.recording_allowed_for_all,
+        chat_allowed_for_all: response.chat_allowed_for_all,
     });
 }
 
@@ -561,7 +564,7 @@ pub fn GuestJoinPage(id: String) -> Element {
     rsx! {
         match &current_guest_status {
             // Admitted — show the meeting
-            GuestStatus::Admitted { host_display_name, host_user_id, room_token, status_observer_token, waiting_room_enabled, admitted_can_admit, allow_guests, recording_allowed_for_all } => rsx! {
+            GuestStatus::Admitted { host_display_name, host_user_id, room_token, status_observer_token, waiting_room_enabled, admitted_can_admit, allow_guests, recording_allowed_for_all, chat_allowed_for_all } => rsx! {
                 AttendantsComponent {
                     display_name: display_name_for_render.clone(),
                     id: id.clone(),
@@ -578,6 +581,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                     admitted_can_admit: *admitted_can_admit,
                     allow_guests: *allow_guests,
                     recording_allowed_for_all: *recording_allowed_for_all,
+                    chat_allowed_for_all: *chat_allowed_for_all,
                 }
             },
 

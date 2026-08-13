@@ -605,6 +605,128 @@ pub struct FreshnessSkip {
     pub tick_gap_ms: f64,
 }
 
+/// A keyframe ARRIVAL at [`JitterBuffer::insert_frame`] (issue #2201).
+///
+/// The receiver branches on `frame_type == KeyFrame` in four places inside `insert_frame` and recorded
+/// the arrival in NONE of them, so when a tile was frozen no artifact could distinguish
+/// the two mutually-exclusive causes — the publisher's keyframe never reached us
+/// (delivery problem, e.g. #1699 WS head-of-line) versus it arrived and failed to
+/// recover the picture (decode/guard/buffer problem). Those need opposite fixes, and
+/// the choice between them was unfalsifiable from logs *or* Prometheus. The existing
+/// `freshness_skip … keyframe_seq=none` states only that the buffer currently HOLDS no
+/// keyframe; it cannot say whether one was delivered-and-rejected, delivered-and-
+/// unusable, or never delivered — precisely the discriminating fact.
+///
+/// ⚠ WHAT "ARRIVED" MEANS HERE, and the one thing this cannot distinguish.
+/// `insert_frame` is inside the decoder worker, so an arrival recorded here has already
+/// passed the main thread's decrypt, the EXACT-MATCH simulcast rung guard, and
+/// `VideoPeerDecoder::decode`'s codec check. A keyframe the RUNG GUARD dropped therefore
+/// reads identically to one that never crossed the network — both are simply absent.
+///
+/// Partial mitigation, and it is genuinely only partial. `should_encode_layer_frame`
+/// short-circuits on `want_keyframe` ("a periodic GOP or PLI keyframe must reach EVERY
+/// layer"), so a keyframe bypasses the per-rung FPS DECIMATION. But that is the SECOND of
+/// two sequential gates in the encode loop: the first, `layer_id >= local_active_layers`,
+/// takes no `want_keyframe` argument at all, so a SHED (inactive) rung emits nothing —
+/// keyframe or not. A cold-started publisher begins at one active layer, so a PLI then
+/// produces a keyframe on layer 0 ONLY, and a receiver whose guard sits on rung 1 gets
+/// nothing. Screen is weaker still: it has no fps gate for `want_keyframe` to bypass, and
+/// `floor_fanout_layer_count` deliberately caps insurance-floor keyframes to base-only at
+/// the lowest tier.
+///
+/// So this counter measures "a keyframe reached this receiver's SELECTED-LAYER decode
+/// path", NOT "reached this receiver". Six sites can absorb one first, each reading here as
+/// never-arrived: the cleartext rung guard, AES-decrypt failure, the post-decrypt per-arm
+/// rung guard, the `video_enabled == false` straggler drop, the VISIBILITY gate
+/// (`should_decode_visible_peer` — not exotic; the invisible→visible edge even sends a PLI
+/// while decode still returns SKIPPED), and the unknown-codec early return.
+///
+/// Practical consequence, and the #1695 case in particular: a decode guard sitting ABOVE
+/// the rung the relay forwards drops EVERY packet pre-worker, and this counter reads a flat
+/// zero indistinguishable from total delivery failure. Disambiguate with
+/// `videocall_video_bitrate_kbps` — bytes still arriving while this and
+/// `videocall_video_fps` read 0 means the packets reached the client and were discarded
+/// locally. A future counter placed in `Peer::decode` BEFORE the rung guard, paired with
+/// this one, would separate the two directly; that is the real fix.
+///
+/// Stashed on every keyframe arrival and drained by the worker via
+/// [`JitterBuffer::take_keyframe_arrival`], mirroring the [`FreshnessSkip`] path.
+/// Deliberately NOT throttled or coalesced, unlike `FreshnessSkip`: periodic keyframes are
+/// one per `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` (camera 5000ms) /
+/// `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS` (screen 3000ms) per stream, well below the
+/// per-tick skip path, and coalescing would destroy the per-arrival timing that is the whole
+/// point. (The main thread does split the LOG LEVEL by interestingness — see
+/// `decoder/wasm.rs` — but every arrival is still recorded and counted here.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyframeArrival {
+    /// Sequence number of the arriving keyframe.
+    pub seq: u64,
+    /// Head-of-line backlog age (ms) at the moment of arrival — the same
+    /// arrival-based measure the freshness deadline trips on
+    /// (`MAX_PLAYOUT_AGE_MS`), so an arrival log line and a `freshness_skip` line
+    /// are directly comparable. `0.0` when the buffer is empty (nothing is pinning
+    /// playout).
+    pub head_age_ms: f64,
+    /// `true` when the buffer was in a keyframe-less hold at arrival — i.e. this
+    /// keyframe landed DURING a freeze the #1662 clock was already counting.
+    ///
+    /// This is the field that turns the record into a recovery/no-recovery datapoint
+    /// rather than noise: an arrival with this `true` is a freeze that a keyframe
+    /// reached, so if the tile stayed frozen the cause is decode-side, not delivery.
+    /// Captured BEFORE `insert_frame` clears `keyframe_less_hold_since_ms`.
+    pub was_in_keyframe_less_hold: bool,
+    /// Milliseconds since this receiver last ATTEMPTED a proactive keyframe request (PLI)
+    /// for this stream, or `None` if it never has.
+    ///
+    /// This is an UPPER BOUND on the PLI→keyframe round-trip, not a confirmed one — the
+    /// distinction matters and the wording is deliberate. The buffer stamps
+    /// `last_keyframe_request_ms` and then fires the `request_keyframe` hook; the
+    /// main-thread route behind that hook can DECLINE to send (the #1479 per-receiver
+    /// `PliBudget` sheds when its cross-sender cap is reached, and the route is absent
+    /// entirely if the transport is not wired). Nothing ACKs back to the worker, so the
+    /// buffer cannot tell a sent request from a shed one.
+    ///
+    /// Consequence when reading a field log: a small value means "a request was attempted
+    /// this recently", NOT "the publisher answered in this many ms". A PERIODIC keyframe
+    /// (every `PERIODIC_KEYFRAME_MAX_INTERVAL_MS`) arriving after a shed request will carry
+    /// a plausible-looking age while answering nothing. Corroborate with
+    /// `was_awaiting_proactive_keyframe` (below) and, for a definitive send, the main
+    /// thread's own `Sending KEYFRAME_REQUEST` line — the budget logs its sheds there too.
+    ///
+    /// Threading a send-ACK back into the worker would make this exact, at the cost of a
+    /// new main→worker message on the recovery path; deliberately not done here.
+    pub ms_since_keyframe_request: Option<f64>,
+    /// `true` when this arrival is answering an outstanding proactive keyframe
+    /// request (the #1479 `awaiting_proactive_keyframe` gate was open). Recorded
+    /// BEFORE the gate is cleared.
+    pub was_awaiting_proactive_keyframe: bool,
+    /// `true` when `insert_frame` went on to REJECT this keyframe as old/duplicate
+    /// (`seq <= last_decoded` without a stream-restart flush), so it never entered
+    /// the buffer.
+    ///
+    /// Load-bearing for the delivery-vs-decode question: a rejected keyframe still
+    /// proves the publisher responded (that is why the #1479 gate clears before the
+    /// old-frame check), but it cannot recover the picture — so "keyframe arrived
+    /// and the freeze continued" reads very differently depending on this flag.
+    /// Stamped after the pre-insertion checks run.
+    ///
+    /// NOT the same as "entered the buffer" — read it with [`Self::stream_restart`]. The
+    /// restart path (an old keyframe far enough back to look like a publisher restart)
+    /// flushes and RETURNS, so that keyframe also never enters the buffer while reporting
+    /// `rejected_as_old: false`. `stream_restart` disambiguates the two.
+    pub rejected_as_old: bool,
+    /// `true` when this arrival was the STREAM-RESTART keyframe: old enough
+    /// (`last_decoded - seq > STREAM_RESTART_BACKTRACK_THRESHOLD`) that `insert_frame`
+    /// treated it as a publisher restart, flushed the buffer, and returned.
+    ///
+    /// Recorded because without it `rejected_as_old: false` is misleading on this path: the
+    /// keyframe did NOT enter the buffer (the flush-and-return happens before insertion), yet
+    /// it is not a duplicate rejection either. It is the arrival that ENDS a
+    /// publisher-restart freeze, so a field reader needs to see it as its own outcome rather
+    /// than as an ordinary accepted arrival.
+    pub stream_restart: bool,
+}
+
 pub struct JitterBuffer<T> {
     /// Frames that have been received but are not yet continuous with the last decoded frame.
     /// A BTreeMap is used to keep them sorted by sequence number automatically.
@@ -820,6 +942,37 @@ pub struct JitterBuffer<T> {
     /// closed. The next emitted diagnostic includes this pending dropped count.
     pending_freshness_skip: Option<FreshnessSkip>,
 
+    /// Most recent keyframe ARRIVAL (issue #2201), set by `insert_frame` and drained by
+    /// the worker via [`JitterBuffer::take_keyframe_arrival`]. `None` when no keyframe
+    /// has arrived since the last drain.
+    ///
+    /// Unthrottled, unlike `last_freshness_skip`: see [`KeyframeArrival`]. The worker drains
+    /// this immediately after every `insert_frame` (`bin/worker_decoder.rs`), NOT only on the
+    /// ~10ms poll — precisely so no arrival can be overwritten by a second keyframe landing in
+    /// the same tick, and so none is delayed by up to a tick. The poll also drains, as a
+    /// backstop for the test-only `InjectStaleFrame` path, and `Option::take` makes that
+    /// second drain a no-op rather than a double-post (pinned by
+    /// `an_arrival_is_drained_exactly_once`).
+    ///
+    /// A single `Option` either way, so this can never accumulate.
+    last_keyframe_arrival: Option<KeyframeArrival>,
+
+    /// Lifetime count of keyframe ARRIVALS on this stream (issue #2201). Read as "is it
+    /// rising at all during a freeze" plus a `rate()` against the expected periodic cadence;
+    /// it is NOT differenceable against `keyframe_requests_sent_total` (that is a
+    /// process-wide client counter over all peers and both media kinds, most arrivals are
+    /// unrequested periodic keyframes, and the reset boundaries differ).
+    ///
+    /// Counts EVERY arrival, including ones rejected as old/duplicate, because the
+    /// question it answers is "did the publisher's keyframe reach us" — for which a
+    /// retransmit counts (the same reasoning the #1479 gate-clear is built on).
+    ///
+    /// Like `governor_skips` this is a cumulative metric, NOT runtime state: deliberately
+    /// preserved across `flush()`. It DOES reset to 0 when the decode pipeline is rebuilt
+    /// (a #1324/#1662 escalation drops the whole buffer and calls `new()`), so consume it
+    /// via `increase()`/`rate()`, never as an absolute.
+    keyframe_arrivals: u64,
+
     /// Resync-governor (issues #1252, #1791): leaky-bucket window count of ~10ms ticks whose buffered
     /// playout-latency total was at/above `GOVERNOR_ENGAGE_MS`. INCREMENTS (saturating at
     /// `GOVERNOR_SUSTAIN_TICKS`) on each qualifying tick and DECREMENTS (floored at 0) on each tick
@@ -909,6 +1062,8 @@ impl<T> JitterBuffer<T> {
             last_freshness_skip: None,
             last_freshness_skip_emit_ms: None,
             pending_freshness_skip: None,
+            last_keyframe_arrival: None,
+            keyframe_arrivals: 0,
             governor_sustain_ticks: 0,
             governor_engaged: false,
             governor_last_skip_ms: None,
@@ -970,6 +1125,61 @@ impl<T> JitterBuffer<T> {
         }
     }
 
+    /// The head-of-line frame the decoder is currently waiting to release, as
+    /// `(sequence_number, arrival-based age in ms)` — or `None` when the buffer is empty
+    /// (nothing is pinning playout).
+    ///
+    /// "Head of line" is the next frame the decoder COULD release: the next contiguous
+    /// sequence number when one is buffered, otherwise (across a gap, or before anything
+    /// has decoded) the oldest buffered frame, which is what actually pins playout. The
+    /// age is arrival-based — how long that frame has sat in THIS buffer — NOT
+    /// media-timestamp-based.
+    ///
+    /// Extracted (issue #2201) so the freshness deadline (`MAX_PLAYOUT_AGE_MS`, #1020) and
+    /// the keyframe-arrival record share ONE definition. Both surface a `head_age_ms` into
+    /// field logs and the whole point of the arrival record is to be diffed against a
+    /// `freshness_skip`, so a second copy of this logic drifting from the first would
+    /// silently invalidate that comparison.
+    fn head_of_line(&self, current_time_ms: u128) -> Option<(u64, f64)> {
+        let head_key = match self.last_decoded_sequence_number {
+            Some(last_seq) => {
+                let next_continuous_seq = last_seq + 1;
+                if self.buffered_frames.contains_key(&next_continuous_seq) {
+                    Some(next_continuous_seq)
+                } else {
+                    // Gap: the decoder is waiting on the next keyframe after the gap. The
+                    // head-of-line wait is measured from the oldest buffered frame, which is
+                    // what actually pins playout.
+                    self.buffered_frames.keys().next().copied()
+                }
+            }
+            // Never decoded yet: head of line is whatever is oldest in the buffer.
+            None => self.buffered_frames.keys().next().copied(),
+        }?;
+        let head_arrival_ms = self.buffered_frames.get(&head_key)?.arrival_time_ms;
+        Some((
+            head_key,
+            current_time_ms.saturating_sub(head_arrival_ms) as f64,
+        ))
+    }
+
+    /// Take the most recent keyframe ARRIVAL (issue #2201), clearing it. Mirrors
+    /// [`JitterBuffer::take_freshness_skip`]: the worker calls this after each
+    /// `insert_frame`-driven poll and, on `Some`, forwards the record to the main thread so
+    /// it lands in uploaded field logs. Without it, a frozen tile's logs cannot say whether
+    /// a keyframe arrived at all — the discriminating fact between a delivery problem and a
+    /// decode problem.
+    pub fn take_keyframe_arrival(&mut self) -> Option<KeyframeArrival> {
+        self.last_keyframe_arrival.take()
+    }
+
+    /// Lifetime count of keyframe ARRIVALS on this stream (issue #2201). The arrival-side
+    /// counterpart to `keyframe_requests_sent_total`; see the `keyframe_arrivals` field for
+    /// the counter's reset semantics (survives `flush()`, resets on a pipeline rebuild).
+    pub fn keyframe_arrival_count(&self) -> u64 {
+        self.keyframe_arrivals
+    }
+
     /// The main entry point for a new frame arriving from the network.
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
@@ -980,6 +1190,38 @@ impl<T> JitterBuffer<T> {
         // respond to our PLI" — even a retransmitted keyframe proves it did. On a lossless WS
         // path the PLI-triggered keyframe always arrives; on WT the timeout backstop handles loss.
         if frame.frame_type == FrameType::KeyFrame {
+            // Issue #2201: record the ARRIVAL. Built HERE, before the two clears below and
+            // before the old-frame rejection, because every field it captures describes the
+            // state the keyframe arrived INTO — which the clears are about to erase. In
+            // particular `was_in_keyframe_less_hold` reads `keyframe_less_hold_since_ms`
+            // while it is still `Some`, and `was_awaiting_proactive_keyframe` reads the
+            // #1479 gate before it closes; sampling either afterwards would read the
+            // post-recovery state and always report `false`, making the record useless for
+            // exactly the freeze case it exists to explain.
+            //
+            // `rejected_as_old` is left `false` here and stamped by the pre-insertion checks
+            // below, which are the only code that can decide it.
+            self.keyframe_arrivals = self.keyframe_arrivals.saturating_add(1);
+            self.last_keyframe_arrival = Some(KeyframeArrival {
+                seq,
+                // Same head-of-line measure the freshness deadline trips on, so this is
+                // directly comparable with a `freshness_skip`'s `head_age_ms`. `0.0` for an
+                // empty buffer: nothing is pinning playout.
+                head_age_ms: self
+                    .head_of_line(arrival_time_ms)
+                    .map(|(_, age)| age)
+                    .unwrap_or(0.0),
+                was_in_keyframe_less_hold: self.keyframe_less_hold_since_ms.is_some(),
+                ms_since_keyframe_request: self
+                    .last_keyframe_request_ms
+                    .map(|req| arrival_time_ms.saturating_sub(req) as f64),
+                was_awaiting_proactive_keyframe: self.awaiting_proactive_keyframe,
+                // Both outcome flags are stamped by the pre-insertion checks below, which
+                // are the only code that can decide them.
+                rejected_as_old: false,
+                stream_restart: false,
+            });
+
             if self.awaiting_proactive_keyframe {
                 self.awaiting_proactive_keyframe = false;
             }
@@ -1014,16 +1256,60 @@ impl<T> JitterBuffer<T> {
                     log::debug!(
                         "[JITTER_BUFFER] Detected keyframe with older sequence ({seq} <= {last_decoded}). Assuming stream restart – flushing buffer."
                     );
+                    // Issue #2201: re-stash the arrival record ACROSS the flush, and mark it
+                    // `stream_restart`.
+                    //
+                    // Be precise about what happens to THIS frame: it is NOT inserted. The
+                    // flush below is followed by an unconditional `return`, so the restart
+                    // keyframe is DISCARDED and recovery waits on the publisher's next
+                    // keyframe. That is why `stream_restart` exists as its own flag — the
+                    // frame did not enter the buffer, yet it is not a duplicate rejection
+                    // either, so reporting `rejected_as_old: false` alone would read as an
+                    // ordinary accepted arrival and hide the discard.
+                    //
+                    // The re-stash is still required: `flush()` clears
+                    // `last_keyframe_arrival` (correctly — its buffer-state fields describe a
+                    // buffer the flush destroys), and without take/restore this arrival, the
+                    // one that signals a publisher restart, would be the only kind never
+                    // reported at all.
+                    let mut arrival = self.last_keyframe_arrival.take();
+                    if let Some(a) = arrival.as_mut() {
+                        a.stream_restart = true;
+                    }
                     self.flush();
+                    self.last_keyframe_arrival = arrival;
                 } else {
                     log::trace!("[JITTER_BUFFER] Ignoring old frame: {seq}");
+                    // Issue #2201: this keyframe is REJECTED as old/duplicate — it never
+                    // enters the buffer, so it cannot recover the picture even though its
+                    // arrival still proves the publisher responded (the reasoning the #1479
+                    // gate-clear above is built on). Field analysis MUST be able to tell this
+                    // apart from an accepted arrival, or "a keyframe arrived and the freeze
+                    // continued" is ambiguous.
+                    //
+                    // The `frame_type` guard matters: this `else` arm is reached by ANY old
+                    // frame, delta included. Today a stale DELTA cannot corrupt the flag
+                    // because the worker drains the slot immediately after each
+                    // `insert_frame`, so it is already `None` — but `poc_decoder`,
+                    // `bin/main.rs` and the `InjectStaleFrame` test path all insert WITHOUT an
+                    // adjacent drain. Without this guard, a future production caller copying
+                    // one of those would silently stamp `rejected_as_old` on a previously
+                    // ACCEPTED keyframe, inverting the field's meaning in the field log.
+                    if let (FrameType::KeyFrame, Some(arrival)) =
+                        (frame.frame_type, self.last_keyframe_arrival.as_mut())
+                    {
+                        arrival.rejected_as_old = true;
+                    }
                     self.num_consecutive_old_frames += 1;
                     if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
                         log::debug!(
                             "[JITTER_BUFFER] Received {} consecutive old frames. Flushing buffer.",
                             self.num_consecutive_old_frames
                         );
+                        // Same cross-flush preservation as the restart path above.
+                        let arrival = self.last_keyframe_arrival.take();
                         self.flush();
+                        self.last_keyframe_arrival = arrival;
                     }
                 }
                 return;
@@ -1376,36 +1662,16 @@ impl<T> JitterBuffer<T> {
     ///   existing PLI / keyframe-request recovery path (driven from the client when it observes the
     ///   gap) to fetch a fresh keyframe. See TODO(#1020) below re: triggering a PLI from here.
     fn enforce_freshness_deadline(&mut self, current_time_ms: u128, tick_gap_ms: f64) -> bool {
-        // Identify the frame the decoder is currently waiting to release.
-        let head_key = match self.last_decoded_sequence_number {
-            Some(last_seq) => {
-                let next_continuous_seq = last_seq + 1;
-                if self.buffered_frames.contains_key(&next_continuous_seq) {
-                    Some(next_continuous_seq)
-                } else {
-                    // Gap: the decoder is waiting on the next keyframe after the gap. The
-                    // head-of-line wait is measured from the oldest buffered frame, which is what
-                    // actually pins playout.
-                    self.buffered_frames.keys().next().copied()
-                }
-            }
-            // Never decoded yet: head of line is whatever is oldest in the buffer.
-            None => self.buffered_frames.keys().next().copied(),
+        // Arrival-based age (issue #1020): how long the frame the decoder is waiting on has sat in
+        // THIS buffer. This is the SOLE freshness-deadline trip — the deadline is arrival-only.
+        // `None` means an empty buffer, i.e. nothing can be stale.
+        //
+        // Shared with the #2201 keyframe-arrival record via `head_of_line` so the two report the
+        // SAME measure: an arrival's `head_age_ms` and a `freshness_skip`'s must be directly
+        // comparable, which a parallel re-implementation would not guarantee.
+        let Some((head_key, head_age_ms)) = self.head_of_line(current_time_ms) else {
+            return false;
         };
-
-        let Some(head_key) = head_key else {
-            return false; // Empty buffer — nothing can be stale.
-        };
-
-        // Arrival-based age (issue #1020): how long the head sat in THIS buffer. This is the SOLE
-        // freshness-deadline trip — the deadline is arrival-only. Read only the head's arrival time
-        // (a scalar copy) inside the borrow, then drop it so the later `&mut self` skip/evict paths
-        // are unobstructed.
-        let head_arrival_ms = match self.buffered_frames.get(&head_key) {
-            Some(f) => f.arrival_time_ms,
-            None => return false,
-        };
-        let head_age_ms = current_time_ms.saturating_sub(head_arrival_ms) as f64;
 
         if head_age_ms < MAX_PLAYOUT_AGE_MS {
             // Within freshness bounds — normal jitter handling is byte-for-byte unaffected.
@@ -2071,6 +2337,13 @@ impl<T> JitterBuffer<T> {
         self.last_freshness_skip = None;
         self.last_freshness_skip_emit_ms = None;
         self.pending_freshness_skip = None;
+        // Drop any UNDRAINED keyframe arrival (issue #2201): the worker drains this every ~10ms
+        // poll, so at most one poll's worth can be pending, and its `head_age_ms` /
+        // `was_in_keyframe_less_hold` describe a buffer state this flush just destroyed. The
+        // lifetime `keyframe_arrivals` COUNTER is NOT reset — like `governor_skips` below it is a
+        // cumulative metric, and a stream restart does not un-deliver the keyframes that already
+        // arrived.
+        self.last_keyframe_arrival = None;
         // Reset resync-governor runtime state (issue #1252) so a fresh post-flush stream
         // re-accumulates from scratch. The lifetime `governor_skips` counter is NOT reset — it is a
         // cumulative metric.
@@ -5884,6 +6157,521 @@ mod tests {
             requests.load(Ordering::SeqCst),
             2,
             "the poll after a resume PLI is throttle-gated again — the fast-path is one-shot (#1851)"
+        );
+    }
+
+    // ── Keyframe ARRIVAL recording (#2201) ────────────────────────────────────────────
+    //
+    // The receiver branches on `frame_type == KeyFrame` in four places inside insert_frame and recorded the
+    // arrival in NONE of them, so during a freeze no artifact could distinguish "the
+    // publisher's keyframe never reached us" (delivery, e.g. #1699) from "it arrived and
+    // failed to recover the picture" (decode/guard/buffer). These pin the recording.
+
+    /// The load-bearing case: a keyframe arriving DURING a real keyframe-less hold must be
+    /// recorded with `was_in_keyframe_less_hold = true`.
+    ///
+    /// That flag is what turns the record into a recovery/no-recovery datapoint. It is
+    /// sampled BEFORE `insert_frame` clears `keyframe_less_hold_since_ms`; reading it after
+    /// would always report `false` and the record would be useless for exactly the freeze
+    /// case it exists to explain.
+    ///
+    /// The hold is produced through the REAL path — a delta-only backlog aged past
+    /// `MAX_PLAYOUT_AGE_MS` so `find_and_move_continuous_frames` takes the keyframe-less
+    /// branch and sets the clock — NOT by poking the field, so the test cannot pass against
+    /// a buffer that never actually holds.
+    ///
+    /// MUTATION: moving the `KeyframeArrival` construction after the
+    /// `keyframe_less_hold_since_ms = None` clear fails the hold assertion. Deleting the
+    /// recording fails `take_keyframe_arrival`.
+    #[test]
+    fn keyframe_arrival_during_keyframe_less_hold_is_recorded() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+
+        // Decode a keyframe so the buffer has a decode baseline, then drain the record it
+        // produces (that arrival is real, but not the one under test).
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100); // past the playout delay
+        assert!(
+            jb.take_keyframe_arrival().is_some(),
+            "the baseline keyframe is itself an arrival and must be recorded"
+        );
+        assert_eq!(jb.keyframe_arrival_count(), 1);
+
+        // A GAP then a delta-only backlog: nothing is releasable and no keyframe is
+        // buffered, so this is the keyframe-less shape.
+        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 2000);
+
+        // Age the head past MAX_PLAYOUT_AGE_MS (1800ms) so the poll takes the keyframe-less
+        // branch and starts the hold clock.
+        jb.find_and_move_continuous_frames(2000 + 1900);
+        assert!(
+            jb.keyframe_less_hold_since_ms.is_some(),
+            "precondition: the REAL keyframe-less hold clock must be running — otherwise \
+             this test proves nothing about the hold case"
+        );
+
+        // The keyframe lands mid-freeze. This is the arrival the field investigation needs.
+        jb.insert_frame(create_test_frame(6, FrameType::KeyFrame), 2000 + 1950);
+
+        let arrival = jb
+            .take_keyframe_arrival()
+            .expect("a keyframe arrival must be recorded");
+        assert_eq!(arrival.seq, 6);
+        assert!(
+            arrival.was_in_keyframe_less_hold,
+            "the arrival landed DURING a keyframe-less hold and must say so — this is the \
+             field that makes the record a recovery datapoint (#2201): {arrival:?}"
+        );
+        assert!(
+            !arrival.rejected_as_old,
+            "seq 6 is newer than last_decoded, so it is accepted, not rejected: {arrival:?}"
+        );
+        assert_eq!(
+            jb.keyframe_arrival_count(),
+            2,
+            "the counter must advance on every arrival"
+        );
+
+        // And the buffer really did recover the hold state (the #1903 clear still works).
+        assert!(
+            jb.keyframe_less_hold_since_ms.is_none(),
+            "the arriving keyframe must still clear the hold clock (#1903 behaviour \
+             preserved)"
+        );
+    }
+
+    /// A keyframe arriving on a HEALTHY stream must record `was_in_keyframe_less_hold = false`.
+    ///
+    /// Without this the flag could be hardcoded `true` and the test above would still pass,
+    /// leaving the field useless as a discriminator — it only carries information if it can
+    /// read both ways.
+    #[test]
+    fn keyframe_arrival_on_healthy_stream_records_no_hold() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1000);
+
+        let arrival = jb
+            .take_keyframe_arrival()
+            .expect("arrival must be recorded on a healthy stream too");
+        assert!(
+            !arrival.was_in_keyframe_less_hold,
+            "no hold was running, so the flag must read false: {arrival:?}"
+        );
+        assert_eq!(
+            arrival.head_age_ms, 0.0,
+            "an empty buffer pins nothing, so head_age is 0: {arrival:?}"
+        );
+        assert_eq!(
+            arrival.ms_since_keyframe_request, None,
+            "no PLI has been sent on this stream, so the round-trip is None — NOT 0, which \
+             would read as an instant response: {arrival:?}"
+        );
+    }
+
+    /// A keyframe REJECTED as old/duplicate must still be recorded, flagged `rejected_as_old`.
+    ///
+    /// Load-bearing for the delivery-vs-decode question: the arrival proves the publisher
+    /// responded (which is why the #1479 gate-clear precedes the old-frame check), but a
+    /// rejected keyframe never enters the buffer and so cannot recover the picture. Without
+    /// the flag, "a keyframe arrived and the freeze continued" is ambiguous.
+    ///
+    /// MUTATION: deleting the `rejected_as_old = true` stamp fails the flag assertion.
+    #[test]
+    fn rejected_old_keyframe_is_recorded_as_rejected() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+
+        // Decode up to seq 5 so a lower-sequence keyframe is "old". Time must advance past
+        // the playout delay before the poll, or the frame is still held and nothing decodes.
+        jb.insert_frame(create_test_frame(5, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100);
+        assert_eq!(
+            jb.last_decoded_sequence_number,
+            Some(5),
+            "precondition: seq 5 must be DECODED, or nothing below it is `old`"
+        );
+        let _ = jb.take_keyframe_arrival();
+
+        // seq 4 <= last_decoded 5, and the backtrack is far too small to look like a stream
+        // restart, so this is the duplicate/old-keyframe path.
+        jb.insert_frame(create_test_frame(4, FrameType::KeyFrame), 1100);
+
+        let arrival = jb.take_keyframe_arrival().expect(
+            "a REJECTED keyframe still ARRIVED and must be recorded — its arrival is \
+                    what proves the publisher responded",
+        );
+        assert_eq!(arrival.seq, 4);
+        assert!(
+            arrival.rejected_as_old,
+            "the buffer rejected this keyframe, so it cannot recover the picture and the \
+             record must say so: {arrival:?}"
+        );
+        assert_eq!(
+            jb.keyframe_arrival_count(),
+            2,
+            "a rejected arrival still counts — the counter answers `did it REACH us`"
+        );
+    }
+
+    /// A DELTA frame must record nothing. Guards against the recording being hoisted out of
+    /// the `frame_type == KeyFrame` branch, which would bury every real arrival in per-frame
+    /// noise and destroy the counter's meaning.
+    #[test]
+    fn delta_frame_records_no_arrival() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+        jb.insert_frame(create_test_frame(1, FrameType::DeltaFrame), 1000);
+        assert!(
+            jb.take_keyframe_arrival().is_none(),
+            "a delta frame is not a keyframe arrival"
+        );
+        assert_eq!(jb.keyframe_arrival_count(), 0);
+    }
+
+    /// A stale DELTA frame must NOT stamp `rejected_as_old` onto an undrained keyframe
+    /// arrival record.
+    ///
+    /// The old-frame `else` arm is reached by ANY old frame, not just keyframes. Production
+    /// is safe today only because the worker drains the slot immediately after every
+    /// `insert_frame` — but `poc_decoder`, `bin/main.rs` and the `InjectStaleFrame` path all
+    /// insert WITHOUT an adjacent drain, so a future caller copying them would silently
+    /// invert this flag's meaning: an ACCEPTED keyframe would be reported as rejected. This
+    /// pins the `frame_type` guard that prevents it, by reproducing the no-drain shape.
+    ///
+    /// MUTATION: dropping `FrameType::KeyFrame` from the `if let` tuple pattern makes the
+    /// delta stamp the record and fails the assertion.
+    #[test]
+    fn stale_delta_does_not_stamp_rejected_as_old_on_a_pending_arrival() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+
+        // Decode up to seq 5 so anything at/below it is "old".
+        jb.insert_frame(create_test_frame(5, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100); // past the playout delay
+        assert_eq!(jb.last_decoded_sequence_number, Some(5));
+
+        // A keyframe arrives and is ACCEPTED (seq 6 > 5). Deliberately do NOT drain it —
+        // this is the no-adjacent-drain shape the non-worker callers use.
+        jb.insert_frame(create_test_frame(6, FrameType::KeyFrame), 1200);
+
+        // Now a STALE DELTA arrives (seq 3 <= 5) and takes the old-frame reject path.
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), 1300);
+
+        let arrival = jb
+            .take_keyframe_arrival()
+            .expect("the accepted keyframe's record must still be pending");
+        assert_eq!(
+            arrival.seq, 6,
+            "the record is still the KEYFRAME's, not the delta's"
+        );
+        assert!(
+            !arrival.rejected_as_old,
+            "a stale DELTA must not mark an ACCEPTED keyframe as rejected — that would \
+             invert the flag's meaning in the field log: {arrival:?}"
+        );
+        assert_eq!(
+            jb.keyframe_arrival_count(),
+            2,
+            "the delta must not be counted as an arrival either"
+        );
+    }
+
+    /// A single arrival is drained EXACTLY ONCE, even though the worker drains from two
+    /// places (the insert path and the ~10ms poll).
+    ///
+    /// `bin/worker_decoder.rs` posts an arrival from `insert_frame_to_jitter_buffer` AND
+    /// from `check_jitter_buffer_for_ready_frames` (the latter as a backstop for the
+    /// test-only `InjectStaleFrame` path, which also inserts). Both call
+    /// `take_keyframe_arrival`, so a regression that made the drain non-consuming — e.g.
+    /// switching to a `clone()`-style read — would post the SAME arrival twice and double
+    /// every line in the field log this signal is read from. `Option::take` guarantees it
+    /// cannot; this pins that guarantee rather than trusting it.
+    #[test]
+    fn an_arrival_is_drained_exactly_once() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+
+        assert!(
+            jb.take_keyframe_arrival().is_some(),
+            "the first drain (the insert path) must see the arrival"
+        );
+        assert!(
+            jb.take_keyframe_arrival().is_none(),
+            "the second drain (the poll backstop) must see NOTHING — a non-consuming \
+             drain would double-post every arrival into the field log"
+        );
+        // The lifetime counter is unaffected by draining: it counts arrivals, not posts.
+        assert_eq!(jb.keyframe_arrival_count(), 1);
+    }
+
+    /// The arrival COUNTER must survive `flush()` (it is a cumulative metric), while the
+    /// undrained per-arrival RECORD must not (its buffer-state fields describe a buffer the
+    /// flush destroyed).
+    ///
+    /// MUTATION: resetting `keyframe_arrivals` in `flush()` fails the counter assertion;
+    /// leaving `last_keyframe_arrival` set fails the record assertion.
+    #[test]
+    fn flush_preserves_the_counter_but_drops_an_undrained_record() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        assert_eq!(jb.keyframe_arrival_count(), 1);
+
+        jb.flush();
+
+        assert_eq!(
+            jb.keyframe_arrival_count(),
+            1,
+            "the lifetime counter is a cumulative metric: a stream restart does not \
+             un-deliver keyframes that already arrived"
+        );
+        assert!(
+            jb.take_keyframe_arrival().is_none(),
+            "an undrained record describes pre-flush buffer state and must be dropped"
+        );
+    }
+
+    /// A STREAM-RESTART keyframe (old sequence, large backtrack) triggers an internal
+    /// `flush()` — but its arrival must still be reported.
+    ///
+    /// This is the single most interesting arrival there is: it is what ENDS a
+    /// publisher-restart freeze. Because `flush()` legitimately clears
+    /// `last_keyframe_arrival`, without the explicit take/restore around it this would be
+    /// the one arrival never reported — a silent hole in exactly the recovery case.
+    ///
+    /// MUTATION: removing the take/restore around the STREAM-RESTART `self.flush()` fails
+    /// this. The OTHER `flush()` (the consecutive-old-frames path) is covered separately by
+    /// `consecutive_old_frames_flush_preserves_a_pending_arrival` — an earlier version of this
+    /// comment claimed "either" call, which was FALSE: removing the second one left all tests
+    /// green. Measured, not predicted.
+    #[test]
+    fn stream_restart_keyframe_arrival_survives_the_internal_flush() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+
+        // Decode far along so a low-sequence keyframe reads as a publisher restart.
+        let far = STREAM_RESTART_BACKTRACK_THRESHOLD + 100;
+        jb.insert_frame(create_test_frame(far, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100); // past the playout delay
+        assert_eq!(
+            jb.last_decoded_sequence_number,
+            Some(far),
+            "precondition: the far keyframe must be DECODED so seq 1 reads as a restart"
+        );
+        let _ = jb.take_keyframe_arrival();
+
+        // The publisher restarted: sequence resets to 1, a backtrack well past the
+        // threshold, so `insert_frame` flushes.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 2000);
+        assert_eq!(
+            jb.last_decoded_sequence_number, None,
+            "precondition: the restart path must actually have flushed"
+        );
+
+        let arrival = jb.take_keyframe_arrival().expect(
+            "the RESTART keyframe arrival must survive the internal flush — it is what ends \
+             a publisher-restart freeze, so losing it would blind the recovery case",
+        );
+        assert_eq!(arrival.seq, 1);
+        assert!(
+            arrival.stream_restart,
+            "the restart arrival must be flagged as such: it was DISCARDED (flush-and-return, \
+             never inserted), so `rejected_as_old: false` alone would read as an ordinary \
+             accepted arrival and hide the discard: {arrival:?}"
+        );
+        assert!(
+            !arrival.rejected_as_old,
+            "it is a restart, not a duplicate rejection — the two outcomes are distinct: \
+             {arrival:?}"
+        );
+        assert_eq!(
+            jb.keyframe_arrival_count(),
+            2,
+            "the restart arrival counts too"
+        );
+    }
+
+    /// The CONSECUTIVE-OLD-FRAMES flush must also preserve a pending arrival record.
+    ///
+    /// `insert_frame` has TWO internal `flush()` calls, and both clear
+    /// `last_keyframe_arrival`. The stream-restart one is covered above; this covers the
+    /// other — reached when more than `MAX_CONSECUTIVE_OLD_FRAMES` old frames arrive in a row.
+    ///
+    /// This test exists because the restart test's MUTATION comment claimed it covered
+    /// "either" flush, and removing the take/restore from THIS one left all tests green. The
+    /// claim was false; this closes the gap it papered over.
+    ///
+    /// MUTATION: removing the take/restore around the consecutive-old-frames `self.flush()`
+    /// fails this.
+    #[test]
+    fn consecutive_old_frames_flush_preserves_a_pending_arrival() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+
+        // Decode seq 1000 so a stream of low-sequence frames reads as "old" WITHOUT looking
+        // like a stream restart (the restart path needs a KEYFRAME; deltas never take it).
+        jb.insert_frame(create_test_frame(1000, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1000));
+
+        // An ACCEPTED keyframe (seq 1001 > 1000) whose record we deliberately leave undrained.
+        jb.insert_frame(create_test_frame(1001, FrameType::KeyFrame), 1200);
+        assert_eq!(jb.keyframe_arrival_count(), 2);
+
+        // Now drive PAST the threshold with old DELTAS so the counter trips the second flush.
+        // All share seq 5 (<= 1000), so each increments `num_consecutive_old_frames`.
+        for _ in 0..=MAX_CONSECUTIVE_OLD_FRAMES {
+            jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1300);
+        }
+        assert_eq!(
+            jb.last_decoded_sequence_number, None,
+            "precondition: the consecutive-old-frames flush must actually have fired"
+        );
+
+        let arrival = jb.take_keyframe_arrival().expect(
+            "the pending arrival must survive the consecutive-old-frames flush — otherwise a \
+             keyframe that DID arrive goes unreported whenever a stale-delta burst follows it",
+        );
+        assert_eq!(arrival.seq, 1001);
+        assert!(
+            !arrival.rejected_as_old,
+            "the preserved record is the ACCEPTED keyframe's; the old deltas must not have \
+             stamped it: {arrival:?}"
+        );
+    }
+
+    /// `ms_since_keyframe_request` must report the age of the last ATTEMPTED PLI — the bound
+    /// that narrows or eliminates #1699 (WS keyframe delivery head-of-line) for a freeze a
+    /// keyframe did not end. It is an upper bound, not a confirmed round-trip: the request
+    /// may have been shed downstream with no ACK back to the buffer (see the field's doc).
+    ///
+    /// The request timestamp is set through the REAL proactive-request path (the stream-open
+    /// one-shot in `insert_frame`), not by writing the field.
+    ///
+    /// MUTATION: hardcoding `ms_since_keyframe_request: None` fails this.
+    #[test]
+    fn arrival_reports_the_pli_round_trip() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+
+        // A never-decoded delta-only backlog fires the stream-open keyframe request
+        // (issue 1899), which anchors `last_keyframe_request_ms` at this arrival time.
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 5000);
+        assert_eq!(
+            jb.last_keyframe_request_ms,
+            Some(5000),
+            "precondition: the REAL stream-open request path must have anchored the clock"
+        );
+        assert!(
+            jb.awaiting_proactive_keyframe,
+            "precondition: the #1479 arrival gate must be open (a request is in flight)"
+        );
+
+        // The keyframe answers 250ms later.
+        jb.insert_frame(create_test_frame(3, FrameType::KeyFrame), 5250);
+
+        let arrival = jb
+            .take_keyframe_arrival()
+            .expect("arrival must be recorded");
+        assert_eq!(
+            arrival.ms_since_keyframe_request,
+            Some(250.0),
+            "the PLI round-trip is the #1699 discriminator: {arrival:?}"
+        );
+        assert!(
+            arrival.was_awaiting_proactive_keyframe,
+            "this arrival answered an outstanding request; the flag is sampled BEFORE the \
+             #1479 gate closes, so reading it after would always be false: {arrival:?}"
+        );
+    }
+
+    /// The arrival's `head_age_ms` must be the SAME head-of-line measure the freshness
+    /// deadline trips on, since the two are diffed against each other in field logs.
+    ///
+    /// Pins the shared `head_of_line` helper: this asserts the arrival's value against the
+    /// age that a `freshness_skip` produced from the identical buffer state, so a future
+    /// re-implementation that drifts fails here rather than silently invalidating the
+    /// comparison.
+    #[test]
+    fn arrival_head_age_matches_the_freshness_deadline_measure() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100); // past the playout delay
+        let _ = jb.take_keyframe_arrival();
+
+        // Delta-only backlog arriving at t=2000, aged to t=3900 (head_age = 1900ms, past the
+        // 1800ms deadline) so the poll emits a skip carrying its own head_age.
+        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 2000);
+        jb.find_and_move_continuous_frames(3900);
+        let skip = jb
+            .take_freshness_skip()
+            .expect("the aged backlog must trip the freshness deadline");
+
+        // The evicted-backlog case leaves the buffer empty, so re-form the SAME shape and
+        // read the arrival's view of it at the same instant.
+        jb.insert_frame(create_test_frame(6, FrameType::DeltaFrame), 2000);
+        jb.insert_frame(create_test_frame(7, FrameType::KeyFrame), 3900);
+        let arrival = jb
+            .take_keyframe_arrival()
+            .expect("arrival must be recorded");
+
+        assert_eq!(
+            arrival.head_age_ms, skip.head_age_ms,
+            "the arrival and the skip must report the same head-of-line age from the same \
+             buffer state — they are compared directly in field logs (arrival={arrival:?}, \
+             skip_head_age={})",
+            skip.head_age_ms
+        );
+        assert_eq!(arrival.head_age_ms, 1900.0, "sanity: 3900 - 2000 = 1900ms");
+    }
+
+    /// `head_of_line` measures the age of the frame playout is BLOCKED ON.
+    ///
+    /// Scope note, because I tried twice to pin something stronger and both attempts passed
+    /// under a mutation that disables the next-contiguous branch (`if false && contains_key`).
+    /// Probing the buffer explained it: the fallback is `buffered_frames.keys().next()` — the
+    /// SMALLEST key — and the contiguous candidate is `last_decoded + 1`. Any buffered frame
+    /// below that has already been released or dropped, so whenever the contiguous frame is
+    /// present it IS the smallest key and both branches return the same value by construction.
+    /// No reachable buffer state separates them through this return value; the branch is a
+    /// fast path, not a semantic difference. Recording that instead of shipping a test whose
+    /// stated mutation does not fail.
+    ///
+    /// What IS guaranteed, and what the sibling
+    /// `arrival_head_age_matches_the_freshness_deadline_measure` rests on: the arrival record
+    /// and the freshness deadline call this ONE function, so their `head_age_ms` cannot drift.
+    /// That is structural (a single definition, two call sites), not assertable.
+    ///
+    /// MUTATION: returning the newest buffered frame instead of the awaited one, or measuring
+    /// from the wrong arrival time, fails this. Dropping the empty-buffer `None` also fails.
+    #[test]
+    fn head_of_line_measures_from_the_frame_the_decoder_awaits() {
+        let (mut jb, _frames) = create_test_jitter_buffer();
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+
+        // Two buffered frames with DIFFERENT arrival times: seq 2 (what playout waits on,
+        // arrived 2000) and seq 9 (a later-sequence frame that arrived EARLIER, 1300).
+        jb.insert_frame(create_test_frame(9, FrameType::DeltaFrame), 1300);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 2000);
+
+        let (head_key, head_age) = jb
+            .head_of_line(2500)
+            .expect("a non-empty buffer must report a head");
+        assert_eq!(
+            head_key, 2,
+            "the head is the frame playout is blocked on (seq 2), NOT the newest buffered (9)"
+        );
+        assert_eq!(
+            head_age, 500.0,
+            "age comes from THAT frame's arrival (2500-2000=500); using seq 9's would report \
+             1200ms and overstate staleness by 700ms"
+        );
+
+        // Empty buffer => no head. The freshness deadline relies on this `None` to return
+        // early rather than report a bogus age.
+        jb.flush();
+        assert!(
+            jb.head_of_line(2500).is_none(),
+            "an empty buffer pins nothing and must report no head"
         );
     }
 }

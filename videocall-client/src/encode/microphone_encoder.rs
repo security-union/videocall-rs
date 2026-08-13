@@ -2231,10 +2231,14 @@ impl MicrophoneEncoder {
 
             // LOCAL user Voice Activity Detection (VAD) via AnalyserNode.
             //
-            // This runs every 100ms and computes the RMS energy of the
+            // This runs every `VAD_POLL_INTERVAL_MS` (50ms, see
+            // videocall-aq/src/constants.rs) and computes the RMS energy of the
             // microphone's time-domain signal.  The resulting `is_speaking`
-            // flag is included in the 1Hz heartbeat so that *remote* peers
-            // can show a speaking indicator for this user.
+            // flag rides the heartbeat packet so that *remote* peers can show a
+            // speaking indicator for this user: a transition sends one
+            // immediately (`Connection::set_speaking` ->
+            // `send_immediate_heartbeat`), otherwise it refreshes on the 5s
+            // `HEARTBEAT_KEEPALIVE_INTERVAL_MS` keepalive.
             let vad_interval = Interval::new(VAD_POLL_INTERVAL_MS, move || {
                 if !enabled_check.load(Ordering::Acquire) || switching_check.load(Ordering::Acquire)
                 {
@@ -2272,7 +2276,8 @@ impl MicrophoneEncoder {
                 log::trace!("VAD: RMS={:.4}, speaking={}", rms, speaking);
 
                 // Only propagate when the speaking state actually changes to
-                // avoid unnecessary callback emissions every 100ms.
+                // avoid a callback emission on every `VAD_POLL_INTERVAL_MS`
+                // (50ms) tick.
                 let prev = is_speaking_clone.load(Ordering::Relaxed);
                 if speaking != prev {
                     is_speaking_clone.store(speaking, Ordering::Relaxed);
@@ -3686,6 +3691,23 @@ mod layer_count_tests {
 
     #[test]
     fn screen_transport_distress_alone_does_not_step_audio() {
+        // The transport counters this reads are PROCESS-GLOBAL, and libtest runs this
+        // crate's plain `#[test]`s on a multi-threaded pool. The whole point of the
+        // test is that the AUDIO-attributed (`MediaStreamKey::Audio` == key 1)
+        // readings stay FLAT while SCREEN (`MediaStreamKey::Screen` == key 3, see
+        // `connection::webmedia::MediaStreamKey::as_u8`) pressure is injected — a
+        // concurrent test bumping any key-1 counter between `audio_before` and
+        // `audio_after` would break it non-deterministically.
+        //
+        // The guard makes the before/inject/after sequence atomic with respect to
+        // other GUARD-TAKERS. It cannot do more: the counters' accessors are lock-free
+        // and live in `videocall-transport`, so an unguarded writer would still race.
+        // The other writers are `videocall-transport`'s netsim-gated `force_*`
+        // helpers, several of which also target the audio stream key; none is called
+        // from a test today, so the guard is FORWARD-LOOKING — it is what a second
+        // netsim-driven test must also take. Held until the test returns.
+        let _tx_guard = crate::test_serial::lock_transport_stream_counters();
+
         let audio_before = current_audio_uplink_counter_values();
         let aggregate_sat_before = videocall_transport::webtransport::unistream_ready_stall_count();
         let aggregate_ws_before = videocall_transport::websocket::websocket_drop_count();

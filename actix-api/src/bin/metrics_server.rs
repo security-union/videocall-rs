@@ -37,6 +37,13 @@ struct SessionInfo {
     // #1561: (peer_session_id, media_kind) pairs we have published RECEIVED_LAYER for.
     // Diffed each packet to remove stale series when a constraint clears.
     received_layer_peers: HashSet<(String, String)>,
+    // #2170: camera rung ids with live geometry series. Diffed each packet so a
+    // narrowed/off ladder cannot leave stale per-layer gauges behind.
+    //
+    // Keyed by rung ALONE: the ENCODER_LAYER_* families take a `media_kind` label but
+    // only ever receive "camera". Adding screen geometry to them requires switching this
+    // to (media_kind, rung) first, or the sweep leaves the other kind's series stale.
+    camera_layer_ids: HashSet<u32>,
     // Issue 2047: [direction, stream, from_tier, to_tier, trigger] tuples we have
     // published TIER_TRANSITIONS_TOTAL for, so the session's series can be reaped
     // on departure. Bounded by the label allowlist, so this set cannot grow with
@@ -45,6 +52,15 @@ struct SessionInfo {
 }
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
+
+const MAX_CAMERA_LAYER_GEOMETRY_PER_PACKET: usize = videocall_aq::constants::SIMULCAST_MAX_LAYERS;
+// Sanity ceiling for a client-reported fps, NOT any encoder's real maximum. The 4x is
+// a defensive round number: the single-stream path (`layer_fps == None`) follows capture
+// cadence, so the value it must not reject is capture-bounded, not ladder-bounded.
+const MAX_PLAUSIBLE_CAMERA_LAYER_OUTPUT_FPS: u32 = videocall_aq::constants::SIMULCAST_VIDEO_LAYERS
+    [videocall_aq::constants::SIMULCAST_MAX_LAYERS - 1]
+    .target_fps
+    * 4;
 
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
@@ -61,7 +77,9 @@ use sec_api::metrics::{
     CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES,
     DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP,
     DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
-    DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS,
+    DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS,
+    ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL, ENCODER_LAYER_HEIGHT, ENCODER_LAYER_OUTPUT_FPS,
+    ENCODER_LAYER_PIXELS, ENCODER_LAYER_PIXEL_RATE, ENCODER_LAYER_WIDTH, ENCODER_OUTPUT_FPS,
     ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
     KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
@@ -71,15 +89,16 @@ use sec_api::metrics::{
     RTT_PROBE_DROPPED_TOTAL, RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_ENCODER_MAX_STALL_GAP_MS,
     SCREEN_ENCODER_OUTPUT_FPS, SCREEN_ENCODER_STALL_EPISODES, SCREEN_SHARING_ACTIVE,
     SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS,
-    SCREEN_VIDEO_PLAYOUT_LATENCY_MS, SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS,
-    SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS, SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_DROPPED_TOTAL, TIER_TRANSITIONS_TOTAL,
-    UNISTREAM_BYTES_DRAINED_TOTAL, UNISTREAM_BYTES_OFFERED_TOTAL,
-    UNISTREAM_STALE_DELTA_DROPS_TOTAL, VIDEOCALL_PEER_INFO, VIDEO_BITRATE_KBPS,
-    VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS,
-    VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE,
-    VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
-    WT_INCOMING_DATAGRAM_HIGH_WATER_MARK, WT_INCOMING_DATAGRAM_MAX_AGE_MS,
+    SCREEN_VIDEO_KEYFRAME_ARRIVALS_TOTAL, SCREEN_VIDEO_PLAYOUT_LATENCY_MS,
+    SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS, SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS,
+    SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
+    TIER_TRANSITIONS_DROPPED_TOTAL, TIER_TRANSITIONS_TOTAL, UNISTREAM_BYTES_DRAINED_TOTAL,
+    UNISTREAM_BYTES_OFFERED_TOTAL, UNISTREAM_STALE_DELTA_DROPS_TOTAL, VIDEOCALL_PEER_INFO,
+    VIDEO_BITRATE_KBPS, VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
+    VIDEO_KEYFRAME_ARRIVALS_TOTAL, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
+    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC,
+    VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS, WT_INCOMING_DATAGRAM_HIGH_WATER_MARK,
+    WT_INCOMING_DATAGRAM_MAX_AGE_MS,
 };
 
 async fn metrics_handler(
@@ -328,6 +347,17 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         let _ = ENCODER_EFFECTIVE_LAYERS.remove_label_values(&layer_labels);
         let _ = ENCODER_ACTIVE_LAYERS.remove_label_values(&layer_labels);
     }
+    for layer_id in &session_info.camera_layer_ids {
+        let layer = layer_id.to_string();
+        let labels = [
+            session_info.meeting_id.as_str(),
+            session_info.session_id.as_str(),
+            session_info.reporting_user_id.as_str(),
+            "camera",
+            layer.as_str(),
+        ];
+        remove_camera_layer_metrics(&labels);
+    }
 
     // #1561: Audio congestion ceiling (4-label reporter gauge)
     let _ = AUDIO_CONGESTION_CEILING.remove_label_values(&reporter_labels);
@@ -518,6 +548,9 @@ fn remove_per_peer_metrics(
     let _ = VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
     let _ = VIDEO_CONTENT_STALENESS_MS.remove_label_values(&labels);
     let _ = VIDEO_SKIP_TO_LIVE_TOTAL.remove_label_values(&labels);
+    // #2201: GC the keyframe-arrival counter with its per-pair siblings, or a departed pair's
+    // series would linger forever (it shares their exact label set).
+    let _ = VIDEO_KEYFRAME_ARRIVALS_TOTAL.remove_label_values(&labels);
     let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
@@ -532,6 +565,8 @@ fn remove_per_peer_metrics(
     let _ = SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
     let _ = SCREEN_VIDEO_CONTENT_STALENESS_MS.remove_label_values(&labels);
     let _ = SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL.remove_label_values(&labels);
+    // #2201: screen sibling of the arrival-counter GC above.
+    let _ = SCREEN_VIDEO_KEYFRAME_ARRIVALS_TOTAL.remove_label_values(&labels);
 
     // NOTE: RECEIVED_LAYER is intentionally NOT reaped here. Its series are
     // reaped authoritatively from the #1561 tracked set
@@ -665,6 +700,14 @@ fn bounded_tier_name(raw: &str) -> &str {
     }
 }
 
+fn remove_camera_layer_metrics(labels: &[&str; 5]) {
+    let _ = ENCODER_LAYER_WIDTH.remove_label_values(labels);
+    let _ = ENCODER_LAYER_HEIGHT.remove_label_values(labels);
+    let _ = ENCODER_LAYER_PIXELS.remove_label_values(labels);
+    let _ = ENCODER_LAYER_OUTPUT_FPS.remove_label_values(labels);
+    let _ = ENCODER_LAYER_PIXEL_RATE.remove_label_values(labels);
+}
+
 /// Guard for every CLIENT-REPORTED floating-point telemetry sample (issue 2047).
 ///
 /// Prometheus gauges and histograms accept any `f64`, including `NaN` and
@@ -740,6 +783,9 @@ fn process_health_packet_to_metrics_pb(
     // the series would be missing from /metrics entirely until the first bad
     // sample, and a dashboard panel would read "No data" instead of 0.
     NON_FINITE_SAMPLES_DROPPED_TOTAL.inc_by(0.0);
+    // Same for the issue-2170 geometry rejection counter: its only other derefs are the
+    // two rejection branches below, so /metrics would omit the series until first abuse.
+    ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.inc_by(0.0);
 
     let meeting_id = if health_packet.meeting_id.is_empty() {
         "unknown"
@@ -791,6 +837,7 @@ fn process_health_packet_to_metrics_pb(
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                camera_layer_ids: HashSet::new(),
                 tier_transition_labels: HashSet::new(),
             });
         info.last_seen = Instant::now();
@@ -1317,6 +1364,83 @@ fn process_health_packet_to_metrics_pb(
                 .set(layers as f64);
         }
 
+        // #2170: client-authored repeated input is bounded before validation or
+        // metric work. Only packed-publisher dimensions and the real ladder id
+        // taxonomy are accepted.
+        let geometries = &health_packet.camera_layer_geometry;
+        if geometries.len() > MAX_CAMERA_LAYER_GEOMETRY_PER_PACKET {
+            let excess = geometries.len() - MAX_CAMERA_LAYER_GEOMETRY_PER_PACKET;
+            ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.inc_by(excess as f64);
+            debug!(
+                "Dropped {} excess camera_layer_geometry entries for meeting={} session={}",
+                excess, meeting_id, session_id
+            );
+        }
+        let mut current_layer_ids = HashSet::new();
+        for geometry in geometries.iter().take(MAX_CAMERA_LAYER_GEOMETRY_PER_PACKET) {
+            if geometry.layer_id >= videocall_aq::constants::SIMULCAST_MAX_LAYERS as u32
+                || geometry.width == 0
+                || geometry.height == 0
+                || geometry.width > u16::MAX as u32
+                || geometry.height > u16::MAX as u32
+                || geometry
+                    .output_fps
+                    .is_some_and(|fps| fps > MAX_PLAUSIBLE_CAMERA_LAYER_OUTPUT_FPS)
+            {
+                ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.inc();
+                continue;
+            }
+
+            let layer = geometry.layer_id.to_string();
+            let labels = [
+                meeting_id,
+                session_id,
+                reporting_user_id,
+                "camera",
+                layer.as_str(),
+            ];
+            let pixels = u64::from(geometry.width) * u64::from(geometry.height);
+            ENCODER_LAYER_WIDTH
+                .with_label_values(&labels)
+                .set(geometry.width as f64);
+            ENCODER_LAYER_HEIGHT
+                .with_label_values(&labels)
+                .set(geometry.height as f64);
+            ENCODER_LAYER_PIXELS
+                .with_label_values(&labels)
+                .set(pixels as f64);
+            if let Some(fps) = geometry.output_fps {
+                ENCODER_LAYER_OUTPUT_FPS
+                    .with_label_values(&labels)
+                    .set(fps as f64);
+                ENCODER_LAYER_PIXEL_RATE
+                    .with_label_values(&labels)
+                    .set((pixels * u64::from(fps)) as f64);
+            } else {
+                let _ = ENCODER_LAYER_OUTPUT_FPS.remove_label_values(&labels);
+                let _ = ENCODER_LAYER_PIXEL_RATE.remove_label_values(&labels);
+            }
+            current_layer_ids.insert(geometry.layer_id);
+        }
+
+        {
+            let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(info) = tracker.get_mut(&session_key) {
+                for layer_id in info.camera_layer_ids.difference(&current_layer_ids) {
+                    let layer = layer_id.to_string();
+                    let labels = [
+                        meeting_id,
+                        session_id,
+                        reporting_user_id,
+                        "camera",
+                        layer.as_str(),
+                    ];
+                    remove_camera_layer_metrics(&labels);
+                }
+                info.camera_layer_ids = current_layer_ids;
+            }
+        }
+
         // #1561: Screen encoder simulcast layer counts
         if let Some(layers) = health_packet.effective_screen_layers {
             ENCODER_EFFECTIVE_LAYERS
@@ -1776,12 +1900,20 @@ fn process_health_packet_to_metrics_pb(
                     // `!= 0` guard to either side: the camera/screen split here is not a
                     // difference in meaning, and the guard that used to sit on camera was the bug.
                     //
-                    // Why 0 is a REAL reading, not "not measured": both fields ride the SAME
+                    // Why 0 is a REAL reading, not "not measured": both fields ride the same
                     // per-heartbeat DiagEvent (`diagnostics_manager.rs::send_diagnostic_packets`),
-                    // which substitutes `(0.0, 0.0, 0.0)` for (fps, bitrate, decode_errors) once a
-                    // tracker has seen no frame for longer than its staleness window (a bare
-                    // `1000.0` ms literal there, not a named constant), and the client folds both
-                    // into the proto unconditionally (`health_reporter.rs`, camera video mapping).
+                    // which substitutes 0 for a value whose source has been idle longer than its
+                    // staleness window (a bare `1000.0` ms literal there, not a named constant),
+                    // and the client folds both into the proto unconditionally
+                    // (`health_reporter.rs`, camera video mapping).
+                    //
+                    // Issue #2190 — the two now have INDEPENDENT staleness clocks, so they can
+                    // legitimately disagree: fps keys off the last DECODED frame, while bitrate
+                    // keys off the last ARRIVING packet (a wrong-rung simulcast packet, or one for
+                    // a hidden/off-budget tile, arrives and is billed but never decodes). A live
+                    // bitrate alongside fps 0 is therefore a MEANINGFUL reading — this receiver is
+                    // consuming downlink without decoding — not an inconsistency to reconcile.
+                    // Both reach 0 only once arrivals themselves stop.
                     // So a genuine 0 reaches this line and MUST be published: the only removal of
                     // these series is `remove_per_peer_metrics`, which is disconnect/peer-departure
                     // GC (#1092), NOT a staleness sweep. Guarding on `!= 0` therefore did not make
@@ -1850,6 +1982,24 @@ fn process_health_packet_to_metrics_pb(
                     VIDEO_SKIP_TO_LIVE_TOTAL
                         .with_label_values(&peer_labels)
                         .set(video_stats.playout_skip_to_live_total as f64);
+                    // Keyframe ARRIVALS (#2201): cumulative COUNTER in a gauge, GUARDED on
+                    // presence — UNLIKE the unconditional counters above. `optional` in the
+                    // proto so a pre-#2201 client is ABSENT rather than 0: publishing 0 for an
+                    // old client would read as total keyframe delivery loss during a staged
+                    // rollout (see the proto comment). Mirrors how
+                    // `keyframe_requests_sent_total` is guarded.
+                    //
+                    // Do NOT diff this against `videocall_keyframe_requests_sent_total` — that
+                    // is a process-wide client counter over all peers and both media kinds,
+                    // most arrivals here are unrequested PERIODIC keyframes (so a healthy call
+                    // drives the difference negative), and the two reset on different
+                    // boundaries. See the `VIDEO_KEYFRAME_ARRIVALS_TOTAL` doc in `metrics.rs`
+                    // for how to read it instead.
+                    if let Some(arrivals) = video_stats.keyframe_arrivals_total {
+                        VIDEO_KEYFRAME_ARRIVALS_TOTAL
+                            .with_label_values(&peer_labels)
+                            .set(arrivals as f64);
+                    }
                 }
 
                 // Screen video metrics (separate from camera)
@@ -1905,6 +2055,13 @@ fn process_health_packet_to_metrics_pb(
                     SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL
                         .with_label_values(&peer_labels)
                         .set(screen_stats.playout_skip_to_live_total as f64);
+                    // Keyframe ARRIVALS for the screen stream (#2201): see the camera sibling.
+                    // #2201: presence-guarded, see the camera sibling.
+                    if let Some(arrivals) = screen_stats.keyframe_arrivals_total {
+                        SCREEN_VIDEO_KEYFRAME_ARRIVALS_TOTAL
+                            .with_label_values(&peer_labels)
+                            .set(arrivals as f64);
+                    }
                 }
 
                 // Decode errors
@@ -2149,11 +2306,13 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use videocall_types::protos::health_packet::{
-        HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
-        NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
-        PeerStats as PbPeerStats, TierTransition as PbTierTransition, VideoStats as PbVideoStats,
+        EncoderLayerGeometry as PbEncoderLayerGeometry, HealthPacket as PbHealthPacket,
+        NetEqNetwork as PbNetEqNetwork, NetEqOperationCounters as PbNetEqOperationCounters,
+        NetEqStats as PbNetEqStats, PeerStats as PbPeerStats, TierTransition as PbTierTransition,
+        VideoStats as PbVideoStats,
     };
 
     #[test]
@@ -2197,6 +2356,20 @@ mod tests {
             .as_millis() as u64;
         hp.peer_stats = peer_stats;
         hp
+    }
+
+    fn camera_geometry(
+        layer_id: u32,
+        width: u32,
+        height: u32,
+        output_fps: Option<u32>,
+    ) -> PbEncoderLayerGeometry {
+        let mut geometry = PbEncoderLayerGeometry::new();
+        geometry.layer_id = layer_id;
+        geometry.width = width;
+        geometry.height = height;
+        geometry.output_fps = output_fps;
+        geometry
     }
 
     fn series_exists(metric_name: &str, expected_labels: &[(&str, &str)]) -> bool {
@@ -2558,6 +2731,216 @@ mod tests {
             None,
             "#2147: an absent field must not mint a fabricated 0 series"
         );
+    }
+
+    #[test]
+    #[serial(camera_geometry)]
+    fn camera_layer_geometry_ingest_is_bounded_and_counted() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let mut packet = create_test_health_packet(
+            "s_geo_bound_2170",
+            "m_geo_bound_2170",
+            "p_geo_bound_2170",
+            HashMap::new(),
+        );
+        packet.camera_layer_geometry = vec![
+            camera_geometry(0, 241, 181, Some(7)),
+            camera_geometry(1, 481, 361, Some(15)),
+            camera_geometry(2, 613, 461, Some(30)),
+            camera_geometry(0, 999, 777, Some(60)),
+        ];
+        let dropped_before = ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.get();
+        process_health_packet_to_metrics_pb(&packet, &tracker).unwrap();
+
+        assert_eq!(
+            ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.get() - dropped_before,
+            1.0
+        );
+        assert_eq!(
+            gauge_value(
+                "videocall_encoder_layer_width",
+                &[
+                    ("meeting_id", "m_geo_bound_2170"),
+                    ("session_id", "s_geo_bound_2170"),
+                    ("peer_id", "p_geo_bound_2170"),
+                    ("media_kind", "camera"),
+                    ("layer", "0"),
+                ],
+            ),
+            Some(241.0),
+            "the entry beyond the cap must never overwrite an accepted rung"
+        );
+    }
+
+    #[test]
+    #[serial(camera_geometry)]
+    fn invalid_camera_geometry_dimensions_and_layer_ids_are_rejected() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let invalid = [
+            camera_geometry(0, 0, 180, Some(7)),
+            camera_geometry(0, u16::MAX as u32 + 1, 180, Some(7)),
+            camera_geometry(0, 320, 0, Some(7)),
+            camera_geometry(0, 320, u16::MAX as u32 + 1, Some(7)),
+            camera_geometry(
+                videocall_aq::constants::SIMULCAST_MAX_LAYERS as u32,
+                320,
+                180,
+                Some(7),
+            ),
+        ];
+        let dropped_before = ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.get();
+        for (index, geometry) in invalid.into_iter().enumerate() {
+            let mut packet = create_test_health_packet(
+                &format!("s_geo_invalid_{index}_2170"),
+                "m_geo_invalid_2170",
+                "p_geo_invalid_2170",
+                HashMap::new(),
+            );
+            packet.camera_layer_geometry.push(geometry);
+            process_health_packet_to_metrics_pb(&packet, &tracker).unwrap();
+            assert!(!series_exists(
+                "videocall_encoder_layer_width",
+                &[("session_id", &format!("s_geo_invalid_{index}_2170"))],
+            ));
+        }
+        assert_eq!(
+            ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.get() - dropped_before,
+            5.0
+        );
+    }
+
+    #[test]
+    #[serial(camera_geometry)]
+    fn camera_layer_fps_presence_controls_pixel_rate_and_validates_values() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let mut packet = create_test_health_packet(
+            "s_geo_fps_2170",
+            "m_geo_fps_2170",
+            "p_geo_fps_2170",
+            HashMap::new(),
+        );
+        packet.camera_layer_geometry = vec![
+            camera_geometry(0, 320, 180, None),
+            camera_geometry(1, 640, 360, Some(0)),
+            camera_geometry(2, 1280, 720, Some(30)),
+        ];
+        process_health_packet_to_metrics_pb(&packet, &tracker).unwrap();
+
+        let labels = |layer| {
+            [
+                ("meeting_id", "m_geo_fps_2170"),
+                ("session_id", "s_geo_fps_2170"),
+                ("peer_id", "p_geo_fps_2170"),
+                ("media_kind", "camera"),
+                ("layer", layer),
+            ]
+        };
+        assert_eq!(
+            gauge_value("videocall_encoder_layer_pixel_rate", &labels("0")),
+            None
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_layer_output_fps", &labels("1")),
+            Some(0.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_layer_pixel_rate", &labels("1")),
+            Some(0.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_layer_pixel_rate", &labels("2")),
+            Some(27_648_000.0)
+        );
+
+        packet.camera_layer_geometry = vec![camera_geometry(2, 1280, 720, None)];
+        process_health_packet_to_metrics_pb(&packet, &tracker).unwrap();
+        assert_eq!(
+            gauge_value("videocall_encoder_layer_width", &labels("2")),
+            Some(1280.0),
+            "geometry remains reportable while the fps window re-warms"
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_layer_output_fps", &labels("2")),
+            None,
+            "an absent fps update must remove the prior measured value"
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_layer_pixel_rate", &labels("2")),
+            None,
+            "an absent fps update must remove the prior derived rate"
+        );
+
+        let mut invalid = create_test_health_packet(
+            "s_geo_bad_fps_2170",
+            "m_geo_bad_fps_2170",
+            "p_geo_bad_fps_2170",
+            HashMap::new(),
+        );
+        invalid.camera_layer_geometry.push(camera_geometry(
+            0,
+            320,
+            180,
+            Some(MAX_PLAUSIBLE_CAMERA_LAYER_OUTPUT_FPS + 1),
+        ));
+        let dropped_before = ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.get();
+        process_health_packet_to_metrics_pb(&invalid, &tracker).unwrap();
+        assert_eq!(
+            ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.get() - dropped_before,
+            1.0
+        );
+        assert!(!series_exists(
+            "videocall_encoder_layer_width",
+            &[("session_id", "s_geo_bad_fps_2170")],
+        ));
+    }
+
+    #[test]
+    #[serial(camera_geometry)]
+    fn camera_layer_geometry_series_are_pruned_when_ladder_narrows() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let mut full = create_test_health_packet(
+            "s_geo_prune_2170",
+            "m_geo_prune_2170",
+            "p_geo_prune_2170",
+            HashMap::new(),
+        );
+        full.camera_layer_geometry = vec![
+            camera_geometry(0, 320, 180, Some(7)),
+            camera_geometry(1, 640, 360, Some(15)),
+            camera_geometry(2, 1280, 720, Some(30)),
+        ];
+        process_health_packet_to_metrics_pb(&full, &tracker).unwrap();
+
+        let narrowed = {
+            let mut packet = full.clone();
+            packet.camera_layer_geometry = vec![camera_geometry(0, 320, 180, Some(7))];
+            packet
+        };
+        process_health_packet_to_metrics_pb(&narrowed, &tracker).unwrap();
+
+        for metric in [
+            "videocall_encoder_layer_width",
+            "videocall_encoder_layer_height",
+            "videocall_encoder_layer_pixels",
+            "videocall_encoder_layer_output_fps",
+            "videocall_encoder_layer_pixel_rate",
+        ] {
+            for layer in ["1", "2"] {
+                assert!(
+                    !series_exists(
+                        metric,
+                        &[
+                            ("meeting_id", "m_geo_prune_2170"),
+                            ("session_id", "s_geo_prune_2170"),
+                            ("peer_id", "p_geo_prune_2170"),
+                            ("media_kind", "camera"),
+                            ("layer", layer),
+                        ],
+                    ),
+                    "{metric} layer {layer} must be removed when the ladder narrows"
+                );
+            }
+        }
     }
 
     /// **The #2143 discrimination test.** The fps gauge alone CANNOT distinguish a
@@ -3229,6 +3612,7 @@ mod tests {
             client_info_labels: None,
             last_network_type: None,
             received_layer_peers: HashSet::new(),
+            camera_layer_ids: HashSet::new(),
             tier_transition_labels: HashSet::new(),
         };
 
@@ -3258,6 +3642,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                camera_layer_ids: HashSet::new(),
                 tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key.clone(), session_info);
@@ -3305,6 +3690,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                camera_layer_ids: HashSet::new(),
                 tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
@@ -3326,6 +3712,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                camera_layer_ids: HashSet::new(),
                 tier_transition_labels: HashSet::new(),
             };
             // Simulate old timestamp by subtracting 40 seconds
@@ -3717,6 +4104,155 @@ mod tests {
             gauge_value("videocall_client_audio_concealment_pct", &ws_labels),
             Some(15.0),
             "the active websocket concealment series must be present after the switch"
+        );
+    }
+    /// #2201: BOTH keyframe-arrival counters must be EXPORTED from their own bucket and
+    /// GC'd by the per-pair cleanup.
+    ///
+    /// Without this, deleting either `.set(...)` export line or either
+    /// `remove_label_values` cleanup line leaves every metrics-server test green — the
+    /// client-side test only reaches protobuf folding, and nothing downstream asserts the
+    /// Prometheus write. A registered-but-never-swept series is one stale series per
+    /// departed pair, which is the exact leak class the perf review checks for.
+    ///
+    /// Camera and screen carry DELIBERATELY DIFFERENT values (9 vs 5) so a bucket
+    /// transposition — screen read from the camera bucket or vice versa — fails rather than
+    /// silently passing, the #1641 defect class.
+    #[test]
+    fn keyframe_arrival_counters_export_per_bucket_and_are_gc_d() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut camera_vs = PbVideoStats::new();
+        camera_vs.fps_received = 8.0;
+        camera_vs.keyframe_arrivals_total = Some(9);
+
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 10.0;
+        screen_vs.keyframe_arrivals_total = Some(5);
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_kfa_2201".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_kfa_2201",
+            "meet_kfa_2201",
+            "alice_kfa_2201",
+            peer_stats,
+        );
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_kfa_2201"),
+            ("session_id", "sess_kfa_2201"),
+            ("from_peer", "alice_kfa_2201"),
+            ("to_peer", "bob_kfa_2201"),
+        ];
+
+        assert_eq!(
+            gauge_value("videocall_video_keyframe_arrivals_total", &labels),
+            Some(9.0),
+            "the CAMERA arrival counter must be exported from video_stats; None => the \
+             .set(video_stats.keyframe_arrivals_total) line was dropped"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_keyframe_arrivals_total", &labels),
+            Some(5.0),
+            "the SCREEN arrival counter must be exported from screen_video_stats (5, NOT the \
+             camera's 9 — a bucket transposition fails here)"
+        );
+
+        // Per-pair GC: a departed pair must not leave either series behind.
+        remove_per_peer_metrics(
+            "meet_kfa_2201",
+            "sess_kfa_2201",
+            "alice_kfa_2201",
+            "bob_kfa_2201",
+        );
+        assert_eq!(
+            gauge_value("videocall_video_keyframe_arrivals_total", &labels),
+            None,
+            "the camera arrival series must be swept with its per-pair siblings; Some => the \
+             remove_label_values line is missing and the series leaks per departed pair"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_keyframe_arrivals_total", &labels),
+            None,
+            "the screen arrival series must be swept too"
+        );
+    }
+
+    /// #2201: an OLD client that does not report keyframe arrivals must be ABSENT from the
+    /// gauge, not published as 0.
+    ///
+    /// The field is `optional` in the proto precisely for this: with implicit presence, a
+    /// pre-#2201 receiver in a mixed-version meeting (the normal state after a staged deploy)
+    /// would publish 0, which is numerically identical to the single most alarming real
+    /// condition the metric exists to detect — "we requested keyframes and none arrived".
+    /// Every un-upgraded receiver would read as total keyframe delivery loss.
+    ///
+    /// MUTATION: dropping the `if let Some(..)` guard around either `.set(..)` publishes 0
+    /// and fails this.
+    #[test]
+    fn absent_keyframe_arrivals_are_not_published_as_zero() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // An OLD client: video/screen stats present and healthy, but the arrival field unset.
+        let mut camera_vs = PbVideoStats::new();
+        camera_vs.fps_received = 8.0;
+        assert_eq!(
+            camera_vs.keyframe_arrivals_total, None,
+            "fixture: field unset"
+        );
+
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 10.0;
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_old_2201".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_old_2201",
+            "meet_old_2201",
+            "alice_old_2201",
+            peer_stats,
+        );
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_old_2201"),
+            ("session_id", "sess_old_2201"),
+            ("from_peer", "alice_old_2201"),
+            ("to_peer", "bob_old_2201"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_video_keyframe_arrivals_total", &labels),
+            None,
+            "an old client must be ABSENT, not 0 — publishing 0 would read as total keyframe \
+             delivery loss for every un-upgraded receiver during a rollout"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_keyframe_arrivals_total", &labels),
+            None,
+            "same for the screen counter"
+        );
+        // Sanity: the packet WAS processed — a sibling gauge from the same bucket is present,
+        // so the absence above is the presence guard, not a failed fold.
+        assert_eq!(
+            gauge_value("videocall_video_fps", &labels),
+            Some(8.0),
+            "the rest of the bucket must still export; otherwise this test proves nothing"
         );
     }
 
@@ -4158,6 +4694,7 @@ mod tests {
         // #1737 Phase 1: the stale-delta-drops gauge shares the same reporter
         // labels and reap path.
         packet.unistream_stale_delta_drops_total = Some(37);
+        packet.camera_layer_geometry = vec![camera_geometry(0, 320, 180, Some(7))];
         let result = process_health_packet_to_metrics_pb(&packet, &tracker);
         assert!(result.is_ok());
 
@@ -4209,6 +4746,23 @@ mod tests {
             ("display_name", "alice"),
         ];
         assert!(series_exists("videocall_peer_info", &peer_info_labels));
+        let camera_layer_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("peer_id", reporting_user_id),
+            ("media_kind", "camera"),
+            ("layer", "0"),
+        ];
+        let camera_layer_series = [
+            "videocall_encoder_layer_width",
+            "videocall_encoder_layer_height",
+            "videocall_encoder_layer_pixels",
+            "videocall_encoder_layer_output_fps",
+            "videocall_encoder_layer_pixel_rate",
+        ];
+        assert!(camera_layer_series
+            .iter()
+            .all(|metric| series_exists(metric, &camera_layer_labels)));
 
         // Remove and ensure it disappears
         let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
@@ -4251,6 +4805,12 @@ mod tests {
                 &unistream_reporter_labels,
             ),
             "unistream_stale_delta_drops_total must be reaped by remove_session_metrics (#1737)"
+        );
+        assert!(
+            camera_layer_series
+                .iter()
+                .all(|metric| !series_exists(metric, &camera_layer_labels)),
+            "all five camera layer gauges must be reaped on session teardown"
         );
     }
 
@@ -4451,6 +5011,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                camera_layer_ids: HashSet::new(),
                 tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key1, session_info1);
@@ -4469,6 +5030,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                camera_layer_ids: HashSet::new(),
                 tier_transition_labels: HashSet::new(),
             };
             session_info2.last_seen -= Duration::from_secs(40);
@@ -4488,6 +5050,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                camera_layer_ids: HashSet::new(),
                 tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key3, session_info3);
@@ -4526,6 +5089,7 @@ mod tests {
             client_info_labels: None,
             last_network_type: None,
             received_layer_peers: HashSet::new(),
+            camera_layer_ids: HashSet::new(),
             tier_transition_labels: HashSet::new(),
         };
 
@@ -4555,6 +5119,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                camera_layer_ids: HashSet::new(),
                 tier_transition_labels: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
@@ -4697,6 +5262,7 @@ mod tests {
                 client_info_labels: None,
                 last_network_type: None,
                 received_layer_peers: HashSet::new(),
+                camera_layer_ids: HashSet::new(),
                 tier_transition_labels: HashSet::new(),
             };
             // Set to exactly 30 seconds ago (timeout boundary)

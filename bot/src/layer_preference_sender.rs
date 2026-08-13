@@ -171,6 +171,15 @@ impl LayerPreferenceSender {
         Arc::clone(&self.preferences_sent)
     }
 
+    /// The layer sources are pinned to **for `kind`**, or `None` when the preference is
+    /// disabled or scoped to a different kind.
+    ///
+    /// Kind-scoped because the relay keys its drop on `(source, kind)` — see
+    /// `InboundStats::decoded_rung_for` for what goes wrong otherwise (#2206).
+    pub fn pinned_layer_for(&self, kind: PinMediaKind) -> Option<u32> {
+        self.desired_layer.filter(|_| self.media_kind == kind)
+    }
+
     /// Whether this sender will ever emit a LAYER_PREFERENCE (i.e. it was
     /// configured with a `desired_layer`). Used to gate logging at construction.
     pub fn is_enabled(&self) -> bool {

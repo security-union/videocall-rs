@@ -4918,7 +4918,7 @@
           "datasource": {
             "type": "prometheus"
           },
-          "description": "Screen-share frames per second observed by the receiver (videocall_screen_video_fps). Arrival-rate: the screen encoder emits on content change, so a static share legitimately reads low. Read with Screen Content Staleness - low fps WITH climbing staleness is a freeze; low fps with flat staleness is just an idle/static share.",
+          "description": "Screen-share frames per second DECODED by the receiver (videocall_screen_video_fps). Decode-call rate, NOT an arrival rate: since #2190 it excludes wrong-rung simulcast packets the decode guard skipped. The screen encoder also emits on content change, so a static share legitimately reads low. Read with Screen Content Staleness - low fps WITH climbing staleness is a freeze; low fps with flat staleness is just an idle/static share.",
           "fieldConfig": {
             "defaults": {
               "custom": {
@@ -5776,6 +5776,202 @@
       ],
       "title": "SCREEN Encoder Tick-Starvation Stalls (#2147) -- THE freeze signal",
       "description": "THIS is the panel that detects a screen freeze; the fps panel to its left cannot. Each episode is one encode-loop tick resume whose gap exceeded SCREEN_ENCODER_STALL_GAP_MS -- a main-thread freeze during which the encoder could not sample fresh capture, so receivers saw fps>0 on stale re-encoded content (the #1899/#2143 mechanism). READ AS A PAIR with the fps panel: fps>0 + episodes FLAT = genuinely healthy; fps>0 + episodes RISING = THE FREEZE; fps==0 + sharing = idle/static share. The worst-gap series (right axis) gives severity: 3 episodes at 200ms is jitter, 3 at 23000ms is the #2143 incident. CAVEAT: the counter is cumulative-since-page-load while session_id changes on reconnect, so an increase() spanning a reconnect can UNDERCOUNT -- for a specific incident prefer max_over_time per session_id.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "Mpx/s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 296
+      },
+      "id": 111,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(meeting_id, session_id, peer_id) (videocall_encoder_layer_pixel_rate{meeting_id=~\"$meeting\"}) / 1000000 * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} total",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_encoder_layer_pixel_rate{meeting_id=~\"$meeting\"} / 1000000 * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} layer {{layer}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Camera Encode Pixel Rate (Mpx/s) (#2170)",
+      "description": "Publisher-side fitted camera encode throughput from measured per-layer output fps. The server derives each rate coherently from one geometry/fps report; do NOT reconstruct it by multiplying videocall_encoder_layer_pixels by videocall_encoder_layer_output_fps because separately collected gauges can tear across reports. An absent value means that rung's first fps window has not closed yet, not zero throughput. The total line sums active rungs for each publisher, which is the shape the bots-vs-webcams gap appears in: 1280x720 synthetic sources can consume roughly 3x the pixels of observed 640x480 webcams even when fps and bitrate panels look identical. CAVEAT (issue 2170): the load-test bot does NOT emit this field yet - it has no CameraEncoder and publishes no per-layer geometry - so bot publishers read as no-data here and the bot side of that comparison is not available from this panel yet. Real browser publishers are covered. Only ACTIVE rungs appear, so a rung vanishing means AQ shed it, not that the encoder broke.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 296
+      },
+      "id": 112,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_encoder_layer_width{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} layer {{layer}} width",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_encoder_layer_height{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} layer {{layer}} height",
+          "refId": "B"
+        }
+      ],
+      "title": "Camera FITTED Layer Geometry (#2170)",
+      "description": "Actual fitted encode width and height per publisher rung, not the ladder bounding boxes. This closes the 3x parity blind spot where 1280x720 bots and observed 640x480 webcams showed matching fps/bitrate despite different pixel load. Do NOT multiply these independently collected series; use the server-derived videocall_encoder_layer_pixels for coherent pixel math, and remember that _pixels is pixels per FRAME, not throughput. Use videocall_encoder_layer_pixel_rate for Mpx/s. Only ACTIVE rungs appear, so a rung vanishing means AQ shed it, not that the encoder broke.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "fps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 305
+      },
+      "id": 113,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_encoder_layer_output_fps{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} layer {{layer}} fps",
+          "refId": "A"
+        }
+      ],
+      "title": "Camera Measured Per-Layer Output FPS (#2170)",
+      "description": "Measured output fps for each active camera rung over the latest roughly one-second window, not the nominal 7/15/30 ladder targets. Layer 0 should closely track the existing videocall_encoder_output_fps series; disagreement is itself a useful wiring or timing signal. Geometry can appear before this series while the first measurement window warms. Only ACTIVE rungs appear, so a rung vanishing means AQ shed it, not that the encoder broke.",
       "type": "timeseries"
     }
   ],

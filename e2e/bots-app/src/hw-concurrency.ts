@@ -12,8 +12,17 @@
 //     target has simulcast enabled before relying on the cap.
 //   - The spoof sets `navigator.hardwareConcurrency`, which ALSO drives the
 //     bot's health-reported `client_cores` (peer telemetry / `cpu_throttled`),
-//     not just the encode-layer ceiling. Bot telemetry will report this value
-//     (e.g. 6), not the node's real core count — expected for a load bot.
+//     not just the encode-layer ceiling. Bot telemetry reports this value, not
+//     the node's real core count — expected for a load bot.
+//   - CONSEQUENCE: do NOT read `videocall_client_cpu_throttled` for a spoofed
+//     bot. It is `capability_score / cores < 150`, and `capability_score` is a
+//     SINGLE-THREADED benchmark that does not scale with the spoof — so raising
+//     the spoof lowers the ratio and makes the flag fire without any change in
+//     real CPU. The ground truth for a starved pod is the container's CFS
+//     throttling counter — which this tool does NOT sample; read
+//     `container_cpu_cfs_throttled_seconds_total` from cluster Prometheus, not
+//     the run CSVs — plus this tool's own fps-based RESOURCE_STARVED verdict
+//     (resource/verdict.ts).
 
 /**
  * Result of resolving a raw hardware-concurrency input.

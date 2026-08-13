@@ -31,25 +31,27 @@ use std::sync::Arc;
 use crate::VideoCallClient;
 use videocall_types::Callback;
 
-pub(crate) use camera_encoder::layer_ceiling_to_count;
 pub use camera_encoder::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
     camera_encoder_frames_submitted_ok, camera_encoder_layers_torn_down,
     camera_encoder_restarts_closed_codec, camera_encoder_restarts_configure,
     camera_encoder_restarts_memory, camera_encoder_restarts_other, CameraEncoder,
-    LiveQualitySnapshot, QualityTierBounds, SimulcastLayerInfo, SimulcastSendSnapshot,
+    CameraLayerMetricSource, LiveQualitySnapshot, QualityTierBounds, SimulcastLayerInfo,
+    SimulcastSendSnapshot,
 };
+pub(crate) use camera_encoder::{layer_ceiling_to_count, CameraLayerMetric};
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{
     screen_capture_display_constraints, screen_encoder_errors_closed_codec,
     screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
     screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
-    screen_encoder_layers_torn_down, screen_encoder_max_stall_gap_ms,
-    screen_encoder_restarts_closed_codec, screen_encoder_restarts_configure,
-    screen_encoder_restarts_memory, screen_encoder_restarts_other, screen_encoder_stall_episodes,
-    screen_ws_stale_delta_drops, should_retry_screen_capture_without_ceiling, ScreenEncoder,
-    ScreenQualitySnapshot, ScreenQualityTierBounds, ScreenShareEvent,
+    screen_encoder_ignored_constraints, screen_encoder_layers_torn_down,
+    screen_encoder_max_stall_gap_ms, screen_encoder_restarts_closed_codec,
+    screen_encoder_restarts_configure, screen_encoder_restarts_memory,
+    screen_encoder_restarts_other, screen_encoder_stall_episodes, screen_ws_stale_delta_drops,
+    should_retry_screen_capture_without_ceiling, ScreenEncoder, ScreenQualitySnapshot,
+    ScreenQualityTierBounds, ScreenShareEvent,
 };
 
 /// **TEST-ONLY** re-export of the stall-counter setter (issue #2147), so
@@ -57,6 +59,11 @@ pub use screen_encoder::{
 /// encode loop's tick-starvation detector normally owns. Without it the health
 /// packet's `> 0`-gated stall emission is unreachable from any host test. The module
 /// itself stays private.
+///
+/// By CONVENTION (not compiler-enforced — the statics' accessors are lock-free)
+/// callers hold [`crate::test_serial::lock_screen_encoder_stall_counters`] while they
+/// depend on what they stored, and restore `(0, 0)` afterwards. See the setter's own
+/// isolation contract for what each of the two actually buys (#2160).
 #[cfg(test)]
 pub(crate) use screen_encoder::set_screen_encoder_stall_counters_for_test;
 

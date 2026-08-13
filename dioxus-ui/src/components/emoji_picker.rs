@@ -1318,8 +1318,18 @@ mod tests {
             block.contains("max-height: calc(100vh - 124px)"),
             "and must keep the `vh` fallback for engines without `dvh`"
         );
+        // The bound stays on `.reactions-palette` (it is the border-box the
+        // 124px budget is measured against), but the SCROLLING it implies now
+        // lives on the inner wrapper — see
+        // `palette_scrolls_on_an_inner_wrapper_so_the_close_badge_is_not_clipped`
+        // for why they had to be split (issue 2173).
+        let scroll_at = css.get_or_panic(".reactions-palette__scroll {");
+        let scroll_rest = &css[scroll_at..];
+        let scroll_end = scroll_rest
+            .find('}')
+            .expect("`.reactions-palette__scroll` block must close");
         assert!(
-            block.contains("overflow-y: auto"),
+            scroll_rest[..scroll_end].contains("overflow-y: auto"),
             "a bounded palette must scroll rather than clip"
         );
 
@@ -1337,6 +1347,107 @@ mod tests {
                 .contains("interactive-widget=resizes-content"),
             "the viewport meta must let the soft keyboard resize the layout viewport"
         );
+    }
+
+    #[test]
+    fn palette_scrolls_on_an_inner_wrapper_so_the_close_badge_is_not_clipped() {
+        // issue 2173. The close (X) is a badge that HANGS half off the palette's
+        // top-right corner (`translate(50%, -50%)`), which only works while the
+        // palette is `overflow: visible`. Issue 2141 then put `overflow-y: auto`
+        // on the palette to bound the picker column, and per CSS overflow a
+        // computed `overflow-y` of `auto` forces `overflow-x` from `visible` to
+        // `auto` — so the palette became a scroll container on BOTH axes. A
+        // scroll container does not extend its scrollable area up or left, so
+        // the badge's top overhang was clipped outright and its right overhang
+        // became horizontal scrollable overflow: a horizontal scrollbar with the
+        // X unreachable.
+        //
+        // The fix splits the scroll container from the badge's containing block.
+        // This pins BOTH halves, because either one alone reintroduces the bug:
+        // the palette must stay overflow-free, and the wrapper must actually be
+        // the scroller.
+        let css = strip_css_comments(SHIPPED_CSS);
+
+        let at = css.get_or_panic(".reactions-palette {");
+        let rest = &css[at..];
+        let end = rest
+            .find('}')
+            .expect("`.reactions-palette` block must close");
+        let palette = &rest[..end];
+        // Any `overflow` declaration with a non-`visible` value — the shorthand
+        // or either axis — makes this box a scroll container on BOTH axes and
+        // re-clips the overhang. An explicit `overflow: visible` is fine, and is
+        // what the failure message recommends, so the value has to be inspected
+        // rather than the property name merely being absent. `clip` is rejected
+        // alongside the scrolling values: it does not scroll, but it still clips
+        // the overhang, which is the half of the bug that hid the X.
+        for (prop, value) in declarations(palette) {
+            assert!(
+                !prop.starts_with("overflow") || value.split_whitespace().all(|v| v == "visible"),
+                "`.reactions-palette` must stay overflow:visible or it clips the \
+                 close badge's corner overhang (issue 2173); found `{prop}: \
+                 {value}`, and the bound belongs on `.reactions-palette__scroll`"
+            );
+        }
+
+        let scroll_at = css.get_or_panic(".reactions-palette__scroll {");
+        let scroll_rest = &css[scroll_at..];
+        let scroll_end = scroll_rest
+            .find('}')
+            .expect("`.reactions-palette__scroll` block must close");
+        let scroll = &scroll_rest[..scroll_end];
+        assert!(
+            scroll.contains("overflow-y: auto"),
+            "the wrapper must be the scroller, or the bounded palette clips \
+             the picker column instead of scrolling it"
+        );
+        // The wrapper must never become a containing block for an absolutely
+        // positioned descendant: the badge is anchored to `.reactions-palette`,
+        // and a `position: relative` here would silently re-anchor it to the
+        // scroll container and clip it all over again if it is ever nested
+        // inside. Comment-only until now, so pinned here. Parsed as declarations
+        // rather than searched as a word — the block's prose says
+        // "absolutely-positioned", which a substring match would trip on.
+        assert!(
+            declarations(scroll).all(|(prop, _)| prop != "position"),
+            "`.reactions-palette__scroll` must declare no `position` — it would \
+             become the close badge's containing block (issue 2173)"
+        );
+        // NOT required for the scrolling: a flex item whose computed overflow is
+        // not `visible` already has an automatic minimum size of zero (CSS
+        // Flexbox 4.5), and the wrapper's `overflow-y: auto` satisfies that, so
+        // it shrinks either way. Pinned because it is a deliberate defensive
+        // line, and it becomes load-bearing the moment the overflow moves off
+        // this box.
+        assert!(
+            scroll.contains("min-height: 0"),
+            "the wrapper keeps an explicit `min-height: 0` so it stays \
+             shrinkable if its overflow ever moves elsewhere"
+        );
+        // The palette must drive that shrinking, which needs a COLUMN flex
+        // container — in the inherited row-wrap the wrapper would have been
+        // sized on the inline axis and the cap would not reach it.
+        assert!(
+            palette.contains("flex-direction: column"),
+            "`.reactions-palette` must be a flex column so its max-height \
+             shrinks the wrapper"
+        );
+    }
+
+    /// The `prop: value` pairs of a COMMENT-STRIPPED rule body, so a pin can
+    /// inspect what a property is set TO instead of matching the property name
+    /// as a substring. Substring matching over a rule body is what made the
+    /// first version of the overflow pin reject an explicit `overflow: visible`
+    /// — the very declaration its own failure message asked for.
+    ///
+    /// Values keep their internal spaces (`hidden auto`, `min(360px, ...)`).
+    /// Splitting on the FIRST colon is safe for the blocks pinned here; a value
+    /// containing a colon (a `url(data:...)`) would need more than this.
+    fn declarations(block: &str) -> impl Iterator<Item = (&str, &str)> {
+        block.split(';').filter_map(|decl| {
+            let (prop, value) = decl.split_once(':')?;
+            Some((prop.trim(), value.trim()))
+        })
     }
 
     /// The `content` attribute of `<meta name="viewport">`, and nothing else.

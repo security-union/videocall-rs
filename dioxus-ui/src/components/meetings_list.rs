@@ -1736,10 +1736,10 @@ mod tests {
     // tooltip tests above these run for real on the HOST target under
     // `cargo test --lib`. The EventSource WIRING itself (listener registration,
     // debounce timer, withCredentials, teardown) is inherently `web_sys`-bound
-    // and browser-only — there is no host harness for `EventSource`, so the
-    // wiring itself is not host-tested here. What we CAN pin without a browser
-    // is the stream URL the wiring opens, which is the load-bearing contract
-    // against the server route.
+    // and browser-only — there is no host harness for `EventSource`, so it is
+    // not host-tested here (mirrors the browser-only EventSource code in the
+    // chat sidebar). What we CAN pin without a browser is the stream URL the
+    // wiring opens, which is the load-bearing contract against the server route.
 
     /// The SSE stream URL must be exactly the feed-fetch path plus `/stream`,
     /// matching the server route `GET /api/v1/meetings/feed/stream`. If the

@@ -2,7 +2,7 @@
 #
 # Runs N one-bot-per-pod headless clock-mode bots in ns `bot-load`, each with a
 # DISTINCT test-account identity (pod ordinal → BOT_EMAIL_<N> from the
-# `bot-accounts` Secret) and a per-pod capability cap (BOT_HW_CONCURRENCY → 2
+# `bot-accounts` Secret) and a per-pod capability cap (BOT_HW_CONCURRENCY → 3
 # simulcast layers). All join the labsworkspace `bottest` room. Stacks on
 # Increment 1 (k8s/bot-pod.yaml) — same hardened pod shape, same image.
 #
@@ -54,6 +54,10 @@ spec:
   # (ordinals 0..replicas-1). Scaling up beyond the number of accounts makes the
   # new pods fail fast at startup (entrypoint: "ordinal N has no provisioned
   # account") — provision the account first, then scale.
+  # ⚠ THE BOT_HW_CONCURRENCY=10 RATIONALE BELOW NEEDS >= 8 REPLICAS. Below 7
+  # decoded peers both ladders pick the top rung and the third rung is pure
+  # encode cost on the same 4-core budget it exists to protect. Scale before
+  # measuring (README fleet runbook); 3 is a deliberate start-small default.
   replicas: 3
   # The bots are independent — no start/stop ordering between them — so bring
   # them up (and tear them down) in parallel rather than one-at-a-time. Ordinal
@@ -153,13 +157,31 @@ spec:
             # volumeMount path.
             - name: BOT_CTL_STATE_DIR
               value: "/var/lib/bots-ctl"
-            # Capability cap → simulcast layer cap. 6 fake cores → 2 layers.
+            # Capability cap → simulcast layer cap. 10 fake cores → 3 rungs
+            # (client check: <6→1, 6..9→2, >=10→3).
+            #
+            # Three, not two: a 2-rung [low, hd] ladder leaves the #1256 tile lid
+            # no middle rung, so each receiver decodes hd per peer. This caps what
+            # a bot PUBLISHES — the decode saving is COLLECTIVE and needs >= 7
+            # decoded peers, so it does NOT hold at the committed replicas (see
+            # the warning at `replicas:`).
+            #
+            # #2248 carries the figures and three consequences that are not
+            # obvious here: it is ALSO the SCREEN ceiling (`host.rs` feeds one
+            # capability value to both encoders, making a 1440p rung reachable);
+            # it is reported as `client_cores`, so it moves
+            # `videocall_client_cpu_throttled` with no change in real CPU; and the
+            # band's dense end has only ~2px of margin.
             - name: BOT_HW_CONCURRENCY
-              value: "6"
+              value: "10"
             # Receiver low-power caps (issues #2068/#2069, increment 5) are
             # DELIBERATELY UNSET here: the fleet default is a REALISTIC
             # full-decode client, so a run reproduces the same total-room decode
             # load (and any decode-saturation freeze) a real participant would.
+            # ⚠ Conditional on 3 rungs: once receivers lid to the middle rung the
+            # relay's LAYER_HINT union can shed publishers toward [low, standard],
+            # so the fleet UNDER-loads. Confirm
+            # videocall_encoder_active_layers{media_kind="camera"} reads 3.
             # They are OPT-IN levers — enable them ONLY to trade realism for
             # scale (cap per-bot DECODE + PAINT CPU so the box holds more bots
             # while you load the SERVER with many participants). To opt in, add:

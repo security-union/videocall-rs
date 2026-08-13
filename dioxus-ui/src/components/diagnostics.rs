@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 use videocall_client::{PrefMediaKind, VideoCallClient};
-use videocall_diagnostics::{subscribe, MetricValue};
+use videocall_diagnostics::{recv_loop_action, subscribe, MetricValue, RecvLoopAction};
 
 /// #1482: one resolved per-peer device block for the diagnostics "Device (per
 /// peer)" section: `(session_id, peer_label, [(row_label, value)])`. The rows
@@ -183,12 +183,19 @@ fn render_reception(map: &BTreeMap<(String, String), ReceptionEntry>) -> Option<
         // issue 1656: `FPS(painted)` (TRUE painted-frame fps, `{:.1}`) and
         // `Stale` (content staleness — ms the painted content is behind
         // real-time, #1641, whole ms) are NEW lines added to the fixed template.
-        // issue 1787: the received-rate line is labelled `FPS(arriving):` (still
-        // sourced from `fps_received`, the network arrival rate) to self-identify
-        // as arrival and parallel the painted line — the two legitimately diverge
-        // during bursts (arriving can spike above painted).
+        // issue 1787 / #2190: the received-rate line is labelled `FPS(decoded):` to
+        // parallel the painted line — the two legitimately diverge during bursts (this
+        // line can spike above painted).
+        //
+        // Renamed from `FPS(arriving):` to `FPS(decoded):` in #2190, because `fps_received` counts DECODE
+        // CALLS and now EXCLUDES packets the simulcast rung guard skipped: a wrong-rung
+        // packet arrives but is not counted, so "arriving" actively misled — a viewer
+        // seeing a low number would read a decode/visibility condition as network loss.
+        // (Counting every arrival is what made this line report the publisher's LADDER
+        // SUM, ~52 for an 8fps 3-rung camera.) Still a decode-CALL count, not a paint
+        // count — `FPS(painted)` below is the paint-truthful one.
         text.push_str(&format!(
-            "Peer: {peer} ({kind})\nFPS(arriving): {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nStale: {} ms\nTimestamp: {}s\n\n",
+            "Peer: {peer} ({kind})\nFPS(decoded): {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nStale: {} ms\nTimestamp: {}s\n\n",
             fmt1(e.fps_painted),
             fmt1(e.bitrate_kbps),
             fmt1(e.loss_per_sec),
@@ -928,7 +935,18 @@ pub fn Diagnostics(
             // tick. Keyed by `to_peer` (u64-as-String).
             let mut peer_lag_fps = HashMap::<String, PeerVideoReadout>::new();
 
-            while let Ok(evt) = rx.recv().await {
+            loop {
+                // Issue 2174: a bare `while let Ok(..)` here died permanently on
+                // the first `Overflowed`, which is recoverable — see
+                // `videocall_diagnostics::recv_loop_action`. The drawer then
+                // stopped updating for the rest of the session.
+                let evt = match rx.recv().await {
+                    Ok(evt) => evt,
+                    Err(e) => match recv_loop_action(&e) {
+                        RecvLoopAction::Continue => continue,
+                        RecvLoopAction::Break => break,
+                    },
+                };
                 match evt.subsystem {
                     // The receiver feed is subsystem "video", emitted by TWO
                     // producers with different metric sets (heartbeat fps/
@@ -2687,7 +2705,7 @@ mod tests {
         assert!(update_reception(&mut map, &evt), "keyed event must fold");
         let text = render_reception(&map).expect("non-empty map → Some");
         assert!(
-            text.contains("FPS(arriving): 30.00"),
+            text.contains("FPS(decoded): 30.00"),
             "FPS value present: {text}"
         );
         assert!(text.contains("850"), "bitrate present: {text}");
@@ -2716,7 +2734,7 @@ mod tests {
     /// and the loss event (loss/keyframe) ALTERNATE for the same (peer, kind).
     /// Folding the loss event must RETAIN the previously-seen fps/bitrate —
     /// every label stays, no line vanishes. Reverting to per-event rendering
-    /// fails the `FPS(arriving): 30.00` assertion after the loss event.
+    /// fails the `FPS(decoded): 30.00` assertion after the loss event.
     #[test]
     fn reception_merges_alternating_event_shapes_without_dropping_lines() {
         let mut map = BTreeMap::new();
@@ -2746,7 +2764,7 @@ mod tests {
         assert!(update_reception(&mut map, &loss));
         let text = render_reception(&map).expect("non-empty map");
         assert!(
-            text.contains("FPS(arriving): 30.00"),
+            text.contains("FPS(decoded): 30.00"),
             "fps retained across the loss event: {text}"
         );
         assert!(text.contains("Loss: 2.5/s"), "loss folded in: {text}");
@@ -2946,7 +2964,7 @@ mod tests {
             "one merged block: {text}"
         );
         assert!(
-            text.contains("FPS(arriving): 30.00"),
+            text.contains("FPS(decoded): 30.00"),
             "fps_received retained: {text}"
         );
         assert!(

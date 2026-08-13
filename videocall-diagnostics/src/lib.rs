@@ -83,6 +83,53 @@ impl MetricValue {
 
 use async_broadcast::{broadcast, Receiver, Sender};
 
+/// Re-exported so subscribers can name the error type their `recv()` loops
+/// handle without taking a direct `async-broadcast` dependency.
+pub use async_broadcast::RecvError;
+
+/// What a diagnostics-bus subscriber loop must do after `Receiver::recv()`
+/// returns an error.
+///
+/// See [`recv_loop_action`] for the policy and the defect it fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvLoopAction {
+    /// Recoverable: keep polling. Some events were missed, but the receiver is
+    /// still attached and future `recv()` calls will deliver new events.
+    Continue,
+    /// Terminal: the channel is empty and closed. Stop the loop.
+    Break,
+}
+
+/// Map a `recv()` error to the action its subscriber loop must take.
+///
+/// # Why this exists (issue 2174)
+///
+/// Every subscriber used to be written as `while let Ok(evt) = rx.recv().await`,
+/// which exits the loop on **any** `Err` — including [`RecvError::Overflowed`].
+/// Overflow is not terminal here: this bus runs in overflow mode
+/// (`set_overflow(true)`, see the `SENDER` initialiser below), so a subscriber
+/// that falls more than 1024 events behind gets `Overflowed(n)` once and, per
+/// async-broadcast 0.7.2's own documentation on that variant, *"Future recv
+/// operations will succeed, but some messages have been skipped."*
+///
+/// Treating that as terminal permanently killed the subscriber on the first
+/// burst, freezing **every** signal it feeds at its last observed value — which
+/// is how the speaking glow got stuck on a peer who had already stopped
+/// talking. [`RecvError::Closed`] is the only genuinely terminal case.
+///
+/// `Continue` cannot spin: reporting an overflow also advances the receiver
+/// past the skipped range (async-broadcast sets the receiver's position to the
+/// queue head *before* returning `Overflowed`), so the next `recv()` either
+/// yields a real event or parks — the same overflow can never be reported
+/// twice in a row.
+#[inline]
+pub fn recv_loop_action(err: &RecvError) -> RecvLoopAction {
+    match err {
+        RecvError::Overflowed(_) => RecvLoopAction::Continue,
+        RecvError::Closed => RecvLoopAction::Break,
+    }
+}
+
 static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
     let (mut s, r) = broadcast(1024);
 
@@ -99,9 +146,22 @@ static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
         wasm_bindgen_futures::spawn_local(async move {
             // Keep the receiver alive to prevent channel closure
             // This receiver will consume messages but not process them
-            while (receiver.recv().await).is_ok() {
-                // Intentionally discard messages in the background receiver
-                // This keeps the channel open for other receivers
+            loop {
+                match receiver.recv().await {
+                    // Intentionally discard messages in the background receiver
+                    // This keeps the channel open for other receivers
+                    Ok(_) => {}
+                    // Issue 2174: this drain is the *only* thing holding the
+                    // channel open when no other subscriber is attached. The
+                    // old `while ... .is_ok()` form dropped it on the first
+                    // `Overflowed`, which closes the channel and makes every
+                    // later `try_broadcast` fail — silently killing diagnostics
+                    // process-wide. Overflow must not end this loop.
+                    Err(e) => match recv_loop_action(&e) {
+                        RecvLoopAction::Continue => continue,
+                        RecvLoopAction::Break => break,
+                    },
+                }
             }
         });
     }
@@ -203,6 +263,117 @@ impl From<Cow<'static, str>> for MetricValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    /// Poll a future exactly once and require it to be ready.
+    ///
+    /// Every `recv()` in these tests is issued against a channel that already
+    /// has a queued item, an overflow to report, or a closed-and-empty queue —
+    /// all of which resolve on the first poll — so no executor is needed. A
+    /// `Pending` result means the test set up the channel wrong, not that the
+    /// production policy is wrong, hence the explicit panic.
+    fn poll_ready<F: Future>(fut: F) -> F::Output {
+        let mut fut = Box::pin(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("recv() was not immediately ready — bad test setup"),
+        }
+    }
+
+    /// `Overflowed` is recoverable. async-broadcast documents it as "Future
+    /// recv operations will succeed, but some messages have been skipped", so a
+    /// subscriber that sees it must keep polling.
+    ///
+    /// Swapping this arm to `Break` reproduces issue 2174 (subscriber dies on
+    /// the first burst, every signal it feeds freezes at its last value).
+    #[test]
+    fn overflowed_is_recoverable() {
+        assert_eq!(
+            recv_loop_action(&RecvError::Overflowed(1)),
+            RecvLoopAction::Continue,
+            "Overflowed must not terminate a subscriber loop"
+        );
+        // The skipped-message count is irrelevant to the policy.
+        assert_eq!(
+            recv_loop_action(&RecvError::Overflowed(9_999)),
+            RecvLoopAction::Continue
+        );
+    }
+
+    /// `Closed` is the only terminal case: the channel is empty AND closed, so
+    /// continuing would spin forever on an error that can never clear.
+    #[test]
+    fn closed_terminates_the_loop() {
+        assert_eq!(
+            recv_loop_action(&RecvError::Closed),
+            RecvLoopAction::Break,
+            "Closed must terminate a subscriber loop"
+        );
+    }
+
+    /// End-to-end pin of the issue 2174 regression against a real
+    /// `async_broadcast` channel in overflow mode (the same mode the global
+    /// bus uses): a loop driven by [`recv_loop_action`] must survive the
+    /// overflow, go on to consume the events that are still queued, and stop
+    /// once the channel is closed.
+    ///
+    /// Mutation sensitivity:
+    /// - `Overflowed => Break` — the loop exits before consuming anything and
+    ///   `seen` is empty.
+    /// - `Closed => Continue` — the loop never terminates and trips the
+    ///   iteration guard.
+    #[test]
+    fn subscriber_loop_survives_overflow_then_stops_on_close() {
+        let (mut sender, mut receiver) = broadcast::<u64>(2);
+        sender.set_overflow(true);
+
+        // Overrun the 2-slot queue: 1 and 2 are evicted, 3 and 4 survive.
+        for i in 1..=4u64 {
+            sender
+                .try_broadcast(i)
+                .expect("overflow mode must accept a broadcast into a full queue");
+        }
+        // Close the channel so the drain terminates deterministically; queued
+        // events are still delivered before `Closed` surfaces.
+        drop(sender);
+
+        let mut seen: Vec<u64> = Vec::new();
+        let mut overflow_reports = 0usize;
+        let mut iterations = 0usize;
+
+        loop {
+            iterations += 1;
+            assert!(
+                iterations < 100,
+                "loop failed to terminate — `Closed` must map to Break"
+            );
+
+            match poll_ready(receiver.recv()) {
+                Ok(v) => seen.push(v),
+                Err(e) => {
+                    if matches!(e, RecvError::Overflowed(_)) {
+                        overflow_reports += 1;
+                    }
+                    match recv_loop_action(&e) {
+                        RecvLoopAction::Continue => continue,
+                        RecvLoopAction::Break => break,
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            overflow_reports, 1,
+            "the receiver should have reported exactly one overflow"
+        );
+        assert_eq!(
+            seen,
+            vec![3, 4],
+            "a loop honouring recv_loop_action must keep consuming after an overflow"
+        );
+    }
 
     /// The wire format of `MetricValue::Text` MUST stay byte-identical to what
     /// it was when the variant held a plain `String`. `serde` treats

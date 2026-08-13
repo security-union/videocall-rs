@@ -82,6 +82,52 @@ const LIVE_REGION = '[data-testid="meeting-timer-live-region"]';
 /** Preset button for a duration, in ms — mirrors `MEETING_TIMER_PRESETS_MS`. */
 const preset = (ms: number) => `[data-testid="meeting-timer-preset-${ms}"]`;
 
+/**
+ * ISSUE 2172 — the typed-duration row, which renders only in the popover's IDLE
+ * branch. Each of these is anchored to exactly one element in
+ * `MeetingTimerPopover`'s RSX (`dioxus-ui/src/components/meeting_timer.rs`):
+ *
+ *   input  { "data-testid": "meeting-timer-custom-value" }
+ *   select { "data-testid": "meeting-timer-custom-unit" }
+ *   button { "data-testid": "meeting-timer-custom-start" }
+ *   p      { "data-testid": "meeting-timer-custom-hint" }
+ *
+ * Deliberately UNSCOPED rather than `${POPOVER} …`, and that is the safer of the
+ * two here: each string appears exactly once in the whole UI (nothing outside
+ * this component writes `meeting-timer-custom-`), and an unscoped test id cannot
+ * be scoped into the WRONG container — which is how #1756 failed. The popover
+ * itself is mounted at most once (`if meeting_timer_open() && local_is_host()`
+ * in `attendants.rs`), so there is no second copy to disambiguate.
+ */
+const CUSTOM_VALUE = '[data-testid="meeting-timer-custom-value"]';
+const CUSTOM_UNIT = '[data-testid="meeting-timer-custom-unit"]';
+const CUSTOM_START = '[data-testid="meeting-timer-custom-start"]';
+const CUSTOM_HINT = '[data-testid="meeting-timer-custom-hint"]';
+
+/**
+ * The visible `<label>`, addressed BY THE ID IT POINTS AT rather than by its
+ * class. `MEETING_TIMER_CUSTOM_VALUE_ID` feeds both the label's `for` and the
+ * input's `id`, so a selector written this way stops matching the moment those
+ * two drift apart — which is exactly the defect worth catching, since the label
+ * is also the field's click target.
+ */
+const CUSTOM_LABEL = 'label[for="meeting-timer-custom-value"]';
+
+/**
+ * `MEETING_TIMER_CUSTOM_HINT_ID` — the target of the `aria-describedby` on BOTH
+ * the field and the confirm button, so the reason the button is inert is
+ * reachable from whichever of the two the user is on.
+ */
+const CUSTOM_HINT_ID = "meeting-timer-custom-hint";
+
+/**
+ * The amount and its unit are ONE value split across two controls, exposed as a
+ * single labelled `role="group"`. `MEETING_TIMER_CUSTOM_LABEL_ID` is what the
+ * group's `aria-labelledby` points at.
+ */
+const CUSTOM_GROUP = ".meeting-timer-custom-group";
+const CUSTOM_LABEL_ID = "meeting-timer-custom-label";
+
 // ---------------------------------------------------------------------------
 // Constants mirrored from the production source
 // ---------------------------------------------------------------------------
@@ -786,6 +832,484 @@ test.describe("Meeting timer (issue 2136)", () => {
     } finally {
       await hostBrowser.close();
       await guestBrowser.close();
+    }
+  });
+});
+
+/**
+ * The host TYPES a duration — issue 2172.
+ *
+ * The four presets are 1 / 5 / 10 / 15 minutes, so before this change the
+ * shortest timer the product could produce was a minute and nothing between the
+ * presets was reachable at all. The issue's own example ("such as 30 seconds")
+ * was therefore unreachable by any sequence of clicks. The popover's idle branch
+ * now carries a number field, a minutes/seconds select and a confirm button
+ * beneath the preset row, all feeding the SAME `on_start` prop the presets use.
+ *
+ * WHY EVERY TEST HERE FAILS ON THE UN-FIXED CODE. Trivially, and worth stating
+ * plainly: the entire row is new. On the pre-change popover
+ * `[data-testid="meeting-timer-custom-value"]`, `-unit`, `-start` and `-hint`
+ * match zero elements, so the first `toBeVisible()` in each test fails before it
+ * reaches anything subtler. Reverting `meeting_timer.rs` breaks all three. The
+ * assertions past that point are what make them worth more than a smoke test:
+ * a sub-minute countdown NO PRESET CAN PRODUCE crossing the wire, the confirm
+ * button's disabled state tracking `custom_duration_ms`, and Enter reaching the
+ * same submit path as the click.
+ *
+ * TAGGING: untagged, matching every test in this file and the two-browser specs
+ * it was modelled on. They run under `--project=dioxus` only —
+ *
+ *     make e2e SPEC=meeting-timer
+ *
+ * — or a `/run-e2e` dioxus dispatch on the PR. A per-PR "Playwright bvt1" green
+ * does NOT cover them.
+ *
+ * CAMERA: not seeded (`vc_prejoin_camera_on`), for the reason the file header
+ * gives — every surface asserted here renders over the camera-off placeholder
+ * exactly as it does over video.
+ *
+ * WHY TWO OF THE THREE ARE SOLO, given this file's "no solo tests" rule. That
+ * rule is about the WIRE: a host renders its own timer from a local echo, so a
+ * solo test proves nothing about `send_meeting_timer`, the relay's host gate, or
+ * `on_meeting_timer`. The first test below is therefore two-browser, and it is
+ * the one that proves a typed duration reaches the room. The other two are about
+ * a control's LOCAL behaviour — whether the confirm button is disabled, whether
+ * Enter reaches the same submit closure the click does — which is settled
+ * entirely inside the host's own document, exactly like the overflow-route test
+ * above. Booting a second browser to watch would add cost and prove nothing.
+ */
+test.describe("Meeting timer — typed custom duration (issue 2172)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  /**
+   * THE ISSUE'S HEADLINE CASE: 30 seconds, typed, seen by everyone.
+   *
+   * The cross-peer half is what makes this more than a UI test, and the
+   * DISCRIMINATOR is the duration itself. Every preset is at least a minute, so
+   * a guest chip reading under 60 s cannot have come from one — the sub-minute
+   * value is proof that the number the host typed is the number that crossed the
+   * wire, not merely that *some* timer started. That is asserted three ways: the
+   * chip's rendered `M:SS` has a zero minutes field, `data-remaining-ms` is at
+   * most 30 000, and the guest's spoken announcement is in SECONDS.
+   *
+   * What a regression looks like: the confirm button wired to its own handler
+   * instead of the shared `on_start` prop (the popover would stay open and focus
+   * would never return to the trigger), or `custom_duration_ms` scaling by the
+   * wrong unit (the guest would get 30 minutes and the chip would read `30:00`).
+   * A unit select that failed to write `custom_unit` fails EARLIER, at the label
+   * assertion before the click — the button would still advertise minutes — and
+   * that is the intended order: a control whose label disagrees with what it
+   * starts is worth failing on before anything is sent to the room.
+   */
+  test("the host types a 30-second timer and every participant sees it", async ({ baseURL }) => {
+    test.setTimeout(180_000);
+
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_meeting_timer_custom_${Date.now()}`;
+    const hostBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const guestBrowser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostPage = await newParticipant(hostBrowser, "host@videocall.rs", "HostUser", uiURL);
+      const guestPage = await newParticipant(
+        guestBrowser,
+        "guest@videocall.rs",
+        "GuestUser",
+        uiURL,
+      );
+      await enterTwoUserMeeting(hostPage, guestPage, meetingId);
+
+      // ── Arrange: nothing is running anywhere.
+      await expect(hostPage.locator(CHIP)).toHaveCount(0);
+      await expect(guestPage.locator(CHIP)).toHaveCount(0);
+
+      await openTimerPopover(hostPage);
+      const popover = hostPage.locator(POPOVER);
+      await expect(popover).toHaveAttribute("data-running", "false");
+
+      // The typed row is an ADDITION to the one-click path, not a replacement:
+      // a change that moved the presets behind the field would regress the
+      // common case, so both are asserted present before either is used.
+      await expect(hostPage.locator(preset(FIVE_MIN_MS))).toBeVisible();
+      const value = hostPage.locator(CUSTOM_VALUE);
+      const unit = hostPage.locator(CUSTOM_UNIT);
+      const start = hostPage.locator(CUSTOM_START);
+      await expect(value).toBeVisible();
+      await expect(unit).toBeVisible();
+      await expect(start).toBeVisible();
+
+      // ── Act: type 30, switch the unit to seconds.
+      await value.pressSequentially("30", { delay: 60 });
+      await unit.selectOption("seconds");
+
+      // The control SAYS what it is about to start, before it is pressed. Both
+      // strings are rendered from the one `custom_duration_ms` result that also
+      // decides what gets sent, so this pins that they cannot disagree — a host
+      // reading "30 seconds" and getting 30 minutes is the failure it rules out.
+      //
+      // `aria-disabled`, not the `disabled` property: the button stays focusable
+      // on purpose (see the validation test), so `aria-disabled="false"` is
+      // where "live" is actually written.
+      await expect(start).toHaveAttribute("aria-disabled", "false");
+      await expect(start).toHaveAttribute("aria-label", "Start a 30 seconds timer");
+      await expect(hostPage.locator(CUSTOM_HINT)).toHaveText("Timer will run for 30 seconds.");
+
+      await start.click();
+
+      // ── The popover closes and focus returns to the trigger, because the
+      // confirm button goes through the SAME `on_start` prop as a preset — the
+      // one that closes the panel and calls `focus_element_by_id`. A bespoke
+      // handler that only started the timer would leave both of these wrong.
+      const hostTrigger = hostPage.locator(TRIGGER);
+      await expect(popover).toHaveCount(0, { timeout: 10_000 });
+      await expect(hostTrigger).toHaveAttribute("aria-expanded", "false");
+      await expect(hostTrigger).toHaveAttribute("data-running", "true");
+      await expect(hostTrigger).toBeFocused();
+
+      // ── Assert: THE GUEST SEES IT, and sees a SUB-MINUTE timer.
+      const guestChip = guestPage.locator(CHIP);
+      await expect(guestChip).toBeVisible({ timeout: CROSS_PEER_TIMEOUT });
+      // Announced in seconds. No preset can produce this wording: the shortest
+      // is a minute, which reads "1 minute remaining".
+      //
+      // Nothing replaces this text before expiry, so the assertion is not racing
+      // a later milestone: `announces_milestone` DROPS the 10-second call for a
+      // timer of a minute or less, and the 30-second one needs a crossing from
+      // above 30 s that a 30-second timer never has. The only milestone left is
+      // zero, ~30 s away.
+      await expect(guestPage.locator(LIVE_REGION)).toHaveText(
+        /^Meeting timer set\. \d{1,2} seconds remaining\.$/,
+        { timeout: CROSS_PEER_TIMEOUT },
+      );
+      // `format_remaining` renders `M:SS`, so a zero minutes field is the
+      // rendered proof of a sub-minute timer.
+      await expect(guestPage.locator(CHIP_VALUE)).toHaveText(/^0:\d{2}$/);
+
+      const guestRemaining = await remainingMs(guestPage, "guest");
+      expect(
+        guestRemaining,
+        "the typed timer must not have expired before it was read",
+      ).toBeGreaterThan(0);
+      expect(
+        guestRemaining,
+        "30 seconds is what the host typed, and no preset could have produced it",
+      ).toBeLessThanOrEqual(30_000);
+
+      // It is the SAME timer on both pages, not two clients each counting their
+      // own — both derive from one `ends_at_ms`, so they agree to the read gap.
+      await expect(hostPage.locator(CHIP)).toBeVisible({ timeout: 10_000 });
+      const hostRemaining = await remainingMs(hostPage, "host");
+      expect(
+        Math.abs(guestRemaining - hostRemaining),
+        "host and guest must be counting down the same timer",
+      ).toBeLessThan(5_000);
+
+      // ...and it is COUNTING DOWN rather than a chip frozen at its start value.
+      // One tick is 1 s, so this settles almost immediately; the 30 s timer has
+      // no way to reach zero inside the window and make this pass vacuously.
+      await expect
+        .poll(async () => remainingMs(guestPage, "guest"), {
+          timeout: 10_000,
+          message: "the typed timer must actually count down on the guest",
+        })
+        .toBeLessThan(guestRemaining);
+    } finally {
+      await hostBrowser.close();
+      await guestBrowser.close();
+    }
+  });
+
+  /**
+   * The confirm button refuses anything that is not a whole count of units.
+   *
+   * A live-looking button that starts something the host did not type is the
+   * failure `custom_duration_ms` returning `None` prevents. Every case below is
+   * driven through the real field, so what is under test is the production
+   * parser wired to the real control — not a re-implementation of its rules in
+   * TypeScript.
+   *
+   * TWO DELIBERATE IMPLEMENTATION CHOICES SHAPE THE ASSERTIONS, and both are
+   * asserted as written rather than through a matcher that would paper over
+   * them:
+   *
+   *  * The refusal is `aria-disabled`, NOT the `disabled` property, so the
+   *    button keeps its place in the tab order and can still describe itself to
+   *    someone who tabbed to it. `submit_custom` is the thing that makes it
+   *    inert: it re-parses and no-ops on `None`. So the state is read off the
+   *    attribute, and — because an aria-disabled button is still clickable —
+   *    this test also CLICKS it while inert and proves nothing starts. A real
+   *    `disabled` here would fail these assertions, which is the point: it
+   *    would be a regression of the keyboard behaviour, not a tidy-up.
+   *  * The field is `type="text"` with `inputmode="numeric"`, not
+   *    `type="number"`, so junk STAYS ON SCREEN instead of being blanked by the
+   *    browser's value sanitization. That is what makes the rejection visible
+   *    (and what makes it testable by keyboard at all): "1.5" typed character
+   *    by character is still "1.5" when the typing stops. The junk cases below
+   *    are therefore typed, not `fill`ed — a `fill` would prove the parser
+   *    rejects a value but not that the host can still SEE what they typed.
+   *
+   * The exhaustive junk list ("", "   ", "000", "+5", "1e3", "5m", non-ASCII
+   * digits …) is pinned in `meeting_timer.rs`'s own
+   * `an_entry_that_is_not_a_duration_disables_the_confirm_button`. What this
+   * test adds is that the parser is actually WIRED to the button's state, its
+   * accessible name and the hint — which no `#[test]` can reach.
+   */
+  test("the confirm button refuses anything that is not a whole duration", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_meeting_timer_custom_invalid_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newParticipant(browser, "host@videocall.rs", "HostUser", uiURL);
+      await enterMeetingAsHost(page, meetingId);
+      await openTimerPopover(page);
+
+      const value = page.locator(CUSTOM_VALUE);
+      const unit = page.locator(CUSTOM_UNIT);
+      const start = page.locator(CUSTOM_START);
+      const hint = page.locator(CUSTOM_HINT);
+      await expect(value).toBeVisible();
+      await expect(unit).toBeVisible();
+      await expect(start).toBeVisible();
+      await expect(hint).toBeVisible();
+
+      // ── The field is LABELLED and DESCRIBED. The label is a real `<label for>`
+      // rather than an `aria-label`, so it is also a click target that focuses
+      // the field. The amount and the unit are one value, so they sit in one
+      // labelled group; the hint is reachable from the field AND from the button,
+      // which is what makes the inert button's REASON available from either.
+      await expect(page.locator(CUSTOM_LABEL)).toHaveText("Custom length");
+      await expect(page.locator(CUSTOM_LABEL)).toHaveAttribute("id", CUSTOM_LABEL_ID);
+      await expect(page.locator(CUSTOM_GROUP)).toHaveAttribute("role", "group");
+      await expect(page.locator(CUSTOM_GROUP)).toHaveAttribute("aria-labelledby", CUSTOM_LABEL_ID);
+      await expect(value).toHaveAttribute("aria-describedby", CUSTOM_HINT_ID);
+      await expect(start).toHaveAttribute("aria-describedby", CUSTOM_HINT_ID);
+      await expect(hint).toHaveAttribute("id", CUSTOM_HINT_ID);
+      await expect(unit).toHaveAttribute("aria-label", "Custom length unit");
+
+      // ── It opens on MINUTES, the unit every preset directly above it is
+      // labelled in. Opening on seconds would make a host who types "5" beside a
+      // row of "min" buttons get a timer that buzzes at the room in five
+      // seconds.
+      await expect(unit).toHaveValue("minutes");
+
+      // ── EMPTY: nothing typed, nothing to start.
+      await expect(value).toHaveValue("");
+      await expect(start).toHaveAttribute("aria-disabled", "true");
+      await expect(start).toHaveAttribute("aria-label", "Start a custom timer");
+      await expect(hint).toHaveText("Enter a whole number, then pick minutes or seconds.");
+
+      // ── ZERO. A "0 seconds" timer would expire the instant it started.
+      await value.pressSequentially("0", { delay: 60 });
+      await expect(value).toHaveValue("0");
+      await expect(start).toHaveAttribute("aria-disabled", "true");
+      await expect(hint).toHaveText("Enter a whole number, then pick minutes or seconds.");
+
+      // ── A FRACTION, typed. Asserting the VALUE first is what makes the inert
+      // assertion mean something: it proves the refusal came from
+      // `custom_duration_ms` rather than from a field the browser had quietly
+      // emptied — the exact failure `type="text"` was chosen to avoid.
+      await value.fill("");
+      await value.pressSequentially("1.5", { delay: 60 });
+      await expect(value).toHaveValue("1.5");
+      await expect(start).toHaveAttribute("aria-disabled", "true");
+      await expect(hint).toHaveText("Enter a whole number, then pick minutes or seconds.");
+
+      // ── A NEGATIVE, same shape.
+      await value.fill("");
+      await value.pressSequentially("-5", { delay: 60 });
+      await expect(value).toHaveValue("-5");
+      await expect(start).toHaveAttribute("aria-disabled", "true");
+
+      // ── LETTERS. A text input keeps them, so this is the parser's refusal
+      // being observed, not the browser's.
+      await value.fill("");
+      await value.pressSequentially("abc", { delay: 60 });
+      await expect(value).toHaveValue("abc");
+      await expect(start).toHaveAttribute("aria-disabled", "true");
+
+      // ── AND THE INERT BUTTON IS REALLY INERT. `aria-disabled` does not stop a
+      // real click the way the `disabled` property does, so the only thing
+      // standing between junk and a broadcast START is `submit_custom` re-parsing
+      // and no-oping. Clicking here with "abc" in the field is the one way to
+      // prove it: drop that guard and the popover closes and a chip appears.
+      //
+      // `force: true` is REQUIRED and is itself corroboration. Playwright's
+      // actionability treats `aria-disabled="true"` on a button role as disabled
+      // (`getAriaDisabled` in its injected script), so an ordinary `click()` would
+      // wait for the button to become enabled and time out — the same reading an
+      // assistive technology takes. Forcing skips that wait and dispatches the
+      // real click anyway, which is exactly the adversarial case worth covering.
+      await start.click({ force: true });
+      await expect(page.locator(POPOVER)).toBeVisible();
+      await expect(page.locator(CHIP)).toHaveCount(0);
+      await expect(value).toHaveValue("abc");
+
+      // ── VALID: the button comes alive and names the duration it will start.
+      await value.fill("");
+      await value.pressSequentially("7", { delay: 60 });
+      await expect(start).toHaveAttribute("aria-disabled", "false");
+      await expect(start).toHaveAttribute("aria-label", "Start a 7 minutes timer");
+      await expect(hint).toHaveText("Timer will run for 7 minutes.");
+
+      // ── Changing the UNIT re-resolves the same number without retyping it.
+      // Both the label and the hint move, because both read the one parse.
+      await unit.selectOption("seconds");
+      await expect(start).toHaveAttribute("aria-label", "Start a 7 seconds timer");
+      await expect(hint).toHaveText("Timer will run for 7 seconds.");
+
+      // ── OVER THE CAP: clamped, and SAID SO before it is applied. This is not
+      // cosmetic — the relay DROPS an over-cap START at ingress rather than
+      // clamping it (`packet_handler.rs` forwards only while
+      // `duration_ms <= MEETING_TIMER_MAX_DURATION_MS`), so an unclamped send
+      // would leave the host watching a local echo of a timer no one else can
+      // see. 2000 minutes is over the 24 h ceiling, and the host reads the
+      // clamped value while the field still has focus.
+      await unit.selectOption("minutes");
+      await value.fill("2000");
+      await expect(start).toHaveAttribute("aria-disabled", "false");
+      await expect(hint).toHaveText("Timer will run for 24 hours.");
+      await expect(start).toHaveAttribute("aria-label", "Start a 24 hours timer");
+
+      // ── Back to invalid. The refusal is not a one-way latch: a host who clears
+      // the field must not be left with a live button carrying the previous
+      // entry's duration.
+      await value.fill("");
+      await expect(start).toHaveAttribute("aria-disabled", "true");
+      await expect(start).toHaveAttribute("aria-label", "Start a custom timer");
+
+      // Nothing was started by any of the above — including the deliberate click
+      // on the inert button — and a stray start would have closed the popover out
+      // from under the test.
+      await expect(page.locator(CHIP)).toHaveCount(0);
+      await expect(page.locator(POPOVER)).toBeVisible();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  /**
+   * ENTER in the field starts the timer, exactly as the confirm button does.
+   *
+   * A text field inside a dialog is a place people press Enter, and the routes
+   * are separate code: the button's `onclick` and a `Key::Enter` arm on EACH of
+   * the two fields all call one `submit_custom` closure. This is the only thing
+   * that can prove the keyboard routes reach it. Delete either `Key::Enter` arm
+   * and the matching phase below fails on its first assertion after the key
+   * press: the popover never closes, and no chip ever appears.
+   *
+   * BOTH FIELDS, because the second is the one that is easy to forget. The unit
+   * `<select>` carries its own copy of the handler for a reason its RSX states:
+   * Tab-to-unit-then-Enter is the single path a keyboard user takes to change
+   * the unit and commit, and without the handler it is a dead key. Phase 3
+   * covers it, and it costs a cancel-and-reopen rather than a second browser.
+   *
+   * SECONDS on purpose, again: 45 s and 20 s are durations no preset can
+   * produce, so each resulting chip is proof that the typed entry — not some
+   * fallback — is what started.
+   *
+   * WHAT THIS DOES NOT COVER, stated so the next reader does not assume it does:
+   * the field is not inside a `<form>` (nothing in `attendants.rs` wraps it in
+   * one), so Enter has no implicit submission to suppress and the handler's
+   * `prevent_default` is defensive rather than load-bearing here. Nor does this
+   * exercise the reason `submit_custom` reads its signals through `peek` at
+   * submit time instead of closing over the render's value — the test lets the
+   * control settle before pressing Enter, so it never races a keystroke against
+   * the render that follows it. That hazard is a fast typist's, and it is not
+   * observable at this granularity.
+   */
+  test("Enter starts the typed timer from either field, like the confirm button", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_meeting_timer_custom_enter_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const page = await newParticipant(browser, "host@videocall.rs", "HostUser", uiURL);
+      await enterMeetingAsHost(page, meetingId);
+      await openTimerPopover(page);
+
+      const value = page.locator(CUSTOM_VALUE);
+      const unit = page.locator(CUSTOM_UNIT);
+      const start = page.locator(CUSTOM_START);
+      const trigger = page.locator(TRIGGER);
+      const chip = page.locator(CHIP);
+      await expect(value).toBeVisible();
+      await expect(unit).toBeVisible();
+      await expect(start).toBeVisible();
+
+      // ── PHASE 1: Enter in the AMOUNT field.
+      await unit.selectOption("seconds");
+      await value.pressSequentially("45", { delay: 60 });
+
+      // The state Enter is about to commit, read off the control rather than
+      // assumed — so a failure below is unambiguously about the key handler.
+      await expect(start).toHaveAttribute("aria-disabled", "false");
+      await expect(start).toHaveAttribute("aria-label", "Start a 45 seconds timer");
+
+      // `press` focuses the field first, so the keydown lands on the input that
+      // carries the handler — not on the select the unit was chosen from.
+      await value.press("Enter");
+
+      // Identical to the click path, down to the focus return.
+      await expect(page.locator(POPOVER)).toHaveCount(0, { timeout: 10_000 });
+      await expect(trigger).toHaveAttribute("aria-expanded", "false");
+      await expect(trigger).toHaveAttribute("data-running", "true");
+      await expect(trigger).toBeFocused();
+
+      await expect(chip).toBeVisible({ timeout: 15_000 });
+      // Sub-minute: 45 s came from the field, and no preset could have made it.
+      await expect(page.locator(CHIP_VALUE)).toHaveText(/^0:\d{2}$/);
+      const remaining = await remainingMs(page, "host");
+      expect(remaining, "the timer must still be running when it is read").toBeGreaterThan(0);
+      expect(
+        remaining,
+        "45 seconds is what Enter committed, and no preset could have produced it",
+      ).toBeLessThanOrEqual(45_000);
+
+      // ── PHASE 2: cancel, to get the idle branch (and the custom row) back.
+      await openTimerPopover(page);
+      await page.locator(CANCEL).click();
+      await expect(chip).toHaveCount(0, { timeout: 10_000 });
+      await expect(trigger).toHaveAttribute("data-running", "false");
+
+      // ── PHASE 3: Enter from the UNIT select — the Tab-to-unit-then-commit
+      // path, which is a dead key without the select's own handler.
+      await openTimerPopover(page);
+      await expect(value).toBeVisible();
+      // The popover is mounted only while open, so the field is a fresh signal
+      // on every open: a host who cancels and reopens must not find the previous
+      // entry still sitting there.
+      await expect(value).toHaveValue("");
+      await expect(unit).toHaveValue("minutes");
+
+      await value.pressSequentially("20", { delay: 60 });
+      await unit.selectOption("seconds");
+      await expect(start).toHaveAttribute("aria-label", "Start a 20 seconds timer");
+
+      // Focus the SELECT and press there. This is the assertion the extra
+      // cancel-and-reopen buys.
+      await unit.press("Enter");
+
+      await expect(page.locator(POPOVER)).toHaveCount(0, { timeout: 10_000 });
+      await expect(trigger).toHaveAttribute("data-running", "true");
+      await expect(chip).toBeVisible({ timeout: 15_000 });
+      await expect(page.locator(CHIP_VALUE)).toHaveText(/^0:\d{2}$/);
+      const secondRemaining = await remainingMs(page, "host");
+      expect(secondRemaining, "the second timer must still be running").toBeGreaterThan(0);
+      expect(
+        secondRemaining,
+        "20 seconds is what Enter on the unit select committed",
+      ).toBeLessThanOrEqual(20_000);
+    } finally {
+      await browser.close();
     }
   });
 });

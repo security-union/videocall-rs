@@ -20,9 +20,13 @@ import { defineConfig, devices } from "@playwright/test";
 //   - Cert validity period MUST be <= 14 days.
 //   - Hash is SHA-256 of the **DER-encoded cert** (NOT the SPKI).
 //
-// The cert + hash are produced together by `scripts/regen-dev-cert.sh` and
-// the hash is checked into `actix-api/certs/localhost.cert-sha256.txt`. Each
-// authenticated context injects the hash into `window.__VC_WT_CERT_HASHES__`
+// The cert + hash are produced together by `scripts/regen-dev-cert.sh`. The hash
+// is written to `actix-api/certs/localhost.cert-sha256.txt`, which is gitignored
+// (#2159 — it fingerprints a machine-local 13-day cert, so tracking it only
+// churned the worktree); `global-setup.ts` asserts it exists before the suite
+// runs.
+//
+// Each authenticated context injects the hash into `window.__VC_WT_CERT_HASHES__`
 // before the wasm boots — see `e2e/helpers/auth-context.ts::CERT_HASH_INIT_SCRIPT`
 // and the wasm side at
 // `videocall-transport/src/webtransport.rs::read_wt_cert_hash_options`.

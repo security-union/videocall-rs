@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { COSTUME_HEIGHT, COSTUME_WIDTH, y4mMatchesTargetGeometry } from "./costumes";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -44,6 +45,22 @@ const CHROME_ARGS = [
  * fleet secrets is strictly better than it holding all of them.)
  */
 const FLEET_CRED_ENV_RE = /^BOT_(EMAIL|PASSWORD|CTL_TOKEN)(_\d+)?$/;
+
+/**
+ * The bot's rendered receive posture — an explicit 1080p desktop (#2235).
+ *
+ * Geometry is an input to receive load, not a cosmetic: #1256 caps each peer's
+ * decoded rung by tile height in DEVICE pixels, and `min_tile_width` bounds how
+ * many peer tiles render at all — unset, Playwright's default decided both. Why
+ * this size, and which rungs it moves (density-dependent): see the PR.
+ *
+ * `satisfies` is load-bearing: Playwright silently ignores a misspelled option
+ * key, and the spread at the call site defeats excess-property checking.
+ */
+export const BOT_RECEIVE_POSTURE = {
+  viewport: { width: 1920, height: 1080 },
+  deviceScaleFactor: 1,
+} as const satisfies NonNullable<Parameters<Browser["newContext"]>[0]>;
 
 /**
  * `process.env` with every fleet-credential variable removed, as a string-only
@@ -231,9 +248,10 @@ export interface BotRunOptions {
    * Host-mount time (dioxus-ui `capability_check.rs`: `<6 cores → 1 layer`,
    * `6–9 → 2`, `>=10 → 3`). In a container, Chrome reports the *node's*
    * core count (e.g. 32) regardless of the pod's CPU limit, so every bot
-   * would sniff a 3-layer ceiling and over-commit encode CPU. Setting this
-   * to match the pod's CPU budget (e.g. `2` → 1 layer, `8` → 2 layers) makes
-   * the sniffed ceiling realistic per-pod.
+   * would sniff a ceiling from the NODE's cores rather than a modelled client.
+   * Setting this to a modelled client's ladder DEPTH — not to the pod's CPU
+   * budget, which would read 4 and collapse the ladder to 1 rung — makes the
+   * ceiling a deliberate choice. The fleet uses 10 (3 rungs); see cli.ts, #2248.
    *
    * This is a `navigator` property (not an `__APP_CONFIG` key), so the spoof
    * SURVIVES the app's runtime `window.__APP_CONFIG` reassignment. When
@@ -547,6 +565,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
     storageState: initialStorageState,
+    ...BOT_RECEIVE_POSTURE,
   });
   if (opts.authBackend === "jwt") {
     const email = participantEmail(opts.participant);
@@ -597,8 +616,9 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // so the spoofed value is in place well before the client ever sniffs it, and
   // therefore controls the sniffed layer ceiling. In a container Chrome reports
   // the NODE's core count (e.g. 32) regardless of the pod's CPU limit, so every
-  // bot would sniff a 3-layer ceiling and over-commit encode CPU; pinning this
-  // to the pod's CPU budget caps the encoded layers realistically. Defining an
+  // bot would sniff a ceiling from the node's cores, not a modelled client;
+  // pinning this to a modelled client's ladder depth (the fleet uses 10 -> 3
+  // rungs) makes the ceiling deliberate. Defining an
   // OWN accessor on the `navigator` instance shadows the read-only prototype
   // getter that `web_sys::Navigator::hardware_concurrency()` reads; it is a
   // navigator property (not an `__APP_CONFIG` key) so it survives the app's
@@ -954,11 +974,24 @@ function resolveOverrideOrAuto(args: {
   if (args.override && args.override !== "" && args.override !== "default") {
     const overridePath = join(args.runDir, args.subdir, args.override);
     if (existsSync(overridePath)) {
-      return overridePath;
+      // A VIDEO override bypasses auto-prime entirely (that only primes the
+      // manifest-matched costume), so it is a third path a stale 1280x720 y4m can
+      // reach Chrome on (#2171). Geometry-check it and fall back rather than
+      // silently publishing 3x a real user's pixel load.
+      if (args.kind === "video" && !y4mMatchesTargetGeometry(overridePath)) {
+        console.warn(
+          `[${args.label}] video override "${args.override}" was built at a different geometry ` +
+            `(expected ${COSTUME_WIDTH}x${COSTUME_HEIGHT}) — ignoring it and falling back to ` +
+            `manifest auto-match. Re-run prep-assets to rebuild it.`,
+        );
+      } else {
+        return overridePath;
+      }
+    } else {
+      console.warn(
+        `[${args.label}] ${args.kind} override "${args.override}" missing at ${overridePath} — falling back to manifest auto-match.`,
+      );
     }
-    console.warn(
-      `[${args.label}] ${args.kind} override "${args.override}" missing at ${overridePath} — falling back to manifest auto-match.`,
-    );
   }
   return args.autoPath;
 }

@@ -185,12 +185,22 @@ pub fn register_freshness_inject_hooks() {}
 /// wall-clock gap in ms since the previous worker poll — an f64, mirroring `head_age_ms`).
 #[cfg(target_arch = "wasm32")]
 fn spawn_freshness_skip_collector() {
-    use videocall_diagnostics::{subscribe, MetricValue};
+    use videocall_diagnostics::{recv_loop_action, subscribe, MetricValue, RecvLoopAction};
     use wasm_bindgen::prelude::*;
 
     wasm_bindgen_futures::spawn_local(async move {
         let mut rx = subscribe();
-        while let Ok(evt) = rx.recv().await {
+        loop {
+            // Issue 2174: a bare `while let Ok(..)` here died permanently on the
+            // first `Overflowed`, which is recoverable — see
+            // `videocall_diagnostics::recv_loop_action`.
+            let evt = match rx.recv().await {
+                Ok(evt) => evt,
+                Err(e) => match recv_loop_action(&e) {
+                    RecvLoopAction::Continue => continue,
+                    RecvLoopAction::Break => break,
+                },
+            };
             if evt.subsystem != "video" {
                 continue;
             }

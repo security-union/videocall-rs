@@ -40,10 +40,11 @@ use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
 use videocall_codecs::jitter_buffer::{
     decide_keyframe_less_escalation, paint_lag_ms, EscalationSignal, FreshnessSkip, JitterBuffer,
+    KeyframeArrival,
 };
 use videocall_codecs::messages::{
-    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerLogMessage,
-    WorkerMessage,
+    FreshnessSkipMessage, KeyframeArrivalMessage, RequestKeyframeMessage, VideoStatsMessage,
+    WorkerLogMessage, WorkerMessage,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -544,6 +545,21 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
             // Get current time in milliseconds
             let current_time_ms = js_sys::Date::now() as u128;
             jb.insert_frame(video_frame, current_time_ms);
+
+            // Issue #2201: forward any keyframe ARRIVAL to the main thread for field-log
+            // visibility, mirroring how the ~10ms poll forwards a `freshness_skip`.
+            //
+            // Drained HERE rather than only in `check_jitter_buffer_for_ready_frames` because
+            // arrivals are produced by THIS function: draining only on the poll would delay
+            // every arrival by up to one tick and — worse — let a second keyframe inside the
+            // same tick overwrite the first. Periodic keyframes are one per
+            // `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` (camera 5000ms) /
+            // `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS` (screen 3000ms) per stream, so this
+            // is well below the per-tick `freshness_skip` path it sits beside. The poll ALSO
+            // drains, as a backstop for the `InjectStaleFrame` test path.
+            if let Some(arrival) = jb.take_keyframe_arrival() {
+                post_keyframe_arrival_to_main(&arrival);
+            }
         }
     });
 }
@@ -628,6 +644,15 @@ fn check_jitter_buffer_for_ready_frames() {
             // below it is not rate-limited.
             if let Some(skip) = jb.take_freshness_skip() {
                 post_freshness_skip_to_main(&skip);
+            }
+
+            // Issue #2201 backstop: the insert path is the normal drain site for a keyframe
+            // arrival (see `insert_frame_to_jitter_buffer`), but the test-only
+            // `inject_stale_frame_to_jitter_buffer` path also inserts, so drain here too. A
+            // no-op on every ordinary poll (`None`), and it can never double-post — `take`
+            // clears the slot.
+            if let Some(arrival) = jb.take_keyframe_arrival() {
+                post_keyframe_arrival_to_main(&arrival);
             }
 
             // Publish buffered frames metric periodically under subsystem "video" with stream_id unset.
@@ -732,6 +757,19 @@ fn check_jitter_buffer_for_ready_frames() {
                                             metric!("content_staleness_ms", content_staleness_ms),
                                             // #1656: true painted-frame cadence (FRAMES_EMITTED / wall-second).
                                             metric!("fps_painted", fps_painted),
+                                            // #2201: lifetime keyframe ARRIVALS on this stream.
+                                            // NOT differenceable against
+                                            // `keyframe_requests_sent_total` (process-wide counter,
+                                            // unrequested periodic arrivals dominate, different
+                                            // reset boundary) — read it as "is it rising during a
+                                            // freeze" plus a rate-vs-periodic-cadence check. A
+                                            // cumulative COUNTER like `playout_skip_to_live_total`:
+                                            // survives flush(), resets on a pipeline rebuild, so
+                                            // consume via increase()/rate().
+                                            metric!(
+                                                "keyframe_arrivals_total",
+                                                jb.keyframe_arrival_count()
+                                            ),
                                         ],
                                     };
                                     let _ = global_sender().try_broadcast(evt);
@@ -749,6 +787,10 @@ fn check_jitter_buffer_for_ready_frames() {
                                             playout_paint_lag_ms,
                                             playout_skip_to_live_total,
                                             content_staleness_ms,
+                                            // #2201: arrival counter, forwarded on the
+                                            // load-bearing main-thread path (the worker's own
+                                            // DiagEvent broadcast does not cross the boundary).
+                                            jb.keyframe_arrival_count(),
                                         );
                                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                             let _ = scope.post_message(&val);
@@ -889,6 +931,45 @@ fn post_freshness_skip_to_main(skip: &FreshnessSkip) {
         }
         Err(e) => {
             console::warn_1(&format!("[WORKER] freshness_skip: serialize failed: {e:?}").into());
+        }
+    }
+}
+
+/// Post a keyframe ARRIVAL (issue #2201) to the main thread so it lands in uploaded field
+/// logs. Mirrors [`post_freshness_skip_to_main`]; context (CONTEXT_FROM/CONTEXT_TO) is read
+/// at emit time because `SetContext` can arrive after the buffer is built.
+///
+/// This is deliberately NOT a `log::` call. The worker's only logger
+/// ([`WorkerLogForwarder`]) filters at `WORKER_LOG_FORWARD_LEVEL` (`Warn`), so an
+/// `info!`/`debug!` would be dropped at the facade and never reach the field logs this
+/// exists to populate — and a `warn!` would share the forwarder's 250ms rate limiter with
+/// the #1662 escalation warnings, so a keyframe burst could SUPPRESS the very escalation
+/// lines these arrivals are meant to be correlated against. A dedicated `postMessage` has
+/// neither problem.
+fn post_keyframe_arrival_to_main(arrival: &KeyframeArrival) {
+    let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
+        console::warn_1(&"[WORKER] keyframe_arrival: no worker scope; dropping".into());
+        return;
+    };
+    let from_peer = CONTEXT_FROM.with(|f| f.borrow().clone());
+    let to_peer = CONTEXT_TO.with(|t| t.borrow().clone());
+    let msg = KeyframeArrivalMessage::new(
+        from_peer,
+        to_peer,
+        arrival.seq,
+        arrival.head_age_ms,
+        arrival.was_in_keyframe_less_hold,
+        arrival.ms_since_keyframe_request,
+        arrival.was_awaiting_proactive_keyframe,
+        arrival.rejected_as_old,
+        arrival.stream_restart,
+    );
+    match serde_wasm_bindgen::to_value(&msg) {
+        Ok(val) => {
+            let _ = scope.post_message(&val);
+        }
+        Err(e) => {
+            console::warn_1(&format!("[WORKER] keyframe_arrival: serialize failed: {e:?}").into());
         }
     }
 }

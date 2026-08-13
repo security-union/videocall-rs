@@ -13,8 +13,8 @@
 
 //! Shared owner-only meeting-options toggles.
 //!
-//! This is the SINGLE source of truth for the five mutable meeting options
-//! (Waiting Room, Admitted-can-admit, End-on-host-leave, Allow-guests, Recording). It is
+//! This is the SINGLE source of truth for the six mutable meeting options
+//! (Waiting Room, Admitted-can-admit, End-on-host-leave, Allow-guests, Recording, Chat). It is
 //! rendered in three places so we never maintain duplicate copies of this UI:
 //!   - the pre-join / startup card ([`crate::components::pre_join_settings_card`]),
 //!   - the dedicated meeting-settings page ([`crate::pages::meeting_settings`]),
@@ -70,7 +70,7 @@ fn waiting_room_rollback(new_val: bool, prev_aca: bool) -> (bool, Option<bool>) 
     (waiting_room_restore, admitted_can_admit_restore)
 }
 
-/// The five owner-editable meeting-option rows, wired to caller-owned signals.
+/// The six owner-editable meeting-option rows, wired to caller-owned signals.
 #[component]
 pub fn MeetingOptionsControls(
     meeting_id: String,
@@ -79,6 +79,7 @@ pub fn MeetingOptionsControls(
     end_on_host_leave_toggle: Signal<bool>,
     allow_guests_toggle: Signal<bool>,
     recording_allowed_for_all_toggle: Signal<bool>,
+    chat_allowed_for_all_toggle: Signal<bool>,
     saving: Signal<bool>,
     toggle_error: Signal<Option<String>>,
 ) -> Element {
@@ -116,6 +117,7 @@ pub fn MeetingOptionsControls(
                             end_on_host_leave_toggle.set(updated.end_on_host_leave);
                             allow_guests_toggle.set(updated.allow_guests);
                             recording_allowed_for_all_toggle.set(updated.recording_allowed_for_all);
+                            chat_allowed_for_all_toggle.set(updated.chat_allowed_for_all);
                             saving.set(false);
                         }
                         Err(e) => {
@@ -332,6 +334,49 @@ pub fn MeetingOptionsControls(
                                 Some(new_val),
                                 None,
                                 recording_allowed_for_all_toggle,
+                                old_val,
+                                None,
+                                saving,
+                                toggle_error,
+                            );
+                        }
+                    },
+                }
+            }
+        }
+
+        // ── Allow chat for all participants ───────────────────────────────
+        // When enabled (the default) every admitted participant can SEND chat
+        // messages.  When disabled, only the host/co-hosts can send; everyone
+        // can still READ the chat.  A host turns this off for an all-hands-style
+        // meeting and can flip it back on live (e.g. to open the floor for
+        // end-of-meeting questions).  This gates the send affordance in the UI;
+        // like recording it is a visibility gate, not server-enforced.
+        div { class: "settings-option-row", style: "opacity: 1;",
+            span { class: "settings-option-label", "Allow chat for all" }
+            div { class: "settings-option-controls",
+                {info_icon("When on, everyone can send chat messages. When off, only hosts can send — everyone can still read the chat.")}
+                ToggleSwitch {
+                    enabled: chat_allowed_for_all_toggle(),
+                    disabled: saving(),
+                    on_toggle: {
+                        let meeting_id = mid.clone();
+                        let update_setting = update_setting.clone();
+                        move |new_val: bool| {
+                            if saving() {
+                                return;
+                            }
+                            let old_val = !new_val;
+                            chat_allowed_for_all_toggle.set(new_val);
+                            update_setting(
+                                meeting_id.clone(),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(new_val),
+                                chat_allowed_for_all_toggle,
                                 old_val,
                                 None,
                                 saving,

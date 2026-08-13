@@ -823,6 +823,14 @@ pub fn generate_for_peer(
     let audio_level = audio_levels.raw;
     let mic_audio_level = audio_levels.mic;
     let signal_level = signal_info.level;
+    let signal_unmeasured = signal_info.decode_paused_locally;
+    let signal_state = if signal_unmeasured {
+        "unmeasured"
+    } else if signal_level.is_lost() {
+        "lost"
+    } else {
+        "measured"
+    };
     let signal_history = signal_info.history;
     let meeting_start_ms = signal_info.meeting_start_ms;
     // Pulled out once before rsx so the SignalQualityPopup call sites
@@ -1058,7 +1066,17 @@ pub fn generate_for_peer(
                         button {
                             id: "{ss_signal_btn_id}",
                             class: "signal-indicator",
-                            "aria-label": "Show screen-share signal quality",
+                            "aria-label": if signal_unmeasured {
+                                "Video paused to save CPU. Signal is not measured for this peer."
+                            } else {
+                                "Show screen-share signal quality"
+                            },
+                            title: if signal_unmeasured {
+                                "Video paused to save CPU. Signal is not measured for this peer."
+                            } else {
+                                "Show screen-share signal quality"
+                            },
+                            "data-signal-state": "{signal_state}",
                             "data-signal-level": format!("{}", signal_level.bars()),
                             "data-signal-lost": format!("{}", signal_level.is_lost()),
                             // stop_propagation: this is a tile-overlay control, not a
@@ -1068,7 +1086,11 @@ pub fn generate_for_peer(
                                 e.stop_propagation();
                                 on_toggle_signal_popup.call(());
                             },
-                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                            SignalBarsIcon {
+                                level: signal_level.bars(),
+                                lost: signal_level.is_lost(),
+                                unmeasured: signal_unmeasured,
+                            }
                         }
                         // Issue #1483: transport badge adjacent to the signal
                         // meter. Renders nothing unless the flag is on AND the
@@ -1122,6 +1144,7 @@ pub fn generate_for_peer(
                                 peer_id: popup_peer_id,
                                 peer_name: popup_peer_name,
                                 history: h,
+                                decode_paused_locally: signal_unmeasured,
                                 meeting_start_ms,
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
@@ -1320,7 +1343,17 @@ pub fn generate_for_peer(
                         button {
                             id: "{split_signal_btn_id}",
                             class: "signal-indicator",
-                            "aria-label": "Show signal quality",
+                            "aria-label": if signal_unmeasured {
+                                "Video paused to save CPU. Signal is not measured for this peer."
+                            } else {
+                                "Show signal quality"
+                            },
+                            title: if signal_unmeasured {
+                                "Video paused to save CPU. Signal is not measured for this peer."
+                            } else {
+                                "Show signal quality"
+                            },
+                            "data-signal-state": "{signal_state}",
                             "data-signal-level": format!("{}", signal_level.bars()),
                             "data-signal-lost": format!("{}", signal_level.is_lost()),
                             // stop_propagation: tile-overlay control, not a grid
@@ -1329,7 +1362,11 @@ pub fn generate_for_peer(
                                 e.stop_propagation();
                                 on_toggle_signal_popup.call(());
                             },
-                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                            SignalBarsIcon {
+                                level: signal_level.bars(),
+                                lost: signal_level.is_lost(),
+                                unmeasured: signal_unmeasured,
+                            }
                         }
                         // Issue #1483: transport badge adjacent to the signal
                         // meter (renders nothing unless flag on + transport known).
@@ -1435,6 +1472,7 @@ pub fn generate_for_peer(
                                 peer_id: popup_peer_id,
                                 peer_name: popup_peer_name,
                                 history: h,
+                                decode_paused_locally: signal_unmeasured,
                                 meeting_start_ms,
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
@@ -1796,7 +1834,17 @@ pub fn generate_for_peer(
                             button {
                                 id: "{grid_signal_btn_id}",
                                 class: "signal-indicator",
-                                "aria-label": "Show signal quality",
+                                "aria-label": if signal_unmeasured {
+                                    "Video paused to save CPU. Signal is not measured for this peer."
+                                } else {
+                                    "Show signal quality"
+                                },
+                                title: if signal_unmeasured {
+                                    "Video paused to save CPU. Signal is not measured for this peer."
+                                } else {
+                                    "Show signal quality"
+                                },
+                                "data-signal-state": "{signal_state}",
                                 "data-signal-level": format!("{}", signal_level.bars()),
                                 "data-signal-lost": format!("{}", signal_level.is_lost()),
                                 // stop_propagation: tile-overlay control, not a grid
@@ -1805,7 +1853,11 @@ pub fn generate_for_peer(
                                     e.stop_propagation();
                                     on_toggle_signal_popup.call(());
                                 },
-                                SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                                SignalBarsIcon {
+                                    level: signal_level.bars(),
+                                    lost: signal_level.is_lost(),
+                                    unmeasured: signal_unmeasured,
+                                }
                             }
                             // Issue #1483: transport badge adjacent to the signal
                             // meter (renders nothing unless flag on + transport known).
@@ -1909,6 +1961,7 @@ pub fn generate_for_peer(
                                     peer_id: popup_peer_id,
                                     peer_name: popup_peer_name,
                                     history: h,
+                                    decode_paused_locally: signal_unmeasured,
                                     meeting_start_ms,
                                     transport: popup_transport,
                                     anchor_id: popup_anchor,

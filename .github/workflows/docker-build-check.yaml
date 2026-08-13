@@ -1,5 +1,8 @@
 name: Docker Build Check
 
+# PR gate: prove every app image derivation builds (no push). Same
+# `release.nix` attrs CI publishes and `make images` loads locally — see
+# docs/nix-architecture.md.
 on:
   pull_request:
     paths:
@@ -7,7 +10,6 @@ on:
       - 'actix-api/**'
       - 'videocall-types/**'
       - 'protobuf/**'
-      - 'Dockerfile.actix'
       - 'Cargo.lock'
       - 'Cargo.toml'
       # UI image dependencies
@@ -15,102 +17,57 @@ on:
       - 'videocall-client/**'
       - 'videocall-codecs/**'
       - 'neteq/**'
-      - 'Dockerfile.dioxus'
-      - 'nginx.conf'
-      - 'flake.nix'
-      - 'flake.lock'
       # Meeting API dependencies
       - 'meeting-api/**'
       - 'videocall-meeting-types/**'
-      - 'Dockerfile.meeting-api'
-      # Docker directory changes
-      - 'docker/Dockerfile.actix.dev'
-      - 'docker/Dockerfile.dioxus.dev'
-      # Website image dependencies
-      - 'leptos-website/**'
-      - 'docker/Dockerfile.website'
+      - 'dbmate/**'
+      # Bot dependencies
+      - 'bot/**'
+      # Nix build system
+      - 'default.nix'
+      - 'release.nix'
+      - 'nix/**'
 
 jobs:
-  build-api:
-    name: Build API Docker image
+  # Four self-sufficient legs. Dependencies, toolchains and runtime payloads
+  # substitute from cachix (videocall-rs.cachix.org) — pushed once, org-wide —
+  # so each leg compiles ONLY the workspace crates the PR touched, then
+  # assembles layers. Measured: 2m24s-4m50s per leg on a warm cache vs ~10m
+  # wall for the docker-era 4-job matrix.
+  #
+  # No warm-up job and no GHA store snapshot on purpose:
+  # - nix-community/cache-nix-action restored files under the RUNNING nix
+  #   daemon, whose open SQLite db never saw them — nix planned 1566-drv full
+  #   rebuilds right after "successful" 1.6GB restores, on every run.
+  # - with cachix substitution a warm-up job only serializes the matrix; on a
+  #   cold cache (lockfile/pin bump) the legs race-build deps redundantly, but
+  #   that is rare and does not extend wall time.
+  build-images:
+    name: Build Nix images (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: actix-services
+            attrs: -A images.media-server -A images.websocket-server -A images.webtransport-server -A images.metrics-server -A images.server-stats
+          - name: meeting-api-and-bot
+            attrs: -A images.meeting-api -A images.bot
+          - name: dioxus-ui
+            attrs: -A images.dioxus-ui
+          - name: website-and-vlog
+            attrs: -A images.website -A images.engineering-vlog
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build API Docker image (no push)
-        uses: docker/build-push-action@v5
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
         with:
-          context: .
-          file: Dockerfile.actix
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            GIT_SHA=${{ github.event.pull_request.head.sha }}
-            GIT_BRANCH=${{ github.head_ref }}
-            BUILD_TIMESTAMP=${{ github.event.pull_request.updated_at }}
+          name: videocall-rs
+          # pull works tokenless (public cache); push activates once the
+          # CACHIX_AUTH_TOKEN repo secret exists
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-  build-meeting-api:
-    name: Build Meeting API Docker image
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out the repo
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Meeting API Docker image (no push)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.meeting-api
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            GIT_SHA=${{ github.event.pull_request.head.sha }}
-            GIT_BRANCH=${{ github.head_ref }}
-            BUILD_TIMESTAMP=${{ github.event.pull_request.updated_at }}
-
-  build-dioxus-ui:
-    name: Build Dioxus UI Docker image
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out the repo
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Dioxus UI Docker image (no push)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.dioxus
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  build-website:
-    name: Build Website Docker image
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out the repo
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Website Docker image (no push)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/Dockerfile.website
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Build image derivations (no push)
+        run: nix-build release.nix ${{ matrix.attrs }} --no-out-link

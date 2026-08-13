@@ -259,6 +259,11 @@ pub mod long_tasks;
 mod media_devices;
 pub mod render_fps;
 pub mod screen_first_render_inject;
+/// **TEST-ONLY** serial guards for tests that touch process-global statics
+/// (issues #2160 / #2016). At the crate root because the participating tests
+/// live in different modules and so cannot share a guard declared in either.
+#[cfg(test)]
+mod test_serial;
 pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;

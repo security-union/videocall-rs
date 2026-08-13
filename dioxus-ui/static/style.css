@@ -5472,10 +5472,39 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border-color: transparent;
 }
 
+/* NOTE: these two values are dead — every branch of `mic_style()`
+   (canvas_generator.rs) emits an inline `transition` covering both `color` and
+   `filter` on this same element, and inline declarations beat a stylesheet
+   rule. The durations that actually run come from there: colour 0.05s easing
+   in while lit and 5.0s easing out once silent, and filter per the Decay
+   setting (0.15s in, 1.50s out, after a 0-5s hold). Tuning the numbers here
+   changes nothing on screen. Left in place rather than deleted — removing it
+   is a separate cleanup, not part of the issue-2174 fix. */
 .audio-indicator {
   transition:
     color 0.4s ease,
     filter 0.4s ease;
+}
+
+/* issue 2174: the icon's `stroke` flips between `currentColor` (while
+   speaking) and the base `white` the moment the `.speaking` class drops.
+   `stroke` was in no transition list, so the icon snapped white at the end of
+   the mic hold — a visible hitch while the glow was still fading out.
+
+   This rule must live on the `svg`, not on `.audio-indicator`: the parent's
+   `transition` is set inline by `mic_style()` (canvas_generator.rs) and inline
+   always wins, so a `stroke` entry added to the parent stylesheet rule below
+   would be overridden and do nothing. `transition` is not an inherited
+   property, so the parent's inline value never reaches this child either —
+   this declaration is the only thing that animates the stroke.
+
+   0.4s is chosen on its own merits, NOT to match any other rule: it sits
+   between the glow's 0.15s fade-in and 1.50s fade-out
+   (GLOW_FADE_IN_SECONDS_DEFAULT / GLOW_FADE_OUT_DURATION), long enough to read
+   as a deliberate fade rather than a snap, short enough that the outline does
+   not visibly trail the icon's colour change. */
+.audio-indicator svg {
+  transition: stroke 0.4s ease;
 }
 
 .audio-indicator.speaking svg {
@@ -8818,6 +8847,15 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   height: min(18px, calc(var(--tile-h, 240px) * 0.09));
 }
 
+.signal-quality-unmeasured {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--text-tertiary);
+  color: var(--text-secondary);
+  background: var(--surface);
+  font-size: var(--fs-3);
+}
+
 /* Signal quality popup -- inline overlay positioned within each tile */
 .signal-quality-popup {
   /* Base visual style.  Positioning is supplied by
@@ -9611,32 +9649,103 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border: 1px solid var(--glass-popover-border);
   border-radius: var(--radius-lg);
   padding: var(--space-2);
+  /* issue 2173: a COLUMN with exactly one in-flow child —
+     `.reactions-palette__scroll`, which owns the content row AND the scrolling.
+     The close (X) badge is the only other child and is `position: absolute`, so
+     it is out of flow and never becomes a flex item of this column. Column
+     direction + `min-height: 0` on the wrapper is what lets the max-height below
+     shrink the wrapper and hand the overflow to it — this element must NOT carry
+     an `overflow` of its own; see the wrapper's comment. */
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1);
-  justify-content: center;
-  /* issue 1884: centre the shorter close (X) button against the 44px reaction
-     options rather than letting it sit top-aligned. */
-  align-items: center;
+  flex-direction: column;
   max-width: min(360px, calc(100% - 32px));
   /* issue 2141: the palette grew a ~400px emoji-picker column, and it is
      anchored to the BOTTOM, so it grows UPWARD without limit. On a short
      viewport (landscape phone ~390px tall, or any viewport with the soft
      keyboard open) it ran off the TOP of the screen and clipped the search
      field — which, being first in the column, is exactly what gets lost.
-     Bounded here so the column scrolls instead of overflowing. 124px = the
-     104px bottom offset + 20px of top breathing room. The `dvh` line re-measures
-     when mobile browser chrome collapses (and, under
+     Bounded here so `.reactions-palette__scroll` scrolls the column instead of
+     the palette overflowing. 124px = the 104px bottom offset + 20px of top
+     breathing room, and it stays exact because the cap is still on THIS box:
+     Tailwind Preflight's universal `box-sizing: border-box` (tailwind.css, and
+     it is loaded before this file) makes max-height a BORDER-box cap, so the
+     padding and the 1px border sit inside the budget — unchanged by issue 2173
+     moving the scrolling inward, which is exactly why the cap did not move with
+     it. Putting the cap on the wrapper instead would have silently added the
+     padding and border back on top of the budget.
+     The `dvh` line re-measures when mobile browser chrome collapses (and, under
      `interactive-widget=resizes-content`, when the keyboard opens); the `vh`
      line above it is the fallback for engines without `dvh`. */
   max-height: calc(100vh - 124px);
   max-height: calc(100dvh - 124px);
-  overflow-y: auto;
-  overscroll-behavior: contain;
   z-index: 9100;
   backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow: var(--glass-popover-shadow);
+}
+
+/* issue 2173: the palette's scroll viewport, and the flex row that issue 1884
+   originally ran on `.reactions-palette` itself. It exists to make the SCROLL
+   CONTAINER and the close (X) badge's containing block two DIFFERENT boxes.
+
+   Why it had to be split: the badge hangs half off the palette's top-right
+   corner (`translate(50%, -50%)`), and issue 2141 put `overflow-y: auto` on the
+   palette to bound the tall picker column. Per CSS overflow, a computed
+   `overflow-y` of `auto` forces `overflow-x` from `visible` to `auto` — the
+   palette became a scroll container on BOTH axes. A scroll container does not
+   extend its scrollable area up or left, so the badge's top overhang was
+   clipped outright, while its right overhang turned into horizontal scrollable
+   overflow: a horizontal scrollbar with the X unreachable. That is issue 2173.
+
+   The content scrolls in here; the badge stays a SIBLING of this box, so it is
+   not a descendant of any scroll container and keeps its full overhang. What
+   makes the scrolling work is that this box is a shrinkable flex item of the
+   capped column above — see the `min-height` note below for why it shrinks.
+   Deliberately NO `position`: nothing here should ever become a containing block
+   for an absolutely-positioned descendant, so the badge's anchor stays the
+   palette even if it is later nested. That contract is pinned by a test. */
+.reactions-palette__scroll {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  justify-content: center;
+  /* issue 1884: centre the shorter items (the recents divider, the picker's
+     first line) against the 44px reaction options rather than letting them sit
+     top-aligned. This no longer affects the close (X): issue 1884 later made it
+     an absolutely-positioned badge, which is out of flow and unaffected by
+     `align-items` — and as of issue 2173 it is not even in this box. */
+  align-items: center;
+  /* issue 2173: NOT required — a flex item whose computed overflow is not
+     `visible` already gets an automatic minimum size of zero (CSS Flexbox 4.5),
+     and this box has `overflow-y: auto` below, so it shrinks and scrolls with or
+     without this line (measured: identical). Kept as a deliberate pin so the
+     wrapper stays shrinkable if the overflow ever moves off this box, which is
+     the one case where the automatic minimum size would come back and push the
+     palette past its max-height instead of scrolling. */
+  min-height: 0;
+  overflow-y: auto;
+  /* issue 2173: explicit, and load-bearing as documentation. `overflow-y: auto`
+     alone would blockify the OTHER axis — a computed `overflow-x` of `visible`
+     becomes `auto` when its counterpart is not `visible` — which is the exact
+     spec rule that turned the palette into a two-axis scroll container and
+     produced this issue's horizontal scrollbar. Nothing in here overflows
+     horizontally today (the row wraps and `.emoji-picker` is width:100%), so
+     this changes no current pixel; it pins the invariant so a future child that
+     does overhang cannot resurrect the scrollbar. */
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  /* issue 2173: the house thin-scrollbar treatment (cf. `.settings-panel`,
+     `.ss-peer-panel`), which this box needs now that it is the
+     scroller — otherwise Windows/Linux paint the default light-grey bar on the
+     glass. The thumb is the DARK `--scrollbar-thumb` value verbatim rather than
+     the token: this surface is FIXED-DARK in both themes (issue 2091), but
+     `--scrollbar-thumb` is theme-aware and flips to rgba(0,0,0,0.18) under
+     html[data-theme="light"] — a near-black thumb on dark-navy glass. That is
+     the same light-theme invisibility issue 2091 re-based this palette's other
+     tokens to avoid, and the popover contract in global.css forbids it. */
+  scrollbar-width: thin;
+  /* @token-exempt: fixed-dark surface — see above */
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
 .reaction-option {
@@ -9689,9 +9798,19 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 
 /* issue 1884: the reactions palette close (X) is a small circular badge that
    HANGS half off the palette's top-right corner (translate(50%,-50%)) rather
-   than sitting inline. Absolutely positioned inside the palette (its transform /
-   fixed position is the containing block); the palette has no overflow:hidden,
-   so the overhang is not clipped. Overrides the shared .close-button colour +
+   than sitting inline. Absolutely positioned against `.reactions-palette` (its
+   fixed position AND its transform each make it the containing block), of which
+   it is a DIRECT child — a sibling of `.reactions-palette__scroll`, never a
+   descendant of it.
+
+   issue 2173: that sibling relationship is the whole point. `.reactions-palette`
+   is `overflow: visible`, so the overhang is not clipped; the scrolling lives on
+   the wrapper instead. Do NOT move an `overflow` back onto `.reactions-palette`
+   and do NOT move this badge inside the wrapper — either one re-clips the top
+   overhang and turns the right overhang into a horizontal scrollbar, which was
+   exactly issue 2173. The full mechanism is on the wrapper rule above.
+
+   Overrides the shared .close-button colour +
    hover (see the issue 2091 note below) but keeps its backgrounds; adds a
    subtle ring/shadow from the popover token set. A 24px box is a
    compact visual, and it stays keyboard-focusable with a visible ring. The
@@ -9811,9 +9930,12 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 /* ===== Standard-emoji picker (CUSTOM reaction, issue 1884) ===== */
-/* Full-width panel that wraps below the palette's quick row (flex-basis:100%).
-   Only the selected category's grid is mounted, so the full ~3600-emoji table
-   is never rendered at once. */
+/* Full-width panel that wraps below the quick row (flex-basis:100%). Both live
+   in `.reactions-palette__scroll`, which is the wrapping flex row this
+   flex-basis resolves against (issue 2173 moved that row off `.reactions-palette`
+   onto the wrapper; this panel stayed a flex item of the same row). Only the
+   selected category's grid is mounted, so the full ~3600-emoji table is never
+   rendered at once. */
 .emoji-picker {
   flex-basis: 100%;
   width: 100%;
@@ -10048,8 +10170,10 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 /* Short viewport — a landscape phone (~390px tall), or any viewport with the
    soft keyboard open, since `interactive-widget=resizes-content` shrinks the
    layout viewport and re-evaluates this query. Shrink the grid so the whole
-   picker column fits inside `.reactions-palette`'s max-height and only ONE
-   scroller is in play. 520px is kept in lockstep with
+   picker column fits inside `.reactions-palette`'s max-height (still the bound
+   after issue 2173; only the scrolling moved inward, to
+   `.reactions-palette__scroll`) and only ONE scroller is in play. 520px is kept
+   in lockstep with
    `AUTOFOCUS_MIN_VIEWPORT_HEIGHT_PX` in `emoji_picker.rs`, which suppresses the
    field's focus-on-open at the same point. */
 @media (max-height: 520px) {
@@ -12248,6 +12372,20 @@ html {
   flex-direction: column;
   gap: var(--space-2);
   max-width: min(360px, calc(100vw - 24px));
+  /* issue 2172: the custom-duration row added a label, a field row and a hint
+     below the presets, and this popover is anchored to the BOTTOM, so it grows
+     UPWARD without limit. On a short viewport (landscape phone, or any viewport
+     with the soft keyboard open — which typing a duration is exactly what
+     opens) it would run off the TOP and clip the preset row, the first thing in
+     the column. Bounded so the column scrolls instead. 124px = the 104px bottom
+     offset + 20px of top breathing room. The `dvh` line re-measures when mobile
+     browser chrome collapses and when the keyboard opens; the `vh` line above it
+     is the fallback for engines without `dvh`. Same fix as `.reactions-palette`
+     took for issue 2141. */
+  max-height: calc(100vh - 124px);
+  max-height: calc(100dvh - 124px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 12px;
   background: var(--glass-popover-bg);
   border: 1px solid var(--glass-popover-border);
@@ -12260,12 +12398,17 @@ html {
    `.action-bar-overflow-popover`'s `left/right: calc(100% + 12px); top: 50%`
    idiom in absolute terms (the dock is at `top: 50%` with a
    `translateY(-50%)`, so centring on the viewport centres on the bar). */
+/* Both side docks are vertically CENTRED rather than bottom-anchored, so they
+   grow in both directions and the 104px bottom offset the base rule subtracts
+   does not apply. 32px leaves 16px of breathing room above and below (issue
+   2172). */
 .meeting-timer-popover--dock-left {
   left: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap));
   right: auto;
   bottom: auto;
   top: 50%;
   transform: translateY(-50%);
+  max-height: calc(100dvh - 32px);
 }
 
 .meeting-timer-popover--dock-right {
@@ -12274,6 +12417,7 @@ html {
   bottom: auto;
   top: 50%;
   transform: translateY(-50%);
+  max-height: calc(100dvh - 32px);
 }
 
 .meeting-timer-popover-row {
@@ -12325,4 +12469,145 @@ html {
   color: var(--on-dark-text-secondary);
   font-size: var(--fs-3);
   line-height: 1.4;
+}
+
+/* ------------------------------------------------------------
+   Custom duration entry (issue 2172)
+   ------------------------------------------------------------
+
+   A rule above it, not a separate card: this is the SAME decision as the preset
+   row (how long is the timer), reached a different way, so it reads as the tail
+   of that choice rather than as another panel.
+
+   The row inherits `.meeting-timer-popover-row`'s `flex-wrap: wrap`, so on the
+   narrowest popover (the 100vw - 24px clamp on a small phone) the field, the
+   unit and Start stack instead of overflowing. */
+.meeting-timer-popover-custom {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--glass-popover-border);
+}
+
+.meeting-timer-popover-custom-label {
+  color: var(--on-dark-text-secondary);
+  font-size: var(--fs-3);
+  font-weight: 600;
+}
+
+.meeting-timer-popover-row--custom {
+  align-items: center;
+}
+
+/* The amount and its unit are one value, so they travel together: a single flex
+   item in the row that wraps as a unit, with Start dropping to the next line
+   before the field is ever separated from its unit. `min-width: 0` because a
+   flex item otherwise refuses to shrink below its content width and would push
+   the row past the popover on a narrow phone. */
+.meeting-timer-custom-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.meeting-timer-custom-value,
+.meeting-timer-custom-unit {
+  /* 44px touch target (WCAG 2.5.5), matching the preset buttons beside them. */
+  min-height: 44px;
+  padding: 0 8px;
+  background: transparent;
+  /* BOUNDARY CONTRAST (WCAG 1.4.11, >=3:1), issue 2172: the popover's own
+     --glass-popover-border resolves to ~1.1:1 against --glass-popover-bg. That
+     is fine for the decorative rule above this row, and invisible as the
+     boundary of a control the host has to find and type into. Same token and
+     same reasoning as `.emoji-picker__search-input` — do NOT soften this back
+     to the popover border. */
+  border: 1px solid var(--on-dark-text-muted);
+  border-radius: var(--radius-md);
+  color: var(--on-dark-text-high);
+  font-family: inherit;
+  /* 16px, NOT --fs-4 (13px): iOS Safari zooms the layout viewport when a
+     control with a sub-16px font takes focus and does NOT zoom back out on
+     blur, so one tap on this field leaves the whole meeting grid magnified.
+     The viewport meta's `user-scalable=no` does not suppress it. Same lever,
+     same reason as `.emoji-picker__search-input`. The Start button beside them
+     keeps --fs-4 — it is not a text-entry control, so it does not trigger the
+     zoom. */
+  font-size: 16px;
+  /* The UA paints the select's chevron and the native option menu from the
+     element's colour scheme. Without this it uses the page's LIGHT scheme on a
+     fixed-dark surface, i.e. dark glyphs on dark glass. */
+  color-scheme: dark;
+}
+
+.meeting-timer-custom-value {
+  /* Grows into the spare width; the basis fits a 5-digit entry, which is more
+     than the 86400-second ceiling needs. */
+  flex: 1 1 88px;
+  min-width: 64px;
+}
+
+.meeting-timer-custom-unit {
+  flex: 0 1 auto;
+  cursor: pointer;
+}
+
+/* The OPEN option menu is a fixed-dark surface like its parent popover, so it
+   takes the fixed-dark contract tokens (issue 2172). An earlier revision of
+   this rule used the theme-aware --surface-elevated / --text-primary pair on
+   the theory that the UA paints the menu in the PAGE's colour scheme — that is
+   exactly what the dock-popover contract forbids, because --text-primary flips
+   to near-black under html[data-theme="light"] and would render ~1.3:1 on this
+   glass. --fixed-dark-opaque is the documented context-menu weight, and
+   `color-scheme: dark` above keeps the UA's own chrome consistent with it. */
+.meeting-timer-custom-unit option {
+  background: var(--fixed-dark-opaque);
+  color: var(--on-dark-text);
+}
+
+.meeting-timer-custom-value:focus-visible,
+.meeting-timer-custom-unit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.meeting-timer-popover-action--custom {
+  /* Sized to its label instead of sharing the presets' `flex: 1 1 auto`, so it
+     never grows wider than the field it confirms. */
+  flex: 0 0 auto;
+  min-width: 64px;
+}
+
+/* The confirm button is inert until the entry parses. Dimmed rather than
+   hidden: a control that appears only once the input is valid gives no hint
+   that anything is expected.
+
+   `[aria-disabled="true"]` as well as `:disabled`, because the custom Start
+   button uses the ARIA form (issue 2172) — a real `disabled` attribute drops it
+   out of the tab order, so a keyboard or screen-reader user could never reach
+   it to discover WHY it is inert. It stays focusable and its description
+   carries the reason.
+
+   DIMMED BY PAINT, NOT BY `opacity` (issue 2172). `opacity` fades the whole
+   element including its FOCUS RING, which would drop the 2px --accent outline
+   below the 3:1 that WCAG 1.4.11 and 2.4.11 require. On an ordinary disabled
+   control that is moot — it is not focusable, so the ring never renders. This
+   button is the exception the ARIA form creates: it stays in the tab order on
+   purpose, so it is precisely the control whose ring MUST survive the inert
+   state. Setting the two paint properties instead leaves the outline at full
+   strength, and the text still drops from --on-dark-text-high to muted, which
+   is the visible difference the state needs. */
+.meeting-timer-popover-action:disabled,
+.meeting-timer-popover-action[aria-disabled="true"] {
+  color: var(--on-dark-text-muted);
+  border-color: var(--on-dark-text-muted);
+  cursor: not-allowed;
+}
+
+.meeting-timer-popover-action:disabled:hover,
+.meeting-timer-popover-action[aria-disabled="true"]:hover {
+  background: transparent;
 }

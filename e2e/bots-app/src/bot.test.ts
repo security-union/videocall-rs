@@ -46,6 +46,7 @@ vi.mock("./meeting-join", async (importOriginal) => {
 });
 
 import {
+  BOT_RECEIVE_POSTURE,
   browserEnvWithoutFleetCreds,
   ENCODER_FPS_POLL_MS,
   isBenignTeardownError,
@@ -872,6 +873,112 @@ describe("launchBot hardwareConcurrency spoof (#2035)", () => {
       (c) => typeof c[0] === "string" && c[0].includes("hardwareConcurrency"),
     );
     expect(touchedHwc).toBe(false);
+  });
+});
+
+describe("launchBot receive posture (#2235)", () => {
+  // Why the posture matters at all: see `BOT_RECEIVE_POSTURE`.
+  let newContext: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.browserClose.mockResolvedValue(undefined);
+    mocks.contextClose.mockResolvedValue(undefined);
+    const page = {
+      addInitScript: mocks.addInitScript,
+      evaluate: mocks.pageEvaluate,
+      goto: vi.fn().mockResolvedValue(undefined),
+      locator: vi.fn(),
+      off: vi.fn(),
+      on: vi.fn(),
+      url: vi.fn(() => "https://example.test/meeting/Posture"),
+    };
+    newContext = vi.fn().mockResolvedValue({
+      close: mocks.contextClose,
+      newPage: vi.fn().mockResolvedValue(page),
+    });
+    mocks.launch.mockResolvedValue({ close: mocks.browserClose, newContext, on: vi.fn() });
+    mocks.addInitScript.mockResolvedValue(undefined);
+    mocks.ensureAssetsPrimed.mockResolvedValue(undefined);
+    mocks.joinMeetingAndEnableMedia.mockResolvedValue(undefined);
+    mocks.resolveAssetsForParticipant.mockReturnValue({
+      audioPath: "/tmp/audio.wav",
+      videoPath: "/tmp/video.y4m",
+    });
+  });
+
+  async function launch(): Promise<void> {
+    await launchBot({
+      meetingURL: "https://example.test/meeting/Posture",
+      participant: "posture-bot",
+      displayName: "Posture Bot",
+      headless: true,
+      videoMode: "clock",
+      authBackend: "none",
+      manifest: { participants: [{ name: "posture-bot" }], lines: [], pauseMs: 0 },
+      manifestDir: "/tmp/manifest",
+      runDir: "/tmp/run",
+      costumeOverride: "clock.y4m",
+      audioOverride: "clock.wav",
+    });
+  }
+
+  /** Device pixels are what the lid measures; CSS px alone cannot express it. */
+  function devicePx(opts: {
+    viewport?: { width: number; height: number } | null;
+    deviceScaleFactor?: number;
+  }): { width: number; height: number } {
+    // A null viewport is a defect either way, so refuse to score it: Playwright
+    // rejects it outright once deviceScaleFactor is set (validateBrowserContextOptions),
+    // and without one a headless context is a fixed 800x600 — smaller still.
+    expect(opts.viewport).toBeTruthy();
+    const dpr = opts.deviceScaleFactor ?? 1;
+    return { width: opts.viewport!.width * dpr, height: opts.viewport!.height * dpr };
+  }
+
+  // Asserted on the newContext CALL, not on BOT_RECEIVE_POSTURE: spreading the
+  // const into the options is the step that can regress, and a test that reads
+  // the const would stay green if the spread were dropped.
+  it("renders a posture bracketing the 1080p desktop it models", async () => {
+    await launch();
+    expect(newContext).toHaveBeenCalledTimes(1);
+    const opts = newContext.mock.calls[0]![0] as Parameters<typeof devicePx>[0];
+    // devicePx FIRST so its null-viewport guard is the assertion that fires; the
+    // non-null asserts below would otherwise TypeError ahead of it.
+    const px = devicePx(opts);
+    // BOTH axes, because a device-pixel product alone cannot express the lid: tile
+    // count and column packing are decided in CSS px and only then scaled by dpr,
+    // so 960x540@dpr2 matches this device-pixel floor while rendering fewer tiles,
+    // or lidding harder, depending on the viewer's density mode.
+    expect(opts.viewport!.width).toBeGreaterThanOrEqual(1920);
+    expect(opts.viewport!.height).toBeGreaterThanOrEqual(1080);
+    expect(px.width).toBeGreaterThanOrEqual(1920);
+    expect(px.height).toBeGreaterThanOrEqual(1080);
+    // Bounded above as well: on a load-test fleet an oversized posture inflates
+    // per-bot decode and raster, which skews the measurement this tool exists to
+    // take. Growing the posture should be a reviewed decision, not a silent one.
+    expect(px.width).toBeLessThanOrEqual(2560);
+    expect(px.height).toBeLessThanOrEqual(1440);
+  });
+
+  it("keeps the posture the launch path actually applies in sync with the export", async () => {
+    await launch();
+    const opts = newContext.mock.calls[0]![0] as Record<string, unknown>;
+    // Premise first: the loop below asserts nothing at all over an emptied const,
+    // and comparing each side to that same const cannot detect it either.
+    expect(Object.keys(BOT_RECEIVE_POSTURE)).toEqual(["viewport", "deviceScaleFactor"]);
+    for (const [k, v] of Object.entries(BOT_RECEIVE_POSTURE)) {
+      expect(opts[k]).toEqual(v);
+    }
+  });
+
+  it("still passes the auth and TLS options the fleet depends on", async () => {
+    // The spread is added to an options object that already carries these; a
+    // careless edit that replaced rather than extended it would break auth.
+    await launch();
+    const opts = newContext.mock.calls[0]![0] as Record<string, unknown>;
+    expect(opts.ignoreHTTPSErrors).toBe(true);
+    expect(opts).toHaveProperty("storageState");
   });
 });
 

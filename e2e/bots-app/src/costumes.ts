@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { type Manifest, costumeNameForParticipant } from "./manifest";
@@ -18,6 +18,51 @@ export function costumeY4mPath(
   if (!name) return null;
   return join(outputDir, `${name}.y4m`);
 }
+
+/**
+ * Whether a cached y4m was encoded at the current target geometry. The header is
+ * a plain-ASCII first line (`YUV4MPEG2 W640 H480 F30:1 ...`), so this reads a few
+ * bytes rather than the whole file.
+ */
+export function y4mMatchesTargetGeometry(path: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(64);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    // Bound to the first line and require the magic: without it any 64-byte
+    // prefix containing `W640`/`H480` passes, including a non-y4m file.
+    const firstLine = buf.subarray(0, n).toString("ascii").split("\n")[0];
+    if (!firstLine.startsWith("YUV4MPEG2")) return false;
+    return (
+      new RegExp(`\\bW${COSTUME_WIDTH}\\b`).test(firstLine) &&
+      new RegExp(`\\bH${COSTUME_HEIGHT}\\b`).test(firstLine)
+    );
+  } catch {
+    // Unreadable or truncated: treat as a miss so it is rebuilt.
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
+ * Costume source geometry — the size a real webcam publishes (#2171).
+ *
+ * The ffmpeg chain scales to cover, centre-crops, and forces square pixels.
+ * `scale` alone keeps the source's DISPLAY aspect by declaring a non-square SAR,
+ * and Chrome passes the raster through unchanged — so the bot would publish a
+ * horizontally squashed face at the right pixel count.
+ *
+ * `force_original_aspect_ratio=increase` + `crop` rather than a bare
+ * `crop=ih*4/3:ih`: the latter computes an output width from the height and
+ * `vf_crop` REJECTS `out_w > in_w`, so it hard-fails on any source narrower than
+ * 4:3. The costume MP4s are third-party recordings with no guaranteed aspect
+ * (`bot/README.md`), and the old `scale=1280:720` force-stretched anything and
+ * never failed — so this form must not introduce a new failure mode.
+ */
+export const COSTUME_WIDTH = 640;
+export const COSTUME_HEIGHT = 480;
 
 export interface PrepareCostumeResult {
   /** Absolute path to the y4m file, or `null` if the participant has no costume. */
@@ -66,7 +111,14 @@ export function prepareParticipantCostume(
   }
 
   mkdirSync(outputDir, { recursive: true });
-  if (existsSync(outputPath) && statSync(outputPath).mtimeMs >= statSync(sourcePath).mtimeMs) {
+  // The mtime check alone cannot see a GEOMETRY change: the source MP4 is
+  // untouched when the target size changes, so a stale 720p y4m would be reused
+  // and #2171 would ship inert. The header check is what makes the fix land.
+  if (
+    existsSync(outputPath) &&
+    statSync(outputPath).mtimeMs >= statSync(sourcePath).mtimeMs &&
+    y4mMatchesTargetGeometry(outputPath)
+  ) {
     return { path: outputPath, rebuilt: false, costumeName };
   }
 
@@ -80,7 +132,8 @@ export function prepareParticipantCostume(
       "-i",
       sourcePath,
       "-vf",
-      "scale=1280:720,fps=30",
+      `scale=${COSTUME_WIDTH}:${COSTUME_HEIGHT}:force_original_aspect_ratio=increase,` +
+        `crop=${COSTUME_WIDTH}:${COSTUME_HEIGHT},setsar=1,fps=30`,
       "-pix_fmt",
       "yuv420p",
       "-f",

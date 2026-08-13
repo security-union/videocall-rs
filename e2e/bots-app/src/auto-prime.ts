@@ -1,7 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { costumeY4mPath, prepareParticipantCostume } from "./costumes";
+import { costumeY4mPath, prepareParticipantCostume, y4mMatchesTargetGeometry } from "./costumes";
 import {
   type Manifest,
   costumeNameForParticipant,
@@ -275,16 +275,27 @@ function isAudioFresh(
 }
 
 /**
- * True iff the costume y4m exists AND its mtime is newer than (or
- * equal to) the source MP4's mtime. Mirrors the equivalent check in
- * `costumes.ts::prepareParticipantCostume`.
+ * True iff the costume y4m exists, was built at the current target geometry, and
+ * its mtime is newer than (or equal to) the source MP4's. Mirrors the equivalent
+ * check in `costumes.ts::prepareParticipantCostume`.
+ *
+ * This is the OUTER gate: when it says "fresh" the prepare helper is never
+ * called, so the geometry check there never runs (#2171).
  */
-function isCostumeFresh(y4mPath: string, sourceMp4: string): boolean {
+export function isCostumeFresh(y4mPath: string, sourceMp4: string): boolean {
   if (!existsSync(y4mPath)) return false;
+  // Geometry FIRST, above the missing-source early return. Geometry does not
+  // depend on the source existing, and "stale 720p y4m present, source MP4
+  // absent" is the DEFAULT state on a fresh clone: `bot/assets/costumes/` and
+  // `*.mp4` are both gitignored, and the documented `--costume-source` lives in
+  // /tmp. Below the early return this check would be skipped on exactly the path
+  // where it matters. Returning false is benign: prepare throws, auto-prime
+  // catches, and Chrome falls back to its default fake camera — already 640x480.
+  if (!y4mMatchesTargetGeometry(y4mPath)) return false;
   if (!existsSync(sourceMp4)) {
-    // Source missing — the prepare helper will throw and the
-    // auto-prime catches that. Treat the cached output as fresh here so
-    // we don't spuriously try to rebuild it and then fail loudly.
+    // Source missing — the prepare helper will throw and the auto-prime catches
+    // that. Treat a correctly-sized cached output as fresh so we don't
+    // spuriously rebuild and then fail loudly.
     return true;
   }
   return statSync(y4mPath).mtimeMs >= statSync(sourceMp4).mtimeMs;

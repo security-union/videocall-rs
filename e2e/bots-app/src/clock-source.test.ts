@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const CLOCK_SOURCE = readFileSync(
   fileURLToPath(new URL("./clock-source.js", import.meta.url)),
@@ -10,6 +10,11 @@ const CLOCK_SOURCE = readFileSync(
 );
 
 type TrackKind = "audio" | "video";
+
+// Set by the fake canvas below when the module configures it, so the track's
+// reported dimensions follow the source instead of a hardcoded pair.
+let capturedCanvasWidth = 0;
+let capturedCanvasHeight = 0;
 
 class FakeTrack {
   readonly stop = vi.fn();
@@ -29,7 +34,7 @@ class FakeTrack {
 
   getSettings(): { width?: number; height?: number } {
     if (this.kind !== "video" || !this.dimensionsReady()) return {};
-    return { width: 1280, height: 720 };
+    return { width: capturedCanvasWidth, height: capturedCanvasHeight };
   }
 }
 
@@ -58,6 +63,7 @@ function installClockSource(dimensionsReady: () => boolean): {
   drawingContext: {
     fillText: ReturnType<typeof vi.fn>;
   };
+  canvas: { width: number; height: number };
   redraw: () => void;
   setParticipant: (participant: string) => void;
 } {
@@ -107,8 +113,18 @@ function installClockSource(dimensionsReady: () => boolean): {
   };
   const captureStream = vi.fn(() => new FakeMediaStream([baseVideoTrack]));
   const canvas = {
-    width: 0,
-    height: 0,
+    set width(v: number) {
+      capturedCanvasWidth = v;
+    },
+    get width(): number {
+      return capturedCanvasWidth;
+    },
+    set height(v: number) {
+      capturedCanvasHeight = v;
+    },
+    get height(): number {
+      return capturedCanvasHeight;
+    },
     getContext: vi.fn(() => drawingContext),
     captureStream,
   };
@@ -143,12 +159,20 @@ function installClockSource(dimensionsReady: () => boolean): {
     baseVideoTrack,
     captureStream,
     drawingContext,
+    canvas,
     redraw: () => redraw(),
     setParticipant: (participant: string) => {
       sandbox.__CLOCK_PARTICIPANT = participant;
     },
   };
 }
+
+beforeEach(() => {
+  // Module-level and shared: each installClockSource re-runs the module and
+  // reassigns these, but reset so one test cannot observe another's canvas.
+  capturedCanvasWidth = 0;
+  capturedCanvasHeight = 0;
+});
 
 afterEach(() => {
   vi.useRealTimers();
@@ -163,13 +187,63 @@ describe("clock-source getUserMedia width gate", () => {
   });
 
   it("reads the participant label on each frame instead of snapshotting init order", () => {
-    const { drawingContext, redraw, setParticipant } = installClockSource(() => true);
+    const { drawingContext, redraw, setParticipant, canvas } = installClockSource(() => true);
     drawingContext.fillText.mockClear();
 
     setParticipant("Late Participant");
     redraw();
 
-    expect(drawingContext.fillText).toHaveBeenCalledWith("Late Participant", 640, 585, 1_160);
+    const call = drawingContext.fillText.mock.calls.find((c) => c[0] === "Late Participant");
+    expect(call).toBeDefined();
+    const [, x] = call as [string, number, number, number];
+    expect(x).toBe(canvas.width / 2);
+  });
+
+  it("keeps EVERY drawn element inside the canvas, none left absolute", () => {
+    // Parameterised over all three `fillText` calls, not just the label. Reverting
+    // any ONE y-coordinate to its absolute 720p value must fail here: at 480 high,
+    // `330` and `465` are both still < 480, so a per-element assertion passes while
+    // the text is jammed together near the bottom — the silent failure #2171 names.
+    //
+    // The invariant is proportionality: each element must sit at the same FRACTION
+    // of frame height it occupied in the 1280x720 reference layout.
+    const { drawingContext, redraw, setParticipant, canvas } = installClockSource(() => true);
+    setParticipant("Someone");
+    drawingContext.fillText.mockClear();
+    redraw();
+
+    const calls = drawingContext.fillText.mock.calls as [string, number, number, number?][];
+    expect(calls.length).toBe(3);
+
+    // Reference fractions from the authored 1280x720 layout: time 330/720,
+    // date 465/720, name 585/720.
+    const expectedFractions = [330 / 720, 465 / 720, 585 / 720];
+    calls.forEach(([text, x, y], i) => {
+      expect(x).toBe(canvas.width / 2);
+      expect(y).toBeGreaterThan(0);
+      expect(y).toBeLessThan(canvas.height);
+      expect(y / canvas.height).toBeCloseTo(expectedFractions[i], 5);
+      void text;
+    });
+
+    // Ordering must stay top-to-bottom with no overlap collapse.
+    const ys = calls.map(([, , y]) => y);
+    expect(ys[0]).toBeLessThan(ys[1]);
+    expect(ys[1]).toBeLessThan(ys[2]);
+
+    // maxWidth, where present, must stay inside the frame.
+    calls.forEach(([, , , maxWidth]) => {
+      if (maxWidth !== undefined) expect(maxWidth).toBeLessThanOrEqual(canvas.width);
+    });
+  });
+
+  it("captures at the geometry real publishers actually send", () => {
+    const { canvas } = installClockSource(() => true);
+    // 21 of 25 observed human publishers emit exactly 640x480; a 1280x720 clock
+    // made every bot ~3x a real user's pixel load (#2171). Pinned because the
+    // relational assertions above are all satisfied at 720p too, so without this
+    // the resolution change has no regression test at all.
+    expect([canvas.width, canvas.height]).toEqual([640, 480]);
   });
 
   it("rejects and stops tracks when video dimensions never appear", async () => {

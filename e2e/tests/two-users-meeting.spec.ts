@@ -714,8 +714,10 @@ test.describe("Two users in a meeting", () => {
       await ensureReactionsPaletteOpen(page);
 
       // The reset control and the quick-picks are SIBLINGS inside the palette
-      // (both direct children of .reactions-palette), so both anchor on the
-      // palette — never one on the other.
+      // (both direct children of .reactions-palette__scroll, the content wrapper
+      // issue 2173 added), so both anchor on the palette — never one on the
+      // other. The locators below are descendant, not child, so the wrapper
+      // makes no difference to them.
       const palette = page.locator('[data-testid="reactions-palette"]');
       const recent0 = palette.locator('[data-testid="reaction-recent-0"]');
       const recent1 = palette.locator('[data-testid="reaction-recent-1"]');
@@ -961,6 +963,129 @@ test.describe("Two users in a meeting", () => {
       await expect(closeBtn).toBeVisible();
       await expect(closeBtn).toHaveAttribute("aria-label", "Close reactions");
 
+      await closeBtn.click();
+      await expect(palette).toBeHidden({ timeout: 3000 });
+      await expect(hostPage.locator('[data-testid="reactions-button"]')).toBeFocused();
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  // TAGGED @bvt1 for the same reason as the reset spec above: single-browser,
+  // single-join and palette-only, so it is cheap enough for the per-PR smoke
+  // superset — which is also how it gets a real run receipt.
+  test("the close badge overhangs a palette that never scrolls horizontally @bvt1", async ({
+    baseURL,
+  }) => {
+    // Issue 2173. The close (X) is a badge that hangs half off the palette's
+    // top-right corner (issue 1884, `translate(50%, -50%)`), which only works
+    // while the palette is `overflow: visible`. Issue 2141 then added
+    // `overflow-y: auto` to bound the tall picker column, and per CSS overflow a
+    // computed `overflow-y` of `auto` forces `overflow-x` from `visible` to
+    // `auto` — so the palette became a scroll container on BOTH axes. Its top
+    // overhang was clipped and its right overhang became horizontal scrollable
+    // overflow: a horizontal scrollbar with the X clipped and unreachable.
+    //
+    // FAILS ON UN-FIXED CODE at assertions 1 and 2: the palette's computed
+    // `overflow-x` reads "auto" instead of "visible", a written `scrollLeft`
+    // sticks at a non-zero value instead of pinning back to 0, and the badge's
+    // top overhang is clipped away so it is absent from the hit-test stack
+    // above the palette's edge. Note the existing
+    // "the X button closes the palette" spec did NOT catch this —
+    // Playwright scrolls a partly-offscreen target into view before clicking, so
+    // a functional click assertion passes even while the badge is clipped. The
+    // discriminator has to be the overflow geometry, not clickability.
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_reaction_badge_clip_${Date.now()}`;
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const hostPage = await hostInMeeting(browser1, uiURL, meetingId);
+      await ensureReactionsPaletteOpen(hostPage);
+
+      const palette = hostPage.locator('[data-testid="reactions-palette"]');
+      const closeBtn = hostPage.locator('[data-testid="reactions-close"]');
+      await expect(palette).toBeVisible();
+      await expect(closeBtn).toBeVisible();
+
+      // 1. The palette itself is not a scroll container on either axis.
+      const overflow = await palette.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        return { x: cs.overflowX, y: cs.overflowY };
+      });
+      expect(overflow.x).toBe("visible");
+      expect(overflow.y).toBe("visible");
+
+      // 2. And so it cannot be scrolled horizontally — the literal "horizontal
+      //    scrollbar" from the bug report. This is deliberately a SCROLLABILITY
+      //    check and not `scrollWidth <= clientWidth`: Blink folds the badge's
+      //    out-of-flow right overhang into the palette's scrollable overflow
+      //    whether or not the palette is a scroll container (the palette is the
+      //    badge's containing block either way), so scrollWidth exceeds
+      //    clientWidth by that overhang on fixed AND un-fixed code alike — it
+      //    cannot discriminate, and asserting it would fail the FIXED build.
+      //    Writing scrollLeft is what discriminates: a box that is not a scroll
+      //    container pins it straight back to 0, a scroll container keeps it.
+      const scrollLeftAfterWrite = await palette.evaluate((el) => {
+        el.scrollLeft = 999;
+        const observed = el.scrollLeft;
+        el.scrollLeft = 0;
+        return observed;
+      });
+      expect(scrollLeftAfterWrite).toBe(0);
+
+      //    The badge's TOP overhang is really painted, not clipped away.
+      //    `getBoundingClientRect` is unclipped and cannot see clipping, so this
+      //    hit-tests instead. The probe point is the badge's upper quarter,
+      //    which is above the palette's top edge because the badge's vertical
+      //    centre sits ON that edge. `elementsFromPoint` returns the whole
+      //    stack, so an unrelated overlay above the palette cannot false-red it.
+      const topOverhangPainted = await hostPage.evaluate(() => {
+        const paletteEl = document.querySelector('[data-testid="reactions-palette"]');
+        const badgeEl = document.querySelector('[data-testid="reactions-close"]');
+        if (!paletteEl || !badgeEl) {
+          throw new Error("reactions palette or close badge missing from the DOM");
+        }
+        const pr = paletteEl.getBoundingClientRect();
+        const br = badgeEl.getBoundingClientRect();
+        const probeY = br.y + br.height / 4;
+        if (probeY >= pr.top) {
+          throw new Error(`probe point ${probeY} is not above the palette top ${pr.top}`);
+        }
+        return document.elementsFromPoint(br.x + br.width / 2, probeY).includes(badgeEl);
+      });
+      expect(topOverhangPainted).toBe(true);
+
+      // 3. The scrolling moved to the inner wrapper, and the badge is a SIBLING
+      //    of it — never a descendant, or it would be clipped all over again.
+      const wrapper = palette.locator(".reactions-palette__scroll");
+      await expect(wrapper).toHaveCount(1);
+      expect(await wrapper.evaluate((el) => getComputedStyle(el).overflowY)).toBe("auto");
+      const badgeIsInsideScroller = await hostPage.evaluate(() => {
+        const scroller = document.querySelector(".reactions-palette__scroll");
+        const badge = document.querySelector('[data-testid="reactions-close"]');
+        // Throw rather than return false: a missing element must not read as
+        // "the badge is outside the scroller", which is the passing value.
+        if (!scroller || !badge) {
+          throw new Error("scroll wrapper or close badge missing from the DOM");
+        }
+        return scroller.contains(badge);
+      });
+      expect(badgeIsInsideScroller).toBe(false);
+
+      // 4. The issue-1884 overhang is still real: the badge's box extends past
+      //    the palette's top and right edges rather than sitting inside them.
+      //    (Layout rects are unclipped, so this pins the 1884 design; assertions
+      //    1-2 are what pin the 2173 fix.)
+      const paletteBox = await palette.boundingBox();
+      const badgeBox = await closeBtn.boundingBox();
+      expect(paletteBox).not.toBeNull();
+      expect(badgeBox).not.toBeNull();
+      if (paletteBox && badgeBox) {
+        expect(badgeBox.x + badgeBox.width).toBeGreaterThan(paletteBox.x + paletteBox.width);
+        expect(badgeBox.y).toBeLessThan(paletteBox.y);
+      }
+
+      // 5. Still functional after the restructure.
       await closeBtn.click();
       await expect(palette).toBeHidden({ timeout: 3000 });
       await expect(hostPage.locator('[data-testid="reactions-button"]')).toBeFocused();

@@ -48,6 +48,24 @@ pub enum DiagnosticEvent {
         peer_id: String,
         media_type: MediaType,
         frame_size: u64, // Size of the frame in bytes
+        /// Whether this packet was actually DECODED, or merely arrived (issue #2190).
+        ///
+        /// `false` for every `DecodeStatus::SKIPPED` path in `Peer::decode` — most
+        /// importantly the EXACT-MATCH simulcast guard, which drops any packet whose
+        /// `simulcast_layer_id` is not this receiver's selected rung. The relay fails
+        /// OPEN and forwards ALL of a publisher's rungs to a healthy receiver, so
+        /// those wrong-rung packets DO arrive here; counting them as frames made
+        /// `fps_received` read the LADDER SUM (an 8fps 3-rung camera published
+        /// 7+15+30 = ~52 fps) instead of the rung actually decoded.
+        ///
+        /// Bytes are still accumulated regardless (see
+        /// [`FpsTracker::track_frame_with_size`]) because they genuinely crossed this
+        /// receiver's downlink — so `bitrate_kbps` keeps measuring real consumption
+        /// while `fps_received` measures real decode. The two are gated on SEPARATE
+        /// freshness clocks so that divergence is representable: bitrate live with
+        /// fps at 0 is the receiving-but-not-decoding signature (wrong-rung, or a
+        /// hidden/off-budget tile).
+        decoded: bool,
     },
     DecodeError {
         peer_id: String,
@@ -97,7 +115,18 @@ struct FpsTracker {
     total_frames: u32,
     #[allow(dead_code)]
     media_type: MediaType,
-    last_frame_time: f64,       // Add timestamp of last received frame
+    /// Timestamp of the last DECODED frame (issue #2190). Drives the fps freshness gate:
+    /// a stream that decodes nothing must report fps 0 rather than a stale cached value.
+    last_frame_time: f64,
+    /// Timestamp of the last ARRIVING packet, decoded or skipped (issue #2190).
+    ///
+    /// Deliberately SEPARATE from `last_frame_time`: bytes are billed on arrival, so the
+    /// bitrate readout must stay live for a stream that is receiving but not decoding —
+    /// a hidden/off-budget tile, or a receiver pinned to a rung the publisher stopped
+    /// producing. Gating bitrate on decoded-frame freshness would report 0 kbps while the
+    /// downlink is genuinely carrying traffic, hiding real bandwidth consumption at
+    /// exactly the moment an operator is trying to account for it.
+    last_packet_time: f64,
     bytes_received: u64,        // Track total bytes received
     last_bitrate_update: f64,   // Last time we calculated bitrate
     current_bitrate: f64,       // Current bitrate in kbits/sec
@@ -116,6 +145,7 @@ impl FpsTracker {
             total_frames: 0,
             media_type,
             last_frame_time: now,
+            last_packet_time: now,
             bytes_received: 0,
             last_bitrate_update: now,
             current_bitrate: 0.0,
@@ -125,11 +155,38 @@ impl FpsTracker {
         }
     }
 
-    fn track_frame_with_size(&mut self, bytes: u64) -> (f64, f64) {
-        self.frames_count += 1;
-        self.total_frames += 1;
+    /// Accumulate one arriving packet.
+    ///
+    /// `decoded` (issue #2190) separates the two things this tracker measures:
+    ///   * FRAME counters (`frames_count`/`total_frames` → `fps`) advance only when
+    ///     the packet was actually decoded, so `fps` is this receiver's real decode
+    ///     cadence rather than the sum of every simulcast rung the relay forwarded.
+    ///   * BYTE accumulation (→ `current_bitrate`) advances unconditionally, because
+    ///     a skipped packet still consumed downlink bandwidth.
+    ///
+    /// The two freshness clocks are likewise separate, and each gates only its own
+    /// readout (see [`FpsTracker::get_metrics`] and `send_diagnostic_packets`):
+    ///   * `last_frame_time` follows the FRAME counter. Its contract is "is this stream
+    ///     still producing video?" A stream whose every packet is skipped produces none,
+    ///     so it must be allowed to go inactive — otherwise wrong-rung arrivals would
+    ///     hold the gate open and keep republishing a stale fps.
+    ///   * `last_packet_time` follows ARRIVALS. Bitrate must NOT be gated on decoded
+    ///     frames: a receiving-but-not-decoding stream (hidden tile, or a rung the
+    ///     publisher stopped producing) is still consuming downlink, and reporting
+    ///     0 kbps for it would hide real bandwidth use.
+    ///
+    /// That separation is what makes "bitrate live while fps reads 0" a usable
+    /// receiving-but-not-decoding signal instead of an unreachable state.
+    fn track_frame_with_size(&mut self, bytes: u64, decoded: bool) -> (f64, f64) {
         let now = Date::now();
-        self.last_frame_time = now; // Record when we received the frame
+        if decoded {
+            self.frames_count += 1;
+            self.total_frames += 1;
+            self.last_frame_time = now; // Record when we received the frame
+        }
+        // Every arrival refreshes the PACKET clock, decoded or not — it is what keeps the
+        // bitrate readout live for a stream that receives without decoding.
+        self.last_packet_time = now;
 
         // Update bytes and calculate bitrate
         self.bytes_received += bytes;
@@ -162,16 +219,52 @@ impl FpsTracker {
         self.total_decode_errors += 1;
     }
 
-    fn get_metrics(&self) -> (f64, f64) {
-        let now = Date::now();
-        let inactive_ms = now - self.last_frame_time;
-
-        // If inactive for more than 1 second, return zeros
-        if inactive_ms > 1000.0 {
+    /// Current `(fps, bitrate_kbps, decode_errors_per_sec)`, each zeroed when ITS OWN source
+    /// has been idle for over a second (issue #2190). The single definition of the
+    /// staleness rule.
+    ///
+    /// The clocks are separate on purpose:
+    ///   * fps keys off the last DECODED frame, so a stream that decodes nothing reports 0
+    ///     rather than a stale rate.
+    ///   * bitrate AND decode_errors key off the last ARRIVING packet, so a
+    ///     receiving-but-not-decoding stream (an off-budget tile, or a rung the publisher
+    ///     stopped producing) still reports its real downlink use instead of a misleading
+    ///     0 kbps. Before the split, one decoded-frame clock zeroed BOTH and hid live
+    ///     bandwidth.
+    ///
+    /// `decode_errors` sits on the ARRIVAL clock deliberately (review follow-up):
+    /// `track_decode_error` fires from `Peer::decode`'s `Err` arm — a packet that ARRIVED and
+    /// then failed to decode — so it is an arrival-keyed event. Pairing it with the decode
+    /// clock would report 0 errors for exactly the stream that is arriving and erroring on
+    /// every packet, which is the case an operator most needs to see.
+    ///
+    /// BOTH readout sites call this — `get_metrics` for the UI string and
+    /// `send_diagnostic_packets` for the "video" DiagEvent that becomes
+    /// `videocall_video_fps` / `videocall_video_bitrate_kbps`. That matters: the rule used to
+    /// be DUPLICATED in `send_diagnostic_packets`, and since `set_stats_callback` has no
+    /// caller anywhere in the repo, `get_metrics` reaches no production consumer at all — so
+    /// tests asserting through it left the only shipped path revertible-green (measured, and
+    /// caught in review). One method, two call sites, so the tests cover production.
+    ///
+    /// `now` is passed in rather than sampled here so the caller can reuse one `Date::now()`
+    /// across a whole heartbeat sweep instead of crossing the JS boundary per tracker.
+    fn gated_metrics(&self, now: f64) -> (f64, f64, f64) {
+        let decode_idle = now - self.last_frame_time > 1000.0;
+        let packet_idle = now - self.last_packet_time > 1000.0;
+        let fps = if decode_idle { 0.0 } else { self.fps };
+        let (bitrate, decode_errors) = if packet_idle {
             (0.0, 0.0)
         } else {
-            (self.fps, self.current_bitrate)
-        }
+            (self.current_bitrate, self.decode_errors_per_sec)
+        };
+        (fps, bitrate, decode_errors)
+    }
+
+    /// `(fps, bitrate_kbps)` for the UI stats string. Thin wrapper over
+    /// [`FpsTracker::gated_metrics`] — see it for the two-clock rationale.
+    fn get_metrics(&self) -> (f64, f64) {
+        let (fps, bitrate, _) = self.gated_metrics(Date::now());
+        (fps, bitrate)
     }
 }
 
@@ -180,6 +273,16 @@ pub struct DiagnosticManager {
     sender: Sender<DiagnosticEvent>,
     frames_decoded: Arc<AtomicU32>,
     report_interval_ms: u64,
+    /// Issue #2190 test seam: every `(media_type, frame_size, decoded)` triple passed
+    /// to [`DiagnosticManager::track_frame`], in call order.
+    ///
+    /// Recorded SYNCHRONOUSLY inside `track_frame`, before the `try_send`, on purpose:
+    /// the `DiagnosticWorker` that owns `fps_trackers` runs on a `spawn_local` task, so
+    /// asserting on tracker state would require yielding to the executor and would make
+    /// the test a race. This seam observes what the CALL SITE decided, which is exactly
+    /// the thing the fix changes.
+    #[cfg(test)]
+    track_frame_calls: std::cell::RefCell<Vec<(MediaType, u64, bool)>>,
     /// Drives the periodic `HeartbeatTick` event.
     ///
     /// Backed by a Worker (when available) so that background-tab throttling
@@ -235,6 +338,8 @@ impl DiagnosticManager {
             frames_decoded: Arc::new(AtomicU32::new(0)),
             report_interval_ms: 500,
             timer: None,
+            #[cfg(test)]
+            track_frame_calls: std::cell::RefCell::new(Vec::new()),
         };
 
         manager.setup_heartbeat(sender);
@@ -304,9 +409,36 @@ impl DiagnosticManager {
         }
     }
 
-    // Track a frame received from a peer for a specific media type
-    pub fn track_frame(&self, peer_id: &str, media_type: MediaType, frame_size: u64) -> f64 {
-        self.frames_decoded.fetch_add(1, Ordering::Relaxed);
+    // Track a frame received from a peer for a specific media type.
+    //
+    // `decoded` (issue #2190) must be `false` whenever the caller's decode returned
+    // `DecodeStatus::SKIPPED` — the packet arrived but nothing was decoded. See the
+    // `DiagnosticEvent::FrameReceived::decoded` docs for why counting skips inflated
+    // `fps_received` to the simulcast ladder sum.
+    pub fn track_frame(
+        &self,
+        peer_id: &str,
+        media_type: MediaType,
+        frame_size: u64,
+        decoded: bool,
+    ) -> f64 {
+        // Issue #2190 test seam — record before any early return so the assertion sees
+        // exactly what the call site passed. See `track_frame_calls`.
+        #[cfg(test)]
+        self.track_frame_calls
+            .borrow_mut()
+            .push((media_type, frame_size, decoded));
+
+        // Gated on `decoded` for the same reason as the per-peer tracker: this counter's
+        // NAME is its contract — `frames_decoded` must not be advanced by a packet that
+        // decoded nothing. (It has no emitter today: `health_reporter` has a
+        // `"frames_decoded"` arm and a proto field, but nothing broadcasts that metric, so
+        // `VideoStats.frames_decoded` currently rides at its proto-0 default. Gate it
+        // correctly anyway, so whoever wires the emitter inherits truthful semantics
+        // rather than the ladder-sum bug this issue fixes.)
+        if decoded {
+            self.frames_decoded.fetch_add(1, Ordering::Relaxed);
+        }
 
         if let Err(e) = self
             .sender
@@ -315,6 +447,7 @@ impl DiagnosticManager {
                 peer_id: peer_id.to_string(),
                 media_type,
                 frame_size,
+                decoded,
             })
         {
             error!("Failed to send frame event: {e}");
@@ -362,6 +495,20 @@ impl DiagnosticManager {
         // Will be implemented when we need it
         Ok(JsValue::null())
     }
+
+    /// Issue #2190 test seam: drain the recorded `track_frame` calls. See
+    /// [`DiagnosticManager::track_frame_calls`].
+    #[cfg(test)]
+    pub(crate) fn take_track_frame_calls_for_test(&self) -> Vec<(MediaType, u64, bool)> {
+        std::mem::take(&mut *self.track_frame_calls.borrow_mut())
+    }
+
+    /// Issue #2190 test seam: the cumulative `frames_decoded` counter, which must
+    /// advance only for genuinely decoded packets.
+    #[cfg(test)]
+    pub(crate) fn frames_decoded_for_test(&self) -> u32 {
+        self.frames_decoded.load(Ordering::Relaxed)
+    }
 }
 
 impl DiagnosticWorker {
@@ -377,6 +524,7 @@ impl DiagnosticWorker {
                 peer_id,
                 media_type,
                 frame_size,
+                decoded,
             } => {
                 let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
 
@@ -384,7 +532,7 @@ impl DiagnosticWorker {
                     .entry(media_type)
                     .or_insert_with(|| FpsTracker::new(media_type));
 
-                tracker.track_frame_with_size(frame_size);
+                tracker.track_frame_with_size(frame_size, decoded);
             }
             DiagnosticEvent::DecodeError {
                 peer_id,
@@ -438,18 +586,20 @@ impl DiagnosticWorker {
 
         for (peer_id, peer_trackers) in &self.fps_trackers {
             for (media_type, tracker) in peer_trackers {
-                // Use inactivity-aware metrics: if no frame has arrived in over 1 second,
-                // report zeros instead of stale cached values from the last active window.
-                let inactive_ms = now - tracker.last_frame_time;
-                let (fps, bitrate, decode_errors) = if inactive_ms > 1000.0 {
-                    (0.0, 0.0, 0.0)
-                } else {
-                    (
-                        tracker.fps,
-                        tracker.current_bitrate,
-                        tracker.decode_errors_per_sec,
-                    )
-                };
+                // Inactivity-aware metrics via the SHARED gate (issue #2190): report zeros
+                // rather than stale cached values from the last active window, with fps on the
+                // DECODE clock and bitrate + decode_errors on the ARRIVAL clock (decode errors
+                // are arrival-keyed — `track_decode_error` fires from `Peer::decode`'s `Err`
+                // arm, a packet that arrived and then failed).
+                //
+                // This is THE production path — these values become the "video" DiagEvent →
+                // health packet → `videocall_video_fps` / `videocall_video_bitrate_kbps`, so
+                // the distinction is what an operator actually sees. It previously duplicated
+                // the rule inline, which meant the tracker tests (which assert through
+                // `get_metrics`, whose only consumer `set_stats_callback` has NO caller in
+                // the repo) could not see a revert here at all. Calling the one method makes
+                // those tests cover this path.
+                let (fps, bitrate, decode_errors) = tracker.gated_metrics(now);
 
                 // Only broadcast "video" subsystem events for VIDEO and SCREEN media types.
                 // AUDIO packet rate from fps_trackers must NOT go into the video-quality channel
@@ -880,5 +1030,203 @@ impl SenderDiagnosticWorker {
             stats.jitter_ms,
             stats.round_trip_time_ms,
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Issue #2190: `FpsTracker` must count FRAMES only when a packet was actually
+    /// decoded, while still accumulating its BYTES either way.
+    ///
+    /// This pins the callee that the `peer_decode_manager` call site feeds. Both
+    /// halves need their own coverage: the call-site regression
+    /// (`skipped_wrong_rung_packet_is_not_counted_as_a_received_frame`) proves the
+    /// right `decoded` value is PASSED, and this proves the tracker ACTS on it.
+    /// Neither implies the other — dropping the `if decoded` guard here leaves the
+    /// call-site test green, because that test observes the argument, not the effect.
+    ///
+    /// `fps` is asserted via the 1-second rollover rather than by reading
+    /// `frames_count`, so the assertion goes through the same arithmetic that
+    /// produces `fps_received` → `videocall_video_fps`.
+    ///
+    /// MUTATION: removing the `if decoded` guard around the frame counters makes the
+    /// `fps` assertion read ~2x the true cadence — the exact ladder-sum inflation
+    /// #2190 reports.
+    ///
+    /// `#[wasm_bindgen_test]`: `FpsTracker` timestamps with `js_sys::Date::now()`.
+    #[wasm_bindgen_test]
+    fn fps_tracker_counts_decoded_frames_only_but_bills_all_bytes() {
+        let mut tracker = FpsTracker::new(MediaType::VIDEO);
+
+        // Three arrivals inside one window: ONE decoded (the selected rung) and TWO
+        // skipped (wrong-rung packets the relay forwarded anyway). This is the 3-rung
+        // publisher shape from the field report.
+        tracker.track_frame_with_size(100, false);
+        tracker.track_frame_with_size(100, true);
+        tracker.track_frame_with_size(100, false);
+
+        // Back-date the window anchor so the NEXT call rolls over and publishes the
+        // fps for the window above, rather than waiting a real second. Rollover is
+        // independent of `decoded`, so a skipped arrival can drive it.
+        tracker.last_bitrate_update = Date::now() - 1000.0;
+        let (fps, bitrate) = tracker.track_frame_with_size(100, false);
+
+        assert_eq!(
+            tracker.total_frames, 1,
+            "only the DECODED arrival is a frame; counting the two skipped rungs is \
+             what inflated fps to the ladder sum (#2190)"
+        );
+        assert!(
+            fps > 0.0 && fps <= 1.5,
+            "the rolled-over fps must reflect ONE decoded frame in ~1s, not three \
+             arrivals (got {fps})"
+        );
+        assert!(
+            bitrate > 0.0,
+            "bytes from SKIPPED packets still crossed the downlink and must be \
+             billed to bitrate_kbps (got {bitrate})"
+        );
+    }
+
+    /// Issue #2190: a RECEIVING-but-not-DECODING stream must read fps 0 while its
+    /// bitrate stays LIVE.
+    ///
+    /// The two freshness clocks are independent, and each half of this matters:
+    ///   * fps must zero out — otherwise a receiver pinned to a rung the publisher
+    ///     stopped sending keeps republishing a stale nonzero fps, reporting health for
+    ///     a frozen tile (the #2190 defect, in its other form).
+    ///   * bitrate must NOT zero out — those packets are genuinely crossing the
+    ///     downlink, and reporting 0 kbps would hide real bandwidth consumption for a
+    ///     hidden/off-budget tile at exactly the moment an operator is accounting for
+    ///     it. This is the state a single decoded-frame clock made unrepresentable.
+    ///
+    /// MUTATION: moving `self.last_packet_time = now` inside the `if decoded` block, or
+    /// re-gating bitrate on the decode clock in `FpsTracker::gated_metrics`, fails the bitrate
+    /// assertion. Hoisting `self.last_frame_time = now` out of the `if decoded` block fails
+    /// the fps one.
+    ///
+    /// This test asserts through `get_metrics`, which is a thin wrapper over `gated_metrics` —
+    /// the SAME method `send_diagnostic_packets` (the only path that reaches Prometheus) calls.
+    /// That single-definition property is what makes this test cover production. An earlier
+    /// version claimed it covered `send_diagnostic_packets` while that function DUPLICATED the
+    /// rule inline, so reverting the split there left this green — measured in review, not
+    /// predicted. Do not re-inline the gate.
+    #[wasm_bindgen_test]
+    fn receiving_but_not_decoding_zeroes_fps_but_keeps_bitrate_live() {
+        let mut tracker = FpsTracker::new(MediaType::VIDEO);
+
+        // Establish a real published fps and bitrate.
+        tracker.last_bitrate_update = Date::now() - 1000.0;
+        let (fps, bitrate) = tracker.track_frame_with_size(100, true);
+        assert!(fps > 0.0, "precondition: a real fps was published");
+        assert!(bitrate > 0.0, "precondition: a real bitrate was published");
+
+        // Age BOTH clocks past the 1s window, so the only thing that can bring either
+        // back is the arrival below. Back-dating only `last_frame_time` would leave the
+        // packet clock trivially fresh from the decoded call above, and the assertion
+        // would pass even if skipped arrivals did NOT refresh it — i.e. it would not
+        // catch re-gating the packet clock on `decoded`.
+        let stale = Date::now() - 2000.0;
+        tracker.last_frame_time = stale;
+        tracker.last_packet_time = stale;
+
+        // A wrong-rung packet arrives. It must NOT revive fps, but it MUST refresh the
+        // packet clock and so keep the bitrate readout live.
+        tracker.track_frame_with_size(100, false);
+
+        let (gated_fps, gated_bitrate) = tracker.get_metrics();
+        assert_eq!(
+            gated_fps, 0.0,
+            "a stream decoding nothing must read fps 0; skipped arrivals must not hold \
+             the DECODE freshness gate open"
+        );
+        assert!(
+            gated_bitrate > 0.0,
+            "packets are still arriving and consuming downlink, so bitrate must stay \
+             LIVE — zeroing it hides real bandwidth use (got {gated_bitrate})"
+        );
+    }
+
+    /// Issue #2190 (review follow-up): `decode_errors_per_sec` must ride the ARRIVAL clock,
+    /// not the decode clock.
+    ///
+    /// `track_decode_error` fires from `Peer::decode`'s `Err` arm — a packet that ARRIVED and
+    /// then failed to decode. That arm also calls `track_frame(..., false)` so the failed
+    /// packet refreshes the arrival clock and bills its bytes without advancing decoded FPS.
+    /// Pairing errors with the decode clock reported 0 for exactly the stream that is arriving
+    /// and erroring on every packet: the case an operator most needs to see, silenced.
+    ///
+    /// MUTATION: moving `decode_errors` back under `decode_idle` in
+    /// `FpsTracker::gated_metrics` makes this read 0.0 and fails.
+    #[wasm_bindgen_test]
+    fn decode_errors_ride_the_arrival_clock_not_the_decode_clock() {
+        let mut tracker = FpsTracker::new(MediaType::VIDEO);
+
+        // Mirror the production error arm: increment the error counter, then record the failed
+        // packet as a non-decoded arrival. The arrival rolls the window over.
+        tracker.track_decode_error();
+        tracker.last_bitrate_update = Date::now() - 1000.0;
+        tracker.track_frame_with_size(100, false);
+        assert!(
+            tracker.decode_errors_per_sec > 0.0,
+            "precondition: a nonzero error rate was published"
+        );
+
+        // Nothing has DECODED for 2s (the arriving-and-erroring stream), but packets are
+        // still arriving — `last_packet_time` was just refreshed by the call above.
+        tracker.last_frame_time = Date::now() - 2000.0;
+
+        let (fps, bitrate, decode_errors) = tracker.gated_metrics(Date::now());
+        assert_eq!(fps, 0.0, "nothing decoded, so fps is 0");
+        assert!(
+            bitrate > 0.0,
+            "packets still arriving, so bitrate stays live"
+        );
+        assert!(
+            decode_errors > 0.0,
+            "decode errors are ARRIVAL-keyed events — a stream arriving and erroring on every \
+             packet must still report its error rate, not 0 (got {decode_errors})"
+        );
+
+        // When arrivals stop too, the error rate goes quiet with them.
+        tracker.last_packet_time = Date::now() - 2000.0;
+        let (_, _, quiet_errors) = tracker.gated_metrics(Date::now());
+        assert_eq!(
+            quiet_errors, 0.0,
+            "with no arrivals there are no new errors to report"
+        );
+    }
+
+    /// Issue #2190: when arrivals STOP entirely, bitrate must also go to zero.
+    ///
+    /// Guards the other direction of the split — without this, `last_packet_time` could
+    /// be hardcoded "always fresh" and the test above would still pass, latching a stale
+    /// bitrate forever on a stream that has genuinely stopped.
+    #[wasm_bindgen_test]
+    fn fully_idle_stream_zeroes_both_fps_and_bitrate() {
+        let mut tracker = FpsTracker::new(MediaType::VIDEO);
+
+        tracker.last_bitrate_update = Date::now() - 1000.0;
+        let (fps, bitrate) = tracker.track_frame_with_size(100, true);
+        assert!(
+            fps > 0.0 && bitrate > 0.0,
+            "precondition: both were published"
+        );
+
+        // Nothing decoded AND nothing arrived for 2s.
+        let stale = Date::now() - 2000.0;
+        tracker.last_frame_time = stale;
+        tracker.last_packet_time = stale;
+
+        assert_eq!(
+            tracker.get_metrics(),
+            (0.0, 0.0),
+            "a stream receiving nothing at all must read INACTIVE on both axes"
+        );
     }
 }

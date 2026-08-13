@@ -160,6 +160,9 @@ pub enum SignalLevel {
     Poor,
     /// 1 bar -- bad quality
     Bad,
+    /// Neutral empty bars -- this client paused local video decode, so video
+    /// quality is not measured.
+    Unmeasured,
     /// 0 bars with red slash -- connection lost
     Lost,
 }
@@ -173,13 +176,18 @@ impl SignalLevel {
             Self::Fair => 3,
             Self::Poor => 2,
             Self::Bad => 1,
-            Self::Lost => 0,
+            Self::Unmeasured | Self::Lost => 0,
         }
     }
 
     /// Whether the signal is completely lost.
     pub fn is_lost(self) -> bool {
         self == Self::Lost
+    }
+
+    /// Whether local decode is paused, so no video signal claim can be made.
+    pub fn is_unmeasured(self) -> bool {
+        self == Self::Unmeasured
     }
 
     /// Derive a signal level from a combined quality score (0.0 -- 1.0).
@@ -220,6 +228,8 @@ pub struct SignalSample {
     pub audio_buffer_ms: f64,
     // Raw screen share metrics
     pub screen_enabled: bool,
+    /// This client paused local video/screen decode for the peer at sample time.
+    pub decode_paused_locally: bool,
     pub screen_fps: f64,
     pub screen_bitrate_kbps: f64,
     /// Screen-share **received** resolution as "WxH" (e.g. "1920x1080"), i.e.
@@ -234,18 +244,39 @@ pub struct SignalSample {
     /// Issue #903: publisher's encoder *target* bitrate for the screen-share // @token-exempt: issue ref, not a color
     /// track (kbps). What the encoder is currently trying to produce, not
     /// the realised on-the-wire bitrate (which is `screen_bitrate_kbps`).
-    /// `0` means the publisher hasn't stamped the field — older client or
-    /// AQ tier 0 (unconstrained). The Cause tooltip line is omitted in
-    /// either case.
+    /// `0` means the publisher hasn't stamped the field — an older client, or a
+    /// publisher that is NOT constrained (see `screen_cause_hint` for what that
+    /// means since issue #2179). This field alone never renders the Cause line:
+    /// `build_screen_cause_line` requires a stamped tier or hint.
     pub screen_encoder_target_bitrate_kbps: u32,
-    /// Issue #903: name of the adaptive-quality tier currently constraining // @token-exempt: issue ref, not a color
-    /// the publisher's screen-share encoder (e.g. `"high"`, `"medium"`,
-    /// `"low"`). Empty when AQ isn't engaged or the publisher is older.
+    /// Issue #903: name of the adaptive-quality tier the publisher's screen-share // @token-exempt: issue ref, not a color
+    /// encoder is being held at (e.g. `"1440p"`, `"high"`, `"low"`). Empty when
+    /// the publisher is not constrained, or is older and doesn't supply it.
     pub screen_adaptive_tier: String,
     /// Issue #903: short publisher-classified cause of the downscale, // @token-exempt: issue ref, not a color
     /// one of `"bitrate-limited"`, `"cpu-pressure"`, `"network-rtt"`,
-    /// `"network-loss"`, `"manual-cap"`, or empty. Empty means the encoder
-    /// is unconstrained or the publisher doesn't supply the field.
+    /// `"network-loss"`, `"manual-cap"`, or empty.
+    ///
+    /// Empty means the publisher is NOT constrained, or doesn't supply the field.
+    /// "Constrained" is SOURCE-relative since issue #2179: the publisher stamps
+    /// this only while its live rung is below the rung its captured surface alone
+    /// needs (`resolve_initial_screen_tier`), so a 1080p share sitting on the
+    /// 1080p rung reports nothing even though the tier table has higher rungs.
+    ///
+    /// When a STATIC cap holds the encoder below that rung the hint names the term
+    /// UNIQUELY responsible, rather than the generic `"bitrate-limited"` (which is
+    /// reserved for a dynamic cause — network floor or live congestion):
+    /// - `"ladder-limited"` — the product's publish ladder tops out at 1440p. The
+    ///   common case for any 4K / Retina share on a capable machine, and
+    ///   deliberately NOT called CPU: no amount of the user's hardware lifts it.
+    /// - `"cpu-pressure"` — the sender's device class is the binding term, which
+    ///   since review round 3 means only below the 1440p core bar; at or above it
+    ///   the device cap and the ladder cap coincide and the ladder is the honest
+    ///   explanation.
+    /// - `"single-stream-limited"` — LATENT. Its cap and the ladder cap are both
+    ///   1440p today, so it never binds alone and never reaches a user. The
+    ///   publisher keeps the path because the two are independent policies; it
+    ///   starts firing if the ladder ever gains a rung above 1440p.
     pub screen_cause_hint: String,
     /// Issue #906: held-last value to render when the current screen FPS // @token-exempt: issue ref, not a color
     /// sample reads zero but a recent non-zero value exists. `None` means
@@ -287,6 +318,7 @@ impl PartialEq for SignalSample {
             && self.audio_expand_rate == other.audio_expand_rate
             && self.audio_buffer_ms == other.audio_buffer_ms
             && self.screen_enabled == other.screen_enabled
+            && self.decode_paused_locally == other.decode_paused_locally
             && self.screen_fps == other.screen_fps
             && self.screen_bitrate_kbps == other.screen_bitrate_kbps
             && self.screen_resolution == other.screen_resolution
@@ -324,12 +356,13 @@ pub struct SampleData {
     /// Issue #903: publisher's encoder target bitrate for the screen-share // @token-exempt: issue ref, not a color
     /// track (kbps); `0` when the publisher doesn't supply the field.
     pub screen_encoder_target_bitrate_kbps: u32,
-    /// Issue #903: name of the AQ tier currently constraining the // @token-exempt: issue ref, not a color
-    /// publisher's screen-share encoder. Empty when AQ isn't engaged.
+    /// Issue #903: name of the AQ tier the publisher's screen-share encoder is // @token-exempt: issue ref, not a color
+    /// being held at. Empty when the publisher is not constrained.
     pub screen_adaptive_tier: String,
-    /// Issue #903: short publisher-classified cause of the downscale. // @token-exempt: issue ref, not a color
-    /// Empty when the encoder is unconstrained or the publisher doesn't
-    /// supply the field.
+    /// Issue #903: short publisher-classified cause of the downscale. Empty when // @token-exempt: issue ref, not a color
+    /// the publisher is not constrained — measured against the rung its captured
+    /// surface needs, see `SignalSample::screen_cause_hint` — or doesn't supply
+    /// the field.
     pub screen_cause_hint: String,
     /// Issue #906: milliseconds since the most recent `peer_status` // @token-exempt: issue ref, not a color
     /// heartbeat from the peer at sample-record time. `None` when no
@@ -340,6 +373,14 @@ pub struct SampleData {
     pub latency_ms: f64,
     pub audio_enabled: bool,
     pub video_enabled: bool,
+    /// Issue #2190 B2: `true` when THIS client has parked the peer off its decode budget, so
+    /// no video/screen frames are being decoded locally regardless of the peer's own health.
+    ///
+    /// Distinct from `video_enabled` (heartbeat-sourced — describes the REMOTE camera). The
+    /// producer already folds this into `video_enabled`/`screen_enabled` so the score EXCLUDES
+    /// the unmeasured streams. The popup reads this field to omit false zero-valued video
+    /// series and explain why the signal is not measured.
+    pub decode_paused_locally: bool,
 }
 
 /// Maximum number of signal samples retained per peer.
@@ -368,10 +409,19 @@ const MAX_SIGNAL_SAMPLES: usize = 1800;
 pub(crate) const SCREEN_STATIC_HOLD_WINDOW_MS: f64 = 30_000.0;
 
 /// Maximum `peer_status` age (in milliseconds) for the heartbeat to be
-/// considered fresh enough to justify holding the screen metrics. The
-/// `peer_status` event fires roughly every 1 second per peer, so 5s gives
-/// 5 missed beats of tolerance for network jitter / packet reordering before
-/// we conclude the publisher is unreachable.
+/// considered fresh enough to justify holding the screen metrics.
+///
+/// Cadence note (issue 2174): a peer's heartbeat fires every
+/// `HEARTBEAT_KEEPALIVE_INTERVAL_MS` = 5000 ms (`videocall-aq`, used by
+/// `videocall-client/src/connection/connection.rs`), *not* the ~1 Hz an
+/// earlier version of this comment claimed. This 5 s threshold is therefore
+/// exactly one heartbeat period — it tolerates jitter within a beat, not the
+/// "5 missed beats" the old text described. Heartbeats also ride datagrams
+/// (best-effort), so a single dropped beat pushes the age past this bound and
+/// classifies a healthy publisher as [`ScreenSampleState::NoFrames`]. That is
+/// worth re-tuning, but the value is deliberately unchanged here: it is pinned
+/// by the #906 classifier tests and raising it changes screen-state
+/// classification, which is out of scope for the issue-2174 glow fix.
 ///
 /// Kept local to `signal_quality.rs` because the threshold is UI-policy, not
 /// shared with the AQ controller's reaction windows in `videocall-aq`.
@@ -493,6 +543,22 @@ impl PeerSignalHistory {
         }
 
         // Video quality: fps as ratio of a 30fps target, clamped to 0-1.
+        //
+        // #2190 CHANGED WHAT THIS READS (behavior note, not observability-only). `video_fps`
+        // is `fps_received`, which until #2190 counted every arriving simulcast rung — so a
+        // 3-rung publisher fed the LADDER SUM (~52 for an 8fps sender), `52/30` clamped to
+        // 1.0, and the bar sat PERMANENTLY FULL no matter the peer's real cadence. Every
+        // multi-rung peer therefore showed full strength, and the indicator could not fall.
+        // It now reads the DECODED rung, so a truthful 8fps peer reads ~0.27 and the bar
+        // moves again. Peers that previously pinned full will now show partial bars.
+        //
+        // KNOWN LIMITATION (pre-existing, deliberately NOT changed here): the `30.0`
+        // denominator is the CAMERA ladder's TOP rung (`target_fps` 7/15/30). A receiver
+        // correctly decoding a lower rung is scored against a target it was never meant to
+        // hit, so it reads low while being perfectly healthy. Making this rung-aware needs
+        // the receiver's selected-rung `target_fps` plumbed into `SampleData`, which is a
+        // separate design change with its own UI consequences — out of scope for a metric
+        // correctness fix. Tracked by `video_quality_bar_tracks_decoded_rung_and_is_saturated_by_the_ladder_sum`.
         let video_quality = if data.video_enabled {
             (data.video_fps / 30.0).clamp(0.0, 1.0)
         } else {
@@ -529,6 +595,22 @@ impl PeerSignalHistory {
         };
 
         // Screen quality: fps as ratio of a 30fps target when screen share is active.
+        //
+        // Same #2190 change and same known limitation as `video_quality` above, and the
+        // denominator mis-scaling is SHARPER here. `SCREEN_QUALITY_TIERS` targets
+        // 10/10/10/8/5 fps (native, 1440p, high, medium, low), so against this 30.0 divisor
+        // a perfectly healthy share reads at most 10/30 = 0.33 on its best rung and as low
+        // as 5/30 = 0.17 on the `low` floor rung — i.e. `Poor`/`Bad` while behaving exactly
+        // as designed. Pre-#2190 the published 2-rung ladder
+        // (`simulcast_screen_layer_labels(2)` = `[low, high]` = 5+10 = 15) read 0.50, so the
+        // apparent "downgrade" from this fix is one band, not a collapse — but it is a
+        // downgrade on a correct stream, which is why the denominator needs its own change.
+        // Left as-is for the scope reason in the video note above.
+        //
+        // (An earlier version of this comment claimed 10 fps on EVERY rung, a ~0.33 floor,
+        // and a pre-fix 0.67 — all three were wrong against `constants.rs`, and they
+        // UNDERSTATED the regression by a full level. Corrected after review; the test below
+        // now reads the tier table instead of restating numbers.)
         let screen_quality = if data.screen_enabled {
             (data.screen_fps / 30.0).clamp(0.0, 1.0)
         } else {
@@ -547,6 +629,7 @@ impl PeerSignalHistory {
             audio_expand_rate: data.audio_expand_rate,
             audio_buffer_ms: data.audio_buffer_ms,
             screen_enabled: data.screen_enabled,
+            decode_paused_locally: data.decode_paused_locally,
             screen_fps: data.screen_fps,
             screen_bitrate_kbps: data.screen_bitrate_kbps,
             screen_resolution: data.screen_resolution.clone(),
@@ -687,6 +770,8 @@ fn combined_quality(
 /// adding individual arguments.
 pub struct SignalInfo {
     pub level: SignalLevel,
+    /// True when this client paused video/screen decode for the peer.
+    pub decode_paused_locally: bool,
     pub history: Vec<SignalSample>,
     /// Meeting start time (Unix ms) for the chart X-axis reference.
     pub meeting_start_ms: f64,
@@ -763,6 +848,9 @@ pub struct SignalQualityPopupProps {
     peer_name: String,
     /// Full history of samples to chart.
     history: Vec<SignalSample>,
+    /// Whether this client currently has the peer's video/screen decode paused.
+    #[props(default)]
+    decode_paused_locally: bool,
     /// Meeting start time (Unix ms). The X-axis is relative to this so all
     /// peers share the same time reference for easy comparison.
     meeting_start_ms: f64,
@@ -1589,14 +1677,14 @@ fn show_body_tooltip(
     let video_line = if show_video {
         if sample.video_resolution.is_empty() {
             format!(
-                "<span style='color:{}'>Video: {:.1} fps arriving | {:.0} kbps</span>",
+                "<span style='color:{}'>Video: {:.1} fps decoded | {:.0} kbps</span>",
                 theme_color::SIGNAL_VIDEO,
                 sample.video_fps,
                 sample.video_bitrate_kbps
             )
         } else if video_tier.is_empty() {
             format!(
-                "<span style='color:{}'>Video: {} | {:.1} fps arriving | {:.0} kbps</span>",
+                "<span style='color:{}'>Video: {} | {:.1} fps decoded | {:.0} kbps</span>",
                 theme_color::SIGNAL_VIDEO,
                 sample.video_resolution,
                 sample.video_fps,
@@ -1604,7 +1692,7 @@ fn show_body_tooltip(
             )
         } else {
             format!(
-                "<span style='color:{}'>Video: {} ({}) | {:.1} fps arriving | {:.0} kbps</span>",
+                "<span style='color:{}'>Video: {} ({}) | {:.1} fps decoded | {:.0} kbps</span>",
                 theme_color::SIGNAL_VIDEO,
                 sample.video_resolution,
                 video_tier,
@@ -1714,6 +1802,46 @@ fn infer_video_tier_short(resolution: &str) -> &'static str {
         "4K UHD" => "UHD",
         other => other,
     }
+}
+
+/// The enabled-flags the signal meter must be scored on (issue #2190).
+///
+/// Returns `(audio, video, screen)` for [`PeerSignalHistory::current_level`] and the
+/// `SampleData` literal, folding the peer's own heartbeat-sourced flags together with
+/// whether THIS client is actually decoding them.
+///
+/// WHY: since #2190 `fps_received` counts DECODES, so a peer the decode budget has parked
+/// reads fps 0 and `video_quality` scores 0.0. `combined_quality` then AVERAGES IN that 0
+/// while the heartbeat flag stays true — a muted parked peer scored exactly 0.0 →
+/// [`SignalLevel::Lost`] → the red "connection lost" slash, on a peer whose connection is
+/// fine and whose tile OUR OWN client chose not to decode. Excluding the unmeasured streams
+/// routes through `combined_quality`'s not-applicable path instead.
+///
+/// `is_decoding` must come from `VideoCallClient::is_decoding_peer` (decode-set membership),
+/// NOT from the tile's `force_avatar` render flag: the active screen sharer is force-inserted
+/// into the decode set regardless of its ranking bucket, so a ranked-out sharer renders as an
+/// avatar tile while genuinely decoding both kinds.
+///
+/// AUDIO is deliberately never folded because audio decodes regardless of tile visibility.
+/// It remains available in popup history, while the tile uses a distinct `Unmeasured` state
+/// instead of converting healthy audio into a video-quality claim.
+///
+/// Extracted as one pure fn called from BOTH consumers because the first attempt at this fix
+/// folded only the `SampleData` literal — which feeds `video_quality`, already 0.0 — while
+/// the RENDERED level comes from `current_level`'s arguments. The fold was inert and the
+/// badge still shipped. A test that pins this fn while a call site goes unwired is exactly
+/// what let that through, so both call sites now route here.
+pub fn signal_enabled_flags(
+    audio_enabled: bool,
+    video_enabled: bool,
+    screen_enabled: bool,
+    is_decoding: bool,
+) -> (bool, bool, bool) {
+    (
+        audio_enabled,
+        video_enabled && is_decoding,
+        screen_enabled && is_decoding,
+    )
 }
 
 /// Parse a `"WxH"` resolution string into `(width, height)`. Returns `None`
@@ -1914,16 +2042,80 @@ fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String
 ///      `Cause: <cause_hint>`
 ///
 /// `tier` is preserved as a literal word because users may not recognise a
-/// bare `'low'` / `'medium'` / `'high'` label without that cue.
+/// bare `'low'` / `'1440p'` / `'high'` label without that cue.
+///
+/// # What "constrained" means (issue #2179 review, UX B1 + round 2)
+/// SOURCE-relative, not ladder-relative. The publisher stamps the cause fields
+/// only while its live rung is BELOW the rung its CAPTURED SURFACE alone needs
+/// (`resolve_initial_screen_tier`, published as
+/// `ScreenQualitySnapshot::source_tier_index`), and clears them otherwise. So a
+/// 1080p window riding the `high` rung stamps nothing even though the ladder has
+/// two better rungs above it that only a larger screen could use.
+///
+/// Round 2 split that yardstick from the share's REACHABLE ceiling
+/// (`best_source_tier_index` = `resolve_screen_tier_ceiling`, which also folds in
+/// the sender's CPU class and stream count). The two diverge when the hardware or
+/// the stream count binds, and the publisher then still stamps — naming the
+/// binding term (`ladder-limited`, `cpu-pressure`) rather than staying silent,
+/// which is what used to leave a viewer staring at a red downscale badge with no
+/// explanation. Since review round 3 the publish ladder caps every path at 1440p,
+/// so `ladder-limited` is the usual answer for a 4K or Retina share, and `native`
+/// (2160p) is not reachable as an encode rung at all — it survives only as the
+/// capture ceiling `getDisplayMedia` requests. The perf panel's SEND meter deliberately uses the OTHER
+/// rung; see `performance_settings::screen_meter_level` for why the same share can
+/// honestly read full bars here and constrained there.
+///
+/// This function must NOT re-derive "constrained" from the tier's position in the
+/// ladder: an index-based test here would re-introduce exactly the false flag the
+/// publisher-side fix removed (after #2179 grew the ladder 3 → 5, "index != 0"
+/// flagged every share that was not 4K). The receiver also cannot compute the
+/// ceiling itself — it is a property of the SENDER's screen and machine, which the
+/// receiver never sees — so the publisher's stamp is the single source of truth by
+/// necessity, not merely by convention.
 ///
 /// Returns an empty string when:
 /// * the screen series is hidden or `screen_enabled` is false, OR
-/// * all three publisher-stamped fields are zero / empty (older publishers
-///   that don't supply cause data, or the unconstrained-tier path).
+/// * neither cause field is stamped — no `adaptive_tier` and no `cause_hint`.
+///   That covers the unconstrained publisher, the older publisher that supplies
+///   nothing, and the partial publisher that supplies only a target bitrate.
 ///
 /// The empty-string return is load-bearing: the tooltip render loop omits
 /// the line entirely when this helper returns empty, so older publishers
 /// never see a placeholder shipped in their UI. See the unit tests below.
+/// Every cause classifier the Screen help popover enumerates for the user.
+///
+/// Kept as DATA rather than inlined in the rsx prose so it can be pinned against
+/// the publisher's vocabulary: `screen_cause_legend_covers_every_aq_cause_string`
+/// asserts each `SCREEN_CAUSE_*` constant the AQ crate exports appears here. That
+/// pin is the reason this const exists — issue #2179 round 2 added
+/// `single-stream-limited` on the publisher side, and without a lockstep check the
+/// legend silently omits a string users will actually see.
+///
+/// The three trigger-derived classifiers (`network-rtt`, `network-loss`,
+/// `manual-cap`) come from `cause_hint_from_trigger`, which is private to
+/// `screen_encoder`, so they cannot be pinned from here and are listed by hand.
+///
+/// `single-stream-limited` is LATENT as of review round 3: the single-stream cap
+/// and the publish-ladder cap are both 1440p, so it never binds alone and no user
+/// sees it today. It stays listed because the publisher still exports and can
+/// still stamp it — the two caps are independent policies that merely coincide,
+/// and it fires again if the ladder gains a rung above 1440p. Do NOT write an e2e
+/// spec that expects to observe it.
+pub(crate) const SCREEN_CAUSE_LEGEND: [&str; 7] = [
+    "bitrate-limited",
+    "ladder-limited",
+    "cpu-pressure",
+    "single-stream-limited",
+    "network-rtt",
+    "network-loss",
+    "manual-cap",
+];
+
+/// The legend rendered as the parenthetical list the help copy shows.
+pub(crate) fn screen_cause_legend_text() -> String {
+    SCREEN_CAUSE_LEGEND.join(", ")
+}
+
 fn build_screen_cause_line(sample: &SignalSample, show_screen: bool) -> String {
     if !show_screen || !sample.screen_enabled {
         return String::new();
@@ -1936,9 +2128,17 @@ fn build_screen_cause_line(sample: &SignalSample, show_screen: bool) -> String {
     let has_tier = !tier.is_empty();
     let has_hint = !hint.is_empty();
 
-    // No data → no line. Older publishers, AQ at top tier, and zero-initialised
-    // newer publishers all land here.
-    if !has_bitrate && !has_tier && !has_hint {
+    // No CAUSE EVIDENCE → no line. The line asserts that the publisher is being
+    // held back, so it may only render on a field that carries that assertion.
+    // Only `adaptive_tier` and `cause_hint` do: the publisher stamps them exactly
+    // when its live rung is below the best rung the share can reach (its own
+    // screen, machine and stream count — see the fn doc), and clears both
+    // otherwise. The target bitrate is a MAGNITUDE, not an assertion — a
+    // bitrate arriving without either cause field (a partial publisher, or a
+    // stamp that raced a clear) says nothing about whether the encoder is
+    // constrained, so it renders no Cause line on its own. Older publishers, an
+    // unconstrained publisher, and zero-initialised samples all land here too.
+    if !has_tier && !has_hint {
         return String::new();
     }
 
@@ -1960,10 +2160,11 @@ fn build_screen_cause_line(sample: &SignalSample, show_screen: bool) -> String {
         // Tier + hint (no bitrate).
         (false, true, true) => format!("Cause: {hint} \u{00B7} tier '{tier}'"),
         // Single signal fallbacks.
-        (true, false, false) => format!("Cause: {bitrate}kbps"),
         (false, true, false) => format!("Cause: tier '{tier}'"),
         (false, false, true) => format!("Cause: {hint}"),
-        (false, false, false) => return String::new(),
+        // No cause evidence — already excluded by the guard above. A bare target
+        // bitrate is not a constraint claim; see that guard's comment.
+        (_, false, false) => return String::new(),
     };
 
     format!(
@@ -2133,6 +2334,12 @@ fn SignalLayerRow(
 #[component]
 pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     let history = &props.history;
+    // Prefer the current render-path state for immediate feedback, while retaining the
+    // sampled field as the historical source of truth for tooltip/chart points.
+    let decode_paused_locally = props.decode_paused_locally
+        || history
+            .last()
+            .is_some_and(|sample| sample.decode_paused_locally);
     let on_close = props.on_close;
     let on_drag_commit = props.on_drag_commit;
     let on_reanchor = props.on_reanchor;
@@ -2266,6 +2473,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
             div {
                 id: "{popup_id}",
                 class: "signal-quality-popup signal-quality-popup-portal",
+                "data-signal-state": if decode_paused_locally { "unmeasured" } else { "measured" },
                 "data-anchor-mode": "{anchor_mode_attr}",
                 "data-meter-mode": "{meter_mode.id_suffix()}",
                 "data-popup-anchor-id": "{popup_anchor_id_attr_empty}",
@@ -2330,7 +2538,14 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         }
                     }
                 }
-                p { style: "color: {theme_color::TEXT_SUBTLE}; font-size: var(--fs-3);", "No data yet." }
+                if decode_paused_locally {
+                    p {
+                        class: "signal-quality-unmeasured",
+                        "Video paused to save CPU. Signal is not measured for this peer."
+                    }
+                } else {
+                    p { style: "color: {theme_color::TEXT_SUBTLE}; font-size: var(--fs-3);", "No data yet." }
+                }
             }
         };
     }
@@ -2364,22 +2579,30 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
         draw_height,
         |s| s.audio_quality,
     );
-    let video_points: String = build_quality_polyline(
+    let video_segments: Vec<String> = build_quality_polyline_segments(
         history,
         first_ts,
         px_per_sec,
         padding_top,
         draw_height,
-        |s| s.video_quality,
+        video_chart_quality,
     );
-    let screen_points: String = if has_screen_data {
+    let screen_segments: Vec<String> = if has_screen_data {
         // Issue #906: the screen polyline is state-aware so static periods // @token-exempt: issue ref, not a color
         // render at the held Y instead of dropping to zero. `NoFrames` and
         // `Live` use the raw `screen_quality`; `Static` plots at the held
-        // value's normalized quality (held_fps / 30).
-        build_screen_quality_polyline(history, first_ts, px_per_sec, padding_top, draw_height)
+        // value's normalized quality (held_fps / 30). Locally paused samples
+        // split the line so unmeasured periods never appear as zero-quality drops.
+        build_quality_polyline_segments(
+            history,
+            first_ts,
+            px_per_sec,
+            padding_top,
+            draw_height,
+            measured_screen_chart_quality,
+        )
     } else {
-        String::new()
+        Vec::new()
     };
 
     // Build polyline points for latency (right y-axis, 0-max_latency ms)
@@ -2460,6 +2683,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
         div {
             id: "{popup_id}",
             class: "signal-quality-popup signal-quality-popup-portal",
+            "data-signal-state": if decode_paused_locally { "unmeasured" } else { "measured" },
             "data-anchor-mode": "{anchor_mode_attr}",
             "data-meter-mode": "{meter_mode.id_suffix()}",
             "data-popup-anchor-id": "{popup_anchor_id_attr}",
@@ -2523,6 +2747,12 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         onclick: move |_| on_close.call(()),
                         "X"
                     }
+                }
+            }
+            if decode_paused_locally {
+                p {
+                    class: "signal-quality-unmeasured",
+                    "Video paused to save CPU. Signal is not measured for this peer."
                 }
             }
             div { class: "signal-chart-wrapper",
@@ -2627,22 +2857,26 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         }
                         // Video polyline
                         if show_video() {
-                            polyline {
-                                points: "{video_points}",
-                                fill: "none",
-                                stroke: "{theme_color::SIGNAL_VIDEO}",
-                                stroke_width: "1.5",
-                                stroke_linejoin: "round",
+                            for points in video_segments.iter() {
+                                polyline {
+                                    points: "{points}",
+                                    fill: "none",
+                                    stroke: "{theme_color::SIGNAL_VIDEO}",
+                                    stroke_width: "1.5",
+                                    stroke_linejoin: "round",
+                                }
                             }
                         }
                         // Screen share polyline (only when data exists and enabled)
                         if has_screen_data && show_screen() {
-                            polyline {
-                                points: "{screen_points}",
-                                fill: "none",
-                                stroke: "{theme_color::SIGNAL_SCREEN}",
-                                stroke_width: "1.5",
-                                stroke_linejoin: "round",
+                            for points in screen_segments.iter() {
+                                polyline {
+                                    points: "{points}",
+                                    fill: "none",
+                                    stroke: "{theme_color::SIGNAL_SCREEN}",
+                                    stroke_width: "1.5",
+                                    stroke_linejoin: "round",
+                                }
                             }
                         }
                         // Latency polyline
@@ -2703,9 +2937,9 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                                             client.y - 10.0,
                                             &time_str,
                                             sample,
-                                            v_video,
+                                            v_video && !sample.decode_paused_locally,
                                             v_audio,
-                                            v_screen,
+                                            v_screen && !sample.decode_paused_locally,
                                             v_latency,
                                         );
                                     }
@@ -2867,7 +3101,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         },
                         "video" => rsx! {
                             strong { "Video Quality" }
-                            p { "Based on received frames per second (FPS) relative to a 30fps target." }
+                            p { "Based on the frames per second this device DECODED for the peer, relative to a 30fps target. Excludes packets the decoder skipped, so it tracks what your device is actually processing — not everything that arrived." }
                             p {
                                 strong { "Resolution: " }
                                 "The dimensions of the video being received (e.g., 1280x720)."
@@ -2884,7 +3118,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         },
                         "screen" => rsx! {
                             strong { "Screen Share Quality" }
-                            p { "Based on received FPS for the shared screen content." }
+                            p { "Based on the FPS this device DECODED for the shared screen content." }
                             p {
                                 strong { "Source vs Received resolution: " }
                                 "Source is the publisher's native capture resolution (their monitor / window). "
@@ -2900,14 +3134,22 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             }
                             p {
                                 strong { "Cause: " }
-                                "Sub-line shown below the Screen row when the publisher's encoder "
-                                "reports it is constrained. Sourced from the publisher's adaptive-"
-                                "quality system: the encoder's current target bitrate, the tier "
-                                "actively limiting it (e.g. 'low' / 'medium'), and a short cause "
-                                "classifier (bitrate-limited, cpu-pressure, network-rtt, "
-                                "network-loss, manual-cap). The line is omitted when the "
-                                "publisher is unconstrained or is an older client that doesn't "
-                                "report this data."
+                                "Sub-line shown below the Screen row only when the publisher is "
+                                "sending LESS than the screen they picked actually needs. Sourced "
+                                "from their adaptive-quality system: the encoder's current target "
+                                "bitrate, the tier it is being held at, and a short cause classifier "
+                                "({screen_cause_legend_text()})."
+                            }
+                            p {
+                                "The yardstick is the publisher\u{2019}s own screen \u{2014} not the top "
+                                "of the quality ladder. A 1080p window sent at 1080p is already at "
+                                "its best and shows no Cause line. But a 4K or Retina screen sent "
+                                "at 1440p IS held back, so it shows one \u{2014} usually "
+                                "ladder-limited, meaning 1440p is the highest quality this app "
+                                "publishes, so nothing the publisher changes will raise it. "
+                                "cpu-pressure appears instead when their machine is the binding "
+                                "limit. The line is also absent for an older client that "
+                                "doesn\u{2019}t report this data."
                             }
                             p {
                                 strong { "FPS: " }
@@ -2994,30 +3236,46 @@ fn build_quality_polyline(
         .join(" ")
 }
 
-/// Build the screen-share polyline. Unlike the camera-video / audio lines
-/// the screen series classifies each sample (issue #906) so static periods // @token-exempt: issue ref, not a color
-/// flatline at the held value's Y position instead of dropping to zero,
-/// which would otherwise be visually indistinguishable from a broken
-/// encoder. `NoFrames` and `Live` use the raw `screen_quality`; `Static`
-/// substitutes the held FPS's normalized quality (held_fps clamped to the
-/// same 30fps target the live path uses).
-fn build_screen_quality_polyline(
+/// Build measured chart segments, splitting the line whenever the accessor
+/// returns `None`. This prevents an unmeasured interval from being drawn as
+/// either a zero-quality drop or a line connecting the measured periods.
+fn build_quality_polyline_segments<F>(
     history: &[SignalSample],
     first_ts: f64,
     px_per_sec: f64,
     padding_top: f64,
     draw_height: f64,
-) -> String {
-    history
-        .iter()
-        .map(|s| {
-            let x = ((s.timestamp_ms - first_ts) / 1000.0) * px_per_sec;
-            let quality = screen_chart_quality(s);
+    quality_fn: F,
+) -> Vec<String>
+where
+    F: Fn(&SignalSample) -> Option<f64>,
+{
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+
+    for sample in history {
+        if let Some(quality) = quality_fn(sample) {
+            let x = ((sample.timestamp_ms - first_ts) / 1000.0) * px_per_sec;
             let y = padding_top + draw_height * (1.0 - quality);
-            format!("{x:.1},{y:.1}")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            current.push(format!("{x:.1},{y:.1}"));
+        } else if !current.is_empty() {
+            segments.push(current.join(" "));
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current.join(" "));
+    }
+
+    segments
+}
+
+fn video_chart_quality(sample: &SignalSample) -> Option<f64> {
+    (!sample.decode_paused_locally).then_some(sample.video_quality)
+}
+
+fn measured_screen_chart_quality(sample: &SignalSample) -> Option<f64> {
+    (!sample.decode_paused_locally).then_some(screen_chart_quality(sample))
 }
 
 /// Issue #906: pick the quality value the screen chart should plot for a   // @token-exempt: issue ref, not a color
@@ -3086,6 +3344,9 @@ mod tests {
     #[test]
     fn signal_level_bars() {
         assert_eq!(SignalLevel::Excellent.bars(), 5);
+        assert_eq!(SignalLevel::Unmeasured.bars(), 0);
+        assert!(SignalLevel::Unmeasured.is_unmeasured());
+        assert!(!SignalLevel::Unmeasured.is_lost());
         assert_eq!(SignalLevel::Lost.bars(), 0);
     }
 
@@ -3141,6 +3402,7 @@ mod tests {
             latency_ms: 40.0,
             audio_enabled: true,
             video_enabled: true,
+            decode_paused_locally: false,
         };
         history.push_sample_at(&data, 1_000.0);
 
@@ -3153,6 +3415,220 @@ mod tests {
         assert!((s.screen_fps - 15.0).abs() < 1e-9);
         // Screen quality is fps / 30 when enabled.
         assert!((s.screen_quality - 0.5).abs() < 1e-9);
+    }
+
+    /// Issue #2190: the VIDEO signal bar must track the DECODED rung, not the simulcast
+    /// ladder sum — and must therefore be able to read below full strength.
+    ///
+    /// `video_quality` is `(video_fps / 30.0).clamp(0.0, 1.0)`, and it drives the rendered
+    /// per-tile signal bars — a trust indicator a viewer reads to judge a peer's health.
+    /// Before #2190 the receive-side fps counted every arriving simulcast rung, so a 3-rung
+    /// publisher reported the LADDER SUM (~52 for an 8fps sender). 52/30 clamps to 1.0, so
+    /// the bar sat PERMANENTLY FULL regardless of the peer's real cadence — the indicator
+    /// could not fall, which is the worst failure mode for a health display. With the
+    /// counter fixed, the same publisher reports its true 8fps and the bar reads ~0.27.
+    ///
+    /// This pins both ends: the honest rung reads a partial bar, and the pre-fix ladder-sum
+    /// value is what saturation looks like. It is a host test because the arithmetic and
+    /// the clamp are pure; `push_sample_at` is the production entry point the live tile
+    /// calls (via `push_sample`), so this is not a re-implementation.
+    #[test]
+    fn video_quality_bar_tracks_decoded_rung_and_is_saturated_by_the_ladder_sum() {
+        let mut history = PeerSignalHistory::new();
+
+        // The TRUE cadence of one 8fps rung (post-#2190).
+        let decoded = SampleData {
+            video_fps: 8.0,
+            video_enabled: true,
+            audio_enabled: true,
+            ..Default::default()
+        };
+        history.push_sample_at(&decoded, 1_000.0);
+        let q_decoded = history.samples_vec()[0].video_quality;
+        assert!(
+            (q_decoded - 8.0 / 30.0).abs() < 1e-9,
+            "an 8fps decoded rung must read ~0.27, not full strength (got {q_decoded})"
+        );
+        assert!(
+            q_decoded < 1.0,
+            "the bar MUST be able to read below full — a health indicator that cannot \
+             fall is useless (got {q_decoded})"
+        );
+
+        // SCREEN: derive the expectation from the REAL tier table, not a restated literal.
+        // An earlier version asserted `(q - 10.0/30.0) < 1e-9` with "10fps on every rung" in
+        // its doc — a literal against itself, and the claim was false (tiers are
+        // 10/10/10/8/5). Reading `SCREEN_QUALITY_TIERS` means a ladder change moves the
+        // expectation instead of silently invalidating the comment.
+        use videocall_client::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
+
+        let best_screen_fps = SCREEN_QUALITY_TIERS
+            .iter()
+            .map(|t| t.target_fps)
+            .max()
+            .expect("the screen tier table is non-empty");
+        let worst_screen_fps = SCREEN_QUALITY_TIERS
+            .iter()
+            .map(|t| t.target_fps)
+            .min()
+            .expect("the screen tier table is non-empty");
+
+        let sample_screen_quality = |fps: f64| {
+            let mut h = PeerSignalHistory::new();
+            h.push_sample_at(
+                &SampleData {
+                    screen_enabled: true,
+                    screen_fps: fps,
+                    video_enabled: true,
+                    audio_enabled: true,
+                    ..Default::default()
+                },
+                1_000.0,
+            );
+            h.samples_vec()[0].screen_quality
+        };
+
+        // Even the BEST screen rung cannot approach full strength against the camera
+        // ladder's 30.0 divisor — the known mis-scale, now pinned to the table.
+        let q_best = sample_screen_quality(best_screen_fps as f64);
+        assert!(
+            (q_best - best_screen_fps as f64 / 30.0).abs() < 1e-9,
+            "the best screen rung ({best_screen_fps} fps) must score its true ratio against \
+             the 30.0 divisor (got {q_best})"
+        );
+        assert!(
+            q_best <= 0.34,
+            "a perfectly healthy top-rung share still cannot exceed ~0.33 — the divisor is \
+             the CAMERA ladder's top rung (got {q_best})"
+        );
+
+        // And the FLOOR rung is worse still: `low` targets 5 fps, so a correct share reads
+        // ~0.17 => `Bad`. This is the number the earlier comment got wrong (it claimed the
+        // floor was ~0.33), understating the regression by a full band.
+        let q_worst = sample_screen_quality(worst_screen_fps as f64);
+        assert!(
+            (q_worst - worst_screen_fps as f64 / 30.0).abs() < 1e-9,
+            "the floor screen rung ({worst_screen_fps} fps) must score its true ratio \
+             (got {q_worst})"
+        );
+        assert_eq!(
+            SignalLevel::from_quality(q_worst),
+            SignalLevel::Bad,
+            "a correct floor-rung share lands in `Bad` on the screen-only meter — the \
+             concrete cost of the deferred denominator, asserted rather than asserted-about"
+        );
+
+        // The pre-#2190 ladder sum (7+15+30) for the very same 8fps publisher.
+        let ladder_sum = SampleData {
+            video_fps: 52.0,
+            video_enabled: true,
+            audio_enabled: true,
+            ..Default::default()
+        };
+        let mut history2 = PeerSignalHistory::new();
+        history2.push_sample_at(&ladder_sum, 1_000.0);
+        let q_sum = history2.samples_vec()[0].video_quality;
+        assert!(
+            (q_sum - 1.0).abs() < 1e-9,
+            "the ladder sum clamps to a permanently FULL bar — this is the defect issue 2190 \
+             removed, pinned here so a regression is visible (got {q_sum})"
+        );
+    }
+
+    /// Issue #2190: the local decode-pause reason must survive sample recording so the popup
+    /// can suppress false zero-valued video/screen series. The rendered state itself is pinned
+    /// through `peer_tile::rendered_level_excludes_streams_we_are_not_decoding`.
+    ///
+    /// MUTATION: dropping the field assignment in `push_sample_at` fails this assertion.
+    #[test]
+    fn decode_paused_reason_is_carried_into_popup_history() {
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(
+            &SampleData {
+                decode_paused_locally: true,
+                ..Default::default()
+            },
+            1_000.0,
+        );
+        assert!(
+            history.samples_vec()[0].decode_paused_locally,
+            "the popup history must retain why video/screen quality is unmeasured"
+        );
+    }
+
+    /// Paused samples must create a gap in video/screen chart lines. Filtering only while
+    /// the peer is currently paused would make the false zero-quality dip reappear as soon
+    /// as decoding resumes.
+    ///
+    /// MUTATION: ignoring `decode_paused_locally` in the accessor returns one segment.
+    #[test]
+    fn decode_paused_samples_split_quality_chart_segments() {
+        let mut history = PeerSignalHistory::new();
+        for (timestamp_ms, decode_paused_locally) in [
+            (1_000.0, false),
+            (2_000.0, false),
+            (3_000.0, true),
+            (4_000.0, true),
+            (5_000.0, false),
+            (6_000.0, false),
+        ] {
+            history.push_sample_at(
+                &SampleData {
+                    video_fps: 30.0,
+                    video_enabled: !decode_paused_locally,
+                    decode_paused_locally,
+                    ..Default::default()
+                },
+                timestamp_ms,
+            );
+        }
+
+        let samples = history.samples_vec();
+        let segments =
+            build_quality_polyline_segments(&samples, 0.0, 10.0, 10.0, 150.0, video_chart_quality);
+
+        assert_eq!(
+            segments.len(),
+            2,
+            "the unmeasured interval must break the line"
+        );
+        assert_eq!(segments[0].split_whitespace().count(), 2);
+        assert_eq!(segments[1].split_whitespace().count(), 2);
+    }
+
+    /// Issue #2190: `signal_enabled_flags` must fold video and screen on decode state while
+    /// leaving AUDIO alone.
+    ///
+    /// Audio decodes regardless of tile visibility, so it remains available in popup history
+    /// even while the rendered video signal state is `Unmeasured`.
+    ///
+    /// MUTATION: folding `audio_enabled` on `is_decoding`, or dropping `&& is_decoding` from
+    /// either of the other two arms, fails this.
+    #[test]
+    fn signal_enabled_flags_folds_video_and_screen_but_never_audio() {
+        // Not decoding: video and screen excluded, audio preserved.
+        assert_eq!(
+            signal_enabled_flags(true, true, true, false),
+            (true, false, false),
+            "video and screen must be excluded when we are not decoding; audio must survive \
+             so the meter is scored on the stream that IS measured"
+        );
+        // Decoding: everything the peer reports is measured.
+        assert_eq!(
+            signal_enabled_flags(true, true, true, true),
+            (true, true, true),
+            "when decoding, the peer's own flags pass through unchanged"
+        );
+        // A muted, camera-off peer we are decoding: nothing to fold.
+        assert_eq!(
+            signal_enabled_flags(false, false, false, true),
+            (false, false, false)
+        );
+        // Audio-only peer we are not decoding video for: audio still counts.
+        assert_eq!(
+            signal_enabled_flags(true, false, false, false),
+            (true, false, false)
+        );
     }
 
     #[test]
@@ -3219,6 +3695,7 @@ mod tests {
             audio_expand_rate: 0.0,
             audio_buffer_ms: 0.0,
             screen_enabled: true,
+            decode_paused_locally: false,
             screen_fps: 8.0,
             screen_bitrate_kbps: 720.0,
             screen_resolution: received.to_string(),
@@ -3397,7 +3874,9 @@ mod tests {
     // -----------------------------------------------------------------
     // Issue #903: Cause line rendering. Sourced from publisher-stamped // @token-exempt: issue ref, not a color
     // `VideoMetadata` fields. Post-tightening copy is compact:
-    //   * No data → empty (older publisher or unconstrained tier).
+    //   * No cause evidence (no tier AND no hint) → empty. Covers the
+    //     older publisher, the unconstrained publisher, and a lone
+    //     target bitrate (issue #2179 review, UX B1).
     //   * Bitrate + tier → `Cause: <N>kbps · tier '<tier>'`.
     //   * Cause hint only → `Cause: <hint>`.
     //   * All three → `Cause: <hint> · <N>kbps · tier '<tier>'`.
@@ -3504,6 +3983,90 @@ mod tests {
             let line = build_screen_cause_line(&s, true);
             assert!(!line.contains("not yet instrumented"));
             assert!(!line.contains("#903")); // @token-exempt: issue ref, not a color
+        }
+    }
+
+    /// Issue #2179 review (UX B1): "constrained" is SOURCE-relative. A publisher
+    /// sharing a 1080p window rides the `high` rung — index 2 of 5 once the ladder
+    /// grew — while doing everything its source allows, and clears all three cause
+    /// fields. The receiver must render NOTHING for that sample.
+    ///
+    /// This is the receive-side half of the fix: the renderer derives the line
+    /// ONLY from the stamped fields, so it cannot re-invent a "tier index != 0"
+    /// constrained test of its own. The screen row's own metrics are populated so
+    /// the empty result cannot be coming from an empty-row shortcut.
+    ///
+    /// MUTATION: make `build_screen_cause_line` render on `has_bitrate` alone
+    /// (the pre-review predicate) and the bare-bitrate case below fails.
+    #[test]
+    fn cause_line_absent_for_an_unconstrained_non_top_rung_publisher() {
+        // Received == source: the publisher is at its source's own size.
+        let mut s = screen_sample("1920x1080", "1920x1080");
+        s.screen_fps = 10.0;
+        s.screen_bitrate_kbps = 2400.0;
+        // All three cleared by the publisher: it is AT its best source rung.
+        s.screen_encoder_target_bitrate_kbps = 0;
+        s.screen_adaptive_tier.clear();
+        s.screen_cause_hint.clear();
+        assert_eq!(build_screen_cause_line(&s, true), "");
+
+        // A target bitrate arriving WITHOUT either cause field is not a constraint
+        // claim and must not resurrect the line.
+        s.screen_encoder_target_bitrate_kbps = 2500;
+        assert_eq!(
+            build_screen_cause_line(&s, true),
+            "",
+            "a bare target bitrate is a magnitude, not evidence of a constraint"
+        );
+
+        // The line returns as soon as the publisher actually stamps a cause.
+        s.screen_cause_hint = "cpu-pressure".to_string();
+        let line = build_screen_cause_line(&s, true);
+        assert!(
+            line.contains("Cause: cpu-pressure \u{00B7} 2500kbps"),
+            "unexpected cause line once a hint is stamped: {line}"
+        );
+    }
+
+    /// Lockstep pin (issue #2179 review round 2): the Screen help popover
+    /// enumerates the cause classifiers for the user, so every string the
+    /// publisher can actually stamp must appear there. Round 2 added
+    /// `single-stream-limited` on the publisher side; without this pin the legend
+    /// would silently omit a classifier users see on their own screen.
+    ///
+    /// Derived from the AQ crate's exported constants, so a future cause string
+    /// fails here rather than shipping an incomplete legend.
+    ///
+    /// MUTATION: drop any entry from `SCREEN_CAUSE_LEGEND` that names an AQ
+    /// constant and this fails.
+    #[test]
+    fn screen_cause_legend_covers_every_aq_cause_string() {
+        use videocall_client::adaptive_quality_constants::{
+            SCREEN_CAUSE_BITRATE, SCREEN_CAUSE_CPU, SCREEN_CAUSE_LADDER, SCREEN_CAUSE_SINGLE_STREAM,
+        };
+        // Every cause the PUBLISHER can stamp. `SCREEN_CAUSE_SINGLE_STREAM` is
+        // latent today (see `SCREEN_CAUSE_LEGEND`) but is still pinned: the code
+        // path exists and stamps it the moment the ladder gains a rung above the
+        // single-stream cap, and the legend must not have to be remembered then.
+        let publisher_causes = [
+            SCREEN_CAUSE_BITRATE,
+            SCREEN_CAUSE_LADDER,
+            SCREEN_CAUSE_CPU,
+            SCREEN_CAUSE_SINGLE_STREAM,
+        ];
+        let text = screen_cause_legend_text();
+        for cause in publisher_causes {
+            assert!(
+                SCREEN_CAUSE_LEGEND.contains(&cause),
+                "the Screen help legend must name the publisher cause \'{cause}\' — \
+                 users see this string in their own Cause line"
+            );
+            // The rendered prose must contain it too (the const is only useful if
+            // the copy is built FROM it).
+            assert!(
+                text.contains(cause),
+                "legend text must render \'{cause}\': {text}"
+            );
         }
     }
 

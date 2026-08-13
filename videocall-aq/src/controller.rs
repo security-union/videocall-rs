@@ -667,7 +667,21 @@ impl EncoderBitrateController {
         if !self.quality_manager.forced_transition_guards_clear(now) {
             return false;
         }
-        // Genuine uplink room for the next rung.
+        // Issue #2179 review — the OUT-OF-BAND congestion axes. Gates 4 and 6
+        // above only see the encoder queue and the CONGESTION drain hold, so a
+        // sender whose WS send-buffer / WS stale-delta / WT unistream drops are
+        // stepping its TIER down could still earn another rung six seconds
+        // later — precisely the case where the marginal screen rung costs
+        // +5000 kbps. Require the tier axis to have been quiet for the same
+        // dwell the encoder queue must have been clear.
+        if !self
+            .quality_manager
+            .no_video_step_down_within(now, LAYER_PROBE_CLEAR_WINDOW_MS)
+        {
+            return false;
+        }
+        // Relative benefit of the next rung (see the constant's own doc for why
+        // this is NOT an uplink-headroom test and cannot be made into one).
         self.uplink_precondition_for_add()
     }
 
@@ -1557,6 +1571,112 @@ impl EncoderBitrateController {
         } else {
             self.quality_manager.set_quality_ceiling(None);
         }
+    }
+
+    /// Seed the video tier at (re)share start (issue #2179).
+    ///
+    /// # Why this exists
+    /// The screen encoder resolves its starting tier from the CAPTURED SOURCE
+    /// SIZE (`resolve_initial_screen_tier`) and writes it straight into the
+    /// shared tier atomics. The AQ controller, however, is constructed once —
+    /// long before any capture exists — at `DEFAULT_SCREEN_TIER_INDEX`. Without
+    /// this seed the two disagree, and the controller's FIRST tier transition
+    /// (in either direction) overwrites the encoder's source-matched tier with
+    /// its own stale neighbour: a share that correctly started at the source
+    /// resolution would get yanked down to 1080p on the first step-up tick and
+    /// then climb back, costing a reconfigure + keyframe each way.
+    ///
+    /// Modelled on [`Self::notify_screen_sharing`] (the other "coordination"
+    /// seed): it uses `force_video_step_to`, which is allowed to move multiple
+    /// rungs at once and deliberately bypasses the warmup guard, because a
+    /// coordination signal must take effect immediately rather than on the next
+    /// adaptation tick.
+    ///
+    /// The target is first clamped into the user's quality bounds (best = floor
+    /// on the index, worst = cap), so a user who pinned their send quality is
+    /// never jumped outside their range by a large shared surface.
+    ///
+    /// Side effect worth knowing: like every `force_video_step_to`, a successful
+    /// seed stamps `last_transition_time_ms`, so the next congestion-driven
+    /// `force_video_step_down` is held off for `MIN_TIER_TRANSITION_INTERVAL_MS`
+    /// (1.5 s). That is intentional settling after a deliberate seed, and it is
+    /// nearly free in practice: the self-congestion axes cannot decide before
+    /// their own ≥1 s windows elapse anyway.
+    ///
+    /// Returns `true` if the tier actually changed.
+    pub fn set_initial_video_tier(&mut self, target: usize) -> bool {
+        let (best, worst) = self.quality_manager.user_video_quality_bounds();
+        let mut clamped = target;
+        if let Some(floor) = best {
+            clamped = clamped.max(floor);
+        }
+        // Issue #2179 review: the persistent source/device ceiling is a floor on
+        // the index too, and it must bind the SEED as well as the climb —
+        // otherwise a share whose ceiling says "no better than high" could still
+        // be seeded straight onto the 1440p rung and only be pulled back on a
+        // later tick, emitting its first GOP at the forbidden rung.
+        if let Some(ceiling) = self.quality_manager.source_ceiling_index() {
+            clamped = clamped.max(ceiling);
+        }
+        if let Some(cap) = worst {
+            clamped = clamped.min(cap);
+        }
+        let now = self.clock.now_ms();
+        let changed = self.quality_manager.force_video_step_to(clamped, now);
+        if changed {
+            let old_bitrate = self.ideal_bitrate_kbps;
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            self.tier_changed = true;
+            log::info!(
+                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: initial_source_tier)",
+                old_bitrate,
+                self.ideal_bitrate_kbps,
+                new_tier.label,
+                self.quality_manager.video_tier_index(),
+            );
+        }
+        changed
+    }
+
+    /// Install (or clear) the PERSISTENT source/device quality ceiling for the
+    /// current share (issue #2179 review).
+    ///
+    /// The screen encoder computes this once per share from
+    /// [`crate::constants::resolve_screen_tier_ceiling`] (captured source size ∨
+    /// CPU class ∨ single-stream cap) and installs it here for the share's whole
+    /// life, clearing it (`None`) on share stop.
+    ///
+    /// It is a FLOOR on the tier index, so the PID may still step DOWN under
+    /// congestion — it simply may never climb PAST it. Without it the source
+    /// term was start-only: a 720p share could be climbed by the AQ loop all the
+    /// way to the `native` rung's 8000 kbps setpoint, spending 4K money on 720p
+    /// pixels and multiplying it by SFU fan-out.
+    ///
+    /// Composes with (never replaces) the user's `best`/`worst` bounds — see
+    /// [`AdaptiveQualityManager::set_source_ceiling`].
+    pub fn set_source_tier_ceiling(&mut self, index: Option<usize>) {
+        let now = self.clock.now_ms();
+        let before = self.quality_manager.video_tier_index();
+        self.quality_manager.set_source_ceiling(index, now);
+        if self.quality_manager.video_tier_index() != before {
+            self.tier_changed = true;
+            let old_bitrate = self.ideal_bitrate_kbps;
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            log::info!(
+                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: source_tier_ceiling)",
+                old_bitrate,
+                self.ideal_bitrate_kbps,
+                new_tier.label,
+                self.quality_manager.video_tier_index(),
+            );
+        }
+    }
+
+    /// The persistent source/device ceiling currently installed, if any.
+    pub fn source_tier_ceiling(&self) -> Option<usize> {
+        self.quality_manager.source_ceiling_index()
     }
 
     /// Drain tier transition records from the quality manager.
@@ -2675,9 +2795,13 @@ mod tests {
             controller.layer_resolution(0),
             Some((tiers[0].max_width, tiers[0].max_height))
         );
-        // The top screen layer must be 1080p (distinct from the camera ladder's
-        // 720p top), proving the screen ladder is in use.
-        assert_eq!(controller.layer_resolution(2), Some((1920, 1080)));
+        // The top screen layer must be 1440p (issue #2179; distinct from the
+        // camera ladder's 720p top), proving the screen ladder is in use.
+        assert_eq!(controller.layer_resolution(2), Some((2560, 1440)));
+        // …and the middle rung must be the 1080p `high` rung, so the ladder is
+        // spaced by RESOLUTION (720p → 1080p → 1440p) rather than repeating
+        // 720p on two rungs as the pre-#2179 `[low, medium, high]` did.
+        assert_eq!(controller.layer_resolution(1), Some((1920, 1080)));
     }
 
     #[test]
@@ -2686,6 +2810,83 @@ mod tests {
         let target_fps = Arc::new(AtomicU32::new(10));
         let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
         assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
+    }
+
+    /// Issue #2179: the screen AQ loop seeds the controller with the tier the
+    /// encoder resolved from the CAPTURED SOURCE, so the controller's first
+    /// transition cannot yank a source-matched share back to its own stale
+    /// construction default.
+    ///
+    /// Mutation guards: deleting `set_initial_video_tier`'s `force_video_step_to`
+    /// leaves the controller at `DEFAULT_SCREEN_TIER_INDEX` (first assert
+    /// fails); dropping the `tier_changed` raise makes the encoder never observe
+    /// the seed (second assert fails); dropping the `ideal_bitrate_kbps` resync
+    /// leaves the PID driving toward the old tier's setpoint (third assert
+    /// fails).
+    #[test]
+    fn set_initial_video_tier_seeds_screen_controller_from_source_tier() {
+        use crate::constants::{screen_tier_index_by_label, DEFAULT_SCREEN_TIER_INDEX};
+        let target_fps = Arc::new(AtomicU32::new(10));
+        let mut controller =
+            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
+        assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
+
+        let target = screen_tier_index_by_label("1440p");
+        assert!(controller.set_initial_video_tier(target));
+        assert_eq!(controller.video_tier_index(), target);
+        assert!(
+            controller.take_tier_changed(),
+            "the seed must raise tier_changed so the encoder picks up the new dims"
+        );
+        assert_eq!(
+            controller.current_video_tier().max_width,
+            2560,
+            "the controller must now be ON the 1440p rung"
+        );
+        assert_eq!(
+            controller.ideal_bitrate_kbps, SCREEN_QUALITY_TIERS[target].ideal_bitrate_kbps,
+            "the PID setpoint must resync to the seeded tier"
+        );
+
+        // Idempotent: seeding the tier it is already on reports no change.
+        assert!(!controller.set_initial_video_tier(target));
+    }
+
+    /// The seed must never escape a user's send-quality bounds — `best` is a
+    /// FLOOR on the index (best allowed) and `worst` is a CAP.
+    #[test]
+    fn set_initial_video_tier_respects_user_quality_bounds() {
+        use crate::constants::screen_tier_index_by_label;
+        let medium = screen_tier_index_by_label("medium");
+        let native = 0usize;
+
+        // User pinned max quality at `medium`: a 4K source must not jump above it.
+        let mut controller = EncoderBitrateController::new_for_screen(
+            Arc::new(AtomicU32::new(10)),
+            SCREEN_QUALITY_TIERS,
+        );
+        controller.set_video_quality_bounds(Some(medium), None);
+        controller.set_initial_video_tier(native);
+        assert_eq!(
+            controller.video_tier_index(),
+            medium,
+            "the source-derived seed must not step above the user's best/floor bound"
+        );
+
+        // User pinned min quality at `high`: a tiny source must not sink below it.
+        let high = screen_tier_index_by_label("high");
+        let low = SCREEN_QUALITY_TIERS.len() - 1;
+        let mut controller = EncoderBitrateController::new_for_screen(
+            Arc::new(AtomicU32::new(10)),
+            SCREEN_QUALITY_TIERS,
+        );
+        controller.set_video_quality_bounds(None, Some(high));
+        controller.set_initial_video_tier(low);
+        assert_eq!(
+            controller.video_tier_index(),
+            high,
+            "the source-derived seed must not step below the user's worst/cap bound"
+        );
     }
 
     #[test]
@@ -3936,6 +4137,20 @@ mod tests {
         // The active layers are budget-capped, so compare the ladder the controller
         // RESOLVED rather than the post-cap numbers: the tier table it built its
         // targets from must be the reduced one.
+        //
+        // `set_simulcast_layers(3)` above seeds `active_layer_count = 3` (all rungs
+        // hot), so `active` is 3 here and this assertion compares at the full ladder
+        // depth — where the two tables genuinely diverge, which is what makes this
+        // assertion variant-discriminating here and vacuous in a ramping controller.
+        //
+        // NOTE the seed is a TEST convenience, not a production shape: no encoder calls
+        // `set_simulcast_layers` any more. Camera uses
+        // `set_simulcast_ceiling_start_at_base` (active starts at 1 and is earned up),
+        // screen uses `set_simulcast_ceiling_start_optimistic` (#1553); #1200 removed
+        // screen's all-rungs-hot seed. It is used here because the point of this test is
+        // the LADDER TABLE the controller resolved, and the all-hot seed reaches full
+        // depth without simulating a ramp. The consequence is that the budget assertion
+        // is only meaningful at this seed — see the note below the top-rung assertion.
         let active = controller.active_layer_count();
         let reduced_budget =
             uplink_budget_kbps(simulcast_layers_for(3, LadderVariant::Reduced), active);
@@ -3945,10 +4160,19 @@ mod tests {
             "active sum {active_sum} must fit the REDUCED budget {reduced_budget}"
         );
 
-        // The decisive assertion: the TOP rung's stored target is the reduced
-        // ideal (900), never the default's (1500). The top rung is retained at its
-        // tier ideal even while shed (so a re-add resumes near it), so this reads
-        // the ladder table directly rather than depending on the active count.
+        // The most ROBUST assertion: the TOP rung's stored target is the reduced ideal
+        // (900), never the default's (1500). The top rung is retained at its tier ideal
+        // even while shed (so a re-add resumes near it), so this reads the ladder table
+        // directly rather than depending on the ACTIVE count — it discriminates the
+        // variant at any active depth, whereas the budget assertion above only does so
+        // at full depth.
+        //
+        // It does still depend on the ladder being 3 rungs DEEP. Both assertions rest on
+        // the `set_simulcast_layers(3)` seed: dropping it leaves the manager in
+        // single-stream mode, `layer_target_bitrates_kbps()` returns empty, and the
+        // `bitrates.len() == 3` precondition above fails first.
+        // That precondition is what keeps this test from degrading silently: without
+        // the seed it fails first, rather than the top-rung assertion passing vacuously.
         assert_eq!(
             bitrates[2], reduced_ideals[2],
             "top rung must carry the REDUCED ideal ({}), not the default ladder's",
@@ -3959,16 +4183,19 @@ mod tests {
             LadderVariant::Reduced,
             "the controller must report the variant it was built with"
         );
-        // Sanity: the two ladders' budgets genuinely differ, so the assertion above is
-        // discriminating rather than vacuously true.
+        // Sanity on the TABLES: the two ladders' full-depth budgets genuinely differ,
+        // so a retune that collapsed the reduced ladder onto the default one would fail
+        // HERE rather than silently making the variant a no-op.
         //
-        // Compared at the FULL ladder depth (3), NOT at the live `active` count. An
-        // earlier revision compared at `active` with an `|| active < 3` escape clause,
-        // which made it vacuous in exactly the case it claimed to check: the ramp
-        // starts at 1 active layer, so the escape hatch was normally taken and this
-        // assertion never ran. The ladders' difference is a property of the TABLES,
-        // not of the current operating point, so pin it at depth 3 where the differing
-        // top rung is included.
+        // Compared at the FULL ladder depth (3), NOT at the live `active` count — even
+        // though `active` happens to be 3 in this test. The ladders' difference is a
+        // property of the TABLES, not of the current operating point: the two share
+        // rungs 0 and 1 byte-for-byte (`low` 320×180@120 and `standard` 640×360@350 in
+        // both), so their budgets are EQUAL at 1 and 2 active rungs and diverge only at
+        // 3. Pinning at a hardcoded depth
+        // keeps this check meaningful even if the seed above changes. Comparing at
+        // the controller's live `active` depth would be vacuous: a ramping controller
+        // sits at 1 active layer, where the two ladders are equal by construction.
         let reduced_full = uplink_budget_kbps(simulcast_layers_for(3, LadderVariant::Reduced), 3);
         let default_full = uplink_budget_kbps(simulcast_layers_for(3, LadderVariant::Default), 3);
         assert!(
@@ -4042,6 +4269,104 @@ mod tests {
         );
     }
 
+    /// Issue #2179 review: the headroom probe must refuse to add a rung while
+    /// the sender's TIER axis is still shedding, even though the encoder queue is
+    /// perfectly clear.
+    ///
+    /// This is the out-of-band case the other seven gates are blind to: the WS
+    /// send-buffer / WS stale-delta / WT unistream drop bursts all call
+    /// `force_video_step_down` without ever touching `encode_queue_size()`, so
+    /// the 6 s clear dwell and the `degrade` check both read "healthy" while the
+    /// uplink is visibly failing. On the screen ladder the rung this would add
+    /// costs +5000 kbps.
+    ///
+    /// Mutation guard: delete the `no_video_step_down_within` gate from
+    /// `probe_add_allowed` and the first assertion fails (the rung is earned
+    /// 4 s after the step-down).
+    #[test]
+    fn probe_refuses_a_rung_inside_the_tier_quiet_window() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = screen_controller_with_clock(&clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "precondition: start-at-base seeds a single active layer"
+        );
+
+        // An OUT-OF-BAND congestion axis steps the tier down. The encoder queue
+        // never leaves depth 0, so no other probe gate can see this.
+        clock.set_ms(t as u64);
+        assert!(
+            controller.force_video_step_down(),
+            "precondition: the tier axis actually stepped down"
+        );
+
+        // Inside the quiet window: the clear dwell is long satisfied, yet no rung
+        // may be earned.
+        tick_at(&mut controller, &clock, t + 4_000.0, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "a rung must NOT be earned while the tier axis is still shedding"
+        );
+
+        // Past the quiet window with the queue still clear: the ramp resumes, so
+        // the gate is time-bounded and cannot wedge the ladder.
+        tick_at(
+            &mut controller,
+            &clock,
+            t + LAYER_PROBE_CLEAR_WINDOW_MS + 500.0,
+            0,
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "the quiet window must RE-OPEN the probe, not pin the ladder at base"
+        );
+    }
+
+    /// Issue #2179 review: the persistent source/device ceiling installed on the
+    /// controller must bind BOTH the share-start seed and the later climb.
+    ///
+    /// Mutation guard: drop the `source_ceiling_index()` clamp from
+    /// `set_initial_video_tier` and the seed lands on `1440p`, failing the first
+    /// assertion.
+    #[test]
+    fn source_tier_ceiling_binds_the_seed_and_the_climb() {
+        use crate::constants::screen_tier_index_by_label;
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = screen_controller_with_clock(&clock);
+
+        let high = screen_tier_index_by_label("high");
+        let best_1440p = screen_tier_index_by_label("1440p");
+        controller.set_source_tier_ceiling(Some(high));
+        assert_eq!(controller.source_tier_ceiling(), Some(high));
+
+        // A seed BETTER than the ceiling is pulled back to it.
+        controller.set_initial_video_tier(best_1440p);
+        assert_eq!(
+            controller.video_tier_index(),
+            high,
+            "the seed must never start a share above its persistent ceiling"
+        );
+
+        // A seed WORSE than the ceiling is honoured as-is (the ceiling is a
+        // floor on the index, not a target).
+        let low = screen_tier_index_by_label("low");
+        controller.set_initial_video_tier(low);
+        assert_eq!(controller.video_tier_index(), low);
+
+        // Clearing it (share stop) releases the bound for the next share.
+        controller.set_source_tier_ceiling(None);
+        assert_eq!(controller.source_tier_ceiling(), None);
+        controller.set_initial_video_tier(best_1440p);
+        assert_eq!(controller.video_tier_index(), best_1440p);
+    }
+
     /// A `Reduced`-ladder publisher must still EARN its upper rungs — the reduced
     /// ladder must not wedge the #1140/#1141 headroom ramp at the base layer
     /// (issue #1768). This is a NON-WEDGING test, not a variant-discrimination
@@ -4056,8 +4381,10 @@ mod tests {
     /// It is still load-bearing: it fails if a Reduced controller cannot climb at
     /// all, which is exactly what a wrong-shaped reduced ladder (e.g. a zero/absent
     /// upper ideal, or a rung count mismatch slipping past the compile-time depth
-    /// assert) would cause. It also becomes variant-sensitive the moment
-    /// `LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC` is raised above 0.
+    /// assert) would cause. It would become variant-sensitive only at a
+    /// `LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC` above 1.67 — not merely "above 0" as
+    /// this note used to claim; see that constant's own doc for the shipped
+    /// `next_ideal / budget_now` ratios and why no useful value exists.
     #[test]
     fn test_reduced_ladder_ramp_still_earns_layers() {
         let base_ms: u64 = 100_000;

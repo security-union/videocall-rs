@@ -432,6 +432,7 @@ pub fn Host(
             // #1143: send-side simulcast layer counts (camera encoder atoms).
             camera.shared_effective_layer_count(),
             camera.shared_active_layer_count(),
+            camera.camera_layer_metric_source(),
             // #1561: screen + audio layer metrics.
             screen.effective_screen_layer_count(),
             screen.shared_active_layer_count(),
@@ -751,15 +752,23 @@ pub fn Host(
                 // the moment screen sharing starts to choose a conservative
                 // starting tier that gives a readable first frame on constrained
                 // uplinks without waiting for the PID loop to ramp down.
+                //
+                // Issue #2179: this is only the network-imposed FLOOR. The
+                // encoder composes it with the capture's real resolution once
+                // getDisplayMedia resolves (`resolve_initial_screen_tier`), so a
+                // share on a healthy link starts at the resolution actually
+                // being shared instead of a flat 1080p ceiling. The capture size
+                // is not knowable here — the browser picker has not run yet —
+                // which is why the composition lives in the encoder.
                 let rtt_ms = client.average_rtt_ms();
                 let camera_tier_index = client.camera_tier_index();
-                let initial_tier = initial_screen_tier(rtt_ms, camera_tier_index);
+                let network_tier = initial_screen_tier(rtt_ms, camera_tier_index);
 
                 log::info!(
-                    "Start screen share encoder: rtt={:?}ms, camera_tier={:?}, initial_tier={}",
+                    "Start screen share encoder: rtt={:?}ms, camera_tier={:?}, network_floor_tier={}",
                     rtt_ms,
                     camera_tier_index,
-                    initial_tier
+                    network_tier
                 );
 
                 // Check if the onclick handler already acquired a MediaStream
@@ -768,7 +777,7 @@ pub fn Host(
                 let maybe_stream = pre_acquired_stream.borrow_mut().take();
                 if let Some(stream) = maybe_stream {
                     log::info!("Start screen share encoder with pre-acquired stream");
-                    s.screen.start_with_stream(stream, initial_tier);
+                    s.screen.start_with_stream(stream, network_tier);
                 } else {
                     // Fallback: let the encoder call getDisplayMedia itself.
                     // This path works on Chrome/Firefox where the gesture
@@ -776,7 +785,7 @@ pub fn Host(
                     log::info!("Start screen share encoder (encoder-acquired stream)");
                     let state_clone = state.clone();
                     Timeout::new(1000, move || {
-                        state_clone.borrow_mut().screen.start(initial_tier);
+                        state_clone.borrow_mut().screen.start(network_tier);
                     })
                     .forget();
                 }

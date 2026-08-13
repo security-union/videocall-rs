@@ -49,6 +49,7 @@ pub fn PreJoinSettingsCard(
     end_on_host_leave_toggle: Signal<bool>,
     allow_guests_toggle: Signal<bool>,
     recording_allowed_for_all_toggle: Signal<bool>,
+    chat_allowed_for_all_toggle: Signal<bool>,
     saving: Signal<bool>,
     toggle_error: Signal<Option<String>>,
     connection_error: Signal<Option<String>>,
@@ -129,6 +130,7 @@ pub fn PreJoinSettingsCard(
                     end_on_host_leave_toggle,
                     allow_guests_toggle,
                     recording_allowed_for_all_toggle,
+                    chat_allowed_for_all_toggle,
                     saving,
                     toggle_error,
                 }

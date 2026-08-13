@@ -62,7 +62,7 @@ Set `--ttl infinite` for a session that only ends on signal.
 
 ### Clock video mode
 
-Pass `--video-mode clock` to publish a live 1280x720 wall clock as the
+Pass `--video-mode clock` to publish a live 640x480 wall clock as the
 bot's camera with a silent audio track. The default, `--video-mode costume`,
 and the accepted `file` alias preserve the existing manifest/override-backed
 fake-device behavior.
@@ -231,6 +231,7 @@ Highlights:
 - In-app **Help** page documents auth backends, network profiles, run profiles, troubleshooting, and the dashboard architecture.
 - Attach-mode is supported for headless / scripted setups: pass `--ctl-port` + `--ctl-token` (or `--ctl-token-file`) to point the dashboard at an externally-managed daemon. In attach mode the dashboard auto-discovers the token file (`run/ctl-*.token`) and injects the bearer token server-side — the browser never sees it.
 - Run-location pick list exposes "Local machine" today; "Cloud VM", "SSH-able host", and "Docker container" are placeholders for future work.
+- **`BOT_CTL_PROXY_IDLE_TIMEOUT_MS` bounds a proxied `/api/*` upstream request** (issue #2120). **Inactivity**, not an absolute deadline: the timer resets on every byte, so a live SSE stream (`/api/assets/prep/:id/stream`) is never severed while it keeps emitting, but a ctl handler that accepts and then goes silent no longer hangs the tab. Default `600000`; `0` disables it. Unparseable, negative, and `-0` values keep the bound armed (a typo must not reinstate the hang) — the CLI warns when it ignores one — and anything above `2147483647` is clamped, because Node clamps a larger socket-timeout delay to that and warns. Two caveats: the prep-stream handler has **no keepalive tick**, so a conversion that idles past the bound _is_ cut; and the bound only applies to an out-of-process ctl (**attach mode**) — in self-hosted mode ctl shares the dashboard's event loop, so the blocking `spawnSync("ffmpeg")` in asset prep freezes this timer too ([#2210](https://github01.hclpnp.com/labs-projects/videocall/issues/2210)).
 
 Implementation lives under `e2e/bots-app/dashboard/` with its own `package.json`, build, and test surface — no dependencies leak into the parent `e2e/` workspace. See [`dashboard/README.md`](dashboard/README.md) for the security model and dev workflow.
 
@@ -432,6 +433,25 @@ kubectl apply -f k8s/service.yaml -f k8s/statefulset.yaml
 kubectl -n bot-load scale statefulset/videocall-bots --replicas=10
 kubectl -n bot-load get pods -w
 
+# Before trusting the numbers (#2248):
+#   * SCALE FIRST. The BOT_HW_CONCURRENCY=10 third rung only pays for itself at
+#     >= 7 decoded peers (>= 8 replicas). The manifest ships replicas: 3, where
+#     it is pure encode cost.
+#   * PIN THE IMAGE for an A/B. The manifest uses :latest + imagePullPolicy:
+#     Always (same in k8s/conductor-job.yaml), so an env-only rollout also
+#     re-pulls latest and can swap the bot image underneath a 2-rung vs 3-rung
+#     comparison. Use the dated tag build.sh emits.
+#   * IGNORE the "CPU Throttle Indicator" panel specifically (not the adjacent
+#     "Tab Visible / Throttled" one) in the meeting-investigation
+#     Grafana dashboard for these bots. It reads videocall_client_cpu_throttled,
+#     which is capability_score/cores < 150 over the SPOOFED core count, so every
+#     bot paints as throttled with no real CPU change. Ground truth is
+#     container_cpu_cfs_throttled_seconds_total in cluster Prometheus (this tool
+#     does not sample it).
+#   * CONFIRM the ladder is what the manifest asked for:
+#     videocall_encoder_active_layers{media_kind="camera"} should read 3. If it
+#     reads 2 or flaps, the relay's LAYER_HINT union shed the top rung.
+
 # Collect the per-bot resource artifacts (#2032) — do this BEFORE scaling down.
 # `kubectl cp` execs into a RUNNING pod, so once the replicas are gone there is no
 # `videocall-bots-$i` to copy from. The DATA itself survives on a per-ordinal PVC
@@ -497,7 +517,7 @@ fails with _"updates to statefulset spec for fields other than … are forbidden
 Use `kubectl -n bot-load delete sts videocall-bots --cascade=orphan` (keeps the
 pods running) then re-`apply`; a fresh namespace needs no special handling.
 
-**Per-bot capability cap.** A container reports the _node's_ core count to the browser, so an un-capped bot over-commits simulcast layers. The StatefulSet sets `BOT_HW_CONCURRENCY=6` (→ 2 layers), which the bot spoofs into `navigator.hardwareConcurrency` before the client's capability check runs (`<6`→1 layer, `6..9`→2, `>=10`→3). Adjust per fleet to match the pod's real CPU budget.
+**Per-bot capability cap.** A container reports the _node's_ core count to the browser, so an un-capped bot over-commits simulcast layers. The StatefulSet sets `BOT_HW_CONCURRENCY=10` (→ 3 layers), which the bot spoofs into `navigator.hardwareConcurrency` before the client's capability check runs (`<6`→1 layer, `6..9`→2, `>=10`→3). Set it to model a real client's ladder depth, not the pod's CPU budget. The cap governs BOTH directions, and for a bot that receives, MORE rungs is CHEAPER: a 2-rung `[low, hd]` ladder gives the #1256 tile lid no middle rung, so each receiver decodes `hd` per peer. **Scoped to >= 7 decoded remote peers** (>= 8 replicas) at the fleet's 1920x1080 / dpr 1 posture — below that both ladders pick the top rung and the third rung is pure encode cost; at dpr 2 under `Auto` the saving never materialises at all — CSS tile height saturates at 200px, so device height bottoms out at 400px, above the 396px boundary, and the top rung is picked at every peer count. Three rungs costs one extra encode rung and saves more on decode — figures in #2248, computed on the bot's SOURCE-BOUNDED ladder (a 640x480 source fits to 240x180 / 480x360 / 640x480; rung dims are a bounding box and are never upscaled), not the nominal 320x180 / 640x360 / 1280x720. It also raises the SCREEN ceiling, making a third screen rung reachable.
 
 ## Remote per-bot control + network impairment (#2072)
 
@@ -585,9 +605,9 @@ npm run bot -- prep-assets \
 For each participant in the manifest, this:
 
 1. Stitches their lines from `bot/conversation/lines/*.wav` into `e2e/bots-app/run/audio/<name>.wav` (ffmpeg concat with optional silence padding per the manifest's `pause_ms`).
-2. Converts their costume's `talking.mp4` into `e2e/bots-app/run/costumes/<name>.y4m` (ffmpeg, 1280×720 @ 30fps, yuv420p).
+2. Converts their costume's `talking.mp4` into `e2e/bots-app/run/costumes/<name>.y4m` (ffmpeg, 640×480 @ 30fps, yuv420p).
 
-Both steps are idempotent — re-runs only spawn ffmpeg when the source file is newer than the cached output. Output sizes: ~1.5 MB per audio WAV, ~370-390 MB per y4m (raw uncompressed). `e2e/bots-app/run/` is gitignored.
+Both steps are idempotent — re-runs spawn ffmpeg only when the source file is newer than the cached output, or when the cached y4m was built at a different geometry (issue #2171). Output sizes: ~1.5 MB per audio WAV, ~123-130 MB per y4m (raw uncompressed). `e2e/bots-app/run/` is gitignored.
 
 Flags:
 

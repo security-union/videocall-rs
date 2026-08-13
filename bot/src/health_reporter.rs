@@ -167,6 +167,17 @@ pub fn spawn_health_reporter(
     });
 }
 
+/// Whether a peer's video is LIVE, for `can_see`.
+///
+/// Reads bytes, not `video_packets`: the latter is rung-filtered (#2206) and sits at
+/// zero for the whole availability window after a ladder shed, so it would report
+/// `can_see = false` while frames are still arriving on the base rung. The browser
+/// drives `can_see` off a clock that advances on every video event regardless of
+/// fps, so it reports `fps_received = 0` with `can_see = true`.
+pub(crate) fn peer_video_is_live(counters: &crate::inbound_stats::SenderHealthCounters) -> bool {
+    counters.video_bytes > 0
+}
+
 /// Build a serialized `PacketWrapper` containing a `HealthPacket`.
 fn build_health_packet(
     config: &HealthReporterConfig,
@@ -336,19 +347,25 @@ fn build_health_packet(
         hp.camera_encoder_frames_submitted_ok = Some(frames_ok);
     }
 
-    // Per-sender peer stats -- this is the critical part for AQ.
-    // The drain window is ~1 second, so packet counts ~ per-second rates.
+    // Per-sender peer stats. The drain window is ~1 second, so packet counts
+    // ~ per-second rates.
     for (sender_id, counters) in sender_counters {
         let mut ps = PbPeerStats::new();
 
         ps.can_listen = counters.audio_packets > 0;
-        ps.can_see = counters.video_packets > 0;
+        ps.can_see = peer_video_is_live(counters);
 
-        // Video stats — fps_received is the field senders' AQ uses for
-        // tier decisions. Each inbound MediaPacket(VIDEO) is one encoded
-        // frame (transport reassembles fragments), so video_packets over
-        // the ~1s drain window ≈ frames/sec. This matches how the browser
-        // FPS tracker works (time-windowed frame count).
+        // Video stats. Each inbound MediaPacket(VIDEO) is one encoded frame
+        // (transport reassembles fragments), so video_packets over the ~1s drain
+        // window ≈ frames/sec.
+        //
+        // `video_packets` counts only the rung this bot would DECODE (#2206) —
+        // `InboundStats` filters to the highest arriving rung, mirroring the
+        // browser's EXACT-MATCH guard, because the relay fans every rung to a
+        // healthy receiver and an unfiltered count reads the ladder SUM.
+        //
+        // No longer fed to any sender AQ: #1108 Stage 2 removed receiver FPS from
+        // the sender loop entirely, so this field is telemetry only.
         let mut vs = PbVideoStats::new();
         vs.fps_received = counters.video_packets as f64;
         vs.bitrate_kbps = counters.video_bytes * 8 / 1000; // bytes/s -> kbps
@@ -371,25 +388,54 @@ fn build_health_packet(
         // Audio concealment: bot has perfect playback (0% concealment)
         ps.audio_concealment_pct = 0.0;
 
-        // Quality scores
-        let audio_flowing = counters.audio_packets > 0;
+        // Quality scores.
+        //
+        // ⚠ #2206 CHANGED THIS TERM'S NUMERATOR AND IT FEEDS AN ALERT. `video_packets` is
+        // now the DECODED rung, not the ladder sum, so the old `fps / 30 * 100` curve —
+        // calibrated when a 3-rung ladder summed to ~52 and pinned this at 100 — reads
+        // 23.3 for a healthy rung-0 receiver (7 fps) and 50.0 for rung 1 (15 fps). That
+        // publishes < 50 onto `videocall_call_quality_score` → `MeetingQualityDegraded`
+        // (`avg by (meeting_id)(...) < 50`, for: 2m, no bot exclusion), i.e. a
+        // `--pin-layer 0` fleet run would alert continuously on a healthy meeting.
+        //
+        // So use the browser's SATURATING curve verbatim (#2190,
+        // `videocall-client/src/health_reporter.rs`): fps is hardware/rung context, not
+        // quality, above 5 — only near-frozen video is a defect. The browser also
+        // subtracts loss/keyframe penalties the bot cannot compute; omitting those
+        // strictly reduces divergence. Zero is OMITTED, not scored, matching the same
+        // function's `fps <= 0.0 => None`; the full alert note lives there.
+        //
+        // ⚠ THE COST OF THAT PARITY, larger here than in the browser: with `--pin-layer
+        // N`, a pinned rung that stops arriving holds fps at zero INDEFINITELY, not for
+        // one availability window, so a starved selected stream never pulls the call
+        // score down. It stays visible on `videocall_video_fps` (fed from `fps_received`
+        // below) and `can_see`, but not on the alert — remedy tracked as #2249. Scoring
+        // it low here would re-open the bot↔browser divergence this PR exists to close.
+        let audio_quality = (counters.audio_packets > 0).then_some(80.0_f64);
         let video_fps = counters.video_packets as f64;
-        let audio_score: f64 = if audio_flowing { 80.0 } else { 0.0 };
-        let video_score: f64 = (video_fps / 30.0 * 100.0).min(100.0);
-        let call_score: f64 = if audio_flowing {
-            audio_score.min(video_score)
-        } else {
-            video_score
+        let video_quality = (video_fps > 0.0).then(|| {
+            if video_fps >= 5.0 {
+                100.0
+            } else {
+                video_fps / 5.0 * 50.0
+            }
+        });
+        // Worst of whichever streams are active — same match arms as the browser's.
+        let call_score = match (audio_quality, video_quality) {
+            (Some(a), Some(v)) => Some(a.min(v)),
+            (Some(a), None) => Some(a),
+            (None, Some(v)) => Some(v),
+            (None, None) => None,
         };
 
-        if audio_flowing {
-            ps.audio_quality_score = Some(audio_score);
+        if let Some(a) = audio_quality {
+            ps.audio_quality_score = Some(a);
         }
-        if counters.video_packets > 0 {
-            ps.video_quality_score = Some(video_score);
+        if let Some(v) = video_quality {
+            ps.video_quality_score = Some(v);
         }
-        if audio_flowing || counters.video_packets > 0 {
-            ps.call_quality_score = Some(call_score);
+        if let Some(c) = call_score {
+            ps.call_quality_score = Some(c);
         }
 
         hp.peer_stats.insert(sender_id.clone(), ps);
@@ -405,4 +451,199 @@ fn build_health_packet(
     };
 
     Ok(wrapper.write_to_bytes()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_health_packet, peer_video_is_live, HealthReporterConfig};
+    use crate::aq_controller::BotAq;
+    use crate::config::{ClientConfig, Transport};
+    use crate::inbound_stats::SenderHealthCounters;
+    use protobuf::Message;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::Arc;
+    use videocall_aq::clock::{Clock, SystemClock};
+    use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+    /// The peer stats the REAL `build_health_packet` produces for one sender.
+    fn peer_stats_for(counters: SenderHealthCounters) -> super::PbPeerStats {
+        let config = HealthReporterConfig {
+            client_config: ClientConfig {
+                user_id: "bot".to_string(),
+                meeting_id: "room".to_string(),
+                enable_audio: true,
+                enable_video: true,
+            },
+            transport: Transport::WebSocket,
+            simulated_rtt_ms: None,
+            measured_rtt_ms: None,
+            packets_sent_counter: Arc::new(AtomicU64::new(0)),
+            transport_drops_counter: Arc::new(AtomicU64::new(0)),
+            encoder_output_fps: Arc::new(AtomicU32::new(0)),
+            encoder_errors_generic: Arc::new(AtomicU64::new(0)),
+            encoder_frames_ok: Arc::new(AtomicU64::new(0)),
+            keyframe_requests_sent: None,
+        };
+        let aq = BotAq::new(Arc::new(SystemClock) as Arc<dyn Clock>);
+        let mut senders = HashMap::new();
+        senders.insert("alice".to_string(), counters);
+
+        let bytes = build_health_packet(&config, &senders, 0, 0, &aq).expect("packet must build");
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).expect("wrapper must parse");
+        let hp = super::PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("health packet must parse");
+        hp.peer_stats.get("alice").expect("alice present").clone()
+    }
+
+    /// The state this PR creates: the shed top rung is still inside the availability
+    /// window, so the rung-filtered count is 0 while bytes keep arriving on base.
+    const POST_SHED: SenderHealthCounters = SenderHealthCounters {
+        audio_packets: 50,
+        video_packets: 0,
+        audio_bytes: 4000,
+        video_bytes: 2000,
+    };
+
+    #[test]
+    fn the_emitted_packet_keeps_can_see_true_through_a_ladder_shed() {
+        let ps = peer_stats_for(POST_SHED);
+        assert!(
+            ps.can_see,
+            "can_see must follow arrivals; the rung-filtered count blanks it for the \
+             whole availability window after a shed"
+        );
+    }
+
+    #[test]
+    fn a_shed_window_omits_the_video_score_instead_of_publishing_zero() {
+        // The alert-bearing gauge. `video_packets == 0` with bytes flowing must NOT
+        // become `Some(0.0)` on `videocall_call_quality_score` — it would satisfy
+        // `MeetingQualityDegraded` (< 50, for 2m) for a healthy stream, and it would
+        // diverge 80 points from the browser, which returns `None` here since #2190.
+        let ps = peer_stats_for(POST_SHED);
+        assert_eq!(
+            ps.video_quality_score, None,
+            "a window we cannot rate must be omitted, not scored 0"
+        );
+        assert_eq!(
+            ps.call_quality_score,
+            Some(80.0),
+            "call score must fall through to audio alone, matching the browser"
+        );
+    }
+
+    #[test]
+    fn a_healthy_low_rung_receiver_does_not_trip_the_quality_alert() {
+        // A healthy receiver on a low rung must not read as degraded: `video_packets` is
+        // the decoded rung, so a linear `fps / 30 * 100` scores rung 0 at 23.3 and rung 1
+        // at exactly 50.0 — at or under `MeetingQualityDegraded`'s `< 50`.
+        //
+        // The real ladder is 7 / 15 / 30 fps (videocall-aq SIMULCAST_VIDEO_LAYERS).
+        for (fps, rung) in [(7u64, "base"), (15, "middle"), (30, "top")] {
+            let ps = peer_stats_for(SenderHealthCounters {
+                audio_packets: 50,
+                video_packets: fps,
+                audio_bytes: 4000,
+                video_bytes: fps * 2000,
+            });
+            assert_eq!(
+                ps.video_quality_score,
+                Some(100.0),
+                "decoding the {rung} rung at {fps}fps is healthy, not degraded"
+            );
+            let call = ps.call_quality_score.expect("call score present");
+            assert!(
+                call >= 50.0,
+                "the {} rung must not trip MeetingQualityDegraded (< 50); got {}",
+                rung,
+                call
+            );
+        }
+    }
+
+    #[test]
+    fn near_frozen_video_still_scores_low() {
+        // The guard must not flatten everything to 100: 1-4 fps is the near-frozen band
+        // the browser's curve deliberately scores 10-40, and it SHOULD pull the alert.
+        let ps = peer_stats_for(SenderHealthCounters {
+            audio_packets: 50,
+            video_packets: 2,
+            audio_bytes: 4000,
+            video_bytes: 4000,
+        });
+        assert_eq!(ps.video_quality_score, Some(20.0));
+        assert_eq!(
+            ps.call_quality_score,
+            Some(20.0),
+            "near-frozen video must pull the call score below the alert threshold"
+        );
+    }
+
+    #[test]
+    fn pinned_rung_starvation_is_deliberately_off_the_quality_alert() {
+        // With `--pin-layer`, `video_packets == 0` while bytes flow is unbounded (the
+        // pinned rung may never return), and the score is still omitted rather than
+        // scored low. `fps_received` carries the starvation instead. Deliberate — see
+        // #2249 before changing this.
+        let ps = peer_stats_for(POST_SHED);
+        assert_eq!(ps.video_quality_score, None, "omitted, not scored low");
+        assert_eq!(
+            ps.video_stats.fps_received, 0.0,
+            "the starvation must remain observable on the fps gauge's source field"
+        );
+        assert!(ps.can_see, "and the peer is still visibly sending bytes");
+    }
+
+    #[test]
+    fn a_decoding_window_still_scores_video() {
+        // The guard must not swallow healthy windows: 30 fps decoded clamps to 100,
+        // and the call score is the worse of the two active streams (audio 80).
+        let ps = peer_stats_for(SenderHealthCounters {
+            audio_packets: 50,
+            video_packets: 30,
+            audio_bytes: 4000,
+            video_bytes: 60_000,
+        });
+        assert_eq!(ps.video_quality_score, Some(100.0));
+        assert_eq!(ps.call_quality_score, Some(80.0));
+    }
+
+    #[test]
+    fn a_video_only_peer_with_no_audio_still_scores_the_call() {
+        // `(None, Some(v))` arm — without it a video-only peer would publish no call
+        // score at all.
+        let ps = peer_stats_for(SenderHealthCounters {
+            audio_packets: 0,
+            video_packets: 15,
+            audio_bytes: 0,
+            video_bytes: 30_000,
+        });
+        assert_eq!(ps.audio_quality_score, None);
+        assert_eq!(ps.video_quality_score, Some(100.0));
+        assert_eq!(ps.call_quality_score, Some(100.0));
+    }
+
+    #[test]
+    fn video_liveness_reads_arrival_not_the_rung_filtered_count() {
+        // The post-shed window: bytes still arriving on the base rung, but
+        // `video_packets` is zero because the shed top rung is still inside the
+        // availability window. `can_see` must stay TRUE — a false negative here is
+        // exported as `videocall_peer_can_see` and panelled in Grafana, so it would
+        // read as "peer cannot see" while video flows.
+        let shed_window = SenderHealthCounters {
+            audio_packets: 0,
+            video_packets: 0,
+            audio_bytes: 0,
+            video_bytes: 2000,
+        };
+        assert!(
+            peer_video_is_live(&shed_window),
+            "liveness must follow arrivals; reading the rung-filtered count blanks \
+             can_see for the whole availability window after a ladder shed"
+        );
+
+        // Genuinely nothing arriving.
+        assert!(!peer_video_is_live(&SenderHealthCounters::default()));
+    }
 }

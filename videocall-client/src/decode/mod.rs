@@ -73,6 +73,28 @@ pub trait AudioPeerDecoderTrait {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
     fn flush(&mut self);
     fn set_muted(&mut self, muted: bool);
+
+    /// Called immediately before this decoder is dropped in favour of a freshly
+    /// built one covering the **same peer** (`Peer::reset_for_decode_error`
+    /// after an AUDIO decode error), as opposed to the peer genuinely going
+    /// away.
+    ///
+    /// Issue 2174 follow-up: a decoder that owns a speaking indicator announces
+    /// `speaking: 0` from its `Drop` so a glow left lit by the edge-triggered
+    /// VAD is cleared when the worker dies. `Drop` cannot tell teardown from
+    /// replacement, so without this hook rebuilding the decoder would blank the
+    /// speaking indicator of a peer that is still mid-sentence — and repeated
+    /// rebuilds would turn that into a blinking glow. Implementations must make
+    /// the subsequent `Drop` silent.
+    ///
+    /// Issue 2225 narrowed *when* a replacement happens — a VIDEO or SCREEN
+    /// decode error no longer rebuilds the audio decoder at all — but did not
+    /// remove the case: an AUDIO decode error still replaces it mid-episode, so
+    /// this hook is still load-bearing.
+    ///
+    /// The default is a no-op: a decoder with no speaking indicator (see
+    /// [`StandardAudioPeerDecoder`]) has nothing to retire.
+    fn retire_for_replacement(&mut self) {}
 }
 
 // Implement trait for standard audio peer decoder

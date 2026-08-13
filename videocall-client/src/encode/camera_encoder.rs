@@ -239,13 +239,33 @@ struct SharedQualityBounds {
 /// call time, so the UI never needs to index `VIDEO_QUALITY_TIERS` /
 /// `AUDIO_QUALITY_TIERS` itself (avoiding out-of-bounds risk). Tier indices are
 /// included so the UI can also render the index↔quality relationship.
+///
+/// **`video_width`/`video_height` are a MEASUREMENT; every other field is a TIER
+/// TARGET** (issue #2170). The dims carry the geometry the encode loop last
+/// requested for its top active layer, with `(0, 0)` as the NOT-YET-PUBLISHED
+/// sentinel. `video_fps`/`video_ideal_kbps` remain AQ tier ideals and stay
+/// meaningful with no frame published. Do not read the two kinds of field as
+/// having the same provenance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LiveQualitySnapshot {
     /// Current video tier index (0 = best / 1080p, 7 = worst / 240p).
     pub video_tier_index: usize,
-    /// Current video tier max width (px).
+    /// Encode width (px) of the top ACTIVE layer — the geometry the encode loop
+    /// last REQUESTED, not the AQ tier's bounding box (issue #2170).
+    ///
+    /// `0` is the NOT-YET-PUBLISHED sentinel: before the first frame, and after
+    /// [`CameraEncoder::stop`]. Consumers must render it as unknown rather than as
+    /// `0x0` — see `format_video_readout`, which emits an em-dash.
+    ///
+    /// **"last REQUESTED", not "is encoding at".** On the single-stream path the
+    /// encoder can revert to its build-time native geometry behind this value,
+    /// because that path reconfigures without storing the new `VideoEncoderConfig`
+    /// (issue #2176, pre-existing and not fixed here). The value is still strictly
+    /// better than the tier box it replaces — a box the encoder never encoded at in
+    /// any state — but it is not a guarantee about the live encoder.
     pub video_width: u32,
-    /// Current video tier max height (px).
+    /// Encode height (px) of the top ACTIVE layer. Same sentinel and the same
+    /// last-REQUESTED caveat as [`Self::video_width`].
     pub video_height: u32,
     /// Current video tier target fps.
     pub video_fps: u32,
@@ -258,6 +278,365 @@ pub struct LiveQualitySnapshot {
     /// Live PID target bitrate (kbps) the encoder is actually aiming at — the
     /// real-time "needle" value for the VU meter (distinct from the tier ideal).
     pub target_bitrate_kbps: f32,
+}
+
+/// Pack a fitted `(width, height)` pair into one `u32` for the shared per-layer
+/// dimension slots (issue #2170).
+///
+/// A SINGLE atomic per layer rather than two, so width and height are always read
+/// as a coherent PAIR: two separate atomics could tear across an encoder
+/// reconfigure, letting a reader observe a width from the new geometry with a
+/// height from the old (e.g. `640×720`), a resolution that never existed.
+///
+/// To be precise about the guarantee, since it is easy to over-claim: that tear is
+/// NOT reachable in this runtime. `wasm32-unknown-unknown` has no shared-memory
+/// threads, and every reader borrows the cell and releases it synchronously inside
+/// a single JS task, so no reader can interleave between two adjacent stores.
+/// Packing is free and keeps the invariant true by construction if this ever runs
+/// under wasm threads — it is not fixing an observed tear today.
+///
+/// Both axes are clamped to `u16::MAX`, which no real capture or tier approaches
+/// (the largest shipped tier is 1920×1080), so the clamp is a
+/// never-emit-a-corrupt-value guard rather than a functional limit.
+pub(crate) fn pack_layer_dims(width: u32, height: u32) -> u32 {
+    (width.min(u16::MAX as u32) << 16) | height.min(u16::MAX as u32)
+}
+
+/// Inverse of [`pack_layer_dims`]. `0` unpacks to `(0, 0)`, which callers treat as
+/// "the encode loop has not published dims for this layer yet".
+pub(crate) fn unpack_layer_dims(packed: u32) -> (u32, u32) {
+    (packed >> 16, packed & 0xFFFF)
+}
+
+/// May THIS encode-loop generation write the SHARED per-layer geometry (issue
+/// #2170)?
+///
+/// `true` only for the current generation. Two writers ask this — the publish
+/// inside [`LayerEncoder::set_encode_dims`] and the `'restart`-head
+/// [`clear_layer_dims`] — and both must answer it the same way, so the comparison
+/// lives here rather than being spelled out twice.
+///
+/// # Why this is NOT [`loop_is_superseded`]
+///
+/// That predicate ORs in `!enabled`, which is right for "should I stop looping?"
+/// and WRONG here: a still-current but disabled loop legitimately clears its own
+/// geometry (that is `stop()`'s contract). The only question this asks is
+/// ownership: is the shared state mine to write?
+///
+/// # What a host test on this DOES and does NOT buy
+///
+/// It pins the DECISION. It does not pin the two CALL SITES, which need a real
+/// `VideoEncoder` (or a live frame read) to reach — deleting either fence leaves
+/// the host suite green. Extraction makes the rule legible and testable; it is not
+/// call-site coverage. See the disclosure at `shared_layer_dims`' clone in
+/// [`CameraEncoder::start`].
+pub(crate) fn loop_owns_shared_geometry(loop_epoch: u64, my_epoch: u64) -> bool {
+    loop_epoch == my_epoch
+}
+
+/// May this generation PUBLISH geometry right now (issue #2170)?
+///
+/// Strictly stronger than [`loop_owns_shared_geometry`]: a publish additionally
+/// requires the encoder to still be ENABLED. The two differ because the two writers
+/// answer different questions.
+///
+/// # Why the epoch alone is not enough for a publish
+///
+/// `CameraEncoder::stop()` clears the slots and sets `enabled = false`, but it does
+/// **not** bump `loop_epoch` — `EncoderState::stop` only touches `enabled` and
+/// `switching`. So a loop of the CURRENT generation that is parked in an await keeps
+/// `loop_epoch == my_epoch` across a `stop()`. The acquire-phase
+/// `loop_is_superseded` check does read `enabled`, but it runs BEFORE
+/// `video_element.play().await` (and its 200 ms autoplay-retry sleep), with no
+/// re-check between there and `build_layer`'s publish. A `stop()` inside that window
+/// would therefore clear, and then the parked loop would publish non-zero dims over
+/// the `(0, 0)` sentinel — leaving a stopped camera reporting a live resolution.
+/// Unrepairable, like every other stale-write on this channel: nothing republishes,
+/// because every other writer is gated on a dimension CHANGE that a clear does not
+/// move.
+///
+/// # Why the CLEAR must NOT require `enabled`
+///
+/// The `'restart`-head clear deliberately uses the epoch-only predicate: a
+/// still-current loop that has just been DISABLED *should* clear its geometry — that
+/// is exactly `stop()`'s contract. Requiring `enabled` there would skip the clear
+/// that makes a stopped camera read as unknown. Publishes tighten, clears do not.
+pub(crate) fn loop_may_publish_geometry(enabled: bool, loop_epoch: u64, my_epoch: u64) -> bool {
+    enabled && loop_owns_shared_geometry(loop_epoch, my_epoch)
+}
+
+/// Publish one layer's fitted dims into the shared per-layer slots (issue #2170).
+///
+/// Split out of [`LayerEncoder::set_encode_dims`] so the WRITE ITSELF is testable
+/// off-browser. It was not, and that mattered: deleting this entire body left the
+/// whole suite green, because every seeding helper writes the vec directly and
+/// bypasses the writer.
+///
+/// **Scope of that coverage, stated precisely — extraction is NOT call-site
+/// coverage.** The host tests pin this FUNCTION. They do NOT pin the
+/// `publish_layer_dims(...)` CALL inside [`LayerEncoder::set_encode_dims`]:
+/// deleting that call leaves the host suite green, because `LayerEncoder` owns a
+/// real `VideoEncoder` and cannot be constructed off-browser. See
+/// [`CameraEncoder::start`]'s `shared_layer_dims` handling for the full list of
+/// browser-only call sites and how they are covered.
+///
+/// Self-sizing rather than pre-sized at ladder build, so the vec cannot fall out of
+/// sync with a ladder whose depth changed on a camera restart, and there is no
+/// second site to keep in step. `try_borrow_mut` (not `borrow_mut`) because the
+/// encode loop and the snapshot readers both touch this cell and a diagnostics
+/// publish must never panic a live encode on a transient conflict.
+///
+/// On the skip path the update is LOST, not deferred: there is no periodic
+/// re-publish, and every writer is gated on a dimension CHANGE, so for a steady
+/// camera the next publish may never come. That is acceptable only because the skip
+/// is unreachable in this runtime — `wasm32-unknown-unknown` has no shared-memory
+/// threads and every reader borrows and releases synchronously within one JS task,
+/// so no reader holds this borrow across a yield. `try_borrow_mut` is defence for a
+/// future where that stops being true, not a recovery mechanism.
+pub(crate) fn publish_layer_dims(
+    shared_layer_dims: &RefCell<Vec<Rc<AtomicU32>>>,
+    layer_id: u32,
+    width: u32,
+    height: u32,
+) {
+    if let Ok(mut dims) = shared_layer_dims.try_borrow_mut() {
+        if dims.len() <= layer_id as usize {
+            dims.resize_with(layer_id as usize + 1, || Rc::new(AtomicU32::new(0)));
+        }
+        dims[layer_id as usize].store(pack_layer_dims(width, height), Ordering::Relaxed);
+    }
+}
+
+/// Zero every published per-layer dim slot (issue #2170).
+///
+/// `0` is the "not yet published" sentinel every reader keys off, so clearing is
+/// how a publisher says "I am not encoding anything right now" — as opposed to
+/// leaving the last-known geometry standing, which reads downstream as a live
+/// encoder. Mirrors the `reset_output_fps` convention already applied to the fps
+/// diagnostic on [`CameraEncoder::stop`].
+pub(crate) fn clear_layer_dims(shared_layer_dims: &RefCell<Vec<Rc<AtomicU32>>>) {
+    // `try_borrow` for the same reason as the publish path: a diagnostics reset
+    // must never panic a live encode on a transient borrow conflict.
+    if let Ok(dims) = shared_layer_dims.try_borrow() {
+        for slot in dims.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Clear ONE layer's published geometry — the shed-teardown counterpart to
+/// [`clear_layer_dims`].
+///
+/// Used when the AQ's dwell timer expires and a shed rung's encoder is actually
+/// closed and freed: that rung is emitting nothing, so leaving its last-known dims
+/// standing makes the consumer report a live encoder that no longer exists.
+///
+/// A no-op for an out-of-range `layer_id`, and (like every other writer here) a
+/// no-op on a borrow conflict — a diagnostics reset must never panic a live encode.
+///
+/// Extracted rather than left inline for the same reason as [`publish_layer_dims`],
+/// and with the same limit: extraction makes the HELPER host-testable, it does NOT
+/// cover the CALL in the shed-teardown loop, which needs a real `VideoEncoder` to
+/// reach.
+pub(crate) fn clear_layer_dim(shared_layer_dims: &RefCell<Vec<Rc<AtomicU32>>>, layer_id: usize) {
+    if let Ok(dims) = shared_layer_dims.try_borrow() {
+        if let Some(slot) = dims.get(layer_id) {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// One reportable camera rung's live fitted geometry and measured output rate.
+pub(crate) type CameraLayerMetric = (u32, u32, u32, Option<u32>);
+
+/// Opaque live source for publisher-side per-layer camera metrics (issue #2170).
+///
+/// Every read applies two independent filters. The active-count bound excludes a
+/// built-then-shed rung whose published dims remain nonzero until dwell teardown;
+/// the nonzero-dims filter excludes a not-yet-built rung inside that active range.
+/// The `.min(dims.len())` guard is load-bearing because the active count can rise
+/// before `build_layer` grows the vec.
+///
+/// `try_borrow` is deliberate. A health report must skip one tick instead of
+/// panicking the UI if it contends with the encode loop. FPS is absent until its
+/// first measurement window closes. Unlike geometry it is not republished on an
+/// OFF-to-ON transition; it re-warms from fresh output within about one second.
+#[derive(Clone, Debug)]
+pub struct CameraLayerMetricSource {
+    dims: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+    output_fps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+    output_fps_ready: Rc<RefCell<Vec<Rc<AtomicBool>>>>,
+    last_chunk_ms: Rc<RefCell<Vec<Rc<AtomicU64>>>>,
+    active_layer_count: Rc<AtomicU32>,
+}
+
+impl Default for CameraLayerMetricSource {
+    fn default() -> Self {
+        Self {
+            dims: Rc::new(RefCell::new(Vec::new())),
+            output_fps: Rc::new(RefCell::new(Vec::new())),
+            output_fps_ready: Rc::new(RefCell::new(Vec::new())),
+            last_chunk_ms: Rc::new(RefCell::new(Vec::new())),
+            active_layer_count: Rc::new(AtomicU32::new(0)),
+        }
+    }
+}
+
+impl CameraLayerMetricSource {
+    fn reportable_layers_at(&self, now_ms: f64) -> Vec<CameraLayerMetric> {
+        let Ok(dims) = self.dims.try_borrow() else {
+            return Vec::new();
+        };
+        let Ok(output_fps) = self.output_fps.try_borrow() else {
+            return Vec::new();
+        };
+        let Ok(output_fps_ready) = self.output_fps_ready.try_borrow() else {
+            return Vec::new();
+        };
+        let Ok(last_chunk_ms) = self.last_chunk_ms.try_borrow() else {
+            return Vec::new();
+        };
+
+        let active = self.active_layer_count.load(Ordering::Relaxed).max(1) as usize;
+        let upto = active.min(dims.len());
+        dims[..upto]
+            .iter()
+            .enumerate()
+            .filter_map(|(layer_id, packed)| {
+                let (width, height) = unpack_layer_dims(packed.load(Ordering::Relaxed));
+                if width == 0 || height == 0 {
+                    return None;
+                }
+
+                let fps = output_fps_ready
+                    .get(layer_id)
+                    .filter(|ready| ready.load(Ordering::Relaxed))
+                    .and_then(|_| output_fps.get(layer_id).zip(last_chunk_ms.get(layer_id)))
+                    .map(|(fps, last_chunk)| {
+                        if crate::encode::fps_after_idle_decay(
+                            fps.load(Ordering::Relaxed),
+                            now_ms,
+                            last_chunk.load(Ordering::Relaxed) as f64,
+                            crate::adaptive_quality_constants::ENCODER_FPS_IDLE_DECAY_MS,
+                        )
+                        .is_some()
+                        {
+                            0
+                        } else {
+                            fps.load(Ordering::Relaxed)
+                        }
+                    });
+                Some((layer_id as u32, width, height, fps))
+            })
+            .collect()
+    }
+
+    pub(crate) fn reportable_layers(&self) -> Vec<CameraLayerMetric> {
+        let Some(performance) = window().performance() else {
+            return Vec::new();
+        };
+        self.reportable_layers_at(performance.now())
+    }
+}
+
+fn layer_output_metric_slots(
+    output_fps: &RefCell<Vec<Rc<AtomicU32>>>,
+    output_fps_ready: &RefCell<Vec<Rc<AtomicBool>>>,
+    last_chunk_ms: &RefCell<Vec<Rc<AtomicU64>>>,
+    layer_id: usize,
+) -> Option<(Rc<AtomicU32>, Rc<AtomicBool>, Rc<AtomicU64>)> {
+    let mut fps = output_fps.try_borrow_mut().ok()?;
+    let mut ready = output_fps_ready.try_borrow_mut().ok()?;
+    let mut last_chunk = last_chunk_ms.try_borrow_mut().ok()?;
+    fps.resize_with(layer_id + 1, || Rc::new(AtomicU32::new(0)));
+    ready.resize_with(layer_id + 1, || Rc::new(AtomicBool::new(false)));
+    last_chunk.resize_with(layer_id + 1, || Rc::new(AtomicU64::new(0)));
+    Some((
+        fps[layer_id].clone(),
+        ready[layer_id].clone(),
+        last_chunk[layer_id].clone(),
+    ))
+}
+
+/// Normalize a chunk count into fps over the window it was actually measured across
+/// (issue #2170).
+///
+/// The window closes on the first chunk at or after 1000 ms and can be FAR longer (a
+/// stall, a backgrounded tab), so the raw count over-reports by `elapsed / 1000`.
+/// Rounds to nearest so a steady 30 fps still reads 30, not 29.
+pub(crate) fn normalize_window_fps(chunks: u32, elapsed_ms: f64) -> u32 {
+    if elapsed_ms <= 0.0 {
+        return chunks;
+    }
+    (f64::from(chunks) * 1000.0 / elapsed_ms).round() as u32
+}
+
+/// Publish one layer's measured rate, and — layer 0 ONLY — the AQ `current_fps`
+/// setpoint.
+///
+/// `measured_fps` (normalized) is exported; `raw_window_count` goes to `current_fps`
+/// deliberately, because that is a CONTROL input and issue #2170 is observability-only.
+/// Its raw-count over-report after a stall is pre-existing and stays untouched.
+fn publish_layer_output_fps(
+    layer_id: u32,
+    measured_fps: u32,
+    raw_window_count: u32,
+    layer_fps: &AtomicU32,
+    layer_fps_ready: &AtomicBool,
+    current_fps: &AtomicU32,
+) {
+    layer_fps.store(measured_fps, Ordering::Relaxed);
+    layer_fps_ready.store(true, Ordering::Relaxed);
+    if layer_id == 0 {
+        current_fps.store(raw_window_count, Ordering::Relaxed);
+    }
+}
+
+fn clear_layer_output_metrics(
+    output_fps: &RefCell<Vec<Rc<AtomicU32>>>,
+    output_fps_ready: &RefCell<Vec<Rc<AtomicBool>>>,
+    last_chunk_ms: &RefCell<Vec<Rc<AtomicU64>>>,
+) {
+    let (Ok(fps), Ok(ready), Ok(last_chunk)) = (
+        output_fps.try_borrow(),
+        output_fps_ready.try_borrow(),
+        last_chunk_ms.try_borrow(),
+    ) else {
+        return;
+    };
+    for slot in fps.iter() {
+        slot.store(0, Ordering::Relaxed);
+    }
+    for slot in ready.iter() {
+        slot.store(false, Ordering::Relaxed);
+    }
+    for slot in last_chunk.iter() {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
+fn clear_layer_output_metric(
+    output_fps: &RefCell<Vec<Rc<AtomicU32>>>,
+    output_fps_ready: &RefCell<Vec<Rc<AtomicBool>>>,
+    last_chunk_ms: &RefCell<Vec<Rc<AtomicU64>>>,
+    layer_id: usize,
+) {
+    let (Ok(fps), Ok(ready), Ok(last_chunk)) = (
+        output_fps.try_borrow(),
+        output_fps_ready.try_borrow(),
+        last_chunk_ms.try_borrow(),
+    ) else {
+        return;
+    };
+    if let Some(slot) = fps.get(layer_id) {
+        slot.store(0, Ordering::Relaxed);
+    }
+    if let Some(slot) = ready.get(layer_id) {
+        slot.store(false, Ordering::Relaxed);
+    }
+    if let Some(slot) = last_chunk.get(layer_id) {
+        slot.store(0, Ordering::Relaxed);
+    }
 }
 
 /// One active simulcast layer's live diagnostics: its layer id, the bitrate the
@@ -452,6 +831,81 @@ struct LayerEncoder {
     _error_closure: Closure<dyn FnMut(JsValue)>,
 }
 
+impl LayerEncoder {
+    /// THE chokepoint for this layer's fitted encode dimensions (issue #2170).
+    ///
+    /// Sets `current_w`/`current_h` **and** publishes the pair into
+    /// `shared_layer_dims`, so the out-of-loop consumer — the self-view readout —
+    /// sees the geometry the loop requested rather than re-deriving the AQ tier's
+    /// bounding box from the tables.
+    ///
+    /// # Why a method rather than four assignments
+    ///
+    /// `current_w`/`current_h` change at four distinct sites — initial build, tier
+    /// dimension change, per-frame simulcast re-fit, and single-stream re-fit. Any
+    /// site that assigns the fields directly without publishing leaves the shared
+    /// dims STALE, which is silent: the readout keeps rendering the previous
+    /// geometry and no test fails. Routing every mutation through one method makes
+    /// that drift require deliberately bypassing this function, and gives a single
+    /// place to audit. **A new assignment site must call this, not assign.**
+    ///
+    /// The publish itself lives in [`publish_layer_dims`] so it can be tested
+    /// without a browser. It GROWS the vec on demand, so there is no out-of-range
+    /// case to guard; the only skip path is a failed `try_borrow_mut`.
+    ///
+    /// This publishes what the loop is ABOUT TO REQUEST, not what `configure()`
+    /// accepted — the three reconfigure sites build their config from the fields
+    /// this sets, so the publish necessarily precedes the `configure()` call. See
+    /// issue #2177 for the refusal path, deliberately out of scope here.
+    ///
+    /// # The publish is EPOCH-FENCED; `current_w`/`current_h` are not
+    ///
+    /// `current_w`/`current_h` are this loop's OWN state and are always updated —
+    /// a superseded loop's encoder really is at that geometry until it exits, and
+    /// its change gates must keep working.
+    ///
+    /// The PUBLISH is different: it writes into state SHARED with whatever loop is
+    /// current, so a stale loop must not touch it. Fencing it is not theoretical
+    /// (issue #2170 review, found independently twice). The acquire-phase
+    /// `loop_is_superseded` check does NOT make this safe, because there are awaits
+    /// between it and the first publish — `video_element.play().await`, plus a 200 ms
+    /// sleep and a second await on the autoplay-retry path — and further awaits
+    /// (`video_reader.read().await`) before every per-frame publish. So: loop A
+    /// passes its supersede check, parks in one of those awaits, the epoch is bumped,
+    /// loop B completes and publishes, then A resumes and would overwrite B's slots
+    /// with A's geometry.
+    ///
+    /// That corruption is UNREPAIRABLE without this fence, which is why it is a fence
+    /// and not a nicety: A then exits at its next epoch check WITHOUT clearing (the
+    /// `'restart`-head clear is itself epoch-guarded, so A skips it), and every other
+    /// writer is gated on a change that A's write does not move — so the readout
+    /// would report A's dead geometry for the rest of the session behind a healthy
+    /// encoder B.
+    fn set_encode_dims(
+        &mut self,
+        width: u32,
+        height: u32,
+        shared_layer_dims: &RefCell<Vec<Rc<AtomicU32>>>,
+        enabled: &AtomicBool,
+        loop_epoch: &AtomicU64,
+        my_epoch: u64,
+    ) {
+        self.current_w = width;
+        self.current_h = height;
+        // Same ordering and convention as the `'restart`-head clear and the
+        // canary/bound-id clears at both supersede sites. `enabled` is read here too
+        // — see `loop_may_publish_geometry` for why a publish needs it and the clear
+        // must not.
+        if loop_may_publish_geometry(
+            enabled.load(Ordering::Acquire),
+            loop_epoch.load(Ordering::Acquire),
+            my_epoch,
+        ) {
+            publish_layer_dims(shared_layer_dims, self.layer_id, width, height);
+        }
+    }
+}
+
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
 /// To use this struct, the caller must first create an `HtmlVideoElement` DOM node, to which the
@@ -637,6 +1091,70 @@ pub struct CameraEncoder {
     /// in single-stream mode (the legacy `current_bitrate` atomic is used
     /// instead). Sized to `SIMULCAST_MAX_SUPPORTED_LAYERS` lazily on first use.
     shared_layer_bitrates_bps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+    /// Per-layer fitted encode dimensions, packed `(w << 16) | h` by
+    /// [`pack_layer_dims`], one atomic per layer (lowest first, index ==
+    /// `layer_id`). Issue #2170.
+    ///
+    /// Written by the encode loop through [`LayerEncoder::set_encode_dims`] — the
+    /// single chokepoint for `current_w`/`current_h` — and read by
+    /// [`CameraEncoder::top_published_layer_dims`], whose only consumer today is
+    /// [`CameraEncoder::live_quality_snapshot`] (the self-view readout).
+    ///
+    /// **Why this exists:** before #2170 the fitted dims lived ONLY inside the
+    /// encode loop's `LayerEncoder`, so the self-view readout re-derived geometry
+    /// from the AQ tier table and reported that tier's bounding box instead of what
+    /// the loop had configured. A rung/tier's `max_width`/`max_height` is a BOUNDING
+    /// BOX: `fit_within_preserving_aspect` never upscales, so a 4:3 640×480 webcam
+    /// on tier `medium` encodes 640×480 while the table says 854×480. This is the
+    /// publication point that gives the readout the real value.
+    ///
+    /// Unlike `shared_layer_bitrates_bps` this is sized for SINGLE-STREAM mode too
+    /// (one entry), because the self-view resolution readout needs fitted dims in
+    /// both modes. `0` means "not yet published"; consumers must render it as
+    /// unknown rather than as `0x0`.
+    ///
+    /// NOTE the asymmetry with the sibling atomics: the per-generation reset at the
+    /// `'restart` loop head clears THIS vec but not `shared_layer_bitrates_bps` or
+    /// `shared_active_layer_count`, which the AQ control loop owns. So during a codec
+    /// rebuild (backoff + re-acquire, ~0.5-3s) the readout reads unknown while the
+    /// AQ's tier targets still render. Deliberate: the AQ's intent (how many rungs it
+    /// wants active, at what bitrate) genuinely survives a codec restart, whereas the
+    /// geometry does not exist until the new generation publishes it.
+    ///
+    /// **`live_simulcast_snapshot` deliberately does NOT read this** — the
+    /// diagnostics ladder still resolves rung bounding boxes from the ladder table,
+    /// the same defect one surface over. Routing it here needs the sentinel rendered
+    /// in the drawer (em-dash copy, a11y labels, shed-rung CSS) and is issue #2170's
+    /// second half, not a loose end of this change.
+    shared_layer_dims: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+    /// Measured output fps per camera rung. These observability-only atomics are
+    /// written by each layer's output callback and are never read by AQ control.
+    shared_layer_output_fps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+    /// Presence companion for `shared_layer_output_fps`: false until the first
+    /// measurement window closes, then true even when an idle decay reports 0.
+    shared_layer_output_fps_ready: Rc<RefCell<Vec<Rc<AtomicBool>>>>,
+    /// Last output-chunk time per rung, used only by the reporter to turn a stale
+    /// measured rate into a present 0 without touching the AQ setpoint.
+    shared_layer_last_chunk_ms: Rc<RefCell<Vec<Rc<AtomicU64>>>>,
+    /// Monotonic count of whole-vec geometry CLEARS (issue #2170).
+    ///
+    /// Bumped by every `clear_layer_dims` caller that is NOT itself about to
+    /// republish — today that is `CameraEncoder::stop()`. The encode loop compares
+    /// the value it last saw against the live one each frame and republishes its
+    /// layers' geometry when they differ.
+    ///
+    /// # Why a COUNTER and not an enabled-edge
+    ///
+    /// The hazard this exists for is a camera OFF→ON pair that happens entirely
+    /// while the loop is parked in `video_reader.read().await` (OS camera shutter,
+    /// another app holding the device). A tick-observed `enabled` edge CANNOT see
+    /// that: the loop never samples the disabled state, so on resume it reads
+    /// `(prev = true, now = true)`, no edge fires — while `start()`'s same-device
+    /// guard has already early-returned, so no new generation republishes either. A
+    /// counter is edge-independent: the clear is recorded whether or not any frame
+    /// boundary observed it. (An earlier fix here used the edge and missed exactly
+    /// the scenario it was written for.)
+    shared_layer_dims_cleared: Rc<AtomicU64>,
     /// Sender-side encoder backpressure (issue #1108, Phase B): the max
     /// `VideoEncoder::encode_queue_size()` across the ACTIVE layers, written by
     /// the encode loop each frame and read by the AQ control loop to feed
@@ -1290,6 +1808,36 @@ fn camera_wt_stale_drop_step_down_decision(
     )
 }
 
+/// Should the encode loop REPUBLISH its layers' geometry on this frame (issue
+/// #2170)?
+///
+/// `true` when a whole-vec CLEAR has happened that this loop has not yet reconciled
+/// AND the encoder is enabled. Extracted as a pure fn so the decision is
+/// host-testable, mirroring [`video_at_floor_on_tick`]'s shape — the encode loop's
+/// own republish call site needs a live `VideoEncoder` and stays browser-only
+/// (disclosed with the other unguarded sites).
+///
+/// # Why a clear GENERATION and not an `enabled` edge
+///
+/// The first cut of this compared `prev_enabled`/`now_enabled` per frame and missed
+/// the case it existed for: the hazard is a camera OFF→ON pair that completes while
+/// the loop is parked in `video_reader.read().await`, so the loop never samples the
+/// disabled state and on resume sees `(true, true)` — no edge fires, while
+/// `start()`'s same-device guard has already early-returned. Comparing counters is
+/// edge-independent: `stop()` records its clear whether or not a frame boundary
+/// observed it.
+///
+/// # Why gated on `enabled`, and why "publish whenever cleared" is wrong
+///
+/// A clear observed while STOPPED must not be undone — that sentinel is `stop()`'s
+/// contract. And republishing unconditionally every frame would defeat the
+/// change-gating that keeps this channel cheap (the design publishes only on a
+/// dimension CHANGE); the caller advances its seen-generation only after a republish,
+/// so a clear seen while disabled is repaired on the next enabled frame instead.
+fn republish_geometry_on_tick(seen_cleared: u64, live_cleared: u64, enabled: bool) -> bool {
+    live_cleared != seen_cleared && enabled
+}
+
 /// Compute the camera's `video_at_floor` flag value for one AQ tick.
 ///
 /// On the camera-ENABLE rising edge (`!prev_enabled && now_enabled`) this force-
@@ -1460,6 +2008,15 @@ impl CameraEncoder {
             // runtime ramp not-yet-earned + AQ shed).
             shared_effective_layer_count: Rc::new(AtomicU32::new(clamp_layer_count(max_layers))),
             shared_layer_bitrates_bps: Rc::new(RefCell::new(Vec::new())),
+            // Fitted per-layer encode dims (issue #2170). Empty until the encode
+            // loop sizes and publishes; the readout reads unknown while it is.
+            shared_layer_dims: Rc::new(RefCell::new(Vec::new())),
+            shared_layer_output_fps: Rc::new(RefCell::new(Vec::new())),
+            shared_layer_output_fps_ready: Rc::new(RefCell::new(Vec::new())),
+            shared_layer_last_chunk_ms: Rc::new(RefCell::new(Vec::new())),
+            // Geometry clear-generation (issue #2170). Starts at 0; the encode loop
+            // seeds its local copy from this at spawn.
+            shared_layer_dims_cleared: Rc::new(AtomicU64::new(0)),
             // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
             // (no frames queued); the encode loop publishes the live depth.
             shared_encoder_queue_depth: Rc::new(AtomicU32::new(0)),
@@ -2257,6 +2814,10 @@ impl CameraEncoder {
     /// video resolution / fps / ideal-kbps, audio kbps, and the live PID target
     /// bitrate. Indices are clamped to valid table bounds, so this never panics
     /// even mid-transition. Call it on the UI's render/poll tick.
+    ///
+    /// Since #2170 the RESOLUTION is not resolved from the tier table — see the
+    /// `video_width` comment inside, and [`LiveQualitySnapshot::video_width`] for
+    /// the field contract.
     pub fn live_quality_snapshot(&self) -> LiveQualitySnapshot {
         let v_idx = (self.shared_video_tier_index.load(Ordering::Relaxed) as usize)
             .min(VIDEO_QUALITY_TIERS.len().saturating_sub(1));
@@ -2268,16 +2829,87 @@ impl CameraEncoder {
             self.shared_encoder_target_bitrate_kbps
                 .load(Ordering::Relaxed),
         );
+        // Issue #2170: report the geometry the encode loop REQUESTED, not the AQ
+        // tier's bounding box.
+        //
+        // `VIDEO_QUALITY_TIERS[v_idx]` is a ceiling the capture is fitted inside
+        // (never upscaled), so on a 4:3 640×480 webcam this read `854x480` for tier
+        // `medium` while every layer encoded 640×480 or below — a resolution the user
+        // was never sending. The self-view readout is exactly the surface someone
+        // checks to answer "what am I publishing right now", so it must carry the
+        // fitted value.
+        //
+        // The TOP ACTIVE layer is the right one to show: it is the best stream any
+        // receiver can pull, and in single-stream mode it is the only one.
+        //
+        // Reports the `(0, 0)` NOT-YET-PUBLISHED sentinel — not the tier box — when
+        // nothing has published. Substituting the box here would be the same
+        // defect one state over: it renders a ceiling in a format that means
+        // "measured", and it is unfalsifiable because a tier box is never 0. Two
+        // consequences of that substitution, both real: `host.rs`'s
+        // `self_metrics_overlay` gates its resolution on
+        // `video_width > 0 && video_height > 0`, so the self tile could NEVER show
+        // "unknown"; and after `stop()` clears the atomics the readout would
+        // silently revert to the box for a camera that is off. The consumer decides
+        // how to present the sentinel — see `format_video_readout`, which renders an
+        // em-dash.
+        let (fitted_w, fitted_h) = self.top_published_layer_dims().unwrap_or((0, 0));
         LiveQualitySnapshot {
             video_tier_index: v_idx,
-            video_width: v.max_width,
-            video_height: v.max_height,
+            video_width: fitted_w,
+            video_height: fitted_h,
             video_fps: v.target_fps,
             video_ideal_kbps: v.ideal_bitrate_kbps,
             audio_tier_index: a_idx,
             audio_kbps: a.bitrate_kbps,
             target_bitrate_kbps,
         }
+    }
+
+    /// The fitted dims of the highest ACTIVE layer that has published geometry, or
+    /// `None` if none has (issue #2170).
+    ///
+    /// Two separate mechanisms, easy to conflate:
+    /// - The `[..active]` bound EXCLUDES shed rungs. A built-then-shed rung keeps
+    ///   NON-zero published dims (only `clear_layer_dim` at dwell-teardown zeroes
+    ///   it), so it would otherwise be reported as what this publisher is sending
+    ///   when the AQ has stopped sending it — the over-report this bound exists to
+    ///   prevent.
+    /// - The downward scan then skips rungs with no published dims at all, so a
+    ///   not-yet-built rung inside the active range still yields the best live
+    ///   geometry rather than `None`.
+    ///
+    /// The bound handles shed rungs; the scan handles unbuilt ones. Neither
+    /// substitutes for the other.
+    pub(crate) fn top_published_layer_dims(&self) -> Option<(u32, u32)> {
+        // `.max(1)` is DEFENSIVE, not load-bearing: a count of 0 is unreachable in
+        // production. `CameraEncoder::new` seeds this to `initial_active_layer_count()
+        // == 1`, and the only runtime writer is the AQ loop, whose source
+        // `AdaptiveQualityManager::active_layer_count` is floored at 1
+        // (`drop_top_layer` returns early at `<= 1`). Only a test can seed 0. Kept so
+        // a future writer that does not floor cannot silently blank the readout.
+        let active = self
+            .shared_active_layer_count
+            .load(Ordering::Relaxed)
+            .max(1) as usize;
+        let dims = self.shared_layer_dims.try_borrow().ok()?;
+        // `.min(dims.len())` IS load-bearing, and it is a PANIC GUARD — not part of
+        // the shed bound, which is `active` itself. Do not "simplify" it away as
+        // redundant: `active > dims.len()` is a REAL state, because
+        // `shared_layer_dims` starts empty and `publish_layer_dims` grows it on
+        // demand, so the whole window between the AQ raising the active count and
+        // `build_layer` publishing has more active rungs than slots. Dropping this
+        // does not mis-report — it panics on the slice index (`range end index 1 out
+        // of range for slice of length 0`, RUN), on a `pub(crate)` path reached from
+        // the UI render tick. Two tests catch it:
+        // `quality_snapshot_reports_the_sentinel_before_any_publish` and
+        // `top_published_layer_dims_picks_the_highest_published_active_rung`.
+        let upto = active.min(dims.len());
+        dims[..upto]
+            .iter()
+            .rev()
+            .map(|a| unpack_layer_dims(a.load(Ordering::Relaxed)))
+            .find(|(w, h)| *w > 0 && *h > 0)
     }
 
     /// Live SEND-side simulcast diagnostics for the camera (issue #1095
@@ -2374,6 +3006,18 @@ impl CameraEncoder {
     /// layers. Cloned into the health reporter for the active-layers metric.
     pub fn shared_active_layer_count(&self) -> Rc<AtomicU32> {
         self.shared_active_layer_count.clone()
+    }
+
+    /// Returns an opaque source that reads the encode loop's live per-layer
+    /// fitted geometry and measured output fps on each health-report tick.
+    pub fn camera_layer_metric_source(&self) -> CameraLayerMetricSource {
+        CameraLayerMetricSource {
+            dims: self.shared_layer_dims.clone(),
+            output_fps: self.shared_layer_output_fps.clone(),
+            output_fps_ready: self.shared_layer_output_fps_ready.clone(),
+            last_chunk_ms: self.shared_layer_last_chunk_ms.clone(),
+            active_layer_count: self.shared_active_layer_count.clone(),
+        }
     }
 
     /// Returns the shared tier transitions buffer for health reporting.
@@ -2586,6 +3230,25 @@ impl CameraEncoder {
     /// Stops encoding after it has been started.
     pub fn stop(&mut self) {
         crate::encode::reset_output_fps(&self.current_fps);
+        clear_layer_output_metrics(
+            &self.shared_layer_output_fps,
+            &self.shared_layer_output_fps_ready,
+            &self.shared_layer_last_chunk_ms,
+        );
+        // Issue #2170: published geometry must stop reading as live the moment the
+        // encoder does. Without this, turning the camera off after it has been on
+        // once leaves the last dims standing for the rest of the session —
+        // `CameraEncoder` is constructed once per Host mount and `start`/`stop`
+        // merely toggle it, so nothing else would ever reset them. Same contract,
+        // same place, as the fps reset above.
+        clear_layer_dims(&self.shared_layer_dims);
+        // Record the clear so a LIVE encode loop republishes even if it never
+        // observes the disable — see `shared_layer_dims_cleared`. `stop()` does not
+        // bump `loop_epoch`, and a camera OFF→ON on the same device makes `start()`
+        // early-return, so without this a stalled loop's geometry stays blank for the
+        // rest of the session behind a working camera.
+        self.shared_layer_dims_cleared
+            .fetch_add(1, Ordering::Release);
         self.state.stop()
     }
 
@@ -2632,6 +3295,77 @@ impl CameraEncoder {
         let ladder_variant = self.ladder_variant;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Fitted per-layer encode dims (issue #2170). The encode loop publishes
+        // configuration changes through `LayerEncoder::set_encode_dims`; it also
+        // owns the generation clear, shed clear, and OFF→ON republish below.
+        // `stop()` owns the synchronous whole-vec clear.
+        //
+        // THE CALL SITES IN THIS FUTURE ARE HOST-UNGUARDED — TEN of them (sites 8-10
+        // are the per-layer fps writes added by issue #2170, documented at
+        // `shared_layer_output_fps`' clone below), all needing a real `VideoEncoder`
+        // (or a live frame read) to reach, so no host test can cover them and
+        // reverting any ONE leaves the whole client suite green. Enumerated, because
+        // a count alone hides which seams are open:
+        //   1-4. the FOUR `LayerEncoder::set_encode_dims` call sites — `build_layer`'s
+        //        initial publish, the single-stream tier-change re-fit, the per-frame
+        //        simulcast re-fit, and the per-frame single-stream re-fit. Replacing
+        //        ANY of them with a direct `current_w`/`current_h` assignment (i.e.
+        //        bypassing the chokepoint, which is exactly the drift the chokepoint
+        //        exists to prevent) was RUN and left 807/807 passing.
+        //   5.   the `clear_layer_dim` call in the shed-teardown loop.
+        //   6.   the `clear_layer_dims` call at the `'restart` head, including its
+        //        epoch guard — an inline atomic load, so deleting or inverting the
+        //        `if` is also invisible to the host suite.
+        //   7.   the OFF→ON republish loop that reconciles `seen_dims_cleared`. Its
+        //        DECISION is host-tested via `republish_geometry_on_tick` (including
+        //        the unobserved-transition case an earlier edge-based fix got wrong),
+        //        but deleting the `for layer in &layers { publish_layer_dims(..) }`
+        //        body leaves the suite green — the same callee-vs-call-site split as
+        //        1-4. Reaching it needs a stalled `video_reader.read().await` across a
+        //        same-device OFF→ON cycle, which is a device-level stall no host test
+        //        can stage.
+        //
+        // WHAT WOULD CLOSE THESE, and why it is not in this PR. They need a live
+        // `VideoEncoder` fed real camera frames, inside the spawned encode task.
+        // `videocall-client` does have a wasm test target (`tests/
+        // capability_probe_wasm.rs` + the `wasm-bindgen-test` dev-dep), so "no
+        // harness exists" would be a FALSE deferral — but that target only exercises
+        // pure fns over synthetic `JsValue`s, has no way to construct a
+        // `CameraEncoder`, and is named in NO CI workflow, so it runs nowhere today.
+        // Covering these ten needs a new browser harness that drives a real capture
+        // through the encode loop AND a CI step to run it: peer-sized work, not a
+        // loose end of this change. What IS covered end-to-end instead is the
+        // OBSERVABLE RESULT of sites 1-4 — `e2e/tests/performance-settings.spec.ts`
+        // asserts the rendered readout and the self-tile overlay both report fitted
+        // geometry from a live encoder, and both were mutation-verified by reverting
+        // `live_quality_snapshot` and rebuilding the stack wasm. That does not pin
+        // the individual call sites, which is why they stay disclosed here.
+        //
+        // The extracted helpers (`publish_layer_dims`, `clear_layer_dim(s)`) DO have
+        // mutation-verified host tests. Those pin the HELPERS and not these CALLS —
+        // the distinction matters, because a test on a callee leaves every caller
+        // revertible-green. An earlier version of this comment said "three", counting
+        // the four `set_encode_dims` callers as the single publish inside the callee;
+        // running the call-site mutations disproved that. Closing these needs
+        // `#[wasm_bindgen_test]`.
+        let shared_layer_dims = self.shared_layer_dims.clone();
+        // Per-layer measured output fps mirrors the geometry lifecycle's clearing
+        // sites. It deliberately has no OFF-to-ON republish: measurements re-warm
+        // from fresh encoded output.
+        //
+        // Sites 8-10, unguarded for the same reason as 1-7, all added by issue #2170:
+        //   8.  `publish_layer_output_fps` in the output closure — the chokepoint
+        //       holding the `layer_id == 0` gate on `current_fps` (the AQ setpoint).
+        //       Keep the store behind the helper: bypassing it inflates the setpoint N×.
+        //   9.  `clear_layer_output_metrics` at the `'restart` head (beside site 6).
+        //   10. `clear_layer_output_metric` in shed teardown (beside site 5).
+        // Tests pin the HELPERS, not these CALLS. Mutation results: PR for issue #2170.
+        let shared_layer_output_fps = self.shared_layer_output_fps.clone();
+        let shared_layer_output_fps_ready = self.shared_layer_output_fps_ready.clone();
+        let shared_layer_last_chunk_ms = self.shared_layer_last_chunk_ms.clone();
+        // Geometry clear-generation (issue #2170): the loop republishes when this
+        // moves, which is how a `stop()` it never observed still gets repaired.
+        let shared_layer_dims_cleared = self.shared_layer_dims_cleared.clone();
         // Sender encoder backpressure (issue #1108, Phase B): the encode loop
         // WRITES the max active-layer encode_queue_size() here each frame.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
@@ -2827,7 +3561,82 @@ impl CameraEncoder {
             // is never shed).
             let mut shed_since_ms: Vec<Option<f64>> = vec![None; n_layers];
 
+            // Geometry clear-generation the loop has already reconciled (issue #2170).
+            //
+            // Seeded from the LIVE counter at spawn, not from 0: every generation's
+            // `build_layer` publishes anyway, so a fresh spawn has nothing to repair
+            // and must not fire a spurious republish for clears that predate it.
+            // Declared outside `'restart` so a codec rebuild does not reset it — the
+            // rebuild republishes via `build_layer` regardless, and it re-seeds below.
+            let mut seen_dims_cleared = shared_layer_dims_cleared.load(Ordering::Acquire);
+
             'restart: loop {
+                // Reset the published geometry for THIS generation (issue #2170).
+                //
+                // WHY HERE AND NOWHERE ELSE. This must run when a new encoder
+                // generation is actually about to be built, and must NOT run on a
+                // `start()` call that changes nothing. Placing it in `start()`'s
+                // prologue satisfied neither:
+                //
+                // - `start()` has three early returns (no device selected, not
+                //   enabled, and the #1295 "true duplicate on the SAME device"
+                //   guard). A prologue clear zeroed the atomics and then returned,
+                //   leaving the LIVE loop running but its geometry blank. Nothing
+                //   republishes: `build_layer`'s publish is the only UNGATED one and
+                //   it does not re-run for a live loop, while each of the three
+                //   RECONFIGURE sites is gated on a CHANGE that a clear does not
+                //   touch — the two per-frame re-fits compare against
+                //   `layer.current_w/h` (via `needs_reconfigure`, and directly), and
+                //   the single-stream tier-change site compares the new TIER BOX
+                //   against `local_tier_max_*`. Not the same predicate, but the same
+                //   consequence: a clear moves none of those inputs, so a steady
+                //   camera on a steady tier fires none of them again and the readout
+                //   reads unknown for the rest of the session.
+                //   Reachable in practice: `EncoderState::select` raises `switching`
+                //   whenever the encoder is enabled WITHOUT comparing device ids, so
+                //   overlapping `on_loaded`/`on_devices_changed` events schedule two
+                //   starts; the first consumes `switching`, the second hits the
+                //   duplicate return.
+                // - A prologue clear also never ran for an internal `'restart`, so a
+                //   fatal codec rebuild kept the PREVIOUS generation's geometry.
+                //
+                // Inside the loop, both holes close by construction: the spawn is
+                // unreachable from every early return, and every generation — cold
+                // start, device switch, and each codec rebuild — starts blank and
+                // republishes via `build_layer`. There is deliberately no host test
+                // for the PLACEMENT: `start()` needs `getUserMedia`, so that half is
+                // guaranteed structurally rather than asserted.
+                //
+                // EPOCH GUARD (issue #1295 convention, same as the canary/bound-id
+                // clears at both supersede sites). A superseded loop must not
+                // clobber a newer generation's published geometry. Both
+                // `loop_is_superseded` checks `return` rather than re-entering
+                // `'restart`, so a stale loop normally cannot reach this line — but
+                // one interleaving evades them: loop A passes its per-frame check,
+                // parks in `video_reader.read().await` (seconds if the tab is
+                // backgrounded or the track stalls), the epoch is bumped, loop B
+                // completes `getUserMedia` + `build_layer` and PUBLISHES, then A's
+                // read resolves, A takes a fatal `break 'encode`, and falls through
+                // cleanup to this loop head. Without the guard A would zero B's
+                // slots — and because every other writer is gated on a change a
+                // clear does not touch (see the enumeration above),
+                // nothing would republish: the readout would read unknown for the
+                // rest of the session behind a healthy encoder.
+                //
+                // This guard is an inline epoch load, NOT reachable from a host test
+                // (it is one of the ten unguarded call sites disclosed at
+                // `shared_layer_dims`' clone above): deleting or inverting the `if`
+                // leaves the whole client suite green. It is deliberately NOT
+                // `loop_is_superseded`, which ORs in `!enabled` — a still-current
+                // disabled loop SHOULD clear.
+                if loop_owns_shared_geometry(loop_epoch.load(Ordering::Acquire), my_epoch) {
+                    clear_layer_dims(&shared_layer_dims);
+                    clear_layer_output_metrics(
+                        &shared_layer_output_fps,
+                        &shared_layer_output_fps_ready,
+                        &shared_layer_last_chunk_ms,
+                    );
+                }
                 // Backoff + max-restart guard (skip on first iteration).
                 if restart_count > 0 {
                     let delay_ms = 500u64.saturating_mul(restart_count.min(4) as u64);
@@ -3110,10 +3919,36 @@ impl CameraEncoder {
                     /// A FATAL `configure()` error before the encode loop.
                     ConfigureFatal,
                 }
+                // Issue #2170: the build closure publishes each layer's INITIAL
+                // fitted dims. Cloned (not borrowed) so the closure does not hold a
+                // borrow of the outer `shared_layer_dims` across the encode loop.
+                let shared_layer_dims_build = shared_layer_dims.clone();
+                // Epoch fence for the build-time publish (issue #2170): cloned
+                // alongside the dims for the same reason — the closure must not hold a
+                // borrow of the outer binding across the encode loop.
+                let loop_epoch_build = loop_epoch.clone();
+                // ...and the enabled flag, so a `stop()` during this generation's
+                // `getUserMedia`/`play()` window cannot publish over the sentinel
+                // `stop()` just wrote (issue #2170).
+                let enabled_build = enabled.clone();
                 let build_layer = |layer_idx: usize,
                                    initial_seq: u64|
                  -> Result<LayerEncoder, LayerBuildError> {
                     let layer_id = layer_idx as u32;
+                    let (layer_output_fps, layer_output_fps_ready, layer_last_chunk_ms) =
+                        layer_output_metric_slots(
+                            &shared_layer_output_fps,
+                            &shared_layer_output_fps_ready,
+                            &shared_layer_last_chunk_ms,
+                            layer_idx,
+                        )
+                        .unwrap_or_else(|| {
+                            (
+                                Rc::new(AtomicU32::new(0)),
+                                Rc::new(AtomicBool::new(false)),
+                                Rc::new(AtomicU64::new(0)),
+                            )
+                        });
                     let source_width_for_handler = source_width_atomic.clone();
                     let source_height_for_handler = source_height_atomic.clone();
 
@@ -3123,6 +3958,12 @@ impl CameraEncoder {
                         let aes = aes.clone();
                         let current_fps = current_fps.clone();
                         let last_layer0_chunk_ms = last_layer0_chunk_ms.clone();
+                        // Epoch + enabled fence for the fps publish (issue #2170).
+                        // Cloned for the same reason as `loop_epoch_build` /
+                        // `enabled_build`: this closure outlives the encode loop's
+                        // frame body and must not hold a borrow of the outer binding.
+                        let loop_epoch_fps = loop_epoch.clone();
+                        let enabled_fps = enabled.clone();
                         let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
                         // Capture this layer's current sequence by value; we read
                         // the updated value back after the encode loop exits.
@@ -3138,6 +3979,22 @@ impl CameraEncoder {
                                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
                                 let is_keyframe =
                                     matches!(chunk.type_(), web_sys::EncodedVideoChunkType::Key);
+                                // Issue #2170: a WebCodecs output callback is
+                                // ASYNCHRONOUS: this callback can fire after its
+                                // generation was superseded, and the slots are cleared
+                                // IN PLACE, so an unfenced late write lands in the live
+                                // generation's slot. Gates the METRIC writes only —
+                                // never the chunk send below, which must keep flowing
+                                // (issue #2170, site 8).
+                                let may_publish_fps = loop_may_publish_geometry(
+                                    enabled_fps.load(Ordering::Acquire),
+                                    loop_epoch_fps.load(Ordering::Acquire),
+                                    my_epoch,
+                                );
+                                if may_publish_fps {
+                                    layer_last_chunk_ms.store(now as u64, Ordering::Relaxed);
+                                    chunks_in_last_second += 1;
+                                }
 
                                 // FPS calculation: ONLY layer 0 updates the
                                 // shared `current_fps`. That atomic is the AQ
@@ -3148,18 +4005,35 @@ impl CameraEncoder {
                                 // the setpoint.
                                 if layer_id == 0 {
                                     last_layer0_chunk_ms.store(now as u64, Ordering::Relaxed);
-                                    chunks_in_last_second += 1;
-                                    if now - last_chunk_time >= 1000.0 {
-                                        let fps = chunks_in_last_second;
-                                        current_fps.store(fps, Ordering::Relaxed);
-                                        // PER-TICK telemetry: fires ~1 Hz while
-                                        // encoding (layer 0). Demoted debug!->trace!
-                                        // so it stays off even when console-log
-                                        // collection bumps to Debug (#1100 follow-up).
+                                }
+                                if may_publish_fps && now - last_chunk_time >= 1000.0 {
+                                    let fps = chunks_in_last_second;
+                                    // The window closes on the first chunk at or
+                                    // AFTER 1000 ms, so normalize by the span it was
+                                    // really measured over — otherwise a resume after
+                                    // a multi-second gap publishes an accumulated
+                                    // count as a per-second rate (issue #2170). The
+                                    // raw count still feeds `current_fps`; see
+                                    // `publish_layer_output_fps`.
+                                    let measured_fps =
+                                        normalize_window_fps(fps, now - last_chunk_time);
+                                    publish_layer_output_fps(
+                                        layer_id,
+                                        measured_fps,
+                                        fps,
+                                        &layer_output_fps,
+                                        &layer_output_fps_ready,
+                                        &current_fps,
+                                    );
+                                    // PER-TICK telemetry: fires ~1 Hz while
+                                    // encoding (layer 0). Demoted debug!->trace!
+                                    // so it stays off even when console-log
+                                    // collection bumps to Debug (#1100 follow-up).
+                                    if layer_id == 0 {
                                         log::trace!("Encoder output FPS: {fps}");
-                                        chunks_in_last_second = 0;
-                                        last_chunk_time = now;
                                     }
+                                    chunks_in_last_second = 0;
+                                    last_chunk_time = now;
                                 }
 
                                 // Ensure the backing buffer is large enough for this chunk
@@ -3315,7 +4189,7 @@ impl CameraEncoder {
                         error!("Error configuring video encoder (layer {layer_id}): {e:?}");
                     }
 
-                    Ok(LayerEncoder {
+                    let mut built = LayerEncoder {
                         encoder: video_encoder,
                         config,
                         seq_out,
@@ -3329,7 +4203,32 @@ impl CameraEncoder {
                         last_encode_ms: f64::NEG_INFINITY,
                         _output_closure: output_closure,
                         _error_closure: error_closure,
-                    })
+                    };
+                    // Publish the INITIAL fitted dims (issue #2170). Without this a
+                    // layer that is built and never re-fitted — the common case for a
+                    // steady camera — would report unknown forever, since the other
+                    // three publish sites only fire on a dimension CHANGE.
+                    //
+                    // Published unconditionally, including after the non-fatal
+                    // `configure()` error logged above. That case is a KNOWN
+                    // imprecision, deliberately left as-is: the encoder may not be
+                    // running at this geometry, so the readout can be optimistic for
+                    // a refused config. Gating the publish on acceptance was
+                    // prototyped and dropped — it turned one non-fatal refusal into a
+                    // 30-50 Hz `configure`+`error!` retry storm (each iteration
+                    // shipping a Matomo event and bumping a Prometheus counter) and
+                    // fed `(0, 0)` into `fit_within_preserving_aspect`, squashing
+                    // aspect for a frame. Tracked as issue #2177 with the design that
+                    // avoids both.
+                    built.set_encode_dims(
+                        layer_w,
+                        layer_h,
+                        &shared_layer_dims_build,
+                        &enabled_build,
+                        &loop_epoch_build,
+                        my_epoch,
+                    );
+                    Ok(built)
                 };
 
                 // Cold-start build: only the layers that are ACTIVE right now
@@ -3490,6 +4389,86 @@ impl CameraEncoder {
                             *loop_device_id.borrow_mut() = None;
                         }
                         return;
+                    }
+
+                    // REPUBLISH after a geometry CLEAR this loop did not make
+                    // (issue #2170).
+                    //
+                    // Closes the OFF→ON stranding path. `stop()` clears the published
+                    // geometry, but a camera OFF→ON pair does not always produce a new
+                    // encoder generation, so nothing would republish and a LIVE camera
+                    // would read `—` for the rest of the session:
+                    //
+                    // 1. `host.rs` camera OFF = `set_enabled(false)` + `stop()`. That
+                    //    clears the slots but does NOT stop the track — only this
+                    //    loop's own exit path does.
+                    // 2. Camera ON = `select(device_id)` → `set_enabled(true)` →
+                    //    `start()`. `select()` raises `switching` ONLY when already
+                    //    enabled (`EncoderState::select`), and here it runs while
+                    //    still disabled — so `switching` stays false.
+                    // 3. `start()`'s #1295 duplicate guard then matches
+                    //    `running && !switch_requested && same_device` and returns
+                    //    early. No new generation ⇒ no epoch bump ⇒ no `'restart`-head
+                    //    clear and no `build_layer` publish.
+                    // 4. This loop resumes with `enabled == true` and an unchanged
+                    //    epoch, so it keeps encoding — but all three reconfigure sites
+                    //    are gated on a change a CLEAR does not move
+                    //    (`needs_reconfigure`, `clamped != current_w`,
+                    //    `tier_dims_changed`), so none of them fires.
+                    //
+                    // WHY A COUNTER AND NOT AN `enabled` EDGE. The first cut of this
+                    // fix compared `prev_enabled`/`now_enabled` per frame, and it
+                    // MISSED THE VERY CASE IT WAS WRITTEN FOR: the whole hazard is that
+                    // the loop is parked in `video_reader.read().await` across the
+                    // OFF→ON pair, so it never samples the disabled state and on resume
+                    // reads `(true, true)` — no edge, no republish. Comparing a clear
+                    // GENERATION is edge-independent: `stop()` records the clear
+                    // whether or not any frame boundary observed it.
+                    //
+                    // Reachability of the underlying stall is narrow — the per-frame
+                    // exit above normally clears `loop_running` within one frame period
+                    // (~33 ms), letting `start()` spawn a fresh generation instead — but
+                    // it is a real device-level stall (OS camera shutter, another app
+                    // grabbing the device), and this is a NEW failure mode: before
+                    // #2170 the readout showed a wrong-but-present tier box, never a
+                    // permanent blank.
+                    //
+                    // This is the same hazard the `'restart`-head clear's own doc gives
+                    // as the reason NOT to put a clear in `start()`'s prologue. That
+                    // reasoning applies verbatim to `stop()`'s clear, which reopens the
+                    // hole through a different door. Republishing `current_w`/
+                    // `current_h` is exactly right because they are the geometry this
+                    // loop's encoders are STILL configured at — the clear erased only
+                    // the published copy, not the encoders.
+                    //
+                    // Gated on `enabled` so a clear observed while STOPPED does not
+                    // undo the sentinel; the next enable re-runs this check because
+                    // `seen_dims_cleared` is only advanced once a republish happens.
+                    //
+                    // DELIBERATELY NO SEPARATE EPOCH FENCE: this is one of two
+                    // encode-loop shared-geometry writers that rely on the frame-head
+                    // `loop_is_superseded` check. There is no `.await` between that
+                    // check and this call, so wasm's single-threaded executor cannot
+                    // switch generations in this interval. The shed-teardown clear
+                    // below relies on the same structural guarantee. If an await is
+                    // introduced into this part of the frame body, both sites need an
+                    // explicit `loop_may_publish_geometry` /
+                    // `loop_owns_shared_geometry` fence.
+                    let live_dims_cleared = shared_layer_dims_cleared.load(Ordering::Acquire);
+                    if republish_geometry_on_tick(
+                        seen_dims_cleared,
+                        live_dims_cleared,
+                        enabled.load(Ordering::Acquire),
+                    ) {
+                        for layer in &layers {
+                            publish_layer_dims(
+                                &shared_layer_dims,
+                                layer.layer_id,
+                                layer.current_w,
+                                layer.current_h,
+                            );
+                        }
+                        seen_dims_cleared = live_dims_cleared;
                     }
 
                     // --- Guard: check if any encoder has been closed externally ---
@@ -3663,6 +4642,34 @@ impl CameraEncoder {
                                 // The rung is gone; clear its timer so a future
                                 // rebuild+shed re-arms a fresh dwell.
                                 shed_since_ms[id] = None;
+                                // Issue #2170: and clear its published geometry —
+                                // this rung's encoder was just closed and freed, so
+                                // leaving dims behind describes a rung emitting
+                                // nothing. Note the readout's `[..active]` bound
+                                // already excludes shed rungs, so this is not what
+                                // keeps a shed rung out of the readout; it is what
+                                // stops a TORN-DOWN rung reappearing as live if the
+                                // active count later rises before the rebuild
+                                // publishes.
+                                // DELIBERATELY UNFENCED: this is one of two encode-loop
+                                // shared-geometry writers without an explicit epoch
+                                // fence; the OFF→ON republish above is the other. Both
+                                // are safe ONLY because there is no `.await` between
+                                // the `'encode`-head supersede check and either call,
+                                // so a superseded or stopped loop cannot reach them.
+                                // The other writers cannot rely on that structural
+                                // argument and carry `loop_may_publish_geometry` /
+                                // `loop_owns_shared_geometry`. If a future refactor
+                                // introduces an await anywhere above this inside the
+                                // frame body, both unfenced sites need an explicit
+                                // fence.
+                                clear_layer_dim(&shared_layer_dims, id);
+                                clear_layer_output_metric(
+                                    &shared_layer_output_fps,
+                                    &shared_layer_output_fps_ready,
+                                    &shared_layer_last_chunk_ms,
+                                    id,
+                                );
                                 CAMERA_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL
                                     .fetch_add(1, Ordering::Relaxed);
                                 log::info!(
@@ -3807,8 +4814,19 @@ impl CameraEncoder {
                                 layer.current_h,
                                 layer.layer_id,
                             );
-                            layer.current_w = constrained_w;
-                            layer.current_h = constrained_h;
+                            // Issue #2170: route through the chokepoint so the
+                            // readout tracks the re-fit. Necessarily BEFORE
+                            // `configure()`, since the config below is built from the
+                            // fields this sets — see `set_encode_dims`' doc and
+                            // issue #2177 for the refusal path.
+                            layer.set_encode_dims(
+                                constrained_w,
+                                constrained_h,
+                                &shared_layer_dims,
+                                &enabled,
+                                &loop_epoch,
+                                my_epoch,
+                            );
 
                             let new_config = VideoEncoderConfig::new(
                                 get_video_codec_string(),
@@ -4162,8 +5180,16 @@ impl CameraEncoder {
                                             layer.layer_id,
                                         );
 
-                                        layer.current_w = decision.target_w;
-                                        layer.current_h = decision.target_h;
+                                        // Issue #2170: publish the re-fit through the
+                                        // chokepoint (see `set_encode_dims`).
+                                        layer.set_encode_dims(
+                                            decision.target_w,
+                                            decision.target_h,
+                                            &shared_layer_dims,
+                                            &enabled,
+                                            &loop_epoch,
+                                            my_epoch,
+                                        );
 
                                         // Replace this layer's config with one at
                                         // the new dims + the cached bitrate, and
@@ -4241,8 +5267,16 @@ impl CameraEncoder {
 
                                         log::info!("Camera dimensions changed from {}x{} to {clamped_width}x{clamped_height}, reconfiguring encoder (layer {})", layer.current_w, layer.current_h, layer.layer_id);
 
-                                        layer.current_w = clamped_width;
-                                        layer.current_h = clamped_height;
+                                        // Issue #2170: publish the re-fit through the
+                                        // chokepoint (see `set_encode_dims`).
+                                        layer.set_encode_dims(
+                                            clamped_width,
+                                            clamped_height,
+                                            &shared_layer_dims,
+                                            &enabled,
+                                            &loop_epoch,
+                                            my_epoch,
+                                        );
 
                                         let new_config = VideoEncoderConfig::new(
                                             get_video_codec_string(),
@@ -4431,12 +5465,13 @@ mod tests {
         clear_video_at_floor_on_enable_edge, encoders_to_build, format_layer_transition,
         frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
         keyframe_tick_decision, layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin,
-        periodic_keyframe_due, record_camera_restart, resolve_capture_dimensions,
-        screen_ready_stall_threshold_update, shed_reason, should_encode_layer_frame,
-        should_pin_single_layer_low, should_teardown_shed_layer, simulcast_layer_encode_params,
-        video_at_floor_on_tick, wt_drop_step_down_decision, wt_saturation_step_down_decision,
-        KeyframeTickInput, LayerView, ScreenReadyStallThresholdTracker, SimulcastLayerInfo,
-        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        periodic_keyframe_due, record_camera_restart, republish_geometry_on_tick,
+        resolve_capture_dimensions, screen_ready_stall_threshold_update, shed_reason,
+        should_encode_layer_frame, should_pin_single_layer_low, should_teardown_shed_layer,
+        simulcast_layer_encode_params, video_at_floor_on_tick, wt_drop_step_down_decision,
+        wt_saturation_step_down_decision, KeyframeTickInput, LayerView,
+        ScreenReadyStallThresholdTracker, SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS,
+        SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
         SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use crate::adaptive_quality_constants::{
@@ -4446,7 +5481,19 @@ mod tests {
         WT_SELF_CONGESTION_WINDOW_MS,
     };
     use crate::{Callback, VideoCallClient, VideoCallClientOptions};
+    // Issue #2170: the fitted-dims publication primitives + the shared-cell types
+    // the seeding helper needs to stand in for the encode loop.
+    use super::loop_may_publish_geometry;
+    use super::{
+        clear_layer_dim, clear_layer_dims, clear_layer_output_metric, clear_layer_output_metrics,
+        loop_owns_shared_geometry, normalize_window_fps, publish_layer_output_fps,
+    };
+    use super::{pack_layer_dims, publish_layer_dims};
+    use super::{unpack_layer_dims, VIDEO_QUALITY_TIERS};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
     fn build_test_client() -> VideoCallClient {
         VideoCallClient::new(VideoCallClientOptions {
@@ -4557,6 +5604,768 @@ mod tests {
             max_layers,
             variant,
         )
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #2170 — the FITTED-vs-NOMINAL geometry guards for the SELF-VIEW
+    // readout.
+    //
+    // The reader tests below exercise the real `CameraEncoder` methods, NOT a pure
+    // helper. That distinction is the point: before #2170 the fitted dims existed
+    // only inside the encode loop's `LayerEncoder`, and the readout re-derived the
+    // AQ tier's BOUNDING BOX from the table. A test that exercised only an
+    // extracted helper would leave the call site revertible-green.
+    //
+    // Seeded values are deliberately dims that NO ladder rung and NO AQ tier
+    // contains (`613x461` etc.), so an implementation that reads any table cannot
+    // accidentally produce them. Each such test also asserts the fixture is
+    // DISCRIMINATING rather than assuming it.
+    //
+    // What these CANNOT reach: the ten write call sites inside the encode-loop
+    // future (four `set_encode_dims` callers, the shed-teardown `clear_layer_dim`,
+    // the `'restart`-head `clear_layer_dims`, the OFF→ON republish loop, and issue
+    // #2170's three fps writes — `publish_layer_output_fps` plus the restart-head and
+    // shed-teardown `clear_layer_output_metric(s)` calls). They
+    // need a real `VideoEncoder`. The disclosure lives at `shared_layer_dims`'
+    // clone in `start()`.
+    // ---------------------------------------------------------------------
+
+    /// Seed `shared_layer_dims` as the encode loop would, without a browser.
+    fn seed_published_dims(encoder: &CameraEncoder, dims: &[(u32, u32)]) {
+        let mut slots = encoder.shared_layer_dims.borrow_mut();
+        *slots = dims
+            .iter()
+            .map(|(w, h)| Rc::new(AtomicU32::new(pack_layer_dims(*w, *h))))
+            .collect();
+    }
+
+    fn seed_layer_output_fps(encoder: &CameraEncoder, values: &[Option<u32>]) {
+        *encoder.shared_layer_output_fps.borrow_mut() = values
+            .iter()
+            .map(|value| Rc::new(AtomicU32::new(value.unwrap_or(0))))
+            .collect();
+        *encoder.shared_layer_output_fps_ready.borrow_mut() = values
+            .iter()
+            .map(|value| Rc::new(AtomicBool::new(value.is_some())))
+            .collect();
+        *encoder.shared_layer_last_chunk_ms.borrow_mut() = values
+            .iter()
+            .map(|_| Rc::new(AtomicU64::new(1_000)))
+            .collect();
+    }
+
+    #[test]
+    fn metric_source_excludes_shed_layers() {
+        let encoder = encoder_with_ladder(3, LadderVariant::Default);
+        seed_published_dims(&encoder, &[(241, 181), (481, 361)]);
+        seed_layer_output_fps(&encoder, &[Some(7), Some(15)]);
+        encoder
+            .shared_active_layer_count
+            .store(1, Ordering::Relaxed);
+
+        assert_eq!(
+            encoder
+                .camera_layer_metric_source()
+                .reportable_layers_at(1_100.0),
+            vec![(0, 241, 181, Some(7))]
+        );
+    }
+
+    #[test]
+    fn metric_source_excludes_unbuilt_layers_and_preserves_ladder_indices() {
+        let encoder = encoder_with_ladder(3, LadderVariant::Default);
+        seed_published_dims(&encoder, &[(241, 181), (0, 0), (613, 461)]);
+        seed_layer_output_fps(&encoder, &[Some(7), None, Some(30)]);
+        encoder
+            .shared_active_layer_count
+            .store(3, Ordering::Relaxed);
+
+        assert_eq!(
+            encoder
+                .camera_layer_metric_source()
+                .reportable_layers_at(1_100.0),
+            vec![(0, 241, 181, Some(7)), (2, 613, 461, Some(30))]
+        );
+    }
+
+    #[test]
+    fn metric_source_reads_live_at_report_time() {
+        let encoder = encoder_with_ladder(1, LadderVariant::Default);
+        seed_published_dims(&encoder, &[(241, 181)]);
+        seed_layer_output_fps(&encoder, &[Some(7)]);
+        let source = encoder.camera_layer_metric_source();
+        assert_eq!(
+            source.reportable_layers_at(1_100.0),
+            vec![(0, 241, 181, Some(7))]
+        );
+
+        encoder.shared_layer_dims.borrow()[0].store(pack_layer_dims(319, 179), Ordering::Relaxed);
+        encoder.shared_layer_output_fps.borrow()[0].store(6, Ordering::Relaxed);
+        assert_eq!(
+            source.reportable_layers_at(1_100.0),
+            vec![(0, 319, 179, Some(6))]
+        );
+    }
+
+    #[test]
+    fn metric_source_preserves_unmeasured_vs_measured_zero_fps() {
+        let encoder = encoder_with_ladder(2, LadderVariant::Default);
+        seed_published_dims(&encoder, &[(241, 181), (481, 361)]);
+        seed_layer_output_fps(&encoder, &[None, Some(0)]);
+        encoder
+            .shared_active_layer_count
+            .store(2, Ordering::Relaxed);
+
+        assert_eq!(
+            encoder
+                .camera_layer_metric_source()
+                .reportable_layers_at(1_100.0),
+            vec![(0, 241, 181, None), (1, 481, 361, Some(0))]
+        );
+    }
+
+    /// A rung that stopped emitting must report `Some(0)`, not its last measured fps.
+    ///
+    /// Guards the AQ shed-then-restore-inside-the-30s-dwell window, where
+    /// `clear_layer_output_metric` never runs and the slot keeps its pre-shed value.
+    #[test]
+    fn metric_source_decays_a_stale_rung_to_zero_but_not_a_fresh_one() {
+        let encoder = encoder_with_ladder(2, LadderVariant::Default);
+        seed_published_dims(&encoder, &[(241, 181), (481, 361)]);
+        seed_layer_output_fps(&encoder, &[Some(7), Some(15)]);
+        encoder
+            .shared_active_layer_count
+            .store(2, Ordering::Relaxed);
+        // `seed_layer_output_fps` stamps both rungs' last chunk at 1_000.
+        let idle = crate::adaptive_quality_constants::ENCODER_FPS_IDLE_DECAY_MS;
+
+        // FRESH: just inside the threshold — the measured value must survive. Uses
+        // `idle` rather than a literal so a constant change cannot silently move
+        // this case onto the other side of the boundary.
+        assert_eq!(
+            encoder
+                .camera_layer_metric_source()
+                .reportable_layers_at(1_000.0 + idle - 1.0),
+            vec![(0, 241, 181, Some(7)), (1, 481, 361, Some(15))],
+            "a rung still inside the idle window must report its measured fps"
+        );
+
+        // STALE: at/past the threshold — both decay to a measured 0, and must stay
+        // PRESENT (`Some(0)`, a real "encoding nothing" reading), never collapse to
+        // `None`, which means "no measurement yet".
+        assert_eq!(
+            encoder
+                .camera_layer_metric_source()
+                .reportable_layers_at(1_000.0 + idle),
+            vec![(0, 241, 181, Some(0)), (1, 481, 361, Some(0))],
+            "a rung that stopped emitting must decay to Some(0), not keep stale fps"
+        );
+
+        // The decay must not resurrect an UNMEASURED rung as a measured zero: a
+        // `ready == false` slot stays absent no matter how stale it looks.
+        seed_layer_output_fps(&encoder, &[None, Some(15)]);
+        assert_eq!(
+            encoder
+                .camera_layer_metric_source()
+                .reportable_layers_at(1_000.0 + idle)[0]
+                .3,
+            None,
+            "an unmeasured rung must stay absent, not decay into Some(0)"
+        );
+    }
+
+    #[test]
+    fn per_layer_fps_never_inflates_the_aq_setpoint() {
+        let current_fps = AtomicU32::new(0);
+        let layer0_fps = AtomicU32::new(0);
+        let layer1_fps = AtomicU32::new(0);
+        let layer0_ready = AtomicBool::new(false);
+        let layer1_ready = AtomicBool::new(false);
+
+        publish_layer_output_fps(0, 7, 7, &layer0_fps, &layer0_ready, &current_fps);
+        publish_layer_output_fps(1, 15, 15, &layer1_fps, &layer1_ready, &current_fps);
+
+        assert_eq!(layer0_fps.load(Ordering::Relaxed), 7);
+        assert_eq!(layer1_fps.load(Ordering::Relaxed), 15);
+        assert_eq!(
+            current_fps.load(Ordering::Relaxed),
+            7,
+            "the AQ setpoint must remain layer 0 only"
+        );
+    }
+
+    /// The count is normalized by the window it was ACTUALLY measured over, so a resume
+    /// after a gap cannot publish an accumulated count as a per-second rate.
+    ///
+    /// The window closes on the first chunk at or after 1000 ms and the closure's
+    /// counter survives the gap, so unnormalized a ~6s stall reads 30 chunks as 30 fps.
+    /// Pins the math only; the call site is site 8 (browser-only).
+    #[test]
+    fn window_fps_is_normalized_by_real_elapsed_but_the_setpoint_keeps_the_raw_count() {
+        // Steady state: a 1000-1033ms window must still read the nominal rate, not 29.
+        assert_eq!(normalize_window_fps(30, 1000.0), 30);
+        assert_eq!(normalize_window_fps(30, 1033.0), 29); // 29.04 -> rounds to 29
+        assert_eq!(normalize_window_fps(30, 1016.0), 30); // 29.53 -> rounds to 30
+        assert_eq!(normalize_window_fps(7, 1000.0), 7);
+
+        // THE DEFECT THIS EXISTS FOR: 30 chunks accumulated across a ~6s stall is a
+        // true rate of 5 fps, not 30.
+        assert_eq!(
+            normalize_window_fps(30, 5967.0),
+            5,
+            "an accumulated count over a long window must not read as a per-second rate"
+        );
+        // A 2x-long window halves the reported rate.
+        assert_eq!(normalize_window_fps(30, 2000.0), 15);
+        // Degenerate elapsed cannot divide-by-zero or produce a wild value; the
+        // caller's `>= 1000.0` guard already excludes it.
+        assert_eq!(normalize_window_fps(30, 0.0), 30);
+
+        // And the AQ setpoint deliberately still receives the RAW count: normalizing a
+        // control input would change adaptive behavior on the stalled/resumed paths,
+        // which is out of scope for an observability change.
+        let current_fps = AtomicU32::new(0);
+        let layer0_fps = AtomicU32::new(0);
+        let layer0_ready = AtomicBool::new(false);
+        publish_layer_output_fps(0, 5, 30, &layer0_fps, &layer0_ready, &current_fps);
+        assert_eq!(
+            layer0_fps.load(Ordering::Relaxed),
+            5,
+            "the EXPORTED metric takes the normalized rate"
+        );
+        assert_eq!(
+            current_fps.load(Ordering::Relaxed),
+            30,
+            "the AQ setpoint keeps the raw window count — pre-existing behavior, \
+             deliberately unchanged by issue 2170"
+        );
+    }
+
+    /// `stop()` clears the fps slots, and the two clear HELPERS do what their names say:
+    /// a per-rung clear leaves its neighbours alone, a whole-vec clear does not.
+    ///
+    /// Pins `stop()` (a real call site) plus both helpers — NOT the `'restart`-head or
+    /// shed-teardown calls, which are sites 9 and 10.
+    #[test]
+    fn per_layer_fps_clears_on_stop_and_the_clear_helpers() {
+        let mut encoder = encoder_with_ladder(3, LadderVariant::Default);
+        seed_published_dims(&encoder, &[(241, 181), (481, 361), (613, 461)]);
+        seed_layer_output_fps(&encoder, &[Some(7), Some(15), Some(30)]);
+
+        encoder.stop();
+        assert!(encoder
+            .shared_layer_output_fps
+            .borrow()
+            .iter()
+            .all(|slot| slot.load(Ordering::Relaxed) == 0));
+        assert!(encoder
+            .shared_layer_output_fps_ready
+            .borrow()
+            .iter()
+            .all(|slot| !slot.load(Ordering::Relaxed)));
+
+        seed_layer_output_fps(&encoder, &[Some(7), Some(15), Some(30)]);
+        clear_layer_output_metric(
+            &encoder.shared_layer_output_fps,
+            &encoder.shared_layer_output_fps_ready,
+            &encoder.shared_layer_last_chunk_ms,
+            2,
+        );
+        assert_eq!(
+            encoder.shared_layer_output_fps.borrow()[1].load(Ordering::Relaxed),
+            15
+        );
+        assert!(!encoder.shared_layer_output_fps_ready.borrow()[2].load(Ordering::Relaxed));
+
+        clear_layer_output_metrics(
+            &encoder.shared_layer_output_fps,
+            &encoder.shared_layer_output_fps_ready,
+            &encoder.shared_layer_last_chunk_ms,
+        );
+        assert!(encoder
+            .shared_layer_output_fps_ready
+            .borrow()
+            .iter()
+            .all(|slot| !slot.load(Ordering::Relaxed)));
+    }
+
+    /// **THE STALE-LOOP FENCE.** Only the CURRENT encode-loop generation may write
+    /// the shared geometry (issue #2170).
+    ///
+    /// Why this is a fence and not a nicety: there are awaits between a loop's
+    /// acquire-phase supersede check and its first publish
+    /// (`video_element.play().await`, plus a 200 ms sleep on the autoplay retry) and
+    /// before every per-frame publish (`video_reader.read().await`). So a stale loop
+    /// CAN resume after a newer one has published. If it wrote, the corruption would
+    /// be permanent: it then exits without clearing (the `'restart`-head clear is
+    /// fenced by this same predicate, so it skips too) and every other writer is
+    /// gated on a change its write does not move — the readout would report a dead
+    /// generation's geometry for the rest of the session.
+    ///
+    /// This is deliberately NOT `loop_is_superseded`: that ORs in `!enabled`, which
+    /// would make a still-current DISABLED loop decline to clear its own geometry,
+    /// breaking `stop()`'s contract. The asserts below pin that difference, so
+    /// "simplifying" one into the other fails.
+    ///
+    /// MUTATION (run): invert to `!=` and every case flips. Replace the body with
+    /// `loop_is_superseded(enabled, loop_epoch, my_epoch)` and the disabled-but-
+    /// current case fails.
+    #[test]
+    fn loop_owns_shared_geometry_only_for_the_current_generation() {
+        // The current generation owns the shared slots.
+        assert!(loop_owns_shared_geometry(7, 7));
+        // A superseded loop does not — neither behind...
+        assert!(!loop_owns_shared_geometry(8, 7));
+        // ...nor (defensively) ahead of the epoch it captured.
+        assert!(!loop_owns_shared_geometry(6, 7));
+        // Cold start: epoch 0 is a legitimate generation, not a sentinel.
+        assert!(loop_owns_shared_geometry(0, 0));
+
+        // THE DIVERGENCE FROM `loop_is_superseded`, pinned. A still-current loop that
+        // has been DISABLED must still own its geometry, because `stop()` clears
+        // through this predicate. `loop_is_superseded` says "superseded" there
+        // (it ORs in `!enabled`), so the two are NOT interchangeable.
+        assert!(
+            loop_owns_shared_geometry(7, 7),
+            "a disabled-but-current loop must still be allowed to clear its own dims"
+        );
+        assert!(
+            loop_is_superseded(false, 7, 7),
+            "precondition: loop_is_superseded treats !enabled as superseded — which is \
+             why it cannot be reused as the geometry-ownership fence"
+        );
+    }
+
+    /// **THE STOP/RESUME FENCE.** A loop of the CURRENT generation that is parked in
+    /// an await across a `stop()` must not publish over the sentinel `stop()` wrote.
+    ///
+    /// This is a distinct hazard from the stale-generation one, and the epoch alone
+    /// does NOT cover it: `CameraEncoder::stop()` clears the slots and sets
+    /// `enabled = false`, but does **not** bump `loop_epoch` (`EncoderState::stop`
+    /// touches only `enabled`/`switching`). So the parked loop still satisfies
+    /// `loop_epoch == my_epoch`. The acquire-phase `loop_is_superseded` check does
+    /// read `enabled`, but it runs BEFORE `video_element.play().await` and its 200 ms
+    /// autoplay-retry sleep, with no re-check before `build_layer` publishes — so a
+    /// `stop()` landing in that window would leave a stopped camera reporting a live
+    /// resolution, permanently (nothing republishes; every other writer is gated on a
+    /// dimension CHANGE a clear does not move).
+    ///
+    /// The asymmetry with the CLEAR is the point and is asserted below: the
+    /// `'restart`-head clear uses the epoch-only predicate on purpose, because a
+    /// still-current but DISABLED loop *should* clear — that is `stop()`'s contract.
+    /// Publishes tighten; clears do not.
+    ///
+    /// MUTATION (run): drop the `enabled &&` from `loop_may_publish_geometry` and the
+    /// disabled cases fail. Make the `'restart` clear use this predicate instead of
+    /// `loop_owns_shared_geometry` and `stop_clears_published_dims_and_the_readout_
+    /// reads_unknown`'s contract is what breaks in production.
+    #[test]
+    fn loop_may_publish_geometry_requires_enabled_as_well_as_the_epoch() {
+        // Current generation, still enabled → may publish.
+        assert!(loop_may_publish_geometry(true, 7, 7));
+
+        // Current generation but STOPPED → must NOT publish. This is the
+        // parked-in-`play().await`-across-`stop()` case; the epoch is unchanged
+        // because `stop()` does not bump it.
+        assert!(
+            !loop_may_publish_geometry(false, 7, 7),
+            "a stopped-but-current loop must not republish over stop()'s sentinel"
+        );
+
+        // Superseded generation → must NOT publish, enabled or not.
+        assert!(!loop_may_publish_geometry(true, 8, 7));
+        assert!(!loop_may_publish_geometry(false, 8, 7));
+
+        // THE ASYMMETRY, pinned: the same disabled-but-current state that is barred
+        // from PUBLISHING is still allowed to CLEAR. Collapsing the two predicates
+        // into one — in either direction — breaks one of the two contracts.
+        assert!(
+            loop_owns_shared_geometry(7, 7),
+            "the clear predicate must still admit a disabled-but-current loop, or \
+             stop() would not be able to clear its own geometry"
+        );
+        assert!(!loop_may_publish_geometry(false, 7, 7));
+    }
+
+    #[test]
+    fn pack_layer_dims_round_trips_and_clamps() {
+        assert_eq!(unpack_layer_dims(pack_layer_dims(640, 480)), (640, 480));
+        assert_eq!(unpack_layer_dims(pack_layer_dims(1920, 1080)), (1920, 1080));
+        // `0` is the "not yet published" sentinel every reader keys off.
+        assert_eq!(unpack_layer_dims(0), (0, 0));
+        // Out-of-range clamps rather than corrupting the neighbouring axis: an
+        // unclamped shift would let a >16-bit width overwrite the height bits.
+        let (w, h) = unpack_layer_dims(pack_layer_dims(70_000, 70_000));
+        assert_eq!((w, h), (u16::MAX as u32, u16::MAX as u32));
+    }
+
+    /// **THE WRITER guard.** `publish_layer_dims` is the publication mechanism the
+    /// whole of #2170 rests on, and it needs its own test because every reader test
+    /// seeds the shared vec directly via `seed_published_dims` and bypasses it —
+    /// deleting the writer's body would otherwise leave the suite green.
+    ///
+    /// MUTATION (run): delete the `store(..)` and the stored-pair assertions fail;
+    /// delete the `resize_with` and the grow-on-demand assertion panics on index.
+    #[test]
+    fn publish_layer_dims_grows_on_demand_and_stores_the_packed_pair() {
+        let cell: RefCell<Vec<Rc<AtomicU32>>> = RefCell::new(Vec::new());
+
+        // Publishing layer 2 into an EMPTY vec must grow it to length 3, not panic
+        // and not silently no-op: the cold-start build publishes only the layers it
+        // constructs, so a lazily-earned upper rung is the normal first writer.
+        publish_layer_dims(&cell, 2, 640, 480);
+        assert_eq!(cell.borrow().len(), 3, "must grow to hold layer_id 2");
+        assert_eq!(
+            unpack_layer_dims(cell.borrow()[2].load(Ordering::Relaxed)),
+            (640, 480)
+        );
+        // Slots skipped by the grow stay at the not-yet-published sentinel.
+        assert_eq!(
+            unpack_layer_dims(cell.borrow()[0].load(Ordering::Relaxed)),
+            (0, 0)
+        );
+        assert_eq!(
+            unpack_layer_dims(cell.borrow()[1].load(Ordering::Relaxed)),
+            (0, 0)
+        );
+
+        // A later publish OVERWRITES in place and does not re-grow — an encoder
+        // reconfigure must not leave the previous geometry readable anywhere.
+        publish_layer_dims(&cell, 2, 960, 540);
+        assert_eq!(cell.borrow().len(), 3, "re-publish must not grow again");
+        assert_eq!(
+            unpack_layer_dims(cell.borrow()[2].load(Ordering::Relaxed)),
+            (960, 540)
+        );
+
+        // Filling a lower slot leaves the higher one intact.
+        publish_layer_dims(&cell, 0, 240, 180);
+        let got: Vec<(u32, u32)> = cell
+            .borrow()
+            .iter()
+            .map(|a| unpack_layer_dims(a.load(Ordering::Relaxed)))
+            .collect();
+        assert_eq!(got, vec![(240, 180), (0, 0), (960, 540)]);
+    }
+
+    /// A failed borrow must SKIP the publish, never panic — a diagnostics write
+    /// must not be able to take down a live encode.
+    ///
+    /// MUTATION (run): change `try_borrow_mut` to `borrow_mut` and this panics with
+    /// "already mutably borrowed".
+    #[test]
+    fn publish_layer_dims_skips_rather_than_panics_when_the_cell_is_borrowed() {
+        let cell: RefCell<Vec<Rc<AtomicU32>>> = RefCell::new(Vec::new());
+        let _held = cell.borrow_mut(); // simulate a reader mid-scan
+        publish_layer_dims(&cell, 0, 640, 480); // must not panic
+    }
+
+    /// The shed-teardown clear zeroes ONLY the torn-down rung; rungs still encoding
+    /// keep their geometry.
+    ///
+    /// Extracted from the teardown loop so this decision is reachable at all — but
+    /// note the limit: this pins the HELPER. The `clear_layer_dim(...)` CALL in that
+    /// loop is one of the ten browser-only sites.
+    ///
+    /// MUTATION (run): delete the `store(0, ..)` and the torn-down assertion fails.
+    /// Widen it to clear ALL slots (i.e. call `clear_layer_dims`) and the
+    /// surviving-rung assertions fail. Drop the `dims.get(layer_id)` bound and the
+    /// out-of-range case panics instead of no-op'ing.
+    #[test]
+    fn clear_layer_dim_zeroes_only_the_torn_down_rung() {
+        let dims: RefCell<Vec<Rc<AtomicU32>>> = RefCell::new(
+            [(240, 180), (480, 360), (640, 480)]
+                .iter()
+                .map(|(w, h)| Rc::new(AtomicU32::new(pack_layer_dims(*w, *h))))
+                .collect(),
+        );
+        let read = |i: usize| unpack_layer_dims(dims.borrow()[i].load(Ordering::Relaxed));
+
+        // Tear down the TOP rung, as the dwell path does when the AQ sheds it.
+        clear_layer_dim(&dims, 2);
+        assert_eq!(read(2), (0, 0), "the torn-down rung reports the sentinel");
+        assert_eq!(read(0), (240, 180), "the base rung is still encoding");
+        assert_eq!(read(1), (480, 360), "the middle rung is still encoding");
+
+        // Out of range is a no-op, not a panic: the ladder can shrink under the
+        // teardown path's `id` between the borrow and the call.
+        clear_layer_dim(&dims, 99);
+        assert_eq!(read(0), (240, 180));
+    }
+
+    /// `clear_layer_dims` zeroes EVERY slot — the whole-generation reset used by
+    /// `stop()` and the `'restart` head.
+    ///
+    /// MUTATION (run): delete the `store(0, ..)` inside the loop and both
+    /// assertions fail; narrow the loop to the first slot and the second fails.
+    #[test]
+    fn clear_layer_dims_zeroes_every_slot() {
+        let dims: RefCell<Vec<Rc<AtomicU32>>> = RefCell::new(
+            [(240, 180), (640, 480)]
+                .iter()
+                .map(|(w, h)| Rc::new(AtomicU32::new(pack_layer_dims(*w, *h))))
+                .collect(),
+        );
+        clear_layer_dims(&dims);
+        let got: Vec<(u32, u32)> = dims
+            .borrow()
+            .iter()
+            .map(|a| unpack_layer_dims(a.load(Ordering::Relaxed)))
+            .collect();
+        assert_eq!(got, vec![(0, 0), (0, 0)]);
+    }
+
+    /// **CALL-SITE guard.** `live_quality_snapshot()` — the self-view "what am I
+    /// sending" readout — must report the fitted encode dims, not the AQ tier box.
+    ///
+    /// MUTATION (run): restore `video_width: v.max_width, video_height:
+    /// v.max_height` and this fails with left `(1920, 1080)` right `(613, 461)` — no
+    /// entry in `VIDEO_QUALITY_TIERS` is `613x461`.
+    ///
+    /// `(1920, 1080)` is tier 0 (`full_hd`), NOT the `DEFAULT_VIDEO_TIER_INDEX = 4`
+    /// (`medium`, 854x480) that reasoning from the AQ default suggests:
+    /// `CameraEncoder::new` seeds `shared_video_tier_index` to `0`, and this fixture
+    /// never moves it. An earlier version of this comment said `(854, 480)` — a
+    /// value I derived instead of observing. Four sibling tests fail on this same
+    /// mutation; this one names it because the tier box is what it exists to reject.
+    #[test]
+    fn quality_snapshot_reports_fitted_dims_not_the_aq_tier_box() {
+        let encoder = encoder_with_ladder(3, LadderVariant::Default);
+        // What a 4:3 webcam actually produces once fitted into the 16:9 rungs.
+        seed_published_dims(&encoder, &[(241, 181), (481, 361), (613, 461)]);
+        // All three rungs ACTIVE. Without this the fixture would be asserting the
+        // geometry of a rung the encoder is not emitting — see the shed test below.
+        encoder
+            .shared_active_layer_count
+            .store(3, Ordering::Relaxed);
+
+        let snap = encoder.live_quality_snapshot();
+
+        assert_eq!(
+            (snap.video_width, snap.video_height),
+            (613, 461),
+            "self-view must show the TOP ACTIVE layer's fitted dims"
+        );
+        assert!(
+            !VIDEO_QUALITY_TIERS
+                .iter()
+                .any(|t| t.max_width == snap.video_width && t.max_height == snap.video_height),
+            "fixture is not discriminating — seeded dims coincide with an AQ tier box"
+        );
+    }
+
+    /// With nothing published, the self-view reports the `(0, 0)` NOT-YET-PUBLISHED
+    /// sentinel — it must NOT substitute the AQ tier box.
+    ///
+    /// Substituting the box would be unfalsifiable downstream because a tier box is
+    /// never 0: `host.rs`'s `self_metrics_overlay` gates on
+    /// `video_width > 0 && video_height > 0`, so the self tile could never render
+    /// "unknown". It would also mean a STOPPED camera (atomics cleared) went back to
+    /// reporting a resolution.
+    ///
+    /// MUTATION (run): add `.unwrap_or((v.max_width, v.max_height))` in
+    /// `live_quality_snapshot` and this fails with left `(1920, 1080)`.
+    #[test]
+    fn quality_snapshot_reports_the_sentinel_before_any_publish() {
+        let encoder = encoder_with_ladder(3, LadderVariant::Default);
+        let snap = encoder.live_quality_snapshot();
+        assert_eq!(
+            (snap.video_width, snap.video_height),
+            (0, 0),
+            "pre-first-frame must read as UNKNOWN, not as a tier box"
+        );
+        // Prove the assertion is discriminating: the box it used to report is a
+        // real, non-zero pair, so (0,0) cannot coincide with it.
+        let tier = &VIDEO_QUALITY_TIERS[snap.video_tier_index];
+        assert!(
+            tier.max_width > 0 && tier.max_height > 0,
+            "the tier box is non-zero, so (0,0) cannot coincide with it"
+        );
+    }
+
+    /// `stop()` must clear the published geometry, exactly as it clears the fps
+    /// diagnostic directly above (issue #2170), taking the readout back to UNKNOWN.
+    ///
+    /// Without this, turning the camera off after it has been on once leaves the
+    /// last dims standing for the rest of the session: `CameraEncoder` is
+    /// constructed once per Host mount and `start`/`stop` merely toggle it, so
+    /// nothing else would ever reset them. The readout then shows a live-looking
+    /// resolution for a publisher that has stopped.
+    ///
+    /// MUTATIONS (run):
+    /// - remove `clear_layer_dims(&self.shared_layer_dims)` from `stop()` and the
+    ///   geometry assertion fails with the stale seeded `(640, 480)`;
+    /// - remove the `shared_layer_dims_cleared.fetch_add(...)` producer and the
+    ///   counter assertion fails with left `0`, right `1`. Without that producer a
+    ///   stalled loop never learns that `stop()` cleared its published geometry, so
+    ///   the OFF→ON repair silently stops working.
+    #[test]
+    fn stop_clears_published_dims_and_the_readout_reads_unknown() {
+        let mut encoder = encoder_with_ladder(3, LadderVariant::Default);
+        seed_published_dims(&encoder, &[(240, 180), (480, 360), (640, 480)]);
+        encoder
+            .shared_active_layer_count
+            .store(3, Ordering::Relaxed);
+        let live = encoder.live_quality_snapshot();
+        assert_eq!(
+            (live.video_width, live.video_height),
+            (640, 480),
+            "precondition: a publishing camera reports its fitted top rung"
+        );
+
+        let before_clear_generation = encoder.shared_layer_dims_cleared.load(Ordering::Relaxed);
+        encoder.stop();
+        assert_eq!(
+            encoder.shared_layer_dims_cleared.load(Ordering::Relaxed),
+            before_clear_generation + 1,
+            "#2170: stop() must record the clear so a stalled loop republishes",
+        );
+
+        assert_eq!(
+            encoder.top_published_layer_dims(),
+            None,
+            "#2170: stop() must clear published dims"
+        );
+        let after = encoder.live_quality_snapshot();
+        assert_eq!(
+            (after.video_width, after.video_height),
+            (0, 0),
+            "a stopped camera reports UNKNOWN, not a resolution"
+        );
+    }
+
+    /// **THE SHED-REGRESSION guard.** Under AQ shed the self-view must report the
+    /// top ACTIVE rung, never the highest ever published.
+    ///
+    /// This is the direction that matters: the pre-#2170 readout used
+    /// `VIDEO_QUALITY_TIERS[v_idx]`, whose index steps down under congestion, so it
+    /// at least tracked the shed. An unbounded scan of published dims tracks nothing
+    /// and over-reports by 16x on the Default ladder at `active == 1` — shown to a
+    /// user who opened the overlay precisely because their video looked bad.
+    ///
+    /// MUTATION (run): drop the `[..upto]` bound in `top_published_layer_dims` and
+    /// this fails with left `(613, 461)` right `(241, 181)`.
+    #[test]
+    fn quality_snapshot_tracks_the_shed_and_does_not_report_shed_rungs() {
+        let encoder = encoder_with_ladder(3, LadderVariant::Default);
+        // All three published at some point...
+        seed_published_dims(&encoder, &[(241, 181), (481, 361), (613, 461)]);
+        // ...but AQ has shed back to the base rung only. A built-then-shed rung
+        // keeps NON-zero dims until dwell-teardown, so only the bound excludes it.
+        encoder
+            .shared_active_layer_count
+            .store(1, Ordering::Relaxed);
+
+        let snap = encoder.live_quality_snapshot();
+        assert_eq!(
+            (snap.video_width, snap.video_height),
+            (241, 181),
+            "a shed publisher must report its BASE rung, not one it stopped emitting"
+        );
+
+        // Restoring the middle rung moves the readout up, but no further.
+        encoder
+            .shared_active_layer_count
+            .store(2, Ordering::Relaxed);
+        let snap = encoder.live_quality_snapshot();
+        assert_eq!((snap.video_width, snap.video_height), (481, 361));
+    }
+
+    /// `top_published_layer_dims` scans DOWNWARD **within the active range**, so a
+    /// rung the AQ has counted active but which has not yet lazily built still
+    /// yields the best live geometry instead of `None`.
+    ///
+    /// The bound (previous test) handles SHED rungs; this scan handles UNBUILT ones.
+    /// A built-then-shed rung retains non-zero dims, so only a never-built rung
+    /// reads `(0, 0)` inside the active range.
+    ///
+    /// MUTATION (run): drop the `.rev()` and this returns the BASE rung `(241, 181)`.
+    #[test]
+    fn top_published_layer_dims_picks_the_highest_published_active_rung() {
+        let encoder = encoder_with_ladder(3, LadderVariant::Default);
+        // Top rung counted active but NOT yet built -> 0; lower two published.
+        seed_published_dims(&encoder, &[(241, 181), (481, 361), (0, 0)]);
+        encoder
+            .shared_active_layer_count
+            .store(3, Ordering::Relaxed);
+        assert_eq!(encoder.top_published_layer_dims(), Some((481, 361)));
+
+        let empty = encoder_with_ladder(3, LadderVariant::Default);
+        assert_eq!(empty.top_published_layer_dims(), None);
+    }
+
+    /// An active count of 0 (pre-init, before the AQ loop has written) must not
+    /// suppress the base rung — the `.max(1)` in `top_published_layer_dims`.
+    ///
+    /// MUTATION (run): drop the `.max(1)` and this returns `None`, taking the
+    /// readout to an em-dash for a camera that is publishing.
+    #[test]
+    fn top_published_layer_dims_reports_the_base_rung_when_active_count_is_zero() {
+        let encoder = encoder_with_ladder(3, LadderVariant::Default);
+        seed_published_dims(&encoder, &[(241, 181)]);
+        encoder
+            .shared_active_layer_count
+            .store(0, Ordering::Relaxed);
+        assert_eq!(encoder.top_published_layer_dims(), Some((241, 181)));
+    }
+
+    /// The single-stream path (`experimentalSimulcastMaxLayers: 1`, the DEPLOYMENT
+    /// DEFAULT) publishes and reads exactly one slot.
+    ///
+    /// `shared_layer_dims` is sized for single-stream unlike
+    /// `shared_layer_bitrates_bps`, precisely so the readout works on this path.
+    #[test]
+    fn quality_snapshot_reports_fitted_dims_in_single_stream_mode() {
+        let encoder = encoder_with_ladder(1, LadderVariant::Default);
+        seed_published_dims(&encoder, &[(613, 461)]);
+        let snap = encoder.live_quality_snapshot();
+        assert_eq!(
+            (snap.video_width, snap.video_height),
+            (613, 461),
+            "single-stream must report its one fitted rung"
+        );
+        assert!(
+            !VIDEO_QUALITY_TIERS
+                .iter()
+                .any(|t| t.max_width == snap.video_width && t.max_height == snap.video_height),
+            "fixture is not discriminating — seeded dims coincide with an AQ tier box"
+        );
+    }
+
+    /// The diagnostics ladder is DELIBERATELY unchanged by this PR: it still
+    /// resolves rung bounding boxes from the ladder table.
+    ///
+    /// This pins the descope boundary so the split is explicit rather than an
+    /// accident of what got ported. Routing `live_simulcast_snapshot` through
+    /// `shared_layer_dims` requires rendering the sentinel in the drawer (em-dash
+    /// copy, a11y labels, shed-rung CSS) and is #2170's second half. If you are
+    /// implementing that, this test SHOULD fail — replace it, do not delete it.
+    #[test]
+    fn simulcast_ladder_still_reports_rung_boxes_not_fitted_dims() {
+        use videocall_aq::constants::simulcast_layers_for;
+
+        let encoder = encoder_with_ladder(3, LadderVariant::Default);
+        // Publish fitted dims no rung contains...
+        seed_published_dims(&encoder, &[(241, 181), (481, 361), (613, 461)]);
+        encoder
+            .shared_active_layer_count
+            .store(3, Ordering::Relaxed);
+
+        // ...and the ladder still reports the NOMINAL boxes.
+        let got: Vec<(u32, u32)> = encoder
+            .live_simulcast_snapshot()
+            .layers
+            .iter()
+            .map(|l| (l.width, l.height))
+            .collect();
+        let nominal: Vec<(u32, u32)> = simulcast_layers_for(3, LadderVariant::Default)
+            .iter()
+            .map(|t| (t.max_width, t.max_height))
+            .collect();
+        assert_eq!(
+            got, nominal,
+            "the ladder half of #2170 is deliberately out of scope in this PR"
+        );
     }
 
     /// **The ENCODE-PATH guard.** The geometry actually handed to `VideoEncoder`
@@ -4823,30 +6632,46 @@ mod tests {
 
     #[test]
     fn screen_ready_stall_threshold_tracks_live_tier_changes() {
-        // Share start uses the live high tier: 8 * (1000 / 10) = 800ms.
+        use crate::adaptive_quality_constants::screen_tier_index_by_label;
+        // Resolve the rungs by LABEL: issue #2179 inserted two tiers above
+        // `high`, so hard-coded 0/1/2 would silently test the wrong rungs.
+        // Resolve EVERY rung by label — including the top one. A hard-coded `0`
+        // is precisely the hazard issue #2179 exists to remove: it silently
+        // re-points at whatever rung a future ladder insertion puts at index 0.
+        let top = screen_tier_index_by_label("native") as u32;
+        let medium = screen_tier_index_by_label("medium") as u32;
+        let low = screen_tier_index_by_label("low") as u32;
+
+        // Share start uses the live top tier: 8 * (1000 / 10) = 800ms.
         assert_eq!(
-            screen_ready_stall_threshold_update(false, true, 0, 0),
+            screen_ready_stall_threshold_update(false, true, top, top),
             Some((800.0, 100.0))
         );
-        // A live degradation to medium and low must lengthen the threshold.
+        // A live degradation to medium (8fps) and low (5fps) must lengthen it.
         assert_eq!(
-            screen_ready_stall_threshold_update(true, true, 0, 1),
+            screen_ready_stall_threshold_update(true, true, top, medium),
             Some((1000.0, 125.0))
         );
         assert_eq!(
-            screen_ready_stall_threshold_update(true, true, 1, 2),
+            screen_ready_stall_threshold_update(true, true, medium, low),
             Some((1600.0, 200.0))
         );
         // Recovery must shorten it again; unchanged and stopped states do no write.
         assert_eq!(
-            screen_ready_stall_threshold_update(true, true, 2, 0),
+            screen_ready_stall_threshold_update(true, true, low, top),
             Some((800.0, 100.0))
         );
-        assert_eq!(screen_ready_stall_threshold_update(true, true, 0, 0), None);
-        assert_eq!(screen_ready_stall_threshold_update(true, false, 0, 2), None);
+        assert_eq!(
+            screen_ready_stall_threshold_update(true, true, top, top),
+            None
+        );
+        assert_eq!(
+            screen_ready_stall_threshold_update(true, false, top, low),
+            None
+        );
         // Invalid input fails conservatively to the slowest (low/5fps) tier.
         assert_eq!(
-            screen_ready_stall_threshold_update(true, true, 0, u32::MAX),
+            screen_ready_stall_threshold_update(true, true, top, u32::MAX),
             Some((1600.0, 200.0))
         );
     }
@@ -4862,14 +6687,16 @@ mod tests {
         reset_ready_stall_threshold_on_construction();
         let mut tracker = ScreenReadyStallThresholdTracker::new(0);
 
+        let low = crate::adaptive_quality_constants::screen_tier_index_by_label("low") as u32;
+
         assert_eq!(tracker.tick(true, 0), Some((800.0, 100.0)));
         assert_eq!(ready_stall_threshold_ms(), 800.0);
         assert_eq!(raised_threshold_owner_count(), 1);
 
-        assert_eq!(tracker.tick(true, 2), Some((1600.0, 200.0)));
+        assert_eq!(tracker.tick(true, low), Some((1600.0, 200.0)));
         assert_eq!(ready_stall_threshold_ms(), 1600.0);
 
-        assert_eq!(tracker.tick(false, 2), None);
+        assert_eq!(tracker.tick(false, low), None);
         assert_eq!(raised_threshold_owner_count(), 0);
         assert_eq!(ready_stall_threshold_ms(), 250.0);
     }
@@ -5979,6 +7806,57 @@ mod tests {
     // is the SINGLE source of truth for the stored value (the loop has exactly
     // one writer). All other transitions pass the live detector value through.
     // ─────────────────────────────────────────────────────────────────────
+    /// **THE OFF→ON STRANDING GUARD** (issue #2170, found in review of #2194).
+    ///
+    /// `stop()` clears the published geometry, but a camera OFF→ON pair does not
+    /// always create a new encoder generation, so nothing would republish and a LIVE
+    /// camera would read `—` for the rest of the session. The chain, each link
+    /// verified in code: `host.rs` camera-ON calls `select()` BEFORE
+    /// `set_enabled(true)`; `select()` raises `switching` only when already enabled,
+    /// so it stays false; `start()`'s #1295 duplicate guard then matches
+    /// `running && !switch_requested && same_device` and returns early; no new
+    /// generation means no `'restart`-head clear and no `build_layer` publish; and all
+    /// three reconfigure sites are gated on a change a CLEAR does not move.
+    ///
+    /// **THE FIRST FIX FOR THIS WAS WRONG and this test is why the shape changed.**
+    /// It compared an `enabled` rising edge per frame, which cannot see the very
+    /// scenario above: the loop is parked in `video_reader.read().await` across the
+    /// OFF→ON pair, so it never samples the disabled state and on resume reads
+    /// `(true, true)` — no edge, no republish, still stranded. Comparing a clear
+    /// GENERATION is edge-independent: `stop()` records its clear whether or not any
+    /// frame boundary observed it. The unobserved-transition case below is the one the
+    /// edge version failed.
+    ///
+    /// MUTATION (run): drop the `&& enabled` and the disabled cases fail (that would
+    /// undo `stop()`'s sentinel). Change `!=` to `>` and it still passes here but
+    /// breaks on `u64` wrap — `!=` is deliberate. Compare against a constant instead
+    /// of `seen` and the already-reconciled case fails, which is the every-frame
+    /// republish this must not become.
+    #[test]
+    fn republish_geometry_after_an_unreconciled_clear_only_while_enabled() {
+        // THE CASE THE EDGE VERSION MISSED: a clear the loop never observed (it was
+        // parked in `read().await` across the whole OFF→ON pair). `seen` still trails
+        // `live`, so the republish fires on resume even though `enabled` never
+        // appeared to change from this loop's point of view.
+        assert!(republish_geometry_on_tick(0, 1, true));
+        // Several unobserved clears collapse into one republish — the loop only needs
+        // to reach the current state, not replay each clear.
+        assert!(republish_geometry_on_tick(3, 7, true));
+
+        // Already reconciled: must NOT republish. This is the steady state at 30-50 Hz
+        // per layer, and republishing here would defeat the change-gating the whole
+        // channel depends on.
+        assert!(!republish_geometry_on_tick(7, 7, true));
+
+        // Clear seen while STOPPED: must NOT republish — that would write live-looking
+        // geometry back over the sentinel `stop()` just wrote, the exact contract
+        // `loop_may_publish_geometry` protects. The caller advances its seen-generation
+        // only after a republish, so this is repaired on the next enabled frame rather
+        // than lost.
+        assert!(!republish_geometry_on_tick(0, 1, false));
+        assert!(!republish_geometry_on_tick(7, 7, false));
+    }
+
     #[test]
     fn video_at_floor_on_tick_clears_on_camera_enable_rising_edge() {
         // RISING edge (disabled -> enabled): force-clear even if the detector

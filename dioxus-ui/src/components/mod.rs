@@ -11,6 +11,10 @@ pub mod capability_check;
 pub mod color_picker;
 pub mod config_error;
 pub mod connection_quality_indicator;
+// Issue #367: test-only diagnostics-bus injection hook that publishes synthetic
+// `active_server_rtt` samples for the indicator above (gated on
+// MOCK_PEERS_ENABLED). Registers window.__videocall_inject_server_rtt.
+pub mod connection_quality_inject;
 pub mod decode_budget;
 pub mod decode_budget_banner;
 pub mod decode_budget_inject;
@@ -81,8 +85,8 @@ pub mod update_display_name_modal;
 pub mod video_control_buttons;
 pub mod waiting_room;
 
-mod canvas_generator;
+pub mod canvas_generator;
 mod peer_list;
-mod peer_tile;
+pub mod peer_tile;
 pub mod pre_join_preview;
 pub mod pre_join_settings_card;

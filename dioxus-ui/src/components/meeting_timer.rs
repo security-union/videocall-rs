@@ -216,15 +216,33 @@ pub fn format_remaining(remaining_ms: u64) -> String {
 }
 
 /// Human-readable duration for announcements and control labels ("5 minutes").
+///
+/// Grows an HOURS field past an hour, which is issue 2172's doing. Before the
+/// typed duration the longest thing a host could set in one action was the
+/// 15-minute preset, and the only route past an hour was clicking "+1 min" a few
+/// dozen times — so an hour-plus wording was barely reachable. Typing a duration
+/// puts the whole range up to the 24h cap one keystroke away, and "Start a 1440
+/// minutes timer" is not an accessible name anyone can parse.
+///
+/// Zero renders as "0 seconds" rather than the empty string: it is the wording
+/// [`compose_transition_announcement`] and [`compose_chip_label`] fall back to,
+/// and an empty duration in the middle of a sentence reads as a bug.
 pub fn format_duration_words(duration_ms: u64) -> String {
     let total_secs = duration_ms / 1_000;
-    let minutes = total_secs / 60;
+    let hours = total_secs / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
     let seconds = total_secs % 60;
-    match (minutes, seconds) {
-        (0, s) => format!("{s} second{}", plural(s)),
-        (m, 0) => format!("{m} minute{}", plural(m)),
-        (m, s) => format!("{m} minute{} {s} second{}", plural(m), plural(s)),
+    let mut parts: Vec<String> = Vec::new();
+    if hours > 0 {
+        parts.push(format!("{hours} hour{}", plural(hours)));
     }
+    if minutes > 0 {
+        parts.push(format!("{minutes} minute{}", plural(minutes)));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!("{seconds} second{}", plural(seconds)));
+    }
+    parts.join(" ")
 }
 
 fn plural(n: u64) -> &'static str {
@@ -326,6 +344,115 @@ pub fn should_drop_timer_on_connect(
     applied: Option<MeetingTimerState>,
 ) -> bool {
     applied.is_some() && !driving.is_some_and(|s| s.running)
+}
+
+/// Unit for the host's typed duration (issue 2172).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomDurationUnit {
+    Seconds,
+    Minutes,
+}
+
+impl CustomDurationUnit {
+    /// Milliseconds in one of this unit.
+    pub fn ms(self) -> u64 {
+        match self {
+            CustomDurationUnit::Seconds => 1_000,
+            CustomDurationUnit::Minutes => 60_000,
+        }
+    }
+
+    /// The `<option value>` this unit is carried as, and the string the change
+    /// handler reads back off the `<select>`.
+    pub fn as_value(self) -> &'static str {
+        match self {
+            CustomDurationUnit::Seconds => "seconds",
+            CustomDurationUnit::Minutes => "minutes",
+        }
+    }
+
+    /// The unit for an `<option value>`, or `None` for anything that is not one
+    /// of the two options rendered.
+    ///
+    /// `None` leaves the current unit ALONE rather than resolving to a default.
+    /// The only writer of this string is the `<option>` list in
+    /// [`MeetingTimerPopover`], so an unrecognised value means the DOM was
+    /// tampered with, and quietly picking some unit would start a timer of a
+    /// length the host never chose.
+    pub fn from_value(raw: &str) -> Option<Self> {
+        match raw {
+            "seconds" => Some(CustomDurationUnit::Seconds),
+            "minutes" => Some(CustomDurationUnit::Minutes),
+            _ => None,
+        }
+    }
+}
+
+/// The unit the custom entry OPENS on.
+///
+/// Minutes, matching the unit every preset button directly above it is labelled
+/// in ("5 min"), so a number the host types reads in the same unit as the row
+/// they just looked at. It also errs in the safer direction: a mis-set value is
+/// then too LONG, rather than a 5-second timer that buzzes at the whole room a
+/// moment after the host meant to give a speaker five minutes.
+pub const MEETING_TIMER_CUSTOM_DEFAULT_UNIT: CustomDurationUnit = CustomDurationUnit::Minutes;
+
+/// Parse the host's typed duration into milliseconds (issue 2172).
+///
+/// THE single source of truth for the custom row: the confirm button's disabled
+/// state, its accessible name, the hint beneath it and the value actually handed
+/// to `on_start` all read this one result, so what the button says, whether it
+/// can be clicked, and what the room gets cannot disagree.
+///
+/// `None` means "not a duration", and DISABLES the confirm button. The accepted
+/// shape is exactly "optional surrounding space, then one or more ASCII digits,
+/// not all zero" — so empty, whitespace, `0`, `-5`, `+5`, `1.5`, `1e3`, `5m` and
+/// non-ASCII digits are all refused. Rejecting rather than coercing matters
+/// because the alternative is a live-looking button that starts something the
+/// host did not type.
+///
+/// The digit check is deliberately made BEFORE the parse rather than as a
+/// fallback after it, because `u64::from_str` accepts a leading `+`: checking
+/// afterwards would take `+5` (parses) but refuse a `+` followed by an
+/// over-length run of digits (does not parse, is not all digits), which is an
+/// asymmetry nobody could predict from the outside.
+///
+/// An amount ABOVE the ceiling CLAMPS to [`MEETING_TIMER_MAX_DURATION_MS`]
+/// instead of rejecting, for two reasons:
+///
+///  * the relay DROPS an over-cap START at ingress rather than clamping it
+///    (`packet_handler.rs` checks `duration_ms <= MEETING_TIMER_MAX_DURATION_MS`
+///    and returns `Dropped`), so an unclamped value would leave the host looking
+///    at a local echo of a timer no other participant can see; and
+///  * disabling on an over-cap value would be visually indistinguishable from
+///    disabling on junk, when a host typing "2000" minutes plainly wants the
+///    longest timer available.
+///
+/// The clamped value is what the button's accessible name and the visible hint
+/// spell out, so the cap is stated BEFORE it is applied rather than discovered
+/// after — a host who types 2000 minutes reads "Timer will run for 24 hours."
+/// while the entry still has focus.
+pub fn custom_duration_ms(value: &str, unit: CustomDurationUnit) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Guaranteed by the check above to be a non-empty run of ASCII digits, so the
+    // ONLY way this parse can fail is overflow — which is still a well-formed
+    // request for more time than exists, and takes the same clamp as "2000
+    // minutes" rather than blanking the button.
+    let amount = trimmed.parse::<u64>().unwrap_or(u64::MAX);
+    if amount == 0 {
+        return None;
+    }
+    // `saturating_mul` before the clamp, and the danger is not that a wrapped
+    // product is obviously wrong — it is that it lands back INSIDE the cap and
+    // reads as a plausible short timer. The smallest minute count that overflows
+    // is 307_445_734_561_826; `scaling_to_milliseconds_saturates_rather_than_wrapping`
+    // pins the seconds witness 18_446_744_073_709_552, whose wrapped product is
+    // exactly 384 ms — a third-of-a-second timer from a host asking for longer
+    // than the universe.
+    Some(clamp_duration_ms(amount.saturating_mul(unit.ms())))
 }
 
 /// Build the state for a host STARTING a timer of `duration_ms` at `now_ms`.
@@ -838,6 +965,49 @@ fn dock_position_class() -> &'static str {
         .unwrap_or("dock-bottom")
 }
 
+/// DOM id of the custom-duration field, so its visible `<label>` can point at it
+/// with `for` rather than relying on an `aria-label` alone (a real label is also
+/// a click target that focuses the field).
+const MEETING_TIMER_CUSTOM_VALUE_ID: &str = "meeting-timer-custom-value";
+
+/// DOM id of the custom row's hint, referenced by the field's AND the confirm
+/// button's `aria-describedby` so the rule, the resolved duration, and the
+/// reason the button is inert are all read out with the control in hand.
+const MEETING_TIMER_CUSTOM_HINT_ID: &str = "meeting-timer-custom-hint";
+
+/// DOM id of the "Custom length" label, so the field+unit pair can be exposed as
+/// one labelled `role="group"` rather than two unrelated controls.
+const MEETING_TIMER_CUSTOM_LABEL_ID: &str = "meeting-timer-custom-label";
+
+/// Accessible name for the custom Start button.
+///
+/// Spells the resulting duration out the way the presets do, because "Start"
+/// alone names no duration at all. Split out of the RSX so the running branch of
+/// [`MeetingTimerPopover`] never allocates it, and so the wording is unit-
+/// testable rather than only reachable through a rendered component.
+fn compose_custom_start_label(custom_ms: Option<u64>) -> String {
+    match custom_ms {
+        Some(ms) => format!("Start a {} timer", format_duration_words(ms)),
+        None => "Start a custom timer".to_string(),
+    }
+}
+
+/// Visible hint under the custom row, also its `aria-describedby` target.
+///
+/// Restates the RESOLVED duration, which is how a CLAMPED entry becomes visible:
+/// type 2000 minutes and this reads "24 hours". When the entry does not parse it
+/// states the rule instead, which is the only place a keyboard or screen-reader
+/// user learns why Start is inert.
+///
+/// Deliberately NOT a live region — one that announced would speak on every
+/// keystroke.
+fn compose_custom_hint(custom_ms: Option<u64>) -> String {
+    match custom_ms {
+        Some(ms) => format!("Timer will run for {}.", format_duration_words(ms)),
+        None => "Enter a whole number, then pick minutes or seconds.".to_string(),
+    }
+}
+
 /// The host's start / extend / cancel panel (issue 2136).
 ///
 /// A COMPONENT rather than inline RSX in `AttendantsComponent` for the same
@@ -863,6 +1033,34 @@ pub fn MeetingTimerPopover(
     // extends a RUNNING timer under time pressure, so a long trip to find the
     // panel actually costs something here.
     let dock_class = dock_position_class();
+
+    // Issue 2172: the typed duration. Local to this component, which the caller
+    // mounts only while the popover is OPEN -- so the field starts empty on every
+    // open and there is no stale entry from a previous session to guard against.
+    let mut custom_value = use_signal(String::new);
+    let mut custom_unit = use_signal(|| MEETING_TIMER_CUSTOM_DEFAULT_UNIT);
+    let custom_raw = custom_value();
+    let unit = custom_unit();
+    // Both of these are allocation-free (a parse that short-circuits on the empty
+    // string plus a comparison), so they cost nothing on the running branch that
+    // does not use them. The two STRING derivations are not computed here for
+    // exactly that reason -- see `compose_custom_start_label` / `_hint`, which are
+    // called from inside the idle branch.
+    let custom_ms = custom_duration_ms(&custom_raw, unit);
+
+    // Shared by the confirm button and the Enter key so the two cannot diverge.
+    // Reads through `peek` rather than closing over `custom_ms`: the render that
+    // produced that value may not have flushed yet when a fast typist hits Enter,
+    // and a stale capture would start the previous keystroke's duration.
+    let submit_custom = move || {
+        let parsed = custom_duration_ms(custom_value.peek().as_str(), *custom_unit.peek());
+        // The peek guards are released by the end of the statement above, BEFORE
+        // `on_start` runs -- it closes the popover, which unmounts this component
+        // and drops these signals.
+        if let Some(ms) = parsed {
+            on_start.call(ms);
+        }
+    };
 
     rsx! {
         div {
@@ -923,6 +1121,139 @@ pub fn MeetingTimerPopover(
                             onclick: move |_| on_start.call(preset_ms),
                             "{preset_ms / 60_000} min"
                         }
+                    }
+                }
+
+                // Issue 2172: anything the presets do not cover, down to a single
+                // second. BELOW the presets rather than beside them -- the
+                // one-click path stays the widest, most obvious target, and a
+                // field sharing that row would squeeze all four presets under the
+                // 44px touch target the row is built around.
+                div { class: "meeting-timer-popover-custom",
+                    label {
+                        id: MEETING_TIMER_CUSTOM_LABEL_ID,
+                        class: "meeting-timer-popover-custom-label",
+                        r#for: MEETING_TIMER_CUSTOM_VALUE_ID,
+                        "Custom length"
+                    }
+                    div { class: "meeting-timer-popover-row meeting-timer-popover-row--custom",
+                        // The amount and its unit are ONE value split across two
+                        // controls, so they are exposed as one labelled group
+                        // rather than as two unrelated fields. The confirm button
+                        // stays outside it -- it is an action, not part of the
+                        // value.
+                        div {
+                            class: "meeting-timer-custom-group",
+                            role: "group",
+                            "aria-labelledby": MEETING_TIMER_CUSTOM_LABEL_ID,
+                            input {
+                                id: MEETING_TIMER_CUSTOM_VALUE_ID,
+                                class: "meeting-timer-custom-value",
+                                "data-testid": "meeting-timer-custom-value",
+                                // TEXT, not `type="number"`, with the numeric soft
+                                // keyboard kept via `inputmode`.
+                                //
+                                // A number input reports "" for any value that is
+                                // not a valid floating-point number, and dioxus-html
+                                // declares input `value` VOLATILE (elements.rs:1488),
+                                // so it writes the signal back to the DOM every
+                                // render instead of trusting the diff. Those two
+                                // compose badly on the INTERMEDIATE states of an
+                                // ordinary keystroke sequence: typing "1.5" passes
+                                // through "1.", which is not a valid float, so the
+                                // read is "", the signal becomes "", and the
+                                // volatile write CLEARS the field -- the "5" then
+                                // lands in an empty box and the button truthfully
+                                // offers to start a 5-minute timer for an entry the
+                                // host never made.
+                                //
+                                // Silently mangling the value is precisely what the
+                                // parser exists to prevent, so the rejection has to
+                                // stay VISIBLE: with a text input "1.5" stays on
+                                // screen, Start stays inert, and the hint says why.
+                                r#type: "text",
+                                inputmode: "numeric",
+                                // The field is a duration, not an identity -- a
+                                // saved-value dropdown over it is noise.
+                                autocomplete: "off",
+                                "aria-describedby": MEETING_TIMER_CUSTOM_HINT_ID,
+                                value: "{custom_raw}",
+                                oninput: move |e: Event<FormData>| custom_value.set(e.value()),
+                                onkeydown: move |evt: Event<KeyboardData>| {
+                                    // Enter commits, exactly as clicking Start does. Escape
+                                    // is deliberately NOT handled here so it keeps bubbling
+                                    // to the dialog's own handler and still closes the
+                                    // popover from inside the field.
+                                    if evt.key() == Key::Enter {
+                                        evt.prevent_default();
+                                        submit_custom();
+                                    }
+                                },
+                            }
+                            select {
+                                class: "meeting-timer-custom-unit",
+                                "data-testid": "meeting-timer-custom-unit",
+                                // A native select rather than a segmented radiogroup:
+                                // it brings arrow keys, type-ahead and Home/End for
+                                // free, which matters inside a dialog that already has
+                                // a deliberate keyboard model to preserve.
+                                "aria-label": "Custom length unit",
+                                onchange: move |e: Event<FormData>| {
+                                    if let Some(u) = CustomDurationUnit::from_value(&e.value()) {
+                                        custom_unit.set(u);
+                                    }
+                                },
+                                // The SAME Enter handler as the field. Without it,
+                                // Tab-to-unit-then-Enter is a dead key -- the one
+                                // path a keyboard user takes to change the unit and
+                                // commit. Bound per-control rather than hoisted to
+                                // the row, because a row-level handler would also
+                                // see the Enter that ACTIVATES the Start button and
+                                // submit twice.
+                                onkeydown: move |evt: Event<KeyboardData>| {
+                                    if evt.key() == Key::Enter {
+                                        evt.prevent_default();
+                                        submit_custom();
+                                    }
+                                },
+                                option {
+                                    value: CustomDurationUnit::Minutes.as_value(),
+                                    selected: unit == CustomDurationUnit::Minutes,
+                                    "minutes"
+                                }
+                                option {
+                                    value: CustomDurationUnit::Seconds.as_value(),
+                                    selected: unit == CustomDurationUnit::Seconds,
+                                    "seconds"
+                                }
+                            }
+                        }
+                        button {
+                            class: "meeting-timer-popover-action meeting-timer-popover-action--custom",
+                            r#type: "button",
+                            "data-testid": "meeting-timer-custom-start",
+                            // `aria-disabled`, NOT the `disabled` attribute. A real
+                            // `disabled` drops the button out of the tab order, so
+                            // a keyboard or screen-reader user reaches the end of
+                            // the popover having never met the control and is never
+                            // told what it wants. This stays focusable and
+                            // describes itself; `submit_custom` is a no-op on a
+                            // `None` parse, so activating it anyway does nothing.
+                            "aria-disabled": if custom_ms.is_none() { "true" } else { "false" },
+                            // Spells the resulting duration out, like the presets do.
+                            "aria-label": compose_custom_start_label(custom_ms),
+                            // The reason it is inert, for someone who tabbed
+                            // straight to it without passing through the field.
+                            "aria-describedby": MEETING_TIMER_CUSTOM_HINT_ID,
+                            onclick: move |_| submit_custom(),
+                            "Start"
+                        }
+                    }
+                    p {
+                        id: MEETING_TIMER_CUSTOM_HINT_ID,
+                        class: "meeting-timer-popover-hint",
+                        "data-testid": "meeting-timer-custom-hint",
+                        {compose_custom_hint(custom_ms)}
                     }
                 }
             }
@@ -1061,6 +1392,10 @@ pub fn MeetingTimerLiveRegion() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The 24h ceiling is referenced only by tests now that the field carries no
+    // `max` attribute — `custom_duration_ms` reaches it through
+    // `clamp_duration_ms`, not by name.
+    use videocall_client::MEETING_TIMER_MAX_DURATION_MS;
 
     fn st(running: bool, ends: u64, dur: u64, updated: u64) -> MeetingTimerState {
         MeetingTimerState {
@@ -1692,6 +2027,360 @@ mod tests {
         assert_eq!(format_duration_words(1_000), "1 second");
         assert_eq!(format_duration_words(30_000), "30 seconds");
         assert_eq!(format_duration_words(90_000), "1 minute 30 seconds");
+    }
+
+    /// Past an hour the wording grows an HOURS field. Issue 2172 is what makes
+    /// this reachable: typing a duration puts the whole range up to the 24h cap
+    /// one keystroke away, where before the longest preset was 15 minutes.
+    ///
+    /// MUTATION PROOF, both shapes the mistake takes, both actually run:
+    ///
+    ///  * DELETE the `hours` branch outright — one hour renders "0 seconds", and
+    ///    so does the 24h cap. NOT "1440 minutes": `minutes` is
+    ///    `(total_secs % 3_600) / 60`, which is 0 at a whole number of hours, so
+    ///    the hours do not spill into it, they simply vanish.
+    ///  * FOLD hours into minutes (`minutes + hours * 60`) — one hour renders
+    ///    "60 minutes" and the cap renders "1440 minutes".
+    ///
+    /// Both go red on the FIRST assertion, since 3_600_000 already separates all
+    /// three spellings.
+    #[test]
+    fn duration_words_grow_an_hours_field_past_an_hour() {
+        assert_eq!(format_duration_words(3_600_000), "1 hour");
+        assert_eq!(format_duration_words(7_200_000), "2 hours");
+        assert_eq!(format_duration_words(3_660_000), "1 hour 1 minute");
+        assert_eq!(
+            format_duration_words(5_430_000),
+            "1 hour 30 minutes 30 seconds"
+        );
+        assert_eq!(
+            format_duration_words(MEETING_TIMER_MAX_DURATION_MS),
+            "24 hours",
+            "the ceiling a typed duration clamps to must read as hours -- \
+             'Start a 1440 minutes timer' is not an accessible name anyone can \
+             parse"
+        );
+    }
+
+    /// Zero must still render, and as SECONDS. It is the wording
+    /// `compose_transition_announcement` and `compose_chip_label` fall back to,
+    /// and an empty string mid-sentence reads as a bug.
+    ///
+    /// MUTATION PROOF: drop the `|| parts.is_empty()` term and this returns "".
+    #[test]
+    fn a_zero_duration_still_reads_as_seconds() {
+        assert_eq!(format_duration_words(0), "0 seconds");
+    }
+
+    // ---------------------------------------------------------------------
+    // custom_duration_ms -- the typed duration (issue 2172)
+    // ---------------------------------------------------------------------
+
+    /// THE case the issue names: "such as 30 seconds". Asserted end to end
+    /// through the production formatter as well, because that string is the
+    /// confirm button's accessible name.
+    ///
+    /// MUTATION PROOF: change `CustomDurationUnit::Seconds.ms()` from 1_000 and
+    /// both assertions go red.
+    #[test]
+    fn a_thirty_second_timer_is_typeable() {
+        let ms = custom_duration_ms("30", CustomDurationUnit::Seconds)
+            .expect("30 seconds is a duration a host must be able to type");
+        assert_eq!(ms, 30_000);
+        assert_eq!(
+            format_duration_words(ms),
+            "30 seconds",
+            "the confirm button spells the resulting duration out with this, so a \
+             wrong conversion would also mislabel the button"
+        );
+    }
+
+    /// Minutes convert against the SAME constant the preset row is built from, so
+    /// typing a preset's number cannot mean something different from clicking it.
+    ///
+    /// MUTATION PROOF: change `CustomDurationUnit::Minutes.ms()` from 60_000 and
+    /// both assertions go red.
+    #[test]
+    fn a_typed_minute_count_means_the_same_as_the_matching_preset() {
+        assert_eq!(
+            custom_duration_ms("5", CustomDurationUnit::Minutes),
+            Some(MEETING_TIMER_PRESETS_MS[1])
+        );
+        assert_eq!(
+            custom_duration_ms("15", CustomDurationUnit::Minutes),
+            Some(MEETING_TIMER_PRESETS_MS[3])
+        );
+    }
+
+    /// The unit the control OPENS on has to be the one the presets are labelled
+    /// in, or a host who types "5" alongside a row of "min" buttons gets five
+    /// SECONDS -- a timer that buzzes at the whole room almost immediately.
+    ///
+    /// MUTATION PROOF: flip `MEETING_TIMER_CUSTOM_DEFAULT_UNIT` to `Seconds` and
+    /// this goes red. (Asserting the constant against itself would pin nothing;
+    /// this asserts what the default MEANS.)
+    #[test]
+    fn the_default_unit_matches_the_unit_the_presets_are_labelled_in() {
+        assert_eq!(
+            custom_duration_ms("5", MEETING_TIMER_CUSTOM_DEFAULT_UNIT),
+            Some(MEETING_TIMER_PRESETS_MS[1]),
+            "the presets read '5 min', so typing 5 into the field as it opens must \
+             mean the same five minutes"
+        );
+    }
+
+    /// Everything that is NOT a duration returns `None`, which is what disables
+    /// the confirm button. A live-looking button that starts something the host
+    /// did not type is the failure this prevents.
+    ///
+    /// `+5` is in the list on purpose. `u64::from_str` ACCEPTS a leading `+`, so
+    /// a digit check applied only as a fallback AFTER a failed parse would take
+    /// `+5` while refusing `+` followed by an over-length run of digits — an
+    /// asymmetry with no reason a caller could infer. Checking the digits first
+    /// refuses every signed entry alike, and this case pins that.
+    ///
+    /// MUTATION PROOF: drop the `amount == 0` guard and "0" returns `Some(0)`;
+    /// drop the `trimmed.is_empty()` guard and "" passes the digit check
+    /// vacuously (`"".bytes().all(..)` is true), fails to parse, and clamps to
+    /// the 24h cap; drop the digit check and "1.5"/"abc"/"+5" clamp to the cap
+    /// instead of rejecting.
+    #[test]
+    fn an_entry_that_is_not_a_duration_disables_the_confirm_button() {
+        for junk in [
+            "",
+            "   ",
+            "0",
+            "000",
+            "-5",
+            "+5",
+            "1.5",
+            ".5",
+            "1e3",
+            "abc",
+            "5m",
+            "5 minutes",
+            "+",
+            "١٢",
+        ] {
+            assert_eq!(
+                custom_duration_ms(junk, CustomDurationUnit::Seconds),
+                None,
+                "{junk:?} is not a whole count of units and must leave the confirm \
+                 button disabled"
+            );
+            assert_eq!(custom_duration_ms(junk, CustomDurationUnit::Minutes), None);
+        }
+    }
+
+    /// Surrounding whitespace is the host's, not an error -- a pasted value
+    /// carries it routinely.
+    ///
+    /// MUTATION PROOF: drop the `.trim()` and " 30 " fails to parse, fails the
+    /// all-digits check, and returns `None`.
+    #[test]
+    fn surrounding_whitespace_is_tolerated() {
+        assert_eq!(
+            custom_duration_ms(" 30 ", CustomDurationUnit::Seconds),
+            Some(30_000)
+        );
+    }
+
+    /// An over-cap amount CLAMPS. The relay drops an over-cap START at ingress
+    /// rather than clamping it, so sending one unclamped leaves the host looking
+    /// at a local echo of a timer nobody else can see.
+    ///
+    /// MUTATION PROOF: remove the `clamp_duration_ms` call and the first case
+    /// returns 120_000_000; replace `saturating_mul` with `*` and the
+    /// all-digits-overflow case panics in a debug build.
+    #[test]
+    fn an_over_cap_entry_clamps_to_the_relay_ceiling() {
+        assert_eq!(
+            custom_duration_ms("2000", CustomDurationUnit::Minutes),
+            Some(MEETING_TIMER_MAX_DURATION_MS),
+            "the relay DROPS an over-cap START instead of clamping it, so the UI \
+             has to clamp before it sends"
+        );
+        assert_eq!(
+            custom_duration_ms("999999999", CustomDurationUnit::Seconds),
+            Some(MEETING_TIMER_MAX_DURATION_MS)
+        );
+        // Longer than `u64` can hold: still a request for more time than exists,
+        // not junk, so it clamps rather than blanking the button.
+        assert_eq!(
+            custom_duration_ms("18446744073709551616", CustomDurationUnit::Minutes),
+            Some(MEETING_TIMER_MAX_DURATION_MS)
+        );
+    }
+
+    /// The multiply must SATURATE. An amount that fits in `u64` can still
+    /// overflow once scaled to milliseconds, and a wrapped product does not land
+    /// somewhere obviously wrong — it lands back inside the cap, as a
+    /// plausible-looking timer that starts and buzzes almost immediately.
+    ///
+    /// THE WITNESS MATTERS, and the obvious one does not work. Neither `u64::MAX`
+    /// nor a digit run too long to parse distinguishes the two spellings:
+    /// `u64::MAX.wrapping_mul(60_000)` is `2^64 - 60_000`, still astronomically
+    /// over the cap, so both forms clamp and the test passes on the broken code.
+    /// (That is the same trap `urgency_does_not_overflow_on_a_huge_remaining`
+    /// documents one function up, and this test was written with the useless
+    /// witness first — it stayed green against `wrapping_mul` until the value
+    /// below replaced it.)
+    ///
+    /// `18_446_744_073_709_552` seconds is the value that bites: times 1_000 it
+    /// is 384 ms past `2^64`, so the wrapping form returns `Some(384)` — a
+    /// third-of-a-second timer — where saturating returns the 24h ceiling.
+    ///
+    /// MUTATION PROOF: swap `saturating_mul` for `wrapping_mul` and this goes red.
+    #[test]
+    fn scaling_to_milliseconds_saturates_rather_than_wrapping() {
+        assert_eq!(
+            custom_duration_ms("18446744073709552", CustomDurationUnit::Seconds),
+            Some(MEETING_TIMER_MAX_DURATION_MS),
+            "a wrapped product lands back INSIDE the cap (384 ms here), so the \
+             host would ask for longer than the universe and get a timer that \
+             expires before they let go of the button"
+        );
+    }
+
+    /// The exact ceiling in BOTH units, plus the value one step below it. The
+    /// second half is what stops a "clamp" that is really a constant: replace the
+    /// clamp with `MEETING_TIMER_MAX_DURATION_MS` and the 1439-minute assertion
+    /// goes red while every over-cap assertion stays green.
+    #[test]
+    fn the_exact_cap_is_accepted_and_the_step_below_it_is_untouched() {
+        let max_minutes = MEETING_TIMER_MAX_DURATION_MS / 60_000;
+        let max_seconds = MEETING_TIMER_MAX_DURATION_MS / 1_000;
+        assert_eq!(
+            custom_duration_ms(&max_minutes.to_string(), CustomDurationUnit::Minutes),
+            Some(MEETING_TIMER_MAX_DURATION_MS)
+        );
+        assert_eq!(
+            custom_duration_ms(&max_seconds.to_string(), CustomDurationUnit::Seconds),
+            Some(MEETING_TIMER_MAX_DURATION_MS)
+        );
+        assert_eq!(
+            custom_duration_ms(&(max_minutes - 1).to_string(), CustomDurationUnit::Minutes),
+            Some(MEETING_TIMER_MAX_DURATION_MS - 60_000),
+            "a sub-cap value must pass through untouched -- clamping everything to \
+             the ceiling would satisfy every over-cap test and still be wrong"
+        );
+    }
+
+    /// The smallest timer the field can produce. There is no floor server-side
+    /// (`packet_handler` bounds `duration_ms` only from ABOVE, plus the
+    /// `ends_at_ms >= duration_ms` consistency check), so one second is a legal
+    /// timer and must not be rejected as if it were junk.
+    #[test]
+    fn one_second_is_the_floor_and_it_is_accepted() {
+        assert_eq!(
+            custom_duration_ms("1", CustomDurationUnit::Seconds),
+            Some(1_000)
+        );
+        let s = start_state(1_000, 1_700_000_000_000);
+        assert!(
+            s.ends_at_ms >= s.duration_ms,
+            "the relay's internal-consistency check must hold for the shortest \
+             timer the field can produce"
+        );
+    }
+
+    /// The `<option value>` strings and the parser that reads them back must
+    /// agree, since a mismatch would silently pin the unit at whatever it was.
+    ///
+    /// MUTATION PROOF: make `as_value` return the same string for both variants
+    /// and the round trip maps Seconds to Minutes -> red.
+    #[test]
+    fn unit_option_values_round_trip() {
+        for unit in [CustomDurationUnit::Seconds, CustomDurationUnit::Minutes] {
+            assert_eq!(
+                CustomDurationUnit::from_value(unit.as_value()),
+                Some(unit),
+                "{unit:?} must survive the trip through its <option value>"
+            );
+        }
+        assert_ne!(
+            CustomDurationUnit::Seconds.as_value(),
+            CustomDurationUnit::Minutes.as_value(),
+            "two units sharing an <option value> would make the control unable to \
+             report which one was picked"
+        );
+    }
+
+    /// An unrecognised value leaves the unit alone rather than resolving to a
+    /// default, so a tampered DOM cannot start a timer of a length the host never
+    /// picked.
+    #[test]
+    fn an_unknown_unit_value_is_refused_rather_than_defaulted() {
+        assert_eq!(CustomDurationUnit::from_value("hours"), None);
+        assert_eq!(CustomDurationUnit::from_value(""), None);
+        assert_eq!(CustomDurationUnit::from_value("Minutes"), None);
+    }
+
+    /// The confirm button's accessible name and the hint are the ONLY places a
+    /// host is told what the entry resolved to — including that it was clamped,
+    /// which nothing else surfaces. Both are asserted through the production
+    /// composers rather than re-formatted here.
+    ///
+    /// MUTATION PROOF: make either composer ignore its argument and return a
+    /// fixed string, and the corresponding pair of assertions goes red.
+    #[test]
+    fn the_button_and_hint_spell_out_what_the_entry_resolved_to() {
+        let thirty_s = custom_duration_ms("30", CustomDurationUnit::Seconds);
+        assert_eq!(
+            compose_custom_start_label(thirty_s),
+            "Start a 30 seconds timer"
+        );
+        assert_eq!(
+            compose_custom_hint(thirty_s),
+            "Timer will run for 30 seconds."
+        );
+
+        // A CLAMPED entry: the host typed 2000 minutes and both surfaces say 24
+        // hours, which is the only warning that the cap was applied.
+        let clamped = custom_duration_ms("2000", CustomDurationUnit::Minutes);
+        assert_eq!(
+            compose_custom_start_label(clamped),
+            "Start a 24 hours timer"
+        );
+        assert_eq!(compose_custom_hint(clamped), "Timer will run for 24 hours.");
+
+        // An entry that does not parse: the button still has a name (it stays in
+        // the tab order under `aria-disabled`), and the hint states the rule,
+        // which is the only place the reason is available.
+        assert_eq!(compose_custom_start_label(None), "Start a custom timer");
+        assert_eq!(
+            compose_custom_hint(None),
+            "Enter a whole number, then pick minutes or seconds."
+        );
+    }
+
+    /// A typed duration takes the SAME start path as a preset, so everything the
+    /// wire contract requires of a preset holds for it: `start_state` clamps, and
+    /// `ends_at_ms >= duration_ms` -- the two conditions the relay checks before
+    /// it will broadcast a START.
+    #[test]
+    fn a_typed_duration_produces_a_start_the_relay_will_accept() {
+        let now = 1_700_000_000_000;
+        for (raw, unit) in [
+            ("30", CustomDurationUnit::Seconds),
+            ("90", CustomDurationUnit::Minutes),
+            ("999999999", CustomDurationUnit::Minutes),
+        ] {
+            let ms = custom_duration_ms(raw, unit).expect("a valid entry");
+            let s = start_state(ms, now);
+            assert!(s.running);
+            assert!(
+                s.duration_ms <= MEETING_TIMER_MAX_DURATION_MS,
+                "{raw} {unit:?} exceeds the cap the relay drops on"
+            );
+            assert!(s.ends_at_ms >= s.duration_ms);
+            assert_eq!(
+                s.duration_ms, ms,
+                "the duration the button advertised must be the duration that \
+                 starts -- `start_state` clamping again would mean the label and \
+                 the timer could disagree"
+            );
+        }
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub enum MeetingStatus {
         end_on_host_leave: bool,
         allow_guests: bool,
         recording_allowed_for_all: bool,
+        chat_allowed_for_all: bool,
     },
     Rejected,
     Error(String),
@@ -354,6 +355,8 @@ pub fn MeetingPage(id: String) -> Element {
                                                     allow_guests: response.allow_guests,
                                                     recording_allowed_for_all: response
                                                         .recording_allowed_for_all,
+                                                    chat_allowed_for_all: response
+                                                        .chat_allowed_for_all,
                                                 });
                                             } else {
                                                 meeting_status.set(MeetingStatus::Error(
@@ -541,6 +544,7 @@ pub fn MeetingPage(id: String) -> Element {
                                         allow_guests: response.allow_guests,
                                         recording_allowed_for_all: response
                                             .recording_allowed_for_all,
+                                        chat_allowed_for_all: response.chat_allowed_for_all,
                                     });
                                 } else {
                                     meeting_status.set(MeetingStatus::Error(
@@ -651,6 +655,7 @@ pub fn MeetingPage(id: String) -> Element {
                 end_on_host_leave: status.end_on_host_leave,
                 allow_guests: status.allow_guests,
                 recording_allowed_for_all: status.recording_allowed_for_all,
+                chat_allowed_for_all: status.chat_allowed_for_all,
             });
         }
     };
@@ -692,6 +697,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     end_on_host_leave: status.end_on_host_leave,
                                     allow_guests: status.allow_guests,
                                     recording_allowed_for_all: status.recording_allowed_for_all,
+                                    chat_allowed_for_all: status.chat_allowed_for_all,
                                 });
                             }
                         }
@@ -762,6 +768,7 @@ pub fn MeetingPage(id: String) -> Element {
                     allow_guests,
                     end_on_host_leave,
                     recording_allowed_for_all,
+                    chat_allowed_for_all,
 
                     // Waiting room
                 },
@@ -784,6 +791,7 @@ pub fn MeetingPage(id: String) -> Element {
                     end_on_host_leave: *end_on_host_leave,
                     allow_guests:*allow_guests,
                     recording_allowed_for_all: *recording_allowed_for_all,
+                    chat_allowed_for_all: *chat_allowed_for_all,
                 }
             },
             (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {

@@ -17,7 +17,7 @@ An open-source, ultra-low-latency video conferencing platform and API built with
 
 ## 🌟 Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=security-union/videocall-rs&type=Date)](https://star-history.com/#security-union/videocall-rs&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=security-union/videocall-rs&type=Date)](https://star-history.dera.page/#security-union/videocall-rs&Date)
 
 ## Who is this for?
 

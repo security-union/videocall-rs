@@ -192,14 +192,12 @@ pub fn MediaVideo(
                     let idx = idx.clone();
                     move || {
                         let cur = idx.get();
-                        let mut next = (js_sys::Math::random() * clips.len() as f64) as usize;
-                        if next >= clips.len() {
-                            next = clips.len() - 1;
-                        }
-                        // Never repeat the clip that just finished.
-                        if next == cur {
-                            next = (cur + 1) % clips.len();
-                        }
+                        // Uniform over the OTHER clips: offset 1..len from the
+                        // current index, so the finished clip never repeats and
+                        // the remaining clips are equally likely.
+                        let offset =
+                            1 + (js_sys::Math::random() * (clips.len() - 1) as f64) as usize;
+                        let next = (cur + offset.min(clips.len() - 1)) % clips.len();
                         idx.set(next);
                         video.set_src(&clips[next]);
                         video.load();

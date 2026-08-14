@@ -251,10 +251,10 @@
 }
 
 /* ====================================================================== *
- * Aliveness layer — live-call panel, system bento, rover field, bone band.
- * All motion is transform/opacity first (sparkline/multicast use tiny
- * stroke-dashoffset paths). Every keyframe is frozen under reduced-motion at
- * the bottom of this block. Byte cost is zero: no video, no fonts, no libs.
+ * Aliveness layer — live-call panel, relay-globe fallback, media bands,
+ * bone band. All motion is transform/opacity first (the multicast fallback
+ * uses tiny stroke-dashoffset paths). Every keyframe is frozen under
+ * reduced-motion at the bottom of this block.
  * ====================================================================== */
 @layer components {
   /* ---- Move A · live-call instrument panel --------------------------- */
@@ -363,85 +363,6 @@
     }
   }
 
-  /* ---- Move B · system bento ----------------------------------------- */
-  /* Waveform — mirrored around a centerline (origin center). */
-  .wave-bar {
-    transform-origin: center;
-    transform: scaleY(0.4);
-    animation-duration: 800ms;
-    animation-timing-function: ease-in-out;
-    animation-iteration-count: infinite;
-  }
-  .wave-bar:nth-child(5n + 1) {
-    animation-name: wave-a;
-    animation-delay: -100ms;
-  }
-  .wave-bar:nth-child(5n + 2) {
-    animation-name: wave-b;
-    animation-delay: -320ms;
-    animation-duration: 700ms;
-  }
-  .wave-bar:nth-child(5n + 3) {
-    animation-name: wave-c;
-    animation-delay: -540ms;
-    animation-duration: 920ms;
-  }
-  .wave-bar:nth-child(5n + 4) {
-    animation-name: wave-d;
-    animation-delay: -260ms;
-    animation-duration: 640ms;
-  }
-  .wave-bar:nth-child(5n + 5) {
-    animation-name: wave-e;
-    animation-delay: -700ms;
-    animation-duration: 860ms;
-  }
-  @keyframes wave-a {
-    0%,
-    100% {
-      transform: scaleY(0.2);
-    }
-    50% {
-      transform: scaleY(0.9);
-    }
-  }
-  @keyframes wave-b {
-    0%,
-    100% {
-      transform: scaleY(0.3);
-    }
-    50% {
-      transform: scaleY(0.7);
-    }
-  }
-  @keyframes wave-c {
-    0%,
-    100% {
-      transform: scaleY(0.15);
-    }
-    50% {
-      transform: scaleY(1);
-    }
-  }
-  @keyframes wave-d {
-    0%,
-    100% {
-      transform: scaleY(0.35);
-    }
-    50% {
-      transform: scaleY(0.6);
-    }
-  }
-  @keyframes wave-e {
-    0%,
-    100% {
-      transform: scaleY(0.25);
-    }
-    50% {
-      transform: scaleY(0.8);
-    }
-  }
-
   /* Multicast fan-out — dashes march outward from source to N nodes. */
   .packet-path {
     stroke-dasharray: 4 6;
@@ -476,51 +397,6 @@
     }
     85% {
       opacity: 1;
-    }
-  }
-
-  /* Latency sparkline — draws in once when its reveal enters view, then the
-     endpoint dot pulses. Fallback (no JS / reduced): rendered fully drawn. */
-  .spark-path {
-    stroke-dasharray: 400;
-    stroke-dashoffset: 0;
-  }
-  .reveal.reveal-armed .spark-path {
-    stroke-dashoffset: 400;
-  }
-  .reveal.reveal-armed.in-view .spark-path {
-    animation: spark-draw 900ms ease-out forwards;
-  }
-  @keyframes spark-draw {
-    to {
-      stroke-dashoffset: 0;
-    }
-  }
-  .spark-dot {
-    animation: spark-pulse 2s ease-in-out infinite;
-  }
-  @keyframes spark-pulse {
-    0%,
-    100% {
-      opacity: 1;
-    }
-    50% {
-      opacity: 0.4;
-    }
-  }
-
-  /* VP9 tile — macroblocks "encode" in a staggered opacity ripple. */
-  .vp9-block {
-    opacity: 0.15;
-    animation: vp9-encode 1.8s ease-in-out infinite;
-  }
-  @keyframes vp9-encode {
-    0%,
-    100% {
-      opacity: 0.15;
-    }
-    50% {
-      opacity: 0.7;
     }
   }
 
@@ -630,12 +506,6 @@
   .bone-ink-3 {
     color: #6e6a62;
   }
-  .bone-surface {
-    background: #e3e0d8;
-  }
-  .bone-border {
-    border-color: rgba(22, 21, 26, 0.16);
-  }
   .bone-divide > * + * {
     border-color: rgba(22, 21, 26, 0.16);
   }
@@ -651,24 +521,13 @@
       transform: scaleY(0.5) !important;
     }
     .rec-dot,
-    .wave-bar,
     .packet-path,
     .source-node,
-    .arrive-node,
-    .spark-dot,
-    .vp9-block {
+    .arrive-node {
       animation: none !important;
-    }
-    .vp9-block {
-      opacity: 0.4 !important;
     }
     .arrive-node {
       opacity: 1 !important;
-    }
-    .reveal.reveal-armed .spark-path,
-    .reveal.reveal-armed.in-view .spark-path {
-      stroke-dashoffset: 0 !important;
-      animation: none !important;
     }
     /* Section B reveal draw-ins freeze at their final frame. */
     .draw-x,

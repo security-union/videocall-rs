@@ -6,6 +6,10 @@
 
 use crate::components::attendants::AttendantsComponent;
 use crate::components::browser_compatibility::BrowserCompatibility;
+use crate::components::meeting_password_prompt::{
+    next_prompt_state, password_prompt_reason, MeetingPasswordPrompt, PasswordPromptReason,
+    PasswordPromptState,
+};
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
     actix_websocket_base, e2ee_enabled, webtransport_enabled, webtransport_host_base,
@@ -29,6 +33,12 @@ const TEXT_INPUT_CLASSES: &str = "input-apple";
 enum GuestStatus {
     NotJoined,
     Joining,
+    /// The server refused the join with one of the two issue-1613 password
+    /// codes. The reason, the attempt counter and the in-flight flag live in
+    /// the page's `password_prompt` signal, not here: this variant only decides
+    /// which view is mounted, and mounting/unmounting it is what drops the
+    /// entered plaintext.
+    PasswordRequired,
     WaitingForMeeting {
         observer_token: String,
     },
@@ -44,6 +54,7 @@ enum GuestStatus {
         admitted_can_admit: bool,
         allow_guests: bool,
         recording_allowed_for_all: bool,
+        chat_allowed_for_all: bool,
     },
     Rejected,
     Error(String),
@@ -76,6 +87,7 @@ fn guest_status_from_join_response(
                     admitted_can_admit: response.admitted_can_admit,
                     allow_guests: response.allow_guests,
                     recording_allowed_for_all: response.recording_allowed_for_all,
+                    chat_allowed_for_all: response.chat_allowed_for_all,
                 }
             } else {
                 GuestStatus::Error("Admitted but no room token".to_string())
@@ -132,6 +144,7 @@ fn handle_admitted(
         admitted_can_admit: response.admitted_can_admit,
         allow_guests: response.allow_guests,
         recording_allowed_for_all: response.recording_allowed_for_all,
+        chat_allowed_for_all: response.chat_allowed_for_all,
     });
 }
 
@@ -152,6 +165,11 @@ fn start_observer_connection(
     mut host_user_id: Signal<Option<String>>,
     mut observer_token_signal: Signal<Option<String>>,
     mut came_from_waiting_room: Signal<bool>,
+    // Issue 1613: the meeting-activation re-join below has to clear the
+    // password gate a second time, so it needs both the value this session
+    // already had accepted and somewhere to report a fresh refusal.
+    mut password_prompt: Signal<PasswordPromptState>,
+    mut pending_password: Signal<Option<String>>,
 ) {
     let lobby_url = |base: &str| format!("{base}/lobby?token={observer_token}");
     let websocket_urls: Vec<String> = actix_websocket_base()
@@ -196,9 +214,18 @@ fn start_observer_connection(
         enable_webtransport: effective_wt_enabled,
         max_received_layer: crate::constants::max_received_layer(),
         skip_canvas_paint: crate::constants::skip_canvas_paint(),
+        // Issue #2156: deployment CAMERA ladder for receiver-side READOUTS.
+        camera_ladder_variant: crate::constants::camera_ladder_variant(),
         // Issue #1884: guest lobby OBSERVER client — no in-call reaction overlay,
         // so no reaction callback.
         on_reaction: None,
+        on_raise_hand: None,
+        // Issue 2136: this is an OBSERVER client. The relay's outbound
+        // allowlist forwards only MEETING and SESSION_ASSIGNED to an
+        // observer, so a MEETING_TIMER can never arrive here -- a
+        // callback would be unreachable code, not a missing feature.
+        // There is deliberately no timer in the waiting room.
+        on_meeting_timer: None,
         on_connected: VcCallback::from(move |_| {
             log::info!("Guest observer connection established (waiting for meeting)");
         }),
@@ -231,7 +258,25 @@ fn start_observer_connection(
                 wasm_bindgen_futures::spawn_local(async move {
                     observer_token_signal.set(None);
 
-                    match join_meeting_as_guest(&meeting_id, &display_name).await {
+                    // Issue 1613: this re-join goes through the password gate
+                    // AGAIN. The server verifies the password before the
+                    // "waiting_for_meeting" early return, so clearing it once
+                    // to reach the lobby did not clear it for the re-join.
+                    // Replay the value this session already had accepted so the
+                    // guest is not re-prompted the instant the host starts the
+                    // meeting — quite possibly while they are away from the
+                    // keyboard. `try_peek` because this callback runs from a
+                    // WebSocket message handler outside the Dioxus runtime,
+                    // where `peek()` (= `try_peek().unwrap()`) would panic on a
+                    // scope that has since been dropped.
+                    let password = pending_password
+                        .try_peek()
+                        .ok()
+                        .and_then(|value| value.clone());
+
+                    match join_meeting_as_guest(&meeting_id, &display_name, password.as_deref())
+                        .await
+                    {
                         Ok(response) => {
                             current_user_id.set(Some(response.user_id.clone()));
                             host_display_name.set(response.host_display_name.clone());
@@ -243,11 +288,33 @@ fn start_observer_connection(
                             if matches!(&status, GuestStatus::Waiting { .. }) {
                                 came_from_waiting_room.set(true);
                             }
+                            // The meeting is active now, so no later re-join
+                            // needs the password: drop it.
+                            if !matches!(&status, GuestStatus::WaitingForMeeting { .. }) {
+                                pending_password.set(None);
+                            }
                             guest_status.set(status);
                         }
-                        Err(e) => {
-                            guest_status.set(GuestStatus::Error(e.to_string()));
-                        }
+                        Err(e) => match password_prompt_reason(&e, password.is_some()) {
+                            // The host changed (or added) the password while we
+                            // waited, or the server throttled/shed the replay.
+                            // Re-prompt instead of dead-ending on an error card
+                            // with no way back in.
+                            Some(reason) => {
+                                let supplied = password.is_some();
+                                let current = password_prompt
+                                    .try_peek()
+                                    .map(|state| *state)
+                                    .unwrap_or_else(|_| PasswordPromptState::opened(reason));
+                                password_prompt.set(next_prompt_state(current, reason, supplied));
+                                pending_password.set(None);
+                                guest_status.set(GuestStatus::PasswordRequired);
+                            }
+                            None => {
+                                pending_password.set(None);
+                                guest_status.set(GuestStatus::Error(e.to_string()));
+                            }
+                        },
                     }
                 });
             }
@@ -305,6 +372,18 @@ pub fn GuestJoinPage(id: String) -> Element {
     let mut observer_token_signal = use_signal(|| None::<String>);
     let mut came_from_waiting_room = use_signal(|| false);
 
+    // Issue 1613 — meeting password.
+    //
+    // `password_prompt` carries what the prompt renders; `GuestStatus::PasswordRequired`
+    // decides whether it is mounted at all. The initial value is never shown —
+    // nothing reads it until a 403 sets both.
+    let mut password_prompt =
+        use_signal(|| PasswordPromptState::opened(PasswordPromptReason::Required));
+    // The accepted password, held ONLY for as long as a later request in this
+    // same join can still need it (the meeting-activation re-join out of
+    // `WaitingForMeeting`). In memory only: never storage, cookie, URL or log.
+    let mut pending_password = use_signal(|| None::<String>);
+
     // When WaitingForMeeting, create an observer WebSocket client that receives
     // a push notification when the host activates the meeting, matching the
     // authenticated flow in meeting.rs.
@@ -339,14 +418,22 @@ pub fn GuestJoinPage(id: String) -> Element {
                 host_user_id,
                 observer_token_signal,
                 came_from_waiting_room,
+                password_prompt,
+                pending_password,
             );
         });
     }
 
-    // Join as guest handler
+    // Join as guest handler.
+    //
+    // Issue 1613: `password` is `None` for the first attempt and `Some(_)` for
+    // every retry driven by the prompt. Everything else about the attempt —
+    // meeting id, display name, the observer-token fallback — is recomputed
+    // from the same signals, so a retry re-issues an identical join and the
+    // user loses nothing by getting the password wrong.
     let on_join_guest = {
         let meeting_id = id.clone();
-        move || {
+        move |password: Option<String>| {
             let meeting_id = meeting_id.clone();
             let display_name = input_value();
             let fallback_status_observer_token = match guest_status() {
@@ -358,10 +445,21 @@ pub fn GuestJoinPage(id: String) -> Element {
                 } => Some(status_observer_token),
                 _ => None,
             };
-            guest_status.set(GuestStatus::Joining);
+            let supplied_password = password.is_some();
+            if supplied_password {
+                // Keep the prompt mounted (and its field read-only) while the
+                // attempt is in flight, rather than swapping in the spinner and
+                // remounting it on failure. The peek is bound out first so its
+                // read guard is dropped before the write — `set` while a `peek`
+                // guard is live is a borrow conflict, not a no-op.
+                let in_flight = password_prompt.peek().submitted();
+                password_prompt.set(in_flight);
+            } else {
+                guest_status.set(GuestStatus::Joining);
+            }
 
             wasm_bindgen_futures::spawn_local(async move {
-                match join_meeting_as_guest(&meeting_id, &display_name).await {
+                match join_meeting_as_guest(&meeting_id, &display_name, password.as_deref()).await {
                     Ok(response) => {
                         current_user_id.set(Some(response.user_id.clone()));
                         host_display_name.set(response.host_display_name.clone());
@@ -373,21 +471,44 @@ pub fn GuestJoinPage(id: String) -> Element {
                         match &status {
                             GuestStatus::WaitingForMeeting { observer_token } => {
                                 observer_token_signal.set(Some(observer_token.clone()));
+                                // Issue 1613: the activation re-join out of this
+                                // state hits the password gate again, so this is
+                                // the ONE outcome that keeps the value.
+                                pending_password.set(password);
                             }
                             GuestStatus::Waiting { .. } => {
                                 observer_token_signal.set(None);
                                 came_from_waiting_room.set(true);
+                                pending_password.set(None);
                             }
                             _ => {
                                 observer_token_signal.set(None);
+                                pending_password.set(None);
                             }
                         }
                         guest_status.set(status);
                     }
-                    Err(e) => {
-                        observer_token_signal.set(None);
-                        guest_status.set(GuestStatus::Error(e.to_string()));
-                    }
+                    Err(e) => match password_prompt_reason(&e, supplied_password) {
+                        Some(reason) => {
+                            // Issue 1613. Note this is driven by the server's
+                            // 403, not by the meeting's `has_password` flag —
+                            // see `components::meeting_password_prompt`.
+                            observer_token_signal.set(None);
+                            pending_password.set(None);
+                            let current = *password_prompt.peek();
+                            password_prompt.set(next_prompt_state(
+                                current,
+                                reason,
+                                supplied_password,
+                            ));
+                            guest_status.set(GuestStatus::PasswordRequired);
+                        }
+                        None => {
+                            observer_token_signal.set(None);
+                            pending_password.set(None);
+                            guest_status.set(GuestStatus::Error(e.to_string()));
+                        }
+                    },
                 }
             });
         }
@@ -443,7 +564,7 @@ pub fn GuestJoinPage(id: String) -> Element {
     rsx! {
         match &current_guest_status {
             // Admitted — show the meeting
-            GuestStatus::Admitted { host_display_name, host_user_id, room_token, status_observer_token, waiting_room_enabled, admitted_can_admit, allow_guests, recording_allowed_for_all } => rsx! {
+            GuestStatus::Admitted { host_display_name, host_user_id, room_token, status_observer_token, waiting_room_enabled, admitted_can_admit, allow_guests, recording_allowed_for_all, chat_allowed_for_all } => rsx! {
                 AttendantsComponent {
                     display_name: display_name_for_render.clone(),
                     id: id.clone(),
@@ -460,6 +581,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                     admitted_can_admit: *admitted_can_admit,
                     allow_guests: *allow_guests,
                     recording_allowed_for_all: *recording_allowed_for_all,
+                    chat_allowed_for_all: *chat_allowed_for_all,
                 }
             },
 
@@ -474,6 +596,33 @@ pub fn GuestJoinPage(id: String) -> Element {
                     on_admitted: on_admitted,
                     on_rejected: on_rejected,
                     on_cancel: on_cancel_waiting,
+                }
+            },
+
+            // Issue 1613 — the meeting is password-protected and the server
+            // refused this join. Replaces the guest form so nothing else on the
+            // page competes for focus (which is what makes `aria-modal` on the
+            // prompt's card truthful).
+            GuestStatus::PasswordRequired => {
+                let mut on_join = on_join_guest.clone();
+                rsx! {
+                    MeetingPasswordPrompt {
+                        state: password_prompt,
+                        // Short on purpose: these two buttons are `flex: 1` in a
+                        // 400px card, so each gets ~170px. "Use a different
+                        // name" wrapped to three lines at every common phone
+                        // width. The CSS `min-height` now contains a wrap
+                        // safely; this keeps the common case to one line.
+                        cancel_label: "Change name",
+                        on_submit: move |password: String| on_join(Some(password)),
+                        // Back to the guest form with the typed name intact.
+                        // Focus follows without any imperative step here: this
+                        // arm and the `NotJoined` arm are different subtrees, so
+                        // the form remounts and the `onmounted` handler on
+                        // `#guest-name` (below) moves focus into it. Focus is
+                        // never dropped to `<body>`.
+                        on_cancel: move |_| guest_status.set(GuestStatus::NotJoined),
+                    }
                 }
             },
 
@@ -583,7 +732,10 @@ pub fn GuestJoinPage(id: String) -> Element {
                                                 input_value.set(valid_name.clone());
                                                 save_display_name_to_storage(&valid_name);
                                                 display_name_ctx.0.set(Some(valid_name));
-                                                on_join();
+                                                // Issue 1613: no password on the first attempt.
+                                                // The prompt only exists once the server has said
+                                                // one is needed.
+                                                on_join(None);
                                             }
                                             Err(msg) => {
                                                 input_error.set(Some(msg));
@@ -623,6 +775,19 @@ pub fn GuestJoinPage(id: String) -> Element {
                                                 oninput: move |e: Event<FormData>| {
                                                     input_value.set(e.value());
                                                     input_error.set(None);
+                                                },
+                                                // Issue 1613: this is also the focus anchor the
+                                                // password prompt returns to. Backing out of the
+                                                // prompt swaps this whole subtree back in, so the
+                                                // mount handler runs and focus lands here rather
+                                                // than on `<body>`. `autofocus` above is not
+                                                // enough on its own — browsers honour it on
+                                                // document load, not reliably on every re-insert.
+                                                onmounted: move |e| {
+                                                    let element = e.data();
+                                                    spawn(async move {
+                                                        let _ = element.set_focus(true).await;
+                                                    });
                                                 },
                                             }
                                             p { class: "text-sm text-foreground-subtle mt-2 ml-1",

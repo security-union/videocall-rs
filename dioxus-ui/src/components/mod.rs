@@ -11,6 +11,10 @@ pub mod capability_check;
 pub mod color_picker;
 pub mod config_error;
 pub mod connection_quality_indicator;
+// Issue #367: test-only diagnostics-bus injection hook that publishes synthetic
+// `active_server_rtt` samples for the indicator above (gated on
+// MOCK_PEERS_ENABLED). Registers window.__videocall_inject_server_rtt.
+pub mod connection_quality_inject;
 pub mod decode_budget;
 pub mod decode_budget_banner;
 pub mod decode_budget_inject;
@@ -30,6 +34,16 @@ pub mod meeting_ended_overlay;
 pub mod meeting_format;
 pub mod meeting_info;
 pub mod meeting_options_controls;
+// Issue 1613: the meeting-password prompt. The error-code -> prompt mapping and
+// the prompt's attempt bookkeeping are pure and host-testable; the component is
+// a thin driver over them.
+pub mod meeting_password_prompt;
+// Issue 2136: the host-set meeting countdown. Pure formatting / urgency /
+// milestone helpers are host-testable; the components are thin drivers, and
+// they are deliberately the ONLY readers of `MeetingTimerCtx` — nothing outside
+// this module subscribes to it, which is what bounds a timer transition's
+// re-render blast radius. See the module docs.
+pub mod meeting_timer;
 pub mod meetings_filter;
 pub mod meetings_list;
 pub mod neteq_chart;
@@ -37,6 +51,9 @@ pub mod okta_sign_in_button;
 pub mod peer_list_item;
 pub mod performance_settings;
 pub mod preferences_settings_panel;
+// Issue 2135: the raised-hand roster (ordering + copy) and its persistent
+// banner. Pure helpers are host-testable; the banner is a thin driver.
+pub mod raised_hands;
 // Issue #1884: pure reaction UI logic (enum→glyph table + overlay coalesce/cap),
 // host-testable.
 pub mod emoji_picker;
@@ -68,8 +85,8 @@ pub mod update_display_name_modal;
 pub mod video_control_buttons;
 pub mod waiting_room;
 
-mod canvas_generator;
+pub mod canvas_generator;
 mod peer_list;
-mod peer_tile;
+pub mod peer_tile;
 pub mod pre_join_preview;
 pub mod pre_join_settings_card;

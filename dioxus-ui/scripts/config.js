@@ -52,16 +52,27 @@ window.__APP_CONFIG = ({
   //     debug-on-collection default, OMIT this key — do not set it to "info".
   // The explicit "info" below caps local dev at info (collection is off here).
   logLevel: "info",
-  // EXPERIMENTAL, TEST-ONLY: max simulcast layers a publisher may emit
-  // (issue #989). 1 = feature OFF (single stream, identical to pre-simulcast).
-  // Effective layers = min(this, device-capability ceiling).
-  // WARNING: values > 1 have NO playback benefit yet — layers are not
-  // tier-differentiated (PR B), receivers decode the base layer only, and the
-  // relay does not filter layers. Raising it purely multiplies encode CPU and
-  // uplink/relay egress. KEEP AT 1 IN PRODUCTION; raise to 2/3 only in
-  // controlled test meetings (and the load-test bot) until relay per-receiver
-  // layer selection lands.
+  // Simulcast publisher ceiling (issues #989/#1082). This committed dev/E2E
+  // fallback sets 1, which emits a single stream. Camera/screen effective layers
+  // are min(this, device-capability ceiling); audio is min(this, its 3-rung
+  // ladder). Values > 1 permit tier-differentiated rungs. Receivers choose one
+  // rung per peer/kind and discard non-selected packets before decrypt/parse;
+  // the relay's #989 layer filter never drops the base rung and filters
+  // unselected upper rungs per receiver. Other earlier filters can still drop
+  // media outright: #988 drops off-screen camera video at every layer, and
+  // observer/waiting-room authorization drops MEDIA. With no recorded layer
+  // preference the #989 filter fails open and forwards all published rungs.
+  // Extra emitted rungs add encode CPU, publisher uplink, and relay egress.
+  // Production Helm runtimeConfig omits this key, so
+  // dioxus-ui/src/constants.rs resolves it to 3 (default ON), still bounded by
+  // each publisher's applicable ceiling.
   experimentalSimulcastMaxLayers: 1,
-  // Receiver low-power knobs. Omit maxReceivedLayer for no receive cap.
+  // Receiver load-test knobs (#2068/#2069; discussion #2066). Omit
+  // maxReceivedLayer for no receive cap; a cap is representative only for an
+  // explicitly named constrained/mobile-client population, never as a silent
+  // default. skipCanvasPaint is non-representative: real visible tiles decode
+  // and paint, while hidden tiles do neither. Skipping paint removes main-thread
+  // work measured by the CPU-overload drift watchdog (discussion #562) and biases
+  // capacity results optimistically; keep it false for representative runs.
   skipCanvasPaint: "false"
 });

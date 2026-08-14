@@ -393,6 +393,14 @@ html[data-theme="dark"] {
   --error-bg-soft-hover: rgba(244, 67, 54, 0.4);
   --error-text-strong: #f44336;
   --error-text-vivid: #ff6b6b;
+  /* Opaque error chip (issue 1613). Error text sitting directly on the glass
+     card is measured against a composited translucent surface, and in light
+     theme that lands around 1.2:1 — the glass is mid-luminance, so NO red can
+     reach 4.5:1 against it. These two are an opaque pair so the ratio is a
+     property of the pair rather than of whatever shows through. Measured
+     8.6:1 dark / 7.9:1 light. */
+  --error-chip-bg: #3b1513;
+  --error-chip-text: #ffb4ab;
   --error-bg-faint: rgba(255, 68, 68, 0.2);
   --delete-bg-hover: rgba(220, 53, 69, 0.15);
   --delete-bg-hover-strong: rgba(220, 53, 69, 0.2);
@@ -706,16 +714,11 @@ html[data-theme="dark"] {
   --glass-select-menu-shadow:          rgba(0, 0, 0, 0.40);
   --glass-select-option-hover-bg:      rgba(255, 255, 255, 0.08);
 
-  /* Glass popover background — shared by dock menu, mock-peers, density popovers */
-  --glass-popover-bg:
-    radial-gradient(600px 400px at 50% -20%, rgba(70, 110, 160, 0.06), transparent 70%),
-    radial-gradient(350px 250px at 85% 90%, rgba(210, 60, 80, 0.06), transparent 65%),
-    linear-gradient(180deg, rgba(70, 100, 140, 0.06) 0%, rgba(50, 80, 120, 0.02) 100%),
-    linear-gradient(135deg, rgba(15, 20, 35, 0.92) 0%, rgba(12, 18, 35, 0.94) 50%, rgba(10, 15, 32, 0.96) 100%);
-  --glass-popover-border:  rgba(70, 100, 140, 0.15);
-  --glass-popover-shadow:
-    inset 0 1px 0 rgba(100, 140, 180, 0.06),
-    0 8px 24px rgba(0, 0, 0, 0.40);
+  /* issue 2091: the --glass-popover-* trio used to be defined HERE, in the
+     dark-only block, with no light-theme counterpart — so in light theme every
+     consumer fell back to its initial value (unpainted surface, no border, no
+     shadow). They now live in the theme-independent :root block below, beside
+     the --fixed-dark / --on-dark-* set. See "Dock popover surface" there. */
 }
 
 html[data-theme="light"] {
@@ -772,6 +775,9 @@ html[data-theme="light"] {
   --error-bg-soft-hover: rgba(244, 67, 54, 0.32);
   --error-text-strong: #c62828;
   --error-text-vivid: #d32f2f;
+  /* Light-theme half of the opaque error chip — see the dark-theme block. */
+  --error-chip-bg: #fceae8;
+  --error-chip-text: #8c1d18;
   --error-bg-faint: rgba(244, 67, 54, 0.18);
   --delete-bg-hover: rgba(220, 53, 69, 0.18);
   --delete-bg-hover-strong: rgba(220, 53, 69, 0.24);
@@ -1568,6 +1574,71 @@ html[data-theme="light"] #invite-overlay p {
   --on-dark-text-high: rgba(255, 255, 255, 0.95);
   --on-dark-text-secondary: rgba(255, 255, 255, 0.7);
   --on-dark-text-muted: rgba(255, 255, 255, 0.5);
+  /* Destructive/close affordance on a fixed dark surface. Its only consumer so
+     far (.reactions-close-badge:hover) also inherits a translucent red fill
+     from .close-button:hover (--error-bg-faint), so the REAL backdrop is that
+     wash — rgb(81,49,61) dark / rgb(75,48,58) light — not the bare glass.
+     Measured against the wash: this value is 5.18:1 dark / 5.39:1 light, both
+     clearing AA for the 11px glyph. It is a lightened cousin of the dark
+     --error-text (#ff7a6e), which sits at 4.49:1 on that wash and misses the
+     4.5 bar by a hair; the theme-aware --error-text is far worse, flipping to
+     #d70015 in light theme for 2.12:1. On the bare surface this reads 6.3:1. */
+  --on-dark-error-text: #ff8f85;
+
+  /* ─── Dock popover surface (issue 2091) ───────────────────────────────────
+     A FIXED-DARK surface, deliberately theme-independent — a member of the
+     --fixed-dark family above, not a theme-aware chrome surface. It is the
+     menu material of the controls dock, and the dock itself is hardcoded dark
+     in both themes (`.video-controls-container` background rgba(28,28,30,0.85)
+     / border #38383a; `.video-control-button` background #1c1c1e, color white
+     — neither has any html[data-theme="light"] override). A popover anchored
+     12-104px off that bar must match it, so `.dock-position-wrapper
+     .glass-select-menu` explicitly overrides the theme-aware
+     --settings-popover-bg with this token precisely to opt that instance out
+     of the light modal surface.
+
+     Consumers — surfaces: `.action-bar-overflow-popover`,
+     `.dock-position-wrapper .glass-select-menu` (global.css),
+     `.density-popover`, `.reactions-palette` (style.css), plus
+     `.mock-peers-popover`, which is NOT a member — it paints the theme-paired
+     --mock-popover-bg and borrows only the shadow.
+     Consumers — dividers inside the palette, both painting
+     --glass-popover-border: `.reactions-recent-sep` (as a `background`, so the
+     1px rule was invisible in light theme pre-fix) and `.emoji-picker`
+     (`border-top`). `.reactions-close-badge` also takes the border + shadow.
+
+     CONTRACT for anything rendered inside these popovers: use the --on-dark-*
+     text tokens and the --glass-popover-item-* / -option-* state fills below.
+     NEVER the theme-aware --text-primary / --text-secondary / --error-text or
+     --settings-ghost-bg-*: those flip under html[data-theme="light"] to
+     near-black text (~1.3:1) and a black-tinted fill that is invisible on this
+     surface. Same rule as "Fixed dark surfaces" above; see also issue 2086.
+
+     Before issue 2091 these three were defined ONLY in the dark block, so in
+     light theme they were UNSET — consumers fell back to initial values
+     (background-image: none, border-style: none, box-shadow: none), leaving an
+     unpainted, borderless popover floating over the video grid.
+     ─────────────────────────────────────────────────────────────────────── */
+  --glass-popover-bg:
+    radial-gradient(600px 400px at 50% -20%, rgba(70, 110, 160, 0.06), transparent 70%),
+    radial-gradient(350px 250px at 85% 90%, rgba(210, 60, 80, 0.06), transparent 65%),
+    linear-gradient(180deg, rgba(70, 100, 140, 0.06) 0%, rgba(50, 80, 120, 0.02) 100%),
+    linear-gradient(135deg, rgba(15, 20, 35, 0.92) 0%, rgba(12, 18, 35, 0.94) 50%, rgba(10, 15, 32, 0.96) 100%);
+  --glass-popover-border:  rgba(70, 100, 140, 0.15);
+  --glass-popover-shadow:
+    inset 0 1px 0 rgba(100, 140, 180, 0.06),
+    0 8px 24px rgba(0, 0, 0, 0.40);
+  /* Hover / selected fills for items ON that surface. Values are the dark-theme
+     --settings-ghost-bg-hover / -selected verbatim, so dark theme is unchanged;
+     pinning them here keeps the affordance visible in light theme, where those
+     ghost tokens flip to rgba(0,0,0,0.04) / rgba(0,0,0,0.05) and vanish. */
+  --glass-popover-item-hover-bg:  rgba(255, 255, 255, 0.035);
+  --glass-popover-item-active-bg: rgba(255, 255, 255, 0.065);
+  /* Same idea for the dock's select-menu options, which are a DIFFERENT
+     component with a deliberately stronger hover: this is the dark-theme
+     --glass-select-option-hover-bg verbatim (0.08, vs the items' 0.035). The
+     two are not unified because they already differed before issue 2091. */
+  --glass-popover-option-hover-bg: rgba(255, 255, 255, 0.08);
 
   /* Vertical room to reserve below the controls dock: dock bottom 20px + dock
      height ~79px + ~12px gap = 112px. (The ~79px = .video-control-button 3.1rem
@@ -2229,7 +2300,12 @@ html[data-theme="light"] #invite-overlay p {
 /* Each item in the overflow popover.
    The popover sits on a fixed-dark glass surface (--glass-popover-bg is
    dark-navy in both themes), so text must use --on-dark-* tokens — never
-   theme-aware --text-primary which flips to near-black in light theme. */
+   theme-aware --text-primary which flips to near-black in light theme.
+   issue 2091: that claim is now TRUE — the trio was previously dark-only, so
+   in light theme the surface was unpainted; it is defined once in the
+   theme-independent :root block. The hover fill follows the same rule: the
+   theme-aware --settings-ghost-bg-hover flips to a black tint that is
+   invisible here, so it uses the pinned --glass-popover-item-hover-bg. */
 .action-bar-overflow-popover .overflow-item {
   display: flex;
   align-items: center;
@@ -2246,7 +2322,23 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .action-bar-overflow-popover .overflow-item:hover {
-  background: var(--settings-ghost-bg-hover);
+  background: var(--glass-popover-item-hover-bg);
+}
+
+/* Issue 2135: the RaiseHand overflow item while the local hand is UP. The only
+   stateful item in this menu, and the path existing users meet the control on
+   first (the layout migration appends the new slot at the END, so it overflows).
+
+   Text colour is deliberately UNTOUCHED at --on-dark-text (~15:1 on this fixed
+   dark-navy surface): the state is carried by the selected fill plus an accent
+   rail, so no foreground drops toward the accent's poor ratio the way the
+   action-bar toggle's did. --glass-popover-item-active-bg is the token already
+   defined for "selected item on this surface"; --accent-hover on the popover
+   base measures ~5.2:1, clearing 1.4.11's 3:1 for a non-text indicator. The
+   authoritative state signal for AT is `aria-pressed` on the button itself. */
+.action-bar-overflow-popover .overflow-item.raised {
+  background: var(--glass-popover-item-active-bg);
+  box-shadow: inset 3px 0 0 var(--accent-hover);
 }
 
 .action-bar-overflow-popover .overflow-item svg {
@@ -2316,6 +2408,61 @@ html[data-theme="light"] #invite-overlay p {
   backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow: var(--glass-popover-shadow);
+}
+
+/* issue 2091: this instance swaps the shared menu's theme-aware
+   --settings-popover-bg for the fixed-dark --glass-popover-bg above, so its
+   options must be re-based onto the fixed-dark set too. The shared
+   `.glass-select-option` (style.css) uses --text-primary and
+   --glass-select-option-hover-bg, which under html[data-theme="light"] resolve
+   to #1a1a1a (~1.3:1 on this surface) and rgba(0,0,0,0.06) (a hover fill that
+   is invisible on dark). Both selectors out-specify the shared rules
+   (0,3,0 / 0,4,0 vs 0,1,0 / 0,2,0).
+
+   COLOUR + HOVER ARE UNCHANGED IN DARK: --on-dark-text is #ffffff, exactly the
+   dark --text-primary it replaces, and --glass-popover-option-hover-bg is the
+   dark --glass-select-option-hover-bg verbatim (rgba(255,255,255,0.08)). That
+   0.08 is deliberately NOT unified with the 0.035 used by
+   --glass-popover-item-*: the select option and the popover item are different
+   components and already differed before this change. The :focus-visible rule
+   below DOES change dark theme — see its own note. */
+.dock-position-wrapper .glass-select-menu .glass-select-option {
+  color: var(--on-dark-text);
+}
+
+.dock-position-wrapper .glass-select-menu .glass-select-option:hover {
+  background: var(--glass-popover-option-hover-bg);
+}
+
+/* issue 2091: the focus indicator has to be re-based too. The shared
+   `.glass-select-option:focus-visible` (style.css) sets `outline: none` and
+   draws its ring as `inset 0 0 0 1px var(--glass-border)` over a
+   --glass-bg-hover fill — there is NO --accent ring on this control. That
+   hairline computes 1.57:1 against its own fill in dark and 1.27:1 in light,
+   failing SC 1.4.11 (3:1) in both, worst in the theme this fix targets. The
+   menu is genuinely keyboard-driven (attendants.rs `focus_glass_option_at`
+   with tabindex 0), so this is a real indicator, not a decorative one.
+
+   WHY `background: transparent` AND NOT a fill: `outline-offset: -2px` draws
+   the ring INSIDE the border box, i.e. on whatever the element itself paints.
+   Over the 0.08 white hover fill, --accent (#007aff) computes only 2.72:1 —
+   still under 3:1. Dropping the fill puts the ring on the bare fixed-dark
+   surface instead, where it computes 3.47:1 and passes. A positive offset was
+   rejected: options are adjacent with no gap, so an outward ring would land on
+   a neighbour's `.selected` fill (2.54:1) for two of its four edges.
+
+   Losing the fill costs no information: `.selected` is also conveyed
+   non-chromatically by the `\2713` (checkmark) prefix in
+   `.glass-select-option.selected::before`, which this rule does not touch.
+
+   DARK THEME CHANGES HERE, deliberately: the focus ring goes from a 1px
+   --glass-border hairline on a lightened fill to a 2px --accent ring on the
+   surface. Both --accent values are #007aff, so the two themes are identical. */
+.dock-position-wrapper .glass-select-menu .glass-select-option:focus-visible {
+  background: transparent;
+  box-shadow: none;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 /* Side dock: menu opens to the side */

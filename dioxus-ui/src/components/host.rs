@@ -219,6 +219,14 @@ pub fn Host(
                 handler.call(err);
             }
         });
+        // Camera simulcast ladder variant (issue #1768). ONE read of the
+        // `experimentalReducedLadder` runtime flag per Host mount, threaded into
+        // the encoder — which forwards this same value into its AQ controller, so
+        // the geometry the encoder emits and the uplink budget the controller
+        // sums are always the SAME rungs. Defaults to the shipped ladder when the
+        // key is absent/falsy, so this is inert unless an operator opts in.
+        let ladder_variant = camera_ladder_variant();
+        log::info!("CameraEncoder: camera simulcast ladder = {ladder_variant:?}");
         let mut camera = CameraEncoder::new(
             client.clone(),
             VIDEO_ELEMENT_ID,
@@ -226,6 +234,7 @@ pub fn Host(
             camera_settings_cb,
             camera_error_cb,
             effective_max_layers,
+            ladder_variant,
         );
         let cam_perm_error_cell = camera_permission_error_handler.clone();
         let camera_permission_error_cb =
@@ -264,9 +273,9 @@ pub fn Host(
             Some(camera.shared_audio_tier_index()),
             // Audio simulcast layer ceiling (issue #989, Phase 3c → #1082):
             // decoupled from the VIDEO CPU ceiling (audio encodes off-main-thread
-            // and is cheap), but still gated by the SAME runtime flag so it stays
-            // OFF by default (single audio layer, byte-identical to the
-            // pre-simulcast mic path).
+            // and is cheap), but still gated by the SAME runtime flag. The flag
+            // defaults to 3 (audio simulcast ON); setting it to 1 collapses audio
+            // to a single layer too.
             audio_effective_max_layers,
         );
         let mic_perm_error_cell = mic_permission_error_handler.clone();
@@ -304,9 +313,10 @@ pub fn Host(
             screen_settings_cb,
             screen_state_cb,
             camera.screen_sharing_flag(),
-            // Screen simulcast layer ceiling (issue #989, Phase 3b) — same
-            // flag + capability gating as the camera, so it's OFF by default
-            // (single layer, byte-identical to the pre-simulcast screen path).
+            // Screen simulcast layer ceiling (issue #989, Phase 3b): the same
+            // `min(flag, sniffed capability)` as camera. The flag defaults to 3
+            // (#1082), so it no longer forces one layer; the sniff can still
+            // clamp to 1 for a marginal core count or the older-Intel-Mac rule.
             effective_max_layers,
         );
 
@@ -411,6 +421,10 @@ pub fn Host(
             screen.shared_screen_tier_index(),
             camera.screen_sharing_flag(),
             camera.shared_encoder_output_fps(),
+            // #2147: the SCREEN encoder's own output fps. Before this the screen
+            // encoder had NO publisher-side fps signal — the camera gauge read
+            // healthy right through the #2143 screen-share freeze.
+            screen.shared_encoder_output_fps(),
             camera.shared_tier_transitions(),
             screen.shared_tier_transitions(),
             camera.shared_climb_limiter_snapshot(),
@@ -418,6 +432,7 @@ pub fn Host(
             // #1143: send-side simulcast layer counts (camera encoder atoms).
             camera.shared_effective_layer_count(),
             camera.shared_active_layer_count(),
+            camera.camera_layer_metric_source(),
             // #1561: screen + audio layer metrics.
             screen.effective_screen_layer_count(),
             screen.shared_active_layer_count(),
@@ -737,15 +752,23 @@ pub fn Host(
                 // the moment screen sharing starts to choose a conservative
                 // starting tier that gives a readable first frame on constrained
                 // uplinks without waiting for the PID loop to ramp down.
+                //
+                // Issue #2179: this is only the network-imposed FLOOR. The
+                // encoder composes it with the capture's real resolution once
+                // getDisplayMedia resolves (`resolve_initial_screen_tier`), so a
+                // share on a healthy link starts at the resolution actually
+                // being shared instead of a flat 1080p ceiling. The capture size
+                // is not knowable here — the browser picker has not run yet —
+                // which is why the composition lives in the encoder.
                 let rtt_ms = client.average_rtt_ms();
                 let camera_tier_index = client.camera_tier_index();
-                let initial_tier = initial_screen_tier(rtt_ms, camera_tier_index);
+                let network_tier = initial_screen_tier(rtt_ms, camera_tier_index);
 
                 log::info!(
-                    "Start screen share encoder: rtt={:?}ms, camera_tier={:?}, initial_tier={}",
+                    "Start screen share encoder: rtt={:?}ms, camera_tier={:?}, network_floor_tier={}",
                     rtt_ms,
                     camera_tier_index,
-                    initial_tier
+                    network_tier
                 );
 
                 // Check if the onclick handler already acquired a MediaStream
@@ -754,7 +777,7 @@ pub fn Host(
                 let maybe_stream = pre_acquired_stream.borrow_mut().take();
                 if let Some(stream) = maybe_stream {
                     log::info!("Start screen share encoder with pre-acquired stream");
-                    s.screen.start_with_stream(stream, initial_tier);
+                    s.screen.start_with_stream(stream, network_tier);
                 } else {
                     // Fallback: let the encoder call getDisplayMedia itself.
                     // This path works on Chrome/Firefox where the gesture
@@ -762,7 +785,7 @@ pub fn Host(
                     log::info!("Start screen share encoder (encoder-acquired stream)");
                     let state_clone = state.clone();
                     Timeout::new(1000, move || {
-                        state_clone.borrow_mut().screen.start(initial_tier);
+                        state_clone.borrow_mut().screen.start(network_tier);
                     })
                     .forget();
                 }

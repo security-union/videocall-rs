@@ -27,32 +27,79 @@ pub mod health_processor {
     // Health data structure matching RFC design
     // Use protobuf HealthPacket on the wire; keep simple structs only if needed internally.
     use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
-    use videocall_types::user_id_bytes_to_string;
+    use videocall_types::to_user_id_bytes;
 
-    /// Process a health packet and update Prometheus metrics
-    pub fn process_health_packet(health_data: &PbHealthPacket, client: async_nats::client::Client) {
+    /// The relay-authenticated identity of the session publishing a
+    /// `HealthPacket` (issue 2047).
+    ///
+    /// Every field is taken from the SESSION ACTOR, never from the health packet:
+    ///
+    /// * `meeting_id` and `user_id` come from the validated JWT claims
+    ///   (`claims.room` / `claims.sub` in `lobby::ws_connect_authenticated`),
+    ///   stored on the session actor as `SessionLogic::room` / `user_id`.
+    /// * `session_id` is the id the RELAY generated in `SessionLogic::new` and
+    ///   announced to the client in SESSION_ASSIGNED — the same value that keys
+    ///   the relay's own per-session metrics.
+    ///
+    /// One caveat on the strength of the word "authenticated": on the DEPRECATED
+    /// path-based endpoint (`lobby::ws_connect`, reachable only while
+    /// `FEATURE_MEETING_MANAGEMENT` is off — it returns 410 Gone otherwise) there
+    /// is no JWT, and `room` / `user_id` are taken from the URL path. On that
+    /// path this type enforces CONSISTENCY — telemetry is pinned to the identity
+    /// the connection itself was opened under, so one participant still cannot
+    /// label its packets as another — but the identity was never authenticated in
+    /// the first place. `session_id` is relay-generated on both paths.
+    ///
+    /// None of the three is ever mutated in place for the life of a session (a
+    /// reconnect or re-election constructs a FRESH `SessionLogic` with a new
+    /// `id`), so a reporter built from `&self` at publish time always carries the
+    /// CURRENT authenticated identity — never a stale cached-at-connect copy.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AuthenticatedReporter {
+        /// Authenticated room id (JWT `room` claim) — the telemetry `meeting_id`.
+        pub meeting_id: String,
+        /// Relay-assigned session id (`SessionLogic::id`).
+        pub session_id: u64,
+        /// Authenticated user identity (JWT `sub` claim).
+        pub user_id: String,
+    }
+
+    /// Process a health packet and publish it to NATS under the relay-authenticated
+    /// identity carried by `reporter`.
+    pub fn process_health_packet(
+        health_data: &PbHealthPacket,
+        client: async_nats::client::Client,
+        reporter: AuthenticatedReporter,
+    ) {
+        // Log the AUTHENTICATED identity, not the client-supplied one: the
+        // client's labels are about to be overwritten, so echoing them here would
+        // misattribute the log line for exactly the forged packet this path
+        // exists to defuse.
         debug!(
             "Publishing health report from {} in session {} for meeting {} to NATS",
-            user_id_bytes_to_string(&health_data.reporting_user_id),
-            health_data.session_id,
-            health_data.meeting_id
+            reporter.user_id, reporter.session_id, reporter.meeting_id
         );
 
         // Publish to NATS instead of processing locally
-        publish_health_to_nats(health_data.clone(), client);
+        publish_health_to_nats(health_data.clone(), client, reporter);
     }
 
-    fn publish_health_to_nats(health_data: PbHealthPacket, client: async_nats::client::Client) {
+    fn publish_health_to_nats(
+        health_data: PbHealthPacket,
+        client: async_nats::client::Client,
+        reporter: AuthenticatedReporter,
+    ) {
         tokio::spawn(async move {
-            if let Err(e) = publish_health_to_nats_async(health_data, client).await {
+            if let Err(e) = publish_health_to_nats_async(health_data, client, &reporter).await {
                 warn!("Failed to publish health data to NATS: {}", e);
             }
         });
     }
 
     async fn publish_health_to_nats_async(
-        mut health_data: PbHealthPacket,
+        health_data: PbHealthPacket,
         client: async_nats::client::Client,
+        reporter: &AuthenticatedReporter,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
         let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| "server-1".to_string());
@@ -61,6 +108,31 @@ pub mod health_processor {
 
         let topic = format!("health.diagnostics.{region}.{service_type}.{server_id}");
 
+        // Every server-authority transformation lives in
+        // `build_health_payload_for_publish`, so the bytes published here are
+        // exactly the bytes its regression tests assert on (the NATS publish
+        // below needs a live broker and cannot be unit-tested).
+        let payload = build_health_payload_for_publish(health_data, reporter)?;
+        client.publish(topic.clone(), payload.into()).await?;
+        debug!("Published health data to NATS topic: {}", topic);
+        Ok(())
+    }
+
+    /// Build the exact NATS payload for a client-published `HealthPacket`,
+    /// applying every server-authority transformation the relay owes the
+    /// telemetry pipeline:
+    ///
+    /// 1. [`scrub_client_supplied_urls`] — strip the JWT-bearing lobby URL.
+    /// 2. [`stamp_authenticated_identity`] — replace the client's self-declared
+    ///    `meeting_id` / `session_id` / `reporting_user_id` with `reporter`'s.
+    ///
+    /// This is the ONLY payload-producing path used by
+    /// [`publish_health_to_nats_async`], so a regression test that calls this
+    /// function asserts on the same bytes the relay actually publishes.
+    pub(crate) fn build_health_payload_for_publish(
+        mut health_data: PbHealthPacket,
+        reporter: &AuthenticatedReporter,
+    ) -> Result<Vec<u8>, protobuf::Error> {
         // SECURITY: scrub any URL fields the client may have populated. The client
         // should NOT include the lobby URL here (it carries the JWT in the query
         // string), but defense-in-depth requires the relay to strip it
@@ -68,10 +140,71 @@ pub mod health_processor {
         // See PR #570 (Phase 1) and security-audit follow-up F4.
         scrub_client_supplied_urls(&mut health_data);
 
-        let payload = health_data.write_to_bytes()?;
-        client.publish(topic.clone(), payload.into()).await?;
-        debug!("Published health data to NATS topic: {}", topic);
-        Ok(())
+        // SECURITY (issue 2047): identity is the relay's to assert, not the
+        // client's to claim.
+        stamp_authenticated_identity(&mut health_data, reporter);
+
+        health_data.write_to_bytes()
+    }
+
+    /// Overwrite a client-published `HealthPacket`'s three identity scalars with
+    /// the relay-authenticated ones (issue 2047, security).
+    ///
+    /// This mirrors the issue-1884 `stamp_reaction_for_broadcast` server-authority
+    /// pattern: the relay does not merely fill in MISSING identity, it OVERWRITES
+    /// UNCONDITIONALLY. A `HealthPacket` is authored entirely by the client and
+    /// forwarded to the telemetry pipeline, where all three scalars become
+    /// Prometheus LABELS (`meeting_id`, `session_id`, `peer_id` — see
+    /// `bin/metrics_server.rs::process_health_packet_to_metrics_pb`). Trusting them
+    /// would let any authenticated participant:
+    ///
+    /// * write telemetry into ANOTHER user's or ANOTHER meeting's series
+    ///   (dashboard poisoning — a healthy attacker can make a victim look broken,
+    ///   or hide its own bad numbers under someone else's labels), and
+    /// * mint unbounded label identities (Prometheus cardinality pressure), since
+    ///   the values are otherwise free-form client strings.
+    ///
+    /// Label NAMES and semantics are unchanged throughout — only the VALUES
+    /// become server-authoritative. For a conformant client that has completed
+    /// SESSION_ASSIGNED and resolved an account identity the stamped values match
+    /// what it already sent, so nothing moves. Two known cases DO shift, and a
+    /// dashboard owner should expect them:
+    ///
+    /// * BEFORE SESSION_ASSIGNED the client seeds a synthetic
+    ///   `format!("session_{}", unix_secs)` (`video_call_client.rs`), and this
+    ///   NATS path is not gated on `ConnectionState::Active` — so packets emitted
+    ///   in that window previously minted a fresh `session_id` label per
+    ///   connect-SECOND, one throwaway series each. Stamping collapses them onto
+    ///   the real session id: a strict CARDINALITY WIN.
+    /// * The UI's reported `user_id` can come from fallback chains that end in a
+    ///   localStorage-derived local id (`meeting.rs` ->
+    ///   `get_or_create_local_user_id`) or in the display name
+    ///   (`attendants.rs`, reachable from guest join). Where such an arm fires,
+    ///   the `peer_id` label MIGRATES to the authenticated JWT `sub`. That is the
+    ///   intended outcome — the label now identifies who the relay authenticated
+    ///   rather than what the browser chose to call itself — but it is a value
+    ///   change, not a no-op.
+    ///
+    /// Runs on the shared `SessionLogic::handle_inbound` HEALTH path, so it covers
+    /// BOTH transports (`WsChatSession` and `WtChatSession` each delegate their
+    /// inbound frames to that one method).
+    ///
+    /// Only the REPORTER's own identity is stamped. Peer-keyed maps (`peer_stats`,
+    /// `received_*_layer`) describe OTHER participants as this reporter observed
+    /// them and are left untouched — they are already scoped under the reporter's
+    /// now-authenticated labels.
+    pub(crate) fn stamp_authenticated_identity(
+        pb: &mut PbHealthPacket,
+        reporter: &AuthenticatedReporter,
+    ) {
+        pb.meeting_id = reporter.meeting_id.clone();
+        // The wire field is a string; the relay's id is a u64. `to_string()` is
+        // the rendering the relay already uses for its own per-session metric
+        // labels (`SessionLogic::record_session_drop` and `on_stopping`) and the
+        // one the client echoes back after SESSION_ASSIGNED, so the stamped value
+        // matches an assigned client's exactly.
+        pb.session_id = reporter.session_id.to_string();
+        pb.reporting_user_id = to_user_id_bytes(&reporter.user_id);
     }
 
     /// Strip any client-supplied URL fields from a `HealthPacket` before it is
@@ -128,8 +261,16 @@ pub mod health_processor {
         false
     }
 
-    /// Process health packet for diagnostics collection from binary data
-    pub fn process_health_packet_bytes(data: &[u8], nc: async_nats::client::Client) {
+    /// Process health packet for diagnostics collection from binary data.
+    ///
+    /// `reporter` is the relay-authenticated identity of the session that sent
+    /// `data`; it REPLACES the packet's self-declared identity before publish
+    /// (issue 2047 — see [`stamp_authenticated_identity`]).
+    pub fn process_health_packet_bytes(
+        data: &[u8],
+        nc: async_nats::client::Client,
+        reporter: AuthenticatedReporter,
+    ) {
         use protobuf::Message;
         use tracing::{debug, error};
         use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -140,11 +281,9 @@ pub mod health_processor {
 
                 match parse_health_packet(&packet_wrapper.data) {
                     Ok(health_data) => {
-                        process_health_packet(&health_data, nc.clone());
-                        debug!(
-                            "Successfully processed health data for session {}",
-                            health_data.session_id
-                        );
+                        let session_id = reporter.session_id;
+                        process_health_packet(&health_data, nc.clone(), reporter);
+                        debug!("Successfully processed health data for session {session_id}");
                     }
                     Err(e) => {
                         error!("Failed to parse health packet: {}", e);
@@ -525,6 +664,145 @@ pub mod health_processor {
                 "the original full packet (NATS telemetry path) must keep peer_stats"
             );
             assert!(full.peer_stats.contains_key("peer-bob-456"));
+        }
+
+        // ==================================================================
+        // Issue 2047: server-authoritative identity on the NATS telemetry path
+        // ==================================================================
+
+        /// The identity the relay authenticated for the attacker's own session.
+        fn attacker_reporter() -> AuthenticatedReporter {
+            AuthenticatedReporter {
+                meeting_id: "attacker-room".to_string(),
+                session_id: 112_233_445_566_778_899,
+                user_id: "mallory@example.com".to_string(),
+            }
+        }
+
+        /// A health packet whose three identity scalars all claim a DIFFERENT
+        /// meeting, session and user than the one that authenticated — the
+        /// telemetry-impersonation payload issue 2047 exists to defuse.
+        fn forged_identity_packet() -> PbHealthPacket {
+            let mut hp = make_packet_with_jwt_url();
+            hp.meeting_id = "victim-boardroom".to_string();
+            hp.session_id = "9999999999999999999".to_string();
+            hp.reporting_user_id = b"ceo@example.com".to_vec();
+            hp
+        }
+
+        /// A forged packet must land under the AUTHENTICATED labels, asserted on
+        /// the exact bytes the relay publishes to NATS
+        /// ([`build_health_payload_for_publish`] is the only payload producer
+        /// used by `publish_health_to_nats_async`).
+        ///
+        /// Mutation coverage:
+        ///   * Delete the `stamp_authenticated_identity` call from
+        ///     `build_health_payload_for_publish` (or revert it to a
+        ///     fill-only-if-empty stamp) and all three "authenticated" asserts
+        ///     fail — the forged values survive.
+        ///   * Delete the `scrub_client_supplied_urls` call and the URL assert
+        ///     fails, pinning that the stamp did not displace the F4 scrub.
+        #[test]
+        fn stamp_overwrites_forged_identity_with_authenticated_session() {
+            let forged = forged_identity_packet();
+            let reporter = attacker_reporter();
+
+            // Sanity: the fixture really does claim someone else's identity, so
+            // the assertions below are meaningful.
+            assert_ne!(forged.meeting_id, reporter.meeting_id);
+            assert_ne!(forged.session_id, reporter.session_id.to_string());
+            assert_ne!(forged.reporting_user_id, reporter.user_id.as_bytes());
+
+            let payload = build_health_payload_for_publish(forged.clone(), &reporter)
+                .expect("serialize published payload");
+            let published =
+                PbHealthPacket::parse_from_bytes(&payload).expect("parse published payload");
+
+            // The published packet carries the RELAY's identity for this session.
+            assert_eq!(
+                published.meeting_id, reporter.meeting_id,
+                "meeting_id must be the authenticated room, not the claimed one"
+            );
+            assert_eq!(
+                published.session_id,
+                reporter.session_id.to_string(),
+                "session_id must be the relay-assigned session, not the claimed one"
+            );
+            assert_eq!(
+                published.reporting_user_id,
+                to_user_id_bytes(&reporter.user_id),
+                "reporting_user_id must be the authenticated user, not the claimed one"
+            );
+
+            // And none of the forged values survives anywhere on the wire — a
+            // substring check catches a stamp that overwrote the scalar but left
+            // the victim's id in some other string field.
+            let bytes_as_str = String::from_utf8_lossy(&payload);
+            assert!(!bytes_as_str.contains("victim-boardroom"));
+            assert!(!bytes_as_str.contains("9999999999999999999"));
+            assert!(!bytes_as_str.contains("ceo@example.com"));
+
+            // The F4 URL scrub still runs on this same path.
+            assert!(
+                published.active_server_url.is_empty(),
+                "the identity stamp must not displace the JWT-bearing URL scrub"
+            );
+        }
+
+        /// The stamp is UNCONDITIONAL, not fill-if-missing: a client that omits
+        /// its identity entirely is still labeled with the authenticated one
+        /// (rather than falling through to the metrics server's "unknown"
+        /// placeholder).
+        #[test]
+        fn stamp_is_unconditional_when_client_omits_identity() {
+            let mut hp = PbHealthPacket::new();
+            hp.timestamp_ms = 1_700_000_000_000;
+            assert!(hp.meeting_id.is_empty());
+            assert!(hp.session_id.is_empty());
+            assert!(hp.reporting_user_id.is_empty());
+
+            let reporter = attacker_reporter();
+            stamp_authenticated_identity(&mut hp, &reporter);
+
+            assert_eq!(hp.meeting_id, reporter.meeting_id);
+            assert_eq!(hp.session_id, reporter.session_id.to_string());
+            assert_eq!(hp.reporting_user_id, to_user_id_bytes(&reporter.user_id));
+        }
+
+        /// The stamp is SURGICAL: it rewrites the reporter's own three identity
+        /// scalars and nothing else. Peer-keyed telemetry describes OTHER
+        /// participants as this reporter observed them and must survive intact,
+        /// or operators lose the per-peer diagnostics the NATS path exists for.
+        ///
+        /// Mutation coverage: a "stamp" implemented by rebuilding the packet from
+        /// the identity fields alone (dropping the payload) fails every assert
+        /// below.
+        #[test]
+        fn stamp_leaves_telemetry_and_peer_stats_untouched() {
+            let original = forged_identity_packet();
+            let mut stamped = original.clone();
+            stamp_authenticated_identity(&mut stamped, &attacker_reporter());
+
+            assert_eq!(stamped.timestamp_ms, original.timestamp_ms);
+            assert_eq!(stamped.active_server_type, original.active_server_type);
+            assert_eq!(stamped.active_server_rtt_ms, original.active_server_rtt_ms);
+            assert_eq!(stamped.is_tab_visible, original.is_tab_visible);
+            assert_eq!(stamped.display_name, original.display_name);
+
+            assert_eq!(stamped.peer_stats.len(), original.peer_stats.len());
+            let stamped_peer = stamped
+                .peer_stats
+                .get("peer-bob-456")
+                .expect("peer entry preserved");
+            assert_eq!(
+                stamped_peer.neteq_stats.target_delay_ms,
+                original
+                    .peer_stats
+                    .get("peer-bob-456")
+                    .expect("peer entry in original")
+                    .neteq_stats
+                    .target_delay_ms
+            );
         }
 
         /// Fail-safe: a non-HEALTH or unparseable payload is forwarded UNCHANGED

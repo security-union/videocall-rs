@@ -932,7 +932,20 @@ impl Handler<WtInbound> for WtChatSession {
                 }
             }
             InboundAction::Forward(data) => {
-                ctx.notify(Packet { data });
+                ctx.notify(Packet {
+                    data,
+                    requires_host: false,
+                });
+            }
+            // #2136: same mailbox hop as `Forward`; the flag tells
+            // `Handler<Packet>` to build a host-gated `ClientMessage` that
+            // `ChatServer` refuses to fan out unless this session is the room's
+            // current host.
+            InboundAction::ForwardHostOnly(data) => {
+                ctx.notify(Packet {
+                    data,
+                    requires_host: true,
+                });
             }
             InboundAction::Processed | InboundAction::KeepAlive => {}
         }
@@ -962,9 +975,11 @@ impl Handler<Packet> for WtChatSession {
             self.logic.id,
             self.logic.room
         );
-        self.logic
-            .addr
-            .do_send(self.logic.create_client_message(msg));
+        // #2136: `requires_host` rides the Packet so the funnel can refuse to fan
+        // out a MEETING_TIMER from a non-host. Both transports delegate to the
+        // SAME `client_message_for` rather than mirroring the branch, so the
+        // gate cannot be disabled on one transport only.
+        self.logic.addr.do_send(self.logic.client_message_for(msg));
     }
 }
 

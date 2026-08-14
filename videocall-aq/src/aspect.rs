@@ -175,9 +175,100 @@ pub fn simulcast_layer_target_dims(
     }
 }
 
+/// Orient a tier BOUNDING BOX to the source's own orientation (issue #2179).
+///
+/// Every AQ tier box is authored LANDSCAPE (`1280x720`, `2560x1440`, …). A
+/// PORTRAIT source — a rotated panel, a phone-shaped window — fitted into a
+/// landscape box is bounded by the box's SHORT edge on its LONG axis, so it is
+/// downscaled far harder than a landscape source carrying the same pixel count:
+/// a 1440x2560 panel fitted into the `1440p` box (2560x1440) comes out
+/// 810x1440 — 1.17 Mpx of a 3.69 Mpx source — while a 2560x1440 landscape
+/// source in that same box is passed through untouched.
+///
+/// Swapping the box's axes when the source is portrait removes that asymmetry
+/// and is **pixel-budget neutral**: `box_w * box_h == box_h * box_w`, so the
+/// rung still costs the same number of encoded pixels and keeps its own
+/// bitrate/fps setpoint — it just spends those pixels in the shape the source
+/// actually has.
+///
+/// Landscape and square sources (and an unknown `0` source dimension) return
+/// the authored box unchanged, so every existing landscape share is unaffected.
+pub fn orient_box_to_source(box_w: u32, box_h: u32, src_w: u32, src_h: u32) -> (u32, u32) {
+    // Unknown source: no orientation to match — keep the authored box.
+    if src_w == 0 || src_h == 0 {
+        return (box_w, box_h);
+    }
+    // Square counts as landscape on BOTH sides, so a square source against a
+    // square box never swaps (and a square source against a landscape box
+    // fits identically either way).
+    let src_portrait = src_h > src_w;
+    let box_portrait = box_h > box_w;
+    if src_portrait == box_portrait {
+        (box_w, box_h)
+    } else {
+        (box_h, box_w)
+    }
+}
+
+/// [`fit_within_preserving_aspect`] against a tier box that is first oriented
+/// to the source by [`orient_box_to_source`] (issue #2179).
+///
+/// Use this wherever a SCREEN tier box bounds a capture whose orientation is
+/// not known in advance. It is deliberately NOT wired into the camera path:
+/// a portrait phone camera fitted 1:1 into a swapped box would triple its
+/// encoded pixel count at an unchanged tier bitrate, which is a bandwidth/CPU
+/// change that belongs to its own issue rather than riding along with #2179.
+pub fn fit_within_tier_box(src_w: u32, src_h: u32, box_w: u32, box_h: u32) -> (u32, u32) {
+    let (box_w, box_h) = orient_box_to_source(box_w, box_h, src_w, src_h);
+    fit_within_preserving_aspect(src_w, src_h, box_w, box_h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #2179: a PORTRAIT source must be bounded by the tier box's LONG
+    /// edge on its long axis, not by the authored landscape short edge.
+    ///
+    /// Mutation guard: drop the swap in `orient_box_to_source` (return
+    /// `(box_w, box_h)` unconditionally) and the 1440x2560 case collapses to
+    /// 810x1440 — the exact double-downscale issue #2179 reports — failing here.
+    #[test]
+    fn orient_box_to_source_matches_source_orientation() {
+        // Portrait source, landscape box -> box swapped, source held 1:1.
+        assert_eq!(orient_box_to_source(2560, 1440, 1440, 2560), (1440, 2560));
+        assert_eq!(fit_within_tier_box(1440, 2560, 2560, 1440), (1440, 2560));
+
+        // Landscape source, landscape box -> untouched (every existing share).
+        assert_eq!(orient_box_to_source(2560, 1440, 3840, 2160), (2560, 1440));
+        assert_eq!(
+            fit_within_tier_box(3840, 2160, 2560, 1440),
+            fit_within_preserving_aspect(3840, 2160, 2560, 1440)
+        );
+
+        // Square source counts as landscape: no swap, and the fit is the same
+        // either way (a square box is symmetric).
+        assert_eq!(orient_box_to_source(1280, 720, 1000, 1000), (1280, 720));
+
+        // Unknown source dims keep the authored box (no fabricated aspect).
+        assert_eq!(orient_box_to_source(1280, 720, 0, 0), (1280, 720));
+        assert_eq!(orient_box_to_source(1280, 720, 1920, 0), (1280, 720));
+    }
+
+    /// Orienting the box must never change what a rung COSTS: the swapped box
+    /// bounds exactly the same pixel budget, so the rung keeps its bitrate/fps
+    /// setpoint honestly.
+    #[test]
+    fn orient_box_to_source_is_pixel_budget_neutral() {
+        for &(bw, bh) in &[(1280u32, 720u32), (1920, 1080), (2560, 1440), (3840, 2160)] {
+            let (ow, oh) = orient_box_to_source(bw, bh, 1440, 2560);
+            assert_eq!(
+                ow as u64 * oh as u64,
+                bw as u64 * bh as u64,
+                "oriented box {ow}x{oh} must carry the same pixel budget as {bw}x{bh}"
+            );
+        }
+    }
 
     /// Helper: aspect ratio as f64.
     fn ar(w: u32, h: u32) -> f64 {

@@ -16,6 +16,10 @@ use crate::auth::{
     UserProfile,
 };
 use crate::components::attendants::AttendantsComponent;
+use crate::components::meeting_password_prompt::{
+    next_prompt_state, password_prompt_reason, MeetingPasswordPrompt, PasswordPromptReason,
+    PasswordPromptState,
+};
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{
     actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled, webtransport_host_base,
@@ -37,6 +41,11 @@ use videocall_client::{VideoCallClient, VideoCallClientOptions};
 pub enum MeetingStatus {
     NotJoined,
     Joining,
+    /// The server refused the join with one of the two issue-1613 password
+    /// codes. What the prompt renders lives in the page's `password_prompt`
+    /// signal; this variant only decides that the prompt is the mounted view,
+    /// and unmounting it is what drops the entered plaintext.
+    PasswordRequired,
     WaitingForMeeting {
         observer_token: String,
     },
@@ -53,6 +62,7 @@ pub enum MeetingStatus {
         end_on_host_leave: bool,
         allow_guests: bool,
         recording_allowed_for_all: bool,
+        chat_allowed_for_all: bool,
     },
     Rejected,
     Error(String),
@@ -78,6 +88,18 @@ pub fn MeetingPage(id: String) -> Element {
     // `RefCell already borrowed` panic in dioxus-core when `on_meeting_activated`
     // set `meeting_status` and the effect tried to re-run synchronously.
     let mut observer_token_signal = use_signal(|| None::<String>);
+
+    // Issue 1613 — meeting password.
+    //
+    // `password_prompt` carries what the prompt renders; `MeetingStatus::PasswordRequired`
+    // decides whether it is mounted at all. The initial value is never shown —
+    // nothing reads it until a 403 sets both.
+    let mut password_prompt =
+        use_signal(|| PasswordPromptState::opened(PasswordPromptReason::Required));
+    // The accepted password, held ONLY for as long as a later request in this
+    // same join can still need it (the meeting-activation re-join out of
+    // `WaitingForMeeting`). In memory only: never storage, cookie, URL or log.
+    let mut pending_password = use_signal(|| None::<String>);
 
     let initial_username: String = if let Some(name) = (display_name_ctx.0)() {
         name
@@ -225,10 +247,19 @@ pub fn MeetingPage(id: String) -> Element {
                 enable_webtransport: effective_wt_enabled,
                 max_received_layer: crate::constants::max_received_layer(),
                 skip_canvas_paint: crate::constants::skip_canvas_paint(),
+                // Issue #2156: deployment CAMERA ladder for receiver-side READOUTS.
+                camera_ladder_variant: crate::constants::camera_ladder_variant(),
                 // Issue #1884: this is the pre-meeting OBSERVER client (waiting for
                 // the meeting to start) — it renders no in-call reaction overlay,
                 // so it takes no reaction callback.
                 on_reaction: None,
+                on_raise_hand: None,
+                // Issue 2136: this is an OBSERVER client. The relay's outbound
+                // allowlist forwards only MEETING and SESSION_ASSIGNED to an
+                // observer, so a MEETING_TIMER can never arrive here -- a
+                // callback would be unreachable code, not a missing feature.
+                // There is deliberately no timer in the waiting room.
+                on_meeting_timer: None,
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting for meeting)");
                 }),
@@ -266,8 +297,39 @@ pub fn MeetingPage(id: String) -> Element {
                             // effect tears down the client without re-entering.
                             observer_token_signal.set(None);
 
-                            match join_meeting(&meeting_id, Some(&display_name)).await {
+                            // Issue 1613: this re-join goes through the password
+                            // gate AGAIN — the server verifies the password
+                            // before the "waiting_for_meeting" early return, so
+                            // clearing it once to reach the lobby did not clear
+                            // it for the re-join. Replay the value this session
+                            // already had accepted so the user is not
+                            // re-prompted the instant the host starts the
+                            // meeting, possibly while they are away from the
+                            // keyboard. `try_peek` because this callback runs
+                            // from a WebSocket message handler outside the
+                            // Dioxus runtime, where `peek()`
+                            // (= `try_peek().unwrap()`) would panic on a scope
+                            // that has since been dropped.
+                            let password = pending_password
+                                .try_peek()
+                                .ok()
+                                .and_then(|value| value.clone());
+
+                            match join_meeting(
+                                &meeting_id,
+                                Some(&display_name),
+                                password.as_deref(),
+                            )
+                            .await
+                            {
                                 Ok(response) => {
+                                    // Issue 1613: the meeting is active now, so
+                                    // no later request in this session can need
+                                    // the password again — drop it. The
+                                    // remaining statuses here are admitted /
+                                    // waiting / rejected, none of which
+                                    // re-enters the join path.
+                                    pending_password.set(None);
                                     let effective_user_id = if response.user_id.is_empty() {
                                         get_or_create_local_user_id()
                                     } else {
@@ -293,6 +355,8 @@ pub fn MeetingPage(id: String) -> Element {
                                                     allow_guests: response.allow_guests,
                                                     recording_allowed_for_all: response
                                                         .recording_allowed_for_all,
+                                                    chat_allowed_for_all: response
+                                                        .chat_allowed_for_all,
                                                 });
                                             } else {
                                                 meeting_status.set(MeetingStatus::Error(
@@ -329,7 +393,30 @@ pub fn MeetingPage(id: String) -> Element {
                                     handle_not_authenticated(&meeting_id).await;
                                 }
                                 Err(e) => {
-                                    meeting_status.set(MeetingStatus::Error(e.to_string()));
+                                    pending_password.set(None);
+                                    match password_prompt_reason(&e, password.is_some()) {
+                                        // Issue 1613: the host changed (or
+                                        // added) the password while we waited,
+                                        // or the server throttled / shed the
+                                        // replay. Re-prompt rather than
+                                        // dead-ending on an error card with no
+                                        // way back in.
+                                        Some(reason) => {
+                                            let supplied = password.is_some();
+                                            let current = password_prompt
+                                                .try_peek()
+                                                .map(|state| *state)
+                                                .unwrap_or_else(|_| {
+                                                    PasswordPromptState::opened(reason)
+                                                });
+                                            password_prompt
+                                                .set(next_prompt_state(current, reason, supplied));
+                                            meeting_status.set(MeetingStatus::PasswordRequired);
+                                        }
+                                        None => {
+                                            meeting_status.set(MeetingStatus::Error(e.to_string()));
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -388,16 +475,33 @@ pub fn MeetingPage(id: String) -> Element {
         };
     }
 
-    // Join meeting handler
+    // Join meeting handler.
+    //
+    // Issue 1613: `password` is `None` for the first attempt and `Some(_)` for
+    // every retry driven by the prompt. Everything else about the attempt —
+    // meeting id and display name — is recomputed from the same signals, so a
+    // retry re-issues an identical join and the user loses nothing by getting
+    // the password wrong.
     let on_join_meeting = {
         let meeting_id = id.clone();
-        move || {
+        move |password: Option<String>| {
             let meeting_id = meeting_id.clone();
             let display_name = input_value_state();
-            meeting_status.set(MeetingStatus::Joining);
+            let supplied_password = password.is_some();
+            if supplied_password {
+                // Keep the prompt mounted (and its field read-only) while the
+                // attempt is in flight, rather than swapping in the spinner and
+                // remounting it on failure. The peek is bound out first so its
+                // read guard is dropped before the write — `set` while a `peek`
+                // guard is live is a borrow conflict, not a no-op.
+                let in_flight = password_prompt.peek().submitted();
+                password_prompt.set(in_flight);
+            } else {
+                meeting_status.set(MeetingStatus::Joining);
+            }
 
             wasm_bindgen_futures::spawn_local(async move {
-                match join_meeting(&meeting_id, Some(&display_name)).await {
+                match join_meeting(&meeting_id, Some(&display_name), password.as_deref()).await {
                     Ok(response) => {
                         // Use the API-provided user_id when available;
                         // fall back to a locally-generated stable UUID
@@ -440,6 +544,7 @@ pub fn MeetingPage(id: String) -> Element {
                                         allow_guests: response.allow_guests,
                                         recording_allowed_for_all: response
                                             .recording_allowed_for_all,
+                                        chat_allowed_for_all: response.chat_allowed_for_all,
                                     });
                                 } else {
                                     meeting_status.set(MeetingStatus::Error(
@@ -450,6 +555,10 @@ pub fn MeetingPage(id: String) -> Element {
                             "waiting_for_meeting" => {
                                 let obs_token = response.observer_token.unwrap_or_default();
                                 observer_token_signal.set(Some(obs_token.clone()));
+                                // Issue 1613: the activation re-join out of this
+                                // state hits the password gate again, so this is
+                                // the ONE outcome that keeps the value.
+                                pending_password.set(password);
                                 meeting_status.set(MeetingStatus::WaitingForMeeting {
                                     observer_token: obs_token,
                                 });
@@ -458,16 +567,19 @@ pub fn MeetingPage(id: String) -> Element {
                                 let obs_token = response.observer_token.unwrap_or_default();
                                 observer_token_signal.set(Some(obs_token.clone()));
                                 came_from_waiting_room.set(true);
+                                pending_password.set(None);
                                 meeting_status.set(MeetingStatus::Waiting {
                                     observer_token: obs_token,
                                 });
                             }
                             "rejected" => {
                                 observer_token_signal.set(None);
+                                pending_password.set(None);
                                 meeting_status.set(MeetingStatus::Rejected);
                             }
                             _ => {
                                 observer_token_signal.set(None);
+                                pending_password.set(None);
                                 meeting_status.set(MeetingStatus::Error(format!(
                                     "Unknown status: {}",
                                     response.status
@@ -478,23 +590,46 @@ pub fn MeetingPage(id: String) -> Element {
                     Err(JoinError::MeetingNotActive) => {
                         // Fallback for older server versions that still return 400
                         observer_token_signal.set(Some(String::new()));
+                        // Issue 1613: same reasoning as the "waiting_for_meeting"
+                        // status above — this lands in `WaitingForMeeting`, whose
+                        // activation re-join has to clear the password gate again.
+                        pending_password.set(password);
                         meeting_status.set(MeetingStatus::WaitingForMeeting {
                             observer_token: String::new(),
                         });
                     }
                     Err(JoinError::JoiningNotAllowed) => {
                         observer_token_signal.set(None);
+                        pending_password.set(None);
                         meeting_status.set(MeetingStatus::Error(
                             "The host has left and no one can admit new participants. New participants cannot join this meeting.".to_string(),
                         ));
                     }
                     Err(JoinError::NotAuthenticated) => {
                         observer_token_signal.set(None);
+                        pending_password.set(None);
                         handle_not_authenticated(&meeting_id).await;
                     }
                     Err(e) => {
                         observer_token_signal.set(None);
-                        meeting_status.set(MeetingStatus::Error(e.to_string()));
+                        pending_password.set(None);
+                        match password_prompt_reason(&e, supplied_password) {
+                            // Issue 1613. Driven by the server's answer, not by
+                            // the meeting's `has_password` flag — see
+                            // `components::meeting_password_prompt`.
+                            Some(reason) => {
+                                let current = *password_prompt.peek();
+                                password_prompt.set(next_prompt_state(
+                                    current,
+                                    reason,
+                                    supplied_password,
+                                ));
+                                meeting_status.set(MeetingStatus::PasswordRequired);
+                            }
+                            None => {
+                                meeting_status.set(MeetingStatus::Error(e.to_string()));
+                            }
+                        }
                     }
                 }
             });
@@ -520,6 +655,7 @@ pub fn MeetingPage(id: String) -> Element {
                 end_on_host_leave: status.end_on_host_leave,
                 allow_guests: status.allow_guests,
                 recording_allowed_for_all: status.recording_allowed_for_all,
+                chat_allowed_for_all: status.chat_allowed_for_all,
             });
         }
     };
@@ -561,6 +697,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     end_on_host_leave: status.end_on_host_leave,
                                     allow_guests: status.allow_guests,
                                     recording_allowed_for_all: status.recording_allowed_for_all,
+                                    chat_allowed_for_all: status.chat_allowed_for_all,
                                 });
                             }
                         }
@@ -602,7 +739,12 @@ pub fn MeetingPage(id: String) -> Element {
             let is_not_joined = matches!(meeting_status(), MeetingStatus::NotJoined);
             if has_username && is_not_joined && !auto_join_attempted() {
                 auto_join_attempted.set(true);
-                on_join();
+                // Issue 1613: no password on the first attempt. The prompt only
+                // exists once the server has said one is needed, and the 403
+                // that raises it leaves `meeting_status` on `PasswordRequired`
+                // — not `NotJoined` — so this effect cannot re-fire underneath
+                // the prompt.
+                on_join(None);
             }
         });
     }
@@ -626,6 +768,7 @@ pub fn MeetingPage(id: String) -> Element {
                     allow_guests,
                     end_on_host_leave,
                     recording_allowed_for_all,
+                    chat_allowed_for_all,
 
                     // Waiting room
                 },
@@ -648,6 +791,7 @@ pub fn MeetingPage(id: String) -> Element {
                     end_on_host_leave: *end_on_host_leave,
                     allow_guests:*allow_guests,
                     recording_allowed_for_all: *recording_allowed_for_all,
+                    chat_allowed_for_all: *chat_allowed_for_all,
                 }
             },
             (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {
@@ -661,6 +805,29 @@ pub fn MeetingPage(id: String) -> Element {
                     on_cancel: on_cancel_waiting,
                 }
             },
+            // Issue 1613 — the meeting is password-protected and the server
+            // refused this join. Replaces the joining view so nothing else on
+            // the page competes for focus (which is what makes `aria-modal` on
+            // the prompt's card truthful).
+            (Some(_), MeetingStatus::PasswordRequired) => {
+                let mut on_join = on_join_meeting.clone();
+                rsx! {
+                    MeetingPasswordPrompt {
+                        state: password_prompt,
+                        // Unlike the guest page there is no join form to fall
+                        // back to here — the meeting page auto-joins — so the
+                        // only meaningful exit is the same one every other
+                        // terminal state on this page offers.
+                        cancel_label: "Return to Home",
+                        on_submit: move |password: String| on_join(Some(password)),
+                        on_cancel: move |_| {
+                            if let Some(w) = web_sys::window() {
+                                let _ = w.location().set_href("/");
+                            }
+                        },
+                    }
+                }
+            }
             (Some(_), MeetingStatus::WaitingForMeeting { .. }) => rsx! {
                 // `data-testid` added for the bots-app waiting-room detection
                 // path (see e2e/bots-app/src/meeting-join.ts). The bot uses it

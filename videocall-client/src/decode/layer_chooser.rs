@@ -86,6 +86,11 @@
 //! is per-(peer, [`PrefMediaKind`]), so a user can cap screen and camera
 //! independently.
 
+/// Which CAMERA simulcast ladder a rung index resolves against (issue #1768).
+/// Re-exported through the crate's AQ shim; imported here so the selection-vs-display
+/// resolver split below can name it (issue #2156).
+use crate::adaptive_quality_constants::LadderVariant;
+
 /// Media kind a layer preference / chooser applies to (issue #989, Phase 3).
 ///
 /// Camera VIDEO, SCREEN-share, and AUDIO of the same peer are independent
@@ -264,7 +269,7 @@ impl LayerAvailability {
     /// cadence so a momentary gap (a few dropped frames, a keyframe-only lull)
     /// does not retract a layer, but short enough that a genuinely-shed top
     /// layer is forgotten within a few seconds.
-    pub const DEFAULT_WINDOW_MS: u64 = 4000;
+    pub const DEFAULT_WINDOW_MS: u64 = videocall_aq::constants::LAYER_AVAILABILITY_WINDOW_MS;
 
     pub fn new() -> Self {
         Self::with_window(Self::DEFAULT_WINDOW_MS)
@@ -290,6 +295,15 @@ impl LayerAvailability {
         self.last_seen_ms
             .retain(|_, &mut seen| now_ms.saturating_sub(seen) <= window);
         self.last_seen_ms.keys().copied().max().unwrap_or(0)
+    }
+
+    /// Whether `layer_id` is within the availability window as of `now_ms`,
+    /// without pruning. Read-only so `&self` diagnostic paths can ask; the
+    /// pruning variant above stays the one selection uses.
+    pub fn layer_available_peek(&self, layer_id: u32, now_ms: u64) -> bool {
+        self.last_seen_ms
+            .get(&layer_id)
+            .is_some_and(|&seen| now_ms.saturating_sub(seen) <= self.window_ms)
     }
 }
 
@@ -1037,19 +1051,31 @@ pub const fn audio_layer_kbps_len() -> usize {
     AUDIO_LAYER_KBPS.len()
 }
 
-/// Nominal kbps of the BASE received-audio layer (layer 0, the rung the relay
-/// always forwards). Exposed as the single source of truth for UI readouts that
-/// want the received-audio bitrate WITHOUT walking the per-peer snapshot path
-/// (issue #1769): audio simulcast is a shallow, off-by-default ladder
-/// (`clamp_audio_layer_count`: `0`/`1` → single layer), so on the default
-/// deployment the ONLY audio layer published is layer 0 and this value is the
-/// exact received nominal — identical to what `received_layer_snapshot(Audio, …)`
-/// resolves for the per-peer Reception row in the diagnostics drawer. When the
-/// (non-default) audio-simulcast feature is on and a receiver pulls a higher
-/// rung, this base value under-reports the selected layer; a consumer needing the
-/// selected-layer bitrate must still use the snapshot path.
+/// Nominal kbps of the BASE received-audio layer (layer 0, the rung the relay's
+/// #989 layer filter never drops). Audio simulcast defaults ON with three rungs
+/// since issue #1082 (`clamp_audio_layer_count` still maps `0`/`1` to one layer),
+/// so this value is not necessarily the nominal bitrate of the layer a receiver
+/// selected.
+///
+/// This cheap const remains deliberate for the #1769 media-overlay path (a plain
+/// `const fn` — no borrow, no clock read).
+///
+/// A consumer needing the SELECTED-layer bitrate must pick the right accessor, and
+/// the similarly-named one is a trap: `received_layer_snapshot` (both here and its
+/// `VideoCallClient` wrapper) is a per-KIND AGGREGATE — one needle per kind, the
+/// active talker for audio with a highest-layer fallback — so it cannot drive a
+/// per-peer readout without showing every peer the same value. For per-peer use
+/// `VideoCallClient::per_peer_received_snapshots` (#1095), one `PeerReceiveDiag`
+/// per peer. Issue #2132 tracks the overlay correction that needs this.
 pub const fn base_audio_layer_kbps() -> u32 {
     AUDIO_LAYER_KBPS[0]
+}
+
+/// Nominal kbps of a SPECIFIC received-audio rung, or `None` if `layer` is off
+/// the ladder. This is what a per-peer readout needs (#2132); the base-only
+/// accessor above under-reports whenever the receiver selected rung 1 or 2.
+pub fn audio_layer_kbps(layer: u32) -> Option<u32> {
+    AUDIO_LAYER_KBPS.get(layer as usize).copied()
 }
 
 /// Receiver-side per-kind layer ceilings (issue #1082). Video and Screen are
@@ -1110,6 +1136,17 @@ pub const SIZE_CAP_MARGIN: f64 = 0.10;
 /// Map a rendered device-pixel tile height to the smallest simulcast layer index
 /// that "covers" it (issue #1256 Phase 1). Pure + host-tested.
 ///
+/// **This is the layer SELECTION path** and is deliberately pinned to
+/// [`LadderVariant::Default`] via [`size_cap_layer_in`]. Simulcast in this codebase
+/// is EXACT-MATCH — a guard/relay layer-id mismatch DROPS packets and freezes video
+/// — so the lid must never become variant-dependent. It provably need not be:
+/// #1768 moved only the top rung, and reaching that rung means every lower rung
+/// already failed. The function therefore returns `highest_available` whether the
+/// top rung covers the tile or the loop falls through, so the top rung's height
+/// cannot change the result. See
+/// `size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung`, which proves the
+/// two variants agree exhaustively by calling [`size_cap_layer_in`] on both arms.
+///
 /// Returns the smallest layer `i` in `0..=highest_available` whose native height
 /// (from [`received_layer_snapshot`]) times `(1.0 + SIZE_CAP_MARGIN)` is >=
 /// `tile_h_px`. If no layer satisfies it (tile taller than the top layer) returns
@@ -1124,11 +1161,35 @@ pub fn size_cap_layer(
     layer_count: u32,
     kind: PrefMediaKind,
 ) -> u32 {
+    size_cap_layer_in(
+        tile_h_px,
+        highest_available,
+        layer_count,
+        kind,
+        LadderVariant::Default,
+    )
+}
+
+/// [`size_cap_layer`] with the camera [`LadderVariant`] supplied explicitly.
+///
+/// **Deliberately PRIVATE**, so no production caller can pass
+/// [`LadderVariant::Reduced`] into layer selection (see [`size_cap_layer`] for why
+/// that must stay impossible). Its only reason to exist is that the equivalence
+/// test can then assert `size_cap_layer_in(.., Reduced) == size_cap_layer_in(..,
+/// Default)` using the REAL production rule on BOTH arms, instead of re-implementing
+/// the lid inside the test and grading its own copy.
+fn size_cap_layer_in(
+    tile_h_px: u32,
+    highest_available: u32,
+    layer_count: u32,
+    kind: PrefMediaKind,
+    variant: LadderVariant,
+) -> u32 {
     if matches!(kind, PrefMediaKind::Audio) || tile_h_px == 0 {
         return highest_available;
     }
     for i in 0..=highest_available {
-        let native_h = received_layer_snapshot(kind, i, layer_count).height;
+        let native_h = received_layer_snapshot_in(kind, i, layer_count, variant).height;
         if native_h as f64 * (1.0 + SIZE_CAP_MARGIN) >= tile_h_px as f64 {
             return i;
         }
@@ -1140,12 +1201,64 @@ pub fn size_cap_layer(
 /// `layer_index`, mapping the layer to its resolution/bitrate via the per-kind
 /// ladder (issue #989, Phase 4). `layer_count` is the number of layers the
 /// source ladder is producing (>= 1). Pure + panic-safe: `layer_index` and
-/// `layer_count` are clamped into range, so the 1-layer (flag-off) default
+/// `layer_count` are clamped into range, so an explicit 1-layer (flag-off) input
 /// always yields a valid layer-0 snapshot.
+///
+/// **This is the layer SELECTION entry point** — pinned to
+/// [`LadderVariant::Default`]. Use it for anything that feeds a DECISION (notably
+/// [`size_cap_layer`]'s #1256 tile-size lid), because simulcast here is EXACT-MATCH
+/// and a variant-dependent selection would risk a freeze.
+///
+/// For anything the USER READS (a rung label, a `{w}x{h}` readout, a `~kbps`
+/// metric) call [`received_layer_snapshot_for_display`] instead and hand it the
+/// deployment's real variant — otherwise a `Reduced` deployment labels a 960×540 @
+/// ~900 kbps stream "720p · ~1.5M" (issue #2156).
 pub fn received_layer_snapshot(
     kind: PrefMediaKind,
     layer_index: u32,
     layer_count: u32,
+) -> ReceivedLayerSnapshot {
+    received_layer_snapshot_in(kind, layer_index, layer_count, LadderVariant::Default)
+}
+
+/// Resolve a [`ReceivedLayerSnapshot`] for **DISPLAY**, honouring the deployment's
+/// camera [`LadderVariant`] (issue #2156).
+///
+/// Identical to [`received_layer_snapshot`] except that the Video arm resolves its
+/// rung geometry/bitrate from `variant`'s ladder, so a `Reduced` deployment's
+/// receiver readouts say `540p · ~900k` rather than the shipped ladder's `720p ·
+/// ~1.5M`. `Screen` and `Audio` are variant-INVARIANT (#1768 touched only the camera
+/// ladder), so they are unaffected by `variant` — but the parameter is still taken
+/// for all kinds so a caller never has to branch on kind to pick a resolver.
+///
+/// This must NOT be used for layer selection — see [`received_layer_snapshot`].
+///
+/// Note for #2156's purpose (unblocking a measurement run): this changes **no
+/// metric**. `health_reporter`'s `received_{video,screen,audio}_layer` maps carry
+/// layer INDICES only (`populate_received_layers`), with no geometry or bitrate, so
+/// Prometheus was never wrong here — only the UI was.
+pub fn received_layer_snapshot_for_display(
+    kind: PrefMediaKind,
+    layer_index: u32,
+    layer_count: u32,
+    variant: LadderVariant,
+) -> ReceivedLayerSnapshot {
+    received_layer_snapshot_in(kind, layer_index, layer_count, variant)
+}
+
+/// The shared clamp + ladder-map body behind [`received_layer_snapshot`] (selection,
+/// pinned `Default`) and [`received_layer_snapshot_for_display`] (display,
+/// variant-explicit).
+///
+/// Private and variant-explicit so the two public wrappers' NAMES carry the
+/// selection-vs-display invariant while the logic itself exists exactly once —
+/// `videocall_aq::constants::simulcast_layers_for` remains the single source of
+/// ladder truth.
+fn received_layer_snapshot_in(
+    kind: PrefMediaKind,
+    layer_index: u32,
+    layer_count: u32,
+    variant: LadderVariant,
 ) -> ReceivedLayerSnapshot {
     // Clamp the ladder size to the supported range for this kind, and the index
     // into [0, count-1], so a degenerate input can never panic the resolver.
@@ -1173,11 +1286,13 @@ pub fn received_layer_snapshot(
     }
 
     // Video / screen: resolve from the AQ ladder (lowest-first, index == layer).
+    // The SCREEN ladder has no variant (#1768 changed only the camera ladder), so
+    // `variant` is deliberately consulted on the camera arm only.
     let tiers = match kind {
         PrefMediaKind::Screen => {
             crate::adaptive_quality_constants::simulcast_screen_layers(count as usize)
         }
-        _ => crate::adaptive_quality_constants::simulcast_layers(count as usize),
+        _ => crate::adaptive_quality_constants::simulcast_layers_for(count as usize, variant),
     };
     let tier = tiers
         .get(idx as usize)
@@ -1208,14 +1323,26 @@ pub fn received_layer_snapshot(
 /// reason is derived from THAT clamped `layer_index` so the row's quality dot and
 /// its reason chip always agree. `user_max` / `constrained` feed
 /// [`degrade_reason`].
+///
+/// **DISPLAY-ONLY** — every caller is inside
+/// `PeerDecodeManager::per_peer_received_snapshots`, whose output drives readouts
+/// (the perf panel's per-peer rows, the diagnostics drawer, the signal popup) and no
+/// selection decision. It therefore takes the deployment's camera
+/// [`LadderVariant`] and resolves geometry through
+/// [`received_layer_snapshot_for_display`] (issue #2156). The `reason`/quality
+/// derivation is variant-INVARIANT: it is computed from layer INDICES
+/// (`layer_index`, `avail_top`, `full_ladder_top`, `user_max`), and both variants are
+/// the same depth (compile-time asserted in `videocall-aq`), so only the rendered
+/// pixels/bitrate move.
 pub fn received_layer_snapshot_with_reason(
     kind: PrefMediaKind,
     raw_selected: u32,
     avail_top: u32,
     user_max: Option<u32>,
     constrained: bool,
+    variant: LadderVariant,
 ) -> ReceivedLayerSnapshot {
-    let mut snap = received_layer_snapshot(kind, raw_selected, avail_top + 1);
+    let mut snap = received_layer_snapshot_for_display(kind, raw_selected, avail_top + 1, variant);
     let full_ladder_top = max_layers_for_kind(kind).saturating_sub(1);
     // Derive from the CLAMPED layer the snapshot actually carries, never the raw
     // selected layer — see the fn doc.
@@ -2197,10 +2324,22 @@ mod tests {
         assert!(base.kbps < s.kbps, "base bitrate < top bitrate");
     }
 
+    /// The SCREEN receive ladder's top rung is 1440p since issue #2179 (it was
+    /// 1080p, which capped how sharp a simulcast receiver could ever get). The
+    /// middle rung is the 1080p `high` rung and the base is the 720p `low` rung,
+    /// so the ladder is spaced by RESOLUTION rather than repeating 720p twice.
+    ///
+    /// Mutation guard: reverting `simulcast_screen_layers(3)` to
+    /// `[low, medium, high]` makes rung 2 read 1920x1080 and rung 1 read
+    /// 1280x720, failing both asserts.
     #[test]
-    fn snapshot_screen_top_layer_is_1080p() {
-        let s = received_layer_snapshot(PrefMediaKind::Screen, 2, 3);
-        assert_eq!((s.width, s.height), (1920, 1080));
+    fn snapshot_screen_ladder_is_spaced_by_resolution() {
+        let base = received_layer_snapshot(PrefMediaKind::Screen, 0, 3);
+        let mid = received_layer_snapshot(PrefMediaKind::Screen, 1, 3);
+        let top = received_layer_snapshot(PrefMediaKind::Screen, 2, 3);
+        assert_eq!((base.width, base.height), (1280, 720));
+        assert_eq!((mid.width, mid.height), (1920, 1080));
+        assert_eq!((top.width, top.height), (2560, 1440));
     }
 
     #[test]
@@ -2230,7 +2369,7 @@ mod tests {
 
     #[test]
     fn snapshot_single_layer_default_is_base() {
-        // 1-layer (flag-off) default: layer 0 / base, valid for every kind.
+        // Explicit 1-layer (flag-off) input: layer 0 / base for every kind.
         for kind in [
             PrefMediaKind::Video,
             PrefMediaKind::Screen,
@@ -2416,6 +2555,7 @@ mod tests {
             0, // avail_top (base-only sender)
             None,
             false,
+            LadderVariant::Default,
         );
         // Clamped to base — the dot will be Low, and the reason explains it.
         assert_eq!(
@@ -2429,15 +2569,200 @@ mod tests {
         );
 
         // A healthy full-quality stream: top of the full ladder, no reason.
-        let top = received_layer_snapshot_with_reason(PrefMediaKind::Video, 2, 2, None, false);
+        let top = received_layer_snapshot_with_reason(
+            PrefMediaKind::Video,
+            2,
+            2,
+            None,
+            false,
+            LadderVariant::Default,
+        );
         assert_eq!(top.layer_index, 2);
         assert_eq!(top.reason, None, "optimal reception carries no reason chip");
 
         // A user cap at the decoded layer below the full top → Setting.
-        let capped =
-            received_layer_snapshot_with_reason(PrefMediaKind::Video, 1, 2, Some(1), false);
+        let capped = received_layer_snapshot_with_reason(
+            PrefMediaKind::Video,
+            1,
+            2,
+            Some(1),
+            false,
+            LadderVariant::Default,
+        );
         assert_eq!(capped.layer_index, 1);
         assert_eq!(capped.reason, Some(DegradeReason::Setting));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #2156: the DISPLAY resolver honours the deployment's camera
+    // LadderVariant, while the SELECTION resolver stays pinned to Default.
+    // -----------------------------------------------------------------
+
+    /// The display resolver must report the REDUCED ladder's top rung
+    /// (960×540 @ 900 kbps) under `LadderVariant::Reduced`, and the shipped
+    /// 1280×720 @ 1500 kbps under `Default`. This is the whole of #2156's
+    /// videocall-client half: the peer-row `720p · ~1.5M` was wrong by 67% on the
+    /// bitrate for a 900 kbps stream.
+    ///
+    /// The expectations are read from the AQ tables (`simulcast_layers_for`, the
+    /// single source of ladder truth) rather than hardcoded, so a future retune of
+    /// either ladder cannot leave this test asserting stale geometry — but the two
+    /// arms are also asserted DIFFERENT, so a resolver that ignored `variant` (both
+    /// arms equal) fails regardless.
+    ///
+    /// MUTATION: make `received_layer_snapshot_for_display` delegate to
+    /// `received_layer_snapshot` (dropping `variant`) and the `assert_ne!` plus the
+    /// Reduced-arm equality both fail.
+    #[test]
+    fn display_resolver_reports_the_reduced_top_rung_under_the_reduced_variant() {
+        use crate::adaptive_quality_constants::{simulcast_layers_for, SIMULCAST_MAX_LAYERS};
+
+        let d_top = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Default)
+            .last()
+            .expect("the default camera ladder is non-empty");
+        let r_top = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Reduced)
+            .last()
+            .expect("the reduced camera ladder is non-empty");
+
+        let shipped =
+            received_layer_snapshot_for_display(PrefMediaKind::Video, 2, 3, LadderVariant::Default);
+        let reduced =
+            received_layer_snapshot_for_display(PrefMediaKind::Video, 2, 3, LadderVariant::Reduced);
+
+        assert_eq!(
+            (shipped.width, shipped.height, shipped.kbps),
+            (d_top.max_width, d_top.max_height, d_top.ideal_bitrate_kbps),
+            "the Default arm must resolve the SHIPPED top rung"
+        );
+        assert_eq!(
+            (reduced.width, reduced.height, reduced.kbps),
+            (r_top.max_width, r_top.max_height, r_top.ideal_bitrate_kbps),
+            "the Reduced arm must resolve the REDUCED top rung (#2156)"
+        );
+        assert_ne!(
+            (shipped.width, shipped.height, shipped.kbps),
+            (reduced.width, reduced.height, reduced.kbps),
+            "a resolver that ignored `variant` would make both arms identical — that is \
+             exactly the #2156 bug"
+        );
+
+        // Non-top rungs are byte-identical across variants (#1768 moved only the top),
+        // so the display resolver must agree there. This is the same invariant the
+        // #1256 lid's insensitivity argument rests on.
+        for idx in 0..2u32 {
+            let a = received_layer_snapshot_for_display(
+                PrefMediaKind::Video,
+                idx,
+                3,
+                LadderVariant::Default,
+            );
+            let b = received_layer_snapshot_for_display(
+                PrefMediaKind::Video,
+                idx,
+                3,
+                LadderVariant::Reduced,
+            );
+            assert_eq!(
+                (a.width, a.height, a.kbps),
+                (b.width, b.height, b.kbps),
+                "rung {idx} (below the top) must be variant-invariant"
+            );
+        }
+    }
+
+    /// SCREEN and AUDIO are variant-INVARIANT — #1768 changed only the camera
+    /// ladder, and `simulcast_screen_layers` has no variant at all. Passing
+    /// `Reduced` must therefore be a no-op for them, so an over-eager fix that
+    /// re-pointed the screen/audio arms at the camera table is caught here.
+    ///
+    /// MUTATION: route the Screen arm of `received_layer_snapshot_in` through
+    /// `simulcast_layers_for(.., variant)` and this fails.
+    #[test]
+    fn display_resolver_leaves_screen_and_audio_variant_invariant() {
+        for kind in [PrefMediaKind::Screen, PrefMediaKind::Audio] {
+            for idx in 0..3u32 {
+                let d = received_layer_snapshot_for_display(kind, idx, 3, LadderVariant::Default);
+                let r = received_layer_snapshot_for_display(kind, idx, 3, LadderVariant::Reduced);
+                assert_eq!(
+                    d, r,
+                    "{kind:?} rung {idx} must be identical across camera ladder variants"
+                );
+            }
+        }
+    }
+
+    /// The SELECTION entry point must stay pinned to the shipped ladder: the whole
+    /// safety argument for option (B) is that `received_layer_snapshot` (and hence
+    /// `size_cap_layer`) is physically incapable of reporting the reduced ladder.
+    ///
+    /// MUTATION: change `received_layer_snapshot`'s pinned variant to `Reduced` and
+    /// this fails.
+    #[test]
+    fn selection_resolver_stays_pinned_to_the_default_ladder() {
+        for idx in 0..3u32 {
+            assert_eq!(
+                received_layer_snapshot(PrefMediaKind::Video, idx, 3),
+                received_layer_snapshot_for_display(
+                    PrefMediaKind::Video,
+                    idx,
+                    3,
+                    LadderVariant::Default
+                ),
+                "the selection resolver must equal the DEFAULT display arm at rung {idx}"
+            );
+        }
+        // And it must NOT equal the reduced arm at the top rung, or the pin is dead.
+        assert_ne!(
+            received_layer_snapshot(PrefMediaKind::Video, 2, 3).height,
+            received_layer_snapshot_for_display(PrefMediaKind::Video, 2, 3, LadderVariant::Reduced)
+                .height,
+            "if these agree the Default pin is meaningless (or the variants no longer differ)"
+        );
+    }
+
+    /// The reason/quality attribution must be VARIANT-INVARIANT: it is derived from
+    /// layer INDICES only, and both ladders are the same depth. Only the rendered
+    /// pixels/bitrate may move. Guards against a #2156 regression where threading the
+    /// variant accidentally changed a peer row's quality dot or reason chip.
+    ///
+    /// MUTATION: derive `full_ladder_top` from the variant's ladder rather than
+    /// `max_layers_for_kind` in a way that differs per variant, and this fails.
+    #[test]
+    fn with_reason_attribution_is_variant_invariant() {
+        // (raw_selected, avail_top, user_max, constrained) covering every branch of
+        // `degrade_reason`: Sender, optimal/None, Setting, Network.
+        let cases: &[(u32, u32, Option<u32>, bool)] = &[
+            (2, 0, None, false),
+            (2, 2, None, false),
+            (1, 2, Some(1), false),
+            (1, 2, None, true),
+            (0, 0, None, false),
+        ];
+        for &(sel, avail_top, user_max, constrained) in cases {
+            let d = received_layer_snapshot_with_reason(
+                PrefMediaKind::Video,
+                sel,
+                avail_top,
+                user_max,
+                constrained,
+                LadderVariant::Default,
+            );
+            let r = received_layer_snapshot_with_reason(
+                PrefMediaKind::Video,
+                sel,
+                avail_top,
+                user_max,
+                constrained,
+                LadderVariant::Reduced,
+            );
+            assert_eq!(
+                (d.layer_index, d.layer_count, d.reason),
+                (r.layer_index, r.layer_count, r.reason),
+                "index/count/reason must not move with the ladder variant \
+                 (sel={sel} avail_top={avail_top} user_max={user_max:?} \
+                 constrained={constrained})"
+            );
+        }
     }
 
     #[test]
@@ -2726,6 +3051,120 @@ mod tests {
                 0,
                 "tile {h}px with only L0 available must clamp to 0"
             );
+        }
+    }
+
+    /// Issue #1768 — **why the receiver-side size lid does NOT need the ladder
+    /// variant threaded into it.**
+    ///
+    /// The publisher-side gate (`LadderVariant::Reduced`) lowers the TOP camera
+    /// rung 720p → 540p. `size_cap_layer` resolves rung heights from the
+    /// receiver's own compiled ladder, so the natural worry is that a receiver
+    /// still believing "L2 == 720p" picks the wrong lid index against a reduced
+    /// publisher.
+    ///
+    /// It cannot. `size_cap_layer` returns the FIRST index `i` in
+    /// `0..=highest_available` whose height covers the tile, and it falls through
+    /// to `highest_available` when none does. #1768 changed ONLY the top rung (the
+    /// 180p/360p rungs are byte-identical between variants, deliberately: the floor
+    /// is ~1.3% of the encode cost). Whatever height the top rung has, reaching it
+    /// means every lower rung already failed, so the answer is
+    /// `highest_available` whether the top covers or the loop falls through.
+    ///
+    /// This test proves that exhaustively over every tile height in
+    /// `0..=2200` device px (past 1080p tiles) × every `highest_available`, by
+    /// running the REAL `size_cap_layer_in` against BOTH ladders. If a future retune
+    /// moves a NON-top rung, this test turns red and the lid then genuinely does need
+    /// the variant plumbed through.
+    ///
+    /// MUTATION: change `SIMULCAST_VIDEO_LAYERS_REDUCED`'s `standard` rung to a
+    /// different height and this fails, correctly reporting that the lid has
+    /// become variant-sensitive.
+    #[test]
+    fn size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung() {
+        use crate::adaptive_quality_constants::{simulcast_layers_for, SIMULCAST_MAX_LAYERS};
+
+        // Precondition this test's whole argument rests on: the two ladders differ
+        // ONLY in the top rung. Asserted, not assumed.
+        let d_full = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Default);
+        let r_full = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Reduced);
+        assert_eq!(d_full.len(), r_full.len(), "same ladder depth");
+        for i in 0..d_full.len() - 1 {
+            assert_eq!(
+                (d_full[i].max_width, d_full[i].max_height),
+                (r_full[i].max_width, r_full[i].max_height),
+                "rung {i} (below the top) must be identical across variants — if this \
+                 fails, `size_cap_layer` HAS become variant-sensitive and the receiver \
+                 lid needs the LadderVariant threaded into it (issue #1768)"
+            );
+        }
+        assert_ne!(
+            d_full[d_full.len() - 1].max_height,
+            r_full[r_full.len() - 1].max_height,
+            "the top rung must differ, or the variant is a no-op"
+        );
+
+        // Exhaustive equivalence, on REAL PRODUCTION CODE on BOTH arms.
+        //
+        // Issue #2156 gave the lid the same private core/wrapper split as the snapshot
+        // resolver (`size_cap_layer_in`), specifically so this test can ASK production
+        // for the reduced-ladder answer. Before that it could not, and an earlier
+        // revision recomputed the rule in a `lid_of` closure — a test grading its own
+        // copy, which CLAUDE.md forbids. That closure is now gone: `chosen_default` and
+        // `chosen_reduced` are both the real `size_cap_layer_in`.
+        //
+        // What still carries the weight:
+        //   1. the PRECONDITION loop above (non-top rungs byte-identical across
+        //      variants) — the actual invariant the argument rests on, and the thing a
+        //      future retune breaks; and
+        //   2. `chosen_default == size_cap_layer(..)` below, which proves the public
+        //      selection entry point remains behaviorally equivalent to the shipped
+        //      core. `selection_resolver_stays_pinned_to_the_default_ladder` separately
+        //      pins the wrapper's explicit `LadderVariant::Default` choice.
+        for layer_count in 1..=SIMULCAST_MAX_LAYERS as u32 {
+            // Kept (though the heights are no longer recomputed against) as a per-count
+            // restatement that the two ladders are the same depth at EVERY `n`, not just
+            // at the full ladder the precondition loop above checked.
+            let d = simulcast_layers_for(layer_count as usize, LadderVariant::Default);
+            let r = simulcast_layers_for(layer_count as usize, LadderVariant::Reduced);
+            assert_eq!(
+                d.len(),
+                r.len(),
+                "same ladder depth at layer_count={layer_count}"
+            );
+            for highest in 0..layer_count {
+                for tile in 0u32..=2200 {
+                    let chosen_default = size_cap_layer_in(
+                        tile,
+                        highest,
+                        layer_count,
+                        PrefMediaKind::Video,
+                        LadderVariant::Default,
+                    );
+                    let chosen_reduced = size_cap_layer_in(
+                        tile,
+                        highest,
+                        layer_count,
+                        PrefMediaKind::Video,
+                        LadderVariant::Reduced,
+                    );
+                    assert_eq!(
+                        chosen_default, chosen_reduced,
+                        "the #1256 lid diverges between ladders at tile={tile}px \
+                         highest={highest} layer_count={layer_count} — the lid HAS become \
+                         variant-sensitive and needs the LadderVariant threaded into it"
+                    );
+                    // The shipped public entry point must be exactly the `Default` core:
+                    // this is the assertion that the #2156 split changed no selection
+                    // behaviour.
+                    assert_eq!(
+                        size_cap_layer(tile, highest, layer_count, PrefMediaKind::Video),
+                        chosen_default,
+                        "`size_cap_layer` must equal `size_cap_layer_in(.., Default)` \
+                         at tile={tile}px highest={highest} layer_count={layer_count}"
+                    );
+                }
+            }
         }
     }
 }

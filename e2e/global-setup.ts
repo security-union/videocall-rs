@@ -1,4 +1,5 @@
 import { chromium } from "@playwright/test";
+import { assertDevCertHashesPresent } from "./helpers/auth-context";
 import { waitForServices } from "./helpers/wait-for-services";
 
 const DIOXUS_UI_URL = process.env.DIOXUS_UI_URL || "http://localhost:3001";
@@ -56,6 +57,11 @@ async function warmupWasm(): Promise<void> {
 }
 
 export default async function globalSetup() {
+  // Fail fast before any browser launches (#2159): a missing hash otherwise
+  // surfaces later as QUIC_TLS_CERTIFICATE_UNKNOWN, which reads like a
+  // broken server. Here rather than per-spec because the run-only targets
+  // (`make e2e`, `e2e-bvt0`, `e2e-bvt1`) do NOT depend on `e2e-cert`.
+  assertDevCertHashesPresent();
   await waitForServices();
   await warmupWasm();
 }

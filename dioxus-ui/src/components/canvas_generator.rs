@@ -21,6 +21,7 @@ use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
+use crate::components::icons::raised_hand::RaisedHandIcon;
 use crate::components::icons::recording::RecordingIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
 use crate::components::icons::zoom::{
@@ -32,6 +33,10 @@ use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
 // SignalMeterMode is referenced via SignalInfo internally — no direct import
 // needed in this file (yet); attendants/peer_tile own the call-site values.
 use crate::constants::users_allowed_to_stream;
+// NOTE (issue 2135): `RaisedHandsCtx` is deliberately NOT imported here. This
+// file is a plain `fn`, so a context read would bind to `PeerTile`'s scope and
+// subscribe every tile to the room-wide roster; the raised state arrives as the
+// `hand_raised` parameter instead. See its doc on `generate_for_peer`.
 use crate::context::{
     AppearanceSettings, CroppedTilesCtx, DetachedShareCtx, HostSetCtx, RecordingSetCtx,
     ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState, VideoCallClientCtx,
@@ -791,12 +796,41 @@ pub fn generate_for_peer(
     // screen-share path. In the split-layout right panel, off-budget SS tiles
     // pass `true` just as the normal grid does.
     force_avatar: bool,
+    // Issue 2135: whether THIS peer's hand is up, as a plain `bool` resolved by
+    // the caller.
+    //
+    // A PARAMETER, not a `try_use_context::<RaisedHandsCtx>()` read in this body,
+    // and the distinction is load-bearing rather than stylistic. This function is
+    // a plain `fn`, NOT a `#[component]`, so it has no scope of its own: a
+    // context read here binds to the CALLER's scope (`PeerTile`), and `.read()`
+    // on the roster signal therefore subscribes THAT TILE to every hand in the
+    // room. A signal write marks subscribed scopes dirty directly in the runtime
+    // without ever consulting props, so such a subscription slips straight past
+    // the stable-props memoization of PR #2125: one person raising a hand
+    // re-rendered every mounted tile (N tiles x 2 renders per toggle), on a
+    // machine already software-decoding up to 30 streams.
+    //
+    // `PeerTile` now resolves this through a `use_memo`, which re-runs on every
+    // roster change but only dirties the ONE tile whose own hand moved. The queue
+    // ORDINAL is deliberately not threaded here at all: it changes for every peer
+    // behind a raiser, so memoizing it per tile would restore the same fan-out.
+    // It lives on the roster row (one component, one subscription) and in the
+    // banner.
+    hand_raised: bool,
 ) -> Element {
     let cropped_tiles: Option<Signal<HashMap<String, bool>>> =
         try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     let audio_level = audio_levels.raw;
     let mic_audio_level = audio_levels.mic;
     let signal_level = signal_info.level;
+    let signal_unmeasured = signal_info.decode_paused_locally;
+    let signal_state = if signal_unmeasured {
+        "unmeasured"
+    } else if signal_level.is_lost() {
+        "lost"
+    } else {
+        "measured"
+    };
     let signal_history = signal_info.history;
     let meeting_start_ms = signal_info.meeting_start_ms;
     // Pulled out once before rsx so the SignalQualityPopup call sites
@@ -1032,7 +1066,17 @@ pub fn generate_for_peer(
                         button {
                             id: "{ss_signal_btn_id}",
                             class: "signal-indicator",
-                            "aria-label": "Show screen-share signal quality",
+                            "aria-label": if signal_unmeasured {
+                                "Video paused to save CPU. Signal is not measured for this peer."
+                            } else {
+                                "Show screen-share signal quality"
+                            },
+                            title: if signal_unmeasured {
+                                "Video paused to save CPU. Signal is not measured for this peer."
+                            } else {
+                                "Show screen-share signal quality"
+                            },
+                            "data-signal-state": "{signal_state}",
                             "data-signal-level": format!("{}", signal_level.bars()),
                             "data-signal-lost": format!("{}", signal_level.is_lost()),
                             // stop_propagation: this is a tile-overlay control, not a
@@ -1042,7 +1086,11 @@ pub fn generate_for_peer(
                                 e.stop_propagation();
                                 on_toggle_signal_popup.call(());
                             },
-                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                            SignalBarsIcon {
+                                level: signal_level.bars(),
+                                lost: signal_level.is_lost(),
+                                unmeasured: signal_unmeasured,
+                            }
                         }
                         // Issue #1483: transport badge adjacent to the signal
                         // meter. Renders nothing unless the flag is on AND the
@@ -1096,6 +1144,7 @@ pub fn generate_for_peer(
                                 peer_id: popup_peer_id,
                                 peer_name: popup_peer_name,
                                 history: h,
+                                decode_paused_locally: signal_unmeasured,
                                 meeting_start_ms,
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
@@ -1262,6 +1311,21 @@ pub fn generate_for_peer(
                         if is_recording {
                             RecordingIcon {}
                         }
+                        // Issue 2135. The label is the bare state ("Hand
+                        // raised") — no name, no ordinal. The badge is a child of
+                        // this same `.floating-name`, whose first child is the
+                        // peer's name, so naming the peer again made AT read
+                        // "Alice ... Alice raised their hand". The ordinal is
+                        // omitted for a second, harder reason: see `hand_raised`
+                        // on `generate_for_peer`.
+                        if hand_raised {
+                            span {
+                                class: "raised-hand-badge",
+                                "data-testid": "peer-raised-hand-badge",
+                                "data-session-id": "{key}",
+                                RaisedHandIcon { decorative: false }
+                            }
+                        }
                         if is_guest {
                             span { class: "guest-badge", "Guest" }
                         }
@@ -1279,7 +1343,17 @@ pub fn generate_for_peer(
                         button {
                             id: "{split_signal_btn_id}",
                             class: "signal-indicator",
-                            "aria-label": "Show signal quality",
+                            "aria-label": if signal_unmeasured {
+                                "Video paused to save CPU. Signal is not measured for this peer."
+                            } else {
+                                "Show signal quality"
+                            },
+                            title: if signal_unmeasured {
+                                "Video paused to save CPU. Signal is not measured for this peer."
+                            } else {
+                                "Show signal quality"
+                            },
+                            "data-signal-state": "{signal_state}",
                             "data-signal-level": format!("{}", signal_level.bars()),
                             "data-signal-lost": format!("{}", signal_level.is_lost()),
                             // stop_propagation: tile-overlay control, not a grid
@@ -1288,7 +1362,11 @@ pub fn generate_for_peer(
                                 e.stop_propagation();
                                 on_toggle_signal_popup.call(());
                             },
-                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                            SignalBarsIcon {
+                                level: signal_level.bars(),
+                                lost: signal_level.is_lost(),
+                                unmeasured: signal_unmeasured,
+                            }
                         }
                         // Issue #1483: transport badge adjacent to the signal
                         // meter (renders nothing unless flag on + transport known).
@@ -1394,6 +1472,7 @@ pub fn generate_for_peer(
                                 peer_id: popup_peer_id,
                                 peer_name: popup_peer_name,
                                 history: h,
+                                decode_paused_locally: signal_unmeasured,
                                 meeting_start_ms,
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
@@ -1728,6 +1807,16 @@ pub fn generate_for_peer(
                             if is_recording {
                                 RecordingIcon {}
                             }
+                            // Issue 2135: bare state label, no name / ordinal —
+                            // see the split-view badge above.
+                            if hand_raised {
+                                span {
+                                    class: "raised-hand-badge",
+                                    "data-testid": "peer-raised-hand-badge",
+                                    "data-session-id": "{key}",
+                                    RaisedHandIcon { decorative: false }
+                                }
+                            }
                             if is_guest {
                                 span { class: "guest-badge", "Guest" }
                             }
@@ -1745,7 +1834,17 @@ pub fn generate_for_peer(
                             button {
                                 id: "{grid_signal_btn_id}",
                                 class: "signal-indicator",
-                                "aria-label": "Show signal quality",
+                                "aria-label": if signal_unmeasured {
+                                    "Video paused to save CPU. Signal is not measured for this peer."
+                                } else {
+                                    "Show signal quality"
+                                },
+                                title: if signal_unmeasured {
+                                    "Video paused to save CPU. Signal is not measured for this peer."
+                                } else {
+                                    "Show signal quality"
+                                },
+                                "data-signal-state": "{signal_state}",
                                 "data-signal-level": format!("{}", signal_level.bars()),
                                 "data-signal-lost": format!("{}", signal_level.is_lost()),
                                 // stop_propagation: tile-overlay control, not a grid
@@ -1754,7 +1853,11 @@ pub fn generate_for_peer(
                                     e.stop_propagation();
                                     on_toggle_signal_popup.call(());
                                 },
-                                SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                                SignalBarsIcon {
+                                    level: signal_level.bars(),
+                                    lost: signal_level.is_lost(),
+                                    unmeasured: signal_unmeasured,
+                                }
                             }
                             // Issue #1483: transport badge adjacent to the signal
                             // meter (renders nothing unless flag on + transport known).
@@ -1858,6 +1961,7 @@ pub fn generate_for_peer(
                                     peer_id: popup_peer_id,
                                     peer_name: popup_peer_name,
                                     history: h,
+                                    decode_paused_locally: signal_unmeasured,
                                     meeting_start_ms,
                                     transport: popup_transport,
                                     anchor_id: popup_anchor,
@@ -2873,6 +2977,14 @@ fn toggle_pinned_div(div_id: &str) {
     }
 }
 
+/// Is the viewport narrow enough to be treated as a phone?
+///
+/// WIDTH ONLY, by design for its callers here — all three are tap-to-spotlight
+/// handlers, where the question is whether tiles are small enough to want a tap
+/// affordance. It is therefore NOT a general "is this a phone" predicate: a
+/// landscape phone is 844x390 and classifies as desktop. Issue 2141 tried to
+/// borrow it to gate the emoji-search autofocus and had to stop; see
+/// `emoji_picker::should_autofocus_search_field` for a both-axes predicate.
 fn is_mobile_viewport() -> bool {
     if let Some(win) = window() {
         if let Ok(width) = win.inner_width() {

@@ -6,6 +6,14 @@ metadata:
   labels:
     app.kubernetes.io/name: grafana
     app.kubernetes.io/instance: {{ .Release.Name }}
+    # Discovery label for an operator-managed Grafana. kube-prometheus-stack's
+    # dashboard sidecar (grafana-sc-dashboard) watches for ConfigMaps labelled
+    # grafana_dashboard=1 across ALL namespaces and loads them at runtime, so
+    # this ConfigMap alone is enough to ship dashboards to a Grafana this chart
+    # does not own (labsworkspace, and eventually Ascend).
+    # Inert where Grafana mounts this ConfigMap as a volume instead (hcl-daily),
+    # so it is safe to carry in the shared template.
+    grafana_dashboard: "1"
 data:
   client-stability.json: |-
     {{ .Files.Get "dashboards/client-stability.json" | nindent 4 }}

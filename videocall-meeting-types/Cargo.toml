@@ -15,3 +15,11 @@ description = "Shared API types for the videocall.rs meeting backend"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+# The `#[cfg(test)]` module in `src/responses.rs` has always called
+# `serde_json::{to_string, from_str}` without the crate ever declaring it, so
+# `cargo test -p videocall-meeting-types` did not compile. Nothing caught it:
+# this crate has no test step in `.github/workflows/pr-check-rust-hcl.yaml` and
+# `cargo clippy --all` builds only the lib target, not the test target.
+serde_json = "1.0"

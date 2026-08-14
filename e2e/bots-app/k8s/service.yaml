@@ -1,0 +1,51 @@
+# service.yaml — headless governing Service for the videocall-bots StatefulSet
+# (Increment 2, #2035/#2072).
+#
+# `clusterIP: None` makes this a HEADLESS service: it creates no load-balanced
+# VIP and instead publishes stable per-pod DNS names of the form
+#   videocall-bots-<ordinal>.videocall-bots.bot-load.svc.cluster.local
+# A StatefulSet REQUIRES such a governing Service (referenced by its
+# spec.serviceName) to give each pod a stable network identity.
+#
+# Increment 3 (#2072): each bot now exposes a control API (`bots-app run
+# --ctl-port`) on the pod network so an in-cluster conductor can drive it. This
+# headless Service publishes that `ctl` port, so
+#   videocall-bots-<ordinal>.videocall-bots.bot-load.svc.cluster.local:8080
+# resolves to a pod AND names the port. On a HEADLESS Service the client
+# connects straight to the pod IP:port (there is no VIP to load-balance across),
+# so the port entry primarily documents + names the endpoint port; the routing
+# is inherent to the per-pod DNS. This is INTERNAL cluster traffic only — no
+# Ingress/LoadBalancer fronts it, and every request needs the bot-ctl-token
+# bearer token. `publishNotReadyAddresses: true` keeps the DNS records
+# resolvable even while a pod is still coming up / has no readiness probe, so
+# the conductor can address a pod without racing pod readiness.
+apiVersion: v1
+kind: Service
+metadata:
+  name: videocall-bots
+  namespace: bot-load
+  labels:
+    app.kubernetes.io/name: videocall-bot
+    app.kubernetes.io/component: bot-fleet
+    app.kubernetes.io/part-of: videocall
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  # The selector MUST include `instance: videocall-bots` — a Service matches any
+  # pod whose labels are a superset of the selector, and Increment 1's standalone
+  # pod (k8s/bot-pod.yaml) carries the same name+component but NO `instance`, so a
+  # {name, component}-only selector would scoop it into this fleet's DNS. The
+  # `instance` label (present on every StatefulSet pod, absent on the Inc1 pod) is
+  # exactly what keeps that pod out — matching the StatefulSet's own spec.selector.
+  selector:
+    app.kubernetes.io/name: videocall-bot
+    app.kubernetes.io/instance: videocall-bots
+    app.kubernetes.io/component: bot-fleet
+  # Control-API port. `targetPort: ctl` binds to the container's named `ctl`
+  # port (statefulset.yaml), so re-numbering the container port only needs one
+  # edit there. Keep `port` in sync with the StatefulSet's BOT_CTL_PORT.
+  ports:
+    - name: ctl
+      port: 8080
+      targetPort: ctl
+      protocol: TCP

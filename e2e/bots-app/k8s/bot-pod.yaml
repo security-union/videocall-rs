@@ -68,6 +68,14 @@ spec:
         # (jwt additionally needs a server-known JWT_SECRET).
         - name: BOT_AUTH
           value: "form-login"
+        # Per-pod simulcast-layer cap, declared explicitly (the entrypoint would
+        # default this to 10 -> 3 layers anyway; stating it here makes the cap
+        # visible at the manifest rather than implied). Set "" to advertise the
+        # node's real core count instead. Kept equal to the fleet value so a pod sharing
+        # a room with the fleet publishes the same ladder; the decode saving is
+        # COLLECTIVE and does not apply to a pod running alone (#2248).
+        - name: BOT_HW_CONCURRENCY
+          value: "10"
         - name: BOT_EMAIL
           valueFrom:
             secretKeyRef:
@@ -93,12 +101,15 @@ spec:
         # Headless Chrome shared memory. Default container /dev/shm is 64Mi,
         # a classic crash/OOM gotcha. Note: src/bot.ts also passes
         # --disable-dev-shm-usage (so Chrome prefers /tmp), making this mount
-        # defense-in-depth. sizeLimit counts against the pod memory limit, so
-        # it is kept modest (512Mi) to preserve headroom under the 2Gi cap.
+        # defense-in-depth. sizeLimit counts against the pod memory limit, so it
+        # is kept at 256Mi — well under the burst band (limit 2Gi − request
+        # 1.5Gi = 512Mi) to preserve OOM margin, matching statefulset.yaml.
+        # --disable-dev-shm-usage already diverts Chrome to /tmp, so 256Mi is
+        # ample.
         - name: dshm
           mountPath: /dev/shm
   volumes:
     - name: dshm
       emptyDir:
         medium: Memory
-        sizeLimit: 512Mi
+        sizeLimit: 256Mi

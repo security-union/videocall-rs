@@ -185,6 +185,63 @@ impl APIError {
             engineering_error: None,
         }
     }
+
+    /// The meeting is password-protected and the join request carried no
+    /// password (issue #1613). Distinct from [`Self::invalid_meeting_password`]
+    /// so a client can tell "prompt the user" from "the user typed it wrong".
+    ///
+    /// Disclosure note: both codes reveal only that the meeting has a password,
+    /// which `has_password` already publishes on every meeting listing
+    /// (`GET /api/v1/meetings`, `/feed`, `/joined`, `/{meeting_id}`) — so
+    /// splitting them leaks nothing that an enumerating caller cannot read
+    /// directly, and it avoids forcing every client into a blind retry loop.
+    pub fn meeting_password_required() -> Self {
+        Self {
+            code: "MEETING_PASSWORD_REQUIRED".to_string(),
+            message: "This meeting requires a password.".to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// The supplied meeting password did not verify against the stored hash —
+    /// or the stored hash could not be parsed at all, in which case the join is
+    /// denied rather than allowed through (fail closed, issue #1613).
+    ///
+    /// The message is deliberately identical for both causes: a caller must not
+    /// be able to distinguish "wrong password" from "this meeting's stored hash
+    /// is corrupt", since the latter would advertise a record an attacker could
+    /// otherwise probe for. Operators get the real cause from the server log.
+    pub fn invalid_meeting_password() -> Self {
+        Self {
+            code: "INVALID_MEETING_PASSWORD".to_string(),
+            message: "Incorrect meeting password.".to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// Too many failed password attempts from this client for this meeting
+    /// (issue #1613). Scoped to a `(client IP, meeting)` pair, so it never locks
+    /// a meeting for anyone but the client that burned the budget.
+    pub fn too_many_password_attempts() -> Self {
+        Self {
+            code: "TOO_MANY_PASSWORD_ATTEMPTS".to_string(),
+            message: "Too many incorrect password attempts. Please wait a minute and try again."
+                .to_string(),
+            engineering_error: None,
+        }
+    }
+
+    /// The server is at its bounded capacity for concurrent password
+    /// verifications and shed this request rather than queueing it without
+    /// limit (issue #1613). Transient and safe to retry.
+    pub fn verifier_overloaded() -> Self {
+        Self {
+            code: "VERIFIER_OVERLOADED".to_string(),
+            message: "The server is busy verifying meeting passwords. Please try again."
+                .to_string(),
+            engineering_error: None,
+        }
+    }
 }
 
 impl std::fmt::Display for APIError {

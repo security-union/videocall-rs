@@ -12,15 +12,15 @@
  * Because it reassigns the whole object, a pre-navigation `page.addInitScript`
  * that sets `window.__APP_CONFIG.experimentalSimulcastMaxLayers` is clobbered
  * the instant `config.js` runs. The committed `config.js` shipped by the e2e
- * docker stack ALSO omits `experimentalSimulcastMaxLayers` entirely (see
- * `docker/start-dioxus.sh`, which has no SIMULCAST env line), so the Rust
- * `#[serde(default = ...)]` falls back to `1` — feature OFF.
+ * docker stack explicitly sets `experimentalSimulcastMaxLayers: 1`, so effective
+ * e2e behavior is feature-OFF even though an omitted key would now take the Rust
+ * `#[serde(default = ...)]` value of `3` (#1082).
  *
  * The robust, source-file-free way to flip the flag for just the test browser
  * is to intercept the `GET /config.js` response, append the simulcast key to
  * the served object literal, and let the patched script run normally. This:
- *   - never mutates `dioxus-ui/scripts/config.js` (the committed production
- *     default stays 1 / OFF),
+ *   - never mutates `dioxus-ui/scripts/config.js` (the committed dev/E2E
+ *     fallback stays explicitly pinned to 1 / OFF),
  *   - never touches the developer's gitignored `config.local.js` override,
  *   - is scoped to the intercepting context only (other tabs/tests are
  *     unaffected),
@@ -36,7 +36,7 @@
  * (`navigator.hardwareConcurrency`) and the UA platform — with NO CPU benchmark:
  *   - `< 6` cores OR unknown → 1 layer
  *   - older Intel Mac        → 1 layer
- *   - `6..10` cores          → 2 layers
+ *   - `6..9` cores           → 2 layers
  *   - `>= 10` cores          → 3 layers
  * (The runtime `videocall-aq` loop then earns layers up to that ceiling.)
  *

@@ -79,6 +79,11 @@ pub struct AppState {
     /// Dev-only auto-login user. When `Some`, `GET /api/v1/dev/auto-login`
     /// issues a session cookie for this identity without any authentication.
     pub dev_user: Option<DevUser>,
+    /// Meeting-password gate (issue #1613): the Argon2 verifier, its
+    /// concurrency/memory bound, and the per-`(client IP, meeting)` failed-attempt
+    /// throttle. Shared across all handlers on this instance — the bound is
+    /// meaningless if each request gets its own.
+    pub password_gate: Arc<crate::password::MeetingPasswordGate>,
 }
 
 impl AppState {
@@ -129,6 +134,7 @@ impl AppState {
             search: config.search.clone(),
             display_name_rate_limit_disabled: config.display_name_rate_limit_disabled,
             dev_user: config.dev_user.clone(),
+            password_gate: Arc::new(crate::password::MeetingPasswordGate::new()),
         }
     }
 }

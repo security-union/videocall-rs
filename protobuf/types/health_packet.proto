@@ -44,9 +44,23 @@ message NetEqStats {
 }
 
 message VideoStats {
+  // Frames per second the receiver actually DECODED for this stream (#2190).
+  // Packets the EXACT-MATCH simulcast guard skipped as wrong-rung are excluded:
+  // the relay fails open and forwards ALL of a publisher's rungs to a healthy
+  // receiver, so counting arrivals made this read the LADDER SUM (an 8fps 3-rung
+  // camera measured ~52 = 7+15+30, above any single rung's ceiling).
+  // Still a DECODE-CALL count, not a paint count — see the #1013 note on
+  // video_seq_loss_per_sec below for why this can look healthy during a freeze.
   double fps_received = 1;
   double frames_buffered = 2;
   uint64 frames_decoded = 3;
+  // Cumulative bytes-derived bitrate. Unlike fps_received this DOES include
+  // skipped wrong-rung packets, because they still consumed the receiver's
+  // downlink (#2190). The client gates the two on SEPARATE freshness clocks —
+  // bitrate on last ARRIVAL, fps on last DECODE — so this stays live for a stream
+  // that receives without decoding (hidden tile, or a rung the publisher stopped
+  // producing). A live bitrate with fps_received at 0 is therefore the
+  // receiving-but-not-decoding signature; both read 0 only when arrivals stop.
   uint64 bitrate_kbps = 4;
 
   // Buffered video playout latency (#1252): how far behind live this peer's
@@ -91,6 +105,42 @@ message VideoStats {
   // Same fps_received > 0 gate as the ms gauges above: a paused/hidden tile
   // decodes nothing, so when fps == 0 this stays at its 0.0 default ("at live").
   double content_staleness_ms = 9;
+  // Lifetime count of keyframe ARRIVALS at this receiver's jitter buffer for this
+  // stream (#2201).
+  //
+  // Do NOT subtract this from keyframe_requests_sent_total (HealthPacket field 23):
+  // that field is a single process-wide client counter covering ALL peers and BOTH
+  // media kinds, most arrivals here are PERIODIC keyframes nobody requested (so a
+  // healthy call drives the difference negative), and the two reset on different
+  // boundaries. See the videocall_video_keyframe_arrivals_total metric doc for how
+  // to read this instead.
+  //
+  // Why this exists: the receiver branches on keyframe arrival in four places inside insert_frame
+  // and recorded it NOWHERE, so during a freeze no artifact could distinguish "the
+  // publisher's keyframe never reached us" (delivery — e.g. #1699 WS head-of-line)
+  // from "it arrived and did not recover the picture" (decode/guard/buffer). Those
+  // need opposite fixes. The request side was already fully observable, making
+  // arrival the one missing link in the chain.
+  //
+  // Counts arrivals REJECTED as old/duplicate too: the question is whether the
+  // publisher's keyframe reached us, for which a retransmit counts (the same
+  // reasoning the #1479 arrival gate-clear is built on).
+  //
+  // A COUNTER with the same semantics as playout_skip_to_live_total (field 8):
+  // preserved across the jitter buffer's flush(), reset to 0 when the decode
+  // pipeline is rebuilt, so consume via increase()/rate(). Folded
+  // UNCONDITIONALLY — NOT gated on fps_received > 0 like the ms gauges — because
+  // it must be readable DURING a freeze, which is exactly when fps can be 0.
+  //
+  // EXPLICIT PRESENCE (`optional`), matching keyframe_requests_sent_total (field 23)
+  // rather than the implicit-presence counters above. Load-bearing during a staged
+  // rollout: with proto3 implicit presence, a pre-#2201 client that never populates
+  // this would report 0, which is numerically indistinguishable from the single most
+  // alarming real condition this metric exists to detect ("we requested keyframes and
+  // none ever arrived"). Every un-upgraded receiver in a mixed-version meeting would
+  // read as total keyframe delivery loss. `optional` lets the server tell "not
+  // reported" from "zero arrived" and omit the series entirely for old clients.
+  optional uint64 keyframe_arrivals_total = 10;
 }
 
 message PeerStats {
@@ -492,6 +542,116 @@ message HealthPacket {
   // browser left the queue un-age-capped or did not honor the setter; any finite
   // value near the requested cap confirms the staleness knob took effect.
   optional double wt_incoming_datagram_max_age_ms = 108; // (issue 2031)
+
+  // Actual frames/sec the SCREEN encoder's base layer is producing (issue 2147).
+  //
+  // WHY a separate field rather than reusing encoder_output_fps (field 29): that
+  // field is CAMERA-only and has no media_kind discriminator, so there was
+  // previously NO publisher-side screen-encoder fps signal anywhere in the
+  // system. In the #2143 run the camera gauge read a healthy 7-9 fps throughout a
+  // screen-share-triggered room-wide freeze (856 freshness_skip events,
+  // head_age up to 23s) because the camera encoder genuinely WAS healthy — the
+  // screen encoder, where the trouble was, was unobservable.
+  //
+  // HONESTY (deliberately NOT gated on `> 0`, unlike field 29 — see #2079): a
+  // screen encoder that has STOPPED producing must be distinguishable from one
+  // that never started. Field 29's `> 0` gate makes a genuine total stall absent
+  // from the wire and therefore indistinguishable from never-started; that
+  // conflation is exactly what made it useless as a freeze signal. This field is
+  // emitted whenever the screen encoder is WIRED, including an honest 0.
+  //
+  // ⚠️ THIS FIELD ALONE CANNOT SEE A FREEZE. It counts encoded CHUNKS, and the
+  // static/PLI synthetic retained-frame re-encodes share the same base-layer output
+  // callback as fresh captures, so during the #1899/#2143 stall it reads a small
+  // NONZERO while receivers sit on minutes-stale content. Pair it with
+  // `screen_encoder_stall_episodes` / `screen_encoder_max_stall_gap_ms`
+  // (fields 110/111), which count the tick-starvation episodes that produce exactly
+  // that symptom. This field answers "is the encoder emitting anything at all";
+  // those answer "is what it emits actually fresh".
+  //
+  // WHEN IS IT ABSENT? Only when no screen encoder has been bound to the health
+  // reporter at all. The dioxus-ui client constructs its ScreenEncoder eagerly at
+  // Host mount and binds it in the same pass, so in THAT client the field is
+  // effectively always present — absence is reserved for other/future consumers
+  // of this proto that never bind one (and for old clients predating this field).
+  // Do NOT read absence as "not sharing"; use screen_sharing_active for that.
+  //
+  // READING A 0: a legitimately static share reports 0 and that is CORRECT, not a
+  // fault — a static share emits ~4 synthetic keyframes on the 3s floor
+  // (SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET) over ~12s and then goes quiet by design.
+  // A 0 while NOT sharing is equally expected (the encoder is bound but idle, and
+  // stop() resets the atom to 0). So pair this with screen_sharing_active
+  // (field 28) to separate the states that matter:
+  //   * 0 with active=false → not sharing. Nothing to see.
+  //   * 0 with active=true  → sharing; static-and-fine OR stalled. Disambiguate
+  //                           with the receivers' rising content_staleness_ms /
+  //                           freshness_skip, which a static share does not show.
+  //   * >0 with active=true → sharing and producing.
+  // Screen fps also has a deliberately longer idle decay than camera
+  // (SCREEN_ENCODER_FPS_IDLE_DECAY_MS = 5000 vs 2000) precisely because static
+  // shares are expected.
+  optional uint32 screen_encoder_output_fps = 109; // (issue 2147)
+
+  // Screen encoder TICK-STARVATION stall signal (issue 2147; discussion 1960
+  // issue 2). These are the fields that can actually see a screen freeze — read
+  // them TOGETHER with screen_encoder_output_fps above, which on its own cannot.
+  //
+  // WHY fps ALONE IS NOT ENOUGH (the #2143 mechanism). `screen_encoder_output_fps`
+  // counts encoded CHUNKS, and the static/PLI synthetic retained-frame re-encodes
+  // go through the same base-layer output callback as fresh captures — the callback
+  // cannot tell them apart. So during the #1899/#2143 freeze (PLI answers
+  // collapsing while the encoder still emits some output) the fps field reads a
+  // small NONZERO — "sharing and producing" — while every receiver is frozen on
+  // minutes-stale content. `content_staleness_ms` does not rescue it either: that
+  // gauge is gated on `fps_received > 0`, so a no-arrivals stall reports its 0.0
+  // "at live" default.
+  //
+  // Each stall episode is one `'encode` loop-tick resume whose wall-clock gap since
+  // the previous tick exceeded SCREEN_ENCODER_STALL_GAP_MS — i.e. a main-thread
+  // freeze during which the encoder could not sample fresh capture and receivers
+  // saw `fps > 0` on stale re-encoded content. That is exactly the symptom, made
+  // countable.
+  //
+  // HOW TO READ THE PAIR:
+  //   * fps > 0, episodes FLAT      → genuinely healthy.
+  //   * fps > 0, episodes RISING    → THE FREEZE. Re-encoded stale content.
+  //   * fps == 0, sharing active    → idle/static share (honest, see field 109).
+  //
+  // Cumulative since PAGE LOAD (not since the last packet) and never reset, so
+  // consume with increase()/rate(). Emitted only once nonzero, matching the
+  // `screen_encoder_restarts_*` counters' convention: a 0 carries no information
+  // for a monotonic counter, unlike the fps gauge where 0 is a real reading.
+  optional uint64 screen_encoder_stall_episodes = 110; // (issue 2147)
+  // Largest single tick-starvation gap observed since page load (ms, rounded).
+  // The severity companion to the episode count: 3 episodes of 200ms is jitter,
+  // 3 episodes with a 23000ms max is the #2143 incident. Same emit-when-nonzero
+  // convention as the counter above.
+  optional uint64 screen_encoder_max_stall_gap_ms = 111; // (issue 2147)
+  // FITTED per-layer camera encode geometry and measured output fps (issue 2170),
+  // lowest ladder index first. Rationale and the bots-vs-webcams measurement are
+  // in issue 2170 -- kept out of this comment because protoc embeds comment TEXT
+  // in the descriptor blob shipped to every wasm client.
+  //
+  // Dims last published by the encode loop for each ACTIVE rung, NOT the rung's
+  // bounding box (a rung is a ceiling the capture is fitted inside without
+  // upscaling). Omitted, never zero-filled, for camera-off/shed/unbuilt rungs; an
+  // empty field also covers a client predating this field, and both mean "no
+  // geometry to show."
+  repeated EncoderLayerGeometry camera_layer_geometry = 112; // (issue 2170)
+}
+
+// One active camera rung's FITTED geometry and measured output rate.
+message EncoderLayerGeometry {
+  // 0 = base ladder index, matching the received_layer gauge convention.
+  uint32 layer_id = 1;
+  // FITTED encode width in px, not the rung's bounding-box width.
+  uint32 width = 2;
+  // FITTED encode height in px, not the rung's bounding-box height.
+  uint32 height = 3;
+  // MEASURED output fps for this rung over the last ~1s window, not nominal
+  // target_fps. ABSENT until the first window closes; PRESENT 0 is a measured
+  // stall -- the two are deliberately distinct.
+  optional uint32 output_fps = 4;
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

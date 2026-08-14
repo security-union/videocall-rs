@@ -199,14 +199,28 @@ pub fn reset_refresh_inflight() {
     REFRESH_INFLIGHT.with(|slot| *slot.borrow_mut() = None);
 }
 
+/// Join a meeting.
+///
+/// `password` is the meeting password (issue #1613). It is `None` for meetings
+/// without one and for the meeting owner, who the server exempts. For any other
+/// caller joining a `has_password: true` meeting the server returns
+/// `MeetingPasswordRequired` / `InvalidMeetingPassword`, which the caller should
+/// surface as a password prompt and retry with the entered value.
+///
+/// NOTE: never log `password`, and never widen the `log::info!` below to format
+/// the whole request.
 pub async fn join_meeting(
     meeting_id: &str,
     display_name: Option<&str>,
+    password: Option<&str>,
 ) -> Result<JoinMeetingResponse, JoinError> {
     log::info!("Joining meeting via API: {meeting_id} (display_name: {display_name:?})");
-    let result =
-        with_refresh_retry(|| async { client()?.join_meeting(meeting_id, display_name).await })
-            .await?;
+    let result = with_refresh_retry(|| async {
+        client()?
+            .join_meeting(meeting_id, display_name, password)
+            .await
+    })
+    .await?;
     log::info!(
         "Join response: status={}, is_host={}",
         result.status,
@@ -352,9 +366,17 @@ pub async fn create_meeting(
     with_refresh_retry(|| async move { client()?.create_meeting(req).await }).await
 }
 
+/// Join a meeting as a guest.
+///
+/// `password` is the meeting password (issue #1613). A guest is never the
+/// meeting owner, so it is required whenever the meeting has one; see
+/// [`join_meeting`].
+///
+/// NOTE: never log `password`.
 pub async fn join_meeting_as_guest(
     meeting_id: &str,
     display_name: &str,
+    password: Option<&str>,
 ) -> Result<JoinMeetingResponse, JoinError> {
     log::info!("Joining meeting as guest via API: {meeting_id} (display_name: {display_name})");
     let stored_id = crate::auth::get_guest_session_id();
@@ -363,7 +385,7 @@ pub async fn join_meeting_as_guest(
         &base_url,
         videocall_meeting_client::AuthMode::Cookie,
     )
-    .join_meeting_as_guest(meeting_id, display_name, stored_id.as_deref())
+    .join_meeting_as_guest(meeting_id, display_name, stored_id.as_deref(), password)
     .await?;
 
     crate::auth::store_guest_session_id(&result.user_id);

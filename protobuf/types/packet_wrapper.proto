@@ -63,6 +63,32 @@ message PacketWrapper {
     // RE-BROADCAST (media fan-out), CLEARTEXT (relay validates the enum), and
     // self-skipped for the sender (client renders a local echo).
     REACTION = 17;
+    // Client -> relay -> all-peers RAISED-HAND STATE broadcast (#2135).
+    // Takes 18: 17 is REACTION and 15/16 are informally reserved by the
+    // unmerged PR #1843 (sfu-capacity `reserved 15, 16`), so 18 is the first
+    // free tag. Like REACTION this is RE-BROADCAST (media fan-out), CLEARTEXT
+    // (the relay validates it at ingress), and self-skipped for the sender.
+    //
+    // UNLIKE REACTION it is persistent STATE, not an ephemeral event, so a
+    // client whose hand is raised RE-ANNOUNCES it on peer-join and after
+    // reconnect. The relay holds NO hand state; see RaiseHandPacket for the
+    // full re-announce contract and why the state lives on the clients.
+    RAISE_HAND = 18;
+    // Host -> relay -> all-peers MEETING TIMER STATE broadcast (#2136).
+    // 18 is taken by RAISE_HAND (#2135); 15 and 16 remain informally reserved
+    // by the unmerged PR #1843 (sfu-capacity `reserved 15, 16`). 19 has never
+    // been used on any branch in this repository's history, so no retired tag
+    // is reused (#1600).
+    //
+    // Like REACTION this is CLIENT-AUTHORED and RE-BROADCAST on the media
+    // fan-out, CLEARTEXT (the relay validates it), and self-skipped for the
+    // sender — so the host renders a local echo of its own timer.
+    //
+    // Unlike REACTION it is HOST-ONLY, and the relay enforces that: see
+    // `ClientMessage.requires_host`. Do NOT confuse it with MEETING (7), which
+    // is server-authored by meeting-api and which `classify_packet` drops
+    // unconditionally when a client sends it. See MeetingTimerPacket.
+    MEETING_TIMER = 19;
   }
 
   // Cleartext media-kind discriminator on the OUTER envelope.

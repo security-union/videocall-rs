@@ -24,6 +24,7 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
 use log::info;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -70,12 +71,20 @@ use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::encode::camera_encoder::{build_simulcast_layers, SimulcastSendSnapshot};
-use videocall_aq::{fit_within_preserving_aspect, simulcast_layer_target_dims};
+use videocall_aq::{fit_within_tier_box, orient_box_to_source, simulcast_layer_target_dims};
 
 /// Upper bound on SCREEN simulcast layers regardless of what the caller
-/// requests (issue #989, Phase 3b). Matches the 3-tier screen ladder the AQ
-/// crate defines (`simulcast_screen_layers`). The caller passes 1 by default
-/// (feature off → single layer, byte-identical to the pre-simulcast path).
+/// requests (issue #989, Phase 3b). Matches the 3-RUNG simulcast ladder the AQ
+/// crate defines (`simulcast_screen_layers`) — which is a 3-rung SELECTION by
+/// label (`low`, `high`, `1440p`) over the longer `SCREEN_QUALITY_TIERS` table,
+/// NOT the table's length: that table carries 5 rungs (`native`, `1440p`,
+/// `high`, `medium`, `low`) and only 3 of them are ever emitted as simulcast
+/// layers.
+///
+/// The UI passes its `min(runtime flag, sniffed capability)` ceiling; the flag
+/// (`experimentalSimulcastMaxLayers`) defaults to 3 (#1082), while capability
+/// can still clamp the value to 1 or 2. A clamp to 1 yields a single layer,
+/// byte-identical to the pre-simulcast screen path.
 const SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = 3;
 
 /// Clamp a requested screen `max_layers` to the supported range. `0` (meaningless
@@ -85,17 +94,39 @@ fn clamp_screen_layer_count(max_layers: u32) -> u32 {
     max_layers.clamp(1, SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS)
 }
 
-/// Capture-time resolution ceiling requested from `getDisplayMedia` (issue 1973).
+/// Capture-time resolution ceiling requested from `getDisplayMedia`
+/// (issue 1973, widened by issue 2179).
 ///
-/// Derived from the top `SCREEN_QUALITY_TIERS` rung (currently 1920x1080) so the
+/// Derived from the top `SCREEN_QUALITY_TIERS` rung (currently 3840x2160) so the
 /// capture ceiling can never silently desync from the encode cap. That rung
-/// already caps ENCODED output, so bounding CAPTURE costs no quality while
-/// sparing the encoder its per-frame WebCodecs software rescale: the encoder is
+/// caps ENCODED output, so bounding CAPTURE here costs no quality while sparing
+/// the encoder its per-frame WebCodecs software rescale: the encoder is
 /// configured at the `fit_within_preserving_aspect` size, but WebCodecs must
 /// rescale each oversized raw capture frame down to those config dims on the
 /// codec queue. Field-proven on an ultra-wide M3 Pro: Chrome delivered native
 /// 3840x1600 frames despite `{ ideal: 1920 }` (a hint), and rescaling that
 /// source every frame stalled the encoder for 60-142s.
+///
+/// # Why raising it to 2160p does NOT reintroduce that stall (issue 2179)
+/// The #1973 stall was caused by `source dims != encoder config dims`, not by
+/// large frames per se. Two mechanisms keep those equal now:
+/// 1. **At start**, the initial tier is resolved FROM the capture size
+///    ([`videocall_aq::resolve_initial_screen_tier`]), so the encoder is
+///    configured at the source's own dimensions and there is nothing to rescale.
+///    The old flat ceiling did the opposite: it made a DPR-2 Retina window
+///    (2496x1440 real pixels) get resampled twice — once at capture into
+///    1920x1080, then again into the encoder's 1280x720 tier box — which is
+///    exactly the fuzzy text issue 2179 reports.
+/// 2. **On a tier step-DOWN**, the encode loop re-negotiates the CAPTURE size
+///    to the new tier's box via
+///    [`apply_screen_track_resolution_constraint`], so the compositor (not the
+///    codec queue) does the downscale and source dims track config dims again.
+///
+/// [`screen_capture_constraint_spec`] requests these same numbers as `ideal` as
+/// well as `max`, so the browser prefers the source's NATIVE resolution up to
+/// the ceiling rather than being biased down to a fixed size. `getDisplayMedia`
+/// only ever downscales a captured surface, so a large `ideal` cannot inflate a
+/// small window.
 const SCREEN_CAPTURE_MAX_WIDTH: f64 = SCREEN_QUALITY_TIERS[0].max_width as f64;
 const SCREEN_CAPTURE_MAX_HEIGHT: f64 = SCREEN_QUALITY_TIERS[0].max_height as f64;
 /// Preferred capture framerate hint (unchanged; screen share targets ≤10fps).
@@ -217,6 +248,442 @@ pub fn screen_capture_display_constraints(
     build_screen_display_constraints(&screen_capture_constraint_spec(include_ceiling))
 }
 
+/// Decide whether a screen-capture TRACK should be re-negotiated to a new
+/// resolution ceiling after an AQ tier change (issue 2179, guarding issue 1973).
+///
+/// # The problem this solves
+/// Since issue 2179 the capture ceiling is the ladder's TOP rung (2160p), so a
+/// 4K / ultra-wide surface now genuinely arrives at 4K. That is harmless while
+/// the encoder is configured at the source's own size — but the moment AQ steps
+/// the tier DOWN, `fit_within_preserving_aspect` shrinks the encoder config
+/// while the SOURCE stays 4K, and WebCodecs must software-rescale every frame on
+/// the codec queue. That is precisely the configuration that stalled the
+/// encoder for 60-142 s in issue 1973.
+///
+/// Re-requesting the tier's box as the track's `max` moves the downscale back
+/// into the capture pipeline (the OS/browser compositor), so source dims track
+/// config dims and the per-frame rescale never happens.
+///
+/// # What it requests
+/// The tier's own box, capped by the capture ceiling — so this can never widen
+/// capture past what `getDisplayMedia` was originally allowed, and at the TOP
+/// rung (whose box IS the ceiling) it naturally RELEASES any earlier
+/// step-down constraint, letting the surface return to its native size once the
+/// network recovers. Without that release a share would stay permanently soft
+/// after a single transient congestion episode.
+///
+/// # Returns
+/// `Some((w, h))` — the `max` width/height to request — or `None` when the call
+/// would be pointless:
+/// - the same box was already requested (`last_w`/`last_h`) → `None`, so a tier
+///   change between two rungs that share a box (e.g. `medium` → `low`, both
+///   1280x720) does not re-negotiate the track;
+/// - neither the new box nor any outstanding one binds the known source → `None`;
+///   the capture is already smaller than every box in play, so there is nothing
+///   to shrink and nothing to release.
+///
+/// `last_w`/`last_h` of `(0, 0)` means **no constraint has been requested yet**
+/// — the state after an acquisition whose ceiling was DROPPED by the
+/// [`should_retry_screen_capture_without_ceiling`] fallback, and the state the
+/// UI's own pre-acquired stream arrives in (the encoder cannot know what that
+/// call asked for). Treating it as a live 0x0 request would be backwards: it
+/// would make the "nothing binds" guard read `0 < source` = "the outgoing
+/// request binds" and fire a pointless `applyConstraints` on every small-window
+/// share. It is therefore read as "nothing outstanding", so only the INCOMING
+/// box decides — which is exactly what lets the first genuine bounding attempt
+/// through on a 5K panel whose ceiling was dropped.
+///
+/// With unknown source dims (`0` on either axis) the source guard is skipped and
+/// the request is made — the constraint is a `max`, so it can only ever shrink a
+/// source that is genuinely larger and is a no-op otherwise.
+///
+/// Pure + host-testable: the wasm caller
+/// ([`apply_screen_track_resolution_constraint`]) only turns the returned pair
+/// into a `MediaTrackConstraints` and fires `applyConstraints`.
+#[allow(clippy::too_many_arguments)]
+fn screen_track_constraint_for_tier(
+    tier_w: u32,
+    tier_h: u32,
+    ceiling_w: u32,
+    ceiling_h: u32,
+    source_w: u32,
+    source_h: u32,
+    last_w: u32,
+    last_h: u32,
+) -> Option<(u32, u32)> {
+    // Never ask for more than getDisplayMedia was allowed to give us.
+    let want_w = tier_w.min(ceiling_w);
+    let want_h = tier_h.min(ceiling_h);
+    if want_w == 0 || want_h == 0 {
+        return None;
+    }
+    if (want_w, want_h) == (last_w, last_h) {
+        return None;
+    }
+    // Neither the new nor any OUTSTANDING request binds a known source: the
+    // track is already smaller than both, so re-negotiating changes nothing.
+    // `(0, 0)` = nothing outstanding (see the doc above), NOT a live 0x0 box.
+    if source_w > 0 && source_h > 0 {
+        let want_binds = want_w < source_w || want_h < source_h;
+        let last_binds = last_w > 0 && last_h > 0 && (last_w < source_w || last_h < source_h);
+        if !want_binds && !last_binds {
+            return None;
+        }
+    }
+    Some((want_w, want_h))
+}
+
+/// Widen a tier's capture box so it still contains the LARGEST ACTIVE simulcast
+/// rung (issue #2179 review).
+///
+/// # The defect this fixes
+/// The AQ tier index drives the BASE rung's encode box, but every simulcast
+/// publisher shares ONE capture track across all its rungs, and the upper rungs
+/// have their own FIXED ladder boxes that are re-fit from the live capture.
+/// Requesting the BASE tier's box on a step-down therefore shrinks the shared
+/// track and silently re-fits every rung above it: a `1440p` rung re-fit into a
+/// 1280x720 capture keeps its 5000 kbps setpoint for 720p pixels — wasted
+/// egress — and every receiver on that rung loses resolution because of a
+/// BASE-rung congestion signal it has nothing to do with.
+///
+/// Clamping the request up to the top ACTIVE rung's box keeps the capture large
+/// enough for the whole published ladder. The base rung is unaffected: its
+/// encode config is still fitted to the (lower) tier box, so the step-down still
+/// sheds bits exactly as before — only the CAPTURE stays big enough for the
+/// rungs that are still on the wire.
+///
+/// `n_layers <= 1` (single stream) returns the tier box unchanged, so the
+/// non-simulcast path is byte-identical.
+fn screen_capture_box_for_ladder(
+    tier_w: u32,
+    tier_h: u32,
+    n_layers: usize,
+    active_layers: usize,
+) -> (u32, u32) {
+    if n_layers <= 1 {
+        return (tier_w, tier_h);
+    }
+    let ladder = simulcast_screen_layers(n_layers);
+    if ladder.is_empty() {
+        return (tier_w, tier_h);
+    }
+    let active = active_layers.clamp(1, ladder.len());
+    let top = &ladder[active - 1];
+    (tier_w.max(top.max_width), tier_h.max(top.max_height))
+}
+
+/// Tolerance (percent) by which a live capture may exceed a requested `max` box
+/// before the engine is judged to have IGNORED the constraint.
+///
+/// Not zero: engines legitimately round to even/macroblock-aligned dimensions,
+/// and a surface whose aspect forces a fractional fit can land a pixel or two
+/// over. The smallest gap between two adjacent DISTINCT rung widths in
+/// `SCREEN_QUALITY_TIERS` is 1920→2560 = +33%, so 5% is far too small to be
+/// reached by a genuinely honoured constraint and far too small to hide a
+/// genuinely ignored one (which leaves the track a whole rung or more too big).
+const SCREEN_CONSTRAINT_TOLERANCE_PCT: u32 = 5;
+
+/// Did the capture engine actually honour the box we asked for? (issue #2179
+/// review.)
+///
+/// `applyConstraints` is specified to resolve only after the new settings are
+/// applied, but an engine that silently declines still resolves the promise and
+/// leaves the track at its old size. When that happens the encoder is configured
+/// smaller than the source and WebCodecs software-rescales every frame on the
+/// codec queue — and each further tier step-down DEEPENS that ratio (4K → 720p
+/// is a 9x rescale), which is the issue #1973 stall spiral.
+///
+/// Returns `false` for any unknown dimension: an absent `getSettings()` pair is
+/// not evidence of misbehaviour, and a false accusation would needlessly pin the
+/// encode box large.
+fn screen_constraint_was_ignored(req_w: u32, req_h: u32, live_w: u32, live_h: u32) -> bool {
+    if req_w == 0 || req_h == 0 || live_w == 0 || live_h == 0 {
+        return false;
+    }
+    let tol_w = req_w + req_w * SCREEN_CONSTRAINT_TOLERANCE_PCT / 100;
+    let tol_h = req_h + req_h * SCREEN_CONSTRAINT_TOLERANCE_PCT / 100;
+    live_w > tol_w || live_h > tol_h
+}
+
+/// The BASE-layer encode box to use once the engine has been observed to ignore
+/// `applyConstraints` (issue #2179 review).
+///
+/// While the constraint is honoured, source dims track config dims and the tier
+/// box is used as-is. Once it is NOT honoured, shrinking the encode config
+/// further only grows the per-frame WebCodecs rescale ratio, so the box is
+/// floored at the source's own size (itself capped by the capture ceiling, which
+/// is the largest frame that can ever arrive). The tier still governs BITRATE
+/// and fps, so a step-down keeps shedding bits — it just stops paying for a
+/// deeper software rescale it cannot benefit from.
+///
+/// Unknown source dims, or a honoured constraint, return the tier box unchanged.
+fn screen_encode_box_when_constraint_ignored(
+    tier_w: u32,
+    tier_h: u32,
+    source_w: u32,
+    source_h: u32,
+    ceiling_w: u32,
+    ceiling_h: u32,
+    ignored: bool,
+) -> (u32, u32) {
+    if !ignored || source_w == 0 || source_h == 0 {
+        return (tier_w, tier_h);
+    }
+    (
+        tier_w.max(source_w.min(ceiling_w)),
+        tier_h.max(source_h.min(ceiling_h)),
+    )
+}
+
+/// Apply a resolution ceiling to a live screen-capture track (issue 2179).
+///
+/// Fire-and-forget: `applyConstraints` returns a promise, and a browser that
+/// rejects or ignores it simply leaves the track at its current size — the
+/// encoder still produces correct output via the existing per-frame fit, exactly
+/// as it did before this call existed. So this is a pure optimization and can
+/// never fail a share.
+///
+/// # What the SUCCESS arm records (issue #2179 review)
+/// Everything that describes "what the track actually is now" is recorded only
+/// once the promise RESOLVES, because only then has anything been applied:
+/// - `last_constraint` — the box the caller may consider outstanding. Recording
+///   it eagerly (as the first cut did) remembered a box a REJECTED call never
+///   applied, and the `== last` short-circuit then suppressed the identical
+///   retry on the next tier change.
+/// - `live_source_w` / `live_source_h` — the LIVE capture size, re-read from
+///   `getSettings()`. This is the pair the wire stamp uses; the acquisition
+///   pair is deliberately frozen (see `run_screen_encoding`).
+/// - `pending_verify` — arms the "did the engine actually honour it?" check the
+///   encode loop performs once the source dims have had `SCREEN_DIM_SETTLE_MS`
+///   to settle. `getSettings()` alone is not proof: an engine may report the
+///   requested settings while still delivering the old frame size, and it is the
+///   FRAME size that drives the per-frame rescale cost.
+///
+/// Wasm-only (touches `web_sys`); the decisions it feeds live in the
+/// host-testable [`screen_track_constraint_for_tier`],
+/// [`screen_constraint_was_ignored`] and
+/// [`screen_encode_box_when_constraint_ignored`].
+fn apply_screen_track_resolution_constraint(
+    track: &MediaStreamTrack,
+    max_w: u32,
+    max_h: u32,
+    last_constraint: Rc<Cell<(u32, u32)>>,
+    source_dims: SourceDims,
+    pending_verify: Rc<Cell<Option<(u32, u32, f64)>>>,
+) {
+    let width = js_sys::Object::new();
+    let _ = Reflect::set(
+        &width,
+        &JsValue::from_str("max"),
+        &JsValue::from_f64(max_w as f64),
+    );
+    let height = js_sys::Object::new();
+    let _ = Reflect::set(
+        &height,
+        &JsValue::from_str("max"),
+        &JsValue::from_f64(max_h as f64),
+    );
+    let constraints = web_sys::MediaTrackConstraints::new();
+    let _ = Reflect::set(&constraints, &JsValue::from_str("width"), &width.into());
+    let _ = Reflect::set(&constraints, &JsValue::from_str("height"), &height.into());
+
+    match track.apply_constraints_with_constraints(&constraints) {
+        Ok(promise) => {
+            let track = track.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match JsFuture::from(promise).await {
+                    Ok(_) => {
+                        // Only NOW is this box genuinely outstanding.
+                        last_constraint.set((max_w, max_h));
+                        let settings = track.get_settings();
+                        let (live_w, live_h) = settings_source_stamp(
+                            settings.get_width().map(f64::from),
+                            settings.get_height().map(f64::from),
+                        );
+                        if live_w > 0 && live_h > 0 {
+                            // ONLY the live pair moves — see `SourceDims`.
+                            source_dims.refresh_live(live_w, live_h);
+                        }
+                        // Give the pipeline the same settle window the #1922 gate
+                        // uses before judging whether the constraint took effect.
+                        let due = window().performance().map(|p| p.now()).unwrap_or(0.0)
+                            + SCREEN_DIM_SETTLE_MS;
+                        pending_verify.set(Some((max_w, max_h, due)));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "ScreenEncoder: applyConstraints({max_w}x{max_h}) rejected \
+                             ({e:?}); the capture stays at its current size and the \
+                             encoder falls back to per-frame scaling"
+                        );
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            log::warn!("ScreenEncoder: applyConstraints threw synchronously: {e:?}");
+        }
+    }
+}
+
+/// Read the capture SOURCE dimensions from a screen `MediaStream`'s first video
+/// track (issue 2179).
+///
+/// Returns `(0, 0)` — "unknown" — when the stream has no video track or the
+/// track's `getSettings()` omits a complete `width`/`height` pair (see
+/// [`settings_source_stamp`], whose "never fabricate an aspect" contract this
+/// reuses). `resolve_initial_screen_tier` treats `(0, 0)` as "keep the
+/// pre-#2179 optimistic start", so an early/incomplete settings read degrades to
+/// exactly the previous behaviour rather than to a guessed rung.
+fn screen_stream_source_dims(stream: &MediaStream) -> (u32, u32) {
+    let tracks = stream.get_video_tracks();
+    if tracks.length() == 0 {
+        return (0, 0);
+    }
+    let track = tracks.get(0).unchecked_into::<MediaStreamTrack>();
+    let settings = track.get_settings();
+    settings_source_stamp(
+        settings.get_width().map(f64::from),
+        settings.get_height().map(f64::from),
+    )
+}
+
+/// The TWO source-dimension pairs a screen share tracks (issue #2179 review r3).
+///
+/// # Why a struct and not four loose atomics
+/// The invariant that matters — "acquisition seeds BOTH, a constraint refreshes
+/// ONLY the live pair" — used to live in a doc comment and in a unit test that
+/// passed literals to a pure function. That test proves the arithmetic but not
+/// the WIRING: someone could refresh the frozen pair inside the encode loop and
+/// every test would stay green. Routing both pairs through these two methods
+/// makes the invariant executable, because `refresh_live` is the only writer a
+/// post-constraint path can reach and it provably cannot touch `frozen`.
+///
+/// # The invariant, and why it is load-bearing
+/// `frozen` is written ONLY at acquisition. [`screen_track_constraint_for_tier`]
+/// needs it to know how big the surface ORIGINALLY was: on a step back UP, if
+/// the source pair had been refreshed to the shrunken post-constraint size then
+/// both `want >= source` and `last >= source` would hold, the "neither request
+/// binds" guard would return `None`, and the step-down constraint could NEVER be
+/// released — a share would stay soft forever after one congestion episode.
+///
+/// `live` is what every outgoing packet is stamped with, because telling
+/// receivers the share is still 4K after a step-down shrank the capture to 720p
+/// is simply a lie on the wire.
+#[derive(Clone)]
+struct SourceDims {
+    frozen_w: Arc<AtomicU32>,
+    frozen_h: Arc<AtomicU32>,
+    live_w: Arc<AtomicU32>,
+    live_h: Arc<AtomicU32>,
+}
+
+impl SourceDims {
+    fn new() -> Self {
+        Self {
+            frozen_w: Arc::new(AtomicU32::new(0)),
+            frozen_h: Arc::new(AtomicU32::new(0)),
+            live_w: Arc::new(AtomicU32::new(0)),
+            live_h: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Capture (re)acquired: both pairs describe the same, brand-new surface.
+    fn seed_on_acquisition(&self, w: u32, h: u32) {
+        self.frozen_w.store(w, Ordering::Relaxed);
+        self.frozen_h.store(h, Ordering::Relaxed);
+        self.live_w.store(w, Ordering::Relaxed);
+        self.live_h.store(h, Ordering::Relaxed);
+    }
+
+    /// A constraint was APPLIED: only the live pair moves. Never touches
+    /// `frozen` — that is the whole point of the type.
+    fn refresh_live(&self, w: u32, h: u32) {
+        self.live_w.store(w, Ordering::Relaxed);
+        self.live_h.store(h, Ordering::Relaxed);
+    }
+
+    /// Acquisition-frozen dims — the CONSTRAINT decision's input.
+    fn frozen(&self) -> (u32, u32) {
+        (
+            self.frozen_w.load(Ordering::Relaxed),
+            self.frozen_h.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Live capture dims — the WIRE STAMP's input.
+    #[cfg(test)]
+    fn live(&self) -> (u32, u32) {
+        (
+            self.live_w.load(Ordering::Relaxed),
+            self.live_h.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// The Cause hint a live screen tier should stamp, or `None` to CLEAR all three
+/// Cause-line fields (issue #2179 review round 2).
+///
+/// # Why TWO reference points and not one
+/// Round 1 published a single composed ceiling and cleared at/above it. That
+/// removed the false POSITIVE (every non-4K share stamped `bitrate-limited`
+/// merely for not being at the top of the ladder) but bought a false NEGATIVE:
+/// a 4K sharer capped by their CPU class sits exactly AT their ceiling, so
+/// nothing was stamped — while their viewers saw a red "3840x2160 → 2560x1440
+/// ↓44%" downscale badge with no explanation. That is a real, nameable
+/// constraint.
+///
+/// So the two questions are separated:
+/// - **Is anything being withheld?** Measured against `source_tier` — the rung
+///   the captured surface alone needs. At or better than it, the share is
+///   genuinely giving everything it has, and silence is honest.
+/// - **What is withholding it?** When the tier is worse than `source_tier`,
+///   `ceiling_cause` (from [`videocall_aq::constants::screen_ceiling_cause`])
+///   names the term that raised the ceiling — the device class or the
+///   single-stream cap. A tier worse than the CEILING itself is not explained by
+///   either: something dynamic put it there, which is the network floor or live
+///   AQ congestion, so it falls back to `bitrate-limited`.
+///
+/// Pure + host-testable; every stamp site calls exactly this.
+fn screen_cause_for_tier(
+    live_tier: usize,
+    source_tier: usize,
+    ceiling_tier: usize,
+    ceiling_cause: &str,
+) -> Option<&str> {
+    if live_tier <= source_tier {
+        return None;
+    }
+    if live_tier <= ceiling_tier && !ceiling_cause.is_empty() {
+        return Some(ceiling_cause);
+    }
+    Some(crate::adaptive_quality_constants::SCREEN_CAUSE_BITRATE)
+}
+
+/// Logical CPU cores for the DEVICE term of the screen-share quality ceiling
+/// (issue #2179 review), or `0` = "unknown" off-wasm.
+///
+/// Wraps [`crate::utils::hardware_concurrency_cores`] — the SAME
+/// `navigator.hardwareConcurrency` read the UI's `capability_check` uses to pick
+/// the simulcast layer ceiling, so the two device judgements cannot disagree.
+///
+/// The cfg gate is load-bearing, not cosmetic: touching a browser global on a
+/// native target panics inside `js-sys` ("cannot access imported statics on
+/// non-wasm targets"), which would take down every host test that walks a start
+/// path. `0` is also the honest native answer — there is no navigator — and it
+/// maps to the most conservative device class, exactly like a browser that
+/// declines to report the value.
+fn sender_core_count() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::utils::hardware_concurrency_cores()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0
+    }
+}
+
 /// Read the DOMException `name` from a rejected-promise `JsValue`, or the empty
 /// string if absent. Feeds the host-tested [`should_retry_screen_capture_without_ceiling`].
 fn js_error_name(err: &JsValue) -> String {
@@ -243,12 +710,19 @@ fn js_error_name(err: &JsValue) -> String {
 /// requirement. The fallback retry runs after an `await` and so may fall outside
 /// the gesture on Safari; if it is rejected the share fails exactly as it would
 /// have without this helper, so the retry only ever adds a recovery chance.
+///
+/// # Return
+/// `(stream, ceiling_dropped)`. `ceiling_dropped` is `true` only when the
+/// fallback path ran, i.e. the capture was acquired with NO `max` — so the
+/// track may be arbitrarily larger than the ladder's top rung and the encode
+/// loop must not pretend a ceiling was ever requested (issue #2179 review; see
+/// the `last_track_constraint` seed).
 async fn acquire_screen_capture_stream(
     media_devices: &web_sys::MediaDevices,
-) -> Result<MediaStream, JsValue> {
+) -> Result<(MediaStream, bool), JsValue> {
     let constraints = screen_capture_display_constraints(true);
     match JsFuture::from(media_devices.get_display_media_with_constraints(&constraints)?).await {
-        Ok(stream) => Ok(stream.unchecked_into::<MediaStream>()),
+        Ok(stream) => Ok((stream.unchecked_into::<MediaStream>(), false)),
         Err(e) => {
             if should_retry_screen_capture_without_ceiling(&js_error_name(&e), false) {
                 log::warn!(
@@ -259,7 +733,7 @@ async fn acquire_screen_capture_stream(
                 let stream =
                     JsFuture::from(media_devices.get_display_media_with_constraints(&fallback)?)
                         .await?;
-                Ok(stream.unchecked_into::<MediaStream>())
+                Ok((stream.unchecked_into::<MediaStream>(), true))
             } else {
                 Err(e)
             }
@@ -565,6 +1039,17 @@ pub fn screen_encoder_layers_torn_down() -> u64 {
 // non-zero-only export convention as the error/restart counters above; the issue-1972 Grafana work
 // folds these getters into the health packet the relay scrapes (this PR provides the surface only).
 static SCREEN_ENCODER_STALL_EPISODES: AtomicU64 = AtomicU64::new(0);
+/// Cumulative count of capture `applyConstraints` calls whose promise RESOLVED
+/// but whose track was still larger than the requested box (issue #2179 review).
+///
+/// A non-zero value means the engine is silently declining the capture-side
+/// downscale, so every frame is being software-rescaled on the WebCodecs queue —
+/// the #1973 stall shape. Deliberately a plain cumulative counter alongside the
+/// stall counters rather than a new subsystem; it is NOT yet carried on the
+/// health packet because that needs a `videocall-types` proto field, so the
+/// field signal today is the `[SCREEN_ENCODER] constraint-ignored` warn that
+/// accompanies each increment.
+static SCREEN_ENCODER_IGNORED_CONSTRAINTS: AtomicU64 = AtomicU64::new(0);
 static SCREEN_ENCODER_MAX_STALL_GAP_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative screen encoder tick-starvation stall episodes since page load (discussion 1960,
@@ -574,11 +1059,57 @@ static SCREEN_ENCODER_MAX_STALL_GAP_MS: AtomicU64 = AtomicU64::new(0);
 pub fn screen_encoder_stall_episodes() -> u64 {
     SCREEN_ENCODER_STALL_EPISODES.load(Ordering::Relaxed)
 }
+
+/// Cumulative count of IGNORED capture-resolution constraints (issue #2179
+/// review). See [`SCREEN_ENCODER_IGNORED_CONSTRAINTS`].
+pub fn screen_encoder_ignored_constraints() -> u64 {
+    SCREEN_ENCODER_IGNORED_CONSTRAINTS.load(Ordering::Relaxed)
+}
 /// Largest screen encoder tick-starvation gap observed since page load (ms, rounded) (discussion 1960,
 /// issue 2). Surfaces the worst single freeze duration for field/Grafana attribution of the
 /// "fps > 0 but content minutes stale" symptom.
 pub fn screen_encoder_max_stall_gap_ms() -> u64 {
     SCREEN_ENCODER_MAX_STALL_GAP_MS.load(Ordering::Relaxed)
+}
+
+/// **TEST-ONLY** seam for the two stall counters above (issue #2147).
+///
+/// The health reporter's emission of `screen_encoder_stall_episodes` /
+/// `screen_encoder_max_stall_gap_ms` is gated `> 0`, and these statics are only ever
+/// incremented by the encode loop's tick-starvation detector inside a `spawn_local`
+/// future. Without a setter both `if` blocks are unreachable from a host test, so
+/// DELETING the emission would leave every test green — the exact gap this closes.
+///
+/// Sets absolute values (not increments) so a test can assert the zero and nonzero
+/// arms deterministically. `#[cfg(test)]`-gated, so it cannot be reached in
+/// production.
+///
+/// # Isolation contract (issue #2160)
+///
+/// These statics are PROCESS-GLOBAL and cumulative-since-page-load, and libtest runs
+/// `videocall-client`'s plain `#[test]`s on a multi-threaded pool, so a caller holds
+/// them at a value that is visible to every CONCURRENT test — not just to later ones.
+/// Nothing available here can prevent that: [`screen_encoder_stall_episodes`] and
+/// [`screen_encoder_max_stall_gap_ms`] are plain `load(Ordering::Relaxed)` and acquire
+/// no lock, and `HealthReporter::create_health_packet` calls them unconditionally, so
+/// a concurrent sibling building a health packet WILL observe whatever is stored here.
+///
+/// Two conventions — both required, neither enforceable by the compiler:
+///
+/// 1. Hold [`crate::test_serial::lock_screen_encoder_stall_counters`] for as long as
+///    you depend on what you stored. This excludes other GUARD-TAKERS only; it is what
+///    keeps two injecting tests from interleaving with each other.
+/// 2. Restore `(0, 0)` before releasing the guard. This is what bounds the window in
+///    which an UNGUARDED sibling can observe the injected value to your own body.
+///
+/// Callers must take [`crate::test_serial::lock_screen_encoder_stall_counters`] and
+/// restore the prior values. A test that asserts on the resulting protobuf fields
+/// must take the same guard; the reasoning is recorded at its caller in
+/// `health_reporter.rs`.
+#[cfg(test)]
+pub(crate) fn set_screen_encoder_stall_counters_for_test(episodes: u64, max_gap_ms: u64) {
+    SCREEN_ENCODER_STALL_EPISODES.store(episodes, Ordering::Relaxed);
+    SCREEN_ENCODER_MAX_STALL_GAP_MS.store(max_gap_ms, Ordering::Relaxed);
 }
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
@@ -778,8 +1309,8 @@ fn floor_budget_replenished() -> u32 {
 /// floor's own emit budget ([`SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET`], ~4 emits over ~12 s).
 ///
 /// ## Modes (who recovers how) — [`SCREEN_QUALITY_TIERS`] is ordered high→low, so idx 0 = healthiest
-/// - **healthy tier (`high`, idx 0)** → FULL fan-out (`active_layers`). Every subscribed layer gets a
-///   keyframe; any receiver recovers directly.
+/// - **any tier above the bottom two (`native`/`1440p`/`high`, idx `0..len-2`)** → FULL fan-out
+///   (`active_layers`). Every subscribed layer gets a keyframe; any receiver recovers directly.
 /// - **second-lowest (`medium`, idx `len-2`)** → base + the lowest active upper rung (`min(active, 2)`).
 ///   Base and lowest-upper receivers recover from THIS floor; a receiver on a higher rung recovers via
 ///   the next REAL captured frame (which always fans out to the full active set), via the controller
@@ -1192,6 +1723,27 @@ fn cause_hint_from_trigger(trigger: &str) -> &'static str {
     }
 }
 
+/// Apply the state changes a screen-share STOP must make to the shared atoms
+/// (issue #2147).
+///
+/// Extracted from the track `onended` closure — the path the browser's own "Stop
+/// sharing" button takes — because that closure lives inside a `spawn_local`
+/// future and is therefore unreachable from a unit test. Everything in it that
+/// touches shared state lives here so the transition is pinned.
+///
+/// The `current_fps` reset is the #2147 addition and the reason this exists: that
+/// atom is now exported as `screen_encoder_output_fps` → the deliberately
+/// ungated `videocall_screen_encoder_output_fps` gauge. `stop()`, `start()` and
+/// `start_with_stream()` already reset it, but this path did not, and it could not
+/// rely on the AQ loop's `SCREEN_ENCODER_FPS_IDLE_DECAY_MS` backstop because that
+/// loop exits once its liveness token drops (Host unmount) — leaving the gauge
+/// holding a stale NONZERO that asserts a live screen encoder which had stopped.
+fn apply_screen_share_stopped(enabled: &AtomicBool, sharing: &AtomicBool, current_fps: &AtomicU32) {
+    enabled.store(false, Ordering::Release);
+    sharing.store(false, Ordering::Release);
+    crate::encode::reset_output_fps(current_fps);
+}
+
 /// Sets `bitrateMode = "variable"` on a [`VideoEncoderConfig`].
 ///
 /// Variable bitrate lets the encoder burst above the target during high-motion
@@ -1242,9 +1794,10 @@ fn set_framerate_hint(config: &VideoEncoderConfig, fps: u32) {
 /// its dimensions are already driven by that tier's `max_width`/`max_height`
 /// (via the `tier_max_width`/`tier_max_height` atomics) — so the framerate
 /// rate-control hint for the base encoder is that SAME tier's `target_fps`
-/// (high=10, medium=8, low=5). Reading the shared tier index keeps the hint in
-/// lockstep with the ACTIVE tier index (medium and low share dims but differ in
-/// fps, so the hint is a function of the index, not the resolution), including
+/// (native/1440p/high=10, medium=8, low=5). Reading the shared tier index keeps
+/// the hint in lockstep with the ACTIVE tier index (medium and low share dims
+/// but differ in fps, so the hint is a function of the index, not the
+/// resolution), including
 /// across tier changes (the reconfigure paths re-read it). The index is clamped
 /// into the ladder so a stale/out-of-range value degrades to the lowest tier
 /// rather than panicking (mirrors the clamps elsewhere in this file). Higher
@@ -1342,8 +1895,8 @@ fn screen_ws_stale_drop_step_down_decision(
 /// User-configurable adaptive-quality tier bounds for SCREEN SHARE (issue #961
 /// follow-up), shared from the UI into the running screen encoder control loop.
 ///
-/// QUALITY IS THE INVERSE OF INDEX over the 3-tier `SCREEN_QUALITY_TIERS` ladder:
-/// index 0 = BEST (1080p), index 2 = WORST (low). So `best` is the user's MAX
+/// QUALITY IS THE INVERSE OF INDEX over the `SCREEN_QUALITY_TIERS` ladder:
+/// index 0 = BEST (2160p), the last index = WORST (low). So `best` is the user's MAX
 /// quality = a FLOOR on the index (adaptation never steps UP past it), and
 /// `worst` is the user's MIN quality = a CAP on the index (never steps DOWN past
 /// it). `None` on either end = "Auto" (no user bound). Screen has no audio, so
@@ -1384,7 +1937,7 @@ struct SharedScreenQualityBounds {
 /// not sharing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScreenQualitySnapshot {
-    /// Current screen tier index (0 = best / 1080p, 2 = worst / low).
+    /// Current screen tier index (0 = best / 2160p, last = worst / low).
     pub tier_index: usize,
     /// Current screen tier max width (px).
     pub width: u32,
@@ -1396,6 +1949,33 @@ pub struct ScreenQualitySnapshot {
     pub ideal_kbps: u32,
     /// Live encoder target bitrate (kbps) — the real-time needle value.
     pub target_bitrate_kbps: u32,
+    /// The BEST (lowest) tier index this share can ever reach (issue #2179
+    /// review) — the persistent ceiling composed from the captured source size,
+    /// the sender's CPU class and the simulcast layer count.
+    ///
+    /// Read it as the reference point for `tier_index`:
+    /// - `tier_index == best_source_tier_index` → the share is as good as it can
+    ///   get; there is nothing to explain and no "constrained" badge is honest;
+    /// - `tier_index > best_source_tier_index` → the share is genuinely
+    ///   constrained BELOW what its source needs (network floor or congestion).
+    ///
+    /// `0` while no share has resolved a ceiling yet.
+    pub best_source_tier_index: usize,
+    /// The rung the captured SOURCE alone needs, ignoring the sender's CPU class
+    /// and stream count (issue #2179 review round 2).
+    ///
+    /// Distinct from [`Self::best_source_tier_index`], and the two answer
+    /// different questions:
+    /// - `best_source_tier_index` is REACHABLE — the best rung this share can
+    ///   ever get to. Use it as the meter's best end, so a share pinned by its
+    ///   hardware still reads full bars for doing all it can.
+    /// - `source_tier_index` is DESERVED — the rung the surface itself needs.
+    ///   `tier_index > source_tier_index` means something is genuinely being
+    ///   withheld, which is when a "constrained" badge is honest.
+    ///
+    /// They are equal on the common path; they diverge exactly when the device
+    /// class or the single-stream cap binds.
+    pub source_tier_index: usize,
 }
 
 /// Events emitted by [ScreenEncoder] to notify about screen share state changes.
@@ -1506,7 +2086,7 @@ pub struct ScreenEncoder {
     /// unrequested keyframe — it only un-gates an already-pending PLI, and the
     /// periodic GOP is unaffected.
     keyframe_cooldown_reset: Rc<AtomicBool>,
-    /// Current screen share quality tier index (0=high, 1=medium, 2=low).
+    /// Current screen share quality tier index (0 = best / 2160p, last = worst / low).
     shared_screen_tier_index: Rc<AtomicU32>,
     /// Tier transition events buffer, drained by health reporter.
     shared_tier_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
@@ -1530,6 +2110,41 @@ pub struct ScreenEncoder {
     /// `"cpu-pressure"`, `"network-rtt"`, `"network-loss"`, `"manual-cap"`.
     /// Empty when AQ is unconstrained or no transition has happened yet.
     shared_screen_cause_hint: Rc<RefCell<String>>,
+    /// The BEST (lowest) `SCREEN_QUALITY_TIERS` index this share may ever reach
+    /// — the PERSISTENT ceiling from
+    /// [`videocall_aq::constants::resolve_screen_tier_ceiling`] (issue #2179
+    /// review), composed at share start from the captured source size, the
+    /// sender's CPU class and the effective simulcast layer count.
+    ///
+    /// Three consumers:
+    /// 1. the AQ control loop installs it on the controller
+    ///    (`set_source_tier_ceiling`) so the PID cannot CLIMB past it — before
+    ///    this, the source gate was start-only and a 720p share could be walked
+    ///    up to the `native` rung's 8000 kbps setpoint;
+    /// 2. the Cause-line stamping predicate: at or better than this rung the
+    ///    share is unconstrained and the Cause fields are cleared. The old
+    ///    predicate (`tier_index == 0`) false-flagged every non-4K share as
+    ///    "bitrate-limited" merely for not being at the top of the ladder;
+    /// 3. the UI, via [`ScreenQualitySnapshot::best_source_tier_index`].
+    ///
+    /// Seeded to `0` = "no ceiling known yet", which reproduces the pre-review
+    /// `tier_index == 0` predicate exactly until a share resolves a real one.
+    shared_best_source_tier_index: Rc<AtomicU32>,
+    /// The rung the CAPTURED SOURCE alone needs — `resolve_initial_screen_tier`
+    /// with no network floor (issue #2179 review round 2).
+    ///
+    /// The "is anything being withheld?" reference point, and deliberately NOT
+    /// the same number as [`Self::shared_best_source_tier_index`]: the ceiling
+    /// can be worse than this (a weak CPU, a single-stream share), and when it
+    /// is, the share IS constrained and must say so. Publishing only the ceiling
+    /// is what made a CPU-capped 4K share stamp nothing while its viewers saw a
+    /// red downscale badge.
+    shared_source_tier_index: Rc<AtomicU32>,
+    /// WHICH term raised the ceiling above the source rung, or empty when none
+    /// did — [`videocall_aq::constants::screen_ceiling_cause`]. Computed once at
+    /// share start (its inputs are fixed for the share's life) and read at every
+    /// stamp site by [`screen_cause_for_tier`].
+    shared_ceiling_cause: Rc<RefCell<String>>,
     /// User-configurable screen-share quality tier bounds (issue #961 follow-up).
     /// Written by the UI via [`Self::set_quality_tier_bounds`], read by the
     /// screen encoder control loop (which applies them live to the
@@ -1539,8 +2154,9 @@ pub struct ScreenEncoder {
     quality_bounds: Rc<RefCell<SharedScreenQualityBounds>>,
     /// Maximum number of SCREEN simulcast layers to emit (issue #989, Phase 3b).
     /// Computed in the UI as `min(experimentalSimulcastMaxLayers, capability
-    /// ceiling)`, exactly like the camera. Defaults to 1 (feature off →
-    /// single-layer, byte-identical to the pre-simulcast screen path).
+    /// ceiling)`, exactly like the camera. The runtime flag defaults to 3
+    /// (#1082), but the capability sniff can still produce 1 or 2. An explicit
+    /// value of 1 preserves the pre-simulcast single-layer path.
     max_layers: u32,
     /// Number of screen layers currently active (encoded + sent), written by the
     /// screen AQ control loop and read by the encode loop. 1 in single-stream
@@ -1597,6 +2213,12 @@ pub struct ScreenEncoder {
     ///
     /// `Arc` (not `Rc`) because it crosses encoder boundaries into the mic.
     screen_at_floor_flag: Arc<AtomicBool>,
+    /// Issue #2179: "the AQ controller must adopt the tier the encoder just
+    /// resolved from the captured source". ARMED by [`apply_initial_tier_to`]
+    /// (i.e. by every `start` / `start_with_stream`), CONSUMED by the AQ control
+    /// loop on its next tick while sharing. See the field of the same name on
+    /// [`InitialTierTargets`] for why this is a flag and not a rising edge.
+    initial_tier_pending: Arc<AtomicBool>,
     /// Screen-sharing-active flag mirrored as `Arc<AtomicBool>` (issue #1611).
     /// Written at the same points as the `Rc<AtomicBool>` `screen_sharing_active`:
     /// share start (`run_screen_encoding` → `true`), normal stop (`stop()` → `false`),
@@ -1627,6 +2249,27 @@ pub struct ScreenEncoder {
 fn clear_screen_sharing_flags(rc: &Rc<AtomicBool>, arc: &Arc<AtomicBool>) {
     rc.store(false, Ordering::Release);
     arc.store(false, Ordering::Release);
+}
+
+/// Clear the sharing flags AND zero the output-fps atom (issue #2147).
+///
+/// Every "the share is over" path must land here rather than on
+/// [`clear_screen_sharing_flags`] alone. `current_fps` is exported as
+/// `screen_encoder_output_fps` → the deliberately ungated
+/// `videocall_screen_encoder_output_fps` gauge, so a path that clears the flags but
+/// leaves the atom nonzero makes the gauge assert a live screen encoder for a share
+/// that has ended.
+///
+/// The AQ loop's `SCREEN_ENCODER_FPS_IDLE_DECAY_MS` (5 s) is only a backstop, and it
+/// stops running once that loop's liveness token drops — while the `HealthReporter`
+/// holds an `Arc` clone of this atom and keeps publishing. Covers the paths
+/// `apply_screen_share_stopped` does not: `cleanup_on_error`, the MAX_RESTARTS
+/// give-up, and the encode loop's final cleanup — the last of which is the
+/// `stream_ended` route taken when a track dies WITHOUT `onended` firing (OS/source
+/// revoke, monitor unplug, Wayland portal revoke).
+fn clear_screen_sharing_state(rc: &Rc<AtomicBool>, arc: &Arc<AtomicBool>, current_fps: &AtomicU32) {
+    clear_screen_sharing_flags(rc, arc);
+    crate::encode::reset_output_fps(current_fps);
 }
 
 impl ScreenEncoder {
@@ -1700,6 +2343,12 @@ impl ScreenEncoder {
             // running yet). Cleared synchronously on share-start to prevent
             // staleness from a prior session.
             screen_at_floor_flag: Arc::new(AtomicBool::new(false)),
+            // Issue #2179: no tier seed pending at construction — nothing has
+            // started a share yet, so there is no captured source to match.
+            initial_tier_pending: Arc::new(AtomicBool::new(false)),
+            shared_best_source_tier_index: Rc::new(AtomicU32::new(0)),
+            shared_source_tier_index: Rc::new(AtomicU32::new(0)),
+            shared_ceiling_cause: Rc::new(RefCell::new(String::new())),
             // Issue #1611: Arc mirror of screen_sharing_active for mic encoder.
             screen_sharing_active_arc: Arc::new(AtomicBool::new(false)),
             // AQ control-loop liveness token (issue #1108). Sole strong owner;
@@ -1734,7 +2383,7 @@ impl ScreenEncoder {
         self.keyframe_cooldown_reset.clone()
     }
 
-    /// Returns the current screen share quality tier index (0=high, 1=medium, 2=low).
+    /// Returns the current screen share quality tier index (0 = best, last = worst).
     pub fn shared_screen_tier_index(&self) -> Rc<AtomicU32> {
         self.shared_screen_tier_index.clone()
     }
@@ -1791,8 +2440,7 @@ impl ScreenEncoder {
     /// Set user-configurable SCREEN-SHARE quality tier bounds (issue #961
     /// follow-up). This is the public API the Dioxus "Screen Share Thresholds"
     /// slider calls. The arguments are **tier indices** into
-    /// `SCREEN_QUALITY_TIERS` (the 3-tier ladder: 0 = high/1080p, 1 =
-    /// medium/720p, 2 = low).
+    /// `SCREEN_QUALITY_TIERS` (0 = native/2160p … last = low/720p·5fps).
     ///
     /// **QUALITY IS THE INVERSE OF INDEX — index 0 is the BEST tier.** So:
     /// - `best` = the user's **max quality** = the *best* tier allowed = a
@@ -1887,6 +2535,11 @@ impl ScreenEncoder {
             fps: tier.target_fps,
             ideal_kbps: tier.ideal_bitrate_kbps,
             target_bitrate_kbps,
+            best_source_tier_index: (self.shared_best_source_tier_index.load(Ordering::Relaxed)
+                as usize)
+                .min(SCREEN_QUALITY_TIERS.len().saturating_sub(1)),
+            source_tier_index: (self.shared_source_tier_index.load(Ordering::Relaxed) as usize)
+                .min(SCREEN_QUALITY_TIERS.len().saturating_sub(1)),
         })
     }
 
@@ -2004,6 +2657,17 @@ impl ScreenEncoder {
         let shared_user_layer_ceiling = self.shared_user_layer_ceiling.clone();
         // Issue #1611: the QUALITY task stores this each tick AFTER `tick()`.
         let screen_at_floor_flag = self.screen_at_floor_flag.clone();
+        // Issue #2179: the QUALITY task CONSUMES this to adopt the tier the
+        // encoder resolved from the captured source.
+        let initial_tier_pending = self.initial_tier_pending.clone();
+        // Issue #2179 review: the share's PERSISTENT quality ceiling, installed
+        // on the controller alongside the seed and cleared on share stop.
+        let shared_best_source_tier_index = self.shared_best_source_tier_index.clone();
+        // Issue #2179 review r2: the Cause-line decision's other two inputs —
+        // the rung the SOURCE alone needs, and which ceiling term (if any) is
+        // holding the share below it.
+        let shared_source_tier_index = self.shared_source_tier_index.clone();
+        let shared_ceiling_cause = self.shared_ceiling_cause.clone();
         // Liveness sentinel (issue #1108): a Weak to the encoder-owned token. The
         // loop breaks once this fails to upgrade (ScreenEncoder dropped on Host
         // unmount), so the immortal `spawn_local` future doesn't leak per remount.
@@ -2015,7 +2679,7 @@ impl ScreenEncoder {
             // Apply any user screen-quality bounds set before the loop started,
             // and track the generation we last applied so we only re-apply when
             // the UI actually changes them (issue #961 follow-up). The screen
-            // controller's clamp logic is generic over its 3-tier ladder.
+            // controller's clamp logic is generic over the screen ladder.
             let mut applied_bounds_generation = {
                 let shared = quality_bounds.borrow();
                 encoder_control.set_video_quality_bounds(shared.bounds.best, shared.bounds.worst);
@@ -2192,6 +2856,47 @@ impl ScreenEncoder {
                 // by `n_layers > 1` to match the construction-time
                 // `set_simulcast_ceiling_start_optimistic` guard — single-stream
                 // mode stays byte-identical.
+                // ── Issue #2179: adopt the encoder's source-resolved tier ────
+                // `start` / `start_with_stream` resolve the starting tier from
+                // the CAPTURED SOURCE size, write it to `shared_screen_tier_idx`
+                // and ARM `initial_tier_pending` — all before
+                // `run_screen_encoding` flips `screen_sharing_active`. The
+                // controller, however, was constructed once (long before any
+                // capture existed) at `DEFAULT_SCREEN_TIER_INDEX`, or is holding
+                // the previous share's last tier. Without adopting the resolved
+                // tier here, the controller's FIRST transition — in either
+                // direction — overwrites the encoder's source-matched dims with
+                // its own stale neighbour: a 1440p share is yanked to 1080p on
+                // the first step-up tick and then has to climb back, costing a
+                // reconfigure + keyframe each way.
+                //
+                // Consumed on the first tick where sharing is ACTIVE rather than
+                // on the rising edge, because a `stop()`+`start()` pair contained
+                // within one tick interval produces no observable edge (see the
+                // sub-tick note in the `share_started` block below) yet still
+                // needs the seed. `swap` makes it exactly-once per share.
+                //
+                // Runs BEFORE the `share_started` drain below so the
+                // "coordination" record this pushes is discarded along with the
+                // rest of the pre-share tail — it is a seed, not an adaptation
+                // event, and must not appear in the share's telemetry. The
+                // explicit drain here covers the non-rising-edge case.
+                if now_sharing && initial_tier_pending.swap(false, Ordering::AcqRel) {
+                    // Issue #2179 review: install the PERSISTENT ceiling BEFORE
+                    // the seed, so the seed is itself clamped by it (the
+                    // controller's `set_initial_video_tier` reads it). Without a
+                    // persistent bound the source term was start-only and the
+                    // PID could climb any share to the top rung's 8000 kbps.
+                    let ceiling = shared_best_source_tier_index.load(Ordering::Relaxed) as usize;
+                    encoder_control.set_source_tier_ceiling(Some(ceiling));
+                    let resolved_tier = shared_screen_tier_idx.load(Ordering::Acquire) as usize;
+                    if encoder_control.set_initial_video_tier(resolved_tier) {
+                        log::info!(
+                            "ScreenEncoder: seeded AQ controller at the source-resolved tier {resolved_tier}"
+                        );
+                    }
+                    let _ = encoder_control.drain_tier_transitions();
+                }
                 if share_started {
                     // Issue #1611 (exactness item #3): synchronously CLEAR the
                     // screen-at-floor flag on the rising edge so a stale `true`
@@ -2240,6 +2945,11 @@ impl ScreenEncoder {
                 // promptly rather than waiting for the next share to start.
                 if share_stopped {
                     let _ = encoder_control.drain_tier_transitions();
+                    // Issue #2179 review: the ceiling describes THIS share's
+                    // source/device/stream-count facts, so it must not outlive
+                    // it. The next share installs its own on its first sharing
+                    // tick; clearing here keeps an idle controller unbound.
+                    encoder_control.set_source_tier_ceiling(None);
                 }
                 // Apply user screen-quality bounds if the UI changed them since
                 // we last applied. Cheap generation check; the controller snaps
@@ -2566,7 +3276,30 @@ impl ScreenEncoder {
                     // for symmetry the target bitrate must read `0` too,
                     // otherwise the receiver renders a partial `Cause: <N>kbps`
                     // line (the renderer keys off ANY non-default Cause field).
-                    if encoder_control.video_tier_index() == 0 {
+                    //
+                    // Issue #2179 review r2: "unconstrained" means "at or better
+                    // than the rung the SOURCE alone needs" — see
+                    // `screen_cause_for_tier`, which every stamp site shares.
+                    // This branch MUST agree with the tier-change branch below,
+                    // or a share sitting at its source rung would have its Cause
+                    // fields cleared there and a bitrate re-stamped here on the
+                    // next tick, rendering the partial `Cause: <N>kbps` line the
+                    // #903 contract forbids.
+                    let ceiling_idx =
+                        shared_best_source_tier_index.load(Ordering::Relaxed) as usize;
+                    let source_idx = shared_source_tier_index.load(Ordering::Relaxed) as usize;
+                    let live_tier_idx = encoder_control.video_tier_index();
+                    let unconstrained = {
+                        let ceiling_cause = shared_ceiling_cause.borrow();
+                        screen_cause_for_tier(
+                            live_tier_idx,
+                            source_idx,
+                            ceiling_idx,
+                            &ceiling_cause,
+                        )
+                        .is_none()
+                    };
+                    if unconstrained {
                         shared_target_bitrate.store(0, Ordering::Relaxed);
                     } else {
                         let last_target =
@@ -2593,21 +3326,37 @@ impl ScreenEncoder {
                             tier.target_fps,
                             tier.keyframe_interval_frames,
                         );
-                        // Issue #903: refresh the tier label exposed on the wire.
-                        // Tier 0 (highest) is treated as "unconstrained" and
-                        // clears the label so the receiver omits the Cause line.
-                        // Target bitrate must also be cleared here for the
-                        // same omit-on-unconstrained contract — the per-tick
-                        // refresh above already guards on `tier_index == 0`,
-                        // but a tier-change tick that arrives without a
-                        // subsequent diagnostics packet would otherwise leave
-                        // the previous tier's target bitrate stale.
-                        if tier_index == 0 {
-                            shared_target_bitrate.store(0, Ordering::Relaxed);
-                            shared_adaptive_tier.borrow_mut().clear();
-                            shared_cause_hint.borrow_mut().clear();
-                        } else {
-                            *shared_adaptive_tier.borrow_mut() = tier.label.to_string();
+                        // Issue #903 + #2179 review r2: refresh the Cause-line
+                        // fields on the wire. A tier at or better than the rung
+                        // the SOURCE alone needs is unconstrained and clears all
+                        // three, so the receiver omits the Cause line; otherwise
+                        // the binding term is named. (NOT "tier 0" — that
+                        // pre-#2179 predicate flagged every non-4K share.) The
+                        // target bitrate is cleared here as well as in the
+                        // per-tick refresh above, which shares the same
+                        // predicate: a tier-change tick that arrives without a
+                        // subsequent diagnostics packet would otherwise leave the
+                        // previous tier's target bitrate stale.
+                        let cause = {
+                            let ceiling_cause = shared_ceiling_cause.borrow();
+                            screen_cause_for_tier(
+                                tier_index,
+                                source_idx,
+                                ceiling_idx,
+                                &ceiling_cause,
+                            )
+                            .map(str::to_string)
+                        };
+                        match cause {
+                            None => {
+                                shared_target_bitrate.store(0, Ordering::Relaxed);
+                                shared_adaptive_tier.borrow_mut().clear();
+                                shared_cause_hint.borrow_mut().clear();
+                            }
+                            Some(cause) => {
+                                *shared_adaptive_tier.borrow_mut() = tier.label.to_string();
+                                *shared_cause_hint.borrow_mut() = cause;
+                            }
                         }
                     }
 
@@ -2617,12 +3366,16 @@ impl ScreenEncoder {
                         t.stream = "screen";
                     }
                     // Issue #903: capture the *most recent* transition's trigger
-                    // as the publisher's cause classification. We only refresh
-                    // the hint when AQ is actually constraining the encoder
-                    // (tier index > 0); at the top tier the encoder is
-                    // unconstrained and the receiver should not show a Cause
-                    // line.
-                    if !transitions.is_empty() && encoder_control.video_tier_index() > 0 {
+                    // as the publisher's cause classification — but ONLY when the
+                    // tier sits below the share's CEILING (issue #2179 review
+                    // r2). Between the source rung and the ceiling the honest
+                    // explanation is the static ceiling term (the CPU class, the
+                    // single-stream cap) that the tier-change branch above just
+                    // stamped; letting a step-UP transition's trigger overwrite
+                    // it would replace "cpu-pressure" with whatever axis last
+                    // moved the tier. Below the ceiling the movement really is
+                    // AQ-driven, so the trigger classification is better.
+                    if !transitions.is_empty() && encoder_control.video_tier_index() > ceiling_idx {
                         if let Some(last) = transitions.last() {
                             let hint = cause_hint_from_trigger(last.trigger);
                             if !hint.is_empty() {
@@ -2672,6 +3425,22 @@ impl ScreenEncoder {
     /// Gets the current encoder output frame rate
     pub fn get_current_fps(&self) -> u32 {
         self.current_fps.load(Ordering::Relaxed)
+    }
+
+    /// Returns the SCREEN encoder output-FPS atomic (issue #2147).
+    ///
+    /// Mirrors `CameraEncoder::shared_encoder_output_fps`. Written by the base
+    /// layer's (`layer_id == 0`) chunk callback once per second, and decayed to 0
+    /// by the AQ control loop after `SCREEN_ENCODER_FPS_IDLE_DECAY_MS` (5000 ms —
+    /// deliberately longer than the camera's 2000 ms, because a static share
+    /// legitimately produces no frames).
+    ///
+    /// Cloned into the health reporter, which reads it each packet and emits it as
+    /// `screen_encoder_output_fps`. Before #2147 this value was log-only, leaving
+    /// the screen encoder — the one implicated in #1899 / #1574 / the #2143 freeze
+    /// — with no publisher-side fps signal at all.
+    pub fn shared_encoder_output_fps(&self) -> Arc<AtomicU32> {
+        self.current_fps.clone()
     }
 
     /// Returns a shared reference to the force-keyframe flag.
@@ -2784,10 +3553,166 @@ impl ScreenEncoder {
         }
     }
 
+    /// Bundle the shared handles [`apply_initial_tier_to`] writes.
+    ///
+    /// Exists so the tier can ALSO be applied from inside the `start()`
+    /// `spawn_local` future — after `getDisplayMedia` resolves and the capture
+    /// size is finally known — where `&mut self` is not available.
+    fn initial_tier_targets(&self) -> InitialTierTargets {
+        InitialTierTargets {
+            shared_screen_tier_index: self.shared_screen_tier_index.clone(),
+            initial_tier_pending: self.initial_tier_pending.clone(),
+            tier_max_width: self.tier_max_width.clone(),
+            tier_max_height: self.tier_max_height.clone(),
+            tier_keyframe_interval: self.tier_keyframe_interval.clone(),
+            current_bitrate: self.current_bitrate.clone(),
+            shared_active_layer_count: self.shared_active_layer_count.clone(),
+            shared_target_bitrate: self.shared_screen_encoder_target_bitrate_kbps.clone(),
+            shared_adaptive_tier: self.shared_screen_adaptive_tier.clone(),
+            shared_cause_hint: self.shared_screen_cause_hint.clone(),
+            best_source_tier_index: self.shared_best_source_tier_index.clone(),
+            source_tier_index: self.shared_source_tier_index.clone(),
+            ceiling_cause: self.shared_ceiling_cause.clone(),
+            effective_layers: self.effective_layer_count(),
+        }
+    }
+
     /// Apply the initial quality tier to shared atomics before starting the
     /// encoding loop.  Called by both [`start`](Self::start) and
     /// [`start_with_stream`](Self::start_with_stream).
     fn apply_initial_tier(&mut self, initial_tier: usize) {
+        apply_initial_tier_to(&self.initial_tier_targets(), initial_tier);
+    }
+
+    /// Compose the capture SOURCE size with the caller's network-signal floor
+    /// and apply the resulting tier (issue 2179). Returns the tier applied.
+    ///
+    /// This is the seam both start paths go through, taking DIMENSIONS rather
+    /// than a `MediaStream` so the "compose then apply" step is host-testable
+    /// (a live `MediaStream` is not constructible off-browser). The only piece
+    /// left outside a unit test is [`screen_stream_source_dims`], which just
+    /// forwards `getSettings()` to the already-tested [`settings_source_stamp`].
+    fn apply_source_start_tier(&mut self, src_w: u32, src_h: u32, network_tier: usize) -> usize {
+        resolve_and_apply_source_start_tier(
+            &self.initial_tier_targets(),
+            src_w,
+            src_h,
+            network_tier,
+            sender_core_count(),
+        )
+    }
+}
+
+/// Resolve a share's PERSISTENT quality ceiling and its starting tier from the
+/// captured source, then apply both (issue #2179 + its review round).
+///
+/// Free function over [`InitialTierTargets`] so BOTH start paths use it: the
+/// pre-acquired-stream path (`start_with_stream`, where `&mut self` is
+/// available) and the `start()` `spawn_local` future (where it is not).
+///
+/// # The device seam
+/// `cores` is `navigator.hardwareConcurrency` via
+/// [`crate::utils::hardware_concurrency_cores`] — the SAME fact the UI's
+/// `capability_check` reads to decide the simulcast layer ceiling. It is passed
+/// in rather than read here so the composition is host-testable off-wasm (the
+/// browser read returns `0` = "unknown" natively, which is the conservative
+/// class and would make every host test look like a weak device).
+///
+/// The stream-count term uses `effective_layers` — the value the UI already
+/// forwards as `max_layers` (`min(runtime flag, capability sniff)`) and which
+/// the encoder clamps in `effective_layer_count`. That is the ONLY layer-count
+/// fact available inside the encoder, and it is exactly the one that decides
+/// whether receivers have a lower rung to fall back to.
+fn resolve_and_apply_source_start_tier(
+    t: &InitialTierTargets,
+    src_w: u32,
+    src_h: u32,
+    network_tier: usize,
+    cores: u32,
+) -> usize {
+    let ceiling = crate::adaptive_quality_constants::resolve_screen_tier_ceiling(
+        src_w,
+        src_h,
+        cores,
+        t.effective_layers,
+    );
+    t.best_source_tier_index
+        .store(ceiling as u32, Ordering::Relaxed);
+    // The source-only rung and the term (if any) that raised the ceiling above
+    // it — the two halves of the Cause-line decision (issue #2179 review r2).
+    let source_only =
+        crate::adaptive_quality_constants::resolve_initial_screen_tier(src_w, src_h, 0);
+    t.source_tier_index
+        .store(source_only as u32, Ordering::Relaxed);
+    *t.ceiling_cause.borrow_mut() = crate::adaptive_quality_constants::screen_ceiling_cause(
+        src_w,
+        src_h,
+        cores,
+        t.effective_layers,
+    )
+    .to_string();
+    // The ceiling is a FLOOR on the index, so it binds the START as well as the
+    // climb — otherwise the first GOP would go out at the very rung the ceiling
+    // forbids and only be pulled back on a later AQ tick.
+    let resolved =
+        crate::adaptive_quality_constants::resolve_initial_screen_tier(src_w, src_h, network_tier)
+            .max(ceiling);
+    log::info!(
+        "ScreenEncoder: capture source {src_w}x{src_h}, cores {cores}, {} layer(s), network floor \
+         tier {network_tier} -> ceiling {ceiling} ('{}'), initial tier {resolved} ('{}')",
+        t.effective_layers,
+        SCREEN_QUALITY_TIERS
+            .get(ceiling)
+            .map(|t| t.label)
+            .unwrap_or("?"),
+        SCREEN_QUALITY_TIERS
+            .get(resolved)
+            .map(|t| t.label)
+            .unwrap_or("?"),
+    );
+    apply_initial_tier_to(t, resolved);
+    resolved
+}
+
+/// The shared state [`apply_initial_tier_to`] writes. Every field is an
+/// encoder-owned `Rc` handle, so writing through this bundle is identical to
+/// writing through `&mut ScreenEncoder`.
+struct InitialTierTargets {
+    shared_screen_tier_index: Rc<AtomicU32>,
+    /// Issue #2179: ARMED by every tier apply, CONSUMED (`swap(false)`) by the AQ
+    /// control loop on its next tick while sharing, which then seeds the
+    /// controller from `shared_screen_tier_index`. A dedicated flag rather than
+    /// the `screen_sharing_active` rising edge because a `stop()`+`start()` pair
+    /// contained within one `AQ_TICK_INTERVAL_MS` (1 s) produces NO observable
+    /// rising edge — the loop samples `true` at both ends — and the re-share
+    /// would then run with a controller still holding the previous session's
+    /// tier, whose first transition would overwrite the new source-matched dims.
+    initial_tier_pending: Arc<AtomicBool>,
+    tier_max_width: Rc<AtomicU32>,
+    tier_max_height: Rc<AtomicU32>,
+    tier_keyframe_interval: Rc<AtomicU32>,
+    current_bitrate: Rc<AtomicU32>,
+    shared_active_layer_count: Rc<AtomicU32>,
+    shared_target_bitrate: Rc<AtomicU32>,
+    shared_adaptive_tier: Rc<RefCell<String>>,
+    shared_cause_hint: Rc<RefCell<String>>,
+    /// See `ScreenEncoder::shared_best_source_tier_index`. Written by
+    /// [`resolve_and_apply_source_start_tier`]; the AQ floor and the meter's
+    /// "reachable" end.
+    best_source_tier_index: Rc<AtomicU32>,
+    /// See `ScreenEncoder::shared_source_tier_index`. The Cause-line
+    /// "is anything being withheld?" reference point.
+    source_tier_index: Rc<AtomicU32>,
+    /// See `ScreenEncoder::shared_ceiling_cause`.
+    ceiling_cause: Rc<RefCell<String>>,
+    /// `ScreenEncoder::effective_layer_count()` at start time — fixed for the
+    /// life of a share, so it is captured once rather than re-read.
+    effective_layers: u32,
+}
+
+/// Free-function body of [`ScreenEncoder::apply_initial_tier`].
+fn apply_initial_tier_to(t: &InitialTierTargets, initial_tier: usize) {
+    {
         let clamped_tier = initial_tier.min(SCREEN_QUALITY_TIERS.len().saturating_sub(1));
         if clamped_tier != initial_tier {
             log::warn!(
@@ -2798,14 +3723,17 @@ impl ScreenEncoder {
         }
 
         let tier = &SCREEN_QUALITY_TIERS[clamped_tier];
-        self.shared_screen_tier_index
+        t.shared_screen_tier_index
             .store(clamped_tier as u32, Ordering::Relaxed);
-        self.tier_max_width.store(tier.max_width, Ordering::Relaxed);
-        self.tier_max_height
-            .store(tier.max_height, Ordering::Relaxed);
-        self.tier_keyframe_interval
+        // Arm the AQ control loop to adopt this tier (issue #2179). Stored with
+        // Release AFTER the tier index so the loop's Acquire consume cannot
+        // observe the flag without the index it is meant to read.
+        t.initial_tier_pending.store(true, Ordering::Release);
+        t.tier_max_width.store(tier.max_width, Ordering::Relaxed);
+        t.tier_max_height.store(tier.max_height, Ordering::Relaxed);
+        t.tier_keyframe_interval
             .store(tier.keyframe_interval_frames, Ordering::Relaxed);
-        self.current_bitrate
+        t.current_bitrate
             .store(tier.ideal_bitrate_kbps, Ordering::Relaxed);
 
         // Issue #1229 + #1553: on every (re)share, synchronously reset the active
@@ -2829,47 +3757,55 @@ impl ScreenEncoder {
         // semantics in single-stream mode: the encode loop ignores
         // `shared_active_layer_count` unless simulcast (n_layers > 1), so this branch
         // is gated off and the path stays byte-identical.
-        let effective = self.effective_layer_count();
+        let effective = t.effective_layers;
         if effective > 1 {
             let seed = (crate::adaptive_quality_constants::SCREEN_INITIAL_ACTIVE_LAYERS as u32)
                 .clamp(1, effective);
-            self.shared_active_layer_count
-                .store(seed, Ordering::Relaxed);
+            t.shared_active_layer_count.store(seed, Ordering::Relaxed);
         }
 
-        // Issue #903: seed the publisher-side encoder-state metadata so the
-        // very first frames carry meaningful Cause data. The screen-share
-        // ladder defaults to the *medium* tier (not the top); that is a
-        // bandwidth-conservative choice and the receiver should be able to
-        // explain the resulting downscale immediately rather than waiting
-        // for the first PID-driven tier transition.
+        // Issue #903 + #2179 review r2: seed the publisher-side encoder-state
+        // metadata so the very first frames carry honest Cause data.
+        //
+        // THE RULE, in one sentence: a share is "unconstrained" — and must stamp
+        // NOTHING — when its tier is at or better than the rung its own captured
+        // SOURCE needs; otherwise it stamps the term that is holding it back.
+        // ([`screen_cause_for_tier`] is that rule; this is its only start-path
+        // caller.) Note this is NOT "tier 0": a 1080p window resolves to the
+        // `high` rung by design, and flagging it merely for not being 4K — which
+        // the pre-#2179 `clamped_tier == 0` predicate did — was a false positive
+        // on essentially every real share.
         //
         // Contract (mirrored in the consumer at
-        // `dioxus-ui/components/signal_quality.rs::build_screen_cause_line`
-        // and on `SignalSample::screen_encoder_target_bitrate_kbps`'s
-        // doc-comment): tier 0 is "unconstrained" and ALL three Cause-line
-        // fields — target bitrate, tier label, and cause hint — must read
-        // their proto3 defaults (`0` / empty). If we leak the high-tier
-        // ideal bitrate here, the receiver renders a partial
-        // `Cause: <N>kbps` line that violates the omit-on-unconstrained
-        // contract (regression caught by HCL e2e iter2: cause-hint test
-        // observed `Cause: 2500kbps` at tier 0 from cold-start RTT/camera
-        // signals).
-        if clamped_tier == 0 {
-            self.shared_screen_encoder_target_bitrate_kbps
-                .store(0, Ordering::Relaxed);
-            self.shared_screen_adaptive_tier.borrow_mut().clear();
-            self.shared_screen_cause_hint.borrow_mut().clear();
-        } else {
-            self.shared_screen_encoder_target_bitrate_kbps
-                .store(tier.ideal_bitrate_kbps, Ordering::Relaxed);
-            *self.shared_screen_adaptive_tier.borrow_mut() = tier.label.to_string();
-            // Default cause for the initial constrained tier: the encoder
-            // started below the top of the ladder because the screen
-            // encoder seeds itself there to avoid ramp-up bandwidth
-            // contention. AQ will revise this once a real transition
-            // fires.
-            *self.shared_screen_cause_hint.borrow_mut() = "bitrate-limited".to_string();
+        // `dioxus-ui/components/signal_quality.rs::build_screen_cause_line` and
+        // on `SignalSample::screen_encoder_target_bitrate_kbps`'s doc-comment):
+        // when the share IS unconstrained, ALL three Cause-line fields — target
+        // bitrate, tier label, and cause hint — must read their proto3 defaults
+        // (`0` / empty). Leaking just the ideal bitrate makes the receiver render
+        // a partial `Cause: <N>kbps` line (regression caught by HCL e2e iter2:
+        // the cause-hint test observed `Cause: 2500kbps` at tier 0 from
+        // cold-start RTT/camera signals).
+        let source_tier = (t.source_tier_index.load(Ordering::Relaxed) as usize)
+            .min(SCREEN_QUALITY_TIERS.len().saturating_sub(1));
+        let ceiling_tier = (t.best_source_tier_index.load(Ordering::Relaxed) as usize)
+            .min(SCREEN_QUALITY_TIERS.len().saturating_sub(1));
+        let cause = {
+            let ceiling_cause = t.ceiling_cause.borrow();
+            screen_cause_for_tier(clamped_tier, source_tier, ceiling_tier, &ceiling_cause)
+                .map(str::to_string)
+        };
+        match cause {
+            None => {
+                t.shared_target_bitrate.store(0, Ordering::Relaxed);
+                t.shared_adaptive_tier.borrow_mut().clear();
+                t.shared_cause_hint.borrow_mut().clear();
+            }
+            Some(cause) => {
+                t.shared_target_bitrate
+                    .store(tier.ideal_bitrate_kbps, Ordering::Relaxed);
+                *t.shared_adaptive_tier.borrow_mut() = tier.label.to_string();
+                *t.shared_cause_hint.borrow_mut() = cause;
+            }
         }
 
         log::info!(
@@ -2883,7 +3819,9 @@ impl ScreenEncoder {
             tier.ideal_bitrate_kbps,
         );
     }
+}
 
+impl ScreenEncoder {
     /// Start screen sharing with an already-acquired `MediaStream`.
     ///
     /// Safari requires `getDisplayMedia()` to be called synchronously within a
@@ -2893,9 +3831,20 @@ impl ScreenEncoder {
     ///
     /// The stream is consumed: this method takes ownership and will stop its
     /// tracks when encoding ends or `stop()` is called.
-    pub fn start_with_stream(&mut self, stream: MediaStream, initial_tier: usize) {
+    ///
+    /// `network_tier` is the network-signal FLOOR from
+    /// [`initial_screen_tier`](crate::adaptive_quality_constants::initial_screen_tier);
+    /// the tier actually applied is that floor composed with the stream's real
+    /// capture size (issue 2179 — see [`resolve_initial_screen_tier`]).
+    pub fn start_with_stream(&mut self, stream: MediaStream, network_tier: usize) {
         crate::encode::reset_output_fps(&self.current_fps);
-        self.apply_initial_tier(initial_tier);
+        // Issue #2179 review r3: the encode loop needs these to recompute the
+        // share'"'"'s ceiling if it re-acquires onto a different surface mid-share.
+        let tier_targets = self.initial_tier_targets();
+        // Issue 2179: the stream is already in hand here, so the capture size is
+        // known BEFORE the tier is applied — resolve it in one shot.
+        let (src_w, src_h) = screen_stream_source_dims(&stream);
+        self.apply_source_start_tier(src_w, src_h, network_tier);
 
         let EncoderState {
             enabled, switching, ..
@@ -2969,6 +3918,15 @@ impl ScreenEncoder {
                 shared_active_layer_count,
                 shared_layer_bitrates_bps,
                 shared_encoder_queue_depth,
+                // The UI acquired this stream in its own click handler, so the
+                // encoder cannot know whether the #1973 ceiling was requested or
+                // dropped. Treat it as unknown (issue #2179 review): the cost of
+                // being wrong is at most one extra `applyConstraints` on the
+                // first tier change, while the cost of assuming a ceiling that
+                // was never applied is a permanent per-frame rescale.
+                true,
+                tier_targets,
+                network_tier,
             )
             .await;
         });
@@ -2978,10 +3936,15 @@ impl ScreenEncoder {
     /// The user is prompted by the browser to select which window or screen to encode.
     ///
     /// # Arguments
-    /// * `initial_tier` - Starting tier index into `SCREEN_QUALITY_TIERS` (0=high, 1=medium, 2=low).
-    ///   This allows the caller to select a conservative starting tier based on network signals
-    ///   (e.g., RTT, camera tier index) at the moment screen sharing starts, giving a readable
-    ///   first frame on constrained uplinks without waiting for the PID loop to ramp down.
+    /// * `network_tier` - The network-signal FLOOR on the starting tier, an index into
+    ///   `SCREEN_QUALITY_TIERS` from
+    ///   [`initial_screen_tier`](crate::adaptive_quality_constants::initial_screen_tier).
+    ///   This lets the caller keep a constrained uplink at a conservative rung (RTT, camera
+    ///   tier index) so the first frame is readable without waiting for the PID loop to ramp
+    ///   down. Issue 2179: it is a FLOOR, not the final answer — once `getDisplayMedia`
+    ///   resolves, the floor is composed with the capture's real resolution by
+    ///   [`resolve_initial_screen_tier`] and the result is what the encoder starts at, so a
+    ///   share on a healthy link begins at the resolution the user is actually sharing.
     ///
     /// This will toggle the enabled state of the encoder.
     ///
@@ -2990,9 +3953,28 @@ impl ScreenEncoder {
     /// timeout or a re-render), Safari will reject the request.  In that case
     /// use [`start_with_stream`](Self::start_with_stream) instead, obtaining the
     /// stream directly in the click handler.
-    pub fn start(&mut self, initial_tier: usize) {
+    pub fn start(&mut self, network_tier: usize) {
         crate::encode::reset_output_fps(&self.current_fps);
-        self.apply_initial_tier(initial_tier);
+        // Seed the shared atomics synchronously with the network floor so no
+        // consumer can observe a stale tier from a previous share during the
+        // (user-gesture-length) getDisplayMedia await below. The authoritative
+        // source-aware tier is applied inside the future, once capture resolves.
+        //
+        // Issue #2179 review r2: reset the Cause-line reference points FIRST.
+        // They describe a share's captured source, and no capture exists yet —
+        // leaving a PREVIOUS share'"'"'s values in place would make this seed stamp
+        // its cause against the wrong surface for the whole gesture-length
+        // window. Zeroed, the rule degrades to exactly the pre-#2179 behaviour
+        // for an unknown source: a network floor stamps, tier 0 does not.
+        self.shared_source_tier_index.store(0, Ordering::Relaxed);
+        self.shared_best_source_tier_index
+            .store(0, Ordering::Relaxed);
+        self.shared_ceiling_cause.borrow_mut().clear();
+        self.apply_initial_tier(network_tier);
+        // Issue 2179: handles for that second, source-aware apply. `&mut self`
+        // is not available inside `spawn_local`, so the writes go through the
+        // encoder's own Rc handles.
+        let tier_targets = self.initial_tier_targets();
 
         let EncoderState {
             enabled, switching, ..
@@ -3044,9 +4026,9 @@ impl ScreenEncoder {
             // capture time, before the per-frame main-thread downscale sees it.
             // The helper transparently retries once without the ceiling if a
             // browser rejects it with OverconstrainedError.
-            let screen_to_share: MediaStream =
+            let (screen_to_share, capture_ceiling_dropped): (MediaStream, bool) =
                 match acquire_screen_capture_stream(&media_devices).await {
-                    Ok(stream) => stream,
+                    Ok(acquired) => acquired,
                     Err(e) => {
                         // Check if user cancelled (NotAllowedError = permission denied/cancelled)
                         let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
@@ -3073,6 +4055,28 @@ impl ScreenEncoder {
                 };
 
             log::info!("Screen to share: {screen_to_share:?}");
+
+            // Issue 2179: NOW the capture size is known. Re-apply the tier from
+            // the source resolution composed with the network floor. This runs
+            // BEFORE `run_screen_encoding` flips `screen_sharing_active`, so the
+            // AQ control loop's rising-edge seed (which reads
+            // `shared_screen_tier_index`) observes the resolved value, not the
+            // pre-capture placeholder.
+            let (src_w, src_h) = screen_stream_source_dims(&screen_to_share);
+            // Always re-apply through the shared seam (issue #2179 review): it
+            // is what publishes `best_source_tier_index`, and the pre-capture
+            // `apply_initial_tier(network_tier)` above could not have — the
+            // capture size was still unknown. Skipping it when the tier happens
+            // to be unchanged would leave the ceiling at its `0` seed, silently
+            // disabling both the PID bound and the Cause-line predicate.
+            let resolved_tier = resolve_and_apply_source_start_tier(
+                &tier_targets,
+                src_w,
+                src_h,
+                network_tier,
+                sender_core_count(),
+            );
+            let _ = resolved_tier;
 
             Self::run_screen_encoding(
                 screen_to_share,
@@ -3104,6 +4108,9 @@ impl ScreenEncoder {
                 shared_active_layer_count,
                 shared_layer_bitrates_bps,
                 shared_encoder_queue_depth,
+                capture_ceiling_dropped,
+                tier_targets,
+                network_tier,
             )
             .await;
         });
@@ -3177,8 +4184,28 @@ impl ScreenEncoder {
         // the screen AQ control loop. Stored-only on the controller side in
         // Stage 1 (no behavior change).
         shared_encoder_queue_depth: Rc<AtomicU32>,
+        // Issue #2179 review: `true` when the capture was acquired WITHOUT the
+        // resolution ceiling — either because `getDisplayMedia` rejected the
+        // ceiling (the OverconstrainedError fallback) or because the stream was
+        // pre-acquired by the UI, whose request this encoder cannot inspect. It
+        // seeds `last_track_constraint` to "nothing outstanding" so the first
+        // tier change genuinely negotiates instead of being short-circuited by a
+        // ceiling that was never actually requested.
+        capture_ceiling_dropped: bool,
+        // Issue #2179 review r3: needed by the `'restart` re-acquire branch,
+        // which must recompute the share's ceiling from the NEW capture.
+        tier_targets: InitialTierTargets,
+        network_tier: usize,
     ) {
         let simulcast = n_layers > 1;
+        let mut capture_ceiling_dropped = capture_ceiling_dropped;
+        // #2147: clones for the two "share is over" cleanup paths below
+        // (`cleanup_on_error` and the encode loop's final cleanup), which must zero
+        // the output-fps atom via `clear_screen_sharing_state` so the ungated
+        // `videocall_screen_encoder_output_fps` gauge cannot keep asserting a live
+        // encoder. Bound here because `cleanup_on_error` is a move-closure.
+        let current_fps_cleanup = current_fps.clone();
+        let current_fps_final = current_fps.clone();
         // Per-layer sequence numbers persist across restarts so a receiver
         // decoding one screen layer sees a dense 0,1,2,… stream (no phantom
         // loss). N=1 is a single-element Vec behaving like the old scalar.
@@ -3207,7 +4234,11 @@ impl ScreenEncoder {
             // Reset enabled flag
             enabled.store(false, Ordering::Release);
             // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
-            clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
+            clear_screen_sharing_state(
+                &screen_sharing_active,
+                &screen_sharing_active_arc,
+                &current_fps_cleanup,
+            );
             // Emit Failed event
             if let Some(ref callback) = on_state_change {
                 callback.emit(ScreenShareEvent::Failed(error_msg));
@@ -3259,8 +4290,28 @@ impl ScreenEncoder {
         // time without locking. `0` means "unknown" and triggers the proto3
         // default-skip, so older publishers / pre-capture frames stay
         // backward-compatible.
-        let source_width_atomic = Arc::new(AtomicU32::new(0));
-        let source_height_atomic = Arc::new(AtomicU32::new(0));
+        //
+        // # The FREEZE invariant (issue #2179 review) — do not "fix" this
+        // This pair is written ONLY at acquisition (and re-acquisition), never
+        // after an `applyConstraints`. That is load-bearing for
+        // [`screen_track_constraint_for_tier`]: its release-on-step-up branch
+        // needs to know how big the surface ORIGINALLY was. If this pair were
+        // refreshed to the shrunken post-constraint size, then on a step back UP
+        // both `want >= source` and `last >= source` would hold, the "neither
+        // request binds" guard would return `None`, and the step-down constraint
+        // could NEVER be released — a share would stay soft forever after one
+        // transient congestion episode.
+        let source_dims = SourceDims::new();
+        // LIVE capture dimensions (issue #2179 review): seeded identically at
+        // acquisition, then REFRESHED from `getSettings()` after every successful
+        // `applyConstraints`. This is the pair stamped onto every outgoing packet
+        // — the frozen pair above would tell receivers the share is still 4K
+        // after a step-down shrank the capture to 720p, which is simply a lie on
+        // the wire. Two pairs rather than one because the two consumers want
+        // genuinely different facts: the constraint decision wants the ORIGINAL
+        // surface, the wire stamp wants what is being captured RIGHT NOW.
+        let live_source_width_atomic = source_dims.live_w.clone();
+        let live_source_height_atomic = source_dims.live_h.clone();
 
         // The onended handler closure must live as long as we use the media track.
         // We store it here so it isn't dropped when the inner loop restarts.
@@ -3333,8 +4384,10 @@ impl ScreenEncoder {
             let userid = userid.clone();
             let aes = aes.clone();
             let client = client.clone();
-            let source_width_for_handler = source_width_atomic.clone();
-            let source_height_for_handler = source_height_atomic.clone();
+            // Issue #2179 review: the wire stamp must describe the LIVE capture,
+            // not the frozen acquisition size (see the atomics' declaration).
+            let source_width_for_handler = live_source_width_atomic.clone();
+            let source_height_for_handler = live_source_height_atomic.clone();
             // Issue #903: per-chunk handles to the encoder-state shared
             // values. Same indirection pattern as the source dimensions —
             // the controller loop writes, the output handler reads, both
@@ -3492,7 +4545,10 @@ impl ScreenEncoder {
                 // OverconstrainedError.
                 let acquired_stream: MediaStream =
                     match acquire_screen_capture_stream(&media_devices).await {
-                        Ok(stream) => stream,
+                        Ok((stream, ceiling_dropped)) => {
+                            capture_ceiling_dropped = ceiling_dropped;
+                            stream
+                        }
                         Err(e) => {
                             // Check if user cancelled (NotAllowedError = permission denied/cancelled)
                             let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
@@ -3559,10 +4615,26 @@ impl ScreenEncoder {
                     let on_state_change_clone = on_state_change.clone();
                     let screen_sharing_flag_clone = screen_sharing_active.clone();
                     let client_onended = client_for_onended.clone();
+                    // Issue #2147: this path must ALSO zero the output-fps atom.
+                    // `stop()` / `start()` / `start_with_stream()` all call
+                    // `reset_output_fps`, but the BROWSER's own "Stop sharing"
+                    // button lands here instead, and this atom is now exported as
+                    // `screen_encoder_output_fps` → the ungated
+                    // `videocall_screen_encoder_output_fps` gauge. Leaving it alone
+                    // relied on the AQ loop's 5s idle decay, which stops running once
+                    // the loop's liveness token drops (Host unmount) — so the gauge
+                    // could hold a stale NONZERO and assert a live screen encoder
+                    // that had stopped. The error/give-up/final-cleanup paths get the
+                    // same treatment via `clear_screen_sharing_state`, so every
+                    // share-over route zeroes the atom.
+                    let current_fps_onended = current_fps.clone();
                     let handler = Closure::wrap(Box::new(move || {
                         log::info!("Screen share track ended (user stopped sharing)");
-                        enabled_clone.store(false, Ordering::Release);
-                        screen_sharing_flag_clone.store(false, Ordering::Release);
+                        apply_screen_share_stopped(
+                            &enabled_clone,
+                            &screen_sharing_flag_clone,
+                            &current_fps_onended,
+                        );
                         client_onended.set_screen_enabled(false);
                         if let Some(ref callback) = on_state_change_clone {
                             callback.emit(ScreenShareEvent::Stopped);
@@ -3586,8 +4658,25 @@ impl ScreenEncoder {
                 // Screen seeds-only (no per-frame correction), so an honest 0
                 // beats a wrong constant a receiver would read as a real aspect.
                 let (stamp_w, stamp_h) = settings_source_stamp(settings_w, settings_h);
-                source_width_atomic.store(stamp_w, Ordering::Relaxed);
-                source_height_atomic.store(stamp_h, Ordering::Relaxed);
+                source_dims.seed_on_acquisition(stamp_w, stamp_h);
+                // Issue #2179 review r3: a mid-share re-acquire re-prompts the
+                // browser picker, so the user may land on a DIFFERENT surface —
+                // a 4K panel after a 720p window, or vice versa. Recompute the
+                // whole start decision from the new capture instead of
+                // inheriting the dead share's ceiling, source rung and cause.
+                // This also re-arms `initial_tier_pending`, so the AQ loop
+                // re-installs the ceiling on the controller on its next tick.
+                let reacquired_tier = resolve_and_apply_source_start_tier(
+                    &tier_targets,
+                    stamp_w,
+                    stamp_h,
+                    network_tier,
+                    sender_core_count(),
+                );
+                log::info!(
+                    "ScreenEncoder: re-acquired capture {stamp_w}x{stamp_h}; recomputed start \
+                     tier {reacquired_tier}"
+                );
 
                 current_stream = Some(acquired_stream);
                 current_track = Some(track);
@@ -3625,10 +4714,26 @@ impl ScreenEncoder {
                     let on_state_change_clone = on_state_change.clone();
                     let screen_sharing_flag_clone = screen_sharing_active.clone();
                     let client_onended = client_for_onended.clone();
+                    // Issue #2147: this path must ALSO zero the output-fps atom.
+                    // `stop()` / `start()` / `start_with_stream()` all call
+                    // `reset_output_fps`, but the BROWSER's own "Stop sharing"
+                    // button lands here instead, and this atom is now exported as
+                    // `screen_encoder_output_fps` → the ungated
+                    // `videocall_screen_encoder_output_fps` gauge. Leaving it alone
+                    // relied on the AQ loop's 5s idle decay, which stops running once
+                    // the loop's liveness token drops (Host unmount) — so the gauge
+                    // could hold a stale NONZERO and assert a live screen encoder
+                    // that had stopped. The error/give-up/final-cleanup paths get the
+                    // same treatment via `clear_screen_sharing_state`, so every
+                    // share-over route zeroes the atom.
+                    let current_fps_onended = current_fps.clone();
                     let handler = Closure::wrap(Box::new(move || {
                         log::info!("Screen share track ended (user stopped sharing)");
-                        enabled_clone.store(false, Ordering::Release);
-                        screen_sharing_flag_clone.store(false, Ordering::Release);
+                        apply_screen_share_stopped(
+                            &enabled_clone,
+                            &screen_sharing_flag_clone,
+                            &current_fps_onended,
+                        );
                         client_onended.set_screen_enabled(false);
                         if let Some(ref callback) = on_state_change_clone {
                             callback.emit(ScreenShareEvent::Stopped);
@@ -3647,8 +4752,7 @@ impl ScreenEncoder {
                 // matching `.store()` in the restart-acquire branch above). Stamp
                 // 0 = "unknown" when settings omit a complete pair (rationale there).
                 let (stamp_w, stamp_h) = settings_source_stamp(settings_w, settings_h);
-                source_width_atomic.store(stamp_w, Ordering::Relaxed);
-                source_height_atomic.store(stamp_h, Ordering::Relaxed);
+                source_dims.seed_on_acquisition(stamp_w, stamp_h);
 
                 current_track = Some(track);
             }
@@ -3745,8 +4849,12 @@ impl ScreenEncoder {
                 // track had not reported them yet), so a non-16:9 display
                 // (16:10, ultrawide, portrait) is not per-axis-squashed into
                 // the 16:9 tier dims on rungs 1..n.
+                // Issue #2179 review: orient the rung's authored-landscape box to
+                // the source so a rotated panel is not bounded by the box's short
+                // edge on its long axis (pixel-budget neutral — see
+                // `orient_box_to_source`).
                 let (layer_w, layer_h) =
-                    fit_within_preserving_aspect(width, height, tier.max_width, tier.max_height);
+                    fit_within_tier_box(width, height, tier.max_width, tier.max_height);
                 let init_bitrate_bps = tier.ideal_bitrate_kbps as f64 * 1000.0;
 
                 // Per-layer output handler: own seq cell + #903 metadata
@@ -3759,8 +4867,9 @@ impl ScreenEncoder {
                     let mut local_seq = initial_seq;
                     let seq_out = Rc::new(std::cell::Cell::new(initial_seq));
                     let seq_out_inner = seq_out.clone();
-                    let source_w = source_width_atomic.clone();
-                    let source_h = source_height_atomic.clone();
+                    // Issue #2179 review: LIVE capture dims for the wire stamp.
+                    let source_w = live_source_width_atomic.clone();
+                    let source_h = live_source_height_atomic.clone();
                     let target_bitrate = shared_target_bitrate.clone();
                     let adaptive_tier = shared_adaptive_tier.clone();
                     let cause_hint = shared_cause_hint.clone();
@@ -4007,6 +5116,99 @@ impl ScreenEncoder {
             let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
             let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
             let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
+            // Issue #2179: the resolution ceiling most recently REQUESTED of the
+            // capture track, and APPLIED — it is written in the `applyConstraints`
+            // success arm, so a rejected call is not remembered as outstanding
+            // (which would short-circuit the identical retry). `Rc<Cell<_>>`
+            // because that success arm is a separate future.
+            //
+            // Seeded with the `getDisplayMedia` ceiling ONLY when we know the
+            // ceiling was actually requested. When it was dropped — the
+            // OverconstrainedError fallback, or a UI-pre-acquired stream whose
+            // request this encoder cannot inspect — the seed is `(0, 0)` =
+            // "nothing outstanding" (issue #2179 review). Seeding the ceiling
+            // unconditionally suppressed the FIRST genuine bounding attempt on,
+            // say, a 5K panel: the tier's own box equalled the never-requested
+            // seed, the `== last` short-circuit fired, and the capture stayed at
+            // 5120x2880 while the encoder ran at 3840x2160 — a per-frame rescale
+            // for the life of the share.
+            //
+            // Declared INSIDE `'restart` (like `current_encoder_*`): a restart
+            // re-acquires the stream, so a constraint requested on the dead track
+            // must not be remembered.
+            let last_track_constraint: Rc<Cell<(u32, u32)>> =
+                Rc::new(Cell::new(if capture_ceiling_dropped {
+                    (0, 0)
+                } else {
+                    (
+                        SCREEN_CAPTURE_MAX_WIDTH as u32,
+                        SCREEN_CAPTURE_MAX_HEIGHT as u32,
+                    )
+                }));
+            // Issue #2179 review: `Some((req_w, req_h, due_ms))` while an applied
+            // constraint is awaiting the "did the engine honour it?" check, which
+            // the frame arm performs once the source dims have had
+            // `SCREEN_DIM_SETTLE_MS` to settle. A share that delivers no frames
+            // (the static-capture case) simply never resolves it — harmless, since
+            // the cost the check guards against is per-FRAME rescale work that a
+            // frameless share is not doing.
+            let constraint_pending_verify: Rc<Cell<Option<(u32, u32, f64)>>> =
+                Rc::new(Cell::new(None));
+            // `true` once an engine has been caught resolving `applyConstraints`
+            // without applying it. While set, the base encode box is floored at
+            // the source size so further tier step-downs cannot DEEPEN the
+            // per-frame WebCodecs rescale (4K -> 720p is 9x — the #1973 spiral).
+            let constraint_ignored: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+            // With nothing outstanding, make the one bounding attempt the
+            // `tier_dims_changed` branch below would otherwise wait for. On a
+            // surface that already fits inside the tier box this is suppressed by
+            // the decision fn's "nothing binds" guard, so an ordinary share pays
+            // nothing.
+            if last_track_constraint.get() == (0, 0) {
+                // Simulcast-aware, for the same reason the tier-change site is:
+                // the cold-start seed already publishes `SCREEN_INITIAL_ACTIVE_LAYERS`
+                // rungs, and a share whose NETWORK floor starts it at a 720p tier
+                // would otherwise shrink the shared capture below the 1080p rung
+                // it is publishing from frame one.
+                let seed_active = if simulcast {
+                    (shared_active_layer_count.load(Ordering::Relaxed) as usize).clamp(1, n_layers)
+                } else {
+                    1
+                };
+                let (seed_ladder_w, seed_ladder_h) = screen_capture_box_for_ladder(
+                    local_tier_max_width,
+                    local_tier_max_height,
+                    n_layers,
+                    seed_active,
+                );
+                let (frozen_w, frozen_h) = source_dims.frozen();
+                let (seed_w, seed_h) =
+                    orient_box_to_source(seed_ladder_w, seed_ladder_h, frozen_w, frozen_h);
+                if let Some((max_w, max_h)) = screen_track_constraint_for_tier(
+                    seed_w,
+                    seed_h,
+                    SCREEN_CAPTURE_MAX_WIDTH as u32,
+                    SCREEN_CAPTURE_MAX_HEIGHT as u32,
+                    frozen_w,
+                    frozen_h,
+                    0,
+                    0,
+                ) {
+                    log::info!(
+                        "ScreenEncoder: capture acquired without a known ceiling; requesting \
+                         {max_w}x{max_h} so the compositor (not the codec queue) does the downscale"
+                    );
+                    apply_screen_track_resolution_constraint(
+                        track_ref,
+                        max_w,
+                        max_h,
+                        last_track_constraint.clone(),
+                        source_dims.clone(),
+                        constraint_pending_verify.clone(),
+                    );
+                }
+            }
 
             // Log-on-change guard for the "Updating screen bitrate" line
             // (issue #1221-pt1). The bitrate reconfigure below is gated on
@@ -4093,6 +5295,70 @@ impl ScreenEncoder {
                     local_tier_max_width = new_tier_w;
                     local_tier_max_height = new_tier_h;
 
+                    // Issue #2179 (guarding the issue #1973 regression): move
+                    // the downscale back into the CAPTURE pipeline. Since the
+                    // capture ceiling was raised to the ladder's top rung, a 4K
+                    // / ultra-wide surface really does arrive at 4K; if the tier
+                    // now configures the encoder smaller than that, WebCodecs
+                    // would software-rescale every frame on the codec queue —
+                    // the exact configuration that stalled the encoder 60-142s
+                    // in #1973. Re-requesting the tier's box as the track's
+                    // `max` keeps source dims tracking config dims. Best-effort:
+                    // a browser that rejects or ignores `applyConstraints` just
+                    // leaves the track alone and the existing per-frame fit
+                    // still produces correct output. The resulting source-dim
+                    // change is absorbed by the #1922 settle gate below, which
+                    // reconfigures the encoder once the new size holds steady.
+                    //
+                    // Issue #2179 review (BLOCKER): the AQ tier drives the BASE
+                    // rung only, but the capture track is SHARED with every
+                    // published simulcast rung. Requesting the base tier's box
+                    // would shrink the shared surface and silently re-fit a live
+                    // 1440p rung into 720p while it keeps billing 5000 kbps — a
+                    // base-rung congestion signal costing every receiver on the
+                    // upper rungs their resolution. Clamp the request up to the
+                    // largest ACTIVE rung; the base encoder is still configured
+                    // at the (lower) tier box, so the step-down still sheds bits.
+                    let active_for_capture = if simulcast {
+                        (shared_active_layer_count.load(Ordering::Relaxed) as usize)
+                            .clamp(1, n_layers)
+                    } else {
+                        1
+                    };
+                    let (ladder_w, ladder_h) = screen_capture_box_for_ladder(
+                        local_tier_max_width,
+                        local_tier_max_height,
+                        n_layers,
+                        active_for_capture,
+                    );
+                    let (frozen_w, frozen_h) = source_dims.frozen();
+                    let (request_w, request_h) =
+                        orient_box_to_source(ladder_w, ladder_h, frozen_w, frozen_h);
+                    let (last_w, last_h) = last_track_constraint.get();
+                    if let Some((max_w, max_h)) = screen_track_constraint_for_tier(
+                        request_w,
+                        request_h,
+                        SCREEN_CAPTURE_MAX_WIDTH as u32,
+                        SCREEN_CAPTURE_MAX_HEIGHT as u32,
+                        frozen_w,
+                        frozen_h,
+                        last_w,
+                        last_h,
+                    ) {
+                        log::info!(
+                            "ScreenEncoder: re-requesting capture ceiling {max_w}x{max_h} for the \
+                             new tier (was {last_w}x{last_h}, {active_for_capture} active rung(s))"
+                        );
+                        apply_screen_track_resolution_constraint(
+                            track_ref,
+                            max_w,
+                            max_h,
+                            last_track_constraint.clone(),
+                            source_dims.clone(),
+                            constraint_pending_verify.clone(),
+                        );
+                    }
+
                     // Constrain to the tier max while preserving the capture
                     // source aspect ratio (issue #1037). `current_encoder_*` is
                     // seeded from the screen track's native getSettings() dims
@@ -4102,11 +5368,30 @@ impl ScreenEncoder {
                     // but the actual capture can be 16:10, ultrawide, portrait,
                     // etc.; a per-axis `.min()` against the 16:9 tier ceiling
                     // would stretch/squash those sources.
-                    let (constrained_w, constrained_h) = fit_within_preserving_aspect(
-                        current_encoder_width,
-                        current_encoder_height,
+                    // The ignored-constraint floor uses the ACQUISITION-frozen
+                    // pair, not the live one: an engine that declines a
+                    // constraint may still REPORT the requested box from
+                    // `getSettings()`, and flooring at a size the frames do not
+                    // actually have would defeat the guard. The acquisition size
+                    // is the largest the surface has ever been, so it is the
+                    // conservative direction. This value is only a one-tick seed
+                    // in any case — the per-frame site below re-derives the box
+                    // from the RAW frame dims, which are ground truth.
+                    let (frozen_box_w, frozen_box_h) = source_dims.frozen();
+                    let (tier_box_w, tier_box_h) = screen_encode_box_when_constraint_ignored(
                         local_tier_max_width,
                         local_tier_max_height,
+                        frozen_box_w,
+                        frozen_box_h,
+                        SCREEN_CAPTURE_MAX_WIDTH as u32,
+                        SCREEN_CAPTURE_MAX_HEIGHT as u32,
+                        constraint_ignored.get(),
+                    );
+                    let (constrained_w, constrained_h) = fit_within_tier_box(
+                        current_encoder_width,
+                        current_encoder_height,
+                        tier_box_w,
+                        tier_box_h,
                     );
 
                     log::info!(
@@ -4517,11 +5802,21 @@ impl ScreenEncoder {
                         if let Some((settled_raw_w, settled_raw_h)) =
                             dim_settle.settled_dims(now, SCREEN_DIM_SETTLE_MS)
                         {
-                            let (fit_w, fit_h) = fit_within_preserving_aspect(
+                            let (settle_box_w, settle_box_h) =
+                                screen_encode_box_when_constraint_ignored(
+                                    local_tier_max_width,
+                                    local_tier_max_height,
+                                    settled_raw_w,
+                                    settled_raw_h,
+                                    SCREEN_CAPTURE_MAX_WIDTH as u32,
+                                    SCREEN_CAPTURE_MAX_HEIGHT as u32,
+                                    constraint_ignored.get(),
+                                );
+                            let (fit_w, fit_h) = fit_within_tier_box(
                                 settled_raw_w,
                                 settled_raw_h,
-                                local_tier_max_width,
-                                local_tier_max_height,
+                                settle_box_w,
+                                settle_box_h,
                             );
                             if fit_w > 0
                                 && fit_h > 0
@@ -4562,11 +5857,20 @@ impl ScreenEncoder {
                                             if (layer.layer_id as usize) >= local_active_layers {
                                                 continue;
                                             }
+                                            // Issue #2179 review: orient this
+                                            // rung's box to the source (see
+                                            // `orient_box_to_source`).
+                                            let (rung_w, rung_h) = orient_box_to_source(
+                                                layer.tier_w,
+                                                layer.tier_h,
+                                                settled_raw_w,
+                                                settled_raw_h,
+                                            );
                                             let d = simulcast_layer_target_dims(
                                                 settled_raw_w,
                                                 settled_raw_h,
-                                                layer.tier_w,
-                                                layer.tier_h,
+                                                rung_w,
+                                                rung_h,
                                                 layer.current_w,
                                                 layer.current_h,
                                             );
@@ -4811,6 +6115,39 @@ impl ScreenEncoder {
                             .expect("Performance API not available")
                             .now();
                         dim_settle.observe(raw_frame_width, raw_frame_height, now);
+                        // Issue #2179 review: verify a previously-APPLIED capture
+                        // constraint against the dims actually arriving. An engine
+                        // that resolves `applyConstraints` without applying it
+                        // leaves the encoder rescaling every frame, and each
+                        // further tier step-down deepens that ratio. Gated on BOTH
+                        // the settle window (so an honoured constraint has had time
+                        // to take effect) and the deadline stamped at apply time
+                        // (so an IGNORED constraint — whose dims never change, and
+                        // which is therefore "settled" from the first frame — is
+                        // not judged before the engine had a chance).
+                        if let Some((req_w, req_h, due_ms)) = constraint_pending_verify.get() {
+                            if now >= due_ms && dim_settle.is_settled(now, SCREEN_DIM_SETTLE_MS) {
+                                constraint_pending_verify.set(None);
+                                let ignored = screen_constraint_was_ignored(
+                                    req_w,
+                                    req_h,
+                                    raw_frame_width,
+                                    raw_frame_height,
+                                );
+                                constraint_ignored.set(ignored);
+                                if ignored {
+                                    SCREEN_ENCODER_IGNORED_CONSTRAINTS
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    log::warn!(
+                                        "[SCREEN_ENCODER] constraint-ignored: requested a \
+                                         {req_w}x{req_h} capture but frames are still \
+                                         {raw_frame_width}x{raw_frame_height}; pinning the encode \
+                                         box at the source so further step-downs cannot deepen \
+                                         the per-frame rescale (issue 2179 / 1973)"
+                                    );
+                                }
+                            }
+                        }
                         // Constrain to tier max dimensions while preserving the
                         // capture's native aspect ratio (issue #1037).
                         // `display_width()` / `display_height()` are the raw
@@ -4821,12 +6158,16 @@ impl ScreenEncoder {
                         // change-detection below skips reconfigure.
                         let (frame_width, frame_height) =
                             if raw_frame_width > 0 && raw_frame_height > 0 {
-                                fit_within_preserving_aspect(
-                                    raw_frame_width,
-                                    raw_frame_height,
+                                let (box_w, box_h) = screen_encode_box_when_constraint_ignored(
                                     local_tier_max_width,
                                     local_tier_max_height,
-                                )
+                                    raw_frame_width,
+                                    raw_frame_height,
+                                    SCREEN_CAPTURE_MAX_WIDTH as u32,
+                                    SCREEN_CAPTURE_MAX_HEIGHT as u32,
+                                    constraint_ignored.get(),
+                                );
+                                fit_within_tier_box(raw_frame_width, raw_frame_height, box_w, box_h)
                             } else {
                                 (0, 0)
                             };
@@ -5051,11 +6392,20 @@ impl ScreenEncoder {
                             // clobbers the per-layer adaptive bitrate (the
                             // pre-frame bitrate pass mutates this same config in
                             // place next tick).
+                            // Issue #2179 review: orient this rung's box to the
+                            // source so a portrait share is not bounded by the
+                            // authored-landscape short edge on its long axis.
+                            let (rung_w, rung_h) = orient_box_to_source(
+                                layer.tier_w,
+                                layer.tier_h,
+                                raw_frame_width,
+                                raw_frame_height,
+                            );
                             let decision = simulcast_layer_target_dims(
                                 raw_frame_width,
                                 raw_frame_height,
-                                layer.tier_w,
-                                layer.tier_h,
+                                rung_w,
+                                rung_h,
                                 layer.current_w,
                                 layer.current_h,
                             );
@@ -5296,7 +6646,11 @@ impl ScreenEncoder {
         }
 
         // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
-        clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
+        clear_screen_sharing_state(
+            &screen_sharing_active,
+            &screen_sharing_active_arc,
+            &current_fps_final,
+        );
 
         // Emit Stopped event if we haven't already (onended handler might have already fired)
         // Check enabled flag - if it's still true, onended hasn't fired yet
@@ -5325,12 +6679,18 @@ mod tests {
     use super::keyframe_tick_decision;
     use super::post_encode_exit_action;
     use super::record_screen_restart;
+    use super::resolve_and_apply_source_start_tier;
     use super::retained_stale_warn_due;
+    use super::screen_capture_box_for_ladder;
     use super::screen_capture_constraint_spec;
+    use super::screen_cause_for_tier;
+    use super::screen_constraint_was_ignored;
+    use super::screen_encode_box_when_constraint_ignored;
     use super::screen_encoder_restarts_closed_codec;
     use super::screen_encoder_restarts_configure;
     use super::screen_encoder_restarts_memory;
     use super::screen_encoder_restarts_other;
+    use super::screen_track_constraint_for_tier;
     use super::screen_ws_freshness_threshold_bytes;
     use super::screen_ws_send_decision;
     use super::screen_ws_stale_drop_step_down_decision;
@@ -5348,6 +6708,7 @@ mod tests {
     use super::ScreenEncoder;
     use super::ScreenFloorAccount;
     use super::ScreenWsSend;
+    use super::SourceDims;
     use super::SCREEN_DIM_SETTLE_MS;
     use super::SCREEN_ENCODER_STALL_GAP_MS;
     use super::SCREEN_RETAINED_STALE_LOG_THROTTLE_MS;
@@ -5360,6 +6721,7 @@ mod tests {
     use super::SHED_TEARDOWN_DWELL_MS;
     use crate::adaptive_quality_constants::ENCODER_PLI_COOLDOWN_MS;
     use crate::adaptive_quality_constants::SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+    use crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
     use crate::adaptive_quality_constants::{
         SCREEN_WS_STALE_DROP_THRESHOLD, SCREEN_WS_STALE_DROP_WINDOW_MS,
         WS_SELF_CONGESTION_WINDOW_MS, WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS,
@@ -5373,11 +6735,14 @@ mod tests {
     // writes onto the JS constraint object and consults on rejection — not a
     // re-implemented copy — so mutating the ceiling or the retry rule fails here.
 
-    /// The normal request carries a `max` ceiling of exactly 1920x1080 on BOTH
-    /// width and height (matching the top screen tier), plus the `ideal` hint.
-    /// Dropping either `max` push in `screen_capture_constraint_spec` fails this.
+    /// The normal request carries a `max` ceiling of exactly 3840x2160 on BOTH
+    /// width and height (matching the top screen tier, raised by issue #2179 —
+    /// the pre-#2179 1920x1080 ceiling is what forced a DPR-2 Retina window
+    /// through a resample before the encoder ever saw it), plus the `ideal`
+    /// hint. Dropping either `max` push in `screen_capture_constraint_spec`
+    /// fails this, and so does reverting the top tier to 1080p.
     #[test]
-    fn screen_capture_spec_requests_1920x1080_ceiling() {
+    fn screen_capture_spec_requests_3840x2160_ceiling() {
         let spec = screen_capture_constraint_spec(true);
         let width_max = spec
             .width
@@ -5389,21 +6754,31 @@ mod tests {
             .iter()
             .find(|&&(k, _)| k == "max")
             .map(|&(_, v)| v as u32);
-        assert_eq!(width_max, Some(1920), "width must request max: 1920");
-        assert_eq!(height_max, Some(1080), "height must request max: 1080");
-        // `ideal` is retained so at/under-ceiling sources capture at native size.
+        assert_eq!(width_max, Some(3840), "width must request max: 3840");
+        assert_eq!(height_max, Some(2160), "height must request max: 2160");
+        // `ideal` matches the ceiling so a source at/under it captures NATIVE
+        // rather than being biased down to a fixed size.
         assert!(spec
             .width
             .iter()
-            .any(|&(k, v)| k == "ideal" && v as u32 == 1920));
+            .any(|&(k, v)| k == "ideal" && v as u32 == 3840));
         assert!(spec
             .height
             .iter()
-            .any(|&(k, v)| k == "ideal" && v as u32 == 1080));
+            .any(|&(k, v)| k == "ideal" && v as u32 == 2160));
         assert!(spec
             .framerate
             .iter()
             .any(|&(k, v)| k == "ideal" && v as u32 == 10));
+        // The ceiling must remain DERIVED from the ladder's top rung, never a
+        // hand-written literal that can drift from it.
+        assert_eq!(
+            (width_max, height_max),
+            (
+                Some(SCREEN_QUALITY_TIERS[0].max_width),
+                Some(SCREEN_QUALITY_TIERS[0].max_height)
+            ),
+        );
     }
 
     /// The OverconstrainedError fallback spec drops the ceiling (no `max`) while
@@ -5423,11 +6798,224 @@ mod tests {
         assert!(spec
             .width
             .iter()
-            .any(|&(k, v)| k == "ideal" && v as u32 == 1920));
+            .any(|&(k, v)| k == "ideal" && v as u32 == 3840));
         assert!(spec
             .height
             .iter()
-            .any(|&(k, v)| k == "ideal" && v as u32 == 1080));
+            .any(|&(k, v)| k == "ideal" && v as u32 == 2160));
+    }
+
+    /// Issue #2179, guarding the issue #1973 regression: once the tier steps
+    /// DOWN the encode loop must re-request the CAPTURE size so the compositor
+    /// (not the WebCodecs queue) does the downscale. These cases pin the policy
+    /// on the production decision function.
+    ///
+    /// Mutation guards, per assertion:
+    /// - dropping the `min(tier, ceiling)` cap lets a request exceed what
+    ///   `getDisplayMedia` was allowed → the `tier larger than ceiling` case
+    ///   fails;
+    /// - dropping the `== last` short-circuit re-negotiates the track on every
+    ///   `medium` ↔ `low` transition (both 1280x720) → the "same box" case fails;
+    /// - dropping the release-on-step-up behaviour (i.e. returning `None`
+    ///   whenever the tier no longer binds) pins a share soft forever after one
+    ///   congestion episode → the step-up case fails;
+    /// - dropping the "neither request binds" guard fires a pointless
+    ///   `applyConstraints` on every small-window share → the small-source case
+    ///   fails.
+    #[test]
+    fn screen_track_constraint_for_tier_tracks_the_tier_box() {
+        let (cw, ch) = (3840u32, 2160u32); // capture ceiling = top rung
+
+        // Step DOWN on a 4K source: request the tier's box so the source shrinks
+        // with the config instead of being software-rescaled per frame.
+        assert_eq!(
+            screen_track_constraint_for_tier(1280, 720, cw, ch, 3840, 2160, cw, ch),
+            Some((1280, 720))
+        );
+        // Step back UP to the top rung: the tier box IS the ceiling, so this
+        // releases the earlier constraint and the surface can go native again.
+        assert_eq!(
+            screen_track_constraint_for_tier(cw, ch, cw, ch, 3840, 2160, 1280, 720),
+            Some((cw, ch))
+        );
+        // Partial step up (1440p) after a 720p constraint.
+        assert_eq!(
+            screen_track_constraint_for_tier(2560, 1440, cw, ch, 3840, 2160, 1280, 720),
+            Some((2560, 1440))
+        );
+
+        // Same box as last time (medium -> low, both 1280x720): no re-negotiation.
+        assert_eq!(
+            screen_track_constraint_for_tier(1280, 720, cw, ch, 3840, 2160, 1280, 720),
+            None
+        );
+
+        // A tier box larger than the ceiling is capped at the ceiling — the
+        // request can never widen capture past what getDisplayMedia allowed.
+        assert_eq!(
+            screen_track_constraint_for_tier(7680, 4320, cw, ch, 3840, 2160, 1280, 720),
+            Some((cw, ch))
+        );
+
+        // Small source: neither the outgoing (ceiling) nor the incoming (1080p)
+        // request binds a 1280x720 capture, so there is nothing to do.
+        assert_eq!(
+            screen_track_constraint_for_tier(1920, 1080, cw, ch, 1280, 720, cw, ch),
+            None
+        );
+        // …but once a request WOULD bind that small source, it is made.
+        assert_eq!(
+            screen_track_constraint_for_tier(1280, 720, cw, ch, 1600, 900, cw, ch),
+            Some((1280, 720))
+        );
+
+        // Unknown source dims: the guard is skipped and the request is made; a
+        // `max` can only shrink a genuinely larger source.
+        assert_eq!(
+            screen_track_constraint_for_tier(1280, 720, cw, ch, 0, 0, cw, ch),
+            Some((1280, 720))
+        );
+
+        // Degenerate tier box never produces a zero-dimension request.
+        assert_eq!(
+            screen_track_constraint_for_tier(0, 720, cw, ch, 3840, 2160, cw, ch),
+            None
+        );
+
+        // ── The FREEZE invariant, made executable (issue #2179 review) ───────
+        // The step-up release case above passes source=3840x2160 together with
+        // last=1280x720. That combination is ONLY reachable because the source
+        // pair is frozen at ACQUISITION and never refreshed after a constraint
+        // shrinks the capture. Feed the same call the dims a REFRESHED source
+        // pair would report and the release returns None — i.e. a share stays
+        // soft forever after one transient congestion episode. This is why
+        // `run_screen_encoding` keeps a SEPARATE live pair for the wire stamp
+        // instead of refreshing this one.
+        assert_eq!(
+            screen_track_constraint_for_tier(cw, ch, cw, ch, 1280, 720, 1280, 720),
+            None,
+            "a REFRESHED source pair would make the step-up release a no-op — the \
+             acquisition freeze is load-bearing, not incidental"
+        );
+    }
+
+    /// Issue #2179 review: `(0, 0)` last-constraint means "nothing requested yet"
+    /// (ceiling dropped by the Overconstrained fallback, or a UI-pre-acquired
+    /// stream), so only the INCOMING box decides.
+    ///
+    /// Mutation guards:
+    /// - treat `(0, 0)` as a live 0x0 request (the pre-review arithmetic) and the
+    ///   small-source case returns `Some` — a pointless `applyConstraints` on
+    ///   every small-window share;
+    /// - drop the `want_binds` term and the 5K case returns `None`, leaving the
+    ///   first genuine bounding attempt un-made.
+    #[test]
+    fn screen_track_constraint_treats_zero_last_as_nothing_outstanding() {
+        let (cw, ch) = (3840u32, 2160u32);
+
+        // 5K panel whose capture ceiling was DROPPED: nothing was ever requested,
+        // so the first tier change must genuinely negotiate the top rung's box.
+        assert_eq!(
+            screen_track_constraint_for_tier(cw, ch, cw, ch, 5120, 2880, 0, 0),
+            Some((cw, ch))
+        );
+        // …and a smaller tier likewise.
+        assert_eq!(
+            screen_track_constraint_for_tier(1280, 720, cw, ch, 5120, 2880, 0, 0),
+            Some((1280, 720))
+        );
+
+        // Small window, nothing outstanding: the incoming box does not bind the
+        // source, so there is nothing to negotiate.
+        assert_eq!(
+            screen_track_constraint_for_tier(1920, 1080, cw, ch, 1280, 720, 0, 0),
+            None
+        );
+    }
+
+    /// Issue #2179 review (CODE BLOCKER): a step-down must not shrink the SHARED
+    /// capture below the largest ACTIVE simulcast rung.
+    ///
+    /// Mutation guard: return `(tier_w, tier_h)` unconditionally (the pre-review
+    /// behaviour) and every simulcast case below fails — which in production
+    /// silently re-fits a 1440p rung into a 720p capture while it keeps billing
+    /// 5000 kbps.
+    #[test]
+    fn screen_capture_box_for_ladder_never_shrinks_below_the_top_active_rung() {
+        use crate::adaptive_quality_constants::simulcast_screen_layers;
+
+        // Single stream: identity, so the non-simulcast path is untouched.
+        assert_eq!(screen_capture_box_for_ladder(1280, 720, 1, 1), (1280, 720));
+
+        let ladder3 = simulcast_screen_layers(3);
+        let top = (ladder3[2].max_width, ladder3[2].max_height);
+        let mid = (ladder3[1].max_width, ladder3[1].max_height);
+        let base = (ladder3[0].max_width, ladder3[0].max_height);
+
+        // Base tier stepped to 720p while all three rungs are published: the
+        // capture must still hold the 1440p rung.
+        assert_eq!(screen_capture_box_for_ladder(1280, 720, 3, 3), top);
+        // Two rungs active: hold the 1080p rung.
+        assert_eq!(screen_capture_box_for_ladder(1280, 720, 3, 2), mid);
+        // Only the base rung is published: nothing above to protect.
+        assert_eq!(screen_capture_box_for_ladder(1280, 720, 3, 1), base);
+
+        // A tier box LARGER than the top active rung is kept (this only ever
+        // widens the request, never narrows it).
+        assert_eq!(
+            screen_capture_box_for_ladder(3840, 2160, 3, 3),
+            (3840, 2160)
+        );
+
+        // Out-of-range active counts are clamped, never panicking.
+        assert_eq!(screen_capture_box_for_ladder(1280, 720, 3, 0), base);
+        assert_eq!(screen_capture_box_for_ladder(1280, 720, 3, 99), top);
+    }
+
+    /// Issue #2179 review (PERF): detect an engine that resolves
+    /// `applyConstraints` without applying it, and stop deepening the per-frame
+    /// rescale when it does.
+    ///
+    /// Mutation guards:
+    /// - make `screen_constraint_was_ignored` return `false` always and the
+    ///   "ignored" assertion fails;
+    /// - drop the source floor in `screen_encode_box_when_constraint_ignored`
+    ///   and the 4K-source case reports the 720p tier box, i.e. the 9x rescale
+    ///   the guard exists to prevent.
+    #[test]
+    fn ignored_capture_constraint_is_detected_and_stops_deepening_the_rescale() {
+        // Honoured exactly, and within the rounding tolerance.
+        assert!(!screen_constraint_was_ignored(1280, 720, 1280, 720));
+        assert!(!screen_constraint_was_ignored(1280, 720, 1282, 720));
+        // Ignored: the track is still the full 4K surface.
+        assert!(screen_constraint_was_ignored(1280, 720, 3840, 2160));
+        // Only one axis over is still ignored.
+        assert!(screen_constraint_was_ignored(1280, 720, 1280, 2160));
+        // Unknown dims never accuse the engine.
+        assert!(!screen_constraint_was_ignored(0, 720, 3840, 2160));
+        assert!(!screen_constraint_was_ignored(1280, 720, 0, 0));
+
+        // While honoured, the tier box is used as-is.
+        assert_eq!(
+            screen_encode_box_when_constraint_ignored(1280, 720, 3840, 2160, 3840, 2160, false),
+            (1280, 720)
+        );
+        // Once ignored, the encode box is floored at the source so the rescale
+        // ratio cannot grow with each further step-down.
+        assert_eq!(
+            screen_encode_box_when_constraint_ignored(1280, 720, 3840, 2160, 3840, 2160, true),
+            (3840, 2160)
+        );
+        // …but never past the capture ceiling (the largest frame that can arrive).
+        assert_eq!(
+            screen_encode_box_when_constraint_ignored(1280, 720, 5120, 2880, 3840, 2160, true),
+            (3840, 2160)
+        );
+        // Unknown source dims fall back to the tier box.
+        assert_eq!(
+            screen_encode_box_when_constraint_ignored(1280, 720, 0, 0, 3840, 2160, true),
+            (1280, 720)
+        );
     }
 
     /// Only the FIRST OverconstrainedError retries without the ceiling; a second
@@ -5897,7 +7485,7 @@ mod tests {
     /// order) fails here.
     ///
     /// Mutation guards, per assertion:
-    /// - healthy `high` tier fans out to the FULL active set (deleting the tier gate
+    /// - the healthy (top) tier fans out to the FULL active set (deleting the tier gate
     ///   is indistinguishable here, but the constrained-tier cases below break);
     /// - `medium` caps at base + one upper rung (`min(active, 2)`) — a mutation that
     ///   returned `active` for medium flips the 3-active case from 2 → 3 and FAILS;
@@ -5907,7 +7495,7 @@ mod tests {
     #[test]
     fn floor_fanout_layer_count_gates_by_screen_tier() {
         use crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
-        let n = SCREEN_QUALITY_TIERS.len(); // high→low, so idx 0 = healthiest
+        let n = SCREEN_QUALITY_TIERS.len(); // best→worst, so idx 0 = healthiest
         let high = 0;
         let medium = n - 2;
         let low = n - 1;
@@ -5977,27 +7565,38 @@ mod tests {
     /// tier via `active_screen_tier_fps`, so it budgets bitrate across the share's
     /// real 5–10 fps cadence instead of a fast (~30/60 fps) default (the #1832
     /// defect). Pin that tier→fps mapping and the out-of-range clamp directly on
-    /// the production helper. Assertions use the LITERAL contract fps (high=10 /
-    /// medium=8 / low=5) — NOT a re-read of `SCREEN_QUALITY_TIERS` — so mutating
-    /// the helper (e.g. back to a blind constant, or dropping the clamp) FAILS
-    /// here, and a deliberate retune of the screen ladder's fps is forced through
-    /// review rather than passing silently.
+    /// the production helper. Assertions use the LITERAL contract fps (issue
+    /// #2179 ladder: native=10 / 1440p=10 / high=10 / medium=8 / low=5) — NOT a
+    /// re-read of `SCREEN_QUALITY_TIERS` — so mutating the helper (e.g. back to
+    /// a blind constant, or dropping the clamp) FAILS here, and a deliberate
+    /// retune of the screen ladder's fps is forced through review rather than
+    /// passing silently.
     #[test]
     fn active_screen_tier_fps_maps_each_tier_and_clamps() {
         assert_eq!(
             active_screen_tier_fps(0),
             10,
-            "tier 0 (high) budgets at 10 fps"
+            "tier 0 (native/2160p) budgets at 10 fps"
         );
         assert_eq!(
             active_screen_tier_fps(1),
-            8,
-            "tier 1 (medium) budgets at 8 fps"
+            10,
+            "tier 1 (1440p) budgets at 10 fps"
         );
         assert_eq!(
             active_screen_tier_fps(2),
+            10,
+            "tier 2 (high/1080p) budgets at 10 fps"
+        );
+        assert_eq!(
+            active_screen_tier_fps(3),
+            8,
+            "tier 3 (medium/720p) budgets at 8 fps"
+        );
+        assert_eq!(
+            active_screen_tier_fps(4),
             5,
-            "tier 2 (low) budgets at 5 fps"
+            "tier 4 (low/720p·5fps) budgets at 5 fps"
         );
         // A stale / out-of-range tier index must clamp to the LOWEST tier's fps
         // (5), never panic — mirrors the defensive clamps elsewhere in this file.
@@ -6033,6 +7632,7 @@ mod tests {
             enable_webtransport: false,
             max_received_layer: None,
             skip_canvas_paint: false,
+            camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant::Default,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -6067,6 +7667,8 @@ mod tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_reaction: None,
+            on_raise_hand: None,
+            on_meeting_timer: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
@@ -6127,7 +7729,7 @@ mod tests {
 
     #[test]
     fn clamp_screen_layer_count_treats_zero_and_one_as_one() {
-        // 0 and 1 → single layer (feature off / byte-identical screen path).
+        // Explicit 0/1 inputs → single layer (feature-off / legacy screen path).
         assert_eq!(clamp_screen_layer_count(0), 1);
         assert_eq!(clamp_screen_layer_count(1), 1);
     }
@@ -6211,6 +7813,87 @@ mod tests {
         assert!(
             !encoder.congestion_step_down.load(Ordering::Acquire),
             "the screen congestion flag must be SEPARATE from the camera's"
+        );
+    }
+
+    /// #2147: the BROWSER's own "Stop sharing" button (the track `onended` path)
+    /// must zero the output-fps atom, not just clear the enabled/sharing flags.
+    ///
+    /// That atom is exported as `screen_encoder_output_fps` → the deliberately
+    /// ungated `videocall_screen_encoder_output_fps` gauge, so a leftover nonzero
+    /// makes the gauge assert a live screen encoder for a share that has stopped —
+    /// the exact stale-value class as #2145. It cannot rely on the AQ loop's
+    /// `SCREEN_ENCODER_FPS_IDLE_DECAY_MS` backstop, because that loop exits when its
+    /// liveness token drops (Host unmount) while the health reporter keeps an `Arc`
+    /// clone of the atom and keeps reporting.
+    ///
+    /// #2147: the ERROR / give-up / final-cleanup teardown paths must zero the
+    /// output-fps atom too, not just the `onended` path.
+    ///
+    /// The last of these is the `stream_ended` route — taken when a capture track
+    /// dies WITHOUT `onended` firing (OS/source revoke, monitor unplug, Wayland
+    /// portal revoke). All three route through `clear_screen_sharing_state`, so this
+    /// pins that chokepoint. Without it the ungated
+    /// `videocall_screen_encoder_output_fps` gauge keeps asserting a live screen
+    /// encoder for a share that has ended.
+    ///
+    /// MUTATION: change `clear_screen_sharing_state` back to calling only
+    /// `clear_screen_sharing_flags` (drop the `reset_output_fps`) and the fps
+    /// assertion fails (stays 17).
+    #[test]
+    fn clear_screen_sharing_state_zeroes_output_fps_and_both_flags() {
+        use super::clear_screen_sharing_state;
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let rc = Rc::new(AtomicBool::new(true));
+        let arc = Arc::new(AtomicBool::new(true));
+        let current_fps = AtomicU32::new(17);
+
+        clear_screen_sharing_state(&rc, &arc, &current_fps);
+
+        assert_eq!(
+            current_fps.load(Ordering::Relaxed),
+            0,
+            "#2147: an error/revoke teardown must report an honest 0, not a stale nonzero"
+        );
+        // The pre-existing #1611 dual-flag behaviour must be preserved.
+        assert!(
+            !rc.load(Ordering::Acquire),
+            "the Rc sharing flag must clear"
+        );
+        assert!(
+            !arc.load(Ordering::Acquire),
+            "the Arc sharing flag must clear (mic-side #1611)"
+        );
+    }
+
+    /// MUTATION: delete the `reset_output_fps(current_fps)` line from
+    /// `apply_screen_share_stopped` and the fps assertion fails (stays 24).
+    #[test]
+    fn screen_share_stopped_zeroes_output_fps_and_flags() {
+        use super::apply_screen_share_stopped;
+        use std::sync::atomic::AtomicU32;
+
+        let enabled = AtomicBool::new(true);
+        let sharing = AtomicBool::new(true);
+        let current_fps = AtomicU32::new(24);
+
+        apply_screen_share_stopped(&enabled, &sharing, &current_fps);
+
+        assert_eq!(
+            current_fps.load(Ordering::Relaxed),
+            0,
+            "#2147: a stopped share must report an honest 0, never a stale nonzero"
+        );
+        // The pre-existing flag behaviour must be preserved by the extraction.
+        assert!(
+            !enabled.load(Ordering::Acquire),
+            "the enabled flag must be cleared"
+        );
+        assert!(
+            !sharing.load(Ordering::Acquire),
+            "the screen-sharing flag must be cleared"
         );
     }
 
@@ -6350,6 +8033,501 @@ mod tests {
             !encoder.shared_screen_cause_hint.borrow().is_empty(),
             "constrained tier must seed cause hint"
         );
+    }
+
+    /// Issue #2179: every tier apply must ARM `initial_tier_pending`, which is
+    /// what makes the AQ control loop adopt the encoder's source-resolved tier
+    /// instead of overwriting it with its own construction default on the first
+    /// transition.
+    ///
+    /// Mutation guard: deleting the `initial_tier_pending.store(true, ...)` in
+    /// `apply_initial_tier_to` leaves the flag `false` and this fails. The flag
+    /// starts `false` at construction (asserted first), so the test cannot pass
+    /// on a stuck-`true` default either.
+    #[test]
+    fn apply_initial_tier_arms_the_aq_controller_seed() {
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+            1, // max_layers (single layer)
+        );
+        assert!(
+            !encoder.initial_tier_pending.load(Ordering::Acquire),
+            "no seed may be pending before a share starts"
+        );
+
+        encoder.apply_initial_tier(1);
+        assert!(
+            encoder.initial_tier_pending.load(Ordering::Acquire),
+            "applying the initial tier must arm the AQ controller seed"
+        );
+        assert_eq!(
+            encoder.shared_screen_tier_index.load(Ordering::Relaxed),
+            1,
+            "the armed seed must be readable from the shared tier index"
+        );
+
+        // The AQ loop's consume is a `swap(false)`: exactly once per apply.
+        assert!(encoder.initial_tier_pending.swap(false, Ordering::AcqRel));
+        assert!(!encoder.initial_tier_pending.load(Ordering::Acquire));
+    }
+
+    /// Issue #2179: the tier the encoder applies must come from the captured
+    /// SOURCE composed with the network floor — not from the raw network floor —
+    /// and (review round) not better than the share's persistent ceiling.
+    /// Exercised through the PRODUCTION resolver + the production
+    /// `apply_initial_tier`, so the wiring and the decision are both pinned.
+    ///
+    /// Mutation guard: making the start seam ignore its `src_w` / `src_h` (i.e.
+    /// reverting to `apply_initial_tier(network_tier)`, which is exactly what
+    /// both start paths did before #2179) applies the network floor `0` — the
+    /// `native` rung's 3840x2160 box — so every dims assert below fails.
+    ///
+    /// The one link this does NOT cover is `screen_stream_source_dims`, which
+    /// needs a live `MediaStream`; it forwards straight to the unit-tested
+    /// `settings_source_stamp`.
+    #[test]
+    fn apply_initial_tier_from_resolved_source_tier_lands_on_the_source_rung() {
+        use crate::adaptive_quality_constants::{
+            resolve_initial_screen_tier, screen_tier_index_by_label,
+        };
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+            1, // max_layers (single layer)
+        );
+        let dims = |e: &ScreenEncoder| {
+            (
+                e.tier_max_width.load(Ordering::Relaxed),
+                e.tier_max_height.load(Ordering::Relaxed),
+            )
+        };
+
+        // `apply_source_start_tier` reads `sender_core_count()`, which is `0` =
+        // "unknown" off-wasm — the most conservative DEVICE class, and the real
+        // production answer on a browser that hides `hardwareConcurrency`. The
+        // ceiling therefore holds even a 1440p source at the 1080p rung.
+        assert_eq!(
+            encoder.apply_source_start_tier(2496, 1440, 0),
+            screen_tier_index_by_label("high"),
+            "an unknown-CPU sender must not be started above the 1080p rung"
+        );
+        assert_eq!(dims(&encoder), (1920, 1080));
+
+        // The issue's case on a sender that DOES report a capable core count: a
+        // DPR-2 Retina window on a healthy link reaches its own rung.
+        assert_eq!(
+            resolve_and_apply_source_start_tier(&encoder.initial_tier_targets(), 2496, 1440, 0, 16),
+            resolve_initial_screen_tier(2496, 1440, 0),
+            "the start seam must apply exactly what the production resolver returns"
+        );
+        assert_eq!(
+            dims(&encoder),
+            (2560, 1440),
+            "a 2496x1440 source on a healthy link must configure the 1440p rung, \
+             not the 1280x720 box that produced the reported 1248x720"
+        );
+
+        // Same source on a constrained link keeps the conservative 720p box.
+        let low = SCREEN_QUALITY_TIERS.len() - 1;
+        resolve_and_apply_source_start_tier(&encoder.initial_tier_targets(), 2496, 1440, low, 16);
+        assert_eq!(
+            dims(&encoder),
+            (1280, 720),
+            "the network floor must still veto the source-derived rung"
+        );
+    }
+
+    /// Issue #2179 review (SECURITY/UX): the share's PERSISTENT ceiling must be
+    /// published, must bind the applied start tier, and must be the reference
+    /// point for the Cause line — a share sitting at the best rung its own source
+    /// needs is NOT "bitrate-limited".
+    ///
+    /// Drives the production seam `resolve_and_apply_source_start_tier` with an
+    /// explicit core count (the browser read returns 0 = "unknown" off-wasm).
+    ///
+    /// Mutation guards, per assertion:
+    /// - revert the Cause predicate to `clamped_tier == 0` and the 1080p and
+    ///   1440p "no hint" assertions fail — that is the live false-flag;
+    /// - drop the `.max(ceiling)` on the resolved tier and the single-stream 4K
+    ///   case starts at `native` instead of `1440p`;
+    /// - drop the `best_source_tier_index.store(...)` and every assertion on the
+    ///   published index fails.
+    #[test]
+    fn source_start_tier_publishes_the_ceiling_and_gates_the_cause_line() {
+        use crate::adaptive_quality_constants::screen_tier_index_by_label;
+
+        let make = |max_layers: u32| {
+            ScreenEncoder::new(
+                build_test_client(),
+                500,
+                Callback::from(|_: String| {}),
+                Callback::from(|_: ScreenShareEvent| {}),
+                Rc::new(AtomicBool::new(false)),
+                max_layers,
+            )
+        };
+        let capable_cores = 16;
+
+        // ── A 1080p window on a capable 3-rung sender ────────────────────────
+        // `high` is the best rung its own pixels need, so the share is at its
+        // ceiling: unconstrained, no Cause line.
+        let encoder = make(3);
+        let applied = resolve_and_apply_source_start_tier(
+            &encoder.initial_tier_targets(),
+            1920,
+            1080,
+            0,
+            capable_cores,
+        );
+        let high = screen_tier_index_by_label("high");
+        assert_eq!(applied, high, "a 1080p source starts at the 1080p rung");
+        assert_eq!(
+            encoder
+                .shared_best_source_tier_index
+                .load(Ordering::Relaxed) as usize,
+            high,
+            "the published ceiling must be the rung the source needs"
+        );
+        assert!(
+            encoder.shared_screen_cause_hint.borrow().is_empty(),
+            "a share AT its ceiling must not be flagged constrained"
+        );
+        assert!(
+            encoder.shared_screen_adaptive_tier.borrow().is_empty(),
+            "…and must not stamp a constraining tier label"
+        );
+        assert_eq!(
+            encoder
+                .shared_screen_encoder_target_bitrate_kbps
+                .load(Ordering::Relaxed),
+            0,
+            "…and must not stamp a target bitrate (a partial Cause line is worse \
+             than none — issue #903)"
+        );
+
+        // ── The SAME source, forced BELOW its ceiling by a network floor ─────
+        let low = SCREEN_QUALITY_TIERS.len() - 1;
+        let applied = resolve_and_apply_source_start_tier(
+            &encoder.initial_tier_targets(),
+            1920,
+            1080,
+            low,
+            capable_cores,
+        );
+        assert_eq!(applied, low);
+        assert_eq!(
+            *encoder.shared_screen_cause_hint.borrow(),
+            "bitrate-limited",
+            "a share pushed BELOW its ceiling is genuinely constrained and must say so"
+        );
+        assert!(!encoder.shared_screen_adaptive_tier.borrow().is_empty());
+
+        // ── A 4K source on a SINGLE-STREAM share ────────────────────────────
+        // Receivers have no lower rung to fall back to, so the sender may not
+        // exceed 1440p — and, being at that cap, is still "unconstrained".
+        let encoder = make(1);
+        let applied = resolve_and_apply_source_start_tier(
+            &encoder.initial_tier_targets(),
+            3840,
+            2160,
+            0,
+            capable_cores,
+        );
+        let rung_1440p = screen_tier_index_by_label("1440p");
+        assert_eq!(
+            applied, rung_1440p,
+            "a single-stream 4K share must not start at the `native` rung"
+        );
+        assert_eq!(
+            (
+                encoder.tier_max_width.load(Ordering::Relaxed),
+                encoder.tier_max_height.load(Ordering::Relaxed),
+            ),
+            (2560, 1440),
+        );
+        // …and because it is BELOW the rung its 4K source needs, it must SAY so
+        // (issue #2179 review r2): silence here is the false negative that left
+        // viewers looking at a red downscale badge with no explanation. The
+        // binding term is the publish LADDER — its top rung and the
+        // single-stream cap coincide at `1440p` today (review r3).
+        assert_eq!(
+            *encoder.shared_screen_cause_hint.borrow(),
+            crate::adaptive_quality_constants::SCREEN_CAUSE_LADDER,
+            "a share capped below its source rung must name the term responsible"
+        );
+
+        // ── A 4K source on a sender BELOW the 1440p tier bar ────────────────
+        // Here the DEVICE class really is the binding term: it caps at `high`,
+        // a rung worse than the ladder would on its own. So the cause is CPU —
+        // not silence, and not "bitrate-limited" (nothing about the network is
+        // constraining it).
+        let encoder = make(3);
+        let applied = resolve_and_apply_source_start_tier(
+            &encoder.initial_tier_targets(),
+            3840,
+            2160,
+            0,
+            4, // below the 1440p tier bar
+        );
+        assert_eq!(
+            applied, high,
+            "a sub-bar sender must not start a 4K share above the 1080p rung"
+        );
+        assert_eq!(
+            *encoder.shared_screen_cause_hint.borrow(),
+            crate::adaptive_quality_constants::SCREEN_CAUSE_CPU,
+            "a share capped below its source rung by the device class must name the CPU"
+        );
+        assert!(
+            !encoder.shared_screen_adaptive_tier.borrow().is_empty(),
+            "a constrained share must stamp its tier label too"
+        );
+
+        // ── The same 4K source on an 8-core laptop ──────────────────────────
+        // The device class caps at the SAME rung the ladder already does, so
+        // blaming the CPU would be misleading — nothing about that machine is
+        // what is holding the share back.
+        let encoder = make(3);
+        let applied =
+            resolve_and_apply_source_start_tier(&encoder.initial_tier_targets(), 3840, 2160, 0, 8);
+        assert_eq!(applied, rung_1440p);
+        assert_eq!(
+            *encoder.shared_screen_cause_hint.borrow(),
+            crate::adaptive_quality_constants::SCREEN_CAUSE_LADDER
+        );
+
+        // ── A 720p window at the `high` rung says NOTHING ───────────────────
+        // It is at the rung its own pixels need; there is nothing to explain,
+        // whatever the machine.
+        let encoder = make(3);
+        let applied =
+            resolve_and_apply_source_start_tier(&encoder.initial_tier_targets(), 1280, 720, 0, 4);
+        assert_eq!(applied, high);
+        assert!(
+            encoder.shared_screen_cause_hint.borrow().is_empty(),
+            "a share at the rung its source needs must not be flagged"
+        );
+        assert_eq!(
+            encoder
+                .shared_screen_encoder_target_bitrate_kbps
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // ── THE ISSUE-REPORTER CASE ─────────────────────────────────────────
+        // A DPR-2 Retina window on an 8-core laptop reaches the 1440p rung and
+        // is unconstrained there.
+        let encoder = make(3);
+        let applied =
+            resolve_and_apply_source_start_tier(&encoder.initial_tier_targets(), 2496, 1440, 0, 8);
+        assert_eq!(
+            applied, rung_1440p,
+            "the 2496x1440 Retina case on consumer hardware must reach the 1440p rung"
+        );
+        assert_eq!(
+            (
+                encoder.tier_max_width.load(Ordering::Relaxed),
+                encoder.tier_max_height.load(Ordering::Relaxed),
+            ),
+            (2560, 1440),
+        );
+        assert!(encoder.shared_screen_cause_hint.borrow().is_empty());
+    }
+
+    /// Issue #2179 review r3: the freeze invariant is WIRING-enforced, not just
+    /// documented. [`SourceDims::refresh_live`] — the only writer reachable from
+    /// the `applyConstraints` success path — must never move the frozen pair.
+    ///
+    /// The earlier pin passed literals to
+    /// [`screen_track_constraint_for_tier`], which proves the arithmetic but NOT
+    /// the wiring: refreshing the frozen pair inside the encode loop would have
+    /// left it green. This one fails.
+    ///
+    /// Mutation guard: add `self.frozen_w.store(w, ..)` /
+    /// `self.frozen_h.store(h, ..)` to `refresh_live` and the divergence
+    /// assertion fails — and with it the step-up RELEASE, which is what pins a
+    /// share soft forever after one congestion episode.
+    #[test]
+    fn source_dims_refresh_live_never_moves_the_frozen_pair() {
+        let dims = SourceDims::new();
+
+        // Acquisition seeds BOTH: at that instant they describe one surface.
+        dims.seed_on_acquisition(3840, 2160);
+        assert_eq!(dims.frozen(), (3840, 2160));
+        assert_eq!(dims.live(), (3840, 2160));
+
+        // A step-down constraint is applied and the capture really shrinks.
+        dims.refresh_live(1280, 720);
+        assert_eq!(
+            dims.live(),
+            (1280, 720),
+            "the wire stamp must follow the LIVE capture"
+        );
+        assert_eq!(
+            dims.frozen(),
+            (3840, 2160),
+            "the constraint decision must still see the ORIGINAL surface"
+        );
+
+        // …and that divergence is exactly what keeps the step-up RELEASE alive.
+        // With the frozen pair (3840x2160) the release is made; with the live
+        // pair it would be suppressed and the share would stay soft forever.
+        let (cw, ch) = (3840u32, 2160u32);
+        assert_eq!(
+            screen_track_constraint_for_tier(
+                cw,
+                ch,
+                cw,
+                ch,
+                dims.frozen().0,
+                dims.frozen().1,
+                1280,
+                720
+            ),
+            Some((cw, ch)),
+            "release must fire against the frozen pair"
+        );
+        assert_eq!(
+            screen_track_constraint_for_tier(
+                cw,
+                ch,
+                cw,
+                ch,
+                dims.live().0,
+                dims.live().1,
+                1280,
+                720
+            ),
+            None,
+            "…and would be suppressed against the live pair — the wedge this \
+             invariant exists to prevent"
+        );
+
+        // A re-acquire re-seeds BOTH, so a new surface is not judged against the
+        // dead one.
+        dims.seed_on_acquisition(1920, 1080);
+        assert_eq!(dims.frozen(), (1920, 1080));
+        assert_eq!(dims.live(), (1920, 1080));
+    }
+
+    /// The shared stamp rule, exercised directly (issue #2179 review r2).
+    ///
+    /// Mutation guards:
+    /// - compare against `ceiling_tier` instead of `source_tier` in the clear
+    ///   branch and the CPU-capped case goes silent — the false negative;
+    /// - drop the `ceiling_cause` branch and the CPU-capped case reports
+    ///   `bitrate-limited`, blaming the network for a CPU limit;
+    /// - drop the clear branch and an unconstrained share stamps a cause.
+    #[test]
+    fn screen_cause_for_tier_splits_withheld_from_reachable() {
+        use crate::adaptive_quality_constants::{
+            SCREEN_CAUSE_BITRATE, SCREEN_CAUSE_CPU, SCREEN_CAUSE_SINGLE_STREAM,
+        };
+
+        // At the source rung: nothing is being withheld, whatever the ceiling.
+        assert_eq!(screen_cause_for_tier(2, 2, 2, ""), None);
+        assert_eq!(screen_cause_for_tier(1, 2, 2, ""), None);
+
+        // Held at a ceiling ABOVE the source rung: name the binding term.
+        assert_eq!(
+            screen_cause_for_tier(1, 0, 1, SCREEN_CAUSE_SINGLE_STREAM),
+            Some(SCREEN_CAUSE_SINGLE_STREAM)
+        );
+        assert_eq!(
+            screen_cause_for_tier(1, 0, 1, SCREEN_CAUSE_CPU),
+            Some(SCREEN_CAUSE_CPU)
+        );
+
+        // BELOW the ceiling: neither static term explains it — something
+        // dynamic (network floor, live congestion) did.
+        assert_eq!(
+            screen_cause_for_tier(4, 0, 1, SCREEN_CAUSE_CPU),
+            Some(SCREEN_CAUSE_BITRATE)
+        );
+        assert_eq!(
+            screen_cause_for_tier(4, 2, 2, ""),
+            Some(SCREEN_CAUSE_BITRATE)
+        );
+
+        // Defensive: a ceiling worse than the source rung with NO cause string
+        // still reports something rather than lying by omission.
+        assert_eq!(
+            screen_cause_for_tier(1, 0, 1, ""),
+            Some(SCREEN_CAUSE_BITRATE)
+        );
+    }
+
+    /// The published ceiling must reach the UI through the SAME snapshot the
+    /// live tier index does, so the panel can tell "as good as it gets" from
+    /// "constrained".
+    ///
+    /// Mutation guard: drop `best_source_tier_index` from the snapshot producer
+    /// and this fails to compile / assert.
+    #[test]
+    fn live_screen_snapshot_carries_the_best_source_tier_index() {
+        let encoder = ScreenEncoder::new(
+            build_test_client(),
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+            3,
+        );
+        assert!(
+            encoder.live_screen_snapshot().is_none(),
+            "precondition: no snapshot while not sharing"
+        );
+
+        resolve_and_apply_source_start_tier(&encoder.initial_tier_targets(), 2496, 1440, 0, 16);
+        encoder.screen_sharing_active.store(true, Ordering::Release);
+
+        let snap = encoder
+            .live_screen_snapshot()
+            .expect("sharing must produce a snapshot");
+        let best = crate::adaptive_quality_constants::screen_tier_index_by_label("1440p");
+        assert_eq!(snap.best_source_tier_index, best);
+        assert_eq!(
+            snap.tier_index, snap.best_source_tier_index,
+            "a share at its ceiling reports tier == best, which is how the UI \
+             renders \"as good as it gets\" rather than a constrained badge"
+        );
+        // Issue #2179 review r2: the SOURCE-only rung is published alongside the
+        // reachable ceiling. On a capable sender they coincide.
+        assert_eq!(snap.source_tier_index, best);
+
+        // …and they DIVERGE exactly when a ceiling term binds. A 4K source on an
+        // 8-core laptop deserves `native` but can only reach `1440p`, which is
+        // the state the meter must read as "full bars" while the badge reads
+        // "constrained".
+        let encoder = ScreenEncoder::new(
+            build_test_client(),
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+            3,
+        );
+        resolve_and_apply_source_start_tier(&encoder.initial_tier_targets(), 3840, 2160, 0, 8);
+        encoder.screen_sharing_active.store(true, Ordering::Release);
+        let snap = encoder.live_screen_snapshot().expect("snapshot");
+        assert_eq!(
+            snap.source_tier_index, 0,
+            "a 4K surface deserves the top rung"
+        );
+        assert_eq!(
+            snap.best_source_tier_index, best,
+            "…but can only reach 1440p"
+        );
+        assert_eq!(snap.tier_index, best, "and is started at what it can reach");
     }
 
     #[test]

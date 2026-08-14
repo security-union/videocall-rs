@@ -318,6 +318,45 @@ lazy_static! {
     )
     .expect("Failed to create health_reports_total metric");
 
+    /// Client-reported floating-point samples REJECTED for being non-finite
+    /// (NaN / +Inf / -Inf) before they could reach a gauge or histogram
+    /// (issue 2047).
+    ///
+    /// Deliberately UNLABELED: a client that emits non-finite telemetry is
+    /// misbehaving or malicious, and adding meeting/session/peer labels here
+    /// would hand it exactly the unbounded-cardinality lever the guard exists to
+    /// deny. This series therefore answers "is anyone sending garbage?" but NOT
+    /// "who" — identifying the reporter is a separate investigation, since
+    /// nothing on this path records it.
+    pub static ref NON_FINITE_SAMPLES_DROPPED_TOTAL: Counter = register_counter!(
+        "videocall_client_non_finite_samples_dropped_total",
+        "Client-reported NaN/Inf telemetry samples rejected before reaching a metric (issue 2047)"
+    )
+    .expect("Failed to create client_non_finite_samples_dropped_total metric");
+
+    /// `TierTransition` entries DISCARDED from a single health packet for
+    /// exceeding the per-packet ingest cap (issue 2047).
+    ///
+    /// Unlabeled for the same reason as
+    /// [`NON_FINITE_SAMPLES_DROPPED_TOTAL`]: the condition is only reachable by
+    /// a misbehaving or malicious client, and labeling it would reintroduce the
+    /// cardinality lever the cap exists to close. A conformant client emits
+    /// single digits per packet, so any non-zero value here is worth a look.
+    pub static ref TIER_TRANSITIONS_DROPPED_TOTAL: Counter = register_counter!(
+        "videocall_tier_transitions_dropped_total",
+        "TierTransition entries discarded for exceeding the per-packet ingest cap (issue 2047)"
+    )
+    .expect("Failed to create tier_transitions_dropped_total metric");
+
+    /// Rejected client-authored camera layer reports (#2170). Unlabeled for the
+    /// same reason as [`TIER_TRANSITIONS_DROPPED_TOTAL`]: rejected input must not
+    /// regain a cardinality lever through this counter.
+    pub static ref ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL: Counter = register_counter!(
+        "videocall_encoder_layer_geometry_dropped_total",
+        "Camera EncoderLayerGeometry entries rejected for count, layer id, dimensions, or implausible measured fps (issue 2170)"
+    )
+    .expect("Failed to create encoder_layer_geometry_dropped_total metric");
+
     /// Whether peer can receive audio (1 = yes, 0 = no)
     pub static ref PEER_CAN_LISTEN: GaugeVec = register_gauge_vec!(
         "videocall_peer_can_listen",
@@ -425,10 +464,45 @@ lazy_static! {
     )
     .expect("Failed to create peer_connections_total metric");
 
-    /// Per-pair video framerate as observed by the receiver
+    /// Per-pair camera video framerate as observed by the receiver.
+    ///
+    /// Counts frames the receiver actually DECODED (issue #2190). Before that fix it
+    /// counted ARRIVALS, including packets the EXACT-MATCH simulcast guard discarded
+    /// as wrong-rung — and because the relay fails open and forwards ALL of a
+    /// publisher's rungs to a healthy receiver, this read the LADDER SUM: an 8fps
+    /// 3-rung camera publisher measured ~52 (7+15+30) here, i.e. above the 30fps
+    /// ceiling of any single rung. Series recorded before that fix are inflated by
+    /// roughly the publisher's active-rung count and are NOT comparable with later
+    /// ones.
+    ///
+    /// Still a DECODE-call count, not a paint count: it can read healthy while video
+    /// is visually frozen, because the decode loop keeps being driven. There is no
+    /// per-rung breakdown — the counter carries no `layer_id`.
+    ///
+    /// ⚠ Reading a 0 here: `content_staleness_ms` is the usual corroborating lag signal,
+    /// but it CANNOT corroborate this one, because the client folds it only while
+    /// `fps_received > 0` — so whenever this reads 0, staleness holds its 0.0 default,
+    /// which is published as "at live".
+    ///
+    /// `videocall_video_quality_score` is WORSE than absent — it STALE-LATCHES. The client
+    /// folds it only when fps > 0, and the server export is `if let Some(score) { .set(..) }`,
+    /// so on `None` nothing is written and the GaugeVec keeps serving its LAST value. The only
+    /// removal is `remove_per_peer_metrics` (disconnect GC, not a staleness sweep). A peer that
+    /// scored once therefore reads its last HEALTHY value while its video is frozen.
+    ///
+    /// Those gates predate #2190, but #2190 widens the window they mislead in: a receiver
+    /// pinned to a rung the publisher stopped sending now reads fps 0 where it previously read
+    /// the ladder sum. To tell an expected idle apart from an unexplained one, read
+    /// `videocall_video_bitrate_kbps` (which since #2190 has an INDEPENDENT arrival-based
+    /// freshness clock, so it stays live while bytes keep arriving — live bitrate with fps 0
+    /// means receiving-but-not-decoding) plus `videocall_video_seq_loss_per_sec` /
+    /// `videocall_keyframe_requests_per_sec`, which are folded OUTSIDE the fps gate and so
+    /// survive it. NOT `videocall_peer_can_see`: that is `video_fresh`, the freshness of the
+    /// stats EVENT (broadcast every heartbeat with fps 0 substituted), not of frames — it reads
+    /// 1 for a receiving-but-not-decoding stream and cannot discriminate.
     pub static ref VIDEO_FPS: GaugeVec = register_gauge_vec!(
         "videocall_video_fps",
-        "Video frames per second observed by the receiver",
+        "Camera video frames per second DECODED by the receiver (excludes wrong-rung simulcast packets the decode guard skipped; see #2190)",
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_fps metric");
@@ -728,6 +802,76 @@ lazy_static! {
     )
     .expect("Failed to create video_skip_to_live_total metric");
 
+    /// Per-peer cumulative count of keyframe ARRIVALS at the receiver's jitter buffer (#2201).
+    ///
+    /// This is the fact that was previously unrecorded: it distinguishes a freeze where the
+    /// publisher's keyframe NEVER ARRIVED (delivery — e.g. #1699 WebSocket publisher
+    /// head-of-line) from one where it arrived and failed to recover the picture
+    /// (decode/guard/buffer). Those need opposite fixes, and the choice between them was
+    /// unfalsifiable from logs or metrics.
+    ///
+    /// Counts arrivals REJECTED as old/duplicate too — the question is whether the publisher's
+    /// keyframe reached the receiver, for which a retransmit counts.
+    ///
+    /// ⛔ DO NOT subtract this from `videocall_keyframe_requests_sent_total`. That would be
+    /// arithmetically meaningless in three independent ways, and an earlier version of this
+    /// doc wrongly recommended it:
+    ///   1. WRONG GRAIN. The request counter is a single process-wide `AtomicU64` in the
+    ///      client (`KEYFRAME_REQUESTS_SENT`), summed over ALL peers and BOTH media kinds.
+    ///      This counter is per-(pair, media kind). They do not describe the same population
+    ///      even in a 2-peer call, because camera and screen share the request total.
+    ///   2. WRONG POPULATION. Most arrivals are PERIODIC keyframes (every
+    ///      `PERIODIC_KEYFRAME_MAX_INTERVAL_MS`, 5s camera / 3s screen) that nobody requested,
+    ///      so on a healthy call with zero PLI this counter rises while requests stay flat —
+    ///      the difference goes NEGATIVE and means nothing.
+    ///   3. WRONG RESET BOUNDARY. This resets on a decode-pipeline rebuild; the request
+    ///      counter resets only on page load.
+    ///
+    /// Read it INSTEAD as: (a) does it rise at all during a freeze — if not, nothing is
+    /// reaching the buffer; (b) `rate()` against the expected periodic cadence, so a stream
+    /// receiving materially fewer than 1-per-5s (camera) is keyframe-starved. For the
+    /// request↔arrival correlation, use the per-arrival `[JITTER_BUFFER] keyframe_arrival`
+    /// console line, which carries `pli_age` — a genuinely per-pair, per-arrival round-trip —
+    /// alongside the per-pair `keyframe_requests_per_sec` rate in the health packet.
+    ///
+    /// ⚠ THIS DOES NOT MEASURE NETWORK DELIVERY. It measures "a keyframe reached this
+    /// receiver's SELECTED-LAYER DECODE PATH". Six client-side sites can absorb a keyframe
+    /// first, and every one of them reads here exactly like a network loss:
+    ///   1. the cleartext EXACT-MATCH simulcast rung guard,
+    ///   2. AES-decrypt failure,
+    ///   3. the post-decrypt per-arm rung guard (older-client fall-through),
+    ///   4. the `video_enabled == false` straggler drop,
+    ///   5. the VISIBILITY gate — NOT exotic: a scrolled-off/off-budget tile skips decode
+    ///      entirely, and the invisible→visible edge even sends a PLI while decode is still
+    ///      returning SKIPPED, so the request and the arrival disagree by construction,
+    ///   6. the unknown-codec early return.
+    ///
+    /// The publisher-side mitigation is only PARTIAL: `should_encode_layer_frame`
+    /// short-circuits on `want_keyframe`, so a keyframe bypasses per-rung FPS decimation —
+    /// but the preceding `layer_id >= local_active_layers` shed takes no such argument, so a
+    /// SHED rung emits no keyframe at all. A cold-started publisher runs one active layer, so
+    /// a PLI yields a layer-0 keyframe only. Screen is weaker again (no fps gate to bypass,
+    /// and `floor_fanout_layer_count` caps floor keyframes to base-only at the lowest tier).
+    ///
+    /// So read a 0 as "nothing reached the decode path", never as "the network dropped it".
+    /// #1695 is the sharp case: a decode guard sitting ABOVE the rung the relay forwards drops
+    /// EVERYTHING client-side and this reads a flat 0 that mimics total delivery failure.
+    /// Disambiguate with `videocall_video_bitrate_kbps` — bytes still arriving while this and
+    /// `videocall_video_fps` read 0 means the packets DID arrive and were discarded locally.
+    /// A companion counter placed BEFORE the rung guard would separate the two directly.
+    ///
+    /// A COUNTER value held in a GaugeVec (set to the current cumulative total) so the per-pair
+    /// `remove_label_values` cleanup GCs it with the sibling playout gauges — same pattern as
+    /// `VIDEO_SKIP_TO_LIVE_TOTAL`. It resets to 0 when the client rebuilds its decode pipeline
+    /// (#1324/#1662 recovery), so query with `increase()`/`rate()`. Reported unconditionally,
+    /// including at fps 0 — load-bearing, since a freeze is exactly when fps can be 0.
+    pub static ref VIDEO_KEYFRAME_ARRIVALS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_video_keyframe_arrivals_total",
+        "Cumulative keyframe ARRIVALS at the receiver's jitter buffer per receiver→source pair (#2201). Read as: is it rising during a freeze, and rate() vs the expected periodic cadence. Do NOT diff against videocall_keyframe_requests_sent_total (process-wide counter, unrequested periodic arrivals dominate, different reset boundary) — see the metric docs",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_keyframe_arrivals_total metric");
+
     /// Call quality score (0-100, min of audio and video)
     pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_call_quality_score",
@@ -994,10 +1138,14 @@ lazy_static! {
     )
     .expect("Failed to create encoder_queue_depth metric");
 
-    /// Screen share quality tier (0=high, 1=medium, 2=low)
+    /// Screen share quality tier index into `SCREEN_QUALITY_TIERS`
+    /// (0 = best, higher = more degraded). Issue #2179 extended that ladder to
+    /// 0=native/2160p, 1=1440p, 2=high/1080p, 3=medium/720p, 4=low, so
+    /// dashboards must NOT assume a fixed top index — compare against the
+    /// client's ladder, not a hard-coded 2.
     pub static ref ADAPTIVE_SCREEN_TIER: GaugeVec = register_gauge_vec!(
         "videocall_adaptive_screen_tier",
-        "Screen share adaptive quality tier index (0=high, 2=low)",
+        "Screen share adaptive quality tier index (0 = best, higher = more degraded)",
         &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create adaptive_screen_tier metric");
@@ -1017,6 +1165,92 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create encoder_output_fps metric");
+
+    /// SCREEN encoder output FPS (issue #2147).
+    ///
+    /// A SEPARATE metric name rather than a `media_kind` label on
+    /// `ENCODER_OUTPUT_FPS` above: that gauge has no `media_kind` today, so adding
+    /// one would silently double the series returned by every existing query —
+    /// including the live `meeting-investigation` Grafana panel, which no workflow
+    /// redeploys automatically. This is additive and changes no existing query.
+    /// (The asymmetry with `ENCODER_{ACTIVE,EFFECTIVE}_LAYERS`, which DO carry
+    /// `media_kind`, is the accepted cost; see issue #2147 for both options.)
+    ///
+    /// **A 0 here is meaningful, not "no data."** Unlike the camera gauge — whose
+    /// source-side `> 0` gate (#2079) makes a genuine stall absent and therefore
+    /// indistinguishable from never-started — the client emits this field whenever a
+    /// screen encoder is BOUND, including an honest 0.
+    ///
+    /// **A 0 does NOT mean "not sharing."** The dioxus-ui client binds its screen
+    /// encoder eagerly at Host mount, so it reports 0 while merely idle; the field
+    /// is omitted only by a client that binds no screen encoder at all. Interpret
+    /// with `videocall_screen_sharing_active`:
+    ///   * 0 + active=0 → idle, nothing to see.
+    ///   * 0 + active=1 → sharing; static-and-fine OR stalled. Receiver-side
+    ///     `content_staleness_ms` also reads 0 once fps is 0, so use
+    ///     `videocall_screen_encoder_stall_episodes_total` to identify publisher
+    ///     tick starvation.
+    ///   * >0 + active=1 → sharing and producing.
+    pub static ref SCREEN_ENCODER_OUTPUT_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_encoder_output_fps",
+        "Actual frames per second produced by the SCREEN encoder's base layer; 0 is a real reading (an idle or legitimately-static share produces none) -- join with videocall_screen_sharing_active to interpret it, and with videocall_screen_encoder_stall_episodes_total to detect a freeze (fps alone cannot)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create screen_encoder_output_fps metric");
+
+    /// Screen encoder TICK-STARVATION stall episodes (issue #2147; discussion
+    /// #1960 issue 2). **This is the gauge that can actually see a screen freeze.**
+    ///
+    /// `SCREEN_ENCODER_OUTPUT_FPS` above counts encoded CHUNKS, and the static/PLI
+    /// synthetic retained-frame re-encodes share the base-layer output callback with
+    /// fresh captures — so during the #1899/#2143 freeze it reads a small NONZERO
+    /// while every receiver is stuck on minutes-stale content. Each episode counted
+    /// here is one encode-loop tick resume whose gap exceeded the client's
+    /// `SCREEN_ENCODER_STALL_GAP_MS`, i.e. a main-thread freeze during which the
+    /// encoder could not sample fresh capture — exactly that symptom.
+    ///
+    /// READ AS A PAIR with the fps gauge:
+    ///   * fps > 0, episodes FLAT   → genuinely healthy.
+    ///   * fps > 0, episodes RISING → THE FREEZE (stale re-encoded content).
+    ///   * fps == 0 + sharing       → idle/static share, honest.
+    ///
+    /// A GaugeVec carrying the client's CUMULATIVE page-session count (same pattern
+    /// as `ENCODER_RESTART_TOTAL`), so chart with `rate()`/`increase()`.
+    ///
+    /// # Counter-reset semantics — read this before trusting an `increase()`
+    ///
+    /// A page reload does NOT produce a within-series drop: it resets the client
+    /// statics AND mints a new `session_id`, so it is series CHURN (old series ends,
+    /// new one begins at a low value). The case that DOES bite, and is easy to miss:
+    /// a mid-call **reconnect / re-election** mints a new `session_id` while the
+    /// client statics keep counting. The new series is therefore born at the
+    /// already-accumulated value (say 11) and `increase()` over a window spanning the
+    /// reconnect silently loses the pre-reconnect episodes — i.e. it can UNDERCOUNT
+    /// during exactly the incidents this metric exists to measure. When investigating
+    /// a specific freeze, prefer `max_over_time(...)` per `session_id` and sum across
+    /// the peer's sessions rather than a single `increase()`.
+    /// NAMING: `_total` matches every sibling of this shape
+    /// (`videocall_encoder_restart_total`, `videocall_rtt_probe_dropped_total`, …) —
+    /// a cumulative count carried in a GaugeVec. The `..._max_stall_gap_ms` companion
+    /// below deliberately has NO suffix: it is a high-water MARK, not a count.
+    pub static ref SCREEN_ENCODER_STALL_EPISODES: GaugeVec = register_gauge_vec!(
+        "videocall_screen_encoder_stall_episodes_total",
+        "Cumulative screen-encoder tick-starvation stall episodes reported by the client (main-thread freezes where the encoder could not sample fresh capture, so receivers saw fps>0 on stale re-encoded content). Chart with rate()/increase(); pair with videocall_screen_encoder_output_fps (#2147)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create screen_encoder_stall_episodes metric");
+
+    /// Worst single screen-encoder tick-starvation gap since page load, in ms
+    /// (issue #2147). The SEVERITY companion to `SCREEN_ENCODER_STALL_EPISODES`:
+    /// 3 episodes at a 200 ms max is scheduling jitter, 3 episodes at a 23000 ms max
+    /// is the #2143 incident. A high-water mark, so it only ever rises within a page
+    /// session.
+    pub static ref SCREEN_ENCODER_MAX_STALL_GAP_MS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_encoder_max_stall_gap_ms",
+        "Largest single screen-encoder tick-starvation gap observed since page load (ms) -- the severity companion to videocall_screen_encoder_stall_episodes_total (#2147)",
+        &["meeting_id", "session_id", "peer_id"]
+    )
+    .expect("Failed to create screen_encoder_max_stall_gap_ms metric");
 
     /// Per-receiver outbound channel depth keyed by session.
     pub static ref RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION: GaugeVec = register_gauge_vec!(
@@ -1144,6 +1378,60 @@ lazy_static! {
     )
     .expect("Failed to create encoder_active_layers metric");
 
+    /// FITTED camera encode width per active ladder rung (#2170), not the rung's
+    /// bounding-box width. Dashboards must use [`ENCODER_LAYER_PIXELS`] for pixel
+    /// math rather than multiplying independently collected width and height.
+    pub static ref ENCODER_LAYER_WIDTH: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_layer_width",
+        "FITTED camera encode width in px for one active rung; use encoder_layer_pixels for pixel math because width and height gauges can be collected from different reports",
+        &["meeting_id", "session_id", "peer_id", "media_kind", "layer"]
+    )
+    .expect("Failed to create encoder_layer_width metric");
+
+    /// FITTED camera encode height companion to [`ENCODER_LAYER_WIDTH`].
+    pub static ref ENCODER_LAYER_HEIGHT: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_layer_height",
+        "FITTED camera encode height in px for one active rung; use encoder_layer_pixels for pixel math because width and height gauges can be collected from different reports",
+        &["meeting_id", "session_id", "peer_id", "media_kind", "layer"]
+    )
+    .expect("Failed to create encoder_layer_height metric");
+
+    /// FITTED pixels per frame, derived server-side from ONE geometry report.
+    ///
+    /// Separate from width/height because an ingest can land between two families'
+    /// collection (they are separate tasks), so a multiplied pair can straddle two
+    /// reports and yield a resolution that never existed.
+    pub static ref ENCODER_LAYER_PIXELS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_layer_pixels",
+        "FITTED pixels per frame for one active camera rung, coherently derived from one report; do not multiply encoder_layer_width by encoder_layer_height",
+        &["meeting_id", "session_id", "peer_id", "media_kind", "layer"]
+    )
+    .expect("Failed to create encoder_layer_pixels metric");
+
+    /// Measured output fps per active camera rung. Layer 0 tracks
+    /// [`ENCODER_OUTPUT_FPS`], which remains the AQ setpoint's observable twin.
+    ///
+    /// Normalized by the real window span, so it is a rate to within one inter-chunk
+    /// interval (~3% at 30 fps).
+    pub static ref ENCODER_LAYER_OUTPUT_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_layer_output_fps",
+        "Measured output fps over the last ~1s for one active camera rung; layer 0 should closely track videocall_encoder_output_fps",
+        &["meeting_id", "session_id", "peer_id", "media_kind", "layer"]
+    )
+    .expect("Failed to create encoder_layer_output_fps metric");
+
+    /// FITTED pixels per second for one rung, derived from ONE report. Use this for
+    /// throughput rather than multiplying the pixel and fps gauges.
+    ///
+    /// Approximate across a geometry change: current dims x fps measured over the
+    /// preceding window. Self-corrects within one window.
+    pub static ref ENCODER_LAYER_PIXEL_RATE: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_layer_pixel_rate",
+        "FITTED pixels per second for one active camera rung, coherently derived from one geometry/fps report; do not multiply encoder_layer_pixels by encoder_layer_output_fps",
+        &["meeting_id", "session_id", "peer_id", "media_kind", "layer"]
+    )
+    .expect("Failed to create encoder_layer_pixel_rate metric");
+
     /// Audio congestion ceiling: the congestion-driven dynamic layer cap (#1561).
     /// Distinct from active layers: this is only the runtime cap applied under
     /// congestion. In the uncapped state the exporter reports the effective
@@ -1217,10 +1505,16 @@ lazy_static! {
 
     // ===== SCREEN SHARE PER-PEER METRICS =====
 
-    /// Screen share FPS observed by receiver
+    /// Screen share FPS observed by receiver.
+    ///
+    /// Counts frames actually DECODED, not arrivals — the screen twin of
+    /// `videocall_video_fps`; see its doc for the #2190 rung-summing history (this is
+    /// the path that produced issue #2179's impossible "20 fps" reading on a 10fps
+    /// ladder). Series recorded before that fix are inflated by roughly the sharer's
+    /// active-rung count.
     pub static ref SCREEN_VIDEO_FPS: GaugeVec = register_gauge_vec!(
         "videocall_screen_video_fps",
-        "Screen share frames per second observed by the receiver",
+        "Screen share frames per second DECODED by the receiver (excludes wrong-rung simulcast packets the decode guard skipped; see #2190)",
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_fps metric");
@@ -1301,6 +1595,21 @@ lazy_static! {
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_skip_to_live_total metric");
+
+    /// Per-peer cumulative count of keyframe ARRIVALS for the SCREEN stream (#2201): screen
+    /// sibling of `videocall_video_keyframe_arrivals_total`. See that metric for the full
+    /// rationale and the label-set caveat when differencing against the request counter.
+    ///
+    /// Particularly load-bearing for screen share, whose freezes are the longest-lived in the
+    /// field (#1899 keyframe starvation: a STATIC share can freeze 13–88s for every receiver
+    /// while the camera-tuned PLI limiter starves its keyframes). This is the first metric that
+    /// can say whether those keyframes were arriving at all.
+    pub static ref SCREEN_VIDEO_KEYFRAME_ARRIVALS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_keyframe_arrivals_total",
+        "Cumulative keyframe ARRIVALS at the receiver's jitter buffer per receiver→source pair for the screen stream (#2201)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_keyframe_arrivals_total metric");
 
     // ===== TIER TRANSITION COUNTER =====
     //

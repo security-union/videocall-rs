@@ -1,0 +1,43 @@
+# scenario.example.yaml — sample conductor timeline (Increment 4, #2072).
+#
+# A ConfigMap holding ONE scenario file that the conductor Job mounts at
+# /scenario/scenario.yaml (conductor-job.yaml) and reads via
+#   bots-app conduct --scenario /scenario/scenario.yaml …
+#
+# SCHEMA (must match the frontend `conduct` implementation EXACTLY):
+#   room:            informational label for the run (not used to route).
+#   timeline: [ ]    list of timed actions, each:
+#     at:            offset from conductor start (e.g. 0s, 10s, 60s).
+#     bot:           the pod ordinal N → drives
+#                    videocall-bots-<N>.videocall-bots.bot-load.svc.cluster.local:8080
+#                    (the --service / --namespace / --dns-suffix flags on the Job
+#                    build this FQDN; `bot` supplies the ordinal <N>).
+#     action:        one of the control-server verbs, e.g.
+#                    unmute | mute | screenshare-on | screenshare-off |
+#                    talk (with durationMs) | netem (with profile) | netem-clear.
+#     profile:       (netem only) a named netem profile, e.g. lossy_mobile.
+#     durationMs:    (talk only) how long to talk, in milliseconds.
+#
+# EDIT + APPLY: copy this file, adjust the timeline, then
+#   kubectl -n bot-load apply -f scenario.example.yaml
+# Only `bot` ordinals that have a running pod (0..replicas-1 of the StatefulSet)
+# can be driven — an ordinal past the fleet size has no pod / no DNS record.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bot-scenario
+  namespace: bot-load
+  labels:
+    app.kubernetes.io/name: bot-conductor
+    app.kubernetes.io/component: conductor
+    app.kubernetes.io/part-of: videocall
+data:
+  scenario.yaml: |
+    room: bottest            # informational
+    timeline:
+      - { at: 0s,   bot: 0, action: unmute }
+      - { at: 10s,  bot: 1, action: screenshare-on }
+      - { at: 20s,  bot: 2, action: netem, profile: lossy_mobile }
+      - { at: 35s,  bot: 1, action: screenshare-off }
+      - { at: 40s,  bot: 0, action: talk, durationMs: 15000 }
+      - { at: 60s,  bot: 2, action: netem-clear }

@@ -527,6 +527,7 @@ impl Drop for ConnectionController {
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
+    use super::super::connection_manager::SessionIdHistory;
     use super::*;
     use std::sync::{Arc, Mutex};
     use videocall_types::Callback;
@@ -576,6 +577,7 @@ mod tests {
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
             allow_post_rebase_retry: true,
             refresh_room_token_callback: None,
+            own_session_ids: Rc::new(RefCell::new(SessionIdHistory::default())),
         }
     }
 

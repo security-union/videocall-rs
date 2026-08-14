@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "videocall-postgres",
+  "description": "Requires a cluster values file. Helm validates this on lint, template, install and upgrade, so omitting -f fails instead of silently deploying Bitnami defaults.",
+  "type": "object",
+  "required": ["postgresql"],
+  "properties": {
+    "postgresql": {
+      "type": "object",
+      "required": ["auth", "primary"],
+      "properties": {
+        "auth": {
+          "type": "object",
+          "required": ["database"],
+          "properties": {
+            "database": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Application database name. No safe default exists; Bitnami creates none."
+            }
+          }
+        },
+        "primary": {
+          "type": "object",
+          "required": ["persistence", "resources"],
+          "properties": {
+            "persistence": {
+              "type": "object",
+              "required": ["storageClass", "size"],
+              "properties": {
+                "storageClass": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Explicit storage class. Empty means the cluster default, which differs per cluster."
+                },
+                "size": { "type": "string", "minLength": 1 }
+              }
+            },
+            "resources": {
+              "type": "object",
+              "required": ["limits", "requests"]
+            }
+          }
+        }
+      }
+    }
+  }
+}

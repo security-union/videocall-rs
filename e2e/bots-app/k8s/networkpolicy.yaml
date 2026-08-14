@@ -1,0 +1,29 @@
+# networkpolicy.yaml — defense-in-depth for the bot control API (#2072).
+#
+# The per-pod control server binds 0.0.0.0:8080 (cross-pod reachable) and is
+# bearer-token gated — but absent a policy ANY pod in the cluster can reach it
+# and attempt auth / brute the token / exhaust connections. This restricts
+# ingress to the bots so only the `bot-load` namespace (where the conductor Job
+# runs) can reach them. The bots take no other inbound traffic (they are
+# outbound headless-Chrome clients), so all-other-ingress-denied is safe.
+#
+# Requires a NetworkPolicy-enforcing CNI (qsk8s runs Calico — enforced).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: videocall-bots-ctl
+  namespace: bot-load
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: videocall-bot
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: bot-load
+      ports:
+        - protocol: TCP
+          port: 8080

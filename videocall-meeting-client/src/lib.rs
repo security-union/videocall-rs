@@ -158,8 +158,50 @@ pub(crate) async fn parse_api_response<T: serde::de::DeserializeOwned + serde::S
                 Err(ApiError::JoiningNotAllowed)
             } else if text.contains("GUESTS_NOT_ALLOWED") {
                 Err(ApiError::GuestsNotAllowed)
+            } else if text.contains("MEETING_PASSWORD_REQUIRED") {
+                Err(ApiError::MeetingPasswordRequired)
+            } else if text.contains("INVALID_MEETING_PASSWORD") {
+                Err(ApiError::InvalidMeetingPassword)
             } else {
                 Err(ApiError::Forbidden(text))
+            }
+        }
+        // Issue #1613. Both of these reject BEFORE any Argon2 verification, so
+        // neither says anything about whether the supplied password was
+        // correct — see the variant docs. They are mapped rather than left to
+        // `ServerError` so a password-aware caller can keep the user in the
+        // prompt instead of ejecting them to a dead-end error card on a flow
+        // whose entire purpose is retrying a password.
+        //
+        // `RATE_LIMIT_EXCEEDED` is the generic rename limiter, not a password
+        // code — but `POST /join` runs it FIRST and only for requests carrying a
+        // `display_name`, so on the authenticated path it shadows
+        // `TOO_MANY_PASSWORD_ATTEMPTS` entirely. It is mapped here so callers
+        // can see it; deciding whether it means "password throttled" needs
+        // context this function does not have (whether the attempt carried a
+        // password), so that decision belongs to the caller.
+        429 => {
+            let text = response.text().await.unwrap_or_default();
+            if text.contains("TOO_MANY_PASSWORD_ATTEMPTS") {
+                Err(ApiError::TooManyPasswordAttempts)
+            } else if text.contains("RATE_LIMIT_EXCEEDED") {
+                Err(ApiError::RateLimitExceeded)
+            } else {
+                Err(ApiError::ServerError {
+                    status: 429,
+                    body: text,
+                })
+            }
+        }
+        503 => {
+            let text = response.text().await.unwrap_or_default();
+            if text.contains("VERIFIER_OVERLOADED") {
+                Err(ApiError::VerifierOverloaded)
+            } else {
+                Err(ApiError::ServerError {
+                    status: 503,
+                    body: text,
+                })
             }
         }
         404 => {

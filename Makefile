@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
+.PHONY: tests_up test test-scripts up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -11,6 +11,7 @@ tests_run:
 		cd /app && \
 		cargo clippy --all -- -D warnings && \
 		cargo fmt --all --check && \
+		cargo test -p videocall-meeting-types && \
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
 		cargo test -p meeting-api -- --nocapture --test-threads=1"
 
@@ -53,6 +54,11 @@ clippy-fix:
 # here. `scripts/check-clippy-ci-sync.sh` (run by the fmt job in
 # pr-check-rust-hcl.yaml) enforces this: editing one list without the other
 # turns CI red, so the byte-identical contract is self-enforcing (issue #1500).
+# Script test suites (bash/python tooling under scripts/). Not covered by cargo
+# test, and nothing else in CI runs them, so a regression here would rot silently.
+test-scripts:
+		python3 scripts/test_parse_meeting_console_logs_census.py
+
 clippy-ci:
 		cargo clippy --all -- -D warnings
 		cargo clippy --target wasm32-unknown-unknown -p videocall-client --tests -- -D warnings
@@ -60,6 +66,8 @@ clippy-ci:
 		cargo clippy -p videocall-codecs --tests -- -D warnings
 		cargo clippy -p videocall-ui --tests -- -D warnings
 		cargo clippy -p neteq --no-default-features --features web --tests -- -D warnings
+		cargo clippy -p videocall-diagnostics --tests -- -D warnings
+		cargo clippy -p bot --tests -- -D warnings
 
 fmt:
 		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo fmt --all"

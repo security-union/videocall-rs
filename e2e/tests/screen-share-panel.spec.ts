@@ -333,15 +333,35 @@ test.describe("Screen share right panel layout", () => {
       // Verify the screen share tile is visible on the left
       await expect(hostPage.locator(".split-screen-tile")).toBeVisible({ timeout: 10_000 });
 
-      // Verify the right panel uses the .ss-peer-panel CSS class with
-      // flexbox layout. The right panel is the 3rd child: left +
-      // resize-handle + right.
-      const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
+      // ---- ASSERT: #grid-container's LEADING children are the split panes ----
+      // A deliberate positional guard, not an incidental one. Three specs
+      // (this one, screen-share-layout, wt-screen-share-split-layout) address
+      // these panes by index — `> div:nth-child(1)`, `:nth-child(3)`,
+      // `> div` .nth(2) — so ANY permanently-present element inserted at the
+      // FRONT of #grid-container silently re-points all of them at the wrong
+      // element, and the resulting failure names a class nobody was looking for.
+      //
+      // Issue 2135 did exactly that: the raised-hands screen-reader live region
+      // was an unconditional second root of the banner component and therefore
+      // always child #1, which turned `:nth-child(3)` from the peer panel into
+      // the resize handle. Asserting the leading order explicitly makes that
+      // class of regression report itself.
+      const leadingChildren = await hostPage.evaluate(() =>
+        Array.from(document.querySelectorAll("#grid-container > *"))
+          .slice(0, 3)
+          .map((el) => el.className),
+      );
+      expect(leadingChildren.length).toBe(3);
+      expect(leadingChildren[0]).toContain("ss-left-pane");
+      expect(leadingChildren[1]).toContain("screen-share-resize-handle");
+      expect(leadingChildren[2]).toContain("ss-peer-panel");
+
+      // Substantive assertions address the panel by its CLASS — the actual
+      // contract — so they fail about the panel rather than about an index.
+      const rightPanel = hostPage.locator("#grid-container > .ss-peer-panel");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
       // Layout is CSS-class-driven (.ss-peer-panel) using CSS grid.
-      // Verify the panel has the expected class and computed layout.
-      await expect(rightPanel).toHaveClass(/ss-peer-panel/);
       expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("grid");
 
       // Verify peer tiles (.split-peer-tile) are rendered in the right panel
@@ -671,12 +691,13 @@ test.describe("Screen share right panel layout", () => {
       // Let the split layout settle.
       await hostPage.waitForTimeout(2000);
 
-      const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
+      // Addressed by CLASS, not by index — see the leading-children guard in
+      // "right panel renders 2-column grid during screen share", which is where
+      // #grid-container's child ORDER is deliberately pinned.
+      const rightPanel = hostPage.locator("#grid-container > .ss-peer-panel");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
       // ── Layout is CSS-class-driven (.ss-peer-panel) using CSS grid.
-      // Verify the panel has the right class and computed grid layout.
-      await expect(rightPanel).toHaveClass(/ss-peer-panel/);
       expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("grid");
 
       // ── Bug #3 GEOMETRIC: the first tile's LEFT edge must sit at the
@@ -684,7 +705,7 @@ test.describe("Screen share right panel layout", () => {
       const firstTile = hostPage.locator(".split-peer-tile").first();
       await expect(firstTile).toBeVisible({ timeout: 10_000 });
       const offsets = await firstTile.evaluate((tile) => {
-        const panel = tile.closest("#grid-container > div:nth-child(3)") as HTMLElement;
+        const panel = tile.closest(".ss-peer-panel") as HTMLElement;
         const tr = tile.getBoundingClientRect();
         const pr = panel.getBoundingClientRect();
         return { tileLeft: tr.left, panelLeft: pr.left, panelWidth: pr.width };

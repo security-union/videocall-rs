@@ -86,11 +86,27 @@ pub struct VideoStatsMessage {
     /// depth: this surfaces the "video lagged by minutes while paint-lag/playout-latency read ~0"
     /// case (#1631 M2). Unlike `playout_latency_ms` (capped at 1800ms) this can exceed 1800ms.
     pub content_staleness_ms: Option<f64>,
+    /// Lifetime count of keyframe ARRIVALS on this stream (issue #2201). Counts rejected
+    /// old/duplicate keyframes too — the question is whether the publisher's keyframe REACHED
+    /// us, for which a retransmit counts (the same reasoning the #1479 arrival gate-clear is
+    /// built on). NOT differenceable against `keyframe_requests_sent_total` (different grain,
+    /// population, and reset boundary — see the `videocall_video_keyframe_arrivals_total`
+    /// metric doc); read it as "is it rising at all" plus a rate-vs-periodic-cadence check.
+    ///
+    /// A COUNTER with the same reset semantics as `playout_skip_to_live_total`: preserved
+    /// across `flush()`, reset to 0 when the decode pipeline is rebuilt. Consume via
+    /// `increase()`/`rate()`.
+    ///
+    /// `Option` + `#[serde(default)]` so an older worker build that omits it still
+    /// deserializes (reads `None`).
+    #[serde(default)]
+    pub keyframe_arrivals_total: Option<u64>,
 }
 
 impl VideoStatsMessage {
-    // 8 worker→main video-diagnostic fields (issue #1641 added content_staleness_ms as the 8th);
-    // bundling them into a struct just to dodge the lint would not improve this thin DTO ctor.
+    // 9 worker→main video-diagnostic fields (#1641 added content_staleness_ms as the 8th;
+    // #2201 added keyframe_arrivals_total as the 9th); bundling them into a struct just to
+    // dodge the lint would not improve this thin DTO ctor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         from_peer: String,
@@ -101,6 +117,7 @@ impl VideoStatsMessage {
         playout_paint_lag_ms: f64,
         playout_skip_to_live_total: u64,
         content_staleness_ms: f64,
+        keyframe_arrivals_total: u64,
     ) -> Self {
         Self {
             kind: "video_stats".to_string(),
@@ -112,6 +129,7 @@ impl VideoStatsMessage {
             playout_paint_lag_ms: Some(playout_paint_lag_ms),
             playout_skip_to_live_total: Some(playout_skip_to_live_total),
             content_staleness_ms: Some(content_staleness_ms),
+            keyframe_arrivals_total: Some(keyframe_arrivals_total),
         }
     }
 }
@@ -270,10 +288,152 @@ impl FreshnessSkipMessage {
     }
 }
 
+/// Discriminator carried in [`KeyframeArrivalMessage::kind`] (issue #2201).
+pub const KEYFRAME_ARRIVAL_KIND: &str = "keyframe_arrival";
+
+/// Worker->main keyframe-ARRIVAL diagnostic (issue #2201).
+///
+/// The receiver recorded no log line, counter, or metric when a keyframe ARRIVED, so a
+/// frozen tile's artifacts could not distinguish "the publisher's keyframe never reached
+/// us" (a delivery problem — e.g. #1699 WS head-of-line) from "it arrived and failed to
+/// recover the picture" (a decode/guard/buffer problem). Those need opposite fixes. The
+/// request side was already observable end-to-end — the receiver's
+/// `Sending KEYFRAME_REQUEST`, the publisher's `Received KEYFRAME_REQUEST`, and its
+/// `forcing keyframe at frame N (PLI)` — so arrival was the one missing link in an
+/// otherwise complete chain.
+///
+/// Mirrors [`FreshnessSkipMessage`]: the jitter buffer runs INSIDE the decoder worker,
+/// whose console output the main-thread capture+upload pipeline never sees, so the
+/// load-bearing delivery is the main thread's re-emitted `console` line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyframeArrivalMessage {
+    pub kind: String,
+    pub from_peer: Option<String>,
+    pub to_peer: Option<String>,
+    /// Sequence number of the arriving keyframe.
+    pub seq: u64,
+    /// Head-of-line backlog age (ms) at arrival — the same measure the freshness
+    /// deadline trips on, so this is directly comparable with a `freshness_skip`'s
+    /// `head_age_ms`.
+    pub head_age_ms: f64,
+    /// `true` when the buffer was in a keyframe-less hold at arrival: this keyframe
+    /// landed DURING a freeze. The field that makes the line a recovery datapoint.
+    pub was_in_keyframe_less_hold: bool,
+    /// Milliseconds since this receiver last sent a keyframe request (PLI) for this
+    /// stream — the PLI→keyframe round-trip. `None` if it never has.
+    pub ms_since_keyframe_request: Option<f64>,
+    /// `true` when this arrival answers an outstanding proactive request (#1479).
+    pub was_awaiting_proactive_keyframe: bool,
+    /// `true` when the buffer REJECTED this keyframe as old/duplicate, so it never
+    /// entered the buffer and cannot recover the picture.
+    pub rejected_as_old: bool,
+    /// `true` when this was the STREAM-RESTART keyframe (flush-and-return, so it did not
+    /// enter the buffer either — but it is not a duplicate rejection). Disambiguates
+    /// `rejected_as_old: false` on that path. `#[serde(default)]` so an older worker build
+    /// that omits it still deserializes.
+    #[serde(default)]
+    pub stream_restart: bool,
+}
+
+impl KeyframeArrivalMessage {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        from_peer: Option<String>,
+        to_peer: Option<String>,
+        seq: u64,
+        head_age_ms: f64,
+        was_in_keyframe_less_hold: bool,
+        ms_since_keyframe_request: Option<f64>,
+        was_awaiting_proactive_keyframe: bool,
+        rejected_as_old: bool,
+        stream_restart: bool,
+    ) -> Self {
+        Self {
+            kind: KEYFRAME_ARRIVAL_KIND.to_string(),
+            from_peer,
+            to_peer,
+            seq,
+            head_age_ms,
+            was_in_keyframe_less_hold,
+            ms_since_keyframe_request,
+            was_awaiting_proactive_keyframe,
+            rejected_as_old,
+            stream_restart,
+        }
+    }
+
+    /// Render the field-log console line for this arrival (issue #2201).
+    ///
+    /// The `[JITTER_BUFFER] keyframe_arrival` prefix and the field tokens are a **grep
+    /// contract** for the freeze investigation, so — exactly like
+    /// [`FreshnessSkipMessage::console_line`] — the formatting lives here in a pure,
+    /// host-tested fn rather than only in the wasm-gated emit arm no host test can reach.
+    ///
+    /// `head_age` rounds to whole ms to match the `freshness_skip` line it is diffed
+    /// against. `pli_age` renders as `never` when this receiver has not ATTEMPTED a keyframe
+    /// request on this stream, so an absence is unambiguous rather than a misleading `0ms`.
+    /// It is an UPPER BOUND on the round-trip — the request may have been shed by the #1479
+    /// budget with no ACK to the worker (see `KeyframeArrival::ms_since_keyframe_request`),
+    /// which is why the token names the AGE of the attempt, not a confirmed round-trip.
+    pub fn console_line(&self) -> String {
+        let from = self.from_peer.as_deref().unwrap_or_default();
+        let to = self.to_peer.as_deref().unwrap_or_default();
+        let pli_age = self
+            .ms_since_keyframe_request
+            .map(|ms| format!("{ms:.0}ms"))
+            .unwrap_or_else(|| "never".to_string());
+        format!(
+            "[JITTER_BUFFER] keyframe_arrival {from}->{to}: seq={} head_age={:.0}ms in_keyframe_less_hold={} pli_age={pli_age} awaiting_proactive={} rejected_as_old={} stream_restart={}",
+            self.seq,
+            self.head_age_ms,
+            self.was_in_keyframe_less_hold,
+            self.was_awaiting_proactive_keyframe,
+            self.rejected_as_old,
+            self.stream_restart
+        )
+    }
+}
+
 /// Discriminator carried in [`WorkerLogMessage::kind`] (issue #1356), to tell it
-/// apart from `"video_stats"` / `"request_keyframe"` / `"freshness_skip"` on the
-/// shared serde worker->main channel.
+/// apart from `"video_stats"` / `"request_keyframe"` / `"freshness_skip"` /
+/// `"keyframe_arrival"` on the shared serde worker->main channel.
 pub const WORKER_LOG_KIND: &str = "worker_log";
+
+/// Which worker->main payload a `kind` string selects (issue #2201).
+///
+/// All worker->main messages ride ONE JS-object channel and are told apart by `kind`,
+/// because several are structurally interchangeable (every `VideoStatsMessage` field is
+/// `Option`, so a `freshness_skip` deserializes into it cleanly). The dispatcher in
+/// `decoder/wasm.rs::handle_worker_diag_message` is therefore deserialize-then-check-kind,
+/// and the CHECK is the whole correctness argument.
+///
+/// That check lives here, in a pure function the dispatcher calls, for one reason: the
+/// dispatcher takes a `JsValue` and cannot be invoked from a host test, so a host test that
+/// only round-trips DTOs would stay GREEN if a dispatch branch or its kind guard were
+/// deleted. Routing through this enum makes the branch SELECTION host-testable against the
+/// real constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerMessageKind {
+    VideoStats,
+    RequestKeyframe,
+    FreshnessSkip,
+    KeyframeArrival,
+    WorkerLog,
+    /// A `kind` none of the branches claim — the dispatcher logs it as unexpected.
+    Unknown,
+}
+
+/// Classify a worker->main payload's `kind` string. See [`WorkerMessageKind`].
+pub fn classify_worker_message_kind(kind: &str) -> WorkerMessageKind {
+    match kind {
+        "video_stats" => WorkerMessageKind::VideoStats,
+        REQUEST_KEYFRAME_KIND => WorkerMessageKind::RequestKeyframe,
+        FRESHNESS_SKIP_KIND => WorkerMessageKind::FreshnessSkip,
+        KEYFRAME_ARRIVAL_KIND => WorkerMessageKind::KeyframeArrival,
+        WORKER_LOG_KIND => WorkerMessageKind::WorkerLog,
+        _ => WorkerMessageKind::Unknown,
+    }
+}
 
 /// Worker->main `log::` facade forwarding message (issue #1356, follow-up to #1045).
 ///
@@ -390,7 +550,7 @@ mod worker_log_disambiguation_tests {
         // fields (level/target/message) are absent from every other message, so none of them can
         // deserialize into WorkerLogMessage at all -> the branch is structurally unable to swallow
         // them, independent of the kind guard.
-        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0);
+        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0, 6);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
         );
@@ -403,6 +563,253 @@ mod worker_log_disambiguation_tests {
         let rk = RequestKeyframeMessage::new(None, None, 0.0);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&rk).unwrap()).is_err()
+        );
+    }
+
+    fn keyframe_arrival_wire() -> String {
+        let m = KeyframeArrivalMessage::new(
+            Some("alice".into()),
+            Some("bob".into()),
+            42,
+            1800.0,
+            true,
+            Some(120.0),
+            true,
+            false,
+            false,
+        );
+        serde_json::to_string(&m).unwrap()
+    }
+
+    /// Issue #2201: the keyframe-arrival message must REACH its own dispatch branch.
+    ///
+    /// The dispatcher deserializes-then-checks-`kind`, and this payload structurally
+    /// satisfies the optional-field shapes, so only the kind guards keep it from being
+    /// consumed by an earlier branch. If a future edit drops a kind guard, this fails.
+    #[test]
+    fn keyframe_arrival_falls_through_overlapping_kinds() {
+        let wire = keyframe_arrival_wire();
+
+        let as_vs: VideoStatsMessage = serde_json::from_str(&wire).unwrap();
+        assert_ne!(as_vs.kind, "video_stats");
+        let as_rk: RequestKeyframeMessage = serde_json::from_str(&wire).unwrap();
+        assert_ne!(as_rk.kind, REQUEST_KEYFRAME_KIND);
+        // NOTE: this payload DOES satisfy FreshnessSkipMessage's required fields
+        // (head_age_ms is shared; `dropped` is absent so it must NOT deserialize). Assert
+        // the actual behaviour rather than assuming it.
+        match serde_json::from_str::<FreshnessSkipMessage>(&wire) {
+            Ok(as_fs) => assert_ne!(
+                as_fs.kind, FRESHNESS_SKIP_KIND,
+                "structurally deserializes into the skip shape, so ONLY the kind guard \
+                 prevents the freshness_skip branch from swallowing an arrival"
+            ),
+            Err(_) => { /* even better: structurally impossible */ }
+        }
+        assert!(serde_json::from_str::<WorkerLogMessage>(&wire).is_err());
+
+        let back: KeyframeArrivalMessage = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.kind, KEYFRAME_ARRIVAL_KIND);
+        assert_eq!(back.seq, 42);
+        assert!(back.was_in_keyframe_less_hold);
+        assert_eq!(back.ms_since_keyframe_request, Some(120.0));
+        assert!(back.was_awaiting_proactive_keyframe);
+        assert!(!back.rejected_as_old);
+    }
+
+    /// Issue #2201: the arrival branch must not SWALLOW another message type. Its required
+    /// `seq` + bool fields are absent from every other payload.
+    #[test]
+    fn keyframe_arrival_branch_cannot_swallow_other_messages() {
+        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0, 6);
+        assert!(serde_json::from_str::<KeyframeArrivalMessage>(
+            &serde_json::to_string(&vs).unwrap()
+        )
+        .is_err());
+
+        let fs = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7, false, 0.0);
+        assert!(serde_json::from_str::<KeyframeArrivalMessage>(
+            &serde_json::to_string(&fs).unwrap()
+        )
+        .is_err());
+
+        let rk = RequestKeyframeMessage::new(None, None, 0.0);
+        assert!(serde_json::from_str::<KeyframeArrivalMessage>(
+            &serde_json::to_string(&rk).unwrap()
+        )
+        .is_err());
+
+        let wl = WorkerLogMessage::new("WARN".into(), "t".into(), "m".into(), None, None, 0);
+        assert!(serde_json::from_str::<KeyframeArrivalMessage>(
+            &serde_json::to_string(&wl).unwrap()
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod worker_message_kind_dispatch_tests {
+    //! Dispatch-routing contract for the shared worker->main channel (issue #2201).
+    //!
+    //! `decoder/wasm.rs::handle_worker_diag_message` takes a `JsValue`, so no host test can
+    //! invoke it. That is why the kind CHECK was extracted into
+    //! [`classify_worker_message_kind`], which the dispatcher genuinely calls for every
+    //! branch — so these tests pin the real branch selection rather than a copy of it.
+    //!
+    //! Without this, the DTO round-trip tests below would stay GREEN if a dispatch branch or
+    //! its kind guard were deleted, which is exactly the "extracted helper != guarded call
+    //! site" failure this repo keeps hitting.
+    use super::*;
+
+    /// Every message type's OWN `kind` must route to its OWN branch. A wrong mapping here is
+    /// a message silently handled by the wrong arm (or logged as unexpected and dropped).
+    #[test]
+    fn each_message_kind_routes_to_its_own_branch() {
+        let cases = [
+            (
+                VideoStatsMessage::new("a".into(), "b".into(), 0, 0.0, 0.0, 0.0, 0, 0.0, 0).kind,
+                WorkerMessageKind::VideoStats,
+            ),
+            (
+                RequestKeyframeMessage::new(None, None, 0.0).kind,
+                WorkerMessageKind::RequestKeyframe,
+            ),
+            (
+                FreshnessSkipMessage::new(None, None, 0.0, None, 0, false, 0.0).kind,
+                WorkerMessageKind::FreshnessSkip,
+            ),
+            (
+                KeyframeArrivalMessage::new(None, None, 0, 0.0, false, None, false, false, false)
+                    .kind,
+                WorkerMessageKind::KeyframeArrival,
+            ),
+            (
+                WorkerLogMessage::new("WARN".into(), "t".into(), "m".into(), None, None, 0).kind,
+                WorkerMessageKind::WorkerLog,
+            ),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(
+                classify_worker_message_kind(&kind),
+                expected,
+                "kind {kind:?} must route to {expected:?} — the constructors are the source \
+                 of truth for the wire string, so this cannot drift from production"
+            );
+        }
+    }
+
+    /// The keyframe-arrival kind must NOT be claimed by any other branch.
+    ///
+    /// This is the load-bearing one: a `KeyframeArrivalMessage` structurally satisfies the
+    /// all-`Option` `VideoStatsMessage` shape, so if the arrival branch or its guard were
+    /// deleted the payload would fall into a neighbouring arm and be silently mishandled.
+    ///
+    /// MUTATION: removing the `KEYFRAME_ARRIVAL_KIND` arm from
+    /// `classify_worker_message_kind` makes this read `Unknown` and fails.
+    #[test]
+    fn keyframe_arrival_is_not_claimed_by_another_branch() {
+        let kind =
+            KeyframeArrivalMessage::new(None, None, 1, 0.0, false, None, false, false, false).kind;
+        let routed = classify_worker_message_kind(&kind);
+        assert_eq!(routed, WorkerMessageKind::KeyframeArrival);
+        for other in [
+            WorkerMessageKind::VideoStats,
+            WorkerMessageKind::RequestKeyframe,
+            WorkerMessageKind::FreshnessSkip,
+            WorkerMessageKind::WorkerLog,
+            WorkerMessageKind::Unknown,
+        ] {
+            assert_ne!(
+                routed, other,
+                "a keyframe_arrival must never route to {other:?}"
+            );
+        }
+    }
+
+    /// An unrecognized kind must be `Unknown`, not silently absorbed by a branch. Guards
+    /// against a catch-all creeping into the classifier.
+    #[test]
+    fn unknown_kind_is_not_absorbed() {
+        assert_eq!(
+            classify_worker_message_kind("some_future_message"),
+            WorkerMessageKind::Unknown
+        );
+        assert_eq!(classify_worker_message_kind(""), WorkerMessageKind::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod keyframe_arrival_console_line_tests {
+    //! Grep-contract for the keyframe-arrival field-log line (issue #2201).
+    //!
+    //! This line is the load-bearing delivery of the arrival signal to uploaded field logs —
+    //! the fact that distinguishes "keyframe never delivered" from "delivered but did not
+    //! recover" during a freeze. The emit lives in the wasm-gated `decoder/wasm.rs` arm no
+    //! host test can reach, so the formatting is pinned here, exactly as #1384 did for
+    //! `freshness_skip`.
+    use super::*;
+
+    #[test]
+    fn pins_prefix_and_field_tokens() {
+        let line = KeyframeArrivalMessage::new(
+            Some("alice".into()),
+            Some("bob".into()),
+            42,
+            1234.0,
+            true,
+            Some(120.0),
+            true,
+            false,
+            false,
+        )
+        .console_line();
+
+        assert!(
+            line.starts_with("[JITTER_BUFFER] keyframe_arrival"),
+            "prefix grep contract broken: {line}"
+        );
+        assert!(line.contains("alice->bob"), "missing peer pair: {line}");
+        assert!(line.contains("seq=42"), "missing seq= token: {line}");
+        // Whole ms, matching the freshness_skip line this is diffed against.
+        assert!(
+            line.contains("head_age=1234ms"),
+            "missing/unrounded head_age= token: {line}"
+        );
+        assert!(
+            line.contains("in_keyframe_less_hold=true"),
+            "missing in_keyframe_less_hold= token — the recovery datapoint: {line}"
+        );
+        assert!(
+            line.contains("pli_age=120ms"),
+            "missing pli_age= token — the #1699 round-trip bound: {line}"
+        );
+        assert!(
+            line.contains("awaiting_proactive=true"),
+            "missing awaiting_proactive= token: {line}"
+        );
+        assert!(
+            line.contains("rejected_as_old=false"),
+            "missing rejected_as_old= token: {line}"
+        );
+        assert!(
+            line.contains("stream_restart=false"),
+            "missing stream_restart= token — without it `rejected_as_old=false` is ambiguous \
+             on the restart path, where the keyframe also never entered the buffer: {line}"
+        );
+    }
+
+    /// A receiver that never requested a keyframe must render `never`, not a misleading
+    /// `0ms` that would read as an instant round-trip.
+    #[test]
+    fn renders_never_when_no_keyframe_was_requested() {
+        let line = KeyframeArrivalMessage::new(None, None, 7, 0.0, false, None, false, true, false)
+            .console_line();
+        assert!(
+            line.contains("pli_age=never"),
+            "an absent PLI must render `never`, never 0ms: {line}"
+        );
+        assert!(
+            line.contains("rejected_as_old=true"),
+            "missing rejected_as_old= token: {line}"
         );
     }
 }

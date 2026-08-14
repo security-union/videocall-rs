@@ -42,6 +42,14 @@ interface CreateMeetingOpts {
   allowGuests?: boolean;
   /** Defaults to `true`. */
   endOnHostLeave?: boolean;
+  /**
+   * Meeting password (issue 1613). `meeting-api` argon2-hashes it at create
+   * time and verifies it on every non-owner join, answering 403
+   * MEETING_PASSWORD_REQUIRED / INVALID_MEETING_PASSWORD. Omitted (the default)
+   * => the meeting has no password and no join is ever gated, which is what
+   * every existing caller of this helper relies on.
+   */
+  password?: string;
 }
 
 /**
@@ -63,6 +71,7 @@ export async function createMeeting(
   };
   if (opts.meetingId !== undefined) body.meeting_id = opts.meetingId;
   if (opts.endOnHostLeave !== undefined) body.end_on_host_leave = opts.endOnHostLeave;
+  if (opts.password !== undefined) body.password = opts.password;
 
   const res = await fetch(`${API_URL}/api/v1/meetings`, {
     method: "POST",

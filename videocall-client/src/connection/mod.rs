@@ -58,7 +58,7 @@ pub use connection_manager::ReconnectionPhase;
 pub use connection_manager::{
     connection_handshake_failures, connection_session_drops, reelection_aborted_total,
     reelection_failed_total, reelection_preserved_total, reelection_proceeded_total,
-    ConnectionManagerOptions, ConnectionState,
+    ConnectionManagerOptions, ConnectionState, SessionIdHistory,
 };
 #[allow(unused_imports)]
 pub use connection_manager::{

@@ -5,11 +5,13 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  CTL_STATE_DIR_ENV,
   defaultTokenFilePath,
   extractBearerToken,
   findLatestTokenFile,
   generateToken,
   readTokenFile,
+  resolveCtlStateDir,
   tokensMatch,
   writeTokenFile,
 } from "./auth";
@@ -130,6 +132,74 @@ describe("tokensMatch", () => {
   });
   it("returns false for different lengths", () => {
     expect(tokensMatch("abc", "abcd")).toBe(false);
+  });
+});
+
+describe("resolveCtlStateDir + defaultTokenFilePath (#2157)", () => {
+  // The fix: the ctl token file must be relocatable OFF --assets-dir/BOT_RUN_DIR,
+  // because in the K8s fleet that dir is a RETAINED PVC (kept on purpose so the
+  // #2032 resource CSVs survive `scale --replicas=0`) — so a token written there
+  // outlives the workload and survives a rotation of the bot-ctl-token Secret.
+  //
+  // Mutation sensitivity: reverting resolveCtlStateDir to `return runDir` fails
+  // the two override cases; dropping the `.length > 0` guard fails the
+  // empty-string case; changing the env-var NAME fails via CTL_STATE_DIR_ENV.
+  // These two are ARBITRARY sample paths for exercising the resolver's logic —
+  // they are NOT a drift check against the manifest, and must not be read as
+  // one. Comparing a literal here to the same literal in the YAML would be the
+  // `X == X` shape: it passes no matter what the manifest says. The real
+  // manifest↔env drift assertions live in `statefulset-dir-drift.test.ts`,
+  // which PARSES `k8s/statefulset.yaml` and compares the env var to the
+  // volumeMount path it must equal.
+  const RUN_DIR = "/var/lib/bots-run";
+  const STATE_DIR = "/var/lib/bots-ctl";
+
+  it("falls back to runDir when the override is unset (docker run / local dev)", () => {
+    expect(resolveCtlStateDir(RUN_DIR, {})).toBe(RUN_DIR);
+    expect(defaultTokenFilePath(RUN_DIR, 42)).toBe(join(RUN_DIR, "ctl-42.token"));
+  });
+
+  it("uses the override dir when set, keeping the token off runDir", () => {
+    expect(resolveCtlStateDir(RUN_DIR, { [CTL_STATE_DIR_ENV]: STATE_DIR })).toBe(STATE_DIR);
+  });
+
+  it("treats an EMPTY override as unset (an empty env var must not yield a bare-root path)", () => {
+    expect(resolveCtlStateDir(RUN_DIR, { [CTL_STATE_DIR_ENV]: "" })).toBe(RUN_DIR);
+  });
+
+  it("defaultTokenFilePath honors the override via process.env", () => {
+    const prev = process.env[CTL_STATE_DIR_ENV];
+    process.env[CTL_STATE_DIR_ENV] = STATE_DIR;
+    try {
+      // The path the orchestrator actually writes (cli.ts calls this with
+      // --assets-dir). It must land in the emptyDir, NOT the PVC.
+      expect(defaultTokenFilePath(RUN_DIR, 42)).toBe(join(STATE_DIR, "ctl-42.token"));
+      expect(defaultTokenFilePath(RUN_DIR, 42)).not.toContain(RUN_DIR);
+    } finally {
+      if (prev === undefined) delete process.env[CTL_STATE_DIR_ENV];
+      else process.env[CTL_STATE_DIR_ENV] = prev;
+    }
+  });
+
+  it("findLatestTokenFile is NOT env-overridden — it scans exactly the dir it is given", async () => {
+    // Deliberate asymmetry (documented on resolveCtlStateDir): an explicit
+    // `ctl --run-dir <dir>` must never be silently redirected by an env var.
+    const dir = await mkdtemp(join(tmpdir(), "bots-ctl-scan-"));
+    const prev = process.env[CTL_STATE_DIR_ENV];
+    process.env[CTL_STATE_DIR_ENV] = "/var/lib/bots-ctl-does-not-exist";
+    try {
+      const p = join(dir, "ctl-7.token");
+      await writeTokenFile(p, {
+        port: 1,
+        token: "t".repeat(64),
+        startedAt: new Date().toISOString(),
+        pid: 7,
+      });
+      expect(await findLatestTokenFile(dir)).toBe(p);
+    } finally {
+      if (prev === undefined) delete process.env[CTL_STATE_DIR_ENV];
+      else process.env[CTL_STATE_DIR_ENV] = prev;
+    }
   });
 });
 

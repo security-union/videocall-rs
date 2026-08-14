@@ -17,6 +17,8 @@
  */
 
 mod layer_preference_sender;
+pub mod meeting_timer;
+pub mod raise_hand;
 pub mod reactions;
 mod video_call_client;
 mod viewport_sender;

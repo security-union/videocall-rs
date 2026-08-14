@@ -50,6 +50,8 @@ With architectural understanding established, examine each changed file checking
 - **Missing state updates**: A function changes state in one place but callers expect state to be updated in another place too.
 
 **Standard Critical Issues:**
+- **Comment volume**: judge the whole PR, not one commit — over ~10% of added lines is a blocker; report it for **deletion, not rewording**. Comments the author cannot delete do not count — licence headers, generated output, public-API doc comments.
+- **Comment content**: report for deletion at any volume — fix rationale, review history, issue narratives.
 - **Commented-out code**: Dead code must be removed, not commented.
 - **Debug/temporary code**: Console.logs, print statements, TODO/FIXME/HACK comments not meant for production.
 - **Credentials or secrets**: API keys, passwords, tokens, or sensitive data.
@@ -143,6 +145,8 @@ Those belong in your private reasoning. The posted review contains conclusions o
 | Architectural Conformity | **Critical Issues** (if Confirmed + breaks a contract) or **Code Quality Suggestions** |
 
 Only Confirmed findings may appear in Critical Issues regardless of which Step 3 category they originated from.
+
+A comment asserting *runtime* behaviour with no test, cited run, or reproducible command goes under Code Quality Suggestions on accuracy grounds as `(Likely)`; it is never a Critical Issue on those grounds.
 
 #### Output template
 

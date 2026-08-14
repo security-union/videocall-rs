@@ -13,14 +13,35 @@
 
 //! Reusable video control button components with SVG icons.
 
+use crate::components::icons::meeting_timer::MeetingTimerIcon;
+use crate::components::icons::raised_hand::RaisedHandIcon;
 use dioxus::prelude::*;
 
 // =============================================================================
 // Microphone Button
 // =============================================================================
 
+// ─── `describedby`: shared opt-in prop on every action-bar slot button ──────
+//
+// Action-bar customize mode (issue 1765) passes the id of a visually-hidden
+// element describing the arrow-key reorder affordance, so a user who Tabs to a
+// slot mid-session still learns that arrows move it — the entry instructions
+// are announced only once, on entry. Every other call site (the normal in-call
+// bar, the overflow popover, the drag preview) leaves it `None`, and Dioxus
+// omits the attribute for `None`, so no other surface is touched.
+//
+// It is a prop rather than a post-render DOM poke because `aria-describedby`
+// belongs on the focusable element, and only Dioxus owns these buttons'
+// attributes; setting it imperatively would be silently undone by any diff
+// that recreates the node.
+
 #[component]
-pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEvent>) -> Element {
+pub fn MicButton(
+    enabled: bool,
+    available: bool,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
     let class = match (enabled, available) {
         (true, false) => "video-control-button active error",
         (true, true) => "video-control-button active",
@@ -39,6 +60,7 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
         button {
             class,
             "aria-label": tooltip_title,
+            "aria-describedby": describedby,
             // Stable hook for E2E (the in-meeting mic toggle). Mirrors the
             // camera button's `camera-toggle-button` testid so the
             // device-permission specs (media-device-permission.spec.ts) can drive
@@ -117,7 +139,12 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
 // =============================================================================
 
 #[component]
-pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseEvent>) -> Element {
+pub fn CameraButton(
+    enabled: bool,
+    available: bool,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
     let class = match (enabled, available) {
         (true, false) => "video-control-button active error",
         (true, true) => "video-control-button active",
@@ -136,6 +163,7 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
         button {
             class,
             "aria-label": tooltip_title,
+            "aria-describedby": describedby,
             // Stable hook for E2E (the in-meeting camera toggle). Used by
             // performance-settings.spec.ts to drive the camera ON/OFF for the
             // send-diagnostics "Camera — off" regression guard (#1101) instead of
@@ -208,6 +236,7 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
 pub fn ScreenShareButton(
     active: bool,
     disabled: bool,
+    #[props(default)] describedby: Option<&'static str>,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
     let class = match (active, disabled) {
@@ -226,6 +255,7 @@ pub fn ScreenShareButton(
         button {
             class,
             "aria-label": tooltip_title,
+            "aria-describedby": describedby,
             disabled,
             onclick: move |evt| {
                 if !disabled {
@@ -271,6 +301,7 @@ pub fn PeerListButton(
     // here; the customize-mode drag-preview call site passes nothing (empty),
     // which omits the attribute so the id is never duplicated in the DOM.
     #[props(default)] id: String,
+    #[props(default)] describedby: Option<&'static str>,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
     let class = if open {
@@ -289,6 +320,7 @@ pub fn PeerListButton(
             id: if id.is_empty() { None } else { Some(id.clone()) },
             class,
             "aria-label": tooltip_title,
+            "aria-describedby": describedby,
             onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
@@ -342,6 +374,7 @@ pub fn DiagnosticsButton(
     // action-bar call site passes "diagnostics-trigger" for #1790 focus restore;
     // the drag-preview call site passes nothing so the id is never duplicated.
     #[props(default)] id: String,
+    #[props(default)] describedby: Option<&'static str>,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
     let class = if open {
@@ -360,6 +393,7 @@ pub fn DiagnosticsButton(
             id: if id.is_empty() { None } else { Some(id.clone()) },
             class,
             "aria-label": tooltip_title,
+            "aria-describedby": describedby,
             onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
@@ -408,6 +442,7 @@ pub fn DiagnosticsButton(
 pub fn ReactionsButton(
     open: bool,
     #[props(default)] id: String,
+    #[props(default)] describedby: Option<&'static str>,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
     let class = if open {
@@ -422,6 +457,7 @@ pub fn ReactionsButton(
             class,
             "data-testid": "reactions-button",
             "aria-label": "Reactions",
+            "aria-describedby": describedby,
             // UX B2: the palette is a role=toolbar, not a menu — drop
             // aria-haspopup (which announces a menu popup), keep aria-expanded,
             // and point aria-controls at the palette's id so AT ties the two.
@@ -450,11 +486,171 @@ pub fn ReactionsButton(
 }
 
 // =============================================================================
+// Raise Hand Button (issue 2135)
+// =============================================================================
+
+/// The action-bar raise/lower-hand toggle.
+///
+/// A TOGGLE BUTTON, not a disclosure: it has no popup, so `aria-pressed` (not
+/// `aria-expanded`) is the correct state property — `aria-expanded` on a control
+/// that opens nothing tells a screen-reader user to look for a region that does
+/// not exist.
+///
+/// ## Why the name is a STABLE NOUN
+///
+/// The accessible name is fixed at "Raise hand" in both states and `aria-pressed`
+/// alone carries the state. It used to flip to "Lower hand" while raised, which
+/// is the [`DOCK_AUTOHIDE_LABEL`](super::attendants) defect (issue #2123) in a
+/// different control: the name and `aria-pressed` flip TOGETHER, so the two
+/// cancel out. Raised, a screen reader spoke
+///
+/// > "Lower hand, toggle button, **pressed**"
+///
+/// from which the only available reading is that "lower hand" is the state that
+/// is switched on — i.e. that the hand is DOWN, at the exact moment it is up.
+/// WCAG 4.1.2 Name/Role/Value.
+///
+/// This is not a marginal path: the throttled live region is up to 4 s behind,
+/// so this control's own announcement is the ONLY immediate feedback a
+/// screen-reader user gets when they raise their own hand. Every self-raise
+/// misinformed them.
+///
+/// The imperative copy still exists where it is unambiguous and additive — the
+/// tooltip's DESCRIPTION line, which is prose rather than a name. The tooltip
+/// TITLE matches the accessible name exactly, so WCAG 2.5.3 Label in Name holds.
+#[component]
+pub fn RaiseHandButton(
+    /// Whether the LOCAL user's hand is currently up.
+    raised: bool,
+    #[props(default)] id: String,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    // `.active` alone supplies the pressed treatment. There is deliberately no
+    // extra `raised` modifier class: the one that used to be here tinted the
+    // glyph `--accent-hover` (#0a84ff) on top of `.active`'s #0a84ff fill —
+    // 1.00:1, an invisible icon in the only state the control exists to
+    // communicate. The inherited `color: white` gives 3.65:1 on that fill, the
+    // same as every other `.active` control in the bar.
+    let class = if raised {
+        "video-control-button active raise-hand-button"
+    } else {
+        "video-control-button raise-hand-button"
+    };
+    // The stable NOUN: what the control is, not what pressing it would do.
+    const NAME: &str = "Raise hand";
+
+    rsx! {
+        button {
+            id: if id.is_empty() { None } else { Some(id.clone()) },
+            class,
+            r#type: "button",
+            "data-testid": "raise-hand-button",
+            // Exposed for the e2e spec and for CSS, so neither has to infer the
+            // state from a class name that also carries styling concerns.
+            "data-raised": if raised { "true" } else { "false" },
+            "aria-label": NAME,
+            "aria-describedby": describedby,
+            "aria-pressed": if raised { "true" } else { "false" },
+            onclick: move |evt| onclick.call(evt),
+            RaisedHandIcon { decorative: true }
+            span { class: "tooltip",
+                // Matches `aria-label` verbatim (WCAG 2.5.3).
+                span { class: "tooltip-title", {NAME} }
+                span { class: "tooltip-desc",
+                    if raised {
+                        "Your hand is up. Press to take it down — everyone in the call sees the change."
+                    } else {
+                        "Let everyone know you want to speak — they see it even if your tile is off-screen."
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Meeting Timer Button (issue 2136, HOST ONLY)
+// =============================================================================
+
+/// The host's entry point to the meeting-timer controls.
+///
+/// A DISCLOSURE, not a toggle of the timer itself. Pressing it opens the popover
+/// that starts / extends / cancels; it never starts a timer on its own. That
+/// distinction drives the a11y contract below and is the reason `aria-expanded`
+/// is used rather than `aria-pressed`.
+#[component]
+pub fn MeetingTimerButton(
+    /// Whether the controls popover is open.
+    open: bool,
+    /// Whether a timer is currently RUNNING. Drives only the `data-` hook and the
+    /// tooltip description — deliberately NOT the accessible name.
+    #[props(default)]
+    running: bool,
+    #[props(default)] id: String,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    // `.active` alone supplies the open treatment, matching every other
+    // disclosure in the bar. No extra modifier class tinting the glyph: the
+    // raise-hand post-mortem is that an accent-on-accent modifier rendered the
+    // icon at 1.00:1 in the one state the control exists to communicate. The
+    // inherited `color: white` gives 3.65:1 on the `.active` fill.
+    let class = if open {
+        "video-control-button active meeting-timer-button"
+    } else {
+        "video-control-button meeting-timer-button"
+    };
+    // The stable NOUN: what the control IS, never what pressing it would do, and
+    // never something that flips with state. A name that changes alongside
+    // `aria-expanded` cancels the state out — the control would announce the
+    // inverse of reality half the time.
+    const NAME: &str = "Meeting timer";
+
+    rsx! {
+        button {
+            id: if id.is_empty() { None } else { Some(id.clone()) },
+            class,
+            r#type: "button",
+            "data-testid": "meeting-timer-button",
+            // Exposed for the e2e spec and for CSS, so neither has to infer state
+            // from a class name that also carries styling concerns.
+            "data-open": if open { "true" } else { "false" },
+            "data-running": if running { "true" } else { "false" },
+            "aria-label": NAME,
+            "aria-describedby": describedby,
+            // `aria-expanded`, NOT `aria-pressed`: this button discloses a
+            // popover. `aria-pressed` would claim the TIMER is toggled on, which
+            // is a different fact and one this control does not carry.
+            "aria-expanded": if open { "true" } else { "false" },
+            "aria-haspopup": "dialog",
+            onclick: move |evt| onclick.call(evt),
+            MeetingTimerIcon { decorative: true }
+            span { class: "tooltip",
+                // Matches `aria-label` verbatim (WCAG 2.5.3).
+                span { class: "tooltip-title", {NAME} }
+                span { class: "tooltip-desc",
+                    if running {
+                        "A timer is running for everyone. Open to add time or cancel it."
+                    } else {
+                        "Show everyone a countdown — useful for keeping a presenter to time."
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Device Settings Button (Mobile Only)
 // =============================================================================
 
 #[component]
-pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
+pub fn DeviceSettingsButton(
+    open: bool,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
     let class = if open {
         "video-control-button active"
     } else {
@@ -482,6 +678,7 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
             class,
             "data-testid": "open-settings",
             "aria-label": tooltip_title,
+            "aria-describedby": describedby,
             onclick: move |evt| onclick.call(evt),
 
             svg {
@@ -512,7 +709,11 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
 /// room, admitted-can-admit, end-on-host-leave, allow-guests). Lets the host
 /// change meeting options live without navigating away from the call.
 #[component]
-pub fn MeetingOptionsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
+pub fn MeetingOptionsButton(
+    open: bool,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
     let class = if open {
         "video-control-button active"
     } else {
@@ -541,6 +742,7 @@ pub fn MeetingOptionsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
             class,
             "data-testid": "open-meeting-options",
             "aria-label": tooltip_title,
+            "aria-describedby": describedby,
             onclick: move |evt| onclick.call(evt),
 
             svg {
@@ -603,7 +805,12 @@ pub fn MockPeersButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element
 // =============================================================================
 
 #[component]
-pub fn DensityModeButton(label: String, open: bool, onclick: EventHandler<MouseEvent>) -> Element {
+pub fn DensityModeButton(
+    label: String,
+    open: bool,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
     let class = if open {
         "video-control-button active"
     } else {
@@ -615,6 +822,7 @@ pub fn DensityModeButton(label: String, open: bool, onclick: EventHandler<MouseE
             id: "density-mode-trigger",
             class,
             title: "Layout density: {label}",
+            "aria-describedby": describedby,
             "aria-haspopup": "menu",
             "aria-expanded": if open { "true" } else { "false" },
             onclick: move |evt| onclick.call(evt),
@@ -693,7 +901,11 @@ impl RecordButtonState {
 }
 
 #[component]
-pub fn RecordButton(state: RecordButtonState, onclick: EventHandler<MouseEvent>) -> Element {
+pub fn RecordButton(
+    state: RecordButtonState,
+    #[props(default)] describedby: Option<&'static str>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
     let is_recording = matches!(state, RecordButtonState::Recording);
     let is_busy = state.is_busy();
 
@@ -716,6 +928,7 @@ pub fn RecordButton(state: RecordButtonState, onclick: EventHandler<MouseEvent>)
             class,
             disabled: is_busy,
             "data-testid": "record-button",
+            "aria-describedby": describedby,
             onclick: move |evt| {
                 if !is_busy {
                     onclick.call(evt);
@@ -769,6 +982,83 @@ pub fn js_state_to_record_button_state(s: &str) -> RecordButtonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── is_busy ────────────────────────────────────────────────────────────
+    // `is_busy()` governs whether the RecordButton is disabled mid-transition —
+    // locking it in prevents regressions where a state is accidentally excluded
+    // from the busy set and lets the user double-click while a transition is in
+    // flight.
+    //
+    // These were `#[wasm_bindgen_test]`s in `dioxus-ui/tests/record_button_state.rs`,
+    // which was compiled by `cargo test --no-run` but named in NO workflow, so it had
+    // never executed (found while adding the run step for issue 2170's own wasm test).
+    // Rather than spend a Chrome launch + a 3-attempt flake budget on pure enum logic,
+    // they run natively here via `cargo test -p videocall-ui --lib`, which already gates
+    // every PR. Nothing here touches the DOM, so the browser bought no fidelity.
+
+    #[test]
+    fn is_busy_false_for_idle() {
+        assert!(
+            !RecordButtonState::Idle.is_busy(),
+            "Idle is not a transition state — button must be enabled"
+        );
+    }
+
+    #[test]
+    fn is_busy_false_for_recording() {
+        assert!(
+            !RecordButtonState::Recording.is_busy(),
+            "Recording is stable — button must be enabled so the user can stop"
+        );
+    }
+
+    #[test]
+    fn is_busy_true_for_activating() {
+        assert!(
+            RecordButtonState::Activating.is_busy(),
+            "Activating is a transition — button must be disabled"
+        );
+    }
+
+    #[test]
+    fn is_busy_true_for_stopping() {
+        assert!(
+            RecordButtonState::Stopping.is_busy(),
+            "Stopping is a transition — button must be disabled"
+        );
+    }
+
+    #[test]
+    fn is_busy_true_for_saving() {
+        assert!(
+            RecordButtonState::Saving.is_busy(),
+            "Saving is a transition — button must be disabled"
+        );
+    }
+
+    // ── PartialEq / Clone sanity ───────────────────────────────────────────
+
+    #[test]
+    fn clone_and_eq_roundtrip() {
+        for state in [
+            RecordButtonState::Idle,
+            RecordButtonState::Activating,
+            RecordButtonState::Recording,
+            RecordButtonState::Stopping,
+            RecordButtonState::Saving,
+        ] {
+            assert_eq!(state.clone(), state, "{state:?} must equal its own clone");
+        }
+    }
+
+    #[test]
+    fn idle_ne_recording() {
+        assert_ne!(
+            RecordButtonState::Idle,
+            RecordButtonState::Recording,
+            "Idle and Recording must be distinct variants"
+        );
+    }
 
     // ── js_state_to_record_button_state ────────────────────────────────────
     // Each arm of the JS→Rust mapping must round-trip correctly.

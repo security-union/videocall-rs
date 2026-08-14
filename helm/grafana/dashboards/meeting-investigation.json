@@ -394,7 +394,7 @@
         }
       ],
       "title": "Client Memory: JS Heap + WASM + Agent (#1032)",
-      "description": "Unified per-client memory pressure (merges the former JS-heap and non-heap panels). JS heap used (Chrome only) + WASM linear memory (WebAssembly.Memory.buffer.byteLength, always available \u2014 the multi-GB decode/jitter-buffer pressure that drives freezes) + JS heap limit + total agent memory (measureUserAgentSpecificMemory, Chrome + crossOriginIsolated only, may be absent for many clients).",
+      "description": "Unified per-client memory pressure (merges the former JS-heap and non-heap panels). JS heap used (Chrome only) + WASM linear memory (WebAssembly.Memory.buffer.byteLength, always available — the multi-GB decode/jitter-buffer pressure that drives freezes) + JS heap limit + total agent memory (measureUserAgentSpecificMemory, Chrome + crossOriginIsolated only, may be absent for many clients).",
       "type": "timeseries"
     },
     {
@@ -1232,7 +1232,7 @@
         }
       ],
       "title": "Keyframe Requests/sec",
-      "description": "Rate of PLI (keyframe) requests sent. Spikes indicate video decode failures \u2014 the receiver is asking the sender to re-sync.",
+      "description": "Rate of PLI (keyframe) requests sent. Spikes indicate video decode failures — the receiver is asking the sender to re-sync.",
       "type": "timeseries"
     },
     {
@@ -1306,8 +1306,8 @@
         "type": "prometheus"
       },
       "id": 65,
-      "title": "Inbound Mailbox Overflow /sec \u2014 FLEET-WIDE (#1057)",
-      "description": "The room-wide-freeze signature (#1057): inbound actor-mailbox overflow drops by transport. FLEET-WIDE \u2014 relay_inbound_mailbox_drops_total carries only a 'transport' label (no room/meeting), so this is NOT filtered by $meeting. Any sustained value > 0 (red) means the 16-slot actix mailbox is dropping inbound messages -> video starves -> DecodeBudget caps -> viewport collapse for the whole room. Cross-check with Outbound Queue Depth and Packet Drops/sec. (Populates after backend PR #TBD deploys.)",
+      "title": "Inbound Mailbox Overflow /sec — FLEET-WIDE (#1057)",
+      "description": "The room-wide-freeze signature (#1057): inbound actor-mailbox overflow drops by transport. FLEET-WIDE — relay_inbound_mailbox_drops_total carries only a 'transport' label (no room/meeting), so this is NOT filtered by $meeting. Any sustained value > 0 (red) means the 16-slot actix mailbox is dropping inbound messages -> video starves -> DecodeBudget caps -> viewport collapse for the whole room. Cross-check with Outbound Queue Depth and Packet Drops/sec. (Populates after backend PR #TBD deploys.)",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -1792,7 +1792,7 @@
       },
       "id": 61,
       "title": "Active Transport per Participant (WS vs WT)",
-      "description": "Each participant's active transport over time, from videocall_client_active_server_rtt_ms broken out by server_type (websocket|webtransport). The RTT value is the line; the server_type in the legend is the transport. A transport flip (WT->WS) or a series gap+reappear is a re-election \u2014 correlate with RTT spikes here and Transport Drops/sec. Companion to 'Client RTT to Server'.",
+      "description": "Each participant's active transport over time, from videocall_client_active_server_rtt_ms broken out by server_type (websocket|webtransport). The RTT value is the line; the server_type in the legend is the transport. A transport flip (WT->WS) or a series gap+reappear is a re-election — correlate with RTT spikes here and Transport Drops/sec. Companion to 'Client RTT to Server'.",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -1854,7 +1854,7 @@
       },
       "id": 66,
       "title": "Transport Re-elections by Outcome (5m)",
-      "description": "Re-election count + outcome (console-log findings #2/#4, discussion #562). result in {proceeded, aborted, preserved, failed}. 'failed' (red) = 'Election failed: No valid connections' \u2014 the on-call signal that a client could not re-establish any transport (often the stale-JWT token-expiry path). videocall_client_reelection_total is a GaugeVec set to the client's CUMULATIVE value, so it is charted with increase() over 5m. Companion to 'Active Transport per Participant'. (Populates after backend PR #TBD deploys.)",
+      "description": "Re-election count + outcome (console-log findings #2/#4, discussion #562). result in {proceeded, aborted, preserved, failed}. 'failed' (red) = 'Election failed: No valid connections' — the on-call signal that a client could not re-establish any transport (often the stale-JWT token-expiry path). videocall_client_reelection_total is a GaugeVec set to the client's CUMULATIVE value, so it is charted with increase() over 5m. Companion to 'Active Transport per Participant'. (Populates after backend PR #TBD deploys.)",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -2411,27 +2411,27 @@
       "targets": [
         {
           "expr": "videocall_video_seq_loss_per_sec{meeting_id=~\"$meeting\"}",
-          "legendFormat": "seq-loss/s: {{from_peer}} \u2192 {{to_peer}}",
+          "legendFormat": "seq-loss/s: {{from_peer}} → {{to_peer}}",
           "refId": "A"
         },
         {
           "expr": "videocall_video_fps{meeting_id=~\"$meeting\"}",
-          "legendFormat": "fps: {{from_peer}} \u2192 {{to_peer}}",
+          "legendFormat": "fps: {{from_peer}} → {{to_peer}}",
           "refId": "B"
         },
         {
           "expr": "videocall_video_frames_dropped{meeting_id=~\"$meeting\"}",
-          "legendFormat": "frames-dropped/s: {{from_peer}} \u2192 {{to_peer}}",
+          "legendFormat": "frames-dropped/s: {{from_peer}} → {{to_peer}}",
           "refId": "C"
         },
         {
           "expr": "deriv(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
-          "legendFormat": "decode-err/s: {{from_peer}} \u2192 {{to_peer}}",
+          "legendFormat": "decode-err/s: {{from_peer}} → {{to_peer}}",
           "refId": "D"
         }
       ],
       "title": "Reference Loss, Decode Errors & FPS (Receiver)",
-      "description": "Per-peer receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series, left axis) is the always-on signal and returns to 0 when healthy \u2014 sustained > 0 while FPS still reads ~30 is the classic frozen-but-decoding case. FPS (videocall_video_fps) is plotted on the right axis so it does not flatten the loss series or trip the loss threshold. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update when a hard WebCodecs decode fault occurs) \u2014 read these two as 'has a fault occurred', not 'is one occurring right now'. All three loss/error gauges are registered + emitted server-side and conditionally populated.",
+      "description": "Per-peer receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series, left axis) is the always-on signal and returns to 0 when healthy — sustained > 0 while FPS still reads ~30 is the classic frozen-but-decoding case. FPS (videocall_video_fps) is plotted on the right axis so it does not flatten the loss series or trip the loss threshold. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update when a hard WebCodecs decode fault occurs) — read these two as 'has a fault occurred', not 'is one occurring right now'. All three loss/error gauges are registered + emitted server-side and conditionally populated.",
       "type": "timeseries"
     },
     {
@@ -2492,12 +2492,12 @@
       "targets": [
         {
           "expr": "videocall_video_seq_loss_per_sec{meeting_id=~\"$meeting\"} > 0",
-          "legendFormat": "{{from_peer}} \u2192 {{to_peer}}",
+          "legendFormat": "{{from_peer}} → {{to_peer}}",
           "refId": "A"
         }
       ],
-      "title": "#1013 Reference Loss \u2014 Video Seq Loss/sec",
-      "description": "Per-peer-pair inbound video sequence-number loss rate (lost packets/sec) observed by each receiver \u2014 the #1013 reference-loss / freeze signal. A reference frame lost to packet loss freezes the stream until a keyframe arrives, so any SUSTAINED value > 0 (red) for a pair is a freeze red flag, cross-checked against Keyframe Requests/sec (sustained PLI => stream cannot self-recover). The `> 0` filter hides idle/healthy pairs so a busy meeting's chart stays readable. seq-loss is the always-on proxy and returns to 0 when healthy; the exact hard-failure counters (videocall_decoder_errors_total, cumulative; videocall_video_frames_dropped, latches its last nonzero value) are overlaid on the per-receiver panels above. Broken out by reporter \u2192 observed peer. Live signal (570 series).",
+      "title": "#1013 Reference Loss — Video Seq Loss/sec",
+      "description": "Per-peer-pair inbound video sequence-number loss rate (lost packets/sec) observed by each receiver — the #1013 reference-loss / freeze signal. A reference frame lost to packet loss freezes the stream until a keyframe arrives, so any SUSTAINED value > 0 (red) for a pair is a freeze red flag, cross-checked against Keyframe Requests/sec (sustained PLI => stream cannot self-recover). The `> 0` filter hides idle/healthy pairs so a busy meeting's chart stays readable. seq-loss is the always-on proxy and returns to 0 when healthy; the exact hard-failure counters (videocall_decoder_errors_total, cumulative; videocall_video_frames_dropped, latches its last nonzero value) are overlaid on the per-receiver panels above. Broken out by reporter → observed peer. Live signal (570 series).",
       "type": "timeseries"
     },
     {
@@ -3186,8 +3186,8 @@
         "type": "prometheus"
       },
       "id": 63,
-      "title": "Auth Rejections /sec \u2014 FLEET-WIDE (not per-meeting)",
-      "description": "MEETING-AGNOSTIC: videocall_auth_rejections_total carries only a 'reason' label (no meeting_id/room), so this rate is across the WHOLE fleet and is NOT filtered by the $meeting variable. A sustained token_expired rate is the stale-JWT re-election failure (discussion #562) \u2014 but you CANNOT attribute it to this meeting from Grafana today (per-meeting attribution is log-only until a room label is added). All reasons are overlaid so you can see the rejection mix.",
+      "title": "Auth Rejections /sec — FLEET-WIDE (not per-meeting)",
+      "description": "MEETING-AGNOSTIC: videocall_auth_rejections_total carries only a 'reason' label (no meeting_id/room), so this rate is across the WHOLE fleet and is NOT filtered by the $meeting variable. A sustained token_expired rate is the stale-JWT re-election failure (discussion #562) — but you CANNOT attribute it to this meeting from Grafana today (per-meeting attribution is log-only until a room label is added). All reasons are overlaid so you can see the rejection mix.",
       "type": "timeseries",
       "fieldConfig": {
         "defaults": {
@@ -3465,22 +3465,22 @@
           "targets": [
             {
               "expr": "videocall_video_seq_loss_per_sec{meeting_id=~\"$meeting\"}",
-              "legendFormat": "seq-loss/s: {{from_peer}} \u2192 {{to_peer}}",
+              "legendFormat": "seq-loss/s: {{from_peer}} → {{to_peer}}",
               "refId": "A"
             },
             {
               "expr": "deriv(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
-              "legendFormat": "decode-err/s: {{from_peer}} \u2192 {{to_peer}}",
+              "legendFormat": "decode-err/s: {{from_peer}} → {{to_peer}}",
               "refId": "B"
             },
             {
               "expr": "videocall_video_frames_dropped{meeting_id=~\"$meeting\"}",
-              "legendFormat": "frames-dropped/s: {{from_peer}} \u2192 {{to_peer}}",
+              "legendFormat": "frames-dropped/s: {{from_peer}} → {{to_peer}}",
               "refId": "C"
             }
           ],
           "title": "Reference Loss & Decode Errors (per receiver)",
-          "description": "Per-receiver-pair receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series) is the always-on signal and returns to 0 when healthy. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update on a real WebCodecs decode fault) \u2014 read these two as 'has a fault occurred', not 'is one occurring right now'. Correlate with tier changes and encoder queue depth (videocall_encoder_queue_depth, sender-side backpressure) to find whether degradation is isolated or widespread. All three are registered + emitted server-side and conditionally populated.",
+          "description": "Per-receiver-pair receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series) is the always-on signal and returns to 0 when healthy. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update on a real WebCodecs decode fault) — read these two as 'has a fault occurred', not 'is one occurring right now'. Correlate with tier changes and encoder queue depth (videocall_encoder_queue_depth, sender-side backpressure) to find whether degradation is isolated or widespread. All three are registered + emitted server-side and conditionally populated.",
           "type": "timeseries"
         }
       ]
@@ -3687,7 +3687,7 @@
             }
           ],
           "title": "Publisher Effective vs Active Layers",
-          "description": "The A3 core-claim panel. effective = ladder depth the publisher is configured to encode; active = layers currently encoding. The effective set should stay constant while one receiver degrades. A gap (active < effective) means AQ shed the top layer(s) at the publisher \u2014 a global cut, NOT per-receiver selection.",
+          "description": "The A3 core-claim panel. effective = ladder depth the publisher is configured to encode; active = layers currently encoding. The effective set should stay constant while one receiver degrades. A gap (active < effective) means AQ shed the top layer(s) at the publisher — a global cut, NOT per-receiver selection.",
           "type": "timeseries"
         },
         {
@@ -3743,7 +3743,7 @@
           "targets": [
             {
               "expr": "videocall_received_layer{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
-              "legendFormat": "{{display_name}} \u2192 {{from_peer}} {{media_kind}}",
+              "legendFormat": "{{display_name}} → {{from_peer}} {{media_kind}}",
               "refId": "A"
             }
           ],
@@ -4069,7 +4069,7 @@
             }
           ],
           "title": "Connection Medium Type",
-          "description": "Network connection type indicator (wifi/ethernet/cellular). Value=1 when that type is active for the client. navigator.connection.type \u2014 Chrome/Edge only.",
+          "description": "Network connection type indicator (wifi/ethernet/cellular). Value=1 when that type is active for the client. navigator.connection.type — Chrome/Edge only.",
           "type": "timeseries"
         },
         {
@@ -4254,8 +4254,8 @@
               "refId": "A"
             }
           ],
-          "title": "CONGESTION Filtered \u2014 non-target (#1220)",
-          "description": "CONGESTION control packets the relay dropped for non-target receivers (#1220 unicast-correctness coalesce). Validates that a CONGESTION signal is delivered only to the intended receiver, not broadcast \u2014 the #1219 collapse fix.",
+          "title": "CONGESTION Filtered — non-target (#1220)",
+          "description": "CONGESTION control packets the relay dropped for non-target receivers (#1220 unicast-correctness coalesce). Validates that a CONGESTION signal is delivered only to the intended receiver, not broadcast — the #1219 collapse fix.",
           "type": "timeseries"
         },
         {
@@ -4321,7 +4321,7 @@
             }
           ],
           "title": "#1057 Guard: relay packet drops by reason",
-          "description": "Relay backpressure loss by drop_reason and transport, filtered to this meeting. A 'mailbox_full' spike (red) is the #1057 room-wide-freeze signature \u2014 the 16-slot actix mailbox is dropping inbound messages. This must stay ~0; any sustained nonzero is the freeze precursor.",
+          "description": "Relay backpressure loss by drop_reason and transport, filtered to this meeting. A 'mailbox_full' spike (red) is the #1057 room-wide-freeze signature — the 16-slot actix mailbox is dropping inbound messages. This must stay ~0; any sustained nonzero is the freeze precursor.",
           "type": "timeseries"
         },
         {
@@ -4386,8 +4386,8 @@
               "refId": "A"
             }
           ],
-          "title": "#1057 Guard: outbound channel drops \u2014 FLEET-WIDE (not per-meeting)",
-          "description": "Outbound per-session channel drops by transport and kind. FLEET-WIDE: videocall_outbound_channel_drops_total carries only 'transport' and 'kind' labels (no room/meeting_id), so this is intentionally NOT filtered by $meeting \u2014 a $meeting filter would return empty. Read alongside the per-meeting relay-packet-drops panel; this is the cluster-wide backpressure backstop for #1057.",
+          "title": "#1057 Guard: outbound channel drops — FLEET-WIDE (not per-meeting)",
+          "description": "Outbound per-session channel drops by transport and kind. FLEET-WIDE: videocall_outbound_channel_drops_total carries only 'transport' and 'kind' labels (no room/meeting_id), so this is intentionally NOT filtered by $meeting — a $meeting filter would return empty. Read alongside the per-meeting relay-packet-drops panel; this is the cluster-wide backpressure backstop for #1057.",
           "type": "timeseries"
         }
       ]
@@ -4547,14 +4547,14 @@
               "refId": "A"
             }
           ],
-          "title": "Video Playout Paint Lag \u2014 Stage 3 (#1338)",
+          "title": "Video Playout Paint Lag — Stage 3 (#1338)",
           "type": "timeseries"
         },
         {
           "datasource": {
             "type": "prometheus"
           },
-          "description": "Per-session buffered AUDIO playout latency (companion to the video panel). DEPENDS ON #1360 (videocall_audio_playout_latency_ms) merging into PR-staging \u2014 the gauge is declared on that branch and this panel will read empty until it lands. NOTE: audio playout is governed by the NetEQ adaptive jitter buffer, whose scale differs from the video jitter buffer; the 600/1800ms threshold bands are inherited from the video panel as a starting point and likely need field tuning against videocall_neteq_target_delay_ms. max_over_time[1m] per session_id.",
+          "description": "Per-session buffered AUDIO playout latency (companion to the video panel). DEPENDS ON #1360 (videocall_audio_playout_latency_ms) merging into PR-staging — the gauge is declared on that branch and this panel will read empty until it lands. NOTE: audio playout is governed by the NetEQ adaptive jitter buffer, whose scale differs from the video jitter buffer; the 600/1800ms threshold bands are inherited from the video panel as a starting point and likely need field tuning against videocall_neteq_target_delay_ms. max_over_time[1m] per session_id.",
           "fieldConfig": {
             "defaults": {
               "custom": {
@@ -4617,7 +4617,7 @@
               "refId": "A"
             }
           ],
-          "title": "Audio Playout Latency (#1360 \u2014 pending merge)",
+          "title": "Audio Playout Latency (#1360 — pending merge)",
           "type": "timeseries"
         }
       ],
@@ -4918,7 +4918,7 @@
           "datasource": {
             "type": "prometheus"
           },
-          "description": "Screen-share frames per second observed by the receiver (videocall_screen_video_fps). Arrival-rate: the screen encoder emits on content change, so a static share legitimately reads low. Read with Screen Content Staleness - low fps WITH climbing staleness is a freeze; low fps with flat staleness is just an idle/static share.",
+          "description": "Screen-share frames per second DECODED by the receiver (videocall_screen_video_fps). Decode-call rate, NOT an arrival rate: since #2190 it excludes wrong-rung simulcast packets the decode guard skipped. The screen encoder also emits on content change, so a static share legitimately reads low. Read with Screen Content Staleness - low fps WITH climbing staleness is a freeze; low fps with flat staleness is just an idle/static share.",
           "fieldConfig": {
             "defaults": {
               "custom": {
@@ -5622,6 +5622,356 @@
         }
       ],
       "title": "WT Incoming Datagram Queue Read-back (issue 2031)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "fps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 287
+      },
+      "id": 109,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_screen_encoder_output_fps{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} screen fps",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_screen_sharing_active{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} sharing (0/1)",
+          "refId": "B"
+        }
+      ],
+      "title": "SCREEN Encoder Output FPS + Sharing Active (#2147)",
+      "description": "Publisher-side SCREEN encoder output, which did not exist before #2147 -- videocall_encoder_output_fps is CAMERA-only, which is why the #2143 screen-share freeze showed a healthy 7-9 fps while receivers were frozen. A 0 here is a REAL reading, not no-data (unlike the camera gauge, which is >0-gated at the source per #2079). Interpret against the sharing line: 0 + not sharing = idle; 0 + sharing = static-or-stalled. IMPORTANT: this gauge ALONE cannot detect a freeze -- it counts encoded chunks, and the synthetic retained-frame re-encodes keep it nonzero during a stall. Use the stall panel to its right.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*worst gap.*"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 287
+      },
+      "id": 110,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "increase(videocall_screen_encoder_stall_episodes_total{meeting_id=~\"$meeting\"}[5m]) * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} stall episodes /5m",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_screen_encoder_max_stall_gap_ms{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} worst gap (ms)",
+          "refId": "B"
+        }
+      ],
+      "title": "SCREEN Encoder Tick-Starvation Stalls (#2147) -- THE freeze signal",
+      "description": "THIS is the panel that detects a screen freeze; the fps panel to its left cannot. Each episode is one encode-loop tick resume whose gap exceeded SCREEN_ENCODER_STALL_GAP_MS -- a main-thread freeze during which the encoder could not sample fresh capture, so receivers saw fps>0 on stale re-encoded content (the #1899/#2143 mechanism). READ AS A PAIR with the fps panel: fps>0 + episodes FLAT = genuinely healthy; fps>0 + episodes RISING = THE FREEZE; fps==0 + sharing = idle/static share. The worst-gap series (right axis) gives severity: 3 episodes at 200ms is jitter, 3 at 23000ms is the #2143 incident. CAVEAT: the counter is cumulative-since-page-load while session_id changes on reconnect, so an increase() spanning a reconnect can UNDERCOUNT -- for a specific incident prefer max_over_time per session_id.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "Mpx/s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 296
+      },
+      "id": 111,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(meeting_id, session_id, peer_id) (videocall_encoder_layer_pixel_rate{meeting_id=~\"$meeting\"}) / 1000000 * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} total",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_encoder_layer_pixel_rate{meeting_id=~\"$meeting\"} / 1000000 * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} layer {{layer}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Camera Encode Pixel Rate (Mpx/s) (#2170)",
+      "description": "Publisher-side fitted camera encode throughput from measured per-layer output fps. The server derives each rate coherently from one geometry/fps report; do NOT reconstruct it by multiplying videocall_encoder_layer_pixels by videocall_encoder_layer_output_fps because separately collected gauges can tear across reports. An absent value means that rung's first fps window has not closed yet, not zero throughput. The total line sums active rungs for each publisher, which is the shape the bots-vs-webcams gap appears in: 1280x720 synthetic sources can consume roughly 3x the pixels of observed 640x480 webcams even when fps and bitrate panels look identical. CAVEAT (issue 2170): the load-test bot does NOT emit this field yet - it has no CameraEncoder and publishes no per-layer geometry - so bot publishers read as no-data here and the bot side of that comparison is not available from this panel yet. Real browser publishers are covered. Only ACTIVE rungs appear, so a rung vanishing means AQ shed it, not that the encoder broke.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 296
+      },
+      "id": 112,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_encoder_layer_width{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} layer {{layer}} width",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_encoder_layer_height{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} layer {{layer}} height",
+          "refId": "B"
+        }
+      ],
+      "title": "Camera FITTED Layer Geometry (#2170)",
+      "description": "Actual fitted encode width and height per publisher rung, not the ladder bounding boxes. This closes the 3x parity blind spot where 1280x720 bots and observed 640x480 webcams showed matching fps/bitrate despite different pixel load. Do NOT multiply these independently collected series; use the server-derived videocall_encoder_layer_pixels for coherent pixel math, and remember that _pixels is pixels per FRAME, not throughput. Use videocall_encoder_layer_pixel_rate for Mpx/s. Only ACTIVE rungs appear, so a rung vanishing means AQ shed it, not that the encoder broke.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "fps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 305
+      },
+      "id": 113,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_encoder_layer_output_fps{meeting_id=~\"$meeting\"} * on(meeting_id, session_id, peer_id) group_left(display_name) videocall_peer_info",
+          "legendFormat": "{{display_name}} layer {{layer}} fps",
+          "refId": "A"
+        }
+      ],
+      "title": "Camera Measured Per-Layer Output FPS (#2170)",
+      "description": "Measured output fps for each active camera rung over the latest roughly one-second window, not the nominal 7/15/30 ladder targets. Layer 0 should closely track the existing videocall_encoder_output_fps series; disagreement is itself a useful wiring or timing signal. Geometry can appear before this series while the first measurement window warms. Only ACTIVE rungs appear, so a rung vanishing means AQ shed it, not that the encoder broke.",
       "type": "timeseries"
     }
   ],

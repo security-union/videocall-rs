@@ -3,6 +3,25 @@ import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
 
+// issue 1762: the auto-hide item's visible label is now a STABLE NOUN. It used
+// to be the imperative "Turn Hiding On"/"Turn Hiding Off", which flipped with
+// the state that `aria-checked` also flips — on a `menuitemcheckbox` the two
+// signals then cancel and a screen reader announces the inverse of the truth
+// ("Turn Hiding Off, check box, checked" while hiding is ON). Must match
+// `DOCK_AUTOHIDE_LABEL` in dioxus-ui/src/components/attendants.rs.
+const AUTOHIDE_LABEL = "Auto-hide action bar";
+
+// The label no longer encodes the state, so every state check below reads
+// `aria-checked` — which is the contract the fix establishes as the single
+// source of truth.
+function autohideItem(page: Page) {
+  return page.locator(".glass-select-option").filter({ hasText: AUTOHIDE_LABEL });
+}
+
+async function autohideIsOn(page: Page): Promise<boolean> {
+  return (await autohideItem(page).first().getAttribute("aria-checked")) === "true";
+}
+
 test.describe("Dock settings", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -63,7 +82,9 @@ test.describe("Dock settings", () => {
   async function openDockMenu(page: Page): Promise<void> {
     // Hover to reveal the action bar in case autohide is active
     await page.locator(".video-controls-container").hover();
-    const toggleBtn = page.locator('.dock-position-wrapper button[aria-haspopup="listbox"]');
+    // Stable id, not `aria-haspopup` — issue 1762 changed that value from
+    // "listbox" to "menu".
+    const toggleBtn = page.locator("#dock-menu-trigger");
     await toggleBtn.click();
     await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 5_000 });
   }
@@ -76,24 +97,83 @@ test.describe("Dock settings", () => {
     const menu = page.locator(".glass-select-menu");
     await expect(menu).toBeVisible();
 
-    const options = menu.locator('.glass-select-option[role="option"]');
-    await expect(options).toHaveCount(5);
+    // The menu grew from 5 entries to 7 (Customize and Reset to Default were
+    // added under issues 1722/1756) and the settings entry was renamed from
+    // "Dock Settings" to "Action Bar…". This count is also the drift pin for
+    // `DOCK_MENU_ITEM_COUNT` in attendants.rs, which drives the roving-tabindex
+    // arithmetic — if an item is added without moving the constant, the roving
+    // index can point at an item that does not render, and this fails first.
+    const options = menu.locator(".glass-select-option");
+    await expect(options).toHaveCount(7);
 
     await expect(options.filter({ hasText: "Bottom" })).toHaveCount(1);
     await expect(options.filter({ hasText: "Left" })).toHaveCount(1);
     await expect(options.filter({ hasText: "Right" })).toHaveCount(1);
-    await expect(options.filter({ hasText: /Turn Hiding (On|Off)/ })).toHaveCount(1);
-    await expect(options.filter({ hasText: /Dock Settings/ })).toHaveCount(1);
+    await expect(options.filter({ hasText: AUTOHIDE_LABEL })).toHaveCount(1);
+    await expect(options.filter({ hasText: "Customize" })).toHaveCount(1);
+    await expect(options.filter({ hasText: "Reset to Default" })).toHaveCount(1);
+    // Capital "B" is load-bearing: `hasText` regexes are case-SENSITIVE, so
+    // /Action Bar/ matches "Action Bar…" and NOT "Auto-hide action bar". The
+    // toHaveCount(1) is what proves that separation holds.
+    await expect(options.filter({ hasText: /Action Bar/ })).toHaveCount(1);
 
     const separators = menu.locator(".glass-select-separator");
-    await expect(separators).toHaveCount(2);
+    await expect(separators).toHaveCount(3);
+  });
+
+  test("auto-hide item announces its state, not the inverse of it", async ({ page }) => {
+    // issue 1762 / WCAG 4.1.2 Name, Role, Value. The item is a
+    // `menuitemcheckbox`, and the universal reading of a checkbox is "the thing
+    // NAMED is true". The old imperative label flipped in lock-step with
+    // `aria-checked`, so the two signals cancelled: auto-hide ON rendered
+    // "Turn Hiding Off" + `aria-checked="true"`, which a screen reader speaks as
+    // "Turn Hiding Off, check box, checked" — the user concludes hiding is OFF
+    // at the exact moment it is ON. Both settings were misreported.
+    //
+    // The contract now: the NAME is invariant across both states, and
+    // `aria-checked` alone carries the state. Reverting the label to the
+    // imperative form fails the invariance assertion below.
+    await joinMeeting(page, "autohide_name_role_value");
+    await openDockMenu(page);
+
+    const item = autohideItem(page).first();
+    await expect(item).toHaveAttribute("role", "menuitemcheckbox");
+
+    const nameWhenOff = ((await item.textContent()) ?? "").trim();
+    await expect(item, "auto-hide defaults to OFF on a fresh profile").toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    // A checked-state item must also SHOW that it is checked. `.selected` is
+    // what paints the ✓ via `.glass-select-option.selected::before`; without it
+    // `aria-checked="true"` shipped with no visible indicator at all — sighted
+    // users saw a bare command, AT users heard a checkbox.
+    await expect(item).not.toHaveClass(/\bselected\b/);
+
+    await item.click();
+    await openDockMenu(page);
+    const itemOn = autohideItem(page).first();
+    await expect(itemOn).toHaveAttribute("aria-checked", "true");
+    await expect(
+      itemOn,
+      "aria-checked=true must be accompanied by the visible ✓ (.selected)",
+    ).toHaveClass(/\bselected\b/);
+
+    const nameWhenOn = ((await itemOn.textContent()) ?? "").trim();
+    expect(
+      nameWhenOn,
+      `the accessible name must NOT flip with the state — it read "${nameWhenOff}" when ` +
+        `unchecked and "${nameWhenOn}" when checked. A name that inverts alongside ` +
+        `aria-checked tells a screen-reader user the opposite of the truth (WCAG 4.1.2).`,
+    ).toBe(nameWhenOff);
+    expect(nameWhenOn).toBe(AUTOHIDE_LABEL);
   });
 
   test("dock position Left changes action bar class", async ({ page }) => {
     await joinMeeting(page, "pos-left");
 
     await openDockMenu(page);
-    await page.locator('.glass-select-option[role="option"]').filter({ hasText: "Left" }).click();
+    await page.locator(".glass-select-option").filter({ hasText: "Left" }).click();
 
     await expect(page.locator(".video-controls-container")).toHaveClass(/dock-left/, {
       timeout: 5_000,
@@ -104,7 +184,7 @@ test.describe("Dock settings", () => {
     await joinMeeting(page, "pos-right");
 
     await openDockMenu(page);
-    await page.locator('.glass-select-option[role="option"]').filter({ hasText: "Right" }).click();
+    await page.locator(".glass-select-option").filter({ hasText: "Right" }).click();
 
     await expect(page.locator(".video-controls-container")).toHaveClass(/dock-right/, {
       timeout: 5_000,
@@ -116,14 +196,14 @@ test.describe("Dock settings", () => {
 
     // First switch to Left so we can verify switching back to Bottom
     await openDockMenu(page);
-    await page.locator('.glass-select-option[role="option"]').filter({ hasText: "Left" }).click();
+    await page.locator(".glass-select-option").filter({ hasText: "Left" }).click();
     await expect(page.locator(".video-controls-container")).toHaveClass(/dock-left/, {
       timeout: 5_000,
     });
 
     // Now switch back to Bottom
     await openDockMenu(page);
-    await page.locator('.glass-select-option[role="option"]').filter({ hasText: "Bottom" }).click();
+    await page.locator(".glass-select-option").filter({ hasText: "Bottom" }).click();
 
     await expect(page.locator(".video-controls-container")).toHaveClass(/dock-bottom/, {
       timeout: 5_000,
@@ -148,32 +228,26 @@ test.describe("Dock settings", () => {
 
     await expect(page.locator(".video-controls-container")).not.toHaveClass(/controls-hidden/);
 
-    // And the dock menu's hiding toggle should read "Turn Hiding On" (i.e.
-    // hiding is currently off), confirming the signal initialised to false.
+    // And the dock menu's auto-hide item must read UNCHECKED (issue 1762: the
+    // label is now a stable noun, so state lives only in `aria-checked`),
+    // confirming the signal initialised to false.
     await openDockMenu(page);
-    await expect(
-      page.locator('.glass-select-option[role="option"]').filter({ hasText: "Turn Hiding On" }),
-    ).toBeVisible();
+    await expect(autohideItem(page).first()).toHaveAttribute("aria-checked", "false");
   });
 
-  test("Turn Hiding Off disables autohide", async ({ page }) => {
+  test("unchecking auto-hide disables autohide", async ({ page }) => {
     await joinMeeting(page, "hide-off");
 
-    // The new default-off behaviour means autohide may already be off; flip
-    // it on first so the subsequent "Turn Hiding Off" click is meaningful.
+    // The default-off behaviour means autohide may already be off; flip it on
+    // first so the subsequent "uncheck" is meaningful.
     await openDockMenu(page);
-    const hidingOn = page
-      .locator('.glass-select-option[role="option"]')
-      .filter({ hasText: "Turn Hiding On" });
-    if ((await hidingOn.count()) > 0) {
-      await hidingOn.click();
+    if (!(await autohideIsOn(page))) {
+      await autohideItem(page).click();
       await openDockMenu(page);
     }
+    await expect(autohideItem(page).first()).toHaveAttribute("aria-checked", "true");
 
-    await page
-      .locator('.glass-select-option[role="option"]')
-      .filter({ hasText: "Turn Hiding Off" })
-      .click();
+    await autohideItem(page).click();
 
     // Wait 5 seconds without mouse movement
     await page.waitForTimeout(5_000);
@@ -181,34 +255,25 @@ test.describe("Dock settings", () => {
     // Controls should NOT be hidden
     await expect(page.locator(".video-controls-container")).not.toHaveClass(/controls-hidden/);
 
-    // Re-open menu and verify the option now reads "Turn Hiding On"
+    // Re-open menu and verify the item now reads unchecked
     await openDockMenu(page);
-    await expect(
-      page.locator('.glass-select-option[role="option"]').filter({ hasText: "Turn Hiding On" }),
-    ).toBeVisible();
+    await expect(autohideItem(page).first()).toHaveAttribute("aria-checked", "false");
   });
 
-  test("Turn Hiding On re-enables autohide", async ({ page }) => {
+  test("checking auto-hide re-enables autohide", async ({ page }) => {
     await joinMeeting(page, "hide-on");
 
     // With the default-off fix, autohide may already be disabled on first
     // load. Make sure it's off before re-enabling so this test always exercises
-    // the off -> on transition. If the menu already shows "Turn Hiding On"
-    // (i.e. hiding is currently off), skip the "Turn Hiding Off" click.
+    // the off -> on transition.
     await openDockMenu(page);
-    const hidingOff = page
-      .locator('.glass-select-option[role="option"]')
-      .filter({ hasText: "Turn Hiding Off" });
-    if ((await hidingOff.count()) > 0) {
-      await hidingOff.click();
+    if (await autohideIsOn(page)) {
+      await autohideItem(page).click();
       await openDockMenu(page);
     }
 
     // Now re-enable autohide
-    await page
-      .locator('.glass-select-option[role="option"]')
-      .filter({ hasText: "Turn Hiding On" })
-      .click();
+    await autohideItem(page).click();
 
     // Move mouse to trigger visibility, then move it away to a neutral spot
     await wakeControls(page);
@@ -225,7 +290,7 @@ test.describe("Dock settings", () => {
 
     // Switch to Left
     await openDockMenu(page);
-    await page.locator('.glass-select-option[role="option"]').filter({ hasText: "Left" }).click();
+    await page.locator(".glass-select-option").filter({ hasText: "Left" }).click();
     await expect(page.locator(".video-controls-container")).toHaveClass(/dock-left/, {
       timeout: 5_000,
     });
@@ -258,23 +323,17 @@ test.describe("Dock settings", () => {
   test("autohide persists via localStorage", async ({ page }) => {
     await joinMeeting(page, "persist_autohide");
 
-    // With the default-off fix, autohide is off on first load and the menu
-    // shows "Turn Hiding On". Flip it on first so the subsequent "Turn
-    // Hiding Off" click writes an explicit `false` to localStorage.
+    // With the default-off fix, autohide is off on first load. Flip it on
+    // first so the subsequent uncheck writes an explicit `false` to
+    // localStorage.
     await openDockMenu(page);
-    const hidingOn = page
-      .locator('.glass-select-option[role="option"]')
-      .filter({ hasText: "Turn Hiding On" });
-    if ((await hidingOn.count()) > 0) {
-      await hidingOn.click();
+    if (!(await autohideIsOn(page))) {
+      await autohideItem(page).click();
       await openDockMenu(page);
     }
 
     // Toggle autohide off
-    await page
-      .locator('.glass-select-option[role="option"]')
-      .filter({ hasText: "Turn Hiding Off" })
-      .click();
+    await autohideItem(page).click();
 
     // Verify localStorage
     const stored = await page.evaluate(() => localStorage.getItem("vc_dock_autohide"));
@@ -303,18 +362,24 @@ test.describe("Dock settings", () => {
   test("Appearance panel dock position syncs with action bar", async ({ page }) => {
     await joinMeeting(page, "appearance_dock_sync");
 
-    // Open Settings → Appearance
+    // Open Settings → Preferences. The menu ITEM is "Action Bar…" (renamed from
+    // "Dock Settings", a string that no longer appears anywhere in
+    // dioxus-ui/src), and the settings it opens moved from the Appearance panel
+    // to Preferences.
     await openDockMenu(page);
     await page
-      .locator('.glass-select-option[role="option"]')
-      .filter({ hasText: /Dock Settings/ })
+      .locator(".glass-select-option")
+      .filter({ hasText: /Action Bar/ })
       .click();
     await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator(".settings-nav-button.active")).toContainText("Appearance");
+    // Preferences, not Appearance: `preferences_settings_panel.rs` now owns the
+    // "Action Bar" section, and the menu item sets the initial section to
+    // "preferences" to match.
+    await expect(page.locator(".settings-nav-button.active")).toContainText("Preferences");
 
     // Click Right in the Position segmented control
     const posGroup = page.locator(
-      '#settings-panel-appearance .transport-segmented[role="radiogroup"][aria-label="Action bar position"]',
+      '#settings-panel-preferences .transport-segmented[role="radiogroup"][aria-label="Action bar position"]',
     );
     await posGroup.locator('button[role="radio"]').filter({ hasText: "Right" }).click();
 
@@ -333,24 +398,30 @@ test.describe("Dock settings", () => {
     });
   });
 
-  test("Dock Settings opens Appearance tab in settings modal", async ({ page }) => {
+  test("Action Bar… opens Preferences tab in settings modal", async ({ page }) => {
     await joinMeeting(page, "dock-settings-modal");
 
     await openDockMenu(page);
     await page
-      .locator('.glass-select-option[role="option"]')
-      .filter({ hasText: /Dock Settings/ })
+      .locator(".glass-select-option")
+      .filter({ hasText: /Action Bar/ })
       .click();
 
     await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
 
-    // Verify the active tab is Appearance
-    await expect(page.locator(".settings-nav-button.active")).toContainText("Appearance");
-    await expect(page.locator("#settings-panel-appearance")).toBeVisible();
+    // Verify the active tab is Preferences. The menu item sets
+    // `device_settings_initial_section` to "preferences"; the old "Appearance"
+    // expectation dated from before the Action Bar section moved panels.
+    await expect(page.locator(".settings-nav-button.active")).toContainText("Preferences");
+    await expect(page.locator("#settings-panel-preferences")).toBeVisible();
 
-    // Verify "Dock Settings" section heading is visible inside the appearance panel
+    // Verify the "Action Bar" section heading is visible inside that panel —
+    // i.e. the entry point actually lands on the settings it names. The section
+    // used to be headed "Dock Settings" in the Appearance panel.
     await expect(
-      page.locator("#settings-panel-appearance").getByText("Dock Settings"),
+      page.locator("#settings-panel-preferences .appearance-section-title").filter({
+        hasText: "Action Bar",
+      }),
     ).toBeVisible();
   });
 });

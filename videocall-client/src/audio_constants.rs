@@ -23,7 +23,18 @@
 //! changing **one** constant definition.
 
 /// RMS level below which audio is considered silence (0.0–1.0 normalized).
-/// 0.01 is quite sensitive, 0.05 filters out most background noise.
+///
+/// This library-level fallback (`0.002`) is deliberately very sensitive, so a
+/// caller that supplies no threshold still registers quiet speakers rather than
+/// missing them. It applies only when `vad_threshold` is `None` — currently the
+/// waiting room, the guest-join page and the meeting page.
+///
+/// The value actually in effect on the deployed UI is **`0.02`** — ten times
+/// less sensitive, which is what filters out most background noise. It comes
+/// from `config.js`'s `vadThreshold` key, mirrored by
+/// `dioxus-ui/src/constants.rs::default_vad_threshold` when the key is absent,
+/// and is threaded through by `attendants.rs` (decoder-side, remote peers) and
+/// `host.rs` (encoder-side, local mic).
 pub const DEFAULT_VAD_THRESHOLD: f32 = 0.002;
 
 /// RMS level that maps to maximum glow intensity (1.0). Normal speech peaks ~0.05–0.15.

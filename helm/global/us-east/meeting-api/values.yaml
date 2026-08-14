@@ -69,12 +69,19 @@ meeting-api:
     - name: SERVICE_VERSION_URLS
       value: "http://websocket-us-east:8080/version,http://webtransport-us-east-lb:444/version,http://videocall-ui-us-east:80/version.json"
 
+  # Argon2 meeting-password verification (issue #1613) is CPU-bound and runs on
+  # tokio's blocking pool. Below 1000m the cgroup quota makes
+  # `available_parallelism()` floor to 1 (Rust computes quota/period with integer
+  # division, then `.max(1)`), which pins the tokio runtime to a single worker
+  # thread and caps the verifier at one permit. 1000m gives the runtime real
+  # parallelism; memory is unchanged because the verifier's peak is bounded by
+  # its semaphore (<=4 permits x ~19 MiB), not by the CPU limit.
   resources:
     limits:
-      cpu: "200m"
+      cpu: "1000m"
       memory: "256Mi"
     requests:
-      cpu: "100m"
+      cpu: "250m"
       memory: "128Mi"
 
   service:

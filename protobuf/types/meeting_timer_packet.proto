@@ -1,0 +1,240 @@
+syntax = "proto3";
+
+// Host -> relay -> all-peers MEETING TIMER STATE broadcast (issue #2136).
+// Carried inside a PacketWrapper whose packet_type is MEETING_TIMER (19).
+//
+// NOT `MEETING` (7). Read this before adding any arm that handles either.
+// The two are adjacent in name and OPPOSITE in trust model:
+//   * MEETING (7) is SERVER-AUTHORED. meeting-api publishes it on
+//     room.{id}.system after a DB-backed `require_host` check, and
+//     `classify_packet` DROPS every client-originated MEETING packet
+//     unconditionally.
+//   * MEETING_TIMER (19) is CLIENT-AUTHORED by the host and RE-BROADCAST by
+//     the relay, like REACTION (17). Its authorization is enforced by the
+//     relay itself (see AUTHORIZATION below), not by meeting-api.
+// A new drop/forward arm written on the assumption that "meeting-ish packets
+// are server-authored" would be wrong for exactly one of these.
+//
+// WHAT IT IS. The host sets a countdown that every participant sees — the
+// motivating use case is bounding a presenter's slot — and when it reaches zero
+// every participant plays an expiry sound.
+//
+// STATE, NOT AN EVENT. `running` is an absolute level ("a timer is running
+// until T" / "no timer"), never a toggle, so re-sending the SAME value is a
+// harmless no-op for every consumer. That idempotence is what makes the
+// RE-ANNOUNCE protocol below safe, and it is why the relay can stay a dumb
+// forwarder with NO server-side timer registry. A toggle-shaped message would
+// let a single lost or duplicated packet invert the room's view permanently.
+// CANCEL is therefore a state transition (`running = false`), not a separate
+// message type.
+//
+// ABSOLUTE END TIME, NOT SECONDS-REMAINING — the decision everything else
+// follows from. `ends_at_ms` is a wall-clock INSTANT, so a client that joins or
+// reconnects mid-run computes its own remaining time from ONE number and is
+// immediately correct. A seconds-remaining encoding would need continuous
+// re-sync to stay accurate and would drift between the re-syncs; an absolute
+// instant is late-joiner-correct and reconnect-safe for free. The cost is
+// host/viewer clock skew, analysed on `ends_at_ms` below.
+//
+// AUTHORIZATION: HOST-ONLY, ENFORCED BY THE RELAY.
+// Only the meeting HOST may start, extend or cancel a timer, and that is
+// enforced server-side — a modified client that is not the host cannot inject
+// one. The check is NOT the sending session's JWT `is_host` claim: that claim
+// is frozen at token-mint time and goes stale in BOTH directions after a
+// transfer-host (the demoted ex-host keeps a `true` claim; the newly promoted
+// host holds a `false` one until it reconnects). The relay instead gates on its
+// live per-room presence mirror, which `internal.meeting_host_changed` keeps in
+// step with the authoritative `meeting_participants.is_host` column. See
+// `ClientMessage.requires_host` and `session_is_room_host` in actix-api.
+//
+// "Host", not "owner", is deliberate. `meetings.creator_id` (the immutable
+// creator, surfaced to the UI as `is_owner`) never reaches the relay at all —
+// it is not a JWT claim and travels on no NATS subject. The transferable
+// `is_host` role is what every other host control in this product authorizes on
+// (`require_host` in meeting-api gates mute-all, kick, and transfer-host), it is
+// exclusive (at most one row per meeting), and it is what "the host of the
+// meeting" means to a user after a transfer.
+//
+// NOT E2EE-sealed: CLEARTEXT even when E2EE_ENABLED=true, mirroring
+// ReactionPacket, because the relay must read the inner packet to enforce
+// ingress validation (size cap + `duration_ms` bound) and a meeting timer is
+// broadcast-public by definition. Put NO private data in this message. Note
+// there is deliberately NO string field here — no label, no display name — so
+// unlike REACTION and RAISE_HAND this packet carries no attacker-controlled
+// text and needs no truncation or escaping on either side.
+//
+// ---------------------------------------------------------------------------
+// WIRE CONTRACT FOR THE CLIENT HALF. These rules are not optional; the relay
+// cannot enforce them and the feature is incorrect without them.
+// ---------------------------------------------------------------------------
+//
+// (1) HEARTBEAT WHILE RUNNING. While `running == true` the host RE-SENDS the
+//     current state every ~5s, with `ends_at_ms` and `updated_at_ms` preserved
+//     VERBATIM. This single rule does three jobs:
+//       * a late joiner sees the timer within one interval, with no join-event
+//         plumbing at all;
+//       * a client that reconnected mid-run recovers the same way;
+//       * a packet LOST on the WebTransport path (see LOSS below) is repaired.
+//     Only ONE session in the room — the host — ever sends this, which is why a
+//     heartbeat is affordable here and is NOT the design RaiseHandPacket (#2135)
+//     could use: there, every participant announces its own state, so a
+//     heartbeat would have been O(participants).
+//
+// (2) REPEAT EVERY TRANSITION. A start, an extend, and above all a CANCEL are
+//     sent 3 times, ~1s apart, with `updated_at_ms` preserved verbatim across
+//     the repeats. A cancel has no heartbeat to repair it — once `running` is
+//     false the host stops sending — so a single lost cancel would otherwise
+//     leave that peer counting down to an audible expiry the host already
+//     called off. Rule (5) makes every repeat a no-op for anyone who got the
+//     first copy.
+//
+// (3) LOSS AND REORDERING ARE REAL ON WEBTRANSPORT. This packet is small and
+//     non-media, and the WT outbound router sends exactly that class over a
+//     QUIC DATAGRAM — unreliable and unordered. Concretely: `build_outbound` in
+//     wt_chat_session.rs routes rule 1, "non-media, fits MTU -> datagram", and
+//     `is_media` there is `packet_type == PacketType::MEDIA`, which
+//     MEETING_TIMER is not; the whole packet is ~35 bytes, far inside
+//     DATAGRAM_MAX_SIZE. On WebSocket (the default transport since #2045) the
+//     path is TCP behind a single-publisher NATS subject, so it does not
+//     REORDER — but it is not loss-free either: this class is
+//     OutboundPriority::Control, which is never preemptively shed, yet a full
+//     outbound channel still drops it (`TrySendError::Full` -> `channel_full`).
+//     So rule (1) earns its keep on BOTH transports and only rule (5) is
+//     WT-specific. Do not simplify any of them away on the grounds that "the
+//     default transport is reliable".
+//
+// (2b) DEBOUNCE RAPID TRANSITIONS. Three "+1 min" clicks in two seconds would be
+//     3 transitions x 3 repeats + a heartbeat = 10 packets, over the relay's
+//     per-sender budget, and the drops would land on the LAST burst — the one
+//     carrying the state that matters. Coalesce a rapid run of adjustments into
+//     ONE repeat burst for the settled state. Every intermediate state is a
+//     value the host has already changed, so nothing is lost by not sending it.
+//
+// (4) COMPUTE THE COUNTDOWN AGAINST A MONOTONIC CLOCK. On receipt, sample
+//     `remaining = ends_at_ms - now_wall_clock` ONCE, then count that remaining
+//     span down with a monotonic clock (`performance.now()`), not by
+//     re-evaluating `Date.now()` each tick. Clock skew then enters exactly once,
+//     at receipt, instead of being re-applied every tick, and a wall-clock STEP
+//     after receipt (an NTP correction, a manual change) cannot jump or freeze a
+//     running countdown. Clamp the rendered remaining to >= 0 and never render a
+//     negative value.
+//
+// (5) LAST-WRITER-WINS ON `updated_at_ms`, WITH A BOUNDED REJECTION WINDOW.
+//     Apply an incoming packet unless it is older than the currently applied
+//     state by no more than ~5s:
+//
+//         reject iff  0 < applied.updated_at_ms - incoming.updated_at_ms <= 5000
+//
+//     The upper bound is load-bearing and is the whole point. Nothing on any of
+//     these paths is in flight for 5 seconds, so a packet that is older by MORE
+//     than that is not reordering — it is a host wall-clock step backwards, and
+//     an unbounded `incoming < applied -> reject` comparator would then reject
+//     every subsequent state the host authored, INCLUDING THE CANCEL, wedging a
+//     timer nobody can stop until it expires and beeps at the whole room. That
+//     is the #2122 failure shape exactly: a guard meant to fail open turning
+//     fail-closed under clock arithmetic. Bounding the rejection makes a large
+//     backwards step self-correcting (the next packet is simply applied) while
+//     still suppressing genuine reordering.
+message MeetingTimerPacket {
+  // Absolute timer state. true = a timer is running and ends at `ends_at_ms`;
+  // false = NO timer (never started, cancelled, or cleared). NOT a toggle.
+  //
+  // proto3 omits default values on the wire, so a CANCEL serializes to zero
+  // bytes for this field — which also means an EMPTY or truncated payload
+  // parses as `running = false`. That degradation is deliberately the SAFE one:
+  // the worst a corrupt payload can do is clear the timer, never start one and
+  // never trigger the expiry sound.
+  //
+  // WHY THIS FIELD IS NOT REDUNDANT with `ends_at_ms == 0`: a CANCELLED timer
+  // and an EXPIRED timer must be distinguishable, because they differ in the
+  // one behaviour users hear. An expired timer (running = true, `ends_at_ms` in
+  // the past) plays the expiry sound; a cancelled one is silent. With only an
+  // end instant to go on, a cancel would be indistinguishable from a timer that
+  // ended at the epoch and every cancel would beep.
+  bool running = 1;
+
+  // Unix epoch milliseconds at which the timer reaches zero. Meaningless (send
+  // 0) when `running == false`.
+  //
+  // Computed ONCE, by the host, at the start/extend transition, and preserved
+  // VERBATIM across every heartbeat and repeat. Never recompute it on a
+  // re-send: recomputing is what would let a host clock step leak into a
+  // running timer that viewers had already sampled correctly.
+  //
+  // WHICH CLOCK, AND WHAT THE SKEW COSTS: this is the HOST'S WALL clock (epoch
+  // ms, so time zones are irrelevant — only absolute offset matters), and each
+  // viewer subtracts its OWN wall clock from it. The rendered remaining time is
+  // therefore off by exactly the host/viewer clock skew.
+  //   * In practice that is nothing. Desktop and mobile OSes are NTP-synced by
+  //     default and hold well under a second of offset; against a timer measured
+  //     in minutes, and rendered at 1-second granularity, sub-second skew is not
+  //     observable. Even a pathological 5s of skew on a 5-minute slot is 1.7%.
+  //   * It does not accumulate. Skew is sampled once at receipt (see wire
+  //     contract rule 4) rather than re-applied on every tick.
+  //   * A client whose clock is wrong by minutes or hours WILL render nonsense —
+  //     but that client already renders every timestamp in the product wrong,
+  //     and the failure is confined to its own screen.
+  // So this is deliberately NOT corrected. The alternative — having the relay
+  // stamp its own `now` so viewers could estimate an offset — buys accuracy we
+  // cannot use (the estimate would fold in an unmeasured one-way network delay,
+  // and the relay's clock is no more trustworthy than the host's) at the cost of
+  // a clock-offset estimator on every client. If a future need for it appears,
+  // it is an additive field and this design does not block it.
+  //
+  // The relay deliberately performs NO clock arithmetic on this field: it never
+  // compares it to the relay's own clock and never rewrites it. A "reject
+  // timers ending too far in the future" rule would have to read the relay
+  // clock, and a relay clock that stepped backwards would then start rejecting
+  // legitimate timers — a fail-closed wedge for no benefit, since the sender is
+  // the authorized host and is entitled to set any end time it likes.
+  uint64 ends_at_ms = 2;
+
+  // Total span this timer currently represents, in milliseconds — the duration
+  // the host configured, INCLUDING any extension (an extend from 5 to 8 minutes
+  // sets 8 minutes here, not 3). Meaningless (send 0) when `running == false`.
+  //
+  // DISPLAY ONLY. `ends_at_ms` alone is the authoritative countdown; this exists
+  // so a client can render a proportion (a progress ring, "3:12 of 5:00")
+  // without a second clock. It is required rather than optional precisely
+  // BECAUSE of late joiners: a client that joins mid-run has no way to know the
+  // timer started at five minutes, so a client-side "total" reconstructed from
+  // first observation would be wrong for exactly the clients this design exists
+  // to serve.
+  //
+  // `started_at_ms` is `ends_at_ms - duration_ms`. Compute it with a SATURATING
+  // subtraction, and likewise for `remaining = ends_at_ms - now`: the relay
+  // rejects `ends_at_ms < duration_ms` at ingress so the first cannot underflow
+  // from a conforming relay, but a peer may be running an older one, and the
+  // SECOND underflows routinely and by design — every timer that has expired has
+  // `now > ends_at_ms`. An unguarded `u64` subtraction there panics in a debug
+  // wasm build, which aborts the module and drops the whole call for that tab.
+  //
+  // Bounded at ingress by MEETING_TIMER_MAX_DURATION_MS (24h); an over-cap value
+  // DROPS the packet. That bound is arithmetic hygiene, not authorization — the
+  // host is entitled to any duration within it — and it exists so an unbounded
+  // u64 cannot overflow client-side arithmetic. The client MUST clamp
+  // independently before rendering, exactly as it does for REACTION's
+  // `custom_emoji`: a peer may be running an older or newer relay.
+  uint64 duration_ms = 3;
+
+  // Unix epoch milliseconds at which the host AUTHORED this state, set once at
+  // the transition that produced it and preserved VERBATIM across every
+  // heartbeat and repeat of that same state. Re-stamping it on a re-send would
+  // destroy the ordering guarantee it exists to provide.
+  //
+  // Its sole consumer is the last-writer-wins comparator in wire contract rule
+  // (5), which suppresses a reordered packet on the WebTransport datagram path
+  // — the case where a stale START could otherwise land after a CANCEL and
+  // resurrect a timer the host already stopped. Read rule (5) before writing
+  // that comparator: it has a bounded rejection window, and the bound is what
+  // stops a host clock step from wedging the feature.
+  //
+  // Same trust class as RaiseHandPacket.raised_at_ms: sender wall clock,
+  // ADVISORY, never authorization. It cannot be relay-stamped (a heartbeat would
+  // then be re-stamped later and defeat the comparator), and it cannot be a
+  // per-client monotonic clock (those have per-tab origins and are not
+  // comparable across the reconnects this must survive). Forgery is not a
+  // concern here in the way it is for a raised hand: only the host can send this
+  // packet at all, and the host can already author any state it wants.
+  uint64 updated_at_ms = 4;
+}

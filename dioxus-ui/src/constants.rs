@@ -246,6 +246,45 @@ pub struct RuntimeConfig {
     #[serde(rename = "logLevel")]
     #[serde(default)]
     pub log_level: Option<String>,
+    /// Operator gate for the REDUCED camera simulcast ladder (issue #1768):
+    /// `180p / 360p / 540p` instead of the shipped `180p / 360p / 720p`.
+    ///
+    /// **Default: OFF** (absent/falsy → the shipped ladder, byte-identical
+    /// behaviour). When truthy (`"true"`/`"1"`/…) every publisher on this
+    /// deployment encodes its top camera rung at 960×540@30 (900 kbps ideal)
+    /// rather than 1280×720@30 (1500 kbps).
+    ///
+    /// # Why a runtime flag rather than a code change
+    ///
+    /// The top rung is ~87.8% of a 3-layer encode's cost, so re-cutting the
+    /// ladder is the main CPU lever — but evaluating each candidate otherwise
+    /// costs a wasm rebuild + full deploy. Behind this key an experiment is a
+    /// `helm upgrade` of `runtimeConfig`.
+    ///
+    /// # DEPLOYMENT-WIDE, not a per-user A/B
+    ///
+    /// The wire carries only a layer INDEX, never geometry, so a receiver
+    /// resolves a rung's native height from its OWN compiled ladder for the
+    /// #1256 tile-size lid. A mixed-variant room still DECODES correctly (the
+    /// decoder takes dimensions from the decoded frame, not this table), but the
+    /// lid turns conservative. Keep the value uniform across a deployment.
+    ///
+    /// Both publisher-side halves — the encoder's geometry and the AQ
+    /// controller's uplink budget — are driven from ONE read of this key (see
+    /// `host.rs`), because gating only one would make the controller budget for
+    /// bitrate the encoder never sends.
+    ///
+    /// The native Rust `bot/` crate has no `config.js` and therefore always
+    /// publishes the DEFAULT ladder; the browser bots-app drives the real client
+    /// and so inherits whatever the deployment serves.
+    ///
+    /// CRITICAL (config.js bind-mount trap, see project memory): a defaulted
+    /// `String` (not a bare `bool`) so a stale bind-mounted `config.js` that
+    /// predates this key parses to `""` → falsy → the shipped ladder, never a
+    /// startup-bricking parse failure. Mirrors `skipCanvasPaint`.
+    #[serde(rename = "experimentalReducedLadder")]
+    #[serde(default)]
+    pub experimental_reduced_ladder: String,
 }
 
 fn default_vad_threshold() -> f32 {
@@ -394,6 +433,72 @@ pub fn skip_canvas_paint() -> bool {
     app_config()
         .map(|c| truthy(Some(c.skip_canvas_paint.as_str())))
         .unwrap_or(false)
+}
+
+/// Which CAMERA simulcast ladder publishers on this deployment encode against
+/// (issue #1768). `experimentalReducedLadder` truthy → the reduced
+/// `180p/360p/540p` ladder; absent, empty, falsy, or an unreadable config → the
+/// shipped `180p/360p/720p` ladder (`LadderVariant::Default`), i.e. behaviour
+/// identical to pre-#1768.
+///
+/// Resolved independently by the publisher `Host`, each client-options construction
+/// site, and the memoized rung-label accessor. `Host` threads it into the camera
+/// encoder's geometry and the AQ controller's uplink budget; client options feed
+/// receiver-side display resolution; the accessor feeds send/receive rung labels.
+/// See [`RuntimeConfig::experimental_reduced_ladder`] for why the publisher halves
+/// must agree and why this is a deployment-wide switch rather than a per-user A/B.
+pub fn camera_ladder_variant() -> videocall_client::adaptive_quality_constants::LadderVariant {
+    // `app_config()` needs `window.__APP_CONFIG`, so only this read is
+    // browser-bound; the DECISION is delegated to the pure fn below so the
+    // config→variant mapping is ALSO pinned by the fast native `--lib` suite, not
+    // only by the browser-bound `tests/reduced_ladder_flag.rs` spec.
+    //
+    // DIAGNOSABILITY: fail-open is right (never brick a call over a flag), but
+    // "flag off" and "config unreadable" must NOT be indistinguishable. Both yield
+    // `Default`, so without this warning an operator who set
+    // `experimentalReducedLadder: "true"` alongside (say) a malformed sibling key
+    // that breaks the whole `__APP_CONFIG` parse would get a silent 720p run whose
+    // logs look exactly like a valid control arm — the measurement the flag exists
+    // for would simply never be taken. `app_config()` does not cache `Err`, so a
+    // transient failure here is otherwise invisible.
+    let raw = match app_config() {
+        Ok(cfg) => Some(cfg.experimental_reduced_ladder),
+        Err(e) => {
+            log::warn!(
+                "camera_ladder_variant: runtime config unreadable ({e}); falling back to the \
+                 SHIPPED camera ladder. If experimentalReducedLadder was set, it is NOT in \
+                 effect for this session."
+            );
+            None
+        }
+    };
+    camera_ladder_variant_from_flag(raw.as_deref())
+}
+
+/// Resolve the camera [`LadderVariant`] from the raw `experimentalReducedLadder`
+/// config value (issue #1768).
+///
+/// `None` = the config could not be read at all (pre-`config.js` cold-load window,
+/// or a non-browser host) → **fail OPEN to the shipped ladder**, never panic.
+/// Otherwise the value goes through [`videocall_types::truthy`], so `"true"`/`"1"`
+/// select the reduced ladder while `""` (the serde default for an absent key —
+/// the config.js bind-mount case) and any falsy value keep the shipped one.
+///
+/// Split out of [`camera_ladder_variant`] deliberately: that fn's `app_config()`
+/// read requires a browser, which would confine this decision to the wasm-bindgen
+/// `tests/` suite (run by `pr-check-dioxus-ui-hcl.yaml`, but only via a
+/// per-target enumerated step — a target with no step is compiled and never
+/// executed). As a pure fn the config→variant mapping is ALSO pinned by the fast
+/// native `--lib` suite, so both halves of the gate are covered.
+pub(crate) fn camera_ladder_variant_from_flag(
+    raw: Option<&str>,
+) -> videocall_client::adaptive_quality_constants::LadderVariant {
+    use videocall_client::adaptive_quality_constants::LadderVariant;
+    if truthy(raw) {
+        LadderVariant::Reduced
+    } else {
+        LadderVariant::Default
+    }
 }
 
 /// Parse a `logLevel` string (case-insensitive `trace`/`debug`/`info`/`warn`/
@@ -951,7 +1056,82 @@ mod simulcast_default_tests {
 
 #[cfg(test)]
 mod runtime_config_tests {
-    use super::RuntimeConfig;
+    use super::{camera_ladder_variant_from_flag, RuntimeConfig};
+    use videocall_client::adaptive_quality_constants::LadderVariant;
+
+    /// Issue #1768: the config→`LadderVariant` decision, pinned in the NATIVE
+    /// `--lib` suite — the fast, browserless half of the gate's coverage.
+    ///
+    /// This closes the seam the pre-submit gate found: the other tests around this
+    /// feature stop one step short on both sides — the parse tests apply `truthy`
+    /// themselves, and the videocall-client encoder/controller tests are handed a
+    /// `LadderVariant` directly. Neither fails if the resolution itself is dead.
+    ///
+    /// Companion coverage: `tests/reduced_ladder_flag.rs` exercises the same
+    /// mapping through the real `window.__APP_CONFIG` (i.e. including
+    /// `camera_ladder_variant()`'s `app_config()` read, which this pure fn does not
+    /// reach). That one needs a browser, and is run by its own enumerated step in
+    /// `.github/workflows/pr-check-dioxus-ui-hcl.yaml` — a target with no step
+    /// there is compiled but never executed, so the step is load-bearing.
+    ///
+    /// MUTATION: hardcode `camera_ladder_variant_from_flag` to return
+    /// `LadderVariant::Default` (i.e. silently disable the whole gate) and this
+    /// test fails. Invert the branch and the falsy cases fail.
+    #[test]
+    fn reduced_ladder_flag_resolves_to_the_right_variant() {
+        // `videocall_types::truthy` accepts exactly "true"/"1", case-insensitive.
+        for raw in ["true", "1", "TRUE", "True"] {
+            assert_eq!(
+                camera_ladder_variant_from_flag(Some(raw)),
+                LadderVariant::Reduced,
+                "experimentalReducedLadder={raw:?} must select the reduced ladder"
+            );
+        }
+        // Falsy, empty (the serde default for an ABSENT key — the config.js
+        // bind-mount case), and non-truthy junk must all keep the shipped ladder.
+        for raw in ["false", "0", "", "no", "yes", "reduced"] {
+            assert_eq!(
+                camera_ladder_variant_from_flag(Some(raw)),
+                LadderVariant::Default,
+                "experimentalReducedLadder={raw:?} must keep the shipped ladder"
+            );
+        }
+        // `None` = config unreadable (pre-config.js cold load, or a non-browser
+        // host): FAIL OPEN to the shipped ladder, never panic and never opt in.
+        assert_eq!(
+            camera_ladder_variant_from_flag(None),
+            LadderVariant::Default,
+            "an unreadable config must fail OPEN to the shipped ladder"
+        );
+    }
+
+    /// The DEFAULT arm and the serde default must agree: a config that omits the
+    /// key parses to `""`, and `""` must resolve to `Default`. Pins the two halves
+    /// in lockstep so changing the serde default without the accessor (or vice
+    /// versa) fails here rather than silently flipping a deployment's ladder.
+    #[test]
+    fn absent_reduced_ladder_key_resolves_to_default_ladder() {
+        let config: RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "apiBaseUrl": "http://test:8080",
+            "wsUrl": "ws://test:8080",
+            "webTransportHost": "https://test:4433",
+            "oauthEnabled": "false",
+            "e2eeEnabled": "false",
+            "webTransportEnabled": "false",
+            "usersAllowedToStream": "",
+            "serverElectionPeriodMs": 2000
+        }))
+        .expect("a config omitting experimentalReducedLadder must parse");
+        assert_eq!(config.experimental_reduced_ladder, "");
+        assert_eq!(
+            camera_ladder_variant_from_flag(Some(&config.experimental_reduced_ladder)),
+            LadderVariant::Default,
+            // NOTE: written "issue 1768", not "#1768" — a `#` followed by 3-8 hex
+            // chars trips `scripts/check-hardcoded-colors.sh`, whose comment-line
+            // exemption does not cover string literals.
+            "issue 1768: an omitted key must leave the shipped ladder in place"
+        );
+    }
 
     /// Issue #1193: bitrate targets are owned by the centralized AQ tables, so
     /// runtime configuration no longer requires the legacy audio/video/screen
@@ -973,6 +1153,52 @@ mod runtime_config_tests {
         assert_eq!(config.server_election_period_ms, 2000);
         assert_eq!(config.max_received_layer, None);
         assert_eq!(config.skip_canvas_paint, "");
+        // Issue #1768: a config.js predating `experimentalReducedLadder` must
+        // parse to the empty string (→ falsy → the shipped ladder), NOT fail. This
+        // is the config.js bind-mount trap: the e2e docker stack and every
+        // deployed environment bind-mount a committed config.js that does not
+        // contain this key.
+        assert_eq!(config.experimental_reduced_ladder, "");
+    }
+
+    /// Issue #1768: an explicitly-set `experimentalReducedLadder` parses and is
+    /// carried through, and the truthy/falsy mapping is the one
+    /// [`super::camera_ladder_variant`] applies.
+    ///
+    /// `camera_ladder_variant()` itself reads `window.__APP_CONFIG` and so cannot
+    /// run on the host target; this pins the FIELD + the `truthy` contract it
+    /// composes with, which is the part a stale config.js can break.
+    #[test]
+    fn parses_experimental_reduced_ladder_flag() {
+        let base = serde_json::json!({
+            "apiBaseUrl": "http://test:8080",
+            "wsUrl": "ws://test:8080",
+            "webTransportHost": "https://test:4433",
+            "oauthEnabled": "false",
+            "e2eeEnabled": "false",
+            "webTransportEnabled": "false",
+            "usersAllowedToStream": "",
+            "serverElectionPeriodMs": 2000
+        });
+
+        for (raw, expect_reduced) in [
+            ("true", true),
+            ("1", true),
+            ("false", false),
+            ("", false),
+            ("0", false),
+        ] {
+            let mut json = base.clone();
+            json["experimentalReducedLadder"] = serde_json::Value::String(raw.to_string());
+            let config: RuntimeConfig = serde_json::from_value(json)
+                .expect("config with the reduced-ladder key must parse");
+            assert_eq!(config.experimental_reduced_ladder, raw);
+            assert_eq!(
+                videocall_types::truthy(Some(config.experimental_reduced_ladder.as_str())),
+                expect_reduced,
+                "experimentalReducedLadder={raw:?} must map to reduced={expect_reduced}"
+            );
+        }
     }
 }
 

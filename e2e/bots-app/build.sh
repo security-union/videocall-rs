@@ -77,6 +77,25 @@ echo "==> Built and tagged:"
 echo "    ${IMAGE_TAGGED}"
 echo "    ${IMAGE_LATEST}"
 
+# Guard: the `setcap cap_net_admin+eip /usr/sbin/tc` xattr must survive the
+# build (a lost cap silently reintroduces tc EPERM at runtime, breaking netem).
+# Assert it on the built image; warn loudly rather than fail (some backends drop
+# xattrs and the fleet still works minus netem).
+#
+# The image sets an ENTRYPOINT (the bot launcher) and no CMD, so a bare
+# `<runtime> run IMAGE getcap …` would APPEND getcap as args to the entrypoint
+# (which ignores argv and aborts on its login preflight) instead of running
+# getcap — the check would then warn on every build. `--entrypoint getcap`
+# actually invokes it. Derive the runtime from BUILD by dropping its trailing
+# `build` subcommand, so the PODMAN_REMOTE path inspects the image on the SAME
+# (remote) daemon that built it rather than a local one that lacks it.
+RUNTIME=("${BUILD[@]:0:${#BUILD[@]}-1}")
+if "${RUNTIME[@]}" run --rm --entrypoint getcap "${IMAGE_TAGGED}" /usr/sbin/tc 2>/dev/null | grep -q cap_net_admin; then
+  echo "==> OK: /usr/sbin/tc retains cap_net_admin+eip"
+else
+  echo "==> WARNING: cap_net_admin NOT found on /usr/sbin/tc in the built image — per-pod netem will EPERM at runtime" >&2
+fi
+
 # ── Push (opt-in) ────────────────────────────────────────────────────────────
 # Enable with PUSH=1. Auth uses the Harbor push user (HARBOR_USERNAME; never
 # commit the password; pass it via env / stdin).

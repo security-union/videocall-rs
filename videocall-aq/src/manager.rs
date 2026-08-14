@@ -110,6 +110,25 @@ pub struct AdaptiveQualityManager {
     /// `None` means no ceiling (default).
     quality_ceiling_index: Option<usize>,
 
+    /// SOURCE/device ceiling (issue #2179 review): step-up cannot go below
+    /// (better quality than) this index for the life of the current share.
+    ///
+    /// Unlike [`Self::quality_ceiling_index`] (cross-stream coordination) and
+    /// `crash_ceiling_index` (yo-yo backoff, decays), this one does NOT decay:
+    /// it encodes facts that do not change while a share runs — the captured
+    /// surface's own resolution, the sender's CPU class, and whether the share
+    /// publishes one rung or a ladder. Installed by
+    /// [`crate::controller::EncoderBitrateController::set_source_tier_ceiling`]
+    /// from [`crate::constants::resolve_screen_tier_ceiling`] at share start and
+    /// cleared at share stop. `None` means no source ceiling (default; every
+    /// camera controller and any pre-#2179 caller).
+    ///
+    /// It composes with the user's bounds through
+    /// [`Self::video_step_up_floor`] (`max` of the internal ceilings and the
+    /// user's `best`), so it can only ever ADD restriction — it never loosens a
+    /// user cap and is never loosened by one.
+    source_ceiling_index: Option<usize>,
+
     // --- User-configurable quality bounds (issue #961) ---
     //
     // QUALITY IS THE INVERSE OF INDEX. Tier index 0 = BEST quality (highest
@@ -292,6 +311,7 @@ impl AdaptiveQualityManager {
             created_at_ms: now,
             warmup_ms,
             quality_ceiling_index: None,
+            source_ceiling_index: None,
             // User-configurable quality bounds (issue #961). Default both ends
             // to None on every stream so behaviour is unchanged until the user
             // opts in via set_video_quality_bounds / set_audio_quality_bounds.
@@ -362,11 +382,14 @@ impl AdaptiveQualityManager {
 
     /// Create a new manager for screen share.
     ///
-    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` ("medium", 720p/8fps — the midpoint
-    /// of the 3-tier screen-share ladder). Peers see an acceptable baseline
-    /// immediately and the PID controller adapts in either direction: stepping
-    /// up to 1080p when bandwidth is plentiful, or down to 720p/5fps when the
-    /// network is constrained.
+    /// Starts at `DEFAULT_SCREEN_TIER_INDEX` ("medium", 720p/8fps) — the
+    /// bandwidth-conservative fallback baseline. A live screen share does not
+    /// stay here: the encoder re-seeds this manager (via
+    /// `EncoderBitrateController::set_initial_video_tier`) with the tier
+    /// resolved from the captured SOURCE resolution once capture starts (issue
+    /// #2179). From wherever it is seeded, the PID controller adapts in either
+    /// direction: stepping up toward the 1440p/2160p rungs when bandwidth is
+    /// plentiful, or down to 720p/5fps when the network is constrained.
     pub fn new_for_screen(video_tiers: &'static [VideoQualityTier]) -> Self {
         Self::new_with_warmup(
             video_tiers,
@@ -1067,6 +1090,28 @@ impl AdaptiveQualityManager {
         if let Some(cap) = worst {
             target = target.min(cap);
         }
+        // Issue #2179 review r3 (security): the `worst`/CAP direction pulls the
+        // index DOWN — i.e. toward BETTER quality — so on its own it can snap the
+        // tier past the source/device ceiling. A user pinning their MINIMUM
+        // quality to the top rung would land a single-stream share on `native`
+        // (3840x2160 at 8000 kbps), which is exactly what the ceiling exists to
+        // prevent. Re-apply the ceiling last so no bound direction can escape it.
+        //
+        // Deliberately `source_ceiling_index` and NOT `effective_ceiling()`,
+        // for two reasons:
+        // - the crash and cross-stream-coordination ceilings DECAY, so folding
+        //   them in here would let a ceiling that has since lifted permanently
+        //   pin a user's bound;
+        // - `source_ceiling_index` is installed ONLY by
+        //   `EncoderBitrateController::set_source_tier_ceiling`, which only the
+        //   screen encoder calls, so this clamp cannot fire on a camera manager
+        //   and the camera path stays byte-identical. (The other two ceilings
+        //   are NOT camera-free: `notify_screen_sharing` sets
+        //   `quality_ceiling_index` on the CAMERA controller when a screen share
+        //   starts, and `maybe_arm_ceiling` is generic to both.)
+        if let Some(source_ceiling) = self.source_ceiling_index {
+            target = target.max(source_ceiling);
+        }
         if target != self.video_tier_index {
             self.force_video_step_to(target, now_ms);
         }
@@ -1076,6 +1121,68 @@ impl AdaptiveQualityManager {
              current index now {}",
             self.video_tier_index,
         );
+    }
+
+    /// Install (or clear) the PERSISTENT source/device quality ceiling for the
+    /// current share (issue #2179 review).
+    ///
+    /// `index` is a FLOOR on the tier index — quality is the inverse of index —
+    /// so the adaptation loop may still step DOWN from it freely under
+    /// congestion but can never climb PAST it. `None` clears it.
+    ///
+    /// Composition, not replacement: this lands in [`Self::effective_ceiling`],
+    /// which [`Self::video_step_up_floor`] combines with the user's `best` bound
+    /// via `max`. A user who pinned a WORSE max quality keeps their pin; a user
+    /// who pinned a BETTER one does not get to exceed this ceiling.
+    ///
+    /// If the current tier is already better (lower index) than the new ceiling,
+    /// it is snapped into range immediately via [`Self::force_video_step_to`]
+    /// rather than waiting for the next adaptation tick — same behaviour as
+    /// [`Self::set_video_quality_bounds`], because a ceiling that takes a second
+    /// to bite would let the first frames go out at the very rung it forbids.
+    pub fn set_source_ceiling(&mut self, index: Option<usize>, now_ms: f64) {
+        let max_index = self.video_tiers.len().saturating_sub(1);
+        let index = index.map(|i| i.min(max_index));
+        self.source_ceiling_index = index;
+        if let Some(floor) = index {
+            if self.video_tier_index < floor {
+                self.force_video_step_to(floor, now_ms);
+            }
+        }
+        log::info!(
+            "AdaptiveQuality: source/device tier ceiling set to {index:?}; current index now {}",
+            self.video_tier_index,
+        );
+    }
+
+    /// The persistent source/device ceiling index, or `None` when unset.
+    pub fn source_ceiling_index(&self) -> Option<usize> {
+        self.source_ceiling_index
+    }
+
+    /// Whether the video tier has been QUIET — no step-DOWN — for at least
+    /// `window_ms` (issue #2179 review). `true` when no step-down has ever been
+    /// recorded (or the crash memory was reset).
+    ///
+    /// This is the closest thing this controller has to "my uplink is currently
+    /// coping": a video step-down is driven by the sender's own congestion axes
+    /// (sustained encoder backpressure, and the out-of-band
+    /// [`Self::force_video_step_down`] used for WS send-buffer backpressure, WS
+    /// stale-delta drop bursts and WT unistream drop bursts). It is used by the
+    /// simulcast headroom probe, which is otherwise blind to those out-of-band
+    /// axes: they never touch the encoder queue, so a sender whose uplink is
+    /// visibly dropping packets could still earn another rung 6 s later.
+    ///
+    /// Deliberately NOT "is the tier at the top of the ladder": the tier starts
+    /// mid-ladder and climbs, so an at-the-top test would block the probe for
+    /// the whole cold-start climb on a perfectly healthy link. A time-bounded
+    /// quiet window cannot wedge — it re-opens `window_ms` after the last
+    /// step-down, with no consecutive-success counter to reset.
+    pub fn no_video_step_down_within(&self, now_ms: f64, window_ms: f64) -> bool {
+        match self.last_step_down_ms {
+            None => true,
+            Some(last) => now_ms - last >= window_ms,
+        }
     }
 
     /// Set user-configurable quality bounds for the **audio** tier (issue #961).
@@ -1275,8 +1382,9 @@ impl AdaptiveQualityManager {
     /// 1080p rung immediately is what de-fuzzes the content. The existing
     /// shed-down machinery (`drop_top_layer` under sustained encoder
     /// backpressure / congestion) still reduces active back toward the floor (1)
-    /// under genuine congestion, and the ramp can still earn the deferred MIDDLE
-    /// `medium` rung up to the full 3-rung ceiling when uplink allows.
+    /// under genuine congestion, and the ramp can still earn the deferred TOP
+    /// `1440p` rung (issue #2179) up to the full 3-rung ceiling when uplink
+    /// allows.
     ///
     /// `initial_active` is the requested optimistic seed (callers pass
     /// `SCREEN_INITIAL_ACTIVE_LAYERS`); it is clamped to `[1, clamped_n]` so it
@@ -1417,12 +1525,14 @@ impl AdaptiveQualityManager {
     // -----------------------------------------------------------------
 
     /// Compute the effective ceiling index — the tighter (higher index,
-    /// meaning lower quality) of the screen share coordination ceiling and
-    /// the crash ceiling. Returns 0 when neither ceiling is active.
+    /// meaning lower quality) of the screen share coordination ceiling, the
+    /// crash ceiling and the persistent source/device ceiling (issue #2179).
+    /// Returns 0 when none of them is active.
     fn effective_ceiling(&self) -> usize {
         let coord = self.quality_ceiling_index.unwrap_or(0);
         let crash = self.crash_ceiling_index.unwrap_or(0);
-        coord.max(crash)
+        let source = self.source_ceiling_index.unwrap_or(0);
+        coord.max(crash).max(source)
     }
 
     /// Compute the current recovery slowdown factor. Decays linearly from
@@ -2241,6 +2351,165 @@ mod tests {
         let mut mgr = new_test_manager(video_tiers);
         mgr.video_tier_index = tier_index;
         mgr
+    }
+
+    /// Issue #2179 review: the persistent source/device ceiling must stop the
+    /// PID climbing past the best rung the share is entitled to, and must
+    /// COMPOSE with (not replace) the user's own bounds.
+    ///
+    /// Mutation guard: drop the `source` term from `effective_ceiling()` and the
+    /// sustained-clear loop climbs all the way to index 0, failing the
+    /// "must not climb past" assertion.
+    #[test]
+    fn source_ceiling_pins_step_up_and_composes_with_user_bounds() {
+        use crate::constants::screen_tier_index_by_label;
+        let high = screen_tier_index_by_label("high");
+        let best_1440p = screen_tier_index_by_label("1440p");
+        let mut mgr = new_test_manager_at(SCREEN_QUALITY_TIERS, high + 1);
+        mgr.set_source_ceiling(Some(high), 0.0);
+        assert_eq!(
+            mgr.video_tier_index(),
+            high + 1,
+            "a tier WORSE than the ceiling is left alone (the ceiling is a floor, not a target)"
+        );
+
+        // Sustained-clear backpressure climbs to the ceiling and then stops.
+        let mut t = 10_000.0;
+        for _ in 0..8 {
+            let _ = mgr.update_from_backpressure(false, true, t);
+            t += 5_100.0;
+        }
+        assert_eq!(
+            mgr.video_tier_index(),
+            high,
+            "the PID must climb TO the source/device ceiling but never past it"
+        );
+
+        // A user "max quality" BETTER than the ceiling cannot loosen it.
+        mgr.set_video_quality_bounds(Some(best_1440p), None, t);
+        for _ in 0..4 {
+            let _ = mgr.update_from_backpressure(false, true, t);
+            t += 5_100.0;
+        }
+        assert_eq!(
+            mgr.video_tier_index(),
+            high,
+            "a user best-bound better than the ceiling must not override it"
+        );
+
+        // A user "max quality" WORSE than the ceiling is MORE restrictive and
+        // therefore wins — composition works in both directions.
+        let worse = high + 1;
+        mgr.set_video_quality_bounds(Some(worse), None, t);
+        assert_eq!(
+            mgr.video_tier_index(),
+            worse,
+            "the more restrictive of (user best, source ceiling) must bind"
+        );
+
+        // Clearing the ceiling releases the pin.
+        mgr.set_video_quality_bounds(None, None, t);
+        mgr.set_source_ceiling(None, t);
+        for _ in 0..8 {
+            let _ = mgr.update_from_backpressure(false, true, t);
+            t += 5_100.0;
+        }
+        assert_eq!(
+            mgr.video_tier_index(),
+            0,
+            "clearing the ceiling must release the pin"
+        );
+    }
+
+    /// Issue #2179 review r3 (security): the user's MIN-quality bound is a CAP
+    /// on the index, so it moves the tier toward BETTER quality and could snap
+    /// straight past the source/device ceiling. The existing bounds tests cover
+    /// only the `best`/floor direction, which cannot escape.
+    ///
+    /// Mutation guard: drop the `source_ceiling_index` re-clamp at the end of
+    /// `set_video_quality_bounds` and the first assertion lands on index 0 — a
+    /// single-stream 8-core sender publishing 3840x2160 at 8000 kbps.
+    #[test]
+    fn user_min_quality_cap_cannot_snap_past_the_source_ceiling() {
+        use crate::constants::screen_tier_index_by_label;
+        let rung_1440p = screen_tier_index_by_label("1440p");
+        let mut mgr = new_test_manager_at(SCREEN_QUALITY_TIERS, rung_1440p);
+        mgr.set_source_ceiling(Some(rung_1440p), 0.0);
+
+        // "My minimum quality is the TOP rung" — a cap of 0.
+        mgr.set_video_quality_bounds(None, Some(0), 1_000.0);
+        assert_eq!(
+            mgr.video_tier_index(),
+            rung_1440p,
+            "a min-quality cap better than the ceiling must not snap past it"
+        );
+
+        // The SAME call with no ceiling installed snaps all the way to index 0 —
+        // which is both the pre-existing user-bounds semantics (unchanged, and
+        // what keeps the camera path byte-identical, since its
+        // `source_ceiling_index` is always `None`) and the proof that the cap
+        // genuinely moves the tier. The assertion above is therefore the ceiling
+        // doing work, not the cap being inert.
+        let mut free = new_test_manager_at(SCREEN_QUALITY_TIERS, rung_1440p);
+        free.set_video_quality_bounds(None, Some(0), 1_000.0);
+        assert_eq!(
+            free.video_tier_index(),
+            0,
+            "without a ceiling a min-quality cap snaps the tier to the top rung"
+        );
+
+        // And the floor direction still composes as before.
+        let mut both = new_test_manager_at(SCREEN_QUALITY_TIERS, rung_1440p);
+        both.set_source_ceiling(Some(rung_1440p), 0.0);
+        // (`best` and `worst` together would be an INVERTED range, which
+        // `normalize_bounds` swaps — so the floor is asserted on its own.)
+        both.set_video_quality_bounds(Some(SCREEN_QUALITY_TIERS.len() - 1), None, 1_000.0);
+        assert_eq!(
+            both.video_tier_index(),
+            SCREEN_QUALITY_TIERS.len() - 1,
+            "a user floor WORSE than the ceiling is more restrictive and still wins"
+        );
+    }
+
+    /// Installing a ceiling while the tier is BETTER than it must snap the tier
+    /// into range immediately, not on some later tick — the first GOP must not
+    /// go out at the forbidden rung.
+    #[test]
+    fn source_ceiling_snaps_a_too_good_tier_immediately() {
+        use crate::constants::screen_tier_index_by_label;
+        let high = screen_tier_index_by_label("high");
+        let mut mgr = new_test_manager_at(SCREEN_QUALITY_TIERS, 0);
+        mgr.set_source_ceiling(Some(high), 1_000.0);
+        assert_eq!(mgr.video_tier_index(), high);
+        assert_eq!(mgr.source_ceiling_index(), Some(high));
+    }
+
+    /// `no_video_step_down_within` is the simulcast probe's out-of-band
+    /// congestion gate: true before any step-down, false inside the window after
+    /// one, true again once the window elapses.
+    ///
+    /// Mutation guard: return `true` unconditionally and the middle assertion
+    /// fails.
+    #[test]
+    fn no_video_step_down_within_tracks_the_quiet_window() {
+        let mut mgr = new_test_manager_at(SCREEN_QUALITY_TIERS, 0);
+        assert!(
+            mgr.no_video_step_down_within(0.0, 6_000.0),
+            "a session with no step-down yet is quiet"
+        );
+
+        assert!(
+            mgr.force_video_step_down(20_000.0),
+            "precondition: a step-down happened"
+        );
+        assert!(
+            !mgr.no_video_step_down_within(24_000.0, 6_000.0),
+            "inside the window the tier axis is NOT quiet"
+        );
+        assert!(
+            mgr.no_video_step_down_within(26_000.0, 6_000.0),
+            "the window is time-bounded — it must re-open, never wedge"
+        );
     }
 
     #[test]
@@ -3615,9 +3884,9 @@ mod tests {
     // =====================================================================
     // SCREEN-SHARE user quality bounds (issue #961 follow-up)
     //
-    // Screen uses its own 3-tier ladder SCREEN_QUALITY_TIERS (index 0 = best /
-    // 1080p, 2 = worst / low). The generic video clamp logic must work over it
-    // exactly as over the 8-tier camera ladder. These tests construct the
+    // Screen uses its own SCREEN_QUALITY_TIERS ladder (index 0 = best /
+    // 2160p, last = worst / low). The generic video clamp logic must work over
+    // it exactly as over the 8-tier camera ladder. These tests construct the
     // manager via `new_for_screen` to exercise the real screen path.
     // =====================================================================
 
@@ -3634,7 +3903,7 @@ mod tests {
     fn test_screen_user_worst_cap_blocks_step_down_under_sustained_congestion() {
         let mut mgr = new_test_screen_manager();
         mgr.video_tier_index = 0; // best
-                                  // User min quality => worst/cap at index 1 ("medium"). No floor.
+                                  // User min quality => worst/cap at index 1. No floor.
         mgr.set_video_quality_bounds(None, Some(1), 0.0);
 
         let final_idx = drive_sustained_congestion(&mut mgr, 10000.0);
@@ -3647,8 +3916,8 @@ mod tests {
     #[test]
     fn test_screen_user_best_floor_blocks_step_up_under_sustained_good() {
         let mut mgr = new_test_screen_manager();
-        mgr.video_tier_index = 2; // worst
-                                  // User max quality => best/floor at index 1 ("medium"). No cap.
+        mgr.video_tier_index = 2;
+        // User max quality => best/floor at index 1. No cap.
         mgr.set_video_quality_bounds(Some(1), None, 0.0);
 
         let final_idx = drive_sustained_good(&mut mgr, 10000.0);
@@ -3660,8 +3929,8 @@ mod tests {
 
     #[test]
     fn test_screen_best_equals_worst_pins_tier_both_directions() {
-        // Pin screen to index 1 ("medium"). Neither congestion nor good
-        // conditions may move it.
+        // Pin screen to index 1. Neither congestion nor good conditions may
+        // move it.
         let mut mgr = new_test_screen_manager();
         mgr.video_tier_index = 1;
         mgr.set_video_quality_bounds(Some(1), Some(1), 0.0);
@@ -3674,30 +3943,22 @@ mod tests {
     }
 
     #[test]
-    fn test_screen_bounds_clamped_to_three_tier_ladder() {
+    fn test_screen_bounds_clamped_to_screen_ladder() {
         // Out-of-range indices (valid for the 8-tier camera ladder but not the
-        // 3-tier screen ladder) must clamp to the screen max index (2).
+        // shorter screen ladder) must clamp to the screen max index.
         let mut mgr = new_test_screen_manager();
-        let max = SCREEN_QUALITY_TIERS.len() - 1; // 2
+        let max = SCREEN_QUALITY_TIERS.len() - 1;
         mgr.set_video_quality_bounds(Some(7), Some(5), 0.0);
         let (best, worst) = mgr.user_video_quality_bounds();
-        assert_eq!(
-            best,
-            Some(max),
-            "Screen floor clamps to max screen index (2)"
-        );
-        assert_eq!(
-            worst,
-            Some(max),
-            "Screen cap clamps to max screen index (2)"
-        );
+        assert_eq!(best, Some(max), "Screen floor clamps to max screen index");
+        assert_eq!(worst, Some(max), "Screen cap clamps to max screen index");
     }
 
     #[test]
     fn test_screen_setting_bounds_snaps_current_index_into_range_immediately() {
         let mut mgr = new_test_screen_manager();
         mgr.video_tier_index = 0; // best
-                                  // Floor 2 (worst) worse than current 0 — snap DOWN to 2 at once.
+                                  // Floor 2 worse than current 0 — snap DOWN to 2 at once.
         mgr.set_video_quality_bounds(Some(2), None, 100.0);
         assert_eq!(
             mgr.video_tier_index(),

@@ -22,8 +22,9 @@ use super::peer_decoder::{PeerDecode, VideoPeerDecoder, MEDIA_TYPE_CAMERA, MEDIA
 use super::pli_budget::{PliBudget, PliBudgetDecision};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
-    KEYFRAME_BACKOFF_DECAY_MS, KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
-    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_SLOW_RETRY_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
+    LadderVariant, KEYFRAME_BACKOFF_DECAY_MS, KEYFRAME_REQUEST_MAX_BACKOFF_MS,
+    KEYFRAME_REQUEST_MAX_UNANSWERED, KEYFRAME_REQUEST_MIN_INTERVAL_MS,
+    KEYFRAME_REQUEST_SLOW_RETRY_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
 };
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
@@ -245,6 +246,124 @@ impl Display for PeerDecodeError {
             PeerDecodeError::UnknownMediaType => write!(f, "UnknownMediaType"),
             PeerDecodeError::UnknownPacketType => write!(f, "UnknownPacketType"),
         }
+    }
+}
+
+/// Which of a peer's three decoders, if any, has to be rebuilt after a
+/// [`PeerDecodeError`].
+///
+/// See [`decoder_reset_scope`] for why this is per-kind rather than "all three".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderResetScope {
+    /// Nothing to rebuild: the packet failed before any decoder was invoked.
+    None,
+    Video,
+    Screen,
+    Audio,
+}
+
+/// Map a decode failure to the decoder that actually failed (issue 2225).
+///
+/// # Why this is not "rebuild everything"
+///
+/// A peer owns three fully independent decoders: two `VideoPeerDecoder`s
+/// (camera + screen, each its own codec worker and canvas renderer) and one
+/// `NetEqAudioPeerDecoder` (its own Web Worker, jitter buffer, AudioWorklet, and
+/// blob URL). They share no state, so a failure in one says nothing about the
+/// health of the others — and rebuilding the audio decoder is *expensive*:
+/// a fresh NetEQ worker, worklet init and message plumbing per rebuild.
+///
+/// Before this mapping existed, the decode-error arm called `Peer::reset`, which
+/// rebuilt all three unconditionally. On a lossy link that repeated for as long
+/// as the errors did, respawning the NetEQ worker every time — with the audio
+/// path interrupted on each respawn even though audio was never the thing that
+/// failed.
+///
+/// # Why the pre-decode errors rebuild nothing
+///
+/// `AesDecryptError`, `PacketParseError`, `NoMediaType`, `NoPacketType`,
+/// `IncorrectPacketType`, `UnknownMediaType` and `UnknownPacketType` are all
+/// raised by `Peer::decode` **before** it reaches any `decoder.decode(..)` call
+/// — they are envelope, crypto and protobuf failures. No decoder was invoked, so
+/// no decoder holds state that a rebuild could recover; rebuilding is pure churn.
+///
+/// `NoSuchPeer` and `SameUserPacket` never reach a peer's reset path at all
+/// (they are raised by the manager, not by `Peer::decode`); they map to `None`
+/// for completeness.
+///
+/// # Which arms fire today
+///
+/// The pre-decode group is, as of this change, the ONLY group that reaches the
+/// decode-error arm: neither concrete decoder currently propagates a failure.
+/// `VideoPeerDecoder::decode` (`peer_decoder.rs`) returns `Ok` on every path —
+/// `push_frame` is fire-and-forget and an unknown codec returns a non-rendered
+/// `Ok` — so `VideoDecodeError`/`ScreenDecodeError` cannot be produced; and
+/// `NetEqAudioPeerDecoder::decode` posts to the worker and likewise always
+/// returns `Ok` (`StandardAudioPeerDecoder`, which *can* fail, is never
+/// constructed — `create_audio_peer_decoder` always builds the NetEQ one).
+///
+/// That is precisely why the pre-2225 blanket reset was so damaging: every
+/// rebuild it performed was churn, and a receiver holding a stale AES key fails
+/// EVERY packet, respawning the NetEQ worker tens of times a second for as long
+/// as the mismatch lasts. The three per-kind arms below are therefore currently
+/// latent. They are kept — rather than collapsed into "rebuild nothing" —
+/// because they encode the correct recovery for the day a decoder does start
+/// propagating errors, and because a per-kind mapping is what makes that future
+/// change safe by construction.
+///
+/// # PRECONDITION for making any decoder fallible on peer input
+///
+/// Do not accept that invitation without first adding a per-peer, per-kind
+/// rebuild budget. The rebuild here is unmetered — no cooldown, no backoff, no
+/// cap — so the moment a decoder starts returning `Err` for attacker-shaped
+/// input, a hostile sender gets the whole issue-2225 storm back, now aimed at
+/// whichever decoder it can make fail. Two specific hazards:
+///
+///  * `create_audio_peer_decoder` spawns a Web Worker, a worklet and a blob URL
+///    per call. At packet rate that is a remote resource lever.
+///  * `NetEqAudioPeerDecoder::create_neteq_worker` `.expect()`s on FOUR
+///    DOM/window lookups (window, document, the `neteq-worker` link tag, its
+///    href). A peer-triggered rebuild racing teardown or navigation would panic
+///    rather than return `Err`. Make those fallible in the same change.
+///
+/// [`crate::decode::pli_budget::PliBudget`] is the template: a pure `allow`
+/// decision over (peer, kind, now), already used to meter the other
+/// peer-triggered work on this path.
+///
+/// The match is deliberately exhaustive with no wildcard arm: a new
+/// `PeerDecodeError` variant must then be classified here explicitly rather than
+/// silently inheriting a default.
+fn decoder_reset_scope(error: &PeerDecodeError) -> DecoderResetScope {
+    match error {
+        PeerDecodeError::VideoDecodeError => DecoderResetScope::Video,
+        PeerDecodeError::ScreenDecodeError => DecoderResetScope::Screen,
+        PeerDecodeError::AudioDecodeError => DecoderResetScope::Audio,
+
+        PeerDecodeError::AesDecryptError
+        | PeerDecodeError::IncorrectPacketType
+        | PeerDecodeError::NoSuchPeer(_)
+        | PeerDecodeError::NoMediaType
+        | PeerDecodeError::NoPacketType
+        | PeerDecodeError::PacketParseError
+        | PeerDecodeError::SameUserPacket(_)
+        | PeerDecodeError::UnknownMediaType
+        | PeerDecodeError::UnknownPacketType => DecoderResetScope::None,
+    }
+}
+
+fn diagnostic_media_type_for_decode_error(
+    packet: &PacketWrapper,
+    error: &PeerDecodeError,
+) -> MediaType {
+    match packet.media_kind.enum_value() {
+        Ok(MediaKind::VIDEO) => MediaType::VIDEO,
+        Ok(MediaKind::SCREEN) => MediaType::SCREEN,
+        Ok(MediaKind::AUDIO) => MediaType::AUDIO,
+        _ => match error {
+            PeerDecodeError::ScreenDecodeError => MediaType::SCREEN,
+            PeerDecodeError::AudioDecodeError => MediaType::AUDIO,
+            _ => MediaType::VIDEO,
+        },
     }
 }
 
@@ -563,6 +682,13 @@ impl SequenceTracker {
 /// wedged — the new low sequence would take many thousands of packets to climb
 /// back — silently blinding the loss signal. (The sub-1024 blind spot is noted
 /// as a known limitation on [`AudioDatagramLossTracker`].)
+///
+/// This guard covers SENDER restarts only. A RECEIVER-side simulcast rung change is
+/// handled separately and unconditionally by
+/// [`AudioDatagramLossTracker::reanchor_for_layer_switch`] (issue #2138), which does
+/// not depend on the jump exceeding this threshold — that is precisely why the
+/// sub-1024 backward rung switch is no longer a blind spot even though this constant
+/// would never trip on it.
 const AUDIO_SEQ_RESET_REANCHOR_GAP: u64 = 1024;
 
 /// Windowed receive-side audio packet-loss tracker for the WebTransport
@@ -617,18 +743,22 @@ const AUDIO_SEQ_RESET_REANCHOR_GAP: u64 = 1024;
 ///    severity. The raw sum does NOT credit back later in-window reordering, so
 ///    it can slightly over-report under genuine reordering — acceptable for a
 ///    single-path datagram burst-loss magnitude.
-/// 2. **Audio simulcast (non-default `max_layers > 1`) can blind the tracker
-///    across a layer switch.** Each simulcast layer carries its own dense
-///    sequence, so a receive switch to a LAGGING audio layer is a BACKWARD jump.
-///    If that jump is smaller than [`AUDIO_SEQ_RESET_REANCHOR_GAP`] it is not a
-///    restart — it lands in the shared window's "too old, ignore" branch, so the
-///    tracker stays pinned at the old high-water mark and silently ignores the
-///    new layer's packets until its sequence climbs back past that mark (up to a
-///    few seconds). Audio simulcast is OFF by default (single audio layer, dense
-///    monotonic sequence — no switch, no blind spot), so this does not affect the
-///    shipped configuration. If audio simulcast is ever rolled out, re-anchor
-///    this tracker on an audio-layer switch exactly like video does in
-///    [`SequenceTracker::reanchor_for_layer_switch`].
+/// 2. **Audio simulcast layer switches ARE handled (issue #2138 — no longer a
+///    limitation).** Each simulcast layer carries its own dense sequence, so a
+///    receive switch to a LAGGING audio layer is a BACKWARD jump (and to a LEADING
+///    one, a FORWARD jump). Left unhandled, the backward case was the worse of the
+///    two: a jump smaller than [`AUDIO_SEQ_RESET_REANCHOR_GAP`] is not treated as a
+///    restart, so it landed in the shared window's "too old, ignore" branch and the
+///    tracker stayed pinned at the old high-water mark, silently ignoring the new
+///    layer's packets (UNDER-reporting) until its sequence climbed back past that
+///    mark. The forward case OVER-reported, booking the cross-counter offset as a
+///    phantom gap — capped at ~64 in [`Self::loss_per_sec`] but summed uncapped into
+///    [`Self::raw_loss_per_sec`]. Both are now removed at the source:
+///    [`Peer::set_selected_audio_layer`] — the SINGLE chokepoint every write to
+///    `selected_audio_layer` goes through — calls
+///    [`Self::reanchor_for_layer_switch`] on an actual rung change, so the next
+///    packet of the new rung establishes a fresh baseline. This matters because the
+///    shipped runtime default is three audio layers (#1082).
 /// 3. **A sender restart in the first ~20 s of a stream is a temporary blind
 ///    spot.** The mic encoder re-initialises `sequence_number` to 0 on restart
 ///    (e.g. a mid-call device change). If it restarts while the high-water mark
@@ -639,6 +769,14 @@ const AUDIO_SEQ_RESET_REANCHOR_GAP: u64 = 1024;
 ///    packets, so it self-heals within ~20 s — it does not wedge). A restart at a
 ///    LARGER mark is caught by the re-anchor guard, so only this early window is
 ///    affected; loss during it is under-counted, never over-counted.
+///
+///    The #2138 layer-switch re-anchor does NOT narrow this: it is driven by the
+///    RECEIVER's own rung selection, whereas this blind spot is a SENDER-side
+///    restart that the receiver never observes as a rung change (the restarted
+///    stream keeps the same `simulcast_layer_id`). The two are independent — a
+///    restart still needs either the >= 1024 backward-jump guard or the self-heal.
+///    Closing it would need a sender-signalled stream epoch, which is out of scope
+///    here.
 struct AudioDatagramLossTracker {
     /// Highest audio sequence seen so far. `None` before the first packet.
     high_seq: Option<u64>,
@@ -752,6 +890,87 @@ impl AudioDatagramLossTracker {
     #[cfg(test)]
     fn raw_loss_per_sec(&self) -> f64 {
         self.raw_loss_per_sec
+    }
+
+    /// Re-anchor because the receiver switched to a DIFFERENT AUDIO simulcast
+    /// layer (issue #2138) — the audio sibling of
+    /// [`SequenceTracker::reanchor_for_layer_switch`].
+    ///
+    /// Each audio rung is an INDEPENDENT Opus encode owning its own sequence
+    /// counter (`microphone_encoder`: "each layer owns its own seq counter + RED
+    /// previous-frame buffer"), and the rungs' counters drift apart over a call:
+    /// the upper rungs are created later (the awaited per-rung `create_node` loop)
+    /// and, while a user/congestion ceiling suppresses them, their publish gate
+    /// returns BEFORE `sequence_number += 1`, so a suppressed rung's counter
+    /// STALLS while the base keeps advancing. A receive-side rung change is
+    /// therefore a sequence DISCONTINUITY in BOTH directions, and both mis-account:
+    ///
+    ///   * **To a LEADING rung — a FORWARD jump — OVER-reports.** The cross-counter
+    ///     offset is summed immediately and UNCAPPED into `window_raw_lost`. Resetting
+    ///     the reorder bitmap then makes the next ~63 packets shift unseen positions
+    ///     out of the window into `window_lost`, so the capped signal also reports a
+    ///     phantom burst.
+    ///     **This is the direction that MATTERS**, and issue 2138's title
+    ///     ("inflates `audio_datagram_loss_per_sec`") is right about it. The BASE
+    ///     rung always LEADS: `audio_layer_is_published` computes
+    ///     `effective_count … .max(1)`, so layer 0 is never suppressed, and the base
+    ///     node is created before the upper-rung loop — so it is the UPPER rungs
+    ///     whose counters stall. A DOWN-switch (2→0) is therefore the FORWARD case,
+    ///     and a down-switch is exactly what a CONGESTED receiver does. On the
+    ///     capped signal that reads ~50 pkt/s against a 5.0 threshold (10× over),
+    ///     and it feeds the #2029 transport-demotion latch (see
+    ///     [`Self::set_selected_audio_layer`]).
+    ///   * **To a LAGGING rung — a BACKWARD jump — UNDER-reports (goes blind).**
+    ///     A backward jump smaller than [`AUDIO_SEQ_RESET_REANCHOR_GAP`] is not
+    ///     treated as a sender restart, so it lands in the shared reorder window's
+    ///     "too old, ignore" branch: `high_seq` stays pinned at the OLD rung's
+    ///     high-water mark and every packet of the new rung is silently ignored —
+    ///     including real loss — until the new rung's sequence climbs back past
+    ///     that mark. This is the recovery-driven UP-switch, so it is the less
+    ///     operationally urgent of the two, but it suppresses a fallback the user
+    ///     may need.
+    ///
+    /// Clearing `high_seq` / `seen_bits` makes the next packet of the new rung
+    /// establish a fresh baseline (the `high_seq == None` path returns 0 loss and
+    /// contributes 0 raw), which removes both directions at once.
+    ///
+    /// `window_lost` and `window_raw_lost` are cleared TOGETHER, and that pairing
+    /// is load-bearing rather than cosmetic: they are two views of the SAME event
+    /// stream in the SAME in-flight window (capped presence vs uncapped magnitude),
+    /// and issue #2031's whole interpretation is their RATIO. Resetting one without
+    /// the other would publish an incoherent pair (e.g. capped 0 alongside raw 400
+    /// = "enormous burst, no loss present"), which is worse than either value alone.
+    /// Clearing both also keeps the rate window from mixing the old rung's partial
+    /// measurements into a sample that will be published as the NEW rung's rate.
+    /// `audio_layer_switch_clears_both_in_flight_window_accumulators` pins BOTH
+    /// independently (dropping either line fails it), so this pairing is enforced and
+    /// not merely asserted here.
+    ///
+    /// DELIBERATELY NOT reset — each for its own reason:
+    ///   * `window_start_ms` — matching [`SequenceTracker::reanchor_for_layer_switch`],
+    ///     which does not touch it either. It is BOTH the window's elapsed origin
+    ///     (the denominator in `observe_window`'s elapsed-normalised rate) and the
+    ///     `== 0` "not yet started" SENTINEL, so zeroing it here would restart the
+    ///     ~1 s cadence on every layer switch — delaying the next published sample
+    ///     by up to a full window — while gaining nothing, since the counts that
+    ///     window would have normalised are already zeroed above.
+    ///   * `loss_per_sec` / `raw_loss_per_sec` — the ALREADY-PUBLISHED rates, left
+    ///     as-is for the same reason the video precedent leaves its published rates
+    ///     alone: they are recomputed on the next ~1 s window rollover, and blanking
+    ///     a last-known-good diagnostic mid-window would read as "loss stopped"
+    ///     rather than "not resampled yet".
+    ///
+    /// Audio has no analogue of the video tracker's connection-level keyframe /
+    /// PLI-backoff state (`lost_count`, `loss_detected_at_ms`, `current_backoff_ms`,
+    /// …) — audio is keyframe-less and its recovery lives inside NetEq — so the
+    /// four fields above are the complete set of layer-scoped state this tracker
+    /// holds. That is why this reset is exhaustive over the struct's 7 fields
+    /// (4 cleared, 3 deliberately preserved) with nothing left unaccounted for.
+    fn reanchor_for_layer_switch(&mut self) {
+        self.high_seq = None;
+        self.seen_bits = 0;
+        self.window_lost = 0;
+        self.window_raw_lost = 0;
     }
 }
 
@@ -910,10 +1129,13 @@ pub struct Peer {
     /// Which simulcast layer (issue #989, Phase 3) this receiver decodes for
     /// this peer's AUDIO stream. Defaults to 0.
     selected_audio_layer: u32,
-    /// Per-peer AUDIO layer chooser + availability (issue #989, Phase 3). Audio
-    /// carries no per-window loss tracker here (NetEq path), so the chooser is
-    /// fed the VIDEO downlink as a proxy for shared-connection health (see
-    /// `tick_audio_layer_chooser`) — hence no separate `last_audio_downlink`.
+    /// Per-peer AUDIO layer chooser + availability (issue #989, Phase 3). The
+    /// chooser is fed the VIDEO downlink as a proxy for shared-connection health
+    /// (see `tick_audio_layer_chooser`) — hence no separate `last_audio_downlink`.
+    /// `audio_datagram_loss` (#1878) is NOT that missing per-window sample: it is
+    /// never fed back into THIS chooser. (It is not inert, though — issue #2029 routes
+    /// it through the health reporter into the one-way WebTransport→WebSocket audio
+    /// fallback; see `set_selected_audio_layer`.)
     audio_layer_chooser: LayerChooser,
     audio_layer_availability: LayerAvailability,
     /// Reorder-tolerant sequence tracker for video packets.
@@ -1141,15 +1363,33 @@ fn age_ms_since(now: u64, last_frame_ms: u64) -> i64 {
 }
 
 /// Resolve a CONTINUOUS live-stream (audio / camera-video) enabled flag
-/// against a heartbeat, using the short [`LIVE_STREAM_FRESH_WINDOW_MS`] so a
-/// real mute / camera-off reflects on remote peers sub-second.
+/// against a heartbeat, using the short [`LIVE_STREAM_FRESH_WINDOW_MS`]
+/// (500ms) rather than the screen-sized [`MEDIA_FRESH_WINDOW_MS`] (5000ms).
+///
+/// # What this window does and does not buy
+///
+/// The window bounds how long a *stale* heartbeat can be overridden by live
+/// frames — it does NOT set how fast a mute propagates. Propagation speed is
+/// the heartbeat's: a mute/camera-off triggers an immediate edge-triggered
+/// heartbeat (`Connection::send_immediate_heartbeat`), and if that datagram is
+/// lost the state is only corrected by the next keepalive, up to
+/// `HEARTBEAT_KEEPALIVE_INTERVAL_MS` (5000ms) later. So the honest worst-case
+/// bound for the `audio_enabled`/`video_enabled` glyph flip is ~5s, not
+/// sub-second.
+///
+/// What the short window prevents is the *additional* lag of ignoring a fresh
+/// off-heartbeat because frames are still arriving: with the screen-sized
+/// window, a peer who stopped 4s ago could still read as enabled. For the
+/// speaking glow specifically the fast signal is not this path at all — it is
+/// the decoder-side VAD's `peer_speaking` events (see
+/// `neteq_audio_decoder::handle_pcm_data` and its terminal zero on teardown).
 ///
 /// Thin wrapper over [`apply_heartbeat_enabled_flag`] that BAKES IN the
-/// correct window. The window is the security-/correctness-critical knob here:
-/// a future "simplify by sharing one window" edit at the call site could
-/// silently widen audio/video back to the screen-sized window and reintroduce
-/// the ~5s mute/camera-off lag. Routing audio and camera-video through this
-/// wrapper makes that window non-passable at the call site.
+/// correct window. The window is the correctness-critical knob here: a future
+/// "simplify by sharing one window" edit at the call site could silently widen
+/// audio/video back to the screen-sized window and reintroduce that extra
+/// staleness. Routing audio and camera-video through this wrapper makes the
+/// window non-passable at the call site.
 pub(crate) fn apply_live_stream_heartbeat_flag(
     current: bool,
     heartbeat_value: bool,
@@ -1359,24 +1599,13 @@ impl Peer {
         ),
         JsValue,
     > {
-        // Create decoders without canvas (will be set later via set_canvas)
-        // We still keep the canvas IDs for backward compatibility with existing code
-        let video_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA, skip_canvas_paint)?;
-        let screen_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN, skip_canvas_paint)?;
-
-        // Attempt to set canvas immediately if available in DOM
-        if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-            if let Some(canvas_element) = document.get_element_by_id(video_canvas_id) {
-                if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-                    let _ = video_decoder.set_canvas(canvas);
-                }
-            }
-            if let Some(canvas_element) = document.get_element_by_id(screen_canvas_id) {
-                if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-                    let _ = screen_decoder.set_canvas(canvas);
-                }
-            }
-        }
+        // Construction order matches the pre-2225 inline version exactly (both
+        // video-like decoders, then audio), so a partial failure drops the same
+        // set of half-built decoders it always did.
+        let video_decoder =
+            Self::new_video_like_decoder(video_canvas_id, MEDIA_TYPE_CAMERA, skip_canvas_paint)?;
+        let screen_decoder =
+            Self::new_video_like_decoder(screen_canvas_id, MEDIA_TYPE_SCREEN, skip_canvas_paint)?;
 
         Ok((
             create_audio_peer_decoder(None, peer_id.to_string(), vad_threshold)?,
@@ -1385,37 +1614,154 @@ impl Peer {
         ))
     }
 
-    fn reset(&mut self, from_peer: &str) -> Result<(), JsValue> {
-        let sid_str = self.session_id.to_string();
-        let (mut audio, video, screen) = Self::new_decoders(
-            &self.video_canvas_id,
-            &self.screen_canvas_id,
-            &sid_str,
-            self.vad_threshold,
-            self.skip_canvas_paint,
-        )?;
+    /// Build one `VideoPeerDecoder` (camera or screen) and wire its canvas.
+    ///
+    /// Extracted from [`Self::new_decoders`] (issue 2225) so a single stream's
+    /// decoder can be rebuilt on its own after a decode error, without dragging
+    /// the peer's other two decoders — in particular the NetEQ audio worker —
+    /// along with it. Cold start is unchanged: `new_decoders` calls this twice
+    /// with the same arguments it used to pass inline.
+    ///
+    /// The decoder is created without a canvas (`set_canvas` may run later, when
+    /// the tile mounts) and then opportunistically wired to whatever element
+    /// currently carries `canvas_id`. Looking the element up fresh on every
+    /// build is what lets a rebuilt decoder re-attach to a tile that is already
+    /// on screen.
+    fn new_video_like_decoder(
+        canvas_id: &str,
+        media_type: &'static str,
+        skip_canvas_paint: bool,
+    ) -> Result<VideoPeerDecoder, JsValue> {
+        let decoder = VideoPeerDecoder::new(None, media_type, skip_canvas_paint)?;
 
+        if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+            if let Some(canvas_element) = document.get_element_by_id(canvas_id) {
+                if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+                    let _ = decoder.set_canvas(canvas);
+                }
+            }
+        }
+
+        Ok(decoder)
+    }
+
+    /// Swap in a freshly built audio decoder for this peer, retiring the
+    /// outgoing one first.
+    ///
+    /// Issue 2174 follow-up: `NetEqAudioPeerDecoder::drop` broadcasts a
+    /// terminal `speaking: 0` so a glow left lit by the edge-triggered VAD is
+    /// cleared when the worker dies — but `Drop` also fires here, on
+    /// REPLACEMENT, where the peer has not stopped speaking at all. Left
+    /// unguarded, one AUDIO decode error blanks the peer's speaking indicator
+    /// (tile level forced to 0.0, roster dot darkened, the UI's speaking deadman
+    /// cancelled) until the replacement NetEQ worker finishes worklet init.
+    ///
+    /// Issue 2225 narrowed the trigger: a VIDEO or SCREEN decode error no longer
+    /// reaches this function at all (`decoder_reset_scope` routes those to
+    /// `Video`/`Screen`), so the "lossy link, repeated decode errors, blinking
+    /// glow" framing no longer applies. The surviving trigger is a
+    /// decoder-propagated AUDIO failure, which no concrete decoder currently
+    /// produces — see `decoder_reset_scope`'s "Which arms fire today".
+    ///
+    /// [`AudioPeerDecoderTrait::retire_for_replacement`] makes the outgoing
+    /// decoder's `Drop` silent, so the indicator simply carries over: the new
+    /// decoder starts from a cleared VAD and re-emits from its first speech
+    /// frame, and the deadman — which the spurious zero would have cancelled —
+    /// stays armed as the backstop for the case where the peer really did go
+    /// quiet across the reset.
+    ///
+    /// Genuine teardown (peer removal via `delete_peer_at` /
+    /// `run_peer_monitor`, which drop the whole `Peer`) never calls this, so it
+    /// keeps the terminal zero that issue 2174 added.
+    fn replace_audio_decoder(&mut self, mut audio: Box<dyn AudioPeerDecoderTrait>) {
         // Preserve the current mute state after reset
         audio.set_muted(!self.audio_enabled);
-        debug!(
-            "Reset peer {} with audio muted: {}",
-            self.session_id, !self.audio_enabled
-        );
-
+        self.audio.retire_for_replacement();
         self.audio = audio;
+    }
+
+    /// Swap in a freshly built camera decoder, giving it stream attribution
+    /// immediately.
+    ///
+    /// Issue #1640: the new codec worker starts with empty context, and
+    /// `context_initialized` stays `true` across a rebuild, so the one-time
+    /// install in `PeerDecodeManager::decode` will not re-run — the `SetContext`
+    /// has to be sent here or the worker's diagnostics are unattributed for the
+    /// rest of the call.
+    ///
+    /// Shaped like [`Self::replace_audio_decoder`] (build outside, swap inside)
+    /// so the swap is one auditable unit and is reachable from host tests, which
+    /// cannot construct a real `VideoPeerDecoder`.
+    fn replace_video_decoder(&mut self, video: VideoPeerDecoder, from_peer: &str) {
         self.video = video;
-        self.screen = screen;
-        // Issue #1640: immediately send SetContext to the new workers so they
-        // have attribution from their first frame (fixes post-reset race where
-        // `context_initialized` stays true but new workers have empty context).
         self.video
-            .set_stream_context(from_peer.to_owned(), sid_str.clone());
+            .set_stream_context(from_peer.to_owned(), self.session_id.to_string());
+    }
+
+    /// SCREEN sibling of [`Self::replace_video_decoder`].
+    fn replace_screen_decoder(&mut self, screen: VideoPeerDecoder, from_peer: &str) {
+        self.screen = screen;
         self.screen
-            .set_stream_context(from_peer.to_owned(), sid_str);
-        // Intentionally keep `has_received_heartbeat` and `*_enabled` flags:
-        // the peer's last-known media state is still the best information we
-        // have.  Resetting the flag would let straggler frames through until
-        // the next heartbeat, which is the opposite of what we want.
+            .set_stream_context(from_peer.to_owned(), self.session_id.to_string());
+    }
+
+    /// Rebuild only the decoder that the failure `error` implicates (issue
+    /// 2225).
+    ///
+    /// This replaces a blanket `reset` that rebuilt all three of the peer's
+    /// decoders on ANY decode failure. See [`decoder_reset_scope`] for the
+    /// classification and the reasoning; the short version is that the three
+    /// decoders are independent, rebuilding the NetEQ audio worker is expensive
+    /// and audible, and the errors that actually reach this path today never
+    /// touched a decoder at all.
+    ///
+    /// `has_received_heartbeat` and the `*_enabled` flags are intentionally
+    /// preserved (as they were by `reset`): the peer's last-known media state is
+    /// still the best information we have, and clearing it would let straggler
+    /// frames through until the next heartbeat.
+    fn reset_for_decode_error(
+        &mut self,
+        from_peer: &str,
+        error: &PeerDecodeError,
+    ) -> Result<(), JsValue> {
+        match decoder_reset_scope(error) {
+            DecoderResetScope::None => {
+                debug!(
+                    "Peer {} decode error {error} touched no decoder; nothing to rebuild",
+                    self.session_id
+                );
+            }
+            DecoderResetScope::Video => {
+                debug!("Rebuilding VIDEO decoder for peer {}", self.session_id);
+                let video = Self::new_video_like_decoder(
+                    &self.video_canvas_id,
+                    MEDIA_TYPE_CAMERA,
+                    self.skip_canvas_paint,
+                )?;
+                self.replace_video_decoder(video, from_peer);
+            }
+            DecoderResetScope::Screen => {
+                debug!("Rebuilding SCREEN decoder for peer {}", self.session_id);
+                let screen = Self::new_video_like_decoder(
+                    &self.screen_canvas_id,
+                    MEDIA_TYPE_SCREEN,
+                    self.skip_canvas_paint,
+                )?;
+                self.replace_screen_decoder(screen, from_peer);
+            }
+            DecoderResetScope::Audio => {
+                debug!(
+                    "Rebuilding AUDIO decoder for peer {} with audio muted: {}",
+                    self.session_id, !self.audio_enabled
+                );
+                let audio = create_audio_peer_decoder(
+                    None,
+                    self.session_id.to_string(),
+                    self.vad_threshold,
+                )?;
+                self.replace_audio_decoder(audio);
+            }
+        }
         Ok(())
     }
 
@@ -1572,7 +1918,7 @@ impl Peer {
     /// Run the AUDIO layer chooser one tick (issue #989, Phase 3) and apply the
     /// result to the audio decode guard.
     ///
-    /// Audio carries no per-window sequence loss tracker here (audio decode goes
+    /// Audio has no per-window loss sample driving this chooser (audio decode goes
     /// through NetEq, not `track_sequence`), and audio is only ~1-3% of call
     /// bandwidth — so rather than build a dedicated audio loss pipeline, the
     /// audio chooser is fed the receiver's VIDEO downlink as a proxy for overall
@@ -1593,6 +1939,8 @@ impl Peer {
             .choose(self.last_video_downlink, highest, now_ms);
         let desired = bounds.clamp(raw);
         // #1561: log audio layer transitions (mirrors video/screen LAYER_SWITCH).
+        // Logged BEFORE the write below so `self.selected_audio_layer` still reads
+        // the OLD rung for the `from=` field.
         if desired != self.selected_audio_layer {
             log::info!(
                 "LAYER_SWITCH session_id={} kind=audio from={} to={} site=tick constrained={} highest_available={}",
@@ -1603,7 +1951,10 @@ impl Peer {
                 highest
             );
         }
-        self.selected_audio_layer = desired;
+        // Issue #2138: route the write through the single chokepoint so the audio
+        // datagram-loss tracker is re-anchored on an actual rung change (it has its
+        // own re-anchor `if`-guard, so an unchanged layer stays a no-op here).
+        self.set_selected_audio_layer(desired);
         desired
     }
 
@@ -1727,9 +2078,17 @@ impl Peer {
             .audio_layer_chooser
             .observe_early_congestion(self.last_video_downlink, ah, now_ms)
         {
-            self.selected_audio_layer = bounds
+            // Issue #2138: route through the single chokepoint (see
+            // `set_selected_audio_layer`) so an actual rung change re-anchors the
+            // audio datagram-loss tracker. `observe_early_congestion` returning
+            // `true` means the chooser stepped DOWN one rung, so this is exactly
+            // the forward-jump case that otherwise inflates the sample — though the
+            // post-clamp layer can still equal the current one (e.g. a user receive
+            // `min` pins it), in which case the setter's guard makes it a no-op.
+            let layer = bounds
                 .for_kind(PrefMediaKind::Audio)
                 .clamp(self.audio_layer_chooser.current());
+            self.set_selected_audio_layer(layer);
             seeded = true;
         }
 
@@ -2036,21 +2395,124 @@ impl Peer {
         self.selected_audio_layer
     }
 
+    /// The audio rung to SHOW for this peer (#2132) — see [`displayed_audio_rung`].
+    pub fn displayed_audio_layer(&self, now_ms: u64) -> Option<u32> {
+        displayed_audio_rung(
+            self.selected_audio_layer,
+            self.audio_layer_availability
+                .layer_available_peek(self.selected_audio_layer, now_ms),
+        )
+    }
+
     /// AUDIO-kind sibling of [`Self::set_selected_video_layer`] (issue #1695):
     /// select which audio simulcast layer this receiver decodes for this peer.
     /// AUDIO packets tagged with a different `simulcast_layer_id` are dropped
     /// (see the AUDIO arm of the decode path) before decode, exactly like VIDEO.
     ///
-    /// Unlike the VIDEO/SCREEN setters there is NO sequence-tracker re-anchor here:
-    /// audio carries no per-kind `SequenceTracker` (`track_sequence` returns early
-    /// for AUDIO — sequencing/PLI is handled inside NetEq, not the per-peer tracker),
-    /// so there is nothing to re-anchor on a layer switch. Assigning the field is the
-    /// whole operation, mirroring how `tick_audio_layer_chooser` / `seed_early_congestion`
-    /// already write `selected_audio_layer` directly. The `if`-guarded change check is
-    /// kept for symmetry with the VIDEO/SCREEN setters and to keep this a no-op on an
-    /// unchanged layer.
+    /// ## THE SINGLE CHOKEPOINT for the audio decode guard (issue #2138)
+    ///
+    /// Every production write to `selected_audio_layer` goes through HERE, so the
+    /// paired re-anchor of [`AudioDatagramLossTracker`] cannot be forgotten at a
+    /// call site. This is deliberately UNLIKE video/screen, whose re-anchor is
+    /// duplicated at four sites each (setter + tick + early-seed + downlink-seed) and
+    /// can drift apart; audio funnels instead.
+    ///
+    /// What ENFORCES the chokepoint (as opposed to merely describing it today):
+    ///   * `selected_audio_layer` is a PRIVATE field of `Peer`, so no code outside
+    ///     this module can write it at all — external callers have only this setter.
+    ///   * In-module, the writers are [`Self::tick_audio_layer_chooser`] (per-tick
+    ///     chooser switch), [`Self::seed_early_congestion`] (the #1179 early-seed
+    ///     bounds-clamped write), and
+    ///     [`PeerDecodeManager::reconcile_decode_guards_to_wire`] (the #1695
+    ///     guard-follows-wire pin). All three call this setter, and ALL THREE have a
+    ///     dedicated routing regression test, so reverting any one of them to a direct
+    ///     field assignment fails CI:
+    ///     `audio_tick_chooser_switch_routes_through_the_reanchor_chokepoint`,
+    ///     `audio_early_seed_switch_routes_through_the_reanchor_chokepoint`,
+    ///     `audio_reconcile_to_wire_switch_routes_through_the_reanchor_chokepoint`.
+    ///     The third was added because the pre-existing #1695 coverage asserts only the
+    ///     guard VALUE, which a direct field write satisfies identically — so that
+    ///     writer was a live switch site with no re-anchor guard at all.
+    ///     A FOURTH in-module writer would still need its own routing test — this list
+    ///     is descriptive; the PRIVATE field is what forces external callers here.
+    ///
+    /// `Peer` construction (`Peer::new` and the test fixtures) initialises the field
+    /// in the struct literal, which is not a switch: the tracker is built fresh
+    /// (`high_seq: None`) in the same literal, so there is nothing to re-anchor.
+    ///
+    /// There is no audio arm in [`Self::seed_downlink_congestion`] to route through:
+    /// that path deliberately does not step audio down at all (#1219 Half 2 —
+    /// audio is priority-protected), so it never writes this field. That absence is
+    /// intentional, not a missed chokepoint.
+    ///
+    /// ## Why the re-anchor is needed
+    ///
+    /// Each audio rung is an independent Opus encode with its OWN sequence counter,
+    /// so a rung change is a cross-counter discontinuity that makes the receive-side
+    /// datagram-loss tracker mis-account — going BLIND on a backward switch, and
+    /// reporting a phantom burst on a forward one. See
+    /// [`AudioDatagramLossTracker::reanchor_for_layer_switch`] for the full mechanism.
+    ///
+    /// Audio DECODE and PLAYOUT are untouched: they run through NetEq, which never
+    /// consults this tracker.
+    ///
+    /// ## But the corrected metric is NOT decode-inert — it ACTUATES (issue #2029)
+    ///
+    /// `audio_datagram_loss_per_sec` is not merely displayed. `health_reporter`
+    /// forwards every ~1 Hz per-peer sample to
+    /// [`crate::connection::connection_manager::ConnectionManager::observe_peer_audio_datagram_loss`],
+    /// and on SUSTAINED, cross-sender-UNIFORM loss above `WT_AUDIO_LOSS_THRESHOLD_PER_SEC`
+    /// (5.0 pkt/s) `check_audio_datagram_fallback` latches the session WebSocket-only
+    /// and re-elects. That latch is ONE-WAY and session-scoped, so a wrong sample here
+    /// can cost this client WebTransport for the rest of the call.
+    ///
+    /// Both pre-fix error directions pushed that detector the WRONG way, so this fix
+    /// improves it on both counts:
+    ///   * the FORWARD-jump phantom burst inflated samples over the 5.0 pkt/s
+    ///     threshold — a rung switch could contribute toward a fallback that the link
+    ///     did not warrant (a spurious, unrecoverable demotion to WebSocket);
+    ///   * the BACKWARD-jump blindness reported ~0 while audio was genuinely dropping,
+    ///     suppressing a fallback the user needed.
+    ///
+    /// WHICH DIRECTION MATTERS MOST: the FORWARD (over-reporting) one, because it is the
+    /// direction a CONGESTED receiver takes. The base rung always LEADS the upper rungs
+    /// — `audio_layer_is_published` computes `effective_count … .max(1)`, so layer 0 is
+    /// never suppressed, and the base node is created before the upper-rung loop — so a
+    /// suppressed upper rung's counter stalls while the base advances. A
+    /// congestion-driven DOWN-switch (2→0) therefore lands on the LEADING counter, i.e. a
+    /// FORWARD jump booking the whole cross-counter offset as a phantom burst. (Issue
+    /// 2138's title says this metric is INFLATED; that is correct for the direction that
+    /// actuates. The backward/blind direction is the recovery-driven UP-switch.)
+    ///
+    /// The remaining trade is deliberate: clearing the in-flight window on a real rung
+    /// change means the sample published for THAT window under-reports (it counts only
+    /// the post-switch part). That is the right side to err on. The detector is a
+    /// WINDOWED K-of-M count over the last 12 samples — `wt_audio_fallback_should_fire`
+    /// counts `uniform_lossy` across the window with no ordering requirement, so a
+    /// truncated sample COSTS ONE SLOT rather than resetting progress. Against that, the
+    /// alternative (leaking a cross-counter offset) inflates a sample ~10× past the
+    /// 5.0 pkt/s threshold and can drive an irreversible transport demotion outright.
+    ///
+    /// Sizing the cost honestly: the single-remote-peer bar is 10-of-12
+    /// (`WT_AUDIO_LOSS_MIN_LOSSY_SAMPLES_SINGLE`), not 8, so a 2-peer call has less slack
+    /// than the multi case. Under availability flap a rung can change faster than the 5 s
+    /// monitor tick (the early-seed path samples at 1 Hz), so more than one slot can be
+    /// truncated in a window. This does NOT make the fix net-negative and cannot wedge
+    /// the detector: the chooser SATURATES at rung 0 under genuinely sustained
+    /// congestion, so switching stops exactly when the loss is persistent — and the
+    /// pre-fix behaviour on those same slots was phantom loss, which is worse than a
+    /// truncated real reading.
+    ///
+    /// The `if`-guard makes an unchanged layer a true no-op: re-anchoring on every
+    /// tick would discard the healthy in-flight loss window ~once per monitor tick
+    /// and permanently suppress the signal this tracker exists to publish — which
+    /// would ALSO blind the #2029 detector, so the guard is load-bearing for that
+    /// path too, not just for signal fidelity.
     pub fn set_selected_audio_layer(&mut self, layer: u32) {
         if layer != self.selected_audio_layer {
+            // Issue #2138: the new rung's sequence comes from a DIFFERENT counter,
+            // so drop the old baseline before the guard starts admitting it.
+            self.audio_datagram_loss.reanchor_for_layer_switch();
             self.selected_audio_layer = layer;
         }
     }
@@ -2058,42 +2520,84 @@ impl Peer {
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
     /// can update peer tiles.
     fn broadcast_peer_status(&self) {
+        let _ = global_sender().try_broadcast(self.peer_status_event());
+    }
+
+    /// Build the `peer_status` event this peer currently reports.
+    ///
+    /// Split out from [`Self::broadcast_peer_status`] so the emitted shape is
+    /// unit-testable on the host target: the global bus keeps no live receiver
+    /// on native and closes itself on first use, so the broadcast itself is
+    /// unobservable there.
+    fn peer_status_event(&self) -> DiagEvent {
+        let now = now_ms();
         let transport_str = match self.transport_type {
             TransportType::TRANSPORT_WEBTRANSPORT => "webtransport",
             TransportType::TRANSPORT_WEBSOCKET => "websocket",
             TransportType::TRANSPORT_UNKNOWN => "unknown",
         };
-        let evt = DiagEvent {
+        DiagEvent {
             subsystem: "peer_status",
             stream_id: None,
-            ts_ms: now_ms(),
-            metrics: vec![
-                metric!("to_peer", self.sid_str.clone()),
-                metric!(
-                    "audio_enabled",
-                    if self.audio_enabled { 1u64 } else { 0u64 }
-                ),
-                metric!(
-                    "video_enabled",
-                    if self.video_enabled { 1u64 } else { 0u64 }
-                ),
-                metric!(
-                    "screen_enabled",
-                    if self.screen_enabled { 1u64 } else { 0u64 }
-                ),
-                metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
-                metric!("audio_level", self.audio_level as f64),
-                // Zero-alloc per emit: `transport_str` is a `&'static str` from
-                // a literal match, so route it through the borrowing path
-                // (`Cow::Borrowed`) instead of the allocating `From<&str>`.
-                // This is the ~2 Hz/peer hot path from issue #1421.
-                Metric {
-                    name: "peer_transport",
-                    value: MetricValue::text_static(transport_str),
-                },
-            ],
-        };
-        let _ = global_sender().try_broadcast(evt);
+            ts_ms: now,
+            metrics: {
+                let mut m = vec![
+                    metric!("to_peer", self.sid_str.clone()),
+                    metric!(
+                        "audio_enabled",
+                        if self.audio_enabled { 1u64 } else { 0u64 }
+                    ),
+                    metric!(
+                        "video_enabled",
+                        if self.video_enabled { 1u64 } else { 0u64 }
+                    ),
+                    metric!(
+                        "screen_enabled",
+                        if self.screen_enabled { 1u64 } else { 0u64 }
+                    ),
+                    // Issue 2174: audio-off dominates the speaking flag. A peer
+                    // whose audio is disabled cannot be audibly speaking, so never
+                    // report `is_speaking: 1` alongside `audio_enabled: 0` — a
+                    // stale `true` here would re-light the tile glow right after
+                    // the decoder's terminal `speaking: 0`. Callers that force
+                    // audio off also clear the field (see `force_media_off`); this
+                    // guard is the backstop that makes any future forced path safe
+                    // by construction.
+                    metric!(
+                        "is_speaking",
+                        if self.is_speaking && self.audio_enabled {
+                            1u64
+                        } else {
+                            0u64
+                        }
+                    ),
+                    metric!("audio_level", self.audio_level as f64),
+                    // Zero-alloc per emit: `transport_str` is a `&'static str` from
+                    // a literal match, so route it through the borrowing path
+                    // (`Cow::Borrowed`) instead of the allocating `From<&str>`.
+                    //
+                    // Issue #1421: the dominant caller is the HEARTBEAT arm below,
+                    // which broadcasts once per received heartbeat per peer. The
+                    // sender's keepalive is `HEARTBEAT_KEEPALIVE_INTERVAL_MS` =
+                    // 5000 (videocall-aq/src/constants.rs, driven by the `Interval`
+                    // in connection/connection.rs), so this is ~0.2 Hz per peer at
+                    // rest — plus an edge-triggered immediate heartbeat on every
+                    // mute / camera / screen transition (`send_immediate_heartbeat`),
+                    // and it scales with participant count.
+                    Metric {
+                        name: "peer_transport",
+                        value: MetricValue::text_static(transport_str),
+                    },
+                ];
+                // Only when the selected rung is actually arriving (#2132): an
+                // absent metric renders as "—" rather than a nominal bitrate the
+                // receiver is not getting.
+                if let Some(rung) = self.displayed_audio_layer(now) {
+                    m.push(metric!(METRIC_SELECTED_AUDIO_LAYER, rung as u64));
+                }
+                m
+            },
+        }
     }
 
     /// Authoritatively force *this* peer's audio and/or video to the *off*
@@ -2123,6 +2627,15 @@ impl Peer {
             // emitting expand/hiss packets after the stream is gone.
             self.audio.set_muted(true);
             self.audio.flush();
+            // Issue 2174: clear the tracked speaking state too, mirroring the
+            // heartbeat audio-off arm. Without this the peer stays recorded as
+            // speaking, and the next `broadcast_peer_status()` would re-light
+            // the tile glow moments after the decoder emitted its terminal
+            // `speaking: 0`. `audio_level` is reset for the same reason (it is
+            // 0.0 on every current path, so this is future-proofing rather than
+            // a live fix).
+            self.is_speaking = false;
+            self.audio_level = 0.0;
             changed = true;
             debug!(
                 "force_media_off: muted audio for peer {} (host command)",
@@ -2238,8 +2751,8 @@ impl Peer {
 
         // Read the cleartext simulcast layer id from the OUTER wrapper (issue
         // #989) before `packet` is shadowed by the decrypted inner MediaPacket.
-        // Pre-simulcast publishers (and the single-layer default) send 0, so
-        // this is 0 for them. The VIDEO arm uses it to drop non-selected layers
+        // Pre-simulcast and explicitly single-layer publishers send 0, so this
+        // is 0 for them. The VIDEO arm uses it to drop non-selected layers
         // before any sequence tracking / decode.
         let incoming_video_layer = packet.simulcast_layer_id;
 
@@ -2718,8 +3231,22 @@ impl Peer {
                     self.video_enabled = resolved_video;
                     self.audio_enabled = resolved_audio;
                     self.screen_enabled = resolved_screen;
-                    self.is_speaking = metadata.is_speaking;
-                    if !metadata.is_speaking {
+                    // Issue 2174 (security carry-over): resolve the peer's
+                    // self-reported speaking claim against its resolved audio
+                    // state before storing it. A peer that announces
+                    // `audio_enabled = 0` while claiming `is_speaking = 1`
+                    // would otherwise hold the #1557 active-speaker exemption
+                    // from the local-CPU layer-drop cascade on EVERY receiver
+                    // (see the `exempt_speakers && peer.is_speaking` skip in
+                    // `seed_downlink_congestion`) without ever sending audio —
+                    // a resource lever a peer should not control unilaterally.
+                    //
+                    // This is #1557's own definition, not a new policy: that
+                    // exemption is documented as keying off the INSTANTANEOUS
+                    // VAD bool, and a peer with no audio is by definition not
+                    // instantaneously speaking.
+                    self.is_speaking = metadata.is_speaking && resolved_audio;
+                    if !self.is_speaking {
                         self.audio_level = 0.0;
                     }
                     // Capture peer's announced transport. Unknown enum
@@ -2947,6 +3474,22 @@ fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> 
     ))
 }
 
+/// Metric on the `peer_status` event carrying the audio rung this receiver is
+/// actually decoding for the peer (#2132). Absent when the selected rung is not
+/// currently arriving, so the readout shows "—" instead of a fabricated number.
+pub const METRIC_SELECTED_AUDIO_LAYER: &str = "selected_audio_layer";
+
+/// The audio rung to display for a peer: the selected one when it is actually
+/// arriving, otherwise `None`. Selection is bandwidth-safe and can sit on a rung
+/// the publisher has since shed; reporting that rung's nominal would overstate
+/// what is being received.
+///
+/// Note this keys off packet arrival, and DTX is on for every audio tier — a peer
+/// silent past the availability window reads "—" until they speak again.
+pub fn displayed_audio_rung(selected: u32, selected_is_arriving: bool) -> Option<u32> {
+    selected_is_arriving.then_some(selected)
+}
+
 #[derive(Debug)]
 pub struct PeerDecodeManager {
     connected_peers: HashMapWithOrderedKeys<u64, Peer>,
@@ -3043,6 +3586,22 @@ pub struct PeerDecodeManager {
     receiver_on_webtransport: bool,
     /// Applied to every camera/screen decoder created now or after a reset.
     skip_canvas_paint: bool,
+    /// Issue #2156: which CAMERA simulcast ladder this DEPLOYMENT's publishers
+    /// encode against (`experimentalReducedLadder`, #1768). Handed in from the UI
+    /// through `VideoCallClientOptions::camera_ladder_variant` →
+    /// [`Self::set_camera_ladder_variant`], because `videocall-client` cannot read
+    /// `window.__APP_CONFIG` itself.
+    ///
+    /// Consumed ONLY by the two DISPLAY snapshot producers
+    /// ([`Self::received_layer_snapshot`], [`Self::per_peer_received_snapshots`]) so
+    /// a receiver's rung labels / `{w}x{h}` / `~kbps` readouts describe the stream it
+    /// is actually decoding. Layer SELECTION deliberately never reads this — see
+    /// `layer_chooser::size_cap_layer`.
+    ///
+    /// Defaults to [`LadderVariant::Default`], i.e. pre-#2156 behaviour, so a
+    /// construction site that forgets to pass it degrades to the shipped labels
+    /// rather than breaking.
+    camera_ladder_variant: LadderVariant,
     /// Test-only count of how many times `log_peer_leave_decode_snapshot`
     /// actually emitted, so #1399 coalescing can be asserted directly
     /// (O(N) -> constant under a within-window cascade). `Cell` because the
@@ -3081,6 +3640,7 @@ impl PeerDecodeManager {
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
             skip_canvas_paint: false,
+            camera_ladder_variant: LadderVariant::Default,
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -3109,6 +3669,7 @@ impl PeerDecodeManager {
             peer_tile_hints: HashMap::new(),
             receiver_on_webtransport: false,
             skip_canvas_paint: false,
+            camera_ladder_variant: LadderVariant::Default,
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -3128,6 +3689,22 @@ impl PeerDecodeManager {
     pub(crate) fn insert_zero_loss_top_peer_for_test(&mut self, session_id: u64) {
         self.connected_peers
             .insert(session_id, make_zero_loss_top_peer(session_id));
+    }
+
+    /// TEST-ONLY: drive a peer's VIDEO decode guard to `layer` so the display
+    /// producers resolve a rung ABOVE the base. Needed because the reduced ladder
+    /// differs from the shipped one ONLY in the top rung, so a peer sitting at
+    /// layer 0 produces byte-identical output under both variants — a test that
+    /// does not raise the guard cannot distinguish them (issue 2156).
+    /// Also marks the peer video-ENABLED, which the needle producer requires for
+    /// eligibility (`PrefMediaKind::Video => peer.video_enabled`) — without it the
+    /// producer returns `None` and the test would assert nothing.
+    #[cfg(test)]
+    pub(crate) fn set_peer_video_layer_for_test(&mut self, session_id: u64, layer: u32) {
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            peer.set_selected_video_layer(layer);
+            peer.video_enabled = true;
+        }
     }
 
     /// Set the callback used to send packets back through the connection.
@@ -3229,6 +3806,25 @@ impl PeerDecodeManager {
 
     pub fn set_skip_canvas_paint(&mut self, skip_canvas_paint: bool) {
         self.skip_canvas_paint = skip_canvas_paint;
+    }
+
+    /// Issue #2156: tell the manager which CAMERA simulcast ladder this deployment's
+    /// publishers encode against, so the DISPLAY snapshot producers label the rung a
+    /// receiver is actually decoding.
+    ///
+    /// Set once at construction from `VideoCallClientOptions::camera_ladder_variant`
+    /// (see `VideoCallClient::create_peer_decoder_manager`) — the flag is a
+    /// deployment-wide switch read once per page load, so there is no reason to
+    /// re-set it mid-call. Affects READOUTS only; layer selection never reads it.
+    pub fn set_camera_ladder_variant(&mut self, variant: LadderVariant) {
+        self.camera_ladder_variant = variant;
+    }
+
+    /// TEST-ONLY read-back of [`Self::set_camera_ladder_variant`], so the
+    /// options→manager wiring can be asserted without a browser.
+    #[cfg(test)]
+    pub(crate) fn camera_ladder_variant_for_test(&self) -> LadderVariant {
+        self.camera_ladder_variant
     }
 
     #[cfg(test)]
@@ -3848,9 +4444,10 @@ impl PeerDecodeManager {
     /// layer from the next packet without a keyframe request. Requesting one would be
     /// a meaningless PLI for a kind that has no keyframes.
     ///
-    /// It writes ONLY the guard (via `set_selected_*_layer`, which for Video/Screen
-    /// re-anchors the seq tracker only on an actual change; AUDIO has no seq tracker,
-    /// so its setter only assigns the field). It does NOT call
+    /// It writes ONLY the guard (via `set_selected_*_layer`; each of the three
+    /// setters re-anchors its OWN receive-side sequence tracker only on an actual
+    /// change — Video/Screen their [`SequenceTracker`], AUDIO its
+    /// [`AudioDatagramLossTracker`] since issue #2138). It does NOT call
     /// `choose()`/`tick_*`/`observe_*`/`seed_*` or mutate ANY chooser hysteresis —
     /// the only mutation besides the guard is the benign lazy prune inside
     /// `highest_available`.
@@ -4144,12 +4741,22 @@ impl PeerDecodeManager {
     /// `layer_count` is the empirically-learned ladder size (highest observed
     /// available layer + 1), clamped by the resolver. `now_ms` lets availability
     /// expiry use one consistent clock. Panic-safe; cheap to poll each render.
+    ///
+    /// DISPLAY-ONLY (issue #2156): the rung geometry/bitrate is resolved through
+    /// [`received_layer_snapshot_for_display`] against `self.camera_ladder_variant`,
+    /// so under `experimentalReducedLadder` the needle readout says `960x540` rather
+    /// than the shipped ladder's `1280x720`.
     pub fn received_layer_snapshot(
         &mut self,
         kind: crate::decode::layer_chooser::PrefMediaKind,
         now_ms: u64,
     ) -> Option<crate::decode::layer_chooser::ReceivedLayerSnapshot> {
-        use crate::decode::layer_chooser::{received_layer_snapshot, PrefMediaKind};
+        use crate::decode::layer_chooser::{received_layer_snapshot_for_display, PrefMediaKind};
+
+        // Copied out up-front: the resolver call below happens while a `&mut` borrow
+        // of `self.connected_peers` is in scope, so reading `self` again there would
+        // not borrow-check.
+        let variant = self.camera_ladder_variant;
 
         // Pick the representative (session_id) for this kind, plus its decoded
         // layer + learned ladder size. Two-pass: prefer the active talker /
@@ -4209,7 +4816,9 @@ impl PeerDecodeManager {
                 peer.audio_layer_availability.highest_available(now_ms) + 1,
             ),
         };
-        Some(received_layer_snapshot(kind, layer, count))
+        Some(received_layer_snapshot_for_display(
+            kind, layer, count, variant,
+        ))
     }
 
     /// Per-peer RECEIVE simulcast diagnostics (issue #1095 observability).
@@ -4242,6 +4851,9 @@ impl PeerDecodeManager {
         let video_max = bounds.for_kind(PrefMediaKind::Video).max;
         let screen_max = bounds.for_kind(PrefMediaKind::Screen).max;
         let audio_max = bounds.for_kind(PrefMediaKind::Audio).max;
+        // Issue #2156: DISPLAY path — resolve rung geometry/bitrate against the
+        // deployment's camera ladder. Copied out before the `&mut` peer borrows below.
+        let variant = self.camera_ladder_variant;
         let keys = self.connected_peers.ordered_keys().clone();
         let mut out = Vec::with_capacity(keys.len());
         for sid in keys {
@@ -4269,6 +4881,7 @@ impl PeerDecodeManager {
                     avail_top,
                     video_max,
                     peer.video_layer_chooser.is_constrained(),
+                    variant,
                 )
             });
             let screen = peer.screen_enabled.then(|| {
@@ -4279,6 +4892,7 @@ impl PeerDecodeManager {
                     avail_top,
                     screen_max,
                     peer.screen_layer_chooser.is_constrained(),
+                    variant,
                 )
             });
             let audio = peer.audio_enabled.then(|| {
@@ -4289,6 +4903,7 @@ impl PeerDecodeManager {
                     avail_top,
                     audio_max,
                     peer.audio_layer_chooser.is_constrained(),
+                    variant,
                 )
             });
             // Skip peers with nothing flowing so the list stays compact.
@@ -4332,7 +4947,7 @@ impl PeerDecodeManager {
         // double-borrowing `self`. `Rc::clone` is cheap; all routes share one budget.
         let pli_budget_for_route = self.pli_budget.clone();
         // Issue #1640: capture local session_id before the mutable borrow for
-        // use in set_stream_context and peer.reset().
+        // use in set_stream_context and peer.reset_for_decode_error().
         let local_sid_for_context = self.local_session_id.clone().unwrap_or_default();
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             let was_screen_enabled = peer.screen_enabled;
@@ -4363,28 +4978,33 @@ impl PeerDecodeManager {
                     );
                 }
                 peer.context_initialized = true;
-            } else if send_packet_for_route.is_some() && !peer.video.has_keyframe_request_route() {
+            } else if send_packet_for_route.is_some()
+                && (!peer.video.has_keyframe_request_route()
+                    || !peer.screen.has_keyframe_request_route())
+            {
                 // Issue 1899 / discussion 1960 — self-healing route re-install. The proactive
                 // keyframe-request route is installed exactly once above (the one-time
                 // `context_initialized` latch), but it is DESTROYED later in the peer lifecycle:
-                // `Peer::reset` (decode-error path) rebuilds the video+screen decoders with empty
-                // route slots, and `clear_send_packet_callback` nulls them on teardown. Because the
-                // latch never re-runs, a reset leaves the route `None` FOREVER — the worker's
-                // keyframe-less eviction PLIs (issue #1025) then post to a no-op main-thread route,
-                // so a keyframe-starved tile can never recover (field: minutes-long screen freeze
-                // after a reset while PLIs fired into the void). Here media is flowing again AND the
-                // transport is wired (`send_packet` set — so this cannot fire during a disconnect
-                // teardown, where it is intentionally `None`), so re-install the route on the fresh
-                // decoders. Transport-agnostic: the same route serves WebTransport and WebSocket.
-                // The `has_keyframe_request_route` probe is a RefCell-borrow `Option` check that runs
-                // on EVERY packet while the transport is wired (the probe itself never stops); only the
-                // install BODY below is skipped once the route is present, so on the common healthy path
-                // this costs just that one borrow-and-check per packet. Probing VIDEO alone is valid
-                // because routes are only ever dropped in PAIRS — both `Peer::reset` and
-                // `clear_send_packet_callback` drop the VIDEO and SCREEN routes together — so a missing
-                // screen route always implies a missing video route. (A future change that dropped the
-                // SCREEN route alone would evade this VIDEO-keyed probe; keep the pair-drop invariant
-                // or probe both.)
+                // `Peer::reset_for_decode_error` (decode-error path) rebuilds a video or screen
+                // decoder with an empty route slot, and `clear_send_packet_callback` nulls them on
+                // teardown. Because the latch never re-runs, a rebuild leaves the route `None`
+                // FOREVER — the worker's keyframe-less eviction PLIs (issue #1025) then post to a
+                // no-op main-thread route, so a keyframe-starved tile can never recover (field:
+                // minutes-long screen freeze after a reset while PLIs fired into the void). Here
+                // media is flowing again AND the transport is wired (`send_packet` set — so this
+                // cannot fire during a disconnect teardown, where it is intentionally `None`), so
+                // re-install the route on the fresh decoder. Transport-agnostic: the same route
+                // serves WebTransport and WebSocket.
+                //
+                // Issue 2225: BOTH slots are probed. The old code probed VIDEO alone and justified
+                // it with a "routes are only ever dropped in PAIRS" invariant — true while
+                // `Peer::reset` rebuilt video and screen together, and explicitly flagged in that
+                // comment as something a future single-stream rebuild would break. Per-kind resets
+                // break it exactly that way: a SCREEN decode error now rebuilds the screen decoder
+                // alone, and a VIDEO-keyed probe would never notice the missing screen route — the
+                // very freeze this self-heal exists to prevent. Both probes are RefCell-borrow
+                // `Option` checks; the install BODY is still skipped once both routes are present,
+                // so the healthy path costs two borrow-and-checks per packet.
                 if let Some(send_packet) = &send_packet_for_route {
                     install_keyframe_request_routes(
                         peer,
@@ -4413,10 +5033,49 @@ impl PeerDecodeManager {
                     // counts toward liveness, not just heartbeats.
                     peer.on_activity();
                     if let Some(diagnostics) = &self.diagnostics {
+                        // Issue #2190: pass whether the packet was actually DECODED, so
+                        // `fps_received` counts decodes rather than arrivals.
+                        //
+                        // `decode_status.rendered` is the discriminator. Precisely, it
+                        // means NOT-SKIPPED, not "a frame reached the screen": every early
+                        // return in `Peer::decode` that declines to decode yields
+                        // `DecodeStatus::SKIPPED` (`rendered: false`), and the real paths
+                        // yield `true`. It is deliberately NOT claimed to be exact —
+                        // `VideoPeerDecoder::decode` wraps its whole body in
+                        // `if let Some(video_metadata)` and still falls through to
+                        // `_rendered: true`, so a packet carrying no video metadata
+                        // decodes nothing yet reports `true`; and `true` marks the frame as
+                        // handed to `push_frame` (async, fire-and-forget), not painted.
+                        // "Not skipped" is nonetheless a large improvement over "arrived" —
+                        // it removes the whole wrong-rung population below. For the
+                        // paint-truthful number, use `fps_painted` (#1656).
+                        //
+                        // The dominant SKIPPED path here is the EXACT-MATCH simulcast
+                        // guard. A receiver that is NOT constraining its layer advertises
+                        // no `LAYER_PREFERENCE` at all (`tick_layer_choosers` omits the
+                        // entry when it already tracks the top), so the relay fails OPEN
+                        // and forwards every rung — each non-selected one arrived here and
+                        // was counted, making an 8fps 3-rung camera read ~52 fps (7+15+30,
+                        // the ladder sum) instead of 8. Field-confirmed across three
+                        // meetings on two clusters. NOTE the inflation is therefore a
+                        // HEALTHY-receiver phenomenon: once this receiver constrains below
+                        // the top, the relay filters server-side and there is little left
+                        // to skip — so pre-fix series are inflated for unconstrained
+                        // receivers, NOT uniformly. The other SKIPPED paths (tile not
+                        // visible, straggler frame after a heartbeat says camera/mic off,
+                        // unknown codec) are equally correct to exclude: in none of them
+                        // did a frame reach the screen or the speaker.
+                        //
+                        // Bytes are still reported regardless — a skipped packet still
+                        // consumed downlink — and bitrate is gated on its OWN arrival
+                        // freshness clock (see `FpsTracker`), so it stays live for a
+                        // receiving-but-not-decoding stream instead of being zeroed with
+                        // fps.
                         diagnostics.track_frame(
                             &peer.sid_str,
                             media_type,
                             packet.data.len() as u64,
+                            decode_status.rendered,
                         );
                     }
 
@@ -4460,13 +5119,33 @@ impl PeerDecodeManager {
                     Ok(())
                 }
                 Err(e) => {
-                    // Track decode errors (codec failures: keyframe miss, parse error, decoder reset).
-                    // Media type is not available in the error arm; default to VIDEO since that
-                    // is where the vast majority of decode errors occur in practice.
+                    // Track decode errors (codec failures: keyframe miss, parse error, decoder
+                    // reset). The failed packet still arrived and consumed downlink, so record it
+                    // as a non-decoded arrival too. Without this, an all-error stream never
+                    // refreshes the arrival clock and falsely reports both bitrate and decode
+                    // errors as zero after one second.
+                    //
+                    // Prefer the cleartext outer media-kind hint because failures such as AES
+                    // decryption happen before the inner media packet is available. Older
+                    // wrappers can leave the hint unspecified, so typed decode errors provide
+                    // the fallback; otherwise retain the historical VIDEO default.
                     if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.track_decode_error(&peer.sid_str, MediaType::VIDEO);
+                        let diagnostic_media_type =
+                            diagnostic_media_type_for_decode_error(&packet, &e);
+                        diagnostics.track_decode_error(&peer.sid_str, diagnostic_media_type);
+                        diagnostics.track_frame(
+                            &peer.sid_str,
+                            diagnostic_media_type,
+                            packet.data.len() as u64,
+                            false,
+                        );
                     }
-                    peer.reset(&local_sid_for_context).map_err(|_| e)
+                    // Issue 2225: rebuild ONLY the decoder this error implicates
+                    // — a video failure must not respawn the peer's NetEQ audio
+                    // worker, and an envelope/crypto failure (which never
+                    // reached a decoder) must rebuild nothing at all.
+                    let rebuilt = peer.reset_for_decode_error(&local_sid_for_context, &e);
+                    rebuilt.map_err(|_| e)
                 }
             }
         } else {
@@ -4673,8 +5352,17 @@ impl PeerDecodeManager {
         // would never be registered unless we attempt it here too.
         //
         // The canvas element id is the bare `session_id` string — see the
-        // UserVideo RSX `canvas { id: "{id}", ... }`.  The `video_canvas_id`
-        // field uses a "video-" prefix (legacy) that no longer matches the DOM.
+        // UserVideo RSX `canvas { id: "{id}", ... }` — which is why this block
+        // looks up `sid_str` directly.
+        //
+        // The "video-{key}" prefix lives ONLY in `PeerDecodeManager::new`'s
+        // DEFAULT `get_video_canvas_id` callback, which nothing in this
+        // workspace ships with: every UI construction site injects the identity
+        // callback (`get_peer_video_canvas_id: VcCallback::from(|id| id)` in
+        // dioxus-ui's meeting / attendants / waiting_room / guest_join, wired
+        // through `VideoCallClient::new`). So in production `video_canvas_id`
+        // IS the bare session id and does match the DOM; the legacy prefix is
+        // reached only by tests that build a manager directly.
         if let Some(peer_ref) = self.connected_peers.get(&session_id) {
             if let Some(window) = web_sys::window() {
                 if let Some(document) = window.document() {
@@ -4840,14 +5528,18 @@ impl PeerDecodeManager {
     /// `DELETE_PEER_SNAPSHOT_COALESCE_MS` window.
     ///
     /// `last_delete_peer_snapshot_ms == 0` is the never-fired sentinel and
-    /// always emits. The `saturating_sub` guards a non-monotonic clock
-    /// (`now_ms < last`, possible across a `Date.now()` step on wasm): a
-    /// backwards clock yields `0 < window` and so *emits* rather than wedging
-    /// the snapshot off — fail-open, matching the diagnostic intent.
+    /// always emits. The explicit `now_ms < last` arm guards a non-monotonic
+    /// clock (possible across a `Date.now()` step on wasm): a backwards clock
+    /// *emits* rather than wedging the snapshot off until the wall clock
+    /// catches back up — fail-open, matching the diagnostic intent.
+    ///
+    /// That arm is load-bearing, not defensive dead code: without it a
+    /// backwards step makes `now_ms - last` underflow to `0`, and `0 >= window`
+    /// is false, suppressing every snapshot for the duration of the step.
     fn delete_peer_snapshot_due(&self, now_ms: u64) -> bool {
         self.last_delete_peer_snapshot_ms == 0
-            || now_ms.saturating_sub(self.last_delete_peer_snapshot_ms)
-                >= DELETE_PEER_SNAPSHOT_COALESCE_MS
+            || now_ms < self.last_delete_peer_snapshot_ms
+            || now_ms - self.last_delete_peer_snapshot_ms >= DELETE_PEER_SNAPSHOT_COALESCE_MS
     }
 
     /// Remove all peers and terminate their decoder workers immediately.
@@ -5263,24 +5955,46 @@ impl PeerDecodeManager {
 // build. `mod tests` re-imports them via its `use super::*;`, so every existing
 // bare-name call site there keeps working unchanged.
 
+/// Ordered log of the lifecycle calls a [`MockAudioDecoder`] received, shared
+/// by every mock in one test. Entries are `"<tag>:<op>"`, so a test can observe
+/// both WHICH decoder was called and in WHAT ORDER — which is the whole point
+/// for decoder replacement (issue 2174 follow-up), where `retire_for_replacement`
+/// must land strictly before the `Drop` it disarms.
+#[cfg(test)]
+type MockAudioLog = Rc<RefCell<Vec<String>>>;
+
 /// No-op audio decoder for unit tests.
 /// Muted state is stored in an `Rc<Cell<bool>>` so tests can inspect it
 /// after handing ownership to `Peer`.
 #[cfg(test)]
 struct MockAudioDecoder {
     muted: Rc<std::cell::Cell<bool>>,
+    tag: &'static str,
+    log: MockAudioLog,
 }
 
 #[cfg(test)]
 impl MockAudioDecoder {
     fn new() -> (Self, Rc<std::cell::Cell<bool>>) {
+        Self::tagged("mock", Rc::new(RefCell::new(Vec::new())))
+    }
+
+    /// A mock that records its lifecycle calls into a caller-owned log under
+    /// `tag`, so several mocks can be told apart in one test.
+    fn tagged(tag: &'static str, log: MockAudioLog) -> (Self, Rc<std::cell::Cell<bool>>) {
         let muted = Rc::new(std::cell::Cell::new(true));
         (
             Self {
                 muted: muted.clone(),
+                tag,
+                log,
             },
             muted,
         )
+    }
+
+    fn record(&self, op: &str) {
+        self.log.borrow_mut().push(format!("{}:{op}", self.tag));
     }
 }
 
@@ -5292,6 +6006,21 @@ impl AudioPeerDecoderTrait for MockAudioDecoder {
     fn flush(&mut self) {}
     fn set_muted(&mut self, muted: bool) {
         self.muted.set(muted);
+        self.record(if muted { "mute" } else { "unmute" });
+    }
+    fn retire_for_replacement(&mut self) {
+        self.record("retire");
+    }
+}
+
+/// Stands in for `NetEqAudioPeerDecoder::drop`, which broadcasts the terminal
+/// `speaking: 0`. Recording the drop is what lets a test distinguish
+/// replacement (retire, then a disarmed drop) from teardown (a drop that still
+/// has to announce silence).
+#[cfg(test)]
+impl Drop for MockAudioDecoder {
+    fn drop(&mut self) {
+        self.record("drop");
     }
 }
 
@@ -5391,6 +6120,87 @@ fn make_zero_loss_top_peer(session_id: u64) -> Peer {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
+    /// Guards the WIRING, not the leaf fn: deleting the emission from
+    /// `peer_status_event` left every other test in both crates green.
+    #[test]
+    fn peer_status_carries_the_arriving_audio_rung_and_omits_a_stale_one() {
+        let now = videocall_diagnostics::now_ms();
+        let (mut peer, _muted) = make_test_peer(2132);
+        peer.audio_layer_availability.observe(1, now);
+        peer.set_selected_audio_layer(1);
+        let evt = peer.peer_status_event();
+        let got = evt
+            .metrics
+            .iter()
+            .find(|m| m.name == METRIC_SELECTED_AUDIO_LAYER)
+            .map(|m| m.value.clone());
+        assert!(
+            matches!(got, Some(MetricValue::U64(1))),
+            "arriving rung 1 must be emitted, got {got:?}"
+        );
+
+        // Same selection, but the observation is now older than the availability
+        // window: the metric must be ABSENT so the readout falls back to "—"
+        // rather than claiming a bitrate the receiver is not getting.
+        let (mut stale, _m2) = make_test_peer(2133);
+        stale.audio_layer_availability.observe(1, 0);
+        stale.set_selected_audio_layer(1);
+        let stale_evt = stale.peer_status_event();
+        assert!(
+            !stale_evt
+                .metrics
+                .iter()
+                .any(|m| m.name == METRIC_SELECTED_AUDIO_LAYER),
+            "a rung outside the availability window must not be emitted"
+        );
+    }
+
+    /// The peek must agree with the pruning sibling about the window boundary;
+    /// replacing it with a bare `contains_key` left every test green.
+    #[test]
+    fn layer_available_peek_respects_the_window() {
+        use crate::decode::layer_chooser::LayerAvailability;
+        let w = LayerAvailability::DEFAULT_WINDOW_MS;
+        let mut a = LayerAvailability::new();
+        a.observe(1, 1_000);
+        assert!(
+            a.layer_available_peek(1, 1_000),
+            "same instant is available"
+        );
+        assert!(
+            a.layer_available_peek(1, 1_000 + w),
+            "boundary is inclusive"
+        );
+        assert!(
+            !a.layer_available_peek(1, 1_000 + w + 1),
+            "one ms past the window must be unavailable"
+        );
+        assert!(
+            !a.layer_available_peek(2, 1_000),
+            "unobserved layer is never available"
+        );
+    }
+
+    #[test]
+    fn displayed_audio_rung_hides_a_selected_rung_that_is_not_arriving() {
+        assert_eq!(
+            crate::decode::peer_decode_manager::displayed_audio_rung(2, true),
+            Some(2)
+        );
+        assert_eq!(
+            crate::decode::peer_decode_manager::displayed_audio_rung(0, true),
+            Some(0)
+        );
+        assert_eq!(
+            crate::decode::peer_decode_manager::displayed_audio_rung(2, false),
+            None
+        );
+        assert_eq!(
+            crate::decode::peer_decode_manager::displayed_audio_rung(0, false),
+            None
+        );
+    }
+
     use super::*;
     use protobuf::Message;
     use std::cell::Cell;
@@ -5401,6 +6211,125 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A FIXED test clock, inside the layer-availability retention window.
+    ///
+    /// `make_zero_loss_top_peer` / `make_congested_top_peer` record layer
+    /// availability at `t == 1000`, and `LayerAvailability::highest_available`
+    /// prunes any entry older than `DEFAULT_WINDOW_MS`. Ticking a
+    /// chooser with the real wall clock (`now_ms()` ≈ 1.7e12) therefore prunes
+    /// the entire learned ladder and collapses `highest_available` from 2 to 0,
+    /// silently defeating both the size lid and the #1079 advertise gate — the
+    /// fixture, not the production code, is what breaks.
+    ///
+    /// 2000 is 1000ms after the fixtures' observation, well inside the window.
+    ///
+    /// Ticking repeatedly at the SAME fixed clock is intentional and safe because
+    /// nothing these call sites exercise is time-gated. Every `FIXTURE_NOW_MS` tick
+    /// seeds a ZERO-LOSS peer (`insert_zero_loss_top_peer_for_test` ->
+    /// `make_zero_loss_top_peer`), so `DownlinkSample::is_congested` is never true,
+    /// the chooser never leaves its unconstrained state, and `choose` takes the
+    /// follow-the-top arm (`layer_chooser.rs:539`) — an unconditional
+    /// `set_layer(highest_available, now_ms)` on EVERY tick that consults no elapsed
+    /// time at all. The dwell gate (`LAYER_STEP_UP_DWELL_MS`) sits only in the
+    /// constrained + clean climb, which a zero-loss fixture never reaches; and
+    /// `set_layer` itself only records timestamps, it never gates on them. The
+    /// tile-size lid is not a chooser decision either: `tick_layer_chooser` applies
+    /// it AFTER `choose` returns, as the pure `bounds.clamp(raw)` at line 1487 of
+    /// this file, so it is a function of the tile hint alone and likewise
+    /// clock-independent.
+    ///
+    /// A fixed small clock is also the established convention in this module:
+    /// `size_lid_yields_to_user_receive_min` and
+    /// `congestion_seed_never_advertises_above_size_lid` both already tick with
+    /// `let now = 2000u64`. Note those two drive the CONGESTED fixture, so their own
+    /// safety argument is the different one their comments give (the step-down arm
+    /// carries no dwell gate) — only the fixed constant is shared with these tests.
+    const FIXTURE_NOW_MS: u64 = 2000;
+
+    /// Build a `delta`-frame packet carrying `seq`. Both VIDEO and SCREEN read
+    /// `video_metadata.sequence` in `track_sequence`, so one helper covers both.
+    fn delta_seq_packet(seq: u64) -> MediaPacket {
+        use videocall_types::protos::media_packet::VideoMetadata;
+        MediaPacket {
+            video_metadata: Some(VideoMetadata {
+                sequence: seq,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: "delta".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The bridging sequence number that turns a first-packet + big-jump pair
+    /// into ACTUAL recorded loss.
+    ///
+    /// `record_seq_into_reorder_window` deliberately primes `seen_bits` to
+    /// `u64::MAX` on the FIRST packet, so that sequence numbers predating the
+    /// stream are never counted as lost. A consequence: a gap of >= 64 taken
+    /// immediately after that first packet hits the `count_zeros()` branch on
+    /// an all-ones window and records ZERO loss. "seq 1 then seq 70" therefore
+    /// establishes no loss at all.
+    ///
+    /// Sending seq 3 first clears exactly one bit (position 1 == the never-sent
+    /// seq 2); the subsequent >= 64 jump shifts that hole off the window and
+    /// counts it. This is the pattern the passing `keyframe_clears_loss_state`
+    /// already uses (1 -> 3 -> 67).
+    const LOSS_BRIDGE_SEQ: u64 = 3;
+
+    /// Install the worker `<link>` tags that the real decoders look up on the page.
+    ///
+    /// Trunk normally emits these into `index.html`; the `wasm-bindgen-test` harness
+    /// page has neither, so ANY test driving the real `add_peer` -> `Peer::new` ->
+    /// `new_decoders` path panics. Both decoders are constructed, so both tags are
+    /// required:
+    ///   * `codecs-worker` — `videocall-codecs/src/decoder/wasm.rs` (video/screen)
+    ///   * `neteq-worker`  — `decode/neteq_audio_decoder.rs` (audio)
+    ///
+    /// These are missing test fixtures, not product defects.
+    ///
+    /// Each `href` points at a `blob:` URL holding a no-op worker script: these tests
+    /// only need `Worker::new` to SUCCEED, and never run a decode round-trip.
+    /// Idempotent, and the tags plus their object URLs are deliberately left installed
+    /// for the life of the test binary — revoking a URL would break later
+    /// `Worker::new` calls.
+    ///
+    /// Creating real DOM nodes from a `run_in_browser` test is the existing in-repo
+    /// convention (`peer_decoder.rs::make_canvas`).
+    fn ensure_decoder_worker_link_tags() {
+        for id in ["codecs-worker", "neteq-worker"] {
+            ensure_worker_link_tag(id);
+        }
+    }
+
+    /// Install one no-op blob-backed worker `<link id="{id}" href="blob:...">`.
+    fn ensure_worker_link_tag(id: &str) {
+        let document = web_sys::window()
+            .expect("no window")
+            .document()
+            .expect("no document");
+        if document.get_element_by_id(id).is_some() {
+            return;
+        }
+        let parts = js_sys::Array::new();
+        parts.push(&wasm_bindgen::JsValue::from_str(
+            "self.onmessage = () => {};",
+        ));
+        let bag = web_sys::BlobPropertyBag::new();
+        bag.set_type("text/javascript");
+        let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &bag)
+            .expect("create worker blob");
+        let url = web_sys::Url::create_object_url_with_blob(&blob).expect("create blob URL");
+        let link = document.create_element("link").expect("create <link>");
+        link.set_id(id);
+        link.set_attribute("href", &url).expect("set href");
+        document
+            .body()
+            .expect("no body")
+            .append_child(&link)
+            .expect("append <link>");
+    }
 
     // ── Issue #1878: receive-side audio DATAGRAM loss accounting ─────────────
     // Pure native `#[test]`s over the production `AudioDatagramLossTracker`
@@ -5590,6 +6519,551 @@ mod tests {
         );
     }
 
+    // ── Issue #2138: an AUDIO simulcast layer switch must re-anchor the tracker ──
+    //
+    // Each audio rung is an independent Opus encode with its OWN sequence counter
+    // (`microphone_encoder`: "each layer owns its own seq counter"), so a receive-side
+    // rung change is a cross-counter discontinuity. Video and screen already
+    // re-anchored on switch; audio did not. These drive the REAL production entry
+    // point (`Peer::set_selected_audio_layer`, the single chokepoint every write goes
+    // through) and the REAL AUDIO decode arm — not the tracker in isolation — so
+    // removing the `reanchor_for_layer_switch()` call from the setter fails them.
+    //
+    // Both are plain `#[test]`s (host libtest, the CI "cargo test videocall-client
+    // (native libtest)" job): `Peer::decode`'s AUDIO path needs no browser API — the
+    // mock audio decoder stands in for NetEq — and a `#[wasm_bindgen_test]` would be
+    // a false green on a box whose wasm harness silently no-ops (see the note on
+    // `should_clear_canvas_only_on_decode_stop_edge`).
+
+    /// THE defect, in the direction that actually bites: a switch to a LAGGING audio
+    /// rung is a BACKWARD jump, and one smaller than `AUDIO_SEQ_RESET_REANCHOR_GAP`
+    /// (1024) is not treated as a sender restart — so pre-fix it landed in the shared
+    /// reorder window's "too old, ignore" branch and the tracker stayed PINNED at the
+    /// old rung's high-water mark, silently ignoring every packet of the new rung
+    /// (including real loss) until its sequence climbed back past that mark.
+    ///
+    /// So the dominant pre-fix symptom is UNDER-reporting — the tracker goes BLIND —
+    /// not the over-reporting the issue title implies. This asserts both halves of
+    /// "not blinded": the baseline actually follows the new rung, AND real loss on the
+    /// new rung is still counted.
+    ///
+    /// Mutation sensitivity: deleting the `reanchor_for_layer_switch()` call in
+    /// `set_selected_audio_layer` leaves `high_seq == Some(900)` and every assertion
+    /// below fails (the new rung's packets are ignored, so `lost == 0`).
+    #[test]
+    fn audio_layer_switch_backward_does_not_blind_the_loss_tracker() {
+        let (mut peer, _muted) = make_test_peer(2138);
+        arm_audio_datagram_tracking(&mut peer);
+
+        // Steady on rung 0, whose counter has advanced to a high-water mark of 900.
+        for seq in 898..=900u64 {
+            let _ = peer.decode(&layered_audio_packet(2138, 0, seq), "local@test.com");
+        }
+        assert_eq!(
+            peer.audio_datagram_loss.high_seq,
+            Some(900),
+            "precondition: the tracker is anchored on rung 0's counter"
+        );
+
+        // Switch to rung 1 — a LAGGING rung whose own counter sits at 200 (it was
+        // created later / was ceiling-suppressed, so it is behind rung 0). The
+        // backward jump is 700: well outside the 64-slot reorder window, yet BELOW
+        // the 1024 restart threshold — exactly the gap the restart guard misses.
+        peer.set_selected_audio_layer(1);
+        assert!(
+            peer.audio_datagram_loss.high_seq.is_none(),
+            "an audio layer switch must re-anchor: the old rung's baseline is cleared"
+        );
+
+        // Rung 1's packets now arrive. Pre-fix these were ALL ignored as "too old"
+        // (200 < 900 - 64), so the tracker published nothing for this peer.
+        for seq in 200..=202u64 {
+            let _ = peer.decode(&layered_audio_packet(2138, 1, seq), "local@test.com");
+        }
+        assert_eq!(
+            peer.audio_datagram_loss.high_seq,
+            Some(202),
+            "post-switch: the new rung's packets must be TRACKED, not silently ignored"
+        );
+
+        // And real loss on the new rung is still detected: sequence 203 never
+        // arrives, and the hole is declared once it shifts off the 64-slot window.
+        // (204 first clears exactly one window bit — the `LOSS_BRIDGE_SEQ` pattern —
+        // so the >= 64 jump has a hole to shift off rather than an all-ones window.)
+        //
+        // `window_lost` is read as a running MAX rather than a final read: this test
+        // drives the production `decode()` path, which stamps the rate window from
+        // the real wall clock, so a >1 s stall mid-loop could roll the ~1 s window and
+        // zero the field. The max survives that (the count is captured on the packet
+        // that declares the loss). The loop is ~65 in-memory iterations, so a rollover
+        // is not expected — this only removes the flake, it does not mask a defect.
+        let mut lost = 0u32;
+        for seq in 204..=268u64 {
+            let _ = peer.decode(&layered_audio_packet(2138, 1, seq), "local@test.com");
+            lost = lost.max(peer.audio_datagram_loss.window_lost);
+        }
+        assert_eq!(
+            lost, 1,
+            "post-switch: real datagram loss on the NEW rung must still be counted \
+             (pre-fix the tracker was blind and reported 0)"
+        );
+    }
+
+    /// The other direction: a switch to a LEADING audio rung is a FORWARD jump, which
+    /// pre-fix was booked as one contiguous gap — capped at ~64 in `window_lost` but
+    /// summed UNCAPPED into `window_raw_lost` (issue #2031's magnitude signal), so a
+    /// layer switch manufactured a phantom multi-hundred-datagram "burst".
+    ///
+    /// This is the assertion the issue's own framing asks for ("an audio layer switch
+    /// does not register as datagram loss"), and it is reachable: rung counters drift
+    /// apart in BOTH directions because a rung suppressed by the user/congestion
+    /// ceiling returns from its publish gate BEFORE `sequence_number += 1`, stalling
+    /// its counter while the base advances — so whichever rung was suppressed is the
+    /// laggard, and switching AWAY from it is a forward jump.
+    ///
+    /// Mutation sensitivity: deleting the `reanchor_for_layer_switch()` call in
+    /// `set_selected_audio_layer` makes the first post-switch packet book 699 skipped
+    /// sequences into `window_raw_lost`; subsequent packets shift unseen positions
+    /// out of the reset reorder window into `window_lost`, failing both assertions.
+    #[test]
+    fn audio_layer_switch_forward_does_not_manufacture_phantom_loss() {
+        let (mut peer, _muted) = make_test_peer(2139);
+        arm_audio_datagram_tracking(&mut peer);
+        // Start ON rung 1: the exact-match decode guard drops any AUDIO packet whose
+        // `simulcast_layer_id != selected_audio_layer`, so the guard must already be
+        // on rung 1 for its packets to reach the tracker at all. Set via the real
+        // setter (from the default rung 0) — the tracker is still empty at this point,
+        // so this initial move's re-anchor is a no-op on `high_seq: None`.
+        peer.set_selected_audio_layer(1);
+
+        // Steady on rung 1 (a rung that was ceiling-suppressed for a while, so its
+        // counter lags): high-water mark 200.
+        for seq in 198..=200u64 {
+            let _ = peer.decode(&layered_audio_packet(2139, 1, seq), "local@test.com");
+        }
+        assert_eq!(peer.audio_datagram_loss.high_seq, Some(200));
+
+        // Switch to rung 0, whose own counter has been running the whole call and
+        // sits at 900 — a 700-sequence FORWARD jump with 699 skipped values.
+        peer.set_selected_audio_layer(0);
+        // `decode()` stamps the rate window from the REAL wall clock (`now_ms()` is not
+        // injectable), and `observe_window` zeroes both accumulators on a ~1 s
+        // rollover. Because the assertions below are `== 0`, a rollover would zero the
+        // phantom gap on the UN-FIXED code and make this test FALSELY PASS — the
+        // dangerous direction. Two things close that hole:
+        //   1. the running MAX below reads the accumulators after every packet, so the
+        //      booked value is captured rather than only the final state; and
+        //   2. `origin_before` is compared after the loop — an unchanged
+        //      `window_start_ms` PROVES no rollover intervened, so the zeros are a real
+        //      observation rather than a rollover artefact. If a rollover ever does
+        //      intervene this fails LOUDLY on that guard instead of passing silently.
+        let origin_before = peer.audio_datagram_loss.window_start_ms;
+        let mut max_capped = 0u32;
+        let mut max_raw = 0u64;
+        for seq in 900..=902u64 {
+            let _ = peer.decode(&layered_audio_packet(2139, 0, seq), "local@test.com");
+            max_capped = max_capped.max(peer.audio_datagram_loss.window_lost);
+            max_raw = max_raw.max(peer.audio_datagram_loss.window_raw_lost);
+        }
+        assert_eq!(
+            peer.audio_datagram_loss.window_start_ms, origin_before,
+            "test validity guard: the ~1s rate window must NOT have rolled during the \
+             3-packet loop, or the `== 0` assertions below would be rollover artefacts \
+             that pass even on the un-fixed code"
+        );
+
+        assert_eq!(
+            max_capped, 0,
+            "a layer switch must not manufacture CAPPED loss (the presence signal)"
+        );
+        assert_eq!(
+            max_raw, 0,
+            "a layer switch must not manufacture RAW loss — the uncapped #2031 \
+             magnitude sum is where the 699 skipped cross-counter values would show up"
+        );
+        assert_eq!(
+            peer.audio_datagram_loss.high_seq,
+            Some(902),
+            "the tracker follows the new rung's counter"
+        );
+    }
+
+    /// A no-op "switch" to the ALREADY-SELECTED rung must NOT reset the tracker.
+    /// `tick_audio_layer_chooser` calls the setter on EVERY 5 s monitor tick, so an
+    /// unguarded re-anchor would discard the in-flight loss window ~once per tick and
+    /// permanently suppress `audio_datagram_loss_per_sec` — turning the fix into a
+    /// worse version of the bug it fixes.
+    ///
+    /// Mutation sensitivity: removing the `if layer != self.selected_audio_layer`
+    /// guard from `set_selected_audio_layer` zeroes `high_seq`/`window_raw_lost` and
+    /// fails both assertions.
+    #[test]
+    fn audio_layer_no_op_switch_preserves_tracker_state() {
+        let (mut peer, _muted) = make_test_peer(2140);
+        arm_audio_datagram_tracking(&mut peer);
+
+        // Build real in-flight state on rung 0: a baseline plus a recorded gap
+        // (sequence 101..=300 lost, so `window_raw_lost` holds the 200 magnitude).
+        for seq in 0..=100u64 {
+            let _ = peer.decode(&layered_audio_packet(2140, 0, seq), "local@test.com");
+        }
+        let _ = peer.decode(&layered_audio_packet(2140, 0, 301), "local@test.com");
+        // If a >1 s stall rolled the real-clock rate window mid-setup this
+        // precondition would not hold, which fails LOUDLY here rather than turning
+        // the assertion below into a vacuous `0 == 0`.
+        assert_eq!(
+            peer.audio_datagram_loss.window_raw_lost, 200,
+            "precondition: a real 200-datagram burst is accumulated in the window"
+        );
+
+        // The per-tick call with an UNCHANGED layer.
+        peer.set_selected_audio_layer(0);
+
+        assert_eq!(
+            peer.audio_datagram_loss.high_seq,
+            Some(301),
+            "selecting the already-selected audio layer must not reset the baseline"
+        );
+        assert_eq!(
+            peer.audio_datagram_loss.window_raw_lost, 200,
+            "a no-op switch must not discard the in-flight loss window"
+        );
+    }
+
+    /// CHOKEPOINT ROUTING, site 1 of 2: `tick_audio_layer_chooser` (the normal
+    /// per-monitor-tick switch — the site that emits the `LAYER_SWITCH … kind=audio`
+    /// log) must go THROUGH `set_selected_audio_layer` rather than assigning
+    /// `selected_audio_layer` directly, or the re-anchor never runs on the path that
+    /// carries virtually every real switch.
+    ///
+    /// This is a distinct failure from "the setter forgot to re-anchor": it is the
+    /// call site bypassing a correct setter. Only a test that drives the TICK can see
+    /// it — which is why it exists alongside the setter tests.
+    ///
+    /// Mutation sensitivity: replacing the `self.set_selected_audio_layer(desired)`
+    /// call in `tick_audio_layer_chooser` with `self.selected_audio_layer = desired`
+    /// leaves `high_seq == Some(900)` and fails the final assertion.
+    #[test]
+    fn audio_tick_chooser_switch_routes_through_the_reanchor_chokepoint() {
+        use crate::decode::layer_chooser::{
+            DownlinkSample, KindLayerBounds, LOSS_STEP_DOWN_PER_SEC,
+        };
+        let now = 2000u64;
+        let (mut peer, _muted) = make_test_peer(2141);
+        arm_audio_datagram_tracking(&mut peer);
+        // Learn a 3-rung audio ladder so `highest_available == 2` (room to step down).
+        // Observed at `now` so the lazy prune inside `highest_available` keeps them.
+        for layer in 0..3u32 {
+            peer.audio_layer_availability.observe(layer, now);
+        }
+
+        // A healthy tick first: an UNCONSTRAINED chooser follows the top, so this
+        // climbs it (and the guard) 0 -> 2. This is the real cold-start acquisition,
+        // and it is what gives the congested tick below somewhere to step DOWN from —
+        // a fresh chooser sits at 0 and cannot step down at all.
+        let top = peer.tick_audio_layer_chooser(now, KindLayerBounds::default());
+        assert_eq!(top, 2, "precondition: a clean tick follows the top rung");
+
+        // Now give the tracker a real rung-2 baseline (after the climb above, so this
+        // baseline is not itself cleared by it).
+        for seq in 898..=900u64 {
+            let _ = peer.decode(&layered_audio_packet(2141, 2, seq), "local@test.com");
+        }
+        assert_eq!(
+            peer.audio_datagram_loss.high_seq,
+            Some(900),
+            "precondition: anchored on rung 2's counter"
+        );
+
+        // The audio chooser is proxied off the VIDEO downlink (see
+        // `tick_audio_layer_chooser`): a congested video window is what makes it step
+        // down. This is the production input, not a synthetic poke at the chooser.
+        peer.last_video_downlink = DownlinkSample {
+            loss_per_sec: LOSS_STEP_DOWN_PER_SEC + 1.0,
+            kf_per_sec: 0.0,
+        };
+
+        // The REAL tick. The congested sample constrains the chooser and steps it
+        // down one rung from the top (2 -> 1), which is an actual guard change.
+        let desired = peer.tick_audio_layer_chooser(now, KindLayerBounds::default());
+        assert_eq!(
+            desired, 1,
+            "precondition: the congested tick stepped 2 -> 1"
+        );
+        assert_eq!(
+            peer.selected_audio_layer(),
+            1,
+            "precondition: the tick wrote the decode guard"
+        );
+
+        assert!(
+            peer.audio_datagram_loss.high_seq.is_none(),
+            "the TICK switch must re-anchor the audio tracker (routed through \
+             `set_selected_audio_layer`), not just write the guard field"
+        );
+    }
+
+    /// CHOKEPOINT ROUTING, site 2 of 2: `seed_early_congestion` (the #1179 early-seed
+    /// path, the only OTHER production writer of `selected_audio_layer` besides the
+    /// tick and `reconcile_decode_guards_to_wire`) must likewise route through the
+    /// chokepoint. It fires on a congested sample taken OUTSIDE the 5 s tick, so on a
+    /// bad join it is the FIRST audio rung change of the call — exactly when a blinded
+    /// tracker would hide the join-time datagram loss it exists to report.
+    ///
+    /// Mutation sensitivity: replacing the `self.set_selected_audio_layer(layer)` call
+    /// in `seed_early_congestion`'s AUDIO branch with a direct
+    /// `self.selected_audio_layer = ...` assignment fails the final assertion.
+    #[test]
+    fn audio_early_seed_switch_routes_through_the_reanchor_chokepoint() {
+        use crate::decode::layer_chooser::{
+            DownlinkSample, KindLayerBounds, ReceiveLayerBounds, LOSS_STEP_DOWN_PER_SEC,
+        };
+        let now = 2000u64;
+        let (mut peer, _muted) = make_test_peer(2142);
+        arm_audio_datagram_tracking(&mut peer);
+        for layer in 0..3u32 {
+            peer.audio_layer_availability.observe(layer, now);
+        }
+
+        // Clean tick first: the unconstrained chooser follows the top (0 -> 2). The
+        // early seed steps down ONE rung from wherever the chooser currently sits, so
+        // without this it would "step down" from 0 to 0 and change nothing.
+        let top = peer.tick_audio_layer_chooser(now, KindLayerBounds::default());
+        assert_eq!(top, 2, "precondition: a clean tick follows the top rung");
+
+        for seq in 898..=900u64 {
+            let _ = peer.decode(&layered_audio_packet(2142, 2, seq), "local@test.com");
+        }
+        assert_eq!(peer.audio_datagram_loss.high_seq, Some(900));
+
+        peer.last_video_downlink = DownlinkSample {
+            loss_per_sec: LOSS_STEP_DOWN_PER_SEC + 1.0,
+            kf_per_sec: 0.0,
+        };
+
+        // The REAL early seed. `observe_early_congestion` acts only while the chooser
+        // is unconstrained AND the sample is congested — both hold here — and steps
+        // down one rung, so the AUDIO branch performs an actual guard change.
+        let seeded = peer.seed_early_congestion(now, &ReceiveLayerBounds::default());
+        assert!(seeded, "precondition: the congested sample seeded the peer");
+        assert_eq!(
+            peer.selected_audio_layer(),
+            1,
+            "precondition: the early seed stepped the audio guard 2 -> 1"
+        );
+
+        assert!(
+            peer.audio_datagram_loss.high_seq.is_none(),
+            "the EARLY-SEED switch must re-anchor the audio tracker (routed through \
+             `set_selected_audio_layer`)"
+        );
+    }
+
+    /// The THIRD in-module writer of `selected_audio_layer` must re-anchor too.
+    ///
+    /// `reconcile_decode_guards_to_wire` (the #1700 fresh-session snap and the
+    /// `set_peer_tile_hints` path) already calls `set_selected_audio_layer`, so it
+    /// inherits the re-anchor — but until this test NOTHING pinned that. The
+    /// pre-existing #1695 coverage asserts only the guard VALUE
+    /// (`selected_audio_layer() == 0`), which a direct field assignment satisfies
+    /// identically, so reverting this writer to `peer.selected_audio_layer = a_target`
+    /// would have compiled, kept every other test green, and silently dropped the
+    /// re-anchor on a live switch site. That is the exact gap the two sibling routing
+    /// tests close for the tick and early-seed writers.
+    ///
+    /// Mutation sensitivity: replace the `set_selected_audio_layer(a_target)` call in
+    /// `reconcile_decode_guards_to_wire` with a direct field write and this fails on the
+    /// `high_seq` assertion while the value assertion still passes.
+    #[test]
+    fn audio_reconcile_to_wire_switch_routes_through_the_reanchor_chokepoint() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+        use std::collections::BTreeMap;
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(900);
+        let now = 2000u64;
+
+        // Pre-raise the AUDIO guard to L2 so the reconcile has somewhere to pull it
+        // DOWN from, and arm datagram tracking so the tracker actually accumulates.
+        {
+            let peer = manager.connected_peers.get_mut(&900).unwrap();
+            peer.set_selected_audio_layer(2);
+            arm_audio_datagram_tracking(peer);
+        }
+        // Establish a real high-water mark on the OLD rung, so a missed re-anchor is
+        // observable as a stale `high_seq` rather than an already-empty one.
+        for seq in 898..=900u64 {
+            let _ = manager
+                .connected_peers
+                .get_mut(&900)
+                .unwrap()
+                .decode(&layered_audio_packet(900, 2, seq), "local@test.com");
+        }
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&900)
+                .unwrap()
+                .audio_datagram_loss
+                .high_seq,
+            Some(900),
+            "precondition: the old rung established a high-water mark"
+        );
+
+        // The wire still records L0 for audio, so the reconcile snaps the guard 2 -> 0.
+        let mut wire: BTreeMap<(u64, PrefMediaKind), u32> = BTreeMap::new();
+        wire.insert((900, PrefMediaKind::Audio), 0);
+        let _ups = manager.reconcile_decode_guards_to_wire(
+            Some(&wire),
+            &ReceiveLayerBounds::default(),
+            now,
+        );
+
+        let peer = manager.connected_peers.get(&900).unwrap();
+        assert_eq!(
+            peer.selected_audio_layer(),
+            0,
+            "precondition: the reconcile snapped the audio guard 2 -> 0"
+        );
+        assert!(
+            peer.audio_datagram_loss.high_seq.is_none(),
+            "the RECONCILE-TO-WIRE switch must re-anchor the audio tracker (routed \
+             through `set_selected_audio_layer`) — a stale high_seq here means this \
+             writer bypasses the chokepoint"
+        );
+    }
+
+    /// The re-anchor must leave the ALREADY-PUBLISHED rates and the rate-window ORIGIN
+    /// alone — the same contract `SequenceTracker::reanchor_for_layer_switch` keeps.
+    ///
+    /// Zeroing `window_start_ms` would restart the ~1 s cadence on every switch
+    /// (delaying the next sample by up to a full window and, because `0` is also
+    /// `observe_window`'s "not yet started" sentinel, re-baselining it to the next
+    /// packet's clock); blanking `loss_per_sec` / `raw_loss_per_sec` would read as
+    /// "loss stopped" rather than "not resampled yet". This pins the doc claim on
+    /// `AudioDatagramLossTracker::reanchor_for_layer_switch` to the code.
+    ///
+    /// Mutation sensitivity: adding `self.window_start_ms = 0;` or
+    /// `self.loss_per_sec = 0.0;` to `reanchor_for_layer_switch` fails this.
+    #[test]
+    fn audio_layer_switch_preserves_published_rates_and_window_origin() {
+        let mut t = AudioDatagramLossTracker::new();
+        // Roll one full window so there ARE published rates and a live origin.
+        for seq in 0..=100u64 {
+            t.record_seq(seq);
+        }
+        t.record_seq(301);
+        assert_eq!(
+            t.observe_window(10_000, 0),
+            None,
+            "first tick sets the origin"
+        );
+        let (capped, raw) = t
+            .observe_window(11_000, 5)
+            .expect("window rolls at +1000ms");
+        assert!(
+            capped > 0.0 && raw > 0.0,
+            "precondition: rates were published"
+        );
+        let origin_before = t.window_start_ms;
+        assert_eq!(
+            origin_before, 11_000,
+            "precondition: the rollover re-based the window origin to `now`"
+        );
+
+        t.reanchor_for_layer_switch();
+
+        assert_eq!(
+            t.loss_per_sec(),
+            capped,
+            "the already-published capped rate must survive a re-anchor \
+             (recomputed on the next ~1s rollover, exactly like video)"
+        );
+        assert_eq!(
+            t.raw_loss_per_sec(),
+            raw,
+            "the already-published raw rate must survive a re-anchor"
+        );
+        assert_eq!(
+            t.window_start_ms, origin_before,
+            "the rate-window ORIGIN must NOT be reset — video's re-anchor does not \
+             touch it, and zeroing it would restart the ~1s publish cadence"
+        );
+        // What the re-anchor DOES clear. `seen_bits` is asserted here rather than in
+        // the dedicated test below because the rollover above leaves it set to bit 0
+        // (`seen_bits == 1`), so `== 0` is a real change.
+        assert!(t.high_seq.is_none(), "the sequence baseline is cleared");
+        assert_eq!(t.seen_bits, 0, "the reorder window is cleared");
+    }
+
+    /// The re-anchor must clear BOTH in-flight window accumulators —
+    /// `window_lost` (capped presence) AND `window_raw_lost` (the #2031 uncapped
+    /// magnitude) — so the discontinuity cannot leak into the sample published as
+    /// the NEW rung's rate.
+    ///
+    /// This is a SEPARATE test from the preserve-rates one on purpose. There, the
+    /// setup rolls the ~1 s window, and `observe_window` zeroes both accumulators on
+    /// rollover — so asserting `== 0` after the re-anchor would compare 0 to 0 and pin
+    /// NOTHING (verified: dropping either field from `reanchor_for_layer_switch` left
+    /// the whole 754-test suite green). Here the accumulators are deliberately loaded
+    /// with real, NON-ZERO in-flight values and asserted non-zero BEFORE the
+    /// re-anchor, so each `== 0` after it is a genuine state transition.
+    ///
+    /// Mutation sensitivity: removing EITHER `self.window_lost = 0;` or
+    /// `self.window_raw_lost = 0;` from `reanchor_for_layer_switch` fails this — the
+    /// two are checked independently, since clearing only one publishes an incoherent
+    /// capped/raw pair (the ratio is how #2031 reads burst severity).
+    #[test]
+    fn audio_layer_switch_clears_both_in_flight_window_accumulators() {
+        let mut t = AudioDatagramLossTracker::new();
+        // Fill the reorder window with received positions, then take a 200-sequence
+        // contiguous gap: `window_raw_lost` accrues the uncapped 200 magnitude.
+        let mut capped = 0u32;
+        for seq in 0..=100u64 {
+            capped += t.record_seq(seq);
+        }
+        capped += t.record_seq(301);
+        // Drain the now-unseen tail so the CAPPED counter also climbs off zero.
+        for seq in 302..=365u64 {
+            capped += t.record_seq(seq);
+        }
+        // Feed the capped count into the window WITHOUT rolling it (the `> 1000ms`
+        // rollover is what would zero these accumulators, so stay inside one window:
+        // 10_000 sets the origin, 10_500 is only +500ms).
+        assert_eq!(t.observe_window(10_000, 0), None, "origin, no rollover");
+        assert_eq!(
+            t.observe_window(10_500, capped),
+            None,
+            "still inside the same ~1s window — no rollover, so nothing is zeroed"
+        );
+
+        // PRECONDITIONS — both accumulators hold real in-flight values. Without
+        // these, the post-re-anchor `== 0` assertions below would be vacuous.
+        assert!(
+            t.window_lost > 0,
+            "precondition: the capped in-flight count is non-zero; got {}",
+            t.window_lost
+        );
+        assert_eq!(
+            t.window_raw_lost, 200,
+            "precondition: the raw in-flight sum holds the true 200-datagram magnitude"
+        );
+
+        t.reanchor_for_layer_switch();
+
+        assert_eq!(
+            t.window_lost, 0,
+            "the in-flight CAPPED count must be cleared, or the old rung's loss leaks \
+             into the sample published as the new rung's rate"
+        );
+        assert_eq!(
+            t.window_raw_lost, 0,
+            "the in-flight RAW sum must be cleared TOO — clearing only the capped \
+             count would publish an incoherent pair (capped 0 alongside raw 200 reads \
+             as 'enormous burst, no loss present')"
+        );
+    }
+
     // `MockAudioDecoder`, `make_test_peer`, and `make_zero_loss_top_peer` were
     // hoisted to the parent module (still `#[cfg(test)]`) so the production-only
     // test seam `PeerDecodeManager::insert_zero_loss_top_peer_for_test` can build
@@ -5665,6 +7139,43 @@ mod tests {
         wrap(&media, session_id)
     }
 
+    /// An AUDIO `PacketWrapper` carrying an outer `simulcast_layer_id` + cleartext
+    /// `media_kind` and an inner `AudioMetadata.sequence` — the AUDIO sibling of
+    /// [`layered_video_packet`], used by the issue #2138 layer-switch tests.
+    ///
+    /// `media_kind` is stamped AUDIO so `Peer::decode` takes the production
+    /// CLEARTEXT-gate path (#1066) that every current client hits: the gate owns the
+    /// availability-observe + layer-drop, and a surviving packet reaches the AUDIO
+    /// arm's `audio_datagram_loss.record_seq` with `cleartext_gate_handled == true`.
+    fn layered_audio_packet(session_id: u64, layer: u32, seq: u64) -> Arc<PacketWrapper> {
+        use videocall_types::protos::media_packet::AudioMetadata;
+        let media = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            user_id: "test@test.com".into(),
+            data: vec![0u8; 10],
+            audio_metadata: Some(AudioMetadata {
+                sequence: seq,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        let mut wrapper = packet_wrapper(&media, session_id);
+        wrapper.simulcast_layer_id = layer;
+        wrapper.media_kind = MediaKind::AUDIO.into();
+        Arc::new(wrapper)
+    }
+
+    /// Wire a `Peer` so the AUDIO arm feeds `audio_datagram_loss` and then completes
+    /// decode. Only `receiver_on_webtransport` gates the tracker itself (audio rides
+    /// unreliable datagrams only on WT); enabling audio with a heartbeat already seen
+    /// prevents the later mute/straggler branch from changing the test outcome.
+    fn arm_audio_datagram_tracking(peer: &mut Peer) {
+        peer.receiver_on_webtransport = true;
+        peer.audio_enabled = true;
+        peer.has_received_heartbeat = true;
+    }
+
     /// A VIDEO `PacketWrapper` carrying an outer `simulcast_layer_id` and an
     /// inner `VideoMetadata.sequence`, used by the receiver layer-select guard
     /// tests (issue #989).
@@ -5720,20 +7231,23 @@ mod tests {
     }
 
     /// Issue 1899 / discussion 1960 — self-healing keyframe-request route. The route is installed
-    /// once (the `context_initialized` latch), but `Peer::reset` (decode-error path) rebuilds the
-    /// video+screen decoders with EMPTY route slots and the latch never re-runs — so without
-    /// self-healing the route stays `None` forever after a reset and the worker's keyframe-less
+    /// once (the `context_initialized` latch), but `Peer::reset_for_decode_error` (decode-error
+    /// path) rebuilds a video or screen decoder with an EMPTY route slot and the latch never
+    /// re-runs — so without self-healing the route stays `None` forever after a rebuild and the
+    /// worker's keyframe-less
     /// eviction PLIs (issue #1025) become permanent no-ops, freezing a keyframe-starved tile for
     /// minutes (the field symptom). `decode()` must re-install a dropped route on the next media
     /// packet whenever the transport is wired.
     ///
-    /// Noop decoders stand in for the fresh (route-less) decoders `Peer::reset` mints — their route
+    /// Noop decoders stand in for the fresh (route-less) decoders a rebuild mints — their route
     /// slot supports `set`/`has`/`clear` exactly like the real `VideoPeerDecoder` — so the invariant
     /// is exercised through the REAL `decode()` path without a browser worker (which the harness
     /// cannot construct).
     ///
     /// Mutation coverage: deleting the `else if send_packet.is_some() && !has_keyframe_request_route`
-    /// re-install branch leaves BOTH routes `None` after decode → both asserts fail. The outer
+    /// re-install branch leaves BOTH routes `None` after decode → both asserts fail. Narrowing the
+    /// probe back to VIDEO alone (issue 2225) is caught by
+    /// `decode_reinstalls_a_screen_only_route_drop`, which drops ONLY the screen route. The outer
     /// `send_packet.is_some()` in the condition is only a cheap short-circuit; the LOAD-BEARING
     /// teardown guard is the inner `if let Some(send_packet)` inside the branch body — during a
     /// disconnect teardown `send_packet` is `None`, so even if the branch is entered the install body
@@ -5747,7 +7261,7 @@ mod tests {
         );
 
         let (mut peer, _muted) = make_test_peer(42);
-        // Past the one-time install latch, with the route dropped exactly as Peer::reset() leaves it.
+        // Past the one-time install latch, with the routes dropped exactly as a rebuild leaves them.
         peer.context_initialized = true;
         peer.has_received_heartbeat = true;
         peer.video.clear_keyframe_request_route();
@@ -5781,6 +7295,65 @@ mod tests {
         assert!(
             peer.screen.has_keyframe_request_route(),
             "decode must re-install a dropped SCREEN keyframe-request route (issue 1899 / discussion 1960)"
+        );
+    }
+
+    /// Issue 2225: the self-heal probe must notice a SCREEN-ONLY route drop.
+    ///
+    /// Per-kind resets made this reachable. Before 2225, `Peer::reset` rebuilt
+    /// the video and screen decoders together, so the routes were only ever
+    /// dropped in pairs — which is why the probe keyed on VIDEO alone, with a
+    /// comment warning that a future single-stream rebuild would evade it. A
+    /// `ScreenDecodeError` now rebuilds the screen decoder on its own, leaving
+    /// the VIDEO route intact and the SCREEN route `None`.
+    ///
+    /// The consequence of missing it is not cosmetic: the codec worker's
+    /// keyframe-less eviction PLIs (issue #1025) post into a no-op route, so a
+    /// keyframe-starved screen tile freezes for minutes — the exact field
+    /// symptom the self-heal exists to prevent.
+    ///
+    /// Mutation: narrow the probe back to `!peer.video.has_keyframe_request_route()`
+    /// and this fails while `decode_reinstalls_dropped_keyframe_request_route`
+    /// (which drops both) still passes.
+    #[wasm_bindgen_test]
+    fn decode_reinstalls_a_screen_only_route_drop() {
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(
+            Callback::from(|_p: PacketWrapper| {}),
+            "me@test.com".to_string(),
+        );
+
+        let (mut peer, _muted) = make_test_peer(2225);
+        peer.context_initialized = true;
+        peer.has_received_heartbeat = true;
+        // Exactly what a SCREEN-only rebuild leaves behind: VIDEO still wired,
+        // SCREEN route-less.
+        peer.video.set_keyframe_request_route(Box::new(|_| {}));
+        peer.screen.clear_keyframe_request_route();
+        assert!(peer.video.has_keyframe_request_route());
+        assert!(!peer.screen.has_keyframe_request_route());
+        manager.connected_peers.insert(2225, peer);
+
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: b"test@test.com".to_vec(),
+            heartbeat_metadata: Some(HeartbeatMetadata {
+                video_enabled: true,
+                audio_enabled: true,
+                screen_enabled: true,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        manager
+            .decode(packet_wrapper(&media, 2225), "test@test.com")
+            .expect("heartbeat should decode");
+
+        let peer = manager.connected_peers.get(&2225).expect("peer present");
+        assert!(
+            peer.screen.has_keyframe_request_route(),
+            "decode must re-install a SCREEN route dropped on its own by a per-kind rebuild"
         );
     }
 
@@ -6565,26 +8138,59 @@ mod tests {
         );
     }
 
-    /// After a heartbeat with screen_enabled=false, a straggler SCREEN frame
-    /// must NOT flip screen_enabled back to true and must return rendered=false.
+    /// After a heartbeat with `screen_enabled = false`, a SCREEN frame DELIBERATELY
+    /// re-enables screen. The production comment on that arm
+    /// (`peer_decode_manager.rs:2594-2603`) states the rationale: "Trust the actual
+    /// media frame over the (stale) heartbeat state — dropping the first keyframe
+    /// here would leave the decoder waiting until a PLI round-trip completes." The
+    /// staleness itself is explained just above it (`:2581-2586`): a heartbeat can
+    /// carry `screen_enabled = false` on WebTransport because heartbeats and SCREEN
+    /// frames race across separate QUIC streams.
+    ///
+    /// The camera path behaves DIFFERENTLY — this is observed behaviour, not a
+    /// documented design intent. A straggler VIDEO frame arriving after a
+    /// camera-off heartbeat is dropped rather than re-enabling video
+    /// (`peer_decode_manager.rs:2428-2437`, pinned by
+    /// `video_enable_disable_straggler_sequence`). The source justifies the SCREEN
+    /// side on its own terms and says nothing about the contrast with camera, so
+    /// this test pins the screen behaviour and only notes the camera difference; it
+    /// does not assert that the asymmetry is intentional. The previous name and
+    /// assertion here claimed the camera behaviour for screen and contradicted the
+    /// production code it was supposed to guard.
+    ///
+    /// Rendering is a SEPARATE gate from the enabled flag: this peer is invisible, so
+    /// the re-enabling frame must still not paint.
+    ///
+    /// MUTATION: delete the `if !self.screen_enabled { self.screen_enabled = true; }`
+    /// arm in the SCREEN decode branch and the `screen_enabled` assertion fails.
     #[wasm_bindgen_test]
-    fn screen_straggler_after_heartbeat_is_dropped() {
+    fn screen_frame_reenables_screen_over_stale_heartbeat() {
         let (mut peer, _muted) = make_test_peer(6);
 
         let hb = heartbeat_packet(6, false, false, false);
         let _ = peer.decode(&hb, "");
         assert!(peer.has_received_heartbeat);
-        assert!(!peer.screen_enabled);
+        assert!(!peer.screen_enabled, "the heartbeat reports screen off");
+        // `make_test_peer` starts the tile INVISIBLE — that is what keeps the frame
+        // from painting below, independently of the enabled flag.
+        assert!(!peer.visible);
 
         let packet = screen_frame_packet(6);
         let result = peer.decode(&packet, "");
         assert!(result.is_ok());
         let (_media_type, status, _kf_req) = result.unwrap();
-        assert!(!status.rendered, "straggler must not be rendered");
-        assert!(!status.first_frame, "straggler must not be a first frame");
         assert!(
-            !peer.screen_enabled,
-            "straggler screen frame must not re-enable screen"
+            peer.screen_enabled,
+            "a live SCREEN frame must re-enable screen over a stale heartbeat \
+             (the decode path trusts live media; camera drops the straggler instead)"
+        );
+        assert!(
+            !status.rendered,
+            "re-enabling the stream must not paint while the tile is invisible"
+        );
+        assert!(
+            !status.first_frame,
+            "an unrendered frame is not a first frame"
         );
     }
 
@@ -6616,9 +8222,15 @@ mod tests {
         let _ = peer.decode(&hb_on, "");
         assert!(peer.video_enabled);
 
-        // Disable video via heartbeat.
+        // Disable video via heartbeat. `resolve_camera_heartbeat_flag` DEBOUNCES a
+        // camera-off: blanking a currently-on tile takes
+        // CAMERA_OFF_CORROBORATION_COUNT consecutive `false` heartbeats, so a lone
+        // stale/reordered datagram can never black out a live camera. Drive the full
+        // streak, bounded by the constant so a future tuning change tracks here.
         let hb_off = heartbeat_packet(8, false, false, false);
-        let _ = peer.decode(&hb_off, "");
+        for _ in 0..CAMERA_OFF_CORROBORATION_COUNT {
+            let _ = peer.decode(&hb_off, "");
+        }
         assert!(!peer.video_enabled);
 
         // Straggler video frame should be dropped.
@@ -6722,6 +8334,63 @@ mod tests {
         );
     }
 
+    /// Issue 2174 (security carry-over): a peer must not be able to claim the
+    /// #1557 active-speaker layer-drop exemption while declaring its audio off.
+    ///
+    /// `seed_downlink_congestion` skips any peer whose stored `is_speaking` is
+    /// true under local-CPU pressure, so a peer that could park that flag at
+    /// `true` with no audio would hold a receiver-side resource exemption on
+    /// every participant indefinitely. The stored field must be resolved
+    /// against the peer's audio state.
+    ///
+    /// Fails if the `&& resolved_audio` guard is dropped from the heartbeat arm.
+    #[wasm_bindgen_test]
+    fn heartbeat_cannot_claim_speaking_while_audio_is_disabled() {
+        let (mut peer, _muted) = make_test_peer(2174);
+        peer.audio_level = 0.4;
+
+        let claim = |audio_enabled: bool| {
+            let media = MediaPacket {
+                media_type: MediaType::HEARTBEAT.into(),
+                user_id: "test@test.com".into(),
+                heartbeat_metadata: Some(HeartbeatMetadata {
+                    video_enabled: false,
+                    audio_enabled,
+                    screen_enabled: false,
+                    is_speaking: true,
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            };
+            wrap(&media, 2174)
+        };
+
+        // Audio declared OFF while claiming to speak — the claim must not stick.
+        let _ = peer.decode(&claim(false), "");
+        assert!(
+            !peer.audio_enabled,
+            "precondition: heartbeat declared audio off"
+        );
+        assert!(
+            !peer.is_speaking,
+            "a peer with audio disabled must not be stored as speaking (#1557 exemption lever)"
+        );
+        assert_eq!(
+            peer.audio_level, 0.0,
+            "audio_level must be cleared alongside the rejected speaking claim"
+        );
+
+        // Control: with audio genuinely enabled the same claim IS honoured, so
+        // the guard suppresses only the contradictory combination.
+        let _ = peer.decode(&claim(true), "");
+        assert!(peer.audio_enabled, "precondition: heartbeat enabled audio");
+        assert!(
+            peer.is_speaking,
+            "an audio-enabled peer's speaking claim must still be honoured"
+        );
+    }
+
     /// Full sequence: enable → legitimate frame → disable → straggler dropped.
     #[wasm_bindgen_test]
     fn video_enable_frame_disable_straggler_full_sequence() {
@@ -6738,8 +8407,17 @@ mod tests {
         assert!(peer.video_enabled, "legitimate frame must not change state");
 
         // 3. Disable video via heartbeat.
+        // Step 2 stamped `last_video_frame_ms` to "now", and the freshness primitive
+        // deliberately out-votes a `false` heartbeat while a frame is within
+        // LIVE_STREAM_FRESH_WINDOW_MS (WT reorder protection). Age that stamp past the
+        // window so this step exercises the camera-off DEBOUNCE, not the freshness veto.
+        peer.last_video_frame_ms = now_ms().saturating_sub(LIVE_STREAM_FRESH_WINDOW_MS + 50);
+        // Blanking then still requires CAMERA_OFF_CORROBORATION_COUNT consecutive
+        // `false`s (bounded by the constant so tuning changes track here).
         let hb_off = heartbeat_packet(9, false, false, false);
-        let _ = peer.decode(&hb_off, "");
+        for _ in 0..CAMERA_OFF_CORROBORATION_COUNT {
+            let _ = peer.decode(&hb_off, "");
+        }
         assert!(!peer.video_enabled);
 
         // 4. Straggler video frame after disable — must be dropped.
@@ -6899,8 +8577,15 @@ mod tests {
             .track_sequence(MediaType::VIDEO, &pkt1)
             .keyframe_request;
 
-        // Send seq 70 -- this shifts positions 2..6 off the 64-packet window,
-        // confirming them as genuinely lost (they never arrived).
+        // Bridge to seq 3, leaving seq 2 as a genuine in-window hole (see
+        // `LOSS_BRIDGE_SEQ` -- without this the first-packet u64::MAX priming
+        // makes the seq-70 jump record ZERO loss).
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &delta_seq_packet(LOSS_BRIDGE_SEQ))
+            .keyframe_request;
+
+        // Send seq 70 -- this shifts the seq-2 hole off the 64-packet window,
+        // confirming it as genuinely lost (it never arrived).
         let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -6952,7 +8637,12 @@ mod tests {
             .track_sequence(MediaType::VIDEO, &pkt1)
             .keyframe_request;
 
-        // Introduce genuine loss: seq 70 shifts positions 2..6 off the window.
+        // Bridge to seq 3 so seq 2 is a real in-window hole (see `LOSS_BRIDGE_SEQ`).
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &delta_seq_packet(LOSS_BRIDGE_SEQ))
+            .keyframe_request;
+
+        // Introduce genuine loss: seq 70 shifts the seq-2 hole off the window.
         let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -7192,7 +8882,9 @@ mod tests {
         }
         assert_eq!(peer.video_seq_tracker.lost_count, 0);
 
-        // Send screen seq 1, then seq 70 (genuine loss: shifts 2-6 off window).
+        // Send screen seq 1 -> 3 -> 70: the bridge leaves seq 2 as a genuine
+        // in-window hole which the seq-70 jump then shifts off as lost (see
+        // `LOSS_BRIDGE_SEQ`). VIDEO stays clean, so the two trackers diverge.
         let screen1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -7207,6 +8899,9 @@ mod tests {
         };
         let _ = peer
             .track_sequence(MediaType::SCREEN, &screen1)
+            .keyframe_request;
+        let _ = peer
+            .track_sequence(MediaType::SCREEN, &delta_seq_packet(LOSS_BRIDGE_SEQ))
             .keyframe_request;
 
         let screen70 = {
@@ -7251,6 +8946,21 @@ mod tests {
             user_id: b"test@test.com".to_vec(),
             video_metadata: Some(VideoMetadata {
                 sequence: seq,
+                // A REAL codec, matching what the encoders actually stamp. Without
+                // this the proto3 default is `VIDEO_CODEC_UNSPECIFIED`, and
+                // `VideoPeerDecoder::decode` takes its "unknown codec" early return
+                // (`_rendered: false`) — so a packet built by this helper never reached
+                // the decoder at all, silently diverging from the "mirrors the real
+                // wire shape" contract in this doc comment, and making any test that
+                // asserts on decode OUTCOME (e.g. #2190's frame-counting regression) read
+                // a false negative.
+                //
+                // Effect on the pre-existing seq-tracker tests below: their ASSERTIONS are
+                // unaffected (`track_sequence` runs before the decoder call), but they do
+                // now execute materially more code — the real `push_frame` path instead of
+                // stopping at the unknown-codec early return. That is strictly closer to
+                // production, not a no-op; calling it out so nobody reads this as inert.
+                codec: videocall_types::protos::media_packet::VideoCodec::VP8.into(),
                 ..Default::default()
             })
             .into(),
@@ -7427,6 +9137,155 @@ mod tests {
         );
     }
 
+    /// Issue #2190: a wrong-rung packet the EXACT-MATCH simulcast guard SKIPPED must
+    /// NOT be counted as a received frame.
+    ///
+    /// This is the defect that made `videocall_video_fps` read the simulcast LADDER
+    /// SUM instead of the decoded rung: the relay fails OPEN and forwards ALL of a
+    /// publisher's rungs to a healthy receiver, the guard drops the non-selected ones
+    /// as `DecodeStatus::SKIPPED`, but `track_frame` was called on the whole `Ok(..)`
+    /// arm regardless — so every dropped rung still bumped the fps counter. Field
+    /// measurement: an 8fps publisher with 3 active camera rungs (7+15+30) read
+    /// **~52 fps** on the receiver, i.e. HEALTHIER than the publisher's real output,
+    /// during a call that was visibly stalled 21% of the time.
+    ///
+    /// Driven through `PeerDecodeManager::decode` — the real production entry point
+    /// that owns the `track_frame` call site — NOT through `Peer::decode` directly,
+    /// because the call site is precisely what the fix changes.
+    ///
+    /// MUTATION: reverting the call site's 4th argument to a literal `true` makes the
+    /// two `decoded` assertions below fail (the skipped rung reads counted, and
+    /// `frames_decoded` reads 2 instead of 1). Deleting the `if decoded` guard in
+    /// `track_frame` fails the `frames_decoded_for_test` assertion on its own.
+    ///
+    /// `#[wasm_bindgen_test]`: `DiagnosticManager::new` starts a real `HeartbeatTimer`
+    /// (Worker, falling back to `setInterval`) and the trackers live on a
+    /// `spawn_local` task, so this needs a browser. The seam it asserts on is written
+    /// synchronously at the call site, so no executor yield is required.
+    #[wasm_bindgen_test]
+    fn skipped_wrong_rung_packet_is_not_counted_as_a_received_frame() {
+        let diagnostics = Rc::new(crate::diagnostics::DiagnosticManager::new(
+            "local@test.com".to_string(),
+        ));
+        let mut manager = PeerDecodeManager::new_with_diagnostics(diagnostics.clone());
+
+        // A peer whose VIDEO is flowing and visible, so the ONLY thing that can
+        // skip a packet below is the simulcast rung guard.
+        let session_id = 2190u64;
+        let (mut peer, _muted) = make_test_peer(session_id);
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        peer.visible = true;
+        manager.connected_peers.insert(session_id, peer);
+
+        // Receiver is decoding the base rung (the N=1 default).
+        assert_eq!(
+            manager.selected_video_layer_for_test(session_id),
+            Some(0),
+            "precondition: receiver decodes rung 0"
+        );
+
+        // Rung 0 — the SELECTED rung. Decoded, so it must count.
+        manager
+            .decode(
+                Arc::try_unwrap(video_layer_wrap(0, 1, session_id))
+                    .expect("sole owner of the wrapper"),
+                "local@test.com",
+            )
+            .expect("selected-rung packet must decode");
+
+        // Rung 2 — a rung this receiver is NOT decoding, which the relay forwarded
+        // anyway (fail-open). The guard SKIPs it pre-decrypt.
+        manager
+            .decode(
+                Arc::try_unwrap(video_layer_wrap(2, 1, session_id))
+                    .expect("sole owner of the wrapper"),
+                "local@test.com",
+            )
+            .expect("a skipped wrong-rung packet is not an error");
+
+        let calls = diagnostics.take_track_frame_calls_for_test();
+        assert_eq!(
+            calls.len(),
+            2,
+            "both packets still reach track_frame (bytes must be counted for \
+             bitrate_kbps either way): {calls:?}"
+        );
+        assert!(
+            calls[0].2,
+            "the SELECTED rung was decoded and must be counted as a frame: {calls:?}"
+        );
+        assert!(
+            !calls[1].2,
+            "the wrong-rung packet was SKIPPED and must NOT be counted as a frame — \
+             counting it is what made fps read the ladder sum (#2190): {calls:?}"
+        );
+
+        // The cumulative counter named `frames_decoded` must likewise count only
+        // real decodes.
+        assert_eq!(
+            diagnostics.frames_decoded_for_test(),
+            1,
+            "frames_decoded must advance once (the decoded rung), not twice"
+        );
+    }
+
+    /// Issue #2190 follow-up: a packet that reaches the decoder but errors is still an
+    /// arrival. It must refresh the arrival clock and count its bytes without incrementing
+    /// decoded FPS.
+    ///
+    /// Driven through `PeerDecodeManager::decode`, the production owner of the error arm.
+    /// The invalid AES payload deterministically reaches that arm.
+    ///
+    /// MUTATION: removing the `track_frame(..., false)` call from the error arm leaves the
+    /// recorded call list empty and fails this test.
+    #[wasm_bindgen_test]
+    fn decode_errors_are_recorded_as_non_decoded_arrivals_by_media_type() {
+        ensure_decoder_worker_link_tags();
+        let diagnostics = Rc::new(crate::diagnostics::DiagnosticManager::new(
+            "local@test.com".to_string(),
+        ));
+        let mut manager = PeerDecodeManager::new_with_diagnostics(diagnostics.clone());
+
+        let mut expected_calls = Vec::new();
+        for (session_id, media_kind, expected_media_type) in [
+            (2191u64, MediaKind::VIDEO, MediaType::VIDEO),
+            (2192u64, MediaKind::SCREEN, MediaType::SCREEN),
+        ] {
+            let (mut peer, _muted) = make_test_peer(session_id);
+            peer.video_enabled = true;
+            peer.screen_enabled = true;
+            peer.has_received_heartbeat = true;
+            peer.visible = true;
+            peer.aes = Some(Aes128State::new(true));
+            manager.connected_peers.insert(session_id, peer);
+
+            let packet = cleartext_kind_wrap(media_kind, 0, session_id);
+            let packet_len = packet.data.len() as u64;
+            let result = manager.decode(
+                Arc::try_unwrap(packet).expect("sole owner of the wrapper"),
+                "local@test.com",
+            );
+            assert!(
+                result.is_ok(),
+                "the production error arm resets the peer and returns the reset result, got \
+                 {result:?}"
+            );
+            expected_calls.push((expected_media_type, packet_len, false));
+        }
+
+        assert_eq!(
+            diagnostics.take_track_frame_calls_for_test(),
+            expected_calls,
+            "each failed packet must count against its own media arrival clock, not decoded FPS"
+        );
+        assert_eq!(
+            diagnostics.frames_decoded_for_test(),
+            0,
+            "a decode error must not increment decoded FPS"
+        );
+    }
+
     /// Different peers should have independent sequence tracking.
     #[wasm_bindgen_test]
     fn different_peers_independent_sequence_tracking() {
@@ -7452,7 +9311,8 @@ mod tests {
                 .keyframe_request;
         }
 
-        // Peer B: genuine loss (seq 1 -> seq 70).
+        // Peer B: genuine loss (seq 1 -> 3 -> 70; the bridge leaves seq 2 as a
+        // real in-window hole the jump then shifts off -- see `LOSS_BRIDGE_SEQ`).
         let pkt1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -7467,6 +9327,9 @@ mod tests {
         };
         let _ = peer_b
             .track_sequence(MediaType::VIDEO, &pkt1)
+            .keyframe_request;
+        let _ = peer_b
+            .track_sequence(MediaType::VIDEO, &delta_seq_packet(LOSS_BRIDGE_SEQ))
             .keyframe_request;
         let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
@@ -7822,7 +9685,9 @@ mod tests {
     fn multiple_losses_handled_independently() {
         let (mut peer, _muted) = make_test_peer(209);
 
-        // First loss: seq 1 -> seq 70 (shifts 2-6 off window).
+        // First loss: seq 1 -> 3 -> 70. The bridge to seq 3 leaves seq 2 as a
+        // genuine in-window hole; the seq-70 jump shifts it off and counts it
+        // (see `LOSS_BRIDGE_SEQ` -- 1 -> 70 alone records NO loss).
         let pkt1 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -7837,6 +9702,9 @@ mod tests {
         };
         let _ = peer
             .track_sequence(MediaType::VIDEO, &pkt1)
+            .keyframe_request;
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &delta_seq_packet(LOSS_BRIDGE_SEQ))
             .keyframe_request;
         let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
@@ -8134,7 +10002,9 @@ mod tests {
             777u64,
             TileHint::Capped { device_px_h: 180 },
         )]));
-        let desired = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
+        // FIXED clock (see `FIXTURE_NOW_MS`): the real wall clock prunes the
+        // fixture's t=1000 ladder, collapsing highest_available 2 -> 0.
+        let desired = manager.tick_layer_choosers(FIXTURE_NOW_MS, &ReceiveLayerBounds::default());
         assert_eq!(
             desired.get(&(777, PrefMediaKind::Video)),
             Some(&0),
@@ -8143,7 +10013,7 @@ mod tests {
 
         // Lift the lid (Uncapped) -> healthy top peer rests at highest, entry OMITTED.
         manager.set_peer_tile_hints(HashMap::from([(777u64, TileHint::Uncapped)]));
-        let desired = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
+        let desired = manager.tick_layer_choosers(FIXTURE_NOW_MS, &ReceiveLayerBounds::default());
         assert!(
             !desired.contains_key(&(777, PrefMediaKind::Video)),
             "uncapped healthy top peer must advertise no video preference: {desired:?}"
@@ -8191,7 +10061,9 @@ mod tests {
         // keyframe so the higher layer can be decoded.
         manager.set_peer_tile_hints(HashMap::from([(888u64, TileHint::Uncapped)]));
         let kf_before_up = keyframe_requests_sent_count();
-        let _ = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
+        // FIXED clock (see `FIXTURE_NOW_MS`) — a wall clock prunes the ladder to
+        // highest_available 0, so there is no L2 to up-switch TO.
+        let _ = manager.tick_layer_choosers(FIXTURE_NOW_MS, &ReceiveLayerBounds::default());
 
         {
             let pkts = collected.borrow();
@@ -8232,7 +10104,7 @@ mod tests {
             TileHint::Capped { device_px_h: 180 },
         )]));
         let kf_before_down = keyframe_requests_sent_count();
-        let _ = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
+        let _ = manager.tick_layer_choosers(FIXTURE_NOW_MS, &ReceiveLayerBounds::default());
         assert!(
             collected.borrow().is_empty(),
             "a genuine DOWN-switch (L2 -> L0) must NOT request a keyframe: {:?}",
@@ -8267,7 +10139,10 @@ mod tests {
             555u64,
             TileHint::Capped { device_px_h: 180 },
         )]));
-        let now = now_ms() as u64;
+        // FIXED clock (see `FIXTURE_NOW_MS`): a wall clock prunes the fixture's
+        // t=1000 ladder, so highest_available collapses to 0 and the lid has
+        // nothing to cap — the P1 regression this test guards becomes untestable.
+        let now = FIXTURE_NOW_MS;
         // The tick path advertises the lid {(555,Video):0}.
         let ticked = manager.tick_layer_choosers(now, &ReceiveLayerBounds::default());
         assert_eq!(
@@ -8500,6 +10375,81 @@ mod tests {
             Some(guard),
             wire,
             "guard must equal wire (no freeze) after the re-lid"
+        );
+    }
+
+    /// Issue 2156: BOTH manager-level display producers must resolve against the
+    /// deployment's ladder — exercised through the REAL production methods with a
+    /// REAL peer, not by inspecting the stored enum or calling the pure resolver.
+    ///
+    /// This closes a coverage hole a cross-model reviewer caught and I confirmed by
+    /// mutation: pinning `received_layer_snapshot_for_display`'s `variant` argument
+    /// back to `Default` inside `PeerDecodeManager::received_layer_snapshot` left
+    /// **753 tests passing** while every real `{w}×{h}` / `~kbps` readout regressed to
+    /// 720p / 1.5M. The pure-resolver tests could not see it (they call the resolver
+    /// directly, bypassing the manager) and neither could the Playwright spec (it
+    /// joins solo with the camera off, so no peer snapshot is ever produced).
+    ///
+    /// Raising the guard to the TOP rung is load-bearing: the two ladders differ ONLY
+    /// in the top rung, so a peer sitting at layer 0 yields byte-identical output
+    /// under both variants and the test would pass either way.
+    ///
+    /// MUTATION: change either producer's `variant` argument to
+    /// `LadderVariant::Default` and the corresponding assertion fails with
+    /// `(1280, 720, 1500)` instead of `(960, 540, 900)`.
+    #[test]
+    fn manager_display_producers_resolve_against_the_reduced_ladder() {
+        use crate::adaptive_quality_constants::LadderVariant;
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+
+        let now = 2000u64;
+        let mut manager = PeerDecodeManager::new();
+        manager.set_camera_ladder_variant(LadderVariant::Reduced);
+        manager.insert_zero_loss_top_peer_for_test(900);
+        // Sit the peer on the TOP rung — the only rung the two ladders disagree about.
+        manager.set_peer_video_layer_for_test(900, 2);
+
+        // Producer 1: the per-KIND representative needle (the receive bar-meter and
+        // the `format_readout` `{w}x{h}` line).
+        let needle = manager
+            .received_layer_snapshot(PrefMediaKind::Video, now)
+            .expect("a connected video peer yields a needle snapshot");
+        assert_eq!(
+            (needle.width, needle.height, needle.kbps),
+            (960, 540, 900),
+            "the manager's needle producer must resolve the REDUCED top rung; \
+             (1280, 720, 1500) means it is still pinned to the shipped ladder (2156)"
+        );
+
+        // Producer 2: the per-PEER rows (the `720p · ~1.5M` peer-row metric, the
+        // diagnostics drawer line, and the signal-quality popup).
+        let rows = manager.per_peer_received_snapshots(now, &ReceiveLayerBounds::default());
+        let video = rows
+            .iter()
+            .find(|r| r.session_id == 900)
+            .and_then(|r| r.video.as_ref())
+            .expect("the peer must appear with a video snapshot");
+        assert_eq!(
+            (video.width, video.height, video.kbps),
+            (960, 540, 900),
+            "the manager's PER-PEER producer must resolve the REDUCED top rung too — \
+             this is the row that renders `720p · ~1.5M` for a 900 kbps stream (2156)"
+        );
+
+        // Control: the SAME peer under the shipped ladder must read 720p, so neither
+        // assertion above can pass by accident (e.g. if the reduced table were wrong).
+        let mut shipped = PeerDecodeManager::new();
+        shipped.set_camera_ladder_variant(LadderVariant::Default);
+        shipped.insert_zero_loss_top_peer_for_test(900);
+        shipped.set_peer_video_layer_for_test(900, 2);
+        let d_needle = shipped
+            .received_layer_snapshot(PrefMediaKind::Video, now)
+            .expect("needle snapshot under the shipped ladder");
+        assert_eq!(
+            (d_needle.width, d_needle.height, d_needle.kbps),
+            (1280, 720, 1500),
+            "control: the shipped ladder must still read 720p — if this fails the \
+             change leaked into the DEFAULT path, which is what production runs"
         );
     }
 
@@ -8818,9 +10768,12 @@ mod tests {
             444u64,
             TileHint::Capped { device_px_h: 180 },
         )]));
-        let _ = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
+        // FIXED clock (see `FIXTURE_NOW_MS`) — a wall clock prunes the fixture
+        // ladder to highest_available 0, so no up-switch happens at all and the
+        // "invisible emits nothing" assertion would pass for the WRONG reason.
+        let _ = manager.tick_layer_choosers(FIXTURE_NOW_MS, &ReceiveLayerBounds::default());
         manager.set_peer_tile_hints(HashMap::from([(444u64, TileHint::Uncapped)]));
-        let _ = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
+        let _ = manager.tick_layer_choosers(FIXTURE_NOW_MS, &ReceiveLayerBounds::default());
         assert!(
             collected.borrow().is_empty(),
             "an INVISIBLE peer's up-switch must NOT request a keyframe: {:?}",
@@ -8838,9 +10791,9 @@ mod tests {
             444u64,
             TileHint::Capped { device_px_h: 180 },
         )]));
-        let _ = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
+        let _ = manager.tick_layer_choosers(FIXTURE_NOW_MS, &ReceiveLayerBounds::default());
         manager.set_peer_tile_hints(HashMap::from([(444u64, TileHint::Uncapped)]));
-        let _ = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
+        let _ = manager.tick_layer_choosers(FIXTURE_NOW_MS, &ReceiveLayerBounds::default());
         let pkts = collected.borrow();
         assert_eq!(
             pkts.len(),
@@ -8923,6 +10876,34 @@ mod tests {
         // Open (default) bounds — these tests cover the unbounded user; the bounds
         // clamp is exercised separately in `early_seed_respects_user_receive_max`.
         let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
+
+        // `observe_early_congestion` steps DOWN from the chooser's CURRENT layer
+        // (`from = current.min(highest); dropped = from.saturating_sub(1)`), and
+        // `LayerChooser::new(0)` starts COLD at 0 — seeding a cold chooser yields
+        // `0.saturating_sub(1) == 0`, not the "top (2) -> 1" step this test is about.
+        // Bring each chooser up to the top with one CLEAN unclamped tick first (the
+        // same preparation the passing `congestion_seed_never_advertises_above_size_lid`
+        // uses), then restore the congested sample the seed must react to.
+        let clean = crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
+        };
+        let congested = crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: crate::decode::layer_chooser::LOSS_STEP_DOWN_PER_SEC + 1.0,
+            kf_per_sec: 0.0,
+        };
+        for sid in [100u64, 200, 300] {
+            if let Some(p) = manager.connected_peers.get_mut(&sid) {
+                p.last_video_downlink = clean;
+            }
+        }
+        let _ = manager.tick_layer_choosers(2000, &bounds);
+        for sid in [100u64, 200, 300] {
+            if let Some(p) = manager.connected_peers.get_mut(&sid) {
+                p.last_video_downlink = congested;
+            }
+        }
+
         let seeded = manager.seed_early_congestion_for_connected_peers(2000, &bounds);
         assert!(seeded, "the congested peers' samples must seed a constrain");
 
@@ -9002,6 +10983,25 @@ mod tests {
         // user's clamp; the clamp itself is covered by
         // `early_seed_respects_user_receive_max`.
         let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
+
+        // The seed steps down from the chooser's CURRENT layer, and a cold
+        // `LayerChooser::new(0)` is at 0 (so it would seed 0, not 1). One CLEAN
+        // unclamped tick brings it to the top first; then restore the congested
+        // sample so the seed has real congestion to constrain on.
+        if let Some(p) = mgr.connected_peers.get_mut(&1) {
+            p.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            };
+        }
+        let _ = mgr.tick_layer_choosers(2000, &bounds);
+        if let Some(p) = mgr.connected_peers.get_mut(&1) {
+            p.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: crate::decode::layer_chooser::LOSS_STEP_DOWN_PER_SEC + 1.0,
+                kf_per_sec: 0.0,
+            };
+        }
+
         // Seed: constrains video 2 -> 1 (and audio, video-proxied).
         assert!(mgr.seed_early_congestion_for_connected_peers(2000, &bounds));
 
@@ -9809,6 +11809,12 @@ mod tests {
         let _ = peer.decode(&hb, "");
         assert!(peer.screen_enabled);
 
+        // The proactive-PLI branch sits BELOW `should_decode_visible_peer(self.visible)`,
+        // and `make_test_peer` starts a peer INVISIBLE. Visibility is not the variable
+        // under test here (that is `screen_visibility_return_triggers_proactive_pli`),
+        // so make the tile visible and let the waiting-for-keyframe path be the only gate.
+        peer.visible = true;
+
         // The noop screen decoder always returns is_waiting_for_keyframe() = true,
         // simulating a late joiner that hasn't decoded a keyframe yet.
         assert!(peer.screen.is_waiting_for_keyframe());
@@ -9836,6 +11842,9 @@ mod tests {
         // Enable screen via heartbeat.
         let hb = heartbeat_packet(231, false, false, true);
         let _ = peer.decode(&hb, "");
+        // Proactive PLI is gated on visibility; `make_test_peer` starts invisible.
+        // The variable under test here is the RATE LIMIT, not the visibility gate.
+        peer.visible = true;
         peer.screen_seq_tracker.last_keyframe_request_ms = 0;
 
         // First frame — triggers proactive PLI.
@@ -9921,7 +11930,27 @@ mod tests {
         };
         let _ = peer.decode(&pkt1, "");
 
-        // Introduce genuine loss: seq 1 -> 70 shifts positions off window.
+        // Bridge to seq 3, leaving seq 2 as a genuine in-window hole. Without
+        // this the first-packet u64::MAX priming makes the seq-70 jump record
+        // ZERO loss (see `LOSS_BRIDGE_SEQ`).
+        let pkt_bridge = {
+            let media = MediaPacket {
+                media_type: MediaType::SCREEN.into(),
+                user_id: "test@test.com".into(),
+                data: vec![0u8; 10],
+                video_metadata: Some(VideoMetadata {
+                    sequence: LOSS_BRIDGE_SEQ,
+                    ..Default::default()
+                })
+                .into(),
+                frame_type: "delta".to_string(),
+                ..Default::default()
+            };
+            wrap(&media, 233)
+        };
+        let _ = peer.decode(&pkt_bridge, "");
+
+        // Introduce genuine loss: the seq-70 jump shifts the seq-2 hole off.
         let pkt70 = {
             let media = MediaPacket {
                 media_type: MediaType::SCREEN.into(),
@@ -10045,21 +12074,28 @@ mod tests {
     fn observe_window_computes_loss_and_keyframe_rates() {
         let mut tracker = SequenceTracker::new();
 
-        // t=0: window starts; no rollover yet.
+        // `window_start_ms == 0` is `observe_window`'s "not started" SENTINEL, so a
+        // window that genuinely starts at t=0 never anchors — every later call sees
+        // the sentinel again and re-anchors to itself, and elapsed never reaches
+        // 1000. Anchor the fixture at a non-zero wall-clock-like base instead; in
+        // production `now_ms()` is a `Date::now()` epoch and is never 0.
+        const T0: u64 = 10_000;
+
+        // First observation: window anchors at T0; no rollover yet.
         assert!(
-            !tracker.observe_window(0, 2, false),
+            !tracker.observe_window(T0, 2, false),
             "first observation must not roll over"
         );
         // Mid-window accumulation, still under 1000ms — no rollover, no emit.
-        assert!(!tracker.observe_window(300, 1, true));
-        assert!(!tracker.observe_window(600, 0, true));
+        assert!(!tracker.observe_window(T0 + 300, 1, true));
+        assert!(!tracker.observe_window(T0 + 600, 0, true));
         // Rates have not been published yet (still the initial zeros).
         assert_eq!(tracker.loss_per_sec(), 0.0);
         assert_eq!(tracker.kf_per_sec(), 0.0);
 
-        // t=1000: window elapsed == 1000ms → rollover, fresh rates available.
+        // elapsed == 1000ms → rollover, fresh rates available.
         assert!(
-            tracker.observe_window(1000, 0, false),
+            tracker.observe_window(T0 + 1000, 0, false),
             "rollover should fire at >=1000ms elapsed"
         );
         // Accumulated this window: lost = 2+1+0+0 = 3, kf = 2 (the two `true`s).
@@ -10068,8 +12104,8 @@ mod tests {
         assert!((tracker.kf_per_sec() - 2.0).abs() < 1e-9);
 
         // Window counters reset: a fresh quiet window yields zero rates.
-        assert!(!tracker.observe_window(1500, 0, false));
-        assert!(tracker.observe_window(2000, 0, false));
+        assert!(!tracker.observe_window(T0 + 1500, 0, false));
+        assert!(tracker.observe_window(T0 + 2000, 0, false));
         assert_eq!(tracker.loss_per_sec(), 0.0);
         assert_eq!(tracker.kf_per_sec(), 0.0);
     }
@@ -10079,13 +12115,26 @@ mod tests {
     #[wasm_bindgen_test]
     fn observe_window_normalizes_long_window() {
         let mut tracker = SequenceTracker::new();
-        tracker.observe_window(0, 0, false); // start window at t=0
-                                             // 10 losses over a 2000ms window → 5 lost/sec.
-        for t in [400u64, 800, 1200, 1600] {
-            assert!(!tracker.observe_window(t, 2, false));
-        }
-        let rolled = tracker.observe_window(2000, 2, false);
-        assert!(rolled, "rollover at 2000ms");
+        // Non-zero base: t=0 collides with the `window_start_ms == 0` "not
+        // started" sentinel and the window never anchors (see
+        // `observe_window_computes_loss_and_keyframe_rates`).
+        const T0: u64 = 10_000;
+
+        // A window can only run LONGER than 1000ms when observations are SPARSE —
+        // `observe_window` rolls over on the first call at elapsed >= 1000, so any
+        // intermediate tick between 1s and 2s would close the window early. This
+        // models the real cause named in the production comment: sparse packet
+        // arrival / a stalled tab. Total 10 losses over a 2000ms window.
+        tracker.observe_window(T0, 0, false); // anchor the window
+        assert!(
+            !tracker.observe_window(T0 + 500, 4, false),
+            "500ms in, still the same window"
+        );
+        let rolled = tracker.observe_window(T0 + 2000, 6, false);
+        assert!(rolled, "rollover once elapsed (2000ms) crosses the 1s gate");
+        // 10 losses / 2.0s = 5/s. This is the assertion that pins the
+        // "denominator is ACTUAL elapsed ms" contract: a fixed-1000 denominator
+        // would report 10.0 here, so the normalization cannot be mutated away.
         assert!(
             (tracker.loss_per_sec() - 5.0).abs() < 1e-9,
             "10 losses / 2s = 5/s, got {}",
@@ -10587,9 +12636,20 @@ mod tests {
             .iter()
             .map(|w| {
                 let inner = MediaPacket::parse_from_bytes(&w.data).expect("deserialize");
+                // WIRE FORMAT: `emit_keyframe_request` stamps the OUTER media_type as
+                // KEYFRAME_REQUEST and carries the requested stream kind in `data`
+                // (b"VIDEO" / b"SCREEN"). Asserting `media_type == VIDEO` pinned a
+                // format the code never emitted. Checking BOTH fields is strictly
+                // stronger than the original intent ("VIDEO, not SCREEN"): it pins the
+                // envelope AND the kind, so a VIDEO->SCREEN mutation still fails here.
                 assert_eq!(
                     inner.media_type.enum_value(),
-                    Ok(MediaType::VIDEO),
+                    Ok(MediaType::KEYFRAME_REQUEST),
+                    "proactive PLI must be a KEYFRAME_REQUEST envelope"
+                );
+                assert_eq!(
+                    inner.data,
+                    b"VIDEO".to_vec(),
                     "Proactive PLI for video peer should request VIDEO keyframe, not SCREEN"
                 );
                 String::from_utf8(inner.user_id).expect("user_id is valid utf8")
@@ -11037,6 +13097,8 @@ mod tests {
     /// assertion fail (the live peer would keep the default empty device_info).
     #[wasm_bindgen_test]
     fn device_info_hydrates_live_peer_from_cache_on_add_peer() {
+        // `add_peer` builds REAL decoders, which look up the Trunk worker link tag.
+        ensure_decoder_worker_link_tags();
         let mut manager = PeerDecodeManager::new();
         let session_id: u64 = 56;
 
@@ -11101,6 +13163,8 @@ mod tests {
     /// new peer set.
     #[wasm_bindgen_test]
     fn sorted_string_keys_invalidates_on_add_peer() {
+        // `add_peer` builds REAL decoders, which look up the Trunk worker link tag.
+        ensure_decoder_worker_link_tags();
         let mut manager = PeerDecodeManager::new();
         let (peer1, _muted1) = make_test_peer(710);
         manager.connected_peers.insert(710, peer1);
@@ -11492,6 +13556,12 @@ mod tests {
         peer.has_received_heartbeat = true;
         // Peer's audio is already on (unmuted) before the host acts.
         peer.audio_enabled = true;
+        // Issue 2174: the peer is mid-sentence when the host force-mutes.
+        // Both fields must be seeded non-default, or the "cleared" assertions
+        // below would pass trivially on un-fixed code (`make_test_peer` starts
+        // at `is_speaking: false, audio_level: 0.0`).
+        peer.is_speaking = true;
+        peer.audio_level = 0.7;
         muted.set(false);
         manager.connected_peers.insert(1001, peer);
 
@@ -11525,8 +13595,319 @@ mod tests {
             muted.get(),
             "audio decoder must be muted after force-off so no expand/hiss packets play"
         );
+        // Issue 2174: the tracked speaking state must be cleared too, or the
+        // next status broadcast re-lights the glow the decoder just cleared.
+        // Fails if `force_media_off` stops resetting `is_speaking`.
+        assert!(
+            !peer.is_speaking,
+            "force_peer_media_off must clear the peer's speaking state"
+        );
+        assert_eq!(peer.audio_level, 0.0, "force-off must clear audio_level");
+        // And the event the UI actually consumes must report silence.
+        assert!(
+            matches!(
+                metric_value(&peer.peer_status_event(), "is_speaking"),
+                MetricValue::U64(0)
+            ),
+            "peer_status after force-off must report is_speaking: 0"
+        );
         // Video untouched.
         assert!(!peer.video_enabled);
+    }
+
+    // ---- Issue 2225: a decode error rebuilds ONLY the decoder that failed ----
+    //
+    // The decode-error arm used to call a blanket `Peer::reset`, rebuilding all
+    // three of a peer's decoders — including the NetEQ audio worker (fresh Web
+    // Worker, worklet init, blob URL, message plumbing) — no matter what had
+    // actually failed. These pin the replacement scoping.
+
+    /// Every `PeerDecodeError` must be classified explicitly, and only the three
+    /// per-kind decode failures may rebuild anything.
+    ///
+    /// The expectations are written out per variant rather than derived, so this
+    /// is a specification of the mapping and not a copy of it. `decoder_reset_scope`
+    /// has no wildcard arm, so a new variant fails to compile until it is
+    /// classified — and adding it here is then a deliberate act.
+    ///
+    /// Mutation: map `VideoDecodeError` to `Audio` (the pre-2225 behaviour for a
+    /// video failure), or any pre-decode error to anything but `None`, and this
+    /// fails.
+    #[test]
+    fn every_error_variant_has_an_explicit_reset_scope() {
+        use DecoderResetScope as S;
+
+        let expected = [
+            (PeerDecodeError::VideoDecodeError, S::Video),
+            (PeerDecodeError::ScreenDecodeError, S::Screen),
+            (PeerDecodeError::AudioDecodeError, S::Audio),
+            // Everything below fails BEFORE `Peer::decode` reaches any
+            // `decoder.decode(..)` call, so there is no decoder state to recover.
+            (PeerDecodeError::AesDecryptError, S::None),
+            (PeerDecodeError::IncorrectPacketType, S::None),
+            (PeerDecodeError::NoMediaType, S::None),
+            (PeerDecodeError::NoPacketType, S::None),
+            (PeerDecodeError::PacketParseError, S::None),
+            (PeerDecodeError::UnknownMediaType, S::None),
+            (PeerDecodeError::UnknownPacketType, S::None),
+            (PeerDecodeError::NoSuchPeer(7), S::None),
+            (PeerDecodeError::SameUserPacket(7), S::None),
+        ];
+
+        for (error, want) in expected {
+            assert_eq!(
+                decoder_reset_scope(&error),
+                want,
+                "{error} must map to {want:?}"
+            );
+        }
+    }
+
+    /// THE issue-2225 regression. A decode failure that never reached a decoder
+    /// must rebuild nothing at all — above all not the peer's NetEQ audio
+    /// worker.
+    ///
+    /// These are the errors that actually reach this path in production: a
+    /// receiver holding a stale AES key fails EVERY packet, so under the old
+    /// blanket `Peer::reset` the audio worker was respawned tens of times a
+    /// second for as long as the key mismatch lasted.
+    ///
+    /// Mutation: restore the blanket reset (have `reset_for_decode_error` call
+    /// `Self::new_decoders` unconditionally) and this fails — `new_decoders`
+    /// builds a real `VideoPeerDecoder`, whose `js_sys` calls abort on the host
+    /// target, so the test never even reaches its assertions. On the fixed code
+    /// nothing is constructed, which is the whole point.
+    #[test]
+    fn a_decode_error_that_never_reached_a_decoder_rebuilds_nothing() {
+        for error in [
+            PeerDecodeError::AesDecryptError,
+            PeerDecodeError::PacketParseError,
+            PeerDecodeError::NoMediaType,
+            PeerDecodeError::NoPacketType,
+            PeerDecodeError::IncorrectPacketType,
+        ] {
+            let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+            let (mut peer, _) = make_test_peer(22250);
+
+            // The peer is unmuted and mid-sentence when the bad packet lands.
+            peer.audio_enabled = true;
+            let (audio, _) = MockAudioDecoder::tagged("live", log.clone());
+            peer.audio = Box::new(audio);
+            log.borrow_mut().clear();
+
+            peer.reset_for_decode_error("local-session", &error)
+                .unwrap_or_else(|e| panic!("{error} must not fail the rebuild: {e:?}"));
+
+            assert!(
+                log.borrow().is_empty(),
+                "{error} touched no decoder, so the audio decoder must be left \
+                 completely alone — got {:?}",
+                log.borrow()
+            );
+        }
+    }
+
+    /// The other side of the scoping: rebuilding the camera decoder must leave
+    /// the audio decoder in place (no retire, no drop, no re-mute), and must
+    /// give the fresh decoder its stream attribution (#1640) — the peer's
+    /// `context_initialized` latch has already fired, so nothing else will.
+    ///
+    /// Mutation: add `self.replace_audio_decoder(..)` to the VIDEO arm of
+    /// `reset_for_decode_error` (the pre-2225 behaviour) and the log assertion
+    /// fails; delete the `set_stream_context` call from `replace_video_decoder`
+    /// and the attribution assertion fails.
+    #[test]
+    fn rebuilding_the_video_decoder_leaves_the_audio_decoder_untouched() {
+        let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+        let (mut peer, _) = make_test_peer(22251);
+
+        peer.audio_enabled = true;
+        let (audio, muted) = MockAudioDecoder::tagged("live", log.clone());
+        peer.audio = Box::new(audio);
+        // A live decoder for an unmuted peer: the mock starts muted, so put it
+        // in the state the peer is actually in before the rebuild lands.
+        muted.set(false);
+        log.borrow_mut().clear();
+
+        peer.replace_video_decoder(VideoPeerDecoder::noop(), "local-session");
+
+        assert!(
+            log.borrow().is_empty(),
+            "a VIDEO rebuild must not retire, drop or re-mute the audio decoder — got {:?}",
+            log.borrow()
+        );
+        assert!(
+            !muted.get(),
+            "the surviving audio decoder must keep the peer's live unmuted state"
+        );
+        assert_eq!(
+            peer.video.stream_context_for_test(),
+            Some(("local-session".to_string(), "22251".to_string())),
+            "the fresh camera decoder must be given its stream attribution (#1640)"
+        );
+    }
+
+    /// SCREEN sibling of the above.
+    ///
+    /// Mutation: have `replace_screen_decoder` write `self.video` instead of
+    /// `self.screen` (a plausible copy-paste) and the attribution lands on the
+    /// wrong decoder, failing both assertions.
+    #[test]
+    fn rebuilding_the_screen_decoder_leaves_the_audio_and_camera_decoders_untouched() {
+        let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+        let (mut peer, _) = make_test_peer(22252);
+
+        peer.audio_enabled = true;
+        let (audio, _) = MockAudioDecoder::tagged("live", log.clone());
+        peer.audio = Box::new(audio);
+        log.borrow_mut().clear();
+
+        peer.replace_screen_decoder(VideoPeerDecoder::noop(), "local-session");
+
+        assert!(
+            log.borrow().is_empty(),
+            "a SCREEN rebuild must not touch the audio decoder — got {:?}",
+            log.borrow()
+        );
+        assert_eq!(
+            peer.screen.stream_context_for_test(),
+            Some(("local-session".to_string(), "22252".to_string())),
+            "the fresh screen decoder must be given its stream attribution (#1640)"
+        );
+        assert_eq!(
+            peer.video.stream_context_for_test(),
+            None,
+            "a SCREEN rebuild must not write the CAMERA decoder's context"
+        );
+    }
+
+    // -- Issue 2174 follow-up: Drop fires on REPLACEMENT, not just teardown --
+    //
+    // `NetEqAudioPeerDecoder::drop` broadcasts a terminal `speaking: 0`. That
+    // is right when the peer is going away and wrong when the decoder is merely
+    // being rebuilt for a peer who is still mid-sentence. These two tests pin
+    // the asymmetry from the manager side; the decoder side (that a retired VAD
+    // makes the drop silent) is pinned in `neteq_audio_decoder.rs`.
+
+    /// Swap in a peer's audio decoder the way `Peer::reset_for_decode_error`
+    /// does after an AUDIO decode error: the outgoing decoder must be retired
+    /// BEFORE the assignment drops it, and the replacement must inherit the
+    /// peer's live mute state.
+    ///
+    /// Mutation: delete the `self.audio.retire_for_replacement()` line in
+    /// `replace_audio_decoder` — or move it after the assignment, where it
+    /// would retire the *incoming* decoder instead — and the `old:retire`
+    /// lookup finds nothing.
+    #[test]
+    fn replacing_a_peers_audio_decoder_retires_the_outgoing_one_before_dropping_it() {
+        let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+        let (mut peer, _) = make_test_peer(21741);
+
+        // The peer is unmuted and talking when the audio decode error lands.
+        peer.audio_enabled = true;
+        let (outgoing, _) = MockAudioDecoder::tagged("old", log.clone());
+        peer.audio = Box::new(outgoing);
+        log.borrow_mut().clear();
+
+        let (incoming, incoming_muted) = MockAudioDecoder::tagged("new", log.clone());
+        peer.replace_audio_decoder(Box::new(incoming));
+
+        let ops = log.borrow().clone();
+        let retired_at = ops
+            .iter()
+            .position(|op| op == "old:retire")
+            .unwrap_or_else(|| {
+                panic!("the outgoing decoder must be retired for replacement, got {ops:?}")
+            });
+        let dropped_at = ops
+            .iter()
+            .position(|op| op == "old:drop")
+            .unwrap_or_else(|| panic!("the outgoing decoder must be dropped, got {ops:?}"));
+        assert!(
+            retired_at < dropped_at,
+            "retire must run BEFORE the drop it disarms, got {ops:?}"
+        );
+
+        assert!(
+            !incoming_muted.get(),
+            "the replacement decoder must inherit the peer's live audio state (unmuted)"
+        );
+    }
+
+    /// The other half: removing a peer is genuine teardown, so its decoder must
+    /// reach `Drop` **without** a retire — that terminal `speaking: 0` is issue
+    /// 2174's actual fix and must survive this change.
+    ///
+    /// Mutation: call `retire_for_replacement` from the removal path (or from a
+    /// `Drop for Peer`) and this fails.
+    #[test]
+    fn removing_a_peer_drops_its_audio_decoder_without_retiring_it() {
+        let log: MockAudioLog = Rc::new(RefCell::new(Vec::new()));
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _) = make_test_peer(21742);
+
+        peer.audio_enabled = true;
+        let (departing, _) = MockAudioDecoder::tagged("gone", log.clone());
+        peer.audio = Box::new(departing);
+        manager.connected_peers.insert(21742, peer);
+        log.borrow_mut().clear();
+
+        manager.delete_peer_at(21742, 50_000);
+
+        let ops = log.borrow().clone();
+        assert_eq!(
+            ops,
+            vec!["gone:drop".to_string()],
+            "peer removal must reach Drop with no retire, so the terminal speaking:0 \
+             still clears the glow (issue 2174)"
+        );
+    }
+
+    /// Read a named metric out of a `DiagEvent`, panicking if absent.
+    fn metric_value<'a>(evt: &'a DiagEvent, name: &str) -> &'a MetricValue {
+        &evt.metrics
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("peer_status event is missing the `{name}` metric"))
+            .value
+    }
+
+    /// Issue 2174 backstop: `audio_enabled == false` must dominate a stale
+    /// `is_speaking == true`, independently of any caller remembering to clear
+    /// the field. A muted peer cannot be audibly speaking, and reporting
+    /// otherwise re-lights the tile glow after the decoder's terminal zero.
+    ///
+    /// Fails if the `&& self.audio_enabled` guard is dropped from
+    /// `peer_status_event`.
+    #[test]
+    fn peer_status_never_reports_speaking_while_audio_is_disabled() {
+        let (mut peer, _muted) = make_test_peer(2002);
+
+        // Stale speaking flag with audio off — the exact state a forced path
+        // that forgot to reset would leave behind.
+        peer.is_speaking = true;
+        peer.audio_enabled = false;
+
+        let evt = peer.peer_status_event();
+        assert!(
+            matches!(metric_value(&evt, "audio_enabled"), MetricValue::U64(0)),
+            "precondition: audio must be reported disabled"
+        );
+        assert!(
+            matches!(metric_value(&evt, "is_speaking"), MetricValue::U64(0)),
+            "is_speaking must be suppressed while audio_enabled is false"
+        );
+
+        // Control: with audio back on, a speaking peer still reports speaking,
+        // so the guard suppresses only the contradictory combination.
+        peer.audio_enabled = true;
+        assert!(
+            matches!(
+                metric_value(&peer.peer_status_event(), "is_speaking"),
+                MetricValue::U64(1)
+            ),
+            "an audio-enabled speaking peer must still report is_speaking: 1"
+        );
     }
 
     /// No permanent latch: after a host force-off, a later legitimate

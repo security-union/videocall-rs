@@ -196,5 +196,16 @@ async fn main() {
 
     tracing::info!("Meeting Backend listening on {}", config.listen_addr);
 
-    axum::serve(listener, app).await.expect("server error");
+    // `into_make_service_with_connect_info` is what makes `ConnectInfo<SocketAddr>`
+    // extractable in handlers. Without it the extractor never yields an address,
+    // and the meeting-password throttle (issue #1613) would silently degrade to
+    // "no client identity, do not throttle" on deployments that terminate TLS
+    // without setting `X-Forwarded-For`. Handlers take it as an `Option`, so
+    // `oneshot`-style tests that never open a socket still work.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("server error");
 }

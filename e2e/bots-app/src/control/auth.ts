@@ -32,11 +32,54 @@ export interface TokenFileContents {
 }
 
 /**
+ * Env var that relocates the ctl token file OFF the run dir (issue #2157).
+ *
+ * WHY this exists: `bots-app run --assets-dir <dir>` uses ONE directory for two
+ * very different things — durable run artifacts (the #2032 resource-sampler
+ * CSVs) and the ephemeral cleartext ctl bearer token. In the K8s fleet those
+ * requirements conflict: `BOT_RUN_DIR` is a per-ordinal `volumeClaimTemplates`
+ * PVC precisely so the CSVs SURVIVE `kubectl scale --replicas=0` (#2032), which
+ * means a token written there also survives — on media that outlives the
+ * workload and that nothing reclaims automatically. Rotating the `bot-ctl-token`
+ * Secret then no longer invalidates the on-disk copies.
+ *
+ * Setting this var splits the two: artifacts keep going to `--assets-dir`, the
+ * token goes here. The StatefulSet points it at a pod-lifetime `emptyDir`, so
+ * the token dies with the pod.
+ */
+export const CTL_STATE_DIR_ENV = "BOT_CTL_STATE_DIR";
+
+/**
+ * Directory the ctl token file is written to: {@link CTL_STATE_DIR_ENV} when set
+ * to a non-empty value, else `runDir` (the `--assets-dir` / `--run-dir` default).
+ *
+ * The fallback is what keeps every non-K8s caller byte-for-byte unchanged — a
+ * plain `docker run`, a local `npm run bot -- run --ctl-port auto`, and the
+ * dashboard all leave the var unset and keep writing `<runDir>/ctl-<pid>.token`.
+ *
+ * NOTE (deliberate asymmetry): this resolves the WRITE path only.
+ * {@link findLatestTokenFile} still scans exactly the directory it is handed, so
+ * an explicit `ctl --run-dir <dir>` is never silently overridden by an env var.
+ * When the override IS set, point `ctl` at it with `--run-dir` / `--state-file`,
+ * or use `--port` + `--token`. Nothing in the bot pod depends on auto-discovery:
+ * the pod only ever runs `bots-app run` (docker-entrypoint.sh), and the
+ * conductor authenticates with `--token-file /ctl/token` read straight from the
+ * `bot-ctl-token` Secret (k8s/conductor-job.yaml), never from a token file on a
+ * bot's disk.
+ */
+export function resolveCtlStateDir(runDir: string, env: NodeJS.ProcessEnv = process.env): string {
+  const override = env[CTL_STATE_DIR_ENV];
+  return override !== undefined && override.length > 0 ? override : runDir;
+}
+
+/**
  * Default token filename. Per-pid so concurrent `bots-app run` invocations
- * each get their own file and don't clobber each other.
+ * each get their own file and don't clobber each other. The directory is
+ * {@link resolveCtlStateDir}(runDir) — i.e. `runDir` unless
+ * {@link CTL_STATE_DIR_ENV} relocates it.
  */
 export function defaultTokenFilePath(runDir: string, pid: number = process.pid): string {
-  return join(runDir, `ctl-${pid}.token`);
+  return join(resolveCtlStateDir(runDir), `ctl-${pid}.token`);
 }
 
 /**

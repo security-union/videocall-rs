@@ -3,8 +3,43 @@
 
   if (globalThis.top !== globalThis.self) return;
 
-  const WIDTH = 1280;
-  const HEIGHT = 720;
+  const WIDTH = 640;
+  const HEIGHT = 480;
+
+  // The layout below is authored against this reference frame and scaled to
+  // WIDTH/HEIGHT, so changing the capture size cannot move text off-canvas.
+  // At the reference size every scale is exactly 1, so rendering is unchanged.
+  const LAYOUT_WIDTH = 1280;
+  const LAYOUT_HEIGHT = 720;
+  const SCALE_X = WIDTH / LAYOUT_WIDTH;
+  const SCALE_Y = HEIGHT / LAYOUT_HEIGHT;
+  // Fonts take the smaller scale so glyphs never distort or overflow the width.
+  const SCALE_FONT = Math.min(SCALE_X, SCALE_Y);
+  const BAR_W = 28 * SCALE_X;
+  // Hoisted: the refactor turned these into per-frame template-literal builds
+  // and float multiplies. Immaterial next to the canvas fill, but free to avoid.
+  const MAXW_TIME = WIDTH - 160 * SCALE_X;
+  // The time string is the one WIDTH-constrained element: 12 fixed monospace
+  // characters ("HH:MM:SS.mmm"). Size it to the larger of what the height allows
+  // and what the width fits, rather than `SCALE_FONT`.
+  //
+  // Why not simply scale by SCALE_Y (which would preserve the legibility fraction
+  // exactly): at 640x480 that is 90.7px, and 12 monospace chars is ~653px against
+  // a 640px frame — it does not fit at ANY padding, including zero. So full parity
+  // is geometrically impossible for this string at 4:3; this recovers ~86% of the
+  // reference fraction (16.2% of frame height vs 18.9%) instead of the 14.2% a
+  // bare `min(SCALE_X, SCALE_Y)` gives. At the 1280x720 reference the height term
+  // wins and the value is 136px exactly, so commit 1 stays byte-neutral.
+  const TIME_CHARS = 12;
+  const MONO_ADVANCE_EM = 0.6;
+  const FONT_TIME_PX = Math.min(136 * SCALE_Y, MAXW_TIME / (TIME_CHARS * MONO_ADVANCE_EM));
+  const FONT_TIME = `700 ${FONT_TIME_PX}px monospace`;
+  const FONT_DATE = `500 ${42 * SCALE_FONT}px sans-serif`;
+  const FONT_NAME = `600 ${48 * SCALE_FONT}px sans-serif`;
+  const Y_TIME = 330 * SCALE_Y;
+  const Y_DATE = 465 * SCALE_Y;
+  const Y_NAME = 585 * SCALE_Y;
+  const MAXW_NAME = WIDTH - 120 * SCALE_X;
   const FRAME_INTERVAL_MS = 33;
   const DIMENSION_TIMEOUT_MS = 5_000;
   const DIMENSION_POLL_MS = 50;
@@ -71,28 +106,28 @@
     context.fillRect(0, 0, WIDTH, HEIGHT);
 
     context.fillStyle = `hsl(${(cachedHue + 55) % 360} 72% 55%)`;
-    context.fillRect(0, 0, 28, HEIGHT);
-    context.fillRect(WIDTH - 28, 0, 28, HEIGHT);
+    context.fillRect(0, 0, BAR_W, HEIGHT);
+    context.fillRect(WIDTH - BAR_W, 0, BAR_W, HEIGHT);
 
     context.textAlign = "center";
     context.textBaseline = "middle";
     context.fillStyle = "#ffffff";
-    context.font = "700 136px monospace";
+    context.font = FONT_TIME;
     const milliseconds = String(now.getMilliseconds()).padStart(3, "0");
     // maxWidth keeps the time clear of the side bars with horizontal padding
     // (the full HH:MM:SS.mmm string in monospace otherwise clips the tile edges).
-    context.fillText(`${cachedTime}.${milliseconds}`, WIDTH / 2, 330, WIDTH - 160);
+    context.fillText(`${cachedTime}.${milliseconds}`, WIDTH / 2, Y_TIME, MAXW_TIME);
 
     context.fillStyle = "rgba(255, 255, 255, 0.82)";
-    context.font = "500 42px sans-serif";
-    context.fillText(cachedDate, WIDTH / 2, 465);
+    context.font = FONT_DATE;
+    context.fillText(cachedDate, WIDTH / 2, Y_DATE);
 
     const participant =
       typeof globalThis.__CLOCK_PARTICIPANT === "string" ? globalThis.__CLOCK_PARTICIPANT : "";
     if (participant !== "") {
       context.fillStyle = "rgba(255, 255, 255, 0.92)";
-      context.font = "600 48px sans-serif";
-      context.fillText(participant, WIDTH / 2, 585, WIDTH - 120);
+      context.font = FONT_NAME;
+      context.fillText(participant, WIDTH / 2, Y_NAME, MAXW_NAME);
     }
   }
 

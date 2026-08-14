@@ -36,7 +36,7 @@ kubectl exec "$API_POD" -n videocall -- \
 | Invocation | Purpose |
 |---|---|
 | `parse_meeting_console_logs.sh <log_dir>` | Markdown summary (default). Pipe to `less` or save to a file. |
-| `parse_meeting_console_logs.sh <log_dir> --json` | Same data in JSON. Feed into other tools or jq queries. |
+| `parse_meeting_console_logs.sh <log_dir> --json` | The per-session table, peer map, meeting window and Prometheus params as JSON. Feed into other tools or jq queries. **Not** the analysis sections — Error Census, re-election events, implausible-RTT, hardware/capacity warnings, concurrent overlaps and simulcast changes are markdown-only. |
 | `parse_meeting_console_logs.sh <log_dir> --verify` | Sanity check that every pattern the parser looks for still appears in the logs. Exits non-zero if a log message was renamed in client code and broke extraction silently. Use in CI or post-deploy spot-checks. |
 | `parse_meeting_console_logs.sh <log_dir> --relay-wt=PATH` | Optionally ingest a videocall-webtransport relay pod log and add a **Slow-drain Receivers** section — joins server-side `Outbound channel full` drops to the peer-email map. Surfaces memory-pressured / slow clients (the Yu-Guo / RELAY-2 pattern from discussion #562). Can combine with default markdown or `--json`. |
 | `parse_meeting_console_logs.sh <log_dir> --relay-ws=PATH` | Optionally ingest a videocall-**websocket** relay pod log and add a **WS Mailbox-Full Drops** section — joins server-side `Dropping inbound message ... (mailbox full)` drops to the peer-email map. This is the 16-slot actor-mailbox overflow that causes room-wide freezes (**issue #1057**); usually bursty fan-out storms (keyframe/join/screen-share spikes) that hit all receivers at once, including fast ones — NOT necessarily slow receivers. Prometheus equivalent: `relay_packet_drops_total{drop_reason="mailbox_full"}`. |
@@ -63,7 +63,7 @@ _Cores/Platform sourced from "level":"preamble" in first chunk. ⚠ flags client
 | antonio.estrada@hcl-software.com | Tony Estrada | 15:01:01 | websocket(ws_0) | 73ms | 1 | 175 | 0 | 3 | clean | 12 | macOS 26.4.1 |
 ```
 
-Also prints sections for: **Re-election Events**, **Implausible RTT Discards**, **Client Hardware Warnings**, **Concurrent Session Overlaps**, **Slow-drain Receivers** (when `--relay-wt=` is provided), **WS Mailbox-Full Drops** (when `--relay-ws=` is provided), **Peer ID → Email Map**, and a **Prometheus Copy-Paste** block with START/END epoch parameters pre-filled.
+Also prints sections for: **Error Census**, **Re-election Events**, **Implausible RTT Discards**, **Client Hardware Warnings**, **Concurrent Session Overlaps**, **Slow-drain Receivers** (when `--relay-wt=` is provided), **WS Mailbox-Full Drops** (when `--relay-ws=` is provided), **Peer ID → Email Map**, and a **Prometheus Copy-Paste** block with START/END epoch parameters pre-filled.
 
 ## Column reference
 
@@ -75,13 +75,67 @@ Also prints sections for: **Re-election Events**, **Implausible RTT Discards**, 
 | Reelect | Number of re-election triggers | > 0 = network instability during session |
 | Chunks | Number of 30s log chunks uploaded | short sessions (< 3) often = tab closed before logging flushed |
 | Implaus RTT | Number of RTT samples discarded as implausible | > 0 usually = client main-thread stall (not server clock drift). See discussion #562. |
-| Speak | Count of `Speaking changed: false -> true` (VAD) | 0 = muted/listen-only; 100+ = active speaker. Helps distinguish "audio pipeline broken" from "person not talking". |
+| Speak | Count of `Speaking changed: false -> true` (VAD) | **Open-mic energy, not speech** — an RMS threshold on the raw mic stream, so it fires on breathing and background noise. Never read it as who was talking. Packet rate does not separate them either: a silent open mic transmits at the same ~50 pkt/s (#2278). For mute state use `videocall_self_audio_enabled`, written unconditionally from the sender's own report. |
 | Buf med | Median of non-zero NetEQ audio buffer depth, ms | 100–300ms = healthy; < 50ms = underrun risk (audible clicks); > 500ms = network jitter; zero-only samples filtered out (they represent peers not sending) |
-| Errors | `level:error` log line count | categorize before alarming — one broken encoder can emit thousands of identical errors |
+| Errors | `level:error` log line count | categorize before alarming — one broken encoder can emit thousands of identical errors. **This is a per-session count, so it HIDES any defect shared by several people — read the Error Census instead** (below). |
 | End | `clean` if user left via UI, `LOST` if `Connection lost` event, `?` if neither | — |
 | Cores | `navigator.hardwareConcurrency` from preamble | **< 6 ⚠** or **Intel Mac (macOS ≤ 15) with ≤ 8 cores ⚠** — see discussion #562 |
 | Platform | OS + version from preamble | macOS 14 / 15 (pre-Apple-Silicon) often indicate old hardware |
 | Concurrent | Count of overlapping sessions for same email (including 15s post-end NetEQ zombie window) | **> 1 ⚠** = duplicate NetEQ + AudioWorkletNode instances mixing into `master_gain` → audio crackling. See NETEQ-1 in discussion #562. |
+
+## Error Census
+
+Groups every `level:error` line by normalised message and ranks by **distinct
+participants affected**, flagging each signature that hits more than one with ⚠.
+
+```
+### Error Census (grouped by message, ranked by participants affected)
+
+| Count | People | Message |
+|-------|--------|---------|
+| 883   | 11 ⚠   | No connection manager available for Ok(MEDIA) packet |
+| 12    | 9 ⚠    | panicked at …/host.rs:213:25: called `Result::unwrap()` on an `Err`… |
+| 6     | 3 ⚠    | Microphone error: Failed to initialize audio encoder: JsValue(Invalid… |
+
+⚠ **11 signature(s) affect MORE THAN ONE person — shared defects, not user oddities.**
+```
+
+**Why it exists.** The `Errors` column is a count, so a defect shared by several
+people just inflates one row and reads as that person's problem. On the 2026-08-12
+27-person call it found a `host.rs` panic across 9 participants and re-scoped an
+`AudioWorkletNode` failure from 1 victim to 3.
+
+**How to read it.** `People > 1` is the signal. Before filing anything, sweep the
+signature so the issue carries the real victim count:
+
+```bash
+mlog <room>/<date> --who '<pattern>'
+```
+
+**Grouping rules.** Long ids (`[0-9]{6,}`) and per-occurrence durations collapse;
+small integers are kept, because `401` vs `500` and close code `1006` vs `1000` are
+different defects. Panics keep their second line, which carries the discriminating
+reason. Signatures are truncated at 100 chars with a `…` marker. Stack frames are
+dropped — they are continuations, not defects.
+
+**Limits worth knowing.**
+- The table is capped at 40 rows with a footer counting the remainder. A high row
+  count usually means a message interpolates an id the normaliser does not
+  collapse (server-supplied error bodies are the common case).
+- Rows are never more than the error count — frames and empty messages are
+  dropped by design, and identical messages collapse into one row. (Equal is
+  normal: three errors with three distinct messages give three rows.)
+- **Loss is detected, not inferred from emptiness, and the all-clear is withheld
+  whenever either signal fires** — including when nothing survived to be counted.
+  - *JSON layer (counted).* Under `jq -R` a malformed line does not abort the run;
+    it yields no signature. Those, plus a jq that dies mid-stream, are counted and
+    reported as `⚠ N error line(s) could not be parsed, or were lost …`, with the
+    counts flagged as a **lower bound**.
+  - *gzip layer (magnitude unknowable).* A truncated `.log.gz` decompresses only
+    its prefix, so the missing lines never exist to be counted. Reported as
+    `⚠ N session(s) had a truncated or corrupt .log.gz`. **Detection needs `zgrep`
+    to exit ≥ 2 or print a gzip diagnostic; where it reports neither, this loss is
+    undetected.**
 
 ## When to use `--verify`
 
@@ -109,8 +163,12 @@ To distinguish: check `videocall_neteq_packets_per_sec` for the same series. If 
 
 ## Performance
 
-Typical runtime:
-- 17-person 50-minute meeting (~2,100 chunks, ~2 GB gzipped): ~30 s
+Typical runtime (measured 2026-08-12):
+- 27-person 36-minute meeting (1,915 chunks, 40 MB gzipped / 355 MB raw): ~52 s
+- 419 chunks: ~15 s
 - 2-person 1-minute meeting (~5 chunks): < 1 s
+
+The Error Census adds no decompression: it reuses the error lines Pass 3 already
+materialises.
 
 Grep pre-filtering keeps jq's working set small. Parallelizing per-session has been tried and is not faster on current data (disk IO bound, not CPU).

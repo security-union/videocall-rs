@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { NETSIM_PRESETS } from "../meeting-config";
 import { findLatestTokenFile, readTokenFile } from "./auth";
 import { type CtlClientConfig, ctlRequest } from "./client";
+import { NETEM_PROFILE_NAMES } from "./netem";
 import { type BotSnapshot } from "./registry";
 
 /**
@@ -22,6 +23,10 @@ export function registerCtlCommands(program: Command, defaultRunDir: string): vo
       .option(
         "--state-file <path>",
         "Explicit path to a ctl-<pid>.token file. Overrides token-file auto-discovery.",
+      )
+      .option(
+        "--host <host>",
+        'Host the control API is reachable at. Default "127.0.0.1". Set a bot pod\'s in-cluster DNS name (e.g. videocall-bots-3.videocall-bots.bot-load.svc) to drive a remote bot — that pod must have been started with a non-loopback --ctl-bind and a shared token (use with --port + --token).',
       )
       .option("--port <port>", "Override the port from the token file (use with --token).")
       .option("--token <token>", "Override the bearer token from the token file (use with --port).")
@@ -206,10 +211,67 @@ export function registerCtlCommands(program: Command, defaultRunDir: string): vo
         console.log(`duplicate: source=${botId} → newBotId=${res.botId}`);
       },
     );
+
+  sharedConnOptions(ctl.command("netem"))
+    .description(
+      "Apply OS-level tc/netem impairment to the target pod's interface (--profile OR raw --delay/--jitter/--loss/--rate), or remove it with --clear. Requires the pod's control server to have been started with --ctl-netem. Combine with --host to target a specific bot pod.",
+    )
+    .option("--profile <name>", `Named profile (${NETEM_PROFILE_NAMES.join(", ")})`)
+    .option("--delay <ms>", "Raw one-way delay in ms")
+    .option("--jitter <ms>", "Raw delay jitter in ms (requires --delay)")
+    .option("--loss <pct>", "Raw packet loss percent (0-100)")
+    .option("--rate <kbit>", "Raw egress rate cap in kbit/s")
+    .option("--clear", "Remove all shaping (restore line rate)", false)
+    .action(async (opts: ConnOptions & NetemCmdOptions) => {
+      const plan = buildNetemRequest(opts);
+      const cfg = await resolveConfig(opts);
+      const res = await ctlRequest<{ op: string; label: string; argv: string[] }>(
+        cfg,
+        plan.method,
+        "/netem",
+        plan.body,
+      );
+      console.log(`netem: ${res.op} (${res.label}) → ${res.argv.join(" ")}`);
+    });
+}
+
+export interface NetemCmdOptions {
+  profile?: string;
+  delay?: string;
+  jitter?: string;
+  loss?: string;
+  rate?: string;
+  clear?: boolean;
+}
+
+/**
+ * Translate `ctl netem` flags into an HTTP verb + request body. Pure so
+ * it is unit-testable without a live server. Numeric strings are parsed
+ * to numbers here; range/grammar validation is the server's job
+ * (`resolveNetemRequest`), so an out-of-range value surfaces as the
+ * server's precise 400 rather than being silently clamped client-side.
+ */
+export function buildNetemRequest(opts: NetemCmdOptions): {
+  method: "POST" | "DELETE";
+  body?: Record<string, unknown>;
+} {
+  if (opts.clear === true) {
+    return { method: "DELETE" };
+  }
+  if (opts.profile !== undefined) {
+    return { method: "POST", body: { profile: opts.profile } };
+  }
+  const body: Record<string, unknown> = {};
+  if (opts.delay !== undefined) body.delayMs = Number(opts.delay);
+  if (opts.jitter !== undefined) body.jitterMs = Number(opts.jitter);
+  if (opts.loss !== undefined) body.lossPct = Number(opts.loss);
+  if (opts.rate !== undefined) body.rateKbit = Number(opts.rate);
+  return { method: "POST", body };
 }
 
 interface ConnOptions {
   stateFile?: string;
+  host?: string;
   port?: string;
   token?: string;
   runDir: string;
@@ -225,6 +287,10 @@ interface ConnOptions {
  * Throws — and the CLI exits non-zero — if no token file is found.
  */
 async function resolveConfig(opts: ConnOptions): Promise<CtlClientConfig> {
+  // `--host` is a pure client-side target override; it applies to BOTH
+  // the explicit --port/--token path and the token-file path. Undefined
+  // ⇒ the client defaults to 127.0.0.1 (back-compat).
+  const host = opts.host;
   if (opts.port !== undefined || opts.token !== undefined) {
     if (opts.port === undefined || opts.token === undefined) {
       throw new Error("ctl: --port and --token must be supplied together");
@@ -233,7 +299,7 @@ async function resolveConfig(opts: ConnOptions): Promise<CtlClientConfig> {
     if (!Number.isFinite(port) || port <= 0 || port > 65535) {
       throw new Error(`ctl: --port must be a positive integer (got "${opts.port}")`);
     }
-    return { port, token: opts.token };
+    return { host, port, token: opts.token };
   }
 
   let tokenFilePath: string | null = opts.stateFile ?? null;
@@ -247,7 +313,7 @@ async function resolveConfig(opts: ConnOptions): Promise<CtlClientConfig> {
     }
   }
   const contents = await readTokenFile(tokenFilePath);
-  return { port: contents.port, token: contents.token };
+  return { host, port: contents.port, token: contents.token };
 }
 
 /**

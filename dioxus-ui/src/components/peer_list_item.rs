@@ -18,7 +18,9 @@
 
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
+use crate::components::icons::raised_hand::RaisedHandIcon;
 use crate::components::icons::recording::RecordingIcon;
+use crate::components::raised_hands::raised_hand_badge_label;
 use crate::context::AppearanceSettingsCtx;
 use dioxus::prelude::*;
 
@@ -28,6 +30,17 @@ pub fn PeerListItem(
     #[props(default)] tooltip: String,
     #[props(default)] is_host: bool,
     #[props(default)] is_recording: bool,
+    /// This participant's 1-based position in the raise-hand queue AND the queue
+    /// length (issue 2135), or `None` when their hand is down.
+    ///
+    /// The SLOT rather than a bare bool because the roster is the one surface
+    /// that lists every raised hand at once: the banner collapses past the third
+    /// name and a tile badge conveys no order, so if the ordinal is not legible
+    /// here it is not legible anywhere. The total rides along because "position
+    /// 2" without "of 5" tells a screen-reader user their rank but not the size
+    /// of what they are ranked in.
+    #[props(default)]
+    hand_slot: Option<(usize, usize)>,
     #[props(default)] is_self: bool,
     #[props(default)] is_guest: bool,
     #[props(default = true)] muted: bool,
@@ -90,6 +103,27 @@ pub fn PeerListItem(
                     }
                     if is_recording {
                         RecordingIcon {}
+                    }
+                    // Issue 2135: raised-hand badge with its queue ordinal. The
+                    // ordinal is rendered as VISIBLE text (not just in the
+                    // accessible name) because "who is next" is the whole reason
+                    // the roster is ordered — a sighted user should not have to
+                    // count rows to find it.
+                    if let Some((position, total)) = hand_slot {
+                        span {
+                            class: "raised-hand-badge raised-hand-badge--roster",
+                            "data-testid": "peer-list-raised-hand",
+                            "data-hand-position": "{position}",
+                            "data-hand-total": "{total}",
+                            RaisedHandIcon {
+                                decorative: false,
+                                // No name: this badge's own row already begins
+                                // with it, so repeating it made AT read
+                                // "Alice … Alice raised their hand".
+                                label: raised_hand_badge_label(Some((position, total))),
+                            }
+                            span { class: "raised-hand-badge-position", aria_hidden: "true", "{position}" }
+                        }
                     }
                     if is_self {
                         button {

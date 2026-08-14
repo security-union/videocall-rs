@@ -21,8 +21,8 @@
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
 use crate::messages::{
-    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerLogMessage,
-    WorkerMessage, FRESHNESS_SKIP_KIND, REQUEST_KEYFRAME_KIND, WORKER_LOG_KIND,
+    classify_worker_message_kind, FreshnessSkipMessage, KeyframeArrivalMessage,
+    RequestKeyframeMessage, VideoStatsMessage, WorkerLogMessage, WorkerMessage, WorkerMessageKind,
 };
 #[cfg(feature = "wasm")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
@@ -390,7 +390,9 @@ fn post_paint_progress(
 /// would deserialize fine into this struct's subset) is NOT mistaken for a keyframe request.
 fn handle_worker_request_keyframe(js_val: &JsValue) -> Option<f64> {
     match serde_wasm_bindgen::from_value::<RequestKeyframeMessage>(js_val.clone()) {
-        Ok(msg) if msg.kind == REQUEST_KEYFRAME_KIND => {
+        Ok(msg)
+            if classify_worker_message_kind(&msg.kind) == WorkerMessageKind::RequestKeyframe =>
+        {
             log::debug!(
                 "Proactive keyframe request from worker (#1025): from_peer={:?} to_peer={:?} head_age_ms={:.0}",
                 msg.from_peer,
@@ -417,7 +419,7 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
     // VideoStatsMessage (its fields are all `Option`), so we must check `kind` and
     // fall through rather than treating a successful deserialize as a match.
     if let Ok(stats_msg) = serde_wasm_bindgen::from_value::<VideoStatsMessage>(js_val.clone()) {
-        if stats_msg.kind == "video_stats" {
+        if classify_worker_message_kind(&stats_msg.kind) == WorkerMessageKind::VideoStats {
             #[cfg(feature = "wasm")]
             {
                 let evt = DiagEvent {
@@ -466,6 +468,105 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                             "content_staleness_ms",
                             stats_msg.content_staleness_ms.unwrap_or(0.0)
                         ),
+                        // Keyframe ARRIVALS (#2201): lifetime counter, default 0. Like
+                        // content_staleness_ms above, THIS main-thread re-broadcast is the
+                        // load-bearing one — the worker's in-process DiagEvent does not cross
+                        // the worker→main boundary, so `keyframe_arrivals_total` reaches
+                        // health_reporter (and Prometheus) only via this forward.
+                        metric!(
+                            "keyframe_arrivals_total",
+                            stats_msg.keyframe_arrivals_total.unwrap_or(0)
+                        ),
+                    ],
+                };
+                let _ = global_sender().try_broadcast(evt);
+            }
+            return true;
+        }
+    }
+
+    // keyframe_arrival (issue #2201): a keyframe ARRIVED at the receiver's jitter buffer.
+    //
+    // Same delivery reasoning as `freshness_skip` below: the load-bearing path to uploaded
+    // field logs is the re-emitted `console` line, not the DiagEvent —
+    // `console-log-collector.js` intercepts `log`/`warn`/`error`/`info`/`debug` alike, so every
+    // level below reaches the upload buffer.
+    //
+    // LEVEL SPLIT — for GREPPABILITY, not for volume. Periodic keyframes are one per
+    // `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` (camera 5000ms) or
+    // `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS` (screen 3000ms) per stream — so a 20-peer
+    // meeting with a share generates a few arrivals per second across all decoders, and
+    // emitting all of them at WARN would dilute the freshness/escalation warnings this signal
+    // exists to be correlated against.
+    //
+    // The split does NOT reduce log VOLUME: `console-log-collector.js` intercepts
+    // `log`/`warn`/`error`/`info`/`debug` alike and calls `pushEntry` identically for every
+    // one, so the level has zero effect on its line/byte budget or upload cadence. What
+    // actually bounds the volume is the keyframe cadence itself — the periodic intervals
+    // above, plus `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS` on the receiver and
+    // `FORCED_KEYFRAME_COOLDOWN_MS` on the publisher during a freeze.
+    //
+    // So, as issue #2201 itself proposes:
+    //   * WARN  — the INTERESTING arrivals: one landing during a keyframe-less hold (the
+    //             recovery datapoint) or one REJECTED as old/duplicate (arrived but cannot
+    //             recover). These are rare and are the reason the signal exists.
+    //   * DEBUG — routine healthy arrivals. Still captured by the collector, so the full
+    //             arrival timeline is reconstructable from an uploaded log, without competing
+    //             with the WARN band. The per-pair Prometheus counter covers the
+    //             always-on/aggregate view independently of any log level.
+    //
+    // Checked BEFORE `freshness_skip`: this payload structurally satisfies that message's
+    // required fields except `dropped`, so ordering plus the kind guards keep them apart (see
+    // `keyframe_arrival_falls_through_overlapping_kinds` in `messages.rs`, which pins it).
+    if let Ok(arrival_msg) =
+        serde_wasm_bindgen::from_value::<KeyframeArrivalMessage>(js_val.clone())
+    {
+        if classify_worker_message_kind(&arrival_msg.kind) == WorkerMessageKind::KeyframeArrival {
+            #[cfg(feature = "wasm")]
+            {
+                // Formatting lives in the pure, host-tested
+                // `KeyframeArrivalMessage::console_line` (mirroring #1384's treatment of the
+                // skip line) so a typo in the grep prefix or a dropped field token fails a
+                // host test rather than shipping green. The same line text is emitted at both
+                // levels — the grep contract does not depend on which branch ran.
+                let line: wasm_bindgen::JsValue = arrival_msg.console_line().into();
+                if arrival_msg.was_in_keyframe_less_hold
+                    || arrival_msg.rejected_as_old
+                    || arrival_msg.stream_restart
+                {
+                    console::warn_1(&line);
+                } else {
+                    console::debug_1(&line);
+                }
+
+                let evt = DiagEvent {
+                    subsystem: "video",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics: vec![
+                        Metric {
+                            name: "event",
+                            value: MetricValue::text_static("keyframe_arrival"),
+                        },
+                        // #1641: stamp the owner's stream kind so health_reporter buckets this
+                        // `subsystem: "video"` event camera-vs-screen instead of defaulting a
+                        // SCREEN decoder's arrival into the CAMERA bucket.
+                        Metric {
+                            name: "media_type",
+                            value: MetricValue::text_static(media_type),
+                        },
+                        metric!("from_peer", arrival_msg.from_peer.unwrap_or_default()),
+                        metric!("to_peer", arrival_msg.to_peer.unwrap_or_default()),
+                        metric!("keyframe_seq", arrival_msg.seq),
+                        metric!("head_age_ms", arrival_msg.head_age_ms),
+                        // `MetricValue` has no bool variant; emit the flags as 1/0 u64,
+                        // which is also the shape a Prometheus consumer wants.
+                        metric!(
+                            "was_in_keyframe_less_hold",
+                            u64::from(arrival_msg.was_in_keyframe_less_hold)
+                        ),
+                        metric!("rejected_as_old", u64::from(arrival_msg.rejected_as_old)),
+                        metric!("stream_restart", u64::from(arrival_msg.stream_restart)),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);
@@ -489,7 +590,7 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
     // consumer, mirroring the other worker->main diagnostics. The `[JITTER_BUFFER]` prefix
     // matches the grep the field investigation already uses for this signal.
     if let Ok(skip_msg) = serde_wasm_bindgen::from_value::<FreshnessSkipMessage>(js_val.clone()) {
-        if skip_msg.kind == FRESHNESS_SKIP_KIND {
+        if classify_worker_message_kind(&skip_msg.kind) == WorkerMessageKind::FreshnessSkip {
             #[cfg(feature = "wasm")]
             {
                 // A skip means the head-of-line frame aged past the playout deadline and stale
@@ -567,7 +668,7 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
     // `message` are required strings, so a stats/skip object will NOT deserialize into it — but we
     // still gate on `WORKER_LOG_KIND` so nothing can be misrouted in either direction.
     if let Ok(log_msg) = serde_wasm_bindgen::from_value::<WorkerLogMessage>(js_val.clone()) {
-        if log_msg.kind == WORKER_LOG_KIND {
+        if classify_worker_message_kind(&log_msg.kind) == WorkerMessageKind::WorkerLog {
             #[cfg(feature = "wasm")]
             {
                 // Deliver into the console-log capture+upload pipeline (issue #1356). That pipeline

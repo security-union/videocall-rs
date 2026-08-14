@@ -7,10 +7,10 @@
 # keeps the fleet a good neighbor on the shared cluster, well under its free
 # headroom. Sizing target: ~20 bots. The binding constraint is limits.cpu vs
 # the pod's 4-CPU limit (bot-pod.yaml raised it to 4 so CFS throttling can't
-# self-induce a false RESOURCE_STARVED verdict): 80 / 4 = 20 pods. The other
-# quotas admit at least that many (requests.cpu 48 / 1500m = 32; limits.memory
-# 96Gi / 2Gi = 48; pods = 30), so limits.cpu is what to raise for a bigger
-# fleet.
+# self-induce a false RESOURCE_STARVED verdict): 96 / 4 = 24 pods, comfortably
+# above the ~20-bot target. The other quotas admit at least that many
+# (requests.cpu 48 / 1500m = 32; limits.memory 96Gi / 2Gi = 48; pods = 48), so
+# limits.cpu is what to raise for a bigger fleet.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -27,9 +27,13 @@ metadata:
 spec:
   hard:
     requests.cpu: "48"
-    # 80 / 4-CPU pod limit = 20 pods (the sizing target above). This is the
-    # binding constraint; raise it (and pods) to grow the fleet.
-    limits.cpu: "80"
+    # 96 / 4-CPU pod limit = 24 pods, >= the ~20-bot target + a coexisting Inc-1
+    # pod. This is the binding constraint; raise it (and pods) to grow the fleet.
+    limits.cpu: "96" # headroom: 20 fleet bots x4 (80) + a coexisting Inc-1 pod (4) = 84, under 96 with slack
     requests.memory: 64Gi
     limits.memory: 96Gi
-    pods: "30"
+    # 20 fleet bots + ~1 per-node netem-preload DS pod (they share THIS quota,
+    # admitted independently — too low starves the DS from covering a new node,
+    # silently breaking tc netem there) + the conductor Job + a coexisting Inc-1
+    # pod + headroom. Was 30 (fleet-only) — too small once #2072's DS+conductor exist.
+    pods: "48"

@@ -130,9 +130,20 @@ pub fn WaitingRoom(
                 enable_webtransport: effective_wt_enabled,
                 max_received_layer: crate::constants::max_received_layer(),
                 skip_canvas_paint: crate::constants::skip_canvas_paint(),
+                // Issue #2156: deployment CAMERA ladder for receiver-side READOUTS.
+                // The waiting-room observer client renders no perf panel today, but it
+                // is a real receive client and MUST NOT be the one site that drifts.
+                camera_ladder_variant: crate::constants::camera_ladder_variant(),
                 // Issue #1884: waiting-room OBSERVER client — no in-call reaction
                 // overlay, so no reaction callback.
                 on_reaction: None,
+                on_raise_hand: None,
+                // Issue 2136: this is an OBSERVER client. The relay's outbound
+                // allowlist forwards only MEETING and SESSION_ASSIGNED to an
+                // observer, so a MEETING_TIMER can never arrive here -- a
+                // callback would be unreachable code, not a missing feature.
+                // There is deliberately no timer in the waiting room.
+                on_meeting_timer: None,
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting room)");
                     obs_conn_on_connect.set(true);

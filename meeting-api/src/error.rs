@@ -130,6 +130,50 @@ impl AppError {
     pub fn guests_not_allowed() -> Self {
         Self::new(StatusCode::FORBIDDEN, APIError::guests_not_allowed())
     }
+
+    /// `403` — the meeting is password-protected and none was supplied.
+    ///
+    /// `403 Forbidden`, not `401 Unauthorized`: the caller's *identity* is
+    /// established (session cookie for `/join`, none needed for `/join-guest`);
+    /// what they lack is a resource-specific credential.
+    ///
+    /// A `401` would also be wrong operationally. `dioxus-ui`'s
+    /// `with_refresh_retry` maps `401` to `ApiError::NotAuthenticated` and, when
+    /// `is_pkce_flow()` is set, responds by refreshing the session and replaying
+    /// the request **once** before surfacing the error. So a `401` here would
+    /// cost a spurious token refresh plus a duplicate join attempt — a second
+    /// Argon2 verification against the same failing password — on every wrong
+    /// entry in PKCE mode. Not an unbounded loop; still work nobody asked for,
+    /// on the exact path this change makes expensive.
+    pub fn meeting_password_required() -> Self {
+        Self::new(StatusCode::FORBIDDEN, APIError::meeting_password_required())
+    }
+
+    /// `403` — the supplied meeting password did not verify (or the stored hash
+    /// was unparseable, which is denied rather than ignored). See
+    /// [`AppError::meeting_password_required`] for why this is `403`.
+    pub fn invalid_meeting_password() -> Self {
+        Self::new(StatusCode::FORBIDDEN, APIError::invalid_meeting_password())
+    }
+
+    /// `429` — this `(client IP, meeting)` pair has burned its failed-password
+    /// budget for the current window.
+    pub fn too_many_password_attempts() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            APIError::too_many_password_attempts(),
+        )
+    }
+
+    /// `503` — no Argon2 verification permit became available in time, so the
+    /// request was shed instead of queueing without bound. Transient; the client
+    /// may retry.
+    pub fn verifier_overloaded() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            APIError::verifier_overloaded(),
+        )
+    }
 }
 
 impl IntoResponse for AppError {

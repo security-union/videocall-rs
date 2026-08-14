@@ -21,12 +21,21 @@ import { waitForServices } from "../helpers/wait-for-services";
  *   - aria-live: "polite"
  *   - aria-label describing the quality level and RTT
  *
- * Since the indicator depends on real RTT diagnostics from the Rust-side
- * connection manager (which requires a live server round-trip), we cannot
- * easily inject high-RTT conditions in E2E. Tests focus on:
+ * The indicator keys off `active_server_rtt`, which the Rust-side connection
+ * manager derives from an application-level probe round-trip — not from anything
+ * a browser-level network throttle can shape. This file is the NEGATIVE half of
+ * the coverage and stays that way. Tests focus on:
  *   1. Verifying the indicator is absent under normal (low-RTT) conditions
  *   2. Verifying the CSS rules exist in the loaded stylesheet
  *   3. Verifying no false positives on good localhost connections
+ *
+ * The POSITIVE half — the Good -> Warn -> Critical -> Good transitions, driven
+ * by publishing synthetic `active_server_rtt` samples onto the diagnostics bus
+ * through the MOCK_PEERS_ENABLED-gated `window.__videocall_inject_server_rtt`
+ * hook — lives in `connection-quality-rtt-transitions.spec.ts` (issue #367).
+ * That file's header documents why CDP network emulation cannot reach this
+ * signal at all, and why netsim — which does reach it — is still not a usable
+ * lever for driving the tri-state transitions.
  */
 
 test.describe("Connection quality indicator", () => {

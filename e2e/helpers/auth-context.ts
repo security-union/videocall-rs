@@ -62,6 +62,10 @@ export const BROWSER_ARGS: string[] = [
  * Path to the base64 SHA-256 of the DER-encoded WT dev cert. Produced by
  * `scripts/regen-dev-cert.sh` alongside `actix-api/certs/localhost.pem`.
  * The file may contain `#`-prefixed comment lines and trailing whitespace.
+ *
+ * **Gitignored** (issue #2159) — it is the fingerprint of a machine-local,
+ * 13-day cert, so a fresh clone does not have it until an `e2e-cert`-dependent
+ * Make target runs.
  */
 const CERT_HASH_FILE = path.resolve(
   __dirname,
@@ -73,24 +77,51 @@ const CERT_HASH_FILE = path.resolve(
 );
 
 /**
- * Read the dev cert hash file and return the base64 SHA-256 string, or
- * `null` if the file is missing / empty. Strips comment and blank lines so
+ * Read the dev cert hash file and return the base64 SHA-256 strings, or an
+ * empty array if the file is missing. Strips comment and blank lines so
  * the human-friendly preamble in the file does not poison the wasm side.
+ *
+ * Returns empty rather than throwing because this runs at module import, and
+ * every spec — including the WS-only majority that never needs the hash —
+ * imports this module. Throwing here would break them all. The actionable error
+ * belongs at the point of USE: see {@link assertDevCertHashesPresent}.
+ *
+ * The `filePath` parameter exists so the unit test can point at a fixture
+ * instead of the developer's real cert directory.
  */
-function readDevCertHashes(): string[] {
+export function readDevCertHashes(filePath: string = CERT_HASH_FILE): string[] {
   let raw: string;
   try {
-    raw = fs.readFileSync(CERT_HASH_FILE, "utf8");
+    raw = fs.readFileSync(filePath, "utf8");
   } catch {
-    // Fall through silently — WS-only specs don't need the hash and
-    // production-style CA paths can still negotiate. WT-only specs will
-    // surface the missing file via a clear browser-side error.
     return [];
   }
   return raw
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
+/**
+ * Throw when the WT dev cert hash is absent (#2159). Without it the failure is
+ * silent rather than loud: {@link CERT_HASH_INIT_SCRIPT} becomes a no-op, wasm
+ * falls back to a bare `WebTransport::new(url)`, and the self-signed cert is
+ * rejected as `QUIC_TLS_CERTIFICATE_UNKNOWN` — which reads like a broken server.
+ *
+ * The remedy is TWO steps: a missing hash makes `regen-dev-cert.sh` rotate the
+ * cert, and a running WT container has already loaded the old one.
+ */
+export function assertDevCertHashesPresent(hashes: string[] = CERT_HASHES): void {
+  if (hashes.length > 0) return;
+  throw new Error(
+    `WT dev cert hash missing (${CERT_HASH_FILE}).\n` +
+      `  make e2e-cert ARGS=--force\n` +
+      `  docker restart videocall-e2e-webtransport-api-1\n` +
+      `Both steps: regenerating rotates the cert, and a running WT container has ` +
+      `already loaded the old one. The hash is machine-local and gitignored (#2159), ` +
+      `so a fresh clone will not have it. Without it the WebTransport handshake ` +
+      `fails later as QUIC_TLS_CERTIFICATE_UNKNOWN.`,
+  );
 }
 
 // Snapshotted at module import. If the dev cert is regenerated mid-run
@@ -110,7 +141,8 @@ const CERT_HASHES = readDevCertHashes();
  *
  * If `CERT_HASHES` is empty (file missing), this becomes a no-op and the
  * wasm falls back to bare `WebTransport::new(url)` — which is also the
- * production path.
+ * production path. That fallback is silent, which is
+ * why `global-setup.ts` asserts the hash is present before the run.
  */
 export const CERT_HASH_INIT_SCRIPT = (() => {
   // Embed the hashes literally so the closure has no closure-over-outer-scope

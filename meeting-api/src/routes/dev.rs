@@ -117,6 +117,7 @@ mod tests {
             search: None,
             display_name_rate_limit_disabled: false,
             dev_user,
+            password_gate: std::sync::Arc::new(crate::password::MeetingPasswordGate::new()),
         }
     }
 

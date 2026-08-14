@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+// Client -> relay -> all-peers RAISED-HAND STATE broadcast (issue #2135).
+// Carried inside a PacketWrapper whose packet_type is RAISE_HAND (18).
+//
+// STATE, NOT AN EVENT -- the one property that shapes everything below.
+// `raised` is an absolute level ("my hand is up / down"), never a toggle, so
+// re-sending the SAME value is a harmless no-op for every consumer. That
+// idempotence is what makes the RE-ANNOUNCE protocol safe (see below), and it
+// is why the relay can stay a dumb forwarder with NO server-side hand registry.
+// A toggle-shaped message would make a single lost or duplicated packet invert
+// the room's view of a participant permanently; a level cannot.
+//
+// RE-ANNOUNCE, NOT RELAY STATE (the reason there is no server-side registry).
+// A hand raised BEFORE you joined -- or before you reconnected -- must still
+// show, otherwise the feature is broken in the ordinary case. That is solved
+// CLIENT-SIDE: a client whose own hand is currently RAISED re-sends this packet
+// when it learns of a new peer (PARTICIPANT_JOINED) and after its own
+// reconnect/re-election. The relay never remembers anything. Wire contract for
+// implementers:
+//   * Re-announce ONLY when `raised == true`. `raised == false` is the default
+//     state of every participant, so announcing it to each new peer would be
+//     pure O(peers) waste; a LOWER is broadcast once, as a real transition.
+//   * COALESCE re-announces across a join wave (one send per debounce window,
+//     not one per PARTICIPANT_JOINED), or a 20-person join wave costs 20 sends
+//     per raised hand and will hit the relay's per-sender rate limit.
+//   * Preserve `raised_at_ms` VERBATIM on a re-announce -- do not re-stamp it,
+//     or the hand appears to have been raised at re-announce time and the
+//     room's ordering collapses whenever anyone joins.
+//
+// NOT E2EE-sealed: CLEARTEXT even when E2EE_ENABLED=true, mirroring
+// ReactionPacket, because the relay must read the inner packet to enforce
+// ingress validation (size cap + display_name bound) and a raised hand is
+// broadcast-public by definition. Put NO private data in this message.
+//
+// Attribution: WHO is anchored on the relay-stamped envelope session_id.
+// Since #2124 (issue #2095) the relay stamps that field UNCONDITIONALLY from
+// the authenticated session on the single fan-out funnel
+// (`chat_server::Handler<ClientMessage>` -> `stamp_wrapper_for_broadcast`), so
+// this is ENFORCED, not aspirational: a client cannot present another
+// participant's session_id and raise a hand on their behalf. `display_name` is
+// a COSMETIC fallback only; never identity/authorization.
+message RaiseHandPacket {
+  // Absolute hand state. true = raised, false = lowered. NOT a toggle.
+  //
+  // proto3 omits default values on the wire, so a LOWER serializes to zero
+  // bytes for this field -- which also means an EMPTY or truncated payload
+  // parses as `raised = false`. That degradation is deliberately the SAFE one:
+  // combined with the relay-stamped envelope session_id, the worst a corrupt
+  // or forged payload can do is lower the SENDER'S OWN hand.
+  bool raised = 1;
+
+  // Unix epoch milliseconds (`Date.now()`) at which the sender RAISED its hand,
+  // set once at the false->true transition and preserved verbatim across every
+  // re-announce. Meaningless (send 0) when `raised == false`.
+  //
+  // WHICH CLOCK, AND WHY IT MATTERS: this is the SENDER'S WALL clock, not a
+  // relay clock and not a monotonic one.
+  //   * It cannot be relay-stamped, because a re-announce would then be
+  //     re-stamped with a later time and destroy the original ordering -- the
+  //     exact case (late joiner) the field exists to serve.
+  //   * It cannot be a per-client monotonic clock (`performance.now()`),
+  //     because those have per-tab origins and are not comparable ACROSS
+  //     clients, which is the only comparison anyone makes with this field.
+  // So cross-client skew is real and unavoidable: honest NTP-synced clients
+  // agree to well under a second, which is enough for "who raised first" in a
+  // human-paced queue, but a misconfigured or MALICIOUS client can claim any
+  // value (0 = "raised at the epoch" jumps the queue permanently).
+  //
+  // Consequently this field is an ADVISORY DISPLAY-ORDERING HINT ONLY, in
+  // exactly the same trust class as `display_name`: never authorization, never
+  // an input to who-may-speak enforcement, never a security decision. The relay
+  // deliberately neither validates nor rewrites it (any u64 is syntactically
+  // valid, and every rewrite rule that would blunt the forgery -- clamping to
+  // the future, or to a floor -- also breaks legitimate re-announce of a hand
+  // raised minutes ago). Consumers MUST tie-break equal values deterministically
+  // on the envelope session_id so that every participant renders the SAME order.
+  uint64 raised_at_ms = 2;
+
+  // Cosmetic display-name fallback for the pre-join display-name-cache race
+  // (a re-announce can outrun the joiner's PARTICIPANT_JOINED list reply).
+  // SAME threat model and cap as ReactionPacket.display_name: attacker-
+  // controlled, so the relay bounds it at ingress (<=256 bytes, truncated at a
+  // UTF-8 char boundary) and the client renders it as ESCAPED text with its own
+  // <=64-char cap. Authoritative attribution is the relay-stamped envelope
+  // session_id resolved through the display-name cache; this is only what to
+  // show while that cache has no entry yet. Optional.
+  bytes display_name = 3;
+}

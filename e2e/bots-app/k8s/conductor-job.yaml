@@ -1,0 +1,158 @@
+# conductor-job.yaml — the in-cluster netem/behaviour conductor (Increment 4, #2072).
+#
+# A one-shot, NON-privileged Job that runs `bots-app conduct` (added by the
+# parallel frontend task). It reads a timeline YAML and drives each bot's
+# token-auth control server over the pod network:
+#   videocall-bots-<N>.videocall-bots.bot-load.svc.cluster.local:8080
+#
+# WHY IN-CLUSTER: the bots' control API is reachable ONLY inside the cluster
+# (headless Service DNS; no Ingress/LoadBalancer fronts it). A conductor OUTSIDE
+# the cluster could neither resolve the per-pod DNS nor reach the pod IPs. This
+# Job runs in the SAME namespace (bot-load) as the fleet, so cluster DNS resolves
+# the per-pod names and the pod network routes straight to each bot.
+#
+# APPLY ORDER (see netem-preload-daemonset.yaml for the full sequence):
+#   netem-preload DS (Ready) → videocall-bots StatefulSet (Running) → THIS Job.
+# The Job addresses pods by ordinal DNS; the Service sets
+# publishNotReadyAddresses:true so those names resolve even before pod readiness,
+# but the bots must be UP (process listening on :8080) for the control calls to
+# succeed — start the fleet first.
+#
+# PREREQS:
+#   - `bot-ctl-token` Secret exists (bot-ctl-token.example.yaml) — the SAME
+#     fleet-wide token the bots mount; the conductor sends it as the bearer token.
+#   - `bot-scenario` ConfigMap exists (scenario.example.yaml) — the timeline.
+#   - `hclcr-io` imagePullSecret copied into bot-load (same image as the bots).
+#
+# RE-RUN: a Job is immutable once created. To run a new/edited scenario, delete
+# and re-apply:  kubectl -n bot-load delete job/bot-conductor && kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bot-conductor
+  namespace: bot-load
+  labels:
+    app.kubernetes.io/name: bot-conductor
+    app.kubernetes.io/component: conductor
+    app.kubernetes.io/part-of: videocall
+spec:
+  # One-shot driver: do not restart the container on failure (a re-run should be
+  # a fresh, explicit apply). backoffLimit is 0 — NO Job-level retries, even for
+  # transient scheduling/pull hiccups — because the timeline is stateful and a
+  # replay is not idempotent (see below):
+  # 0: do NOT auto-replay. conduct exits 1 on ANY per-action failure, and the
+  # timeline is stateful (applies netem, unmute windows) with no fleet-wide
+  # reset-at-start — a replay would re-apply impairments and corrupt the
+  # measurement window. Surface the failure; a re-run is an explicit re-apply.
+  backoffLimit: 0
+  # Hard wall-clock cap on the RUNNING Job (distinct from ttlSecondsAfterFinished,
+  # which only reaps AFTER completion and does nothing for a hang). Per-call
+  # timeouts in ctlRequest already bound any single control request, but this
+  # backstops a stuck conductor (e.g. a scenario waiting on a pod that never
+  # becomes reachable) so the Job fails visibly instead of hanging until manual
+  # deletion. 3600s comfortably exceeds a normal scenario timeline — RAISE THIS
+  # above your scenario's total scheduled duration before running a longer soak.
+  activeDeadlineSeconds: 3600
+  # Auto-clean the finished Job (and its pod) an hour after completion so repeat
+  # runs don't collide with a leftover Completed pod. Bump if you need to inspect
+  # logs longer, or `kubectl logs job/bot-conductor` before it's reaped.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bot-conductor
+        app.kubernetes.io/component: conductor
+        app.kubernetes.io/part-of: videocall
+    spec:
+      # A Job pod's restartPolicy must be Never or OnFailure (not Always). Never:
+      # container failure → Job-level retry (backoffLimit), not an in-pod restart.
+      restartPolicy: Never
+      # Drives bots over DNS + HTTP only; it never calls the K8s API. Resolving
+      # *.svc.cluster.local is done by cluster DNS (CoreDNS) independent of any
+      # ServiceAccount token, so dropping the token does NOT break DNS reach.
+      automountServiceAccountToken: false
+      # Same image as the bots → same Harbor pull secret.
+      imagePullSecrets:
+        - name: hclcr-io
+      # Non-root, and hardened FURTHER than the bots: the conductor is a pure
+      # HTTP client — it launches NO browser, so (unlike the bots) it needs no
+      # setuid chrome-sandbox and can safely set allowPrivilegeEscalation:false
+      # and drop ALL capabilities.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        # fsGroup so kubelet group-owns mounted secret files to gid 1000; the
+        # ctl-token is mounted 0440 (below) so this non-root uid can read it via
+        # group. Without this the 0400 root-owned mount gives EACCES on /ctl/token.
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: conductor
+          # Same image the bots run (contains the `bots-app` CLI incl. `conduct`).
+          image: hclcr.io/hcllabs/videocall-bots-app:latest
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # readOnlyRootFilesystem intentionally left at default (false): tsx
+            # may write a transient on-disk compile cache under $HOME/.cache or
+            # /tmp. Tighten to true (with an emptyDir at /tmp) once the `conduct`
+            # command's on-disk behaviour is confirmed by the frontend task.
+          # Override the image ENTRYPOINT (docker-entrypoint.sh → `bots-app run`)
+          # to run the conductor instead. Absolute paths so this does not depend
+          # on the image WORKDIR. The flag contract MUST match the frontend
+          # `conduct` subcommand exactly (see scenario.example.yaml header).
+          command:
+            - /app/e2e/node_modules/.bin/tsx
+            - /app/e2e/bots-app/src/cli.ts
+            - conduct
+          args:
+            - --scenario
+            - /scenario/scenario.yaml
+            - --service
+            - videocall-bots
+            - --namespace
+            - bot-load
+            - --port
+            - "8080"
+            # Token is READ FROM A FILE, never passed on argv — so it does not
+            # leak into `ps`, container-inspect args, or logs. Mounted read-only
+            # from the bot-ctl-token Secret below (key `token` → /ctl/token).
+            - --token-file
+            - /ctl/token
+            - --dns-suffix
+            - svc.cluster.local
+          volumeMounts:
+            - name: scenario
+              mountPath: /scenario
+              readOnly: true
+            - name: ctl-token
+              mountPath: /ctl
+              readOnly: true
+          # bot-load ResourceQuota REQUIRES requests AND limits on every pod.
+          # A DNS + HTTP driver is lightweight; the node runtime (tsx) is the
+          # main cost.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: scenario
+          configMap:
+            name: bot-scenario
+            items:
+              - key: scenario.yaml
+                path: scenario.yaml
+        - name: ctl-token
+          secret:
+            secretName: bot-ctl-token
+            defaultMode: 0440
+            items:
+              - key: token
+                path: token

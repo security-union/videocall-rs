@@ -31,8 +31,9 @@ use crate::encode::{
     camera_encoder_restarts_other, screen_encoder_errors_closed_codec,
     screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
     screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
-    screen_encoder_restarts_closed_codec, screen_encoder_restarts_configure,
-    screen_encoder_restarts_memory, screen_encoder_restarts_other,
+    screen_encoder_max_stall_gap_ms, screen_encoder_restarts_closed_codec,
+    screen_encoder_restarts_configure, screen_encoder_restarts_memory,
+    screen_encoder_restarts_other, screen_encoder_stall_episodes,
 };
 use log::{debug, trace, warn};
 use protobuf::Message;
@@ -42,10 +43,10 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
+use videocall_diagnostics::{recv_loop_action, subscribe, DiagEvent, MetricValue, RecvLoopAction};
 use videocall_types::protos::health_packet::{
     decode_budget::OverrideMode as PbOverrideMode, DecodeBudget as PbDecodeBudget,
-    HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
+    EncoderLayerGeometry, HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
     PeerStats as PbPeerStats, TierDwell as PbTierDwell, TierTransition as PbTierTransition,
     VideoStats as PbVideoStats,
@@ -241,6 +242,36 @@ pub struct HealthReporter {
     screen_sharing_active: Rc<RefCell<Rc<AtomicBool>>>,
     /// Encoder output FPS (camera).
     encoder_output_fps: Rc<RefCell<Arc<AtomicU32>>>,
+    /// #2147: SCREEN encoder output FPS (base layer). Late-bound like the other
+    /// encoder sources; swapped in by `set_encoder_metric_sources`.
+    ///
+    /// **`None` until wired, then Some even at 0** — this is the deliberate
+    /// difference from `encoder_output_fps` above. That field's `> 0` gate makes a
+    /// genuine screen-encoder stall indistinguishable from never-started (#2079),
+    /// which is the whole reason it could not serve as a freeze signal. Here the
+    /// wired-ness is tracked separately (`screen_encoder_fps_wired`) so a real 0
+    /// reaches the wire.
+    screen_encoder_output_fps: Rc<RefCell<Arc<AtomicU32>>>,
+    /// #2147: `true` once `set_encoder_metric_sources` has bound the real screen
+    /// encoder's fps atom. Distinguishes "no screen encoder bound yet" (omit the
+    /// field) from "screen encoder bound and honestly producing 0 fps" (emit 0) —
+    /// the distinction a `> 0` gate destroys.
+    ///
+    /// **Latches: set once, never cleared.** That is deliberate — it tracks whether
+    /// an ATOM IS BOUND, not whether a share is running. `Host` binds the screen
+    /// encoder eagerly at mount, so in practice this is `true` for the whole
+    /// session and the field is effectively always present; a consumer must read
+    /// `screen_sharing_active` (never this field's presence) to know whether a share
+    /// is live.
+    ///
+    /// Every screen-share STOP path zeroes the atom, so a stopped/idle share reports
+    /// an honest 0 rather than a stale nonzero: `stop()`, `start()` and
+    /// `start_with_stream()` call `reset_output_fps`, and the browser's own "Stop
+    /// sharing" button (the track `onended` handler) was given the same reset in
+    /// #2147 — before that it relied on the AQ loop's 5s idle decay, which stops
+    /// running once that loop's liveness token drops. The decay remains the backstop
+    /// for a share that merely goes quiet without stopping.
+    screen_encoder_fps_wired: Rc<Cell<bool>>,
     /// #1143: camera encoder EFFECTIVE simulcast layer count (ladder depth the
     /// publisher is configured to encode/send). Wrapped for late binding like the
     /// other encoder sources; swapped in by `set_encoder_metric_sources`. Reads as
@@ -249,6 +280,9 @@ pub struct HealthReporter {
     /// #1143: camera encoder ACTIVE simulcast layer count (layers presently
     /// encoded + sent; `<=` effective, the gap being AQ-shed layers).
     active_video_layers: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Opaque live camera geometry/fps source, late-bound with the other encoder
+    /// sources and read through on every health packet.
+    camera_layer_metrics: Rc<RefCell<crate::encode::CameraLayerMetricSource>>,
     /// #1561: screen encoder EFFECTIVE simulcast layer count (ladder depth).
     effective_screen_layers: Rc<RefCell<Rc<AtomicU32>>>,
     /// #1561: screen encoder ACTIVE simulcast layer count (layers currently sent).
@@ -363,8 +397,20 @@ fn compute_cpu_throttled(capability_score: u32, cores: u32) -> Option<bool> {
 ///     RESOURCE_STARVED rule targets. A total stall now publishes `Some(0)`; the
 ///     bots consumer (`fps.ts` `coerceEncoderFps`) maps 0 -> "no data", so a total
 ///     stall surfaces downstream as no-data (the verdict's CPU rule is the
-///     backstop). Flagging a total stall AS `RESOURCE_STARVED` (accepting 0 as a
-///     stall reading) is the remaining follow-up: revisit the `fps.ts` `> 0` gate.
+///     backstop).
+///
+/// Flagging a total stall AS `RESOURCE_STARVED` remains open (#2079), but it is
+/// NOT the one-line consumer change the shape of this gate suggests. `Some(0)`
+/// here is ambiguous by construction: it is emitted both when the BOX starved the
+/// encoder (what the verdict is for) and when the encoder WEDGED with the camera
+/// still nominally enabled — for example the fatal-`configure()` `'restart` loop
+/// in `camera_encoder.rs`, which never passes through camera-off, so
+/// `next_has_encoded_real` keeps the latch set and this fn keeps returning
+/// `Some(0)`. A wedged encoder is a PRODUCT bug; reporting it as a confounded
+/// harness run inverts the verdict's purpose. Four consumer-side heuristics were
+/// tried against real code and each failed on a reachable path (see #2079), so the
+/// conclusion is that the disambiguation belongs HERE, at the source — an explicit
+/// stall signal distinct from no-data — not in `fps.ts`.
 fn encoder_fps_publish_value(
     video_enabled: bool,
     output_fps: u32,
@@ -395,6 +441,31 @@ fn next_has_encoded_real(prev: bool, video_enabled: bool, output_fps: u32) -> bo
         true
     } else {
         prev
+    }
+}
+
+/// Decide what to report for `screen_encoder_output_fps` (#2147).
+///
+/// `wired` is whether `set_encoder_metric_sources` has bound the REAL screen
+/// encoder's atom; `output_fps` is that atom's current reading.
+///
+/// - not wired → `None` → the proto field is OMITTED. Reporting `0` here would
+///   fabricate "a screen encoder exists and is producing nothing" for a client
+///   that has no screen encoder bound at all.
+/// - wired → `Some(output_fps)`, **including `Some(0)`**. This is the whole point
+///   of the field: `encoder_output_fps` (camera) is `> 0`-gated, so a genuine
+///   total stall is absent and indistinguishable from never-started (#2079) —
+///   which is exactly why it was useless as a screen-freeze signal.
+///
+/// Extracted as a pure fn (mirroring [`encoder_fps_publish_value`] /
+/// [`next_has_encoded_real`]) because the live decision otherwise sits inside the
+/// report loop's `spawn_local` future, where no host test can reach it — so a
+/// mutation dropping the `wired` check would pass unnoticed.
+fn screen_encoder_fps_report_value(wired: bool, output_fps: u32) -> Option<u32> {
+    if wired {
+        Some(output_fps)
+    } else {
+        None
     }
 }
 
@@ -786,10 +857,17 @@ impl HealthReporter {
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
             encoder_output_fps: Rc::new(RefCell::new(Arc::new(AtomicU32::new(0)))),
+            // #2147: placeholder atom + not-yet-wired, so the field is OMITTED
+            // (not a fabricated 0) until the real screen encoder is bound.
+            screen_encoder_output_fps: Rc::new(RefCell::new(Arc::new(AtomicU32::new(0)))),
+            screen_encoder_fps_wired: Rc::new(Cell::new(false)),
             // #1143: 0 until the encoder atoms are wired by
             // `set_encoder_metric_sources`; a 0 effective count omits the field.
             effective_video_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             active_video_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            camera_layer_metrics: Rc::new(RefCell::new(
+                crate::encode::CameraLayerMetricSource::default(),
+            )),
             effective_screen_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             active_screen_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             effective_audio_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
@@ -904,12 +982,15 @@ impl HealthReporter {
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
         output_fps: Arc<AtomicU32>,
+        // #2147: the SCREEN encoder's output-fps atom.
+        screen_output_fps: Arc<AtomicU32>,
         camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
+        camera_layer_metrics: crate::encode::CameraLayerMetricSource,
         // #1561: screen + audio layer metrics
         effective_screen_layers: u32,
         active_screen_layers: Rc<AtomicU32>,
@@ -922,11 +1003,16 @@ impl HealthReporter {
         *self.adaptive_screen_tier.borrow_mut() = screen_tier;
         *self.screen_sharing_active.borrow_mut() = screen_active;
         *self.encoder_output_fps.borrow_mut() = output_fps;
+        // #2147: bind the screen fps atom AND record that it is now wired, so a
+        // subsequent honest 0 is emitted rather than mistaken for unwired.
+        *self.screen_encoder_output_fps.borrow_mut() = screen_output_fps;
+        self.screen_encoder_fps_wired.set(true);
         *self.tier_transitions.borrow_mut() = vec![camera_transitions, screen_transitions];
         *self.climb_limiter_snapshot.borrow_mut() = climb_limiter_snapshot;
         *self.dwell_samples.borrow_mut() = dwell_samples;
         *self.effective_video_layers.borrow_mut() = effective_video_layers;
         *self.active_video_layers.borrow_mut() = active_video_layers;
+        *self.camera_layer_metrics.borrow_mut() = camera_layer_metrics;
         // #1561: screen layers — effective is constant (static u32), wrapped in an
         // atomic so the spawned health loop can read it uniformly.
         *self.effective_screen_layers.borrow_mut() =
@@ -971,7 +1057,17 @@ impl HealthReporter {
             debug!("Started health diagnostics subscription");
 
             let mut receiver = subscribe();
-            while let Ok(event) = receiver.recv().await {
+            loop {
+                // Issue 2174: a bare `while let Ok(..)` here died permanently on
+                // the first `Overflowed`, which is recoverable — see
+                // `videocall_diagnostics::recv_loop_action`.
+                let event = match receiver.recv().await {
+                    Ok(event) => event,
+                    Err(e) => match recv_loop_action(&e) {
+                        RecvLoopAction::Continue => continue,
+                        RecvLoopAction::Break => break,
+                    },
+                };
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
                     // Capture self-state from sender diagnostics events
                     if event.subsystem == "sender" {
@@ -1407,6 +1503,13 @@ impl HealthReporter {
                                 video_stats["playout_skip_to_live_total"] = json!(v);
                             }
                         }
+                        // Keyframe ARRIVALS (#2201): lifetime counter, bucketed
+                        // camera-vs-screen by `media_type` like the playout family.
+                        "keyframe_arrivals_total" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                video_stats["keyframe_arrivals_total"] = json!(v);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1587,9 +1690,13 @@ impl HealthReporter {
         // #1143: send-side simulcast layer counts (camera encoder).
         let effective_video_layers = self.effective_video_layers.clone();
         let active_video_layers = self.active_video_layers.clone();
+        let camera_layer_metrics = self.camera_layer_metrics.clone();
         // #1561: screen + audio layer metrics.
         let effective_screen_layers = self.effective_screen_layers.clone();
         let active_screen_layers = self.active_screen_layers.clone();
+        // #2147: screen encoder fps + its wired-ness flag.
+        let screen_encoder_output_fps = self.screen_encoder_output_fps.clone();
+        let screen_encoder_fps_wired = self.screen_encoder_fps_wired.clone();
         let effective_audio_layers = self.effective_audio_layers.clone();
         let audio_congestion_ceiling = self.audio_congestion_ceiling.clone();
         let audio_user_layer_ceiling = self.audio_user_layer_ceiling.clone();
@@ -1700,6 +1807,14 @@ impl HealthReporter {
                         let screen_active_val =
                             screen_sharing_active.borrow().load(Ordering::Relaxed);
                         let output_fps_val = encoder_output_fps.borrow().load(Ordering::Relaxed);
+                        // #2147: SCREEN encoder fps. `None` when the atom has not
+                        // been wired yet (omit the field); `Some(n)` once wired,
+                        // INCLUDING `Some(0)` — an honest 0 is the whole point (see
+                        // the proto field's doc and #2079).
+                        let screen_output_fps_val = screen_encoder_fps_report_value(
+                            screen_encoder_fps_wired.get(),
+                            screen_encoder_output_fps.borrow().load(Ordering::Relaxed),
+                        );
                         has_encoded_real = next_has_encoded_real(
                             has_encoded_real,
                             self_video_enabled,
@@ -1720,6 +1835,10 @@ impl HealthReporter {
                             effective_video_layers.borrow().load(Ordering::Relaxed);
                         let active_layers_val =
                             active_video_layers.borrow().load(Ordering::Relaxed);
+                        let camera_layer_metrics_val = camera_layer_metrics
+                            .try_borrow()
+                            .map(|source| source.reportable_layers())
+                            .unwrap_or_default();
                         // #1561: screen + audio layer counts.
                         let effective_screen_layers_val =
                             effective_screen_layers.borrow().load(Ordering::Relaxed);
@@ -1862,6 +1981,7 @@ impl HealthReporter {
                             screen_tier_val,
                             screen_active_val,
                             output_fps_val,
+                            screen_output_fps_val,
                             effective_layers_val,
                             active_layers_val,
                             drained_transitions,
@@ -1900,6 +2020,7 @@ impl HealthReporter {
                                 incoming_queue_readback:
                                     videocall_transport::webtransport::incoming_datagram_queue_readback(),
                             },
+                            camera_layer_metrics_val,
                         );
 
                         if let Some(packet) = health_packet {
@@ -1980,6 +2101,11 @@ impl HealthReporter {
         adaptive_screen_tier: u32,
         screen_sharing_active: bool,
         encoder_output_fps: u32,
+        // #2147: SCREEN encoder output fps. `None` = the screen encoder's atom is
+        // not wired yet (field OMITTED); `Some(0)` = wired and honestly producing
+        // nothing. Unlike `encoder_output_fps` above this is deliberately NOT
+        // collapsed by a `> 0` gate — see the proto field doc and #2079.
+        screen_encoder_output_fps: Option<u32>,
         // #1143: send-side simulcast layer counts (camera). 0 = unwired/omitted.
         effective_video_layers: u32,
         active_video_layers: u32,
@@ -2016,6 +2142,7 @@ impl HealthReporter {
         // Issue 2031: per-client WebTransport receive-health telemetry, read from
         // the transport statics in the report loop. `Default` on WebSocket.
         wt_telemetry: WtReceiveTelemetry,
+        camera_layer_metrics: Vec<crate::encode::CameraLayerMetric>,
     ) -> Option<PacketWrapper> {
         // Keep client-wide telemetry flowing even before any peer stats have
         // been observed (solo sessions / warm-up).
@@ -2090,11 +2217,42 @@ impl HealthReporter {
         pb.screen_sharing_active = Some(screen_sharing_active);
 
         // Encoder outputs (P1)
-        // encoder_output_fps uses > 0 (not is_finite) because 0 means the encoder
-        // hasn't started yet, which isn't diagnostic. The other encoder metrics
-        // allow 0.0 through because a zero ratio/bitrate IS the diagnostic signal.
+        // encoder_output_fps uses > 0 (not is_finite) because 0 USED to mean only
+        // "the encoder hasn't started yet", which isn't diagnostic. The other
+        // encoder metrics allow 0.0 through because a zero ratio/bitrate IS the
+        // diagnostic signal.
+        //
+        // KNOWN LOSSY POINT (#2079): since #2060 a `0` here ALSO means a genuine
+        // total stall (the producer decays `current_fps` to 0 after a sustained
+        // layer-0 output gap), so this gate silently drops that from the protobuf —
+        // a stalled encoder is indistinguishable from never-started because the
+        // field is ABSENT in both cases. That is the same conflation `fps.ts`
+        // `coerceEncoderFps` has on the window-global path, and the reason
+        // `encoder_output_fps` cannot serve as the "check this instead" signal for a
+        // frozen encoder. Left as-is deliberately: changing the gate changes the
+        // wire contract for every consumer of this field, so the fix belongs with
+        // #2079's source-side stall signal rather than here.
         if encoder_output_fps > 0 {
             pb.encoder_output_fps = Some(encoder_output_fps);
+        }
+
+        // #2147: SCREEN encoder output fps — the publisher-side signal that did not
+        // exist before, leaving screen-encoder stalls (#1899, #1574, the #2143
+        // room-wide freeze) unobservable while the CAMERA gauge read healthy.
+        //
+        // DELIBERATELY NOT `> 0`-gated, unlike `encoder_output_fps` directly above.
+        // That gate is the #2079 defect: it makes a genuine stall ABSENT and
+        // therefore indistinguishable from never-started. Here "not wired yet" is
+        // carried by the `Option` (a `None` omits the field) so a wired encoder's
+        // honest 0 reaches the wire. Copying the `> 0` gate here would reproduce
+        // exactly the blind spot this field exists to close.
+        //
+        // A 0 is not by itself a fault: a static share legitimately emits nothing
+        // once its keyframe floor budget drains. Pair with `screen_sharing_active`
+        // and `screen_encoder_stall_episodes` to identify a publisher tick-starvation
+        // freeze. Receiver-side content_staleness_ms also reads 0 once fps is 0.
+        if let Some(fps) = screen_encoder_output_fps {
+            pb.screen_encoder_output_fps = Some(fps);
         }
 
         // #1143: send-side simulcast layer counts (camera). Gated on > 0 (same
@@ -2107,6 +2265,17 @@ impl HealthReporter {
             pb.effective_video_layers = Some(effective_video_layers);
             pb.active_video_layers = Some(active_video_layers.min(effective_video_layers));
         }
+        pb.camera_layer_geometry = camera_layer_metrics
+            .into_iter()
+            .map(|(layer_id, width, height, output_fps)| {
+                let mut geometry = EncoderLayerGeometry::new();
+                geometry.layer_id = layer_id;
+                geometry.width = width;
+                geometry.height = height;
+                geometry.output_fps = output_fps;
+                geometry
+            })
+            .collect();
 
         // #1561: screen encoder simulcast layer counts. Same gating convention as video.
         if effective_screen_layers > 0 {
@@ -2246,6 +2415,29 @@ impl HealthReporter {
         }
         if scr_restart_other > 0 {
             pb.screen_encoder_restarts_other = Some(scr_restart_other);
+        }
+
+        // #2147: screen encoder TICK-STARVATION stall signal — the half of the
+        // screen-freeze story `screen_encoder_output_fps` cannot tell. That gauge
+        // counts encoded CHUNKS, and the synthetic retained-frame re-encodes share
+        // the base-layer output callback with fresh captures, so during the
+        // #1899/#2143 freeze it reads a small NONZERO while receivers sit on stale
+        // content. These count the episodes that CAUSE that symptom, so
+        // `fps > 0 AND episodes rising` identifies the freeze while
+        // `fps > 0 AND episodes flat` is genuinely healthy.
+        //
+        // Read from the same process-global accessors as the `*_restarts_*`
+        // counters above (no per-encoder plumbing), and gated `> 0` on the SAME
+        // rationale: these are monotonic counters, where a 0 carries no
+        // information. That is deliberately the opposite of the fps field's
+        // ungated treatment, where 0 IS the reading — see the proto docs.
+        let scr_stall_episodes = screen_encoder_stall_episodes();
+        let scr_stall_max_gap = screen_encoder_max_stall_gap_ms();
+        if scr_stall_episodes > 0 {
+            pb.screen_encoder_stall_episodes = Some(scr_stall_episodes);
+        }
+        if scr_stall_max_gap > 0 {
+            pb.screen_encoder_max_stall_gap_ms = Some(scr_stall_max_gap);
         }
 
         // Connection-loss reason counters
@@ -2623,6 +2815,18 @@ impl HealthReporter {
                 {
                     vs.playout_skip_to_live_total = v;
                 }
+                // Keyframe ARRIVALS (#2201): folded UNCONDITIONALLY, outside the
+                // fps_received > 0 gate, for the same reason as the counter above — a
+                // cumulative counter must keep reporting its lifetime value even at fps 0.
+                // That is load-bearing HERE specifically: the whole point of this counter is
+                // to be read DURING a freeze, which is exactly when fps can be 0. Gating it
+                // would blank the metric in the only case it exists for.
+                if let Some(v) = video
+                    .get("keyframe_arrivals_total")
+                    .and_then(|v| v.as_u64())
+                {
+                    vs.keyframe_arrivals_total = Some(v);
+                }
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 
                 // Extract decode_errors_per_sec (windowed rate) from camera video stats
@@ -2700,6 +2904,15 @@ impl HealthReporter {
                     .and_then(|v| v.as_u64())
                 {
                     svs.playout_skip_to_live_total = v;
+                }
+                // Keyframe ARRIVALS (#2201): unconditional, mirroring the camera fold — see
+                // its comment for why gating on fps would blank the metric during the very
+                // freeze it is meant to explain.
+                if let Some(v) = screen
+                    .get("keyframe_arrivals_total")
+                    .and_then(|v| v.as_u64())
+                {
+                    svs.keyframe_arrivals_total = Some(v);
                 }
                 ps.screen_video_stats = ::protobuf::MessageField::some(svs);
             }
@@ -2891,6 +3104,21 @@ fn video_quality_score(
     // camera doing auto-exposure correctly.
     //   fps >= 5  → 100  (video is working; FPS is hardware context, not quality)
     //   fps 1–4   → 0–50 (near-frozen; something is likely wrong)
+    // ⚠ #2190 CHANGED THE INPUT TO THIS, AND IT FEEDS AN ALERT. `fps` is now DECODED frames,
+    // not arrivals, so this term moves in both directions and
+    // `videocall_call_quality_score` → `MeetingQualityDegraded`
+    // (`avg by (meeting_id)(...) < 50`, for: 2m) moves with it:
+    //   * MORE firing — a receiver genuinely decoding at 1-4 fps now scores 10-40 where the
+    //     pre-fix ladder sum read >= 5 and pinned this at 100. That `< 50` threshold was tuned
+    //     against the inflated input, so expect an alert-volume step change on rollout in
+    //     multi-rung meetings.
+    //   * LESS firing, which is the dangerous direction — at fps 0 `video_quality_score`
+    //     returns `None`, and `call_quality_score`'s `(Some(a), None) => Some(a)` arm falls
+    //     through to the AUDIO score alone. A frozen-video peer with healthy audio then scores
+    //     high and stops pulling the meeting average down, so the freeze becomes invisible to
+    //     the alert that exists to catch it.
+    // Re-tune the threshold (or add a video-specific alert) before relying on this in a
+    // cluster. Recorded here rather than only in the PR body so it outlives the PR.
     let video_health = if fps >= 5.0 { 100.0 } else { fps / 5.0 * 50.0 };
 
     // Decode error penalty: 0/s→0, 10+/s→−50.
@@ -3101,8 +3329,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -3124,8 +3353,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf");
@@ -3168,6 +3398,305 @@ mod tests {
         assert!((sample.concealment_pct - 20.0).abs() < 1e-9);
         assert!((sample.buffer_ms - proto_buf).abs() < 1e-9);
         assert!((sample.buffer_ms - 200.0).abs() < 1e-9);
+    }
+
+    // --- #2147: screen encoder output fps must be HONEST about zero ----------
+
+    /// Build a HealthPacket through the production `create_health_packet` path
+    /// with the given `(encoder_output_fps, screen_encoder_output_fps)` inputs and
+    /// return what actually landed on the wire for both fields.
+    ///
+    /// Deliberately parameterized on BOTH so the camera field's `> 0` gate and the
+    /// screen field's ungated behaviour are compared through the same call.
+    fn health_packet_encoder_fps(
+        camera_fps: u32,
+        screen_fps: Option<u32>,
+    ) -> (Option<u32>, Option<u32>) {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0,
+            true, // screen_sharing_active: a share IS running
+            camera_fps,
+            screen_fps,
+            0,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            0,
+            [0, 0, 0, 0],
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            HashMap::new(),
+            WtReceiveTelemetry::default(),
+            Vec::new(),
+        )
+        .expect("create_health_packet returns Some unconditionally");
+
+        let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf");
+        (pb.encoder_output_fps, pb.screen_encoder_output_fps)
+    }
+
+    /// **THE #2147 honesty guard.** A wired screen encoder producing 0 fps must
+    /// reach the wire as `Some(0)`, NOT be dropped.
+    ///
+    /// This is the entire point of the field. `encoder_output_fps` (camera) is
+    /// gated on `> 0`, so a genuine total stall is ABSENT from the packet and
+    /// therefore indistinguishable from an encoder that never started (#2079) —
+    /// which is precisely why it could not be used as a screen-freeze signal. The
+    /// same call is asserted on both fields so the difference is explicit: with
+    /// camera=0 and screen=Some(0), camera is None and screen is Some(0).
+    ///
+    /// MUTATION: wrap the screen assignment in `if fps > 0` (i.e. copy the camera
+    /// gate) in `create_health_packet` and this fails — screen becomes None.
+    #[test]
+    fn screen_encoder_fps_zero_is_emitted_not_gated_away() {
+        let (camera, screen) = health_packet_encoder_fps(0, Some(0));
+        assert_eq!(
+            screen,
+            Some(0),
+            "#2147: a wired screen encoder at 0 fps MUST be emitted — a stall has \
+             to be distinguishable from never-started"
+        );
+        assert_eq!(
+            camera, None,
+            "the camera field's `> 0` gate still drops a 0 (the #2079 defect this \
+             field deliberately does NOT copy); if this changes, #2079 was fixed \
+             and this test's contrast should be revisited"
+        );
+    }
+
+    /// `None` (no screen encoder wired) must OMIT the field — the packet must not
+    /// fabricate a 0 for a client that has no screen encoder bound at all. This is
+    /// the other half of the honesty contract: absent and 0 mean different things.
+    ///
+    /// MUTATION: make `create_health_packet` write `Some(0)` for a `None` input
+    /// (e.g. `unwrap_or(0)`) and this fails.
+    #[test]
+    fn screen_encoder_fps_absent_when_unwired() {
+        let (_, screen) = health_packet_encoder_fps(15, None);
+        assert_eq!(
+            screen, None,
+            "#2147: an unwired screen encoder must OMIT the field, not report 0"
+        );
+    }
+
+    /// The wired-vs-unwired DECISION itself (`screen_encoder_fps_report_value`),
+    /// which is what the report loop actually calls.
+    ///
+    /// The packet-level test above pins the BUILDER, so it cannot catch a mutation
+    /// in the loop's decision (that code runs inside `spawn_local` and is
+    /// unreachable from a host test) — hence the pure fn, tested directly.
+    ///
+    /// MUTATION: drop the `wired` check (`Some(output_fps)` unconditionally) and
+    /// the unwired assertions fail; invert it and the wired ones fail.
+    #[test]
+    fn screen_encoder_fps_report_value_honours_wiredness_and_zero() {
+        // Unwired: ALWAYS omit, regardless of what the placeholder atom reads.
+        assert_eq!(screen_encoder_fps_report_value(false, 0), None);
+        assert_eq!(
+            screen_encoder_fps_report_value(false, 12),
+            None,
+            "an unwired atom's value must never be reported, even if nonzero"
+        );
+        // Wired: report the reading, INCLUDING an honest 0.
+        assert_eq!(
+            screen_encoder_fps_report_value(true, 0),
+            Some(0),
+            "#2147: a wired encoder's 0 is a real reading, not no-data"
+        );
+        assert_eq!(screen_encoder_fps_report_value(true, 9), Some(9));
+    }
+
+    /// **The stall-counter EMISSION guard (#2147).** The two counters are the half
+    /// of the screen-freeze story fps cannot tell, and their emission was previously
+    /// untestable: they read private process-global statics only the encode loop's
+    /// tick-starvation detector increments, so both `if` blocks were always false in
+    /// a host test and DELETING them left every test green.
+    ///
+    /// Closed with the `#[cfg(test)]` setter beside those statics, per CLAUDE.md's
+    /// "grep for a `#[cfg(test)]` seam before declaring a side effect untestable".
+    ///
+    /// MUTATION: delete either `pb.screen_encoder_stall_episodes = …` or
+    /// `pb.screen_encoder_max_stall_gap_ms = …` from `create_health_packet` and the
+    /// matching assertion fails.
+    #[test]
+    fn stall_counters_are_emitted_when_nonzero_and_omitted_when_zero() {
+        use crate::encode::set_screen_encoder_stall_counters_for_test;
+        use crate::test_serial::lock_screen_encoder_stall_counters;
+
+        // The two statics this drives are PROCESS-GLOBAL, and libtest runs this
+        // crate's plain `#[test]`s on a multi-threaded pool, so holding them at a
+        // nonzero value IS visible to any concurrent sibling that builds a health
+        // packet — the guard does not stop that. `create_health_packet` reads them
+        // lock-free and takes nothing, so the guard excludes only other GUARD-TAKERS.
+        //
+        // Safe because no unguarded sibling ASSERTS on `pb.screen_encoder_stall_episodes`
+        // / `pb.screen_encoder_max_stall_gap_ms` — grep both field names before relying
+        // on that, since it is a property of the current test population rather than
+        // anything enforced. A future test that asserts on either must take this guard.
+        // Held until the test returns.
+        let _stall_guard = lock_screen_encoder_stall_counters();
+
+        // ZERO arm first: monotonic counters carry no information at 0, so the fields
+        // must be ABSENT (deliberately the opposite convention from the fps field,
+        // where 0 IS the reading — see `screen_encoder_fps_zero_is_emitted_not_gated_away`).
+        set_screen_encoder_stall_counters_for_test(0, 0);
+        let (episodes, gap) = health_packet_stall_counters();
+        assert_eq!(episodes, None, "#2147: 0 episodes must OMIT the field");
+        assert_eq!(gap, None, "#2147: a 0 max-gap must OMIT the field");
+
+        // NONZERO arm: the #2143 shape — 11 episodes with a 23.15s worst gap.
+        set_screen_encoder_stall_counters_for_test(11, 23_150);
+        let (episodes, gap) = health_packet_stall_counters();
+        assert_eq!(
+            episodes,
+            Some(11),
+            "#2147: a rising stall count is the ONLY signal that distinguishes a \
+             frozen share from a healthy one at the same fps — it must reach the wire"
+        );
+        assert_eq!(
+            gap,
+            Some(23_150),
+            "#2147: the worst gap gives the freeze its severity (3 episodes at 200ms \
+             is jitter; 3 at 23s is the incident)"
+        );
+        // The two values above are DISTINCT, so a copy-paste slip assigning one field
+        // from the other's source would fail rather than pass.
+        //
+        // Restore 0, so a later guarded test starts from the cold-start value
+        // regardless of run order. Not redundant with the guard, which excludes only
+        // other guard-takers — but note this is a trailing statement, so on a FAILING
+        // run the assertions above leave the injected values in place for the rest of
+        // the process.
+        set_screen_encoder_stall_counters_for_test(0, 0);
+    }
+
+    /// Build a HealthPacket through the production `create_health_packet` path and
+    /// return the two stall fields as they landed on the wire.
+    fn health_packet_stall_counters() -> (Option<u64>, Option<u64>) {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0,
+            true,
+            0,
+            None,
+            0,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            0,
+            [0, 0, 0, 0],
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            HashMap::new(),
+            WtReceiveTelemetry::default(),
+            Vec::new(),
+        )
+        .expect("create_health_packet returns Some unconditionally");
+        let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf");
+        (
+            pb.screen_encoder_stall_episodes,
+            pb.screen_encoder_max_stall_gap_ms,
+        )
+    }
+
+    /// A nonzero screen fps passes through unchanged.
+    ///
+    /// MUTATION: assign the camera value to the screen field (a copy-paste slip
+    /// that a single-field test would not catch) and this fails, because the two
+    /// inputs differ.
+    #[test]
+    fn screen_encoder_fps_nonzero_passes_through() {
+        let (camera, screen) = health_packet_encoder_fps(24, Some(9));
+        assert_eq!(screen, Some(9), "screen fps must pass through unchanged");
+        assert_eq!(
+            camera,
+            Some(24),
+            "and must not be confused with the camera value"
+        );
     }
 
     /// Below the pps gate the production path leaves audio_concealment_pct at 0.0
@@ -3296,8 +3825,14 @@ mod tests {
     /// preventing accidental regression of the credential leak.
     #[test]
     fn health_packet_does_not_carry_active_server_url() {
-        // Seed `health_map` with at least one entry so `create_health_packet`
-        // does not early-return `None`.
+        // One peer entry, so the assertion below is made against a packet that
+        // carries peer stats — the shape a real report has.
+        //
+        // NOT because an empty map would suppress the packet: `create_health_packet`
+        // has no early return and always yields `Some(PacketWrapper)`. Client-wide
+        // telemetry must keep flowing during warm-up and in solo sessions, which is
+        // why there is no emptiness gate to satisfy — pinned by
+        // `health_packet_still_emitted_with_empty_peer_map` (#1032).
         let mut health_map = HashMap::new();
         health_map.insert(
             "peer-1".to_string(),
@@ -3333,8 +3868,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -3356,8 +3892,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         // Round-trip the wrapper through the protobuf so we are asserting on
         // exactly what goes on the wire, not an in-memory builder field.
@@ -3424,8 +3961,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -3447,8 +3985,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
@@ -3498,8 +4037,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -3521,8 +4061,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
@@ -3614,8 +4155,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -3637,8 +4179,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
@@ -3743,20 +4286,23 @@ mod tests {
         telemetry: WtReceiveTelemetry,
         active_server_type: &str,
         neteq_stats: &[serde_json::Value],
+        camera_layer_metrics: Vec<crate::encode::CameraLayerMetric>,
     ) -> PbHealthPacket {
+        let camera_layer_count = camera_layer_metrics
+            .iter()
+            .map(|(layer_id, ..)| layer_id + 1)
+            .max()
+            .unwrap_or(0);
+        // One peer per supplied NetEQ snapshot, and none when the caller passes none:
+        // `create_health_packet` always yields a packet (pinned by
+        // `health_packet_still_emitted_with_empty_peer_map`), so an empty map is the
+        // faithful fixture for WT-telemetry callers asserting on client-wide fields.
         let mut health_map = HashMap::new();
-        // Always include at least one peer so the packet is built.
         for (i, neteq) in neteq_stats.iter().enumerate() {
             let pid = format!("peer-{i}");
             let mut peer = PeerHealthData::new(pid.clone());
             peer.last_neteq_stats = Some(neteq.clone());
             health_map.insert(pid, peer);
-        }
-        if health_map.is_empty() {
-            health_map.insert(
-                "peer-0".to_string(),
-                PeerHealthData::new("peer-0".to_string()),
-            );
         }
 
         let wrapper = HealthReporter::create_health_packet(
@@ -3770,25 +4316,26 @@ mod tests {
             None,
             Some(active_server_type.to_string()),
             Some(42.0),
-            None,       // send_queue_bytes
-            None,       // packets_received_per_sec
-            None,       // packets_sent_per_sec
-            0,          // adaptive_video_tier
-            0,          // adaptive_audio_tier
-            0,          // datagram_drops_total
-            0,          // unistream_bytes_offered_total
-            0,          // unistream_bytes_drained_total
-            0,          // websocket_drops_total
-            0,          // keyframe_requests_sent_total
-            0,          // unistream_stale_delta_drops_total
-            0.0,        // encoder_queue_depth_report
-            0.0,        // encoder_target_bitrate_kbps
-            0,          // adaptive_screen_tier
-            false,      // screen_sharing_active
-            0,          // encoder_output_fps
-            0,          // effective_video_layers
-            0,          // active_video_layers
-            Vec::new(), // tier_transitions
+            None,               // send_queue_bytes
+            None,               // packets_received_per_sec
+            None,               // packets_sent_per_sec
+            0,                  // adaptive_video_tier
+            0,                  // adaptive_audio_tier
+            0,                  // datagram_drops_total
+            0,                  // unistream_bytes_offered_total
+            0,                  // unistream_bytes_drained_total
+            0,                  // websocket_drops_total
+            0,                  // keyframe_requests_sent_total
+            0,                  // unistream_stale_delta_drops_total
+            0.0,                // encoder_queue_depth_report
+            0.0,                // encoder_target_bitrate_kbps
+            0,                  // adaptive_screen_tier
+            false,              // screen_sharing_active
+            0,                  // encoder_output_fps
+            None,               // screen_encoder_output_fps (#2147: unwired => omitted)
+            camera_layer_count, // effective_video_layers
+            camera_layer_count, // active_video_layers
+            Vec::new(),         // tier_transitions
             ClimbLimiterSnapshot::default(),
             Vec::new(),   // dwell_samples
             0,            // handshake_failures_total
@@ -3809,11 +4356,51 @@ mod tests {
             0,              // active_audio_layers
             HashMap::new(), // received_layers
             telemetry,
+            camera_layer_metrics,
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    #[test]
+    fn camera_layer_geometry_and_fps_reach_the_wire() {
+        let packet = health_packet_with_wt_telemetry(
+            WtReceiveTelemetry::default(),
+            "webtransport",
+            &[],
+            vec![(0, 241, 181, Some(7)), (2, 613, 461, Some(30))],
+        );
+
+        let got: Vec<_> = packet
+            .camera_layer_geometry
+            .iter()
+            .map(|geometry| {
+                (
+                    geometry.layer_id,
+                    geometry.width,
+                    geometry.height,
+                    geometry.output_fps,
+                )
+            })
+            .collect();
+        assert_eq!(got, vec![(0, 241, 181, Some(7)), (2, 613, 461, Some(30))]);
+        assert_eq!(packet.effective_video_layers, Some(3));
+        assert_eq!(packet.active_video_layers, Some(3));
+    }
+
+    #[test]
+    fn camera_layer_fps_preserves_absent_vs_measured_zero() {
+        let packet = health_packet_with_wt_telemetry(
+            WtReceiveTelemetry::default(),
+            "webtransport",
+            &[],
+            vec![(0, 241, 181, None), (1, 481, 361, Some(0))],
+        );
+
+        assert_eq!(packet.camera_layer_geometry[0].output_fps, None);
+        assert_eq!(packet.camera_layer_geometry[1].output_fps, Some(0));
     }
 
     /// Issue 2031: the per-client read-loop max gap must fold UNCONDITIONALLY as
@@ -3829,7 +4416,7 @@ mod tests {
             read_loop_max_gap_ms: 350.0,
             incoming_queue_readback: Some((2048.0, 3000.0)),
         };
-        let pb = health_packet_with_wt_telemetry(telemetry, "webtransport", &[]);
+        let pb = health_packet_with_wt_telemetry(telemetry, "webtransport", &[], Vec::new());
         assert_eq!(
             pb.wt_datagram_read_loop_max_gap_ms,
             Some(350.0),
@@ -3860,7 +4447,7 @@ mod tests {
             read_loop_max_gap_ms: 0.0,
             incoming_queue_readback: Some((4096.0, f64::NAN)),
         };
-        let pb = health_packet_with_wt_telemetry(telemetry, "webtransport", &[]);
+        let pb = health_packet_with_wt_telemetry(telemetry, "webtransport", &[], Vec::new());
         assert_eq!(
             pb.wt_incoming_datagram_max_age_ms,
             Some(-1.0),
@@ -3878,7 +4465,12 @@ mod tests {
     /// wire. read_loop_max_gap_ms still folds (as the 0.0 default here).
     #[test]
     fn create_health_packet_omits_queue_readback_without_wt() {
-        let pb = health_packet_with_wt_telemetry(WtReceiveTelemetry::default(), "websocket", &[]);
+        let pb = health_packet_with_wt_telemetry(
+            WtReceiveTelemetry::default(),
+            "websocket",
+            &[],
+            Vec::new(),
+        );
         assert_eq!(
             pb.wt_incoming_datagram_high_water_mark, None,
             "queue read-back must be omitted when the WT queue was never configured"
@@ -3911,6 +4503,7 @@ mod tests {
             WtReceiveTelemetry::default(),
             "webtransport",
             &[peer_a, peer_b],
+            Vec::new(),
         );
         let mean = pb
             .client_audio_concealment_pct
@@ -3930,8 +4523,12 @@ mod tests {
             "packets_per_sec": 1.0,
             "network": { "operation_counters": { "expand_per_sec": 0.0 } }
         });
-        let pb =
-            health_packet_with_wt_telemetry(WtReceiveTelemetry::default(), "webtransport", &[idle]);
+        let pb = health_packet_with_wt_telemetry(
+            WtReceiveTelemetry::default(),
+            "webtransport",
+            &[idle],
+            Vec::new(),
+        );
         assert_eq!(
             pb.client_audio_concealment_pct, None,
             "no active source => concealment field omitted (absent != 0%)"
@@ -3975,8 +4572,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -3998,8 +4596,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
@@ -4046,8 +4645,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -4069,8 +4669,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
@@ -4122,6 +4723,9 @@ mod tests {
             // #1641: a 5-minute content age — deliberately > the 1800ms playout-latency cap, to
             // prove this field is NOT bounded by it (the whole point of the metric).
             "content_staleness_ms": 300000.0,
+            // #2201: keyframe ARRIVALS. Distinct from skip_to_live_total above so a
+            // transposition between the two counters is observable.
+            "keyframe_arrivals_total": 9u64,
         }));
 
         let mut health_map = HashMap::new();
@@ -4154,8 +4758,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -4177,8 +4782,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
@@ -4384,6 +4990,87 @@ mod tests {
         );
     }
 
+    /// #2201: the keyframe-arrival counter must survive the WORKER-METRIC -> JSON hop, and
+    /// land in the correct camera/screen bucket.
+    ///
+    /// Added because both halves were revertible-green — measured, not assumed. Deleting the
+    /// `"keyframe_arrivals_total"` ingest arm (the single entry point for the whole Prometheus
+    /// path) left all 827 tests passing, because the fold test writes the JSON key straight
+    /// into its fixture and bypasses the hop. This drives `process_diagnostics_event`
+    /// end-to-end instead, pinning the metric NAME to the json key.
+    ///
+    /// Distinct values per kind (7 screen vs 3 camera) so a bucket misroute — the #1641 defect
+    /// class — fails rather than silently passing.
+    ///
+    /// MUTATION: deleting the ingest arm makes both lookups `None`; swapping the buckets, or
+    /// renaming the metric on either side of the hop, fails the value assertions.
+    #[test]
+    fn keyframe_arrivals_total_survives_the_metric_to_json_hop_per_bucket() {
+        use crate::decode::peer_decoder::{MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let make_event = |media_type: &'static str, arrivals: u64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(media_type)),
+                },
+                Metric {
+                    name: "from_peer",
+                    value: MetricValue::Text(Cow::Borrowed("reporter")),
+                },
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                // The exact metric name the worker emits. If this and the ingest arm ever
+                // disagree, this test is what catches it.
+                Metric {
+                    name: "keyframe_arrivals_total",
+                    value: MetricValue::U64(arrivals),
+                },
+            ],
+        };
+
+        HealthReporter::process_diagnostics_event(
+            make_event(MEDIA_TYPE_SCREEN, 7),
+            &peer_health_data,
+        );
+        HealthReporter::process_diagnostics_event(
+            make_event(MEDIA_TYPE_CAMERA, 3),
+            &peer_health_data,
+        );
+
+        let map = peer_health_data.borrow();
+        let peer = map.get("peer-1").expect("peer-1 health entry must exist");
+
+        assert_eq!(
+            peer.last_screen_stats
+                .as_ref()
+                .and_then(|v| v.get("keyframe_arrivals_total"))
+                .and_then(|v| v.as_u64()),
+            Some(7),
+            "the SCREEN arrival count must reach the screen bucket; None => the ingest arm is \
+             gone, so nothing reaches Prometheus at all"
+        );
+        assert_eq!(
+            peer.last_camera_stats
+                .as_ref()
+                .and_then(|v| v.get("keyframe_arrivals_total"))
+                .and_then(|v| v.as_u64()),
+            Some(3),
+            "the CAMERA arrival count must reach the camera bucket and read 3, NOT the \
+             screen's 7 — a misroute overwrites one bucket with the other (#1641)"
+        );
+    }
+
     /// Issue 2029: `process_diagnostics_event` must surface the per-peer WT
     /// audio-datagram loss sample (peer id + pkt/s) so the subscription loop can
     /// forward it into the connection layer's fallback detector — INCLUDING a
@@ -4496,6 +5183,35 @@ mod tests {
         assert_eq!(stats.playout_skip_to_live_total, 4);
     }
 
+    /// #2201: the keyframe-ARRIVAL counter must fold at fps 0.
+    ///
+    /// This is not a stylistic parallel to the counter above — it is the whole point of the
+    /// metric. It exists to answer "did a keyframe arrive during this freeze?", and a freeze
+    /// is exactly when `fps_received` can be 0. Gating it behind the `fps_received > 0` guard
+    /// that (correctly) protects the ms gauges would blank the field in the only case it was
+    /// built for.
+    ///
+    /// MUTATION: moving the camera fold inside the `if vs.fps_received > 0.0` block makes this
+    /// read 0 instead of 9.
+    #[test]
+    fn keyframe_arrivals_total_folds_even_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        assert_eq!(
+            stats.keyframe_arrivals_total,
+            Some(9),
+            "the arrival counter MUST survive fps 0 — a freeze is the case it exists for"
+        );
+    }
+
     /// #1660 sibling of `health_packet_with_camera_playout_stats`, but drives the SCREEN path:
     /// populates only `last_screen_stats` (camera bucket left empty) so the resulting proto's
     /// `screen_video_stats` — not `video_stats` — must carry the folded playout family. Values are
@@ -4511,6 +5227,10 @@ mod tests {
             // #1660: a 4-minute screen content age — deliberately > the 1800ms playout-latency cap,
             // to prove the screen content-staleness field is UNBOUNDED like its camera sibling.
             "content_staleness_ms": 240000.0,
+            // #2201: distinct from the camera fixture's 9, so a bucket transposition in the
+            // screen fold is observable. Without this key the whole screen fold block was
+            // revertible-green.
+            "keyframe_arrivals_total": 4u64,
         }));
 
         let mut health_map = HashMap::new();
@@ -4543,8 +5263,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -4566,8 +5287,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
@@ -4626,8 +5348,13 @@ mod tests {
         assert_eq!(stats.playout_stage1_span_ms, 0.0);
         assert_eq!(stats.playout_paint_lag_ms, 0.0);
         assert_eq!(stats.content_staleness_ms, 0.0);
-        // ... but the cumulative COUNTER still reports its lifetime value.
+        // ... but the cumulative COUNTERS still report their lifetime values.
         assert_eq!(stats.playout_skip_to_live_total, 7);
+        // #2201: same unconditional rule, and load-bearing HERE — a screen freeze is exactly
+        // when fps reads 0, so gating this would blank the metric in its only case. 4, not the
+        // camera fixture's 9, so a bucket transposition fails. Deleting the screen fold block
+        // makes this `None` (measured: it was previously revertible-green).
+        assert_eq!(stats.keyframe_arrivals_total, Some(4));
     }
 
     /// Build a health packet whose peer carries NetEQ audio stats. `playout_latency_ms` is
@@ -4676,8 +5403,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -4699,8 +5427,9 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
-        .expect("create_health_packet must return Some when health_map is non-empty");
+        .expect("create_health_packet returns Some unconditionally");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
@@ -4792,8 +5521,9 @@ mod tests {
             0,
             false,
             0,
-            0, // effective_video_layers (#1143)
-            0, // active_video_layers (#1143)
+            None, // screen_encoder_output_fps (#2147: unwired => omitted)
+            0,    // effective_video_layers (#1143)
+            0,    // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -4815,6 +5545,7 @@ mod tests {
             0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
+            Vec::new(),                    // camera_layer_metrics (#2170)
         )
         .expect("empty peer map must still produce a packet");
 

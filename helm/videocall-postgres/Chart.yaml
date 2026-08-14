@@ -1,0 +1,9 @@
+apiVersion: v2
+name: videocall-postgres
+version: 0.1.0
+description: PostgreSQL for the videocall application. Cluster-agnostic; supply an environment values file.
+
+dependencies:
+  - name: postgresql
+    version: 18.1.3
+    repository: https://charts.bitnami.com/bitnami

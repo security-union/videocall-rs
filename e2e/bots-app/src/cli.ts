@@ -14,9 +14,12 @@ import {
 import { captureSsoStateInteractive } from "./auth/sso-capture";
 import { writeFileSync } from "node:fs";
 
+import { registerConductCommand } from "./control/conduct";
 import { registerCtlCommands } from "./control/ctl";
 import { generateBotId } from "./control/registry";
 import { defaultTokenFilePath, generateToken, writeTokenFile } from "./control/auth";
+import { NETEM_IFACE_DEFAULT } from "./control/netem";
+import { isLoopbackBindAddress } from "./control/server";
 import { prepareParticipantCostume } from "./costumes";
 import { firstNParticipantNames, loadManifest, type Manifest } from "./manifest";
 import {
@@ -27,6 +30,8 @@ import {
 } from "./meeting-config";
 import { runBotsToCompletion, type BotTask, type RunOptions } from "./orchestrator";
 import { type VideoMode } from "./bot";
+import { resolveHardwareConcurrency } from "./hw-concurrency";
+import { resolveMaxReceivedLayer, resolveSkipCanvasPaint } from "./receiver-caps";
 import { FpsTracker } from "./resource/fps";
 import { RemoteResourceManager, ResourceCaptureSession } from "./resource/session";
 import { RESOURCE_FPS_BASE_RUNG } from "./resource/verdict";
@@ -115,6 +120,34 @@ program
   .option(
     "--ctl-port <port>",
     'Phase 4: bind a local HTTP control API so `bots-app ctl <cmd>` can introspect and mutate the running fleet. Pass an integer port, "auto" to let the kernel pick a free port, or omit to disable the control surface entirely. The token is written to run/ctl-<pid>.token (mode 0600). See discussion #793 phase 4.',
+  )
+  .option(
+    "--ctl-bind <addr>",
+    'Address the control API binds to (env: BOT_CTL_BIND). Default "127.0.0.1" (loopback — reachable only from the same host). Set "0.0.0.0" so an in-cluster conductor on ANOTHER pod can reach this bot (issue #2072). A non-loopback bind REQUIRES a token (see --ctl-token) — the server refuses to start otherwise. Only meaningful with --ctl-port.',
+  )
+  .option(
+    "--ctl-token <token>",
+    "Bearer token for the control API (env: BOT_CTL_TOKEN). When omitted, a fresh per-process token is generated and written to run/ctl-<pid>.token. Supply a shared token (e.g. injected from a k8s Secret) so ONE fleet-wide conductor can authenticate to every pod. Only meaningful with --ctl-port.",
+  )
+  .option(
+    "--ctl-netem",
+    "Force-enable the OS-level tc/netem impairment endpoint (/netem) on the control API even for a loopback --ctl-bind (env: BOT_CTL_NETEM=1). /netem is ALREADY auto-enabled whenever --ctl-bind is non-loopback (the cross-pod case). This flag exists for local testing on a loopback bind. Requires NET_ADMIN + iproute2 in the container. Only meaningful with --ctl-port.",
+  )
+  .option(
+    "--netem-iface <iface>",
+    `Interface shaped by --ctl-netem (env: BOT_NETEM_IFACE). Default "${NETEM_IFACE_DEFAULT}".`,
+  )
+  .option(
+    "--hardware-concurrency <N>",
+    "Spoof navigator.hardwareConcurrency to N inside each bot's browser (env: BOT_HW_CONCURRENCY; CLI flag wins). In a container Chrome reports the node's core count (e.g. 32) regardless of the pod's CPU limit, so the served videocall-client sniffs an unrealistic ceiling. Set N to model a real client's ladder depth (2 → 1 layer, 6-9 → 2 layers, 10+ → 3 layers). This caps what THIS bot PUBLISHES. It does not lower this bot's own decode cost — that is set by the ladders of the REMOTE publishers it receives. The decode saving in #2248 is therefore a fleet-wide effect: at >= 7 decoded tiles (below that both ladders pick the top rung and this is pure encode cost), when every bot publishes 3 rungs each receiver's #1256 tile-lid selection at index 1 lands on standard 480x360@15 instead of hd 640x480@30, and the receiver then advertises a preference so the relay forwards one rung instead of failing open. Raising this for ONE bot in a room of 2-rung publishers adds encode load and saves nothing. The fleet manifests set 10 (issues #2035, #2248). When unset (or <= 0) the browser's real value is used.",
+  )
+  .option(
+    "--max-received-layer <N>",
+    "Cap the RECEIVED simulcast layer via window.__APP_CONFIG.maxReceivedLayer (env: BOT_MAX_RECEIVED_LAYER; CLI flag wins). 0 = base rung only (lowest decode CPU); a higher N allows that many layers. Cuts per-bot DECODE CPU so a room holds more bots before the box saturates (issue #2068). Injected at launch (the client parses __APP_CONFIG once, so this is not runtime-toggleable); effect requires a deployment carrying videocall-client PR #2078. When unset there is no receive cap.",
+  )
+  .option(
+    "--skip-canvas-paint <bool>",
+    "Skip per-tile canvas paint via window.__APP_CONFIG.skipCanvasPaint (env: BOT_SKIP_CANVAS_PAINT; CLI flag wins). true = decode-and-drop (saves paint/GPU only — decode still runs; use --max-received-layer to cut decode CPU) (issue #2069). Same launch-time injection + PR #2078 dependency as --max-received-layer. When unset the deployment's value is inherited.",
   )
   .action(async (opts: RunCommandOptions) => {
     // Mutual exclusion / required-arg checks ──────────────────────────
@@ -279,6 +312,41 @@ program
     const ssoStateFile =
       authBackend === "jwt" ? (opts.ssoStateFile ?? defaultSsoStatePath(opts.assetsDir)) : null;
 
+    // Issue #2035 (increment 2): resolve the optional hardwareConcurrency spoof.
+    // The CLI flag wins over the BOT_HW_CONCURRENCY env var (K8s pods set the
+    // env to a modelled client's ladder depth, NOT the pod's CPU budget — see
+    // the flag help and #2248). Parsing/validation live in
+    // resolveHardwareConcurrency (unit-tested): unset/empty or <= 0 => no spoof
+    // (real cores); a strict positive integer => spoof; malformed => fail fast.
+    const hwResult = resolveHardwareConcurrency(
+      opts.hardwareConcurrency ?? process.env.BOT_HW_CONCURRENCY,
+    );
+    if (hwResult.kind === "invalid") {
+      console.error(`bots-app: ${hwResult.message}`);
+      process.exit(2);
+    }
+    const hardwareConcurrency = hwResult.value;
+
+    // Issues #2068/#2069 (increment 5): resolve the optional receiver-side
+    // low-power caps (CLI flag wins over the env the K8s pod sets). Parsing
+    // lives in receiver-caps.ts (unit-tested); malformed values fail fast.
+    const mrlResult = resolveMaxReceivedLayer(
+      opts.maxReceivedLayer ?? process.env.BOT_MAX_RECEIVED_LAYER,
+    );
+    if (mrlResult.kind === "invalid") {
+      console.error(`bots-app: ${mrlResult.message}`);
+      process.exit(2);
+    }
+    const maxReceivedLayer = mrlResult.value;
+    const scpResult = resolveSkipCanvasPaint(
+      opts.skipCanvasPaint ?? process.env.BOT_SKIP_CANVAS_PAINT,
+    );
+    if (scpResult.kind === "invalid") {
+      console.error(`bots-app: ${scpResult.message}`);
+      process.exit(2);
+    }
+    const skipCanvasPaint = scpResult.value;
+
     const tasks: BotTask[] = participants.map((participant) => {
       const displayName =
         opts.displayName && participants.length === 1
@@ -331,6 +399,9 @@ program
         runDir: opts.assetsDir,
         ttl: botTtl,
         network,
+        hardwareConcurrency,
+        maxReceivedLayer,
+        skipCanvasPaint,
       };
     });
 
@@ -375,13 +446,48 @@ program
 
     let control: RunOptions["control"];
     if (ctlPort !== null) {
-      const token = generateToken();
+      // Bind address: CLI flag > env > loopback default. Non-loopback is
+      // the cross-pod (issue #2072) path.
+      const ctlBind = opts.ctlBind ?? process.env.BOT_CTL_BIND ?? "127.0.0.1";
+      // Token: CLI flag > env > freshly generated. A shared token (flag/
+      // env, e.g. from a k8s Secret) lets one conductor drive the whole
+      // fleet; the generated token remains the local-only default.
+      const suppliedToken = opts.ctlToken ?? process.env.BOT_CTL_TOKEN;
+      const token = suppliedToken && suppliedToken.length > 0 ? suppliedToken : generateToken();
+      // Fail fast (before we bind) if a non-loopback bind has no token —
+      // this mirrors the control server's own hard refusal but gives a
+      // clearer CLI-level error. (Today `token` is always non-empty, so
+      // this only trips if someone passes --ctl-token "" explicitly.)
+      if (!isLoopbackBindAddress(ctlBind) && token.length === 0) {
+        console.error(
+          `bots-app: --ctl-bind ${ctlBind} is a non-loopback address and requires a control token (pass --ctl-token or set BOT_CTL_TOKEN). Refusing to expose an unauthenticated control surface.`,
+        );
+        process.exit(2);
+      }
+      // Netem endpoint availability. AUTO-ENABLED for a NON-LOOPBACK bind
+      // — that is the cross-pod scenario (#2072), the only place OS-level
+      // shaping makes sense and where the deploy grants CAP_NET_ADMIN.
+      // For a LOOPBACK bind (a local `run` used for dev/testing) it stays
+      // OFF unless forced with --ctl-netem / BOT_CTL_NETEM=1, so a local
+      // run never shells `tc` against the operator's own interface by
+      // surprise. The endpoint still requires the shared token AND
+      // NET_ADMIN to do anything, so a non-loopback bind without the
+      // capability simply gets a clear error from `tc`, not a silent
+      // impairment.
+      const netemForced =
+        opts.ctlNetem === true ||
+        process.env.BOT_CTL_NETEM === "1" ||
+        process.env.BOT_CTL_NETEM === "true";
+      const netemEnabled = netemForced || !isLoopbackBindAddress(ctlBind);
+      const netemIface = opts.netemIface ?? process.env.BOT_NETEM_IFACE ?? NETEM_IFACE_DEFAULT;
       const tokenFilePath = defaultTokenFilePath(opts.assetsDir);
       control = {
         port: ctlPort,
         token,
         tokenFilePath,
+        bindAddress: ctlBind,
         runDir: opts.assetsDir,
+        netem: netemEnabled ? { iface: netemIface } : undefined,
         onListen: async ({ port, token: t }) => {
           await writeTokenFile(tokenFilePath, {
             port,
@@ -420,6 +526,13 @@ interface RunCommandOptions {
   ssoStateFile?: string;
   network?: string;
   ctlPort?: string;
+  ctlBind?: string;
+  ctlToken?: string;
+  ctlNetem?: boolean;
+  netemIface?: string;
+  hardwareConcurrency?: string;
+  maxReceivedLayer?: string;
+  skipCanvasPaint?: string;
 }
 
 function defaultDisplayName(participant: string): string {
@@ -458,12 +571,67 @@ program
       `bots-app login: the captured file at ${outPath} contains real session tokens — do NOT commit or share it.`,
     );
 
-    const browser = await chromium.launch({ headless: false });
+    const browser = await chromium.launch({
+      headless: false,
+      // Match the opt-out its siblings already carry (`bot.ts`,
+      // `auth/sso-capture.ts`, added by #2142 for #2089). This subcommand is
+      // standalone — it never shares a process with the orchestrator or a bot
+      // browser — so unlike those two this is not a correctness fix. It removes
+      // a latent papercut (#2148) and keeps the launch options uniform, which
+      // is less to reason about than a documented exception.
+      //
+      // The papercut, verified by experiment against playwright-core 1.62.0:
+      // Playwright's `sigtermHandler` is `gracefullyCloseAll()` with NO
+      // `process.exit`, and registering ANY SIGTERM listener overrides Node's
+      // default terminate-on-SIGTERM. Because the action below parks on
+      // `await rl.question(...)`, the event loop stays open — so a SIGTERM'd
+      // `bots-app login` closed Chrome and then sat forever at a dead prompt
+      // (measured: node still running 7s after SIGTERM, Chrome gone). With the
+      // opt-out, Node's default applies and the process terminates.
+      handleSIGTERM: false,
+      // SIGHUP likewise: prefer Node's default termination over Playwright
+      // closing the browser and then swallowing the signal.
+      handleSIGHUP: false,
+    });
     const context = await browser.newContext({ ignoreHTTPSErrors: true });
     const page = await context.newPage();
     await page.goto(opts.startUrl, { waitUntil: "domcontentloaded" });
 
     const rl = createInterface({ input: process.stdin, output: process.stdout });
+    // Ctrl-C at the prompt needs an explicit abort path (#2148's second
+    // checkbox). Leaving `handleSIGINT` at Playwright's default is NOT enough
+    // here, and the reason is readline, not Playwright: an active
+    // `rl.question` puts the TTY in raw mode, which clears ISIG, so Ctrl-C
+    // arrives as a literal 0x03 byte and NO SIGINT is ever delivered to the
+    // process. Verified by experiment: with Playwright's SIGINT handler
+    // installed, Ctrl-C at this prompt never ran it — Chrome stayed up and the
+    // process hung (rc=None after 8s).
+    //
+    // readline translates that 0x03 into its own `SIGINT` event, so listening
+    // on `rl` is the abort path that actually fires. Aborting here captures
+    // NOTHING — no `storageState` call has run — so the only job is to tear the
+    // browser down and leave.
+    //
+    // Chrome would not actually leak without the explicit `close()`:
+    // `processLauncher.js` installs an `exit` handler unconditionally, and
+    // `process.exit(130)` runs exit handlers, so its `killSet` SIGKILLs the
+    // browser's process group and removes the temp profile dir (verified both
+    // ways). We still close explicitly so the shutdown is GRACEFUL rather than
+    // a SIGKILL, and so this path does not silently depend on that handler
+    // staying unconditional across Playwright upgrades. Exit 130 is the
+    // conventional SIGINT status, matching Playwright's own `sigintHandler`.
+    rl.on("SIGINT", () => {
+      console.log("\nbots-app login: aborted — no session captured.");
+      rl.close();
+      void (async (): Promise<void> => {
+        try {
+          await browser.close();
+        } catch {
+          // The operator may have closed the window already — swallow.
+        }
+        process.exit(130);
+      })();
+    });
     try {
       await rl.question("Press Enter once logged in to capture the session... ");
     } finally {
@@ -733,6 +901,10 @@ function repoRoot(): string {
 // writes to.
 registerCtlCommands(program, join(repoRoot(), "e2e/bots-app/run"));
 
+// Increment 4 (#2072): the `conduct` subcommand — runs a scripted
+// scenario timeline against the fleet's per-pod control servers.
+registerConductCommand(program);
+
 // Phase 5: the dashboard subcommand. Spins up a small Node HTTP
 // sidecar that proxies the browser-facing UI to a phase-4
 // orchestrator's ctl API, attaching the bearer token server-side so
@@ -777,7 +949,8 @@ program
     join(repoRoot(), "bot/conversation/manifest.yaml"),
   )
   .action(async (opts: DashboardCommandOptions) => {
-    const { startDashboardServer, resolveCtlConfig, spawnViteDev } = await import("./dashboard");
+    const { startDashboardServer, resolveCtlConfig, spawnViteDev, resolveCtlProxyIdleTimeout } =
+      await import("./dashboard");
     const port = Number.parseInt(opts.port, 10);
     if (!Number.isFinite(port) || port < 0 || port > 65535) {
       console.error(
@@ -890,12 +1063,23 @@ program
       );
     }
 
+    // The resolver is fail-safe by design (anything unusable keeps the bound armed),
+    // but silence would leave an operator believing a typo'd override took effect.
+    const rawIdleTimeout = process.env.BOT_CTL_PROXY_IDLE_TIMEOUT_MS;
+    const idleTimeout = resolveCtlProxyIdleTimeout(rawIdleTimeout);
+    if (idleTimeout.ignored) {
+      console.warn(
+        `bots-app dashboard: ignoring BOT_CTL_PROXY_IDLE_TIMEOUT_MS="${rawIdleTimeout}" (must be a non-negative integer in ms); using ${idleTimeout.value}`,
+      );
+    }
+
     const handle = await startDashboardServer({
       port,
       ctl,
       distDir: builtMode ? distDir : undefined,
       assetsDir: opts.runDir,
       daemonMode,
+      ctlProxyIdleTimeoutMs: idleTimeout.value,
       onListen: ({ port: actual }) => {
         const url = `http://127.0.0.1:${actual}/`;
         if (builtMode) {

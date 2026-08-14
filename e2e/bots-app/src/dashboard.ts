@@ -56,6 +56,62 @@ export interface DashboardOptions {
    * the listen URL and (optionally) open a browser.
    */
   onListen?: (info: { port: number }) => void;
+  /** See {@link CTL_PROXY_IDLE_TIMEOUT_MS}, the default. `0` disables it. */
+  ctlProxyIdleTimeoutMs?: number;
+}
+
+/**
+ * INACTIVITY bound for `proxyToCtl`, not an absolute deadline — do NOT unify with
+ * `ctlRequest`'s `DEFAULT_CTL_TIMEOUT_MS`: this proxy also carries the long-lived
+ * SSE route `/assets/prep/:id/stream`, which an absolute deadline would sever.
+ *
+ * Applies to an OUT-OF-PROCESS ctl only (attach mode, which the K8s fleet uses).
+ * In self-hosted mode ctl shares this event loop, so a synchronous handler — the
+ * `spawnSync("ffmpeg")` in asset prep — freezes this timer too. See #2210.
+ */
+export const CTL_PROXY_IDLE_TIMEOUT_MS = 600_000;
+
+/**
+ * `2^31 - 1`. Node clamps a larger socket-timeout delay to this and emits
+ * `TimeoutOverflowWarning`, so clamping here keeps the configured value equal to
+ * the one that actually runs.
+ */
+export const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * Bound for one proxied request. Repeats the resolver's fail-safe because
+ * `ctlProxyIdleTimeoutMs` is public API: unusable input keeps the bound ARMED.
+ * Clamping a negative to 0 would DISABLE it instead, and `-0` needs `Object.is`
+ * because `-0 < 0` is false while `-0 > 0` is too, so it would never arm.
+ */
+export function normalizeIdleTimeoutMs(configured: number | undefined): number {
+  if (
+    configured === undefined ||
+    !Number.isFinite(configured) ||
+    configured < 0 ||
+    Object.is(configured, -0)
+  ) {
+    return CTL_PROXY_IDLE_TIMEOUT_MS;
+  }
+  // An explicit 0 still disables — the documented escape hatch.
+  return Math.min(configured, MAX_TIMER_MS);
+}
+
+export function resolveCtlProxyIdleTimeout(raw: string | undefined): {
+  value: number;
+  ignored: boolean;
+} {
+  if (raw === undefined || raw.trim() === "") {
+    return { value: CTL_PROXY_IDLE_TIMEOUT_MS, ignored: false };
+  }
+  const token = raw.trim();
+  if (!/^\d+$/.test(token)) return { value: CTL_PROXY_IDLE_TIMEOUT_MS, ignored: true };
+  return { value: Math.min(Number(token), MAX_TIMER_MS), ignored: false };
+}
+
+/** Value-only form. `ignored` is what the CLI warns on — see {@link resolveCtlProxyIdleTimeout}. */
+export function resolveCtlProxyIdleTimeoutMs(raw: string | undefined): number {
+  return resolveCtlProxyIdleTimeout(raw).value;
 }
 
 export interface DashboardServerHandle {
@@ -218,12 +274,46 @@ function proxyToCtl(
         upstreamRes.on("end", () => resolveFn());
       },
     );
+    // Inactivity bound (#2120). Node only EMITS `timeout` — it never destroys the
+    // socket — so the `destroy` is what ends the hang, and destroying WITH an Error
+    // routes through the `error` handler so the stall surfaces as the 502 below.
+    // Re-normalized here, not just in the resolver: `opts` is public API a caller can
+    // set directly, and a negative would skip the arm below and disable the bound.
+    const idleTimeoutMs = normalizeIdleTimeoutMs(opts.ctlProxyIdleTimeoutMs);
+    if (idleTimeoutMs > 0) {
+      upstream.setTimeout(idleTimeoutMs, () => {
+        upstream.destroy(
+          new Error(
+            `ctl did not send data for ${idleTimeoutMs}ms (inactivity timeout) ` +
+              `on 127.0.0.1:${opts.ctl.port} — the ctl handler appears stalled`,
+          ),
+        );
+      });
+    }
     upstream.on("error", (err) => {
+      // Once upstream has responded (the SSE case) a second writeHead throws
+      // ERR_HTTP_HEADERS_SENT — uncaught inside this listener, killing the whole
+      // dashboard process. Abort instead; EventSource sees the disconnect.
+      if (res.headersSent) {
+        res.destroy(err);
+        resolveFn();
+        return;
+      }
       sendJson(res, 502, {
         error: `ctl proxy failed: ${err.message}`,
         ctl: { host: "127.0.0.1", port: opts.ctl.port },
       });
       resolveFn();
+    });
+    // The half the inactivity timer cannot reclaim: a client that leaves mid-stream
+    // leaves a live upstream still resetting it. `writableEnded` distinguishes that
+    // early close from normal completion. `resolveFn` is explicit because a bare
+    // `destroy()` need not emit `error`, which would strand the Promise.
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        upstream.destroy();
+        resolveFn();
+      }
     });
     req.pipe(upstream);
   });

@@ -811,6 +811,109 @@ impl RecordingSetCtx {
     }
 }
 
+/// Live raised-hand roster for the meeting, in RAISE ORDER (issue 2135).
+///
+/// Same reactive shape as [`RecordingSetCtx`] and for the same reason: three
+/// unrelated surfaces (the video tile badge, the persistent banner, and the peer
+/// list) must all agree about who has a hand up without prop-drilling through
+/// `AttendantsComponent`. Keyed by SESSION, not user: a raised hand belongs to a
+/// tab, so two sessions of one account raise independently.
+///
+/// A `Vec` rather than a set because ORDER is part of the data — the banner
+/// renders "who is next", which is the whole point of showing raised hands for
+/// participants whose tile is off-screen. The invariant, maintained by
+/// [`crate::components::raised_hands::set_raised_hand`], is ascending
+/// `(raised_at_ms, session_id)`; the session-id tie-break is what makes every
+/// participant render the SAME order despite `raised_at_ms` being a forgeable
+/// per-sender wall clock.
+///
+/// Purely live, like the recording set: there is no server-side hand registry, so
+/// this is driven entirely by inbound RAISE_HAND packets (peers), the local
+/// user's own toggle, and departure cleanup. Nothing seeds it from a roster.
+#[derive(Clone, Copy)]
+pub struct RaisedHandsCtx(pub Signal<Vec<crate::components::raised_hands::RaisedHand>>);
+
+impl RaisedHandsCtx {
+    /// Whether the session identified by `session_id` currently has a hand up.
+    ///
+    /// Takes the string form because that is what tiles and roster rows carry;
+    /// a non-numeric id (e.g. a layout-only `mock-N` placeholder) simply never
+    /// matches, which is the correct answer.
+    pub fn is_raised(&self, session_id: &str) -> bool {
+        let Ok(sid) = session_id.parse::<u64>() else {
+            return false;
+        };
+        self.0.read().iter().any(|h| h.session_id == sid)
+    }
+
+    /// This session's 1-based position in the raise queue AND the queue length,
+    /// or `None` if its hand is down. Used for the "2nd of 5" affordance on the
+    /// roster row — the ordering is only useful if it is legible somewhere other
+    /// than the banner, and a bare ordinal ("2 in the queue") reads as a count
+    /// rather than a position without the total beside it.
+    ///
+    /// ONLY the roster calls this, and that is a deliberate constraint rather
+    /// than an accident of who needed it (issue 2135 perf review). The roster is
+    /// ONE component rendering all rows, so it holds ONE subscription to the
+    /// roster signal. A per-tile caller would instead subscribe every mounted
+    /// `PeerTile` to a value that changes for everyone whenever ANY hand moves —
+    /// the ordinal of the tenth raiser shifts when the first one lowers — which
+    /// is precisely the N-tiles-per-toggle re-render this API must not invite
+    /// back. `PeerTile` therefore uses [`Self::is_raised`] behind a `use_memo`,
+    /// whose output only changes for the one tile whose own hand moved.
+    pub fn queue_slot(&self, session_id: &str) -> Option<(usize, usize)> {
+        let sid = session_id.parse::<u64>().ok()?;
+        let list = self.0.read();
+        let index = list.iter().position(|h| h.session_id == sid)?;
+        Some((index + 1, list.len()))
+    }
+}
+
+/// One remote session's identity metadata, as a video tile renders it.
+///
+/// `user_id` / `display_name` are `Option` because they resolve
+/// ASYNCHRONOUSLY: a peer entry is created by the first inbound media packet,
+/// while the name and the guest flag arrive on `PARTICIPANT_JOINED` (and can
+/// change later on `PARTICIPANT_DISPLAY_NAME_CHANGED`). Either order is
+/// possible on the wire, so `None` is the legitimate "not known yet" state a
+/// tile must be able to leave.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PeerMetadata {
+    pub session_id: String,
+    pub user_id: Option<String>,
+    pub display_name: Option<String>,
+    pub is_guest: bool,
+}
+
+/// Reactive snapshot of the peer identity metadata that video tiles read
+/// IMPERATIVELY off `VideoCallClient` (issue #2103 follow-up).
+///
+/// WHY THIS EXISTS. `canvas_generator::generate_for_peer` resolves a tile's
+/// name / crown / "Guest" badge with three NON-reactive calls —
+/// `get_peer_user_id`, `get_peer_display_name`, `get_peer_is_guest` — which
+/// read a `RefCell` inside the client and therefore subscribe the tile to
+/// NOTHING. Before the #2103 memoization work, `AttendantsComponent` wrote
+/// `MeetingTimeCtx` unconditionally in its render body, which dirtied every
+/// `PeerTile` on every parent render and INCIDENTALLY refreshed those reads.
+/// Change-guarding that write removed the accident and exposed the latent gap:
+/// a display name that arrives AFTER its tile has mounted never reached the
+/// DOM, so the tile kept rendering the fallback `user_id` (the e2e failures in
+/// `two-users-meeting` / `tile-order-camera-toggle`, whose host grid read
+/// `tileorderb@videocall.rs` instead of `TileOrderGuestB`).
+///
+/// This context is the deliberate replacement for that accident — the same
+/// shape as [`HostSetCtx`] / [`RecordingSetCtx`], which is exactly why the
+/// crown and the recording dot never had the bug. `AttendantsComponent`
+/// republishes the snapshot from its render body CHANGE-GUARDED, so tiles are
+/// dirtied when the metadata actually moves and NOT on every parent render
+/// (which is what issue 2103 bought).
+///
+/// Ordered by the parent's `display_peers` (a `Vec`, not a map) so the value
+/// has a stable `PartialEq`: the guard must never see a spurious change from
+/// hash-map iteration order.
+#[derive(Clone, Copy)]
+pub struct PeerMetadataCtx(pub Signal<Vec<PeerMetadata>>);
+
 // ---------------------------------------------------------------------------
 // Local-storage helpers
 // ---------------------------------------------------------------------------

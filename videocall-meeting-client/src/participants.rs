@@ -32,14 +32,23 @@ impl MeetingApiClient {
     /// - If the meeting is not yet active, `status` will be
     ///   `"waiting_for_meeting"` and `observer_token` will contain a JWT for
     ///   receiving push notifications.
+    ///
+    /// `password` is the meeting password (issue #1613). Pass `None` for
+    /// meetings whose `has_password` is `false`, and for the meeting owner —
+    /// the server exempts `creator_id` from the check. Every other caller
+    /// joining a `has_password: true` meeting must supply it or the server
+    /// answers [`ApiError::MeetingPasswordRequired`]; a wrong one answers
+    /// [`ApiError::InvalidMeetingPassword`].
     pub async fn join_meeting(
         &self,
         meeting_id: &str,
         display_name: Option<&str>,
+        password: Option<&str>,
     ) -> Result<ParticipantStatusResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/join");
         let body = JoinMeetingRequest {
             display_name: display_name.map(|s| s.to_string()),
+            password: password.map(|s| s.to_string()),
         };
         let response = self.post(&path).json(&body).send().await?;
         parse_api_response(response).await
@@ -51,16 +60,22 @@ impl MeetingApiClient {
     ///
     /// The meeting must have `allow_guests` enabled. `display_name` is required.
     /// Guests are never hosts and cannot auto-create meetings.
+    ///
+    /// `password` is the meeting password (issue #1613). A guest is never the
+    /// meeting owner, so it is required whenever the meeting has one; see
+    /// [`Self::join_meeting`] for the error codes.
     pub async fn join_meeting_as_guest(
         &self,
         meeting_id: &str,
         display_name: &str,
         guest_session_id: Option<&str>,
+        password: Option<&str>,
     ) -> Result<ParticipantStatusResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/join-guest");
         let body = GuestJoinRequest {
             display_name: display_name.to_string(),
             guest_session_id: guest_session_id.map(|s| s.to_string()),
+            password: password.map(|s| s.to_string()),
         };
         let response = self.post(&path).json(&body).send().await?;
         parse_api_response(response).await

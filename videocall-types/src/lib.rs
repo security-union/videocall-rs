@@ -18,6 +18,7 @@
 
 pub mod callback;
 pub mod feature_flags;
+pub mod limits;
 pub mod protos;
 pub mod user_id;
 pub mod validation;
@@ -119,6 +120,12 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             protos::packet_wrapper::packet_wrapper::PacketType::REACTION => {
                 write!(f, "REACTION")
             }
+            protos::packet_wrapper::packet_wrapper::PacketType::RAISE_HAND => {
+                write!(f, "RAISE_HAND")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::MEETING_TIMER => {
+                write!(f, "MEETING_TIMER")
+            }
         }
     }
 }
@@ -201,6 +208,74 @@ mod video_stats_wire_tests {
         assert_eq!(
             decoded.content_staleness_ms, 0.0,
             "a VideoStats without field 9 must decode content_staleness_ms as the proto3 default 0.0"
+        );
+    }
+
+    /// Issue #2201: `keyframe_arrivals_total` (field 10, tag 80) must round-trip, and — unlike
+    /// its implicit-presence siblings — must preserve EXPLICIT PRESENCE.
+    ///
+    /// The `optional` keyword is load-bearing for a staged rollout, not stylistic. With implicit
+    /// presence a pre-#2201 client reports 0, which is numerically identical to the single most
+    /// alarming real condition this metric exists to detect ("we requested keyframes and none
+    /// arrived") — so every un-upgraded receiver in a mixed-version meeting would read as total
+    /// keyframe delivery loss. Explicit presence lets the server distinguish "not reported" from
+    /// "zero arrived" and omit the series entirely.
+    ///
+    /// This exercises the REAL generated codec rather than an in-memory field set, so it fails
+    /// if the field is mis-tagged, loses its `optional` (collapsing `None` and `Some(0)`), or is
+    /// decoded with the wrong wire type. `Some(0)` is asserted specifically because that is the
+    /// case implicit presence would silently destroy.
+    #[test]
+    fn keyframe_arrivals_total_round_trips_and_preserves_presence() {
+        // A set, nonzero value survives.
+        let mut vs = VideoStats::new();
+        vs.keyframe_arrivals_total = Some(42);
+        let decoded =
+            VideoStats::parse_from_bytes(&vs.write_to_bytes().expect("VideoStats must serialize"))
+                .expect("serialized VideoStats must parse back");
+        assert_eq!(
+            decoded.keyframe_arrivals_total,
+            Some(42),
+            "field 10 must round-trip its value unchanged"
+        );
+
+        // Some(0) must stay Some(0) — the discriminating case. Under implicit presence this
+        // would be omitted from the wire and decode as the default, indistinguishable from an
+        // old client that never reports the field at all.
+        let mut zero = VideoStats::new();
+        zero.keyframe_arrivals_total = Some(0);
+        let decoded_zero = VideoStats::parse_from_bytes(
+            &zero.write_to_bytes().expect("VideoStats must serialize"),
+        )
+        .expect("serialized VideoStats must parse back");
+        assert_eq!(
+            decoded_zero.keyframe_arrivals_total,
+            Some(0),
+            "an explicitly-reported ZERO must survive as Some(0), not collapse to None — that \
+             distinction is what stops an old client from reading as total delivery loss"
+        );
+
+        // An OLD client (field never set) must decode as None, not Some(0).
+        let mut older_peer = VideoStats::new();
+        older_peer.fps_received = 8.0;
+        assert_eq!(
+            older_peer.keyframe_arrivals_total, None,
+            "precondition: field 10 unset"
+        );
+        let decoded_old = VideoStats::parse_from_bytes(
+            &older_peer
+                .write_to_bytes()
+                .expect("VideoStats must serialize"),
+        )
+        .expect("a field-10-less VideoStats must still parse (additive field)");
+        assert_eq!(
+            decoded_old.fps_received, 8.0,
+            "the field that WAS set must survive"
+        );
+        assert_eq!(
+            decoded_old.keyframe_arrivals_total, None,
+            "a pre-#2201 peer must decode as None so the server can OMIT the series rather \
+             than publish a 0 that reads as total keyframe delivery loss"
         );
     }
 }
@@ -360,6 +435,31 @@ mod reaction_packet_wire_tests {
             PacketType::REACTION.value(),
             17,
             "PacketType::REACTION must be wire value 17 (15/16 reserved for #1843)"
+        );
+    }
+
+    /// #2136: the MEETING_TIMER envelope discriminant is pinned at 19. If a future edit
+    /// renumbers it, this fails — catching a silent wire-compat break with peers and with the
+    /// relay's `classify_packet` arm before it ships.
+    ///
+    /// The second assert is the part that actually earns its keep: it pins 19 as DISTINCT from
+    /// MEETING (7). The two names are adjacent and their trust models are opposite (MEETING is
+    /// server-authored and dropped on client ingress; MEETING_TIMER is client-authored and
+    /// re-broadcast), so a collision would silently route host timers into the drop arm — or,
+    /// far worse, route forged client MEETING packets into the re-broadcast arm.
+    #[test]
+    fn meeting_timer_packet_type_is_wire_value_19_and_distinct_from_meeting() {
+        assert_eq!(
+            PacketType::MEETING_TIMER.value(),
+            19,
+            "PacketType::MEETING_TIMER must be wire value 19 (15/16 reserved for #1843, \
+             17 = REACTION, 18 = RAISE_HAND per #2135)"
+        );
+        assert_ne!(
+            PacketType::MEETING_TIMER.value(),
+            PacketType::MEETING.value(),
+            "MEETING_TIMER (client-authored, re-broadcast) must never collide with MEETING \
+             (server-authored, dropped on client ingress) — they have opposite trust models"
         );
     }
 }

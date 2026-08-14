@@ -93,6 +93,7 @@ fn build_app_inner(pool: PgPool, dev_user: Option<DevUser>) -> Router {
         search: None,
         display_name_rate_limit_disabled: false,
         dev_user,
+        password_gate: std::sync::Arc::new(meeting_api::password::MeetingPasswordGate::new()),
     };
     build_app_from_state(state)
 }

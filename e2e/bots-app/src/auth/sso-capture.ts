@@ -54,7 +54,17 @@ export interface SsoCaptureSession {
 export async function openSsoCaptureBrowser(opts: {
   startUrl: string;
 }): Promise<SsoCaptureSession> {
-  const browser = await chromium.launch({ headless: false });
+  const browser = await chromium.launch({
+    headless: false,
+    // Playwright's signal-handler registry and graceful-close set are
+    // process-global. A dashboard recapture can coexist with bot browsers, so
+    // enabling these handlers here would let SIGTERM close every bot before the
+    // orchestrator's leaveMeeting()->shutdown() sequence (#2089).
+    handleSIGTERM: false,
+    // The orchestrator has no SIGHUP path; preserve Node's default termination
+    // instead of letting Playwright swallow the signal after closing browsers.
+    handleSIGHUP: false,
+  });
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
   const page = await context.newPage();
   await page.goto(opts.startUrl, { waitUntil: "domcontentloaded" });

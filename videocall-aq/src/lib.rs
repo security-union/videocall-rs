@@ -33,7 +33,10 @@ pub mod constants;
 pub mod controller;
 pub mod manager;
 
-pub use aspect::{fit_within_preserving_aspect, simulcast_layer_target_dims, SimulcastLayerDims};
+pub use aspect::{
+    fit_within_preserving_aspect, fit_within_tier_box, orient_box_to_source,
+    simulcast_layer_target_dims, SimulcastLayerDims,
+};
 
 pub use clock::{default_clock, Clock, TestClock};
 

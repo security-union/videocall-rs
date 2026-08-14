@@ -13,7 +13,7 @@ use crate::components::icons::signal_bars::SignalBarsIcon;
 use dioxus::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use videocall_diagnostics::{subscribe, MetricValue};
+use videocall_diagnostics::{recv_loop_action, subscribe, MetricValue, RecvLoopAction};
 
 // ---------------------------------------------------------------------------
 // Thresholds & hysteresis constants
@@ -60,6 +60,76 @@ enum QualityLevel {
     Warn,
     /// RTT >= CRITICAL_THRESHOLD — red warning.
     Critical,
+}
+
+// ---------------------------------------------------------------------------
+// Sample ordering / gap classification
+// ---------------------------------------------------------------------------
+
+/// What the diagnostics loop should do with an incoming RTT sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampleAction {
+    /// The event is older than the last accepted one (replay / reorder).
+    /// Ignore it entirely and leave all state untouched.
+    Skip,
+    /// Contiguous sample — feed it straight to the hysteresis state.
+    Accept,
+    /// The gap since the last sample exceeded `SAMPLE_GAP_RESET_MS`
+    /// (reconnect / re-election). Reset the hysteresis state, then process
+    /// the sample normally.
+    Reset,
+}
+
+/// Classify an incoming sample against the last-accepted timestamp watermark,
+/// advancing the watermark for every sample the caller will act on.
+///
+/// The watermark must be monotonic. The diagnostics bus makes no ordering
+/// guarantee, so a replayed or reordered event can arrive with a timestamp
+/// older than the last accepted one. Such an event returns [`SampleAction::Skip`]
+/// and the watermark is left untouched, because processing it would corrupt gap
+/// detection twice over: a backwards delta cannot express a real gap (the
+/// un-fixed code used `saturating_sub`, which floored it to 0, so the stale
+/// event read as a normal contiguous sample), *and* storing its timestamp would
+/// rewind the watermark — making the next genuine sample look like a
+/// multi-second gap and spuriously reset the hysteresis counters.
+///
+/// The skip window is bounded by `SAMPLE_GAP_RESET_MS`, symmetrically with the
+/// forward-gap check: `videocall_diagnostics::now_ms` is `Date::now` on wasm, a
+/// wall clock, so timestamps can also move backwards because the clock itself
+/// was stepped (NTP correction, sleep/resume). Skipping *every* older event
+/// would then stall the indicator until the clock caught back up — and a single
+/// far-future timestamp would stall it permanently, since every later sample
+/// would be older than the watermark. A backwards jump too large to be a
+/// reorder is therefore treated like any other discontinuity: re-seed the
+/// watermark and reset, which is self-healing on the very next sample.
+///
+/// A `last_sample_ts_ms` of `0` is the "no sample seen yet" sentinel: the first
+/// sample is always accepted and only seeds the watermark.
+fn classify_sample(evt_ts_ms: u64, last_sample_ts_ms: &mut u64) -> SampleAction {
+    if *last_sample_ts_ms == 0 {
+        *last_sample_ts_ms = evt_ts_ms;
+        return SampleAction::Accept;
+    }
+
+    if evt_ts_ms < *last_sample_ts_ms {
+        if *last_sample_ts_ms - evt_ts_ms <= SAMPLE_GAP_RESET_MS {
+            // Replay / reorder: drop it, leaving the watermark untouched.
+            return SampleAction::Skip;
+        }
+        // The clock moved, not the sample order — re-seed and start fresh.
+        *last_sample_ts_ms = evt_ts_ms;
+        return SampleAction::Reset;
+    }
+
+    // The branch above established `evt_ts_ms >= *last_sample_ts_ms`, so this
+    // subtraction cannot underflow.
+    let action = if evt_ts_ms - *last_sample_ts_ms > SAMPLE_GAP_RESET_MS {
+        SampleAction::Reset
+    } else {
+        SampleAction::Accept
+    };
+    *last_sample_ts_ms = evt_ts_ms;
+    action
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +244,9 @@ pub fn ConnectionQualityIndicator() -> Element {
     // Displayed quality level (drives rendering).
     let mut quality = use_signal(|| QualityLevel::Good);
     // Latest raw RTT for the title/aria-label tooltip. Using a Signal so
-    // the tooltip text stays current while the indicator is visible.
-    // When in the Good state the component returns early (rsx! {}), so
-    // the 1 Hz signal updates do not cause unnecessary re-renders.
+    // the tooltip text stays current while the indicator is visible. It is
+    // read only AFTER the Good-state early return below, so the 1 Hz signal
+    // updates do not re-render the component while it renders nothing.
     let mut raw_rtt_ms = use_signal(|| 0.0_f64);
     // Track whether we are in the "exiting" transition (fading out).
     let mut exiting = use_signal(|| false);
@@ -205,7 +275,18 @@ pub fn ConnectionQualityIndicator() -> Element {
                 // Track the timestamp of the last processed sample so we can
                 // detect reconnection / re-election gaps and reset hysteresis.
                 let mut last_sample_ts_ms: u64 = 0;
-                while let Ok(evt) = rx.recv().await {
+                loop {
+                    // Issue 2174: a bare `while let Ok(..)` here died permanently
+                    // on the first `Overflowed`, which is recoverable — see
+                    // `videocall_diagnostics::recv_loop_action`. The RTT pill then
+                    // froze on whatever quality it last showed.
+                    let evt = match rx.recv().await {
+                        Ok(evt) => evt,
+                        Err(e) => match recv_loop_action(&e) {
+                            RecvLoopAction::Continue => continue,
+                            RecvLoopAction::Break => break,
+                        },
+                    };
                     if evt.subsystem != "connection_manager" {
                         continue;
                     }
@@ -226,24 +307,27 @@ pub fn ConnectionQualityIndicator() -> Element {
                         continue;
                     };
 
-                    // Detect sample gaps that indicate a transport reconnect or
-                    // re-election. When the gap exceeds SAMPLE_GAP_RESET_MS,
-                    // the previous hysteresis state is stale — reset it so the
-                    // indicator starts fresh with the new connection.
-                    if last_sample_ts_ms > 0
-                        && evt.ts_ms.saturating_sub(last_sample_ts_ms) > SAMPLE_GAP_RESET_MS
-                    {
-                        hysteresis.borrow_mut().reset();
-                        // If the indicator was visible, immediately hide it.
-                        // The next sample will re-evaluate from a clean state.
-                        if quality() != QualityLevel::Good {
-                            let gen = exit_gen.get().wrapping_add(1);
-                            exit_gen.set(gen);
-                            quality.set(QualityLevel::Good);
-                            exiting.set(false);
+                    // Classify the sample against the timestamp watermark:
+                    // out-of-order replays are dropped, and gaps that indicate a
+                    // transport reconnect or re-election reset the (now stale)
+                    // hysteresis state so the indicator starts fresh with the
+                    // new connection. `classify_sample` owns the watermark
+                    // advance, so a skipped event cannot rewind it.
+                    match classify_sample(evt.ts_ms, &mut last_sample_ts_ms) {
+                        SampleAction::Skip => continue,
+                        SampleAction::Reset => {
+                            hysteresis.borrow_mut().reset();
+                            // If the indicator was visible, immediately hide it.
+                            // The next sample will re-evaluate from a clean state.
+                            if quality() != QualityLevel::Good {
+                                let gen = exit_gen.get().wrapping_add(1);
+                                exit_gen.set(gen);
+                                quality.set(QualityLevel::Good);
+                                exiting.set(false);
+                            }
                         }
+                        SampleAction::Accept => {}
                     }
-                    last_sample_ts_ms = evt.ts_ms;
 
                     raw_rtt_ms.set(rtt_val);
 
@@ -281,12 +365,18 @@ pub fn ConnectionQualityIndicator() -> Element {
 
     let level = quality();
     let is_exiting = exiting();
-    let rtt = raw_rtt_ms();
 
     // Do not render anything in the Good state (after exit animation completes).
     if level == QualityLevel::Good && !is_exiting {
         return rsx! {};
     }
+
+    // Read the RTT only past the early return. A Dioxus scope re-subscribes
+    // from scratch on every render (`ReactiveContext::reset_and_run_in`), so a
+    // read that does not execute drops the subscription: in the Good state the
+    // 1 Hz `raw_rtt_ms.set` above cannot wake this component, and when it does
+    // become visible the read re-subscribes and the tooltip tracks live again.
+    let rtt = raw_rtt_ms();
 
     // During exit animation, render the last non-Good state so the fade-out
     // shows the correct icon/label (e.g., red 1-bar for Critical, not amber).
@@ -435,5 +525,144 @@ mod tests {
         assert_eq!(state.update(350.0), None);
         assert_eq!(state.update(350.0), None);
         assert_eq!(state.update(350.0), Some(QualityLevel::Warn));
+    }
+
+    // -----------------------------------------------------------------------
+    // Sample ordering / gap classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_sample_first_sample_is_never_skipped() {
+        // The `0` sentinel means "no sample seen yet" — whatever the bus
+        // hands us first seeds the watermark and is accepted.
+        let mut watermark = 0;
+        assert_eq!(
+            classify_sample(1_000_000, &mut watermark),
+            SampleAction::Accept
+        );
+        assert_eq!(watermark, 1_000_000);
+
+        // Even a huge first timestamp must not be read as a reconnect gap.
+        let mut fresh = 0;
+        assert_eq!(
+            classify_sample(u64::MAX, &mut fresh),
+            SampleAction::Accept,
+            "first sample must never be classified as a gap reset"
+        );
+    }
+
+    #[test]
+    fn classify_sample_accepts_normal_forward_step() {
+        let mut watermark = 100_000;
+        assert_eq!(
+            classify_sample(101_000, &mut watermark),
+            SampleAction::Accept
+        );
+        assert_eq!(watermark, 101_000);
+    }
+
+    #[test]
+    fn classify_sample_accepts_equal_timestamp() {
+        // A duplicate timestamp is a zero-length gap, not a backwards jump:
+        // it is still processed, and the watermark stays where it was.
+        let mut watermark = 100_000;
+        assert_eq!(
+            classify_sample(100_000, &mut watermark),
+            SampleAction::Accept
+        );
+        assert_eq!(watermark, 100_000);
+    }
+
+    #[test]
+    fn classify_sample_resets_beyond_gap_threshold() {
+        let mut watermark = 100_000;
+        let past_gap = 100_000 + SAMPLE_GAP_RESET_MS + 1;
+        assert_eq!(
+            classify_sample(past_gap, &mut watermark),
+            SampleAction::Reset
+        );
+        assert_eq!(
+            watermark, past_gap,
+            "a reset sample still advances the watermark"
+        );
+
+        // Exactly at the threshold is still contiguous — the check is `>`.
+        let mut boundary = 100_000;
+        assert_eq!(
+            classify_sample(100_000 + SAMPLE_GAP_RESET_MS, &mut boundary),
+            SampleAction::Accept
+        );
+    }
+
+    #[test]
+    fn classify_sample_skips_backwards_jump_without_rewinding_watermark() {
+        let mut watermark = 100_000;
+        // A replayed / reordered event from 8s earlier — inside the reorder
+        // window, so it is dropped rather than treated as a clock step.
+        assert_eq!(classify_sample(92_000, &mut watermark), SampleAction::Skip);
+        assert_eq!(
+            watermark, 100_000,
+            "a skipped event must not rewind the watermark"
+        );
+
+        // The boundary is inclusive: a backwards jump of exactly
+        // SAMPLE_GAP_RESET_MS is still a reorder, not a clock step.
+        let mut boundary = 100_000;
+        assert_eq!(
+            classify_sample(100_000 - SAMPLE_GAP_RESET_MS, &mut boundary),
+            SampleAction::Skip
+        );
+        assert_eq!(boundary, 100_000);
+    }
+
+    #[test]
+    fn classify_sample_large_backwards_step_reseeds_instead_of_wedging() {
+        // `now_ms` is a wall clock on wasm, so it can be stepped backwards by
+        // an NTP correction. Skipping every older event would stall the
+        // indicator for the whole duration of the step, and a single far-future
+        // timestamp would stall it forever. Instead the watermark re-seeds.
+        let mut watermark = 100_000;
+        let stepped_back = 100_000 - SAMPLE_GAP_RESET_MS - 1;
+        assert_eq!(
+            classify_sample(stepped_back, &mut watermark),
+            SampleAction::Reset
+        );
+        assert_eq!(
+            watermark, stepped_back,
+            "a clock step must re-seed the watermark, not leave it in the future"
+        );
+
+        // Self-healing: the very next sample on the new clock is contiguous.
+        assert_eq!(
+            classify_sample(stepped_back + 1_000, &mut watermark),
+            SampleAction::Accept,
+            "the indicator must resume immediately, not wedge behind a stale watermark"
+        );
+    }
+
+    #[test]
+    fn classify_sample_replay_does_not_trigger_a_spurious_reset_later() {
+        // This is the composite failure the guard exists to prevent. Without
+        // it, the stale event at 92_000 reads as a 0-length gap (the un-fixed
+        // code's `saturating_sub` floored the backwards delta) AND rewinds the
+        // watermark to 92_000 — so the next genuine sample at 103_000 looks
+        // like an 11s gap and wipes the hysteresis counters even though the
+        // connection never dropped.
+        let mut watermark = 0;
+
+        assert_eq!(
+            classify_sample(100_000, &mut watermark),
+            SampleAction::Accept
+        );
+        // The classification of the replay itself is pinned by
+        // `classify_sample_skips_backwards_jump_without_rewinding_watermark`;
+        // what this test pins is the effect it has on the *next* sample.
+        let _ = classify_sample(92_000, &mut watermark);
+        assert_eq!(
+            classify_sample(103_000, &mut watermark),
+            SampleAction::Accept,
+            "the sample following a replay must stay contiguous, not reset hysteresis"
+        );
+        assert_eq!(watermark, 103_000);
     }
 }

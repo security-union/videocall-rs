@@ -2,6 +2,8 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { COSTUME_HEIGHT, COSTUME_WIDTH } from "./costumes";
+import { isCostumeFresh } from "./auto-prime";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ensureAssetsPrimed, type PrimeProgress } from "./auto-prime";
@@ -139,7 +141,10 @@ describe("ensureAssetsPrimed", () => {
     mkdirSync(join(runDir, "audio"), { recursive: true });
     mkdirSync(join(runDir, "costumes"), { recursive: true });
     writeFileSync(join(runDir, "audio", "alice.wav"), "RIFF");
-    writeFileSync(join(runDir, "costumes", "pirate.y4m"), "YUV4MPEG2");
+    writeFileSync(
+      join(runDir, "costumes", "pirate.y4m"),
+      `YUV4MPEG2 W${COSTUME_WIDTH} H${COSTUME_HEIGHT} F30:1 Ip A1:1\nFRAME\n`,
+    );
     const future = new Date(Date.now() + 60_000);
     utimesSync(join(runDir, "audio", "alice.wav"), future, future);
     utimesSync(join(runDir, "costumes", "pirate.y4m"), future, future);
@@ -168,7 +173,10 @@ describe("ensureAssetsPrimed", () => {
   it("primes only audio when the WAV is missing but the costume is cached", async () => {
     const manifest = parseManifestText(FIXTURE);
     mkdirSync(join(runDir, "costumes"), { recursive: true });
-    writeFileSync(join(runDir, "costumes", "pirate.y4m"), "YUV4MPEG2");
+    writeFileSync(
+      join(runDir, "costumes", "pirate.y4m"),
+      `YUV4MPEG2 W${COSTUME_WIDTH} H${COSTUME_HEIGHT} F30:1 Ip A1:1\nFRAME\n`,
+    );
     const future = new Date(Date.now() + 60_000);
     utimesSync(join(runDir, "costumes", "pirate.y4m"), future, future);
     const f = fakes();
@@ -312,5 +320,55 @@ describe("ensureAssetsPrimed", () => {
     expect(result.audioPrimed).toBe(true);
     expect(result.costumePrimed).toBe(false);
     expect(result.skipped.costume).toBe(true);
+  });
+});
+
+/**
+ * The OUTER gate. `auto-prime` decides freshness itself and skips
+ * `prepareParticipantCostume` entirely when it says fresh — so the inner guard
+ * never runs on the common launch path. This is the layer where #2171 either
+ * lands or ships inert.
+ */
+describe("auto-prime costume freshness", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "autoprime-geom-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function seed(header: string): { y4m: string; mp4: string } {
+    const mp4 = join(dir, "talking.mp4");
+    writeFileSync(mp4, "x");
+    const y4m = join(dir, "pirate.y4m");
+    writeFileSync(y4m, `${header}\nFRAME\n`); // newer than the source
+    return { y4m, mp4 };
+  }
+
+  it("treats a stale 1280x720 cache as NOT fresh even though its mtime is newer", () => {
+    const { y4m, mp4 } = seed("YUV4MPEG2 W1280 H720 F30:1 Ip A1:1");
+    expect(isCostumeFresh(y4m, mp4)).toBe(false);
+  });
+
+  it("treats a cache at the target geometry as fresh", () => {
+    const { y4m, mp4 } = seed(`YUV4MPEG2 W${COSTUME_WIDTH} H${COSTUME_HEIGHT} F30:1 Ip A1:1`);
+    expect(isCostumeFresh(y4m, mp4)).toBe(true);
+  });
+
+  it("rejects a stale-geometry cache even when the SOURCE MP4 is absent", () => {
+    // The default state on a fresh clone: costumes and *.mp4 are gitignored and
+    // the documented --costume-source lives in /tmp. The geometry check must sit
+    // ABOVE the missing-source early return or it is skipped exactly here.
+    const y4m = join(dir, "pirate.y4m");
+    writeFileSync(y4m, "YUV4MPEG2 W1280 H720 F30:1 Ip A1:1\nFRAME\n");
+    expect(isCostumeFresh(y4m, join(dir, "absent.mp4"))).toBe(false);
+  });
+
+  it("still treats a correctly-sized cache as fresh when the source is absent", () => {
+    const y4m = join(dir, "ok.y4m");
+    writeFileSync(y4m, `YUV4MPEG2 W${COSTUME_WIDTH} H${COSTUME_HEIGHT} F30:1 Ip A1:1\nFRAME\n`);
+    expect(isCostumeFresh(y4m, join(dir, "absent.mp4"))).toBe(true);
   });
 });

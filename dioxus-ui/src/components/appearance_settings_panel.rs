@@ -184,6 +184,71 @@ fn is_keyboard_activation_key(key: &Key) -> bool {
     *key == Key::Enter || matches!(key, Key::Character(s) if s == " ")
 }
 
+/// The Decay explanation. Rendered as a real `role="tooltip"` element and
+/// wired to the `(?)` trigger through `aria-describedby`, which is what makes
+/// it reach screen readers: CSS `content` on a pseudo-element is not reliably
+/// exposed to assistive technology and cannot be referenced by an `id`
+/// (issue 1871). Kept as one constant so the visible bubble and the accessible
+/// description cannot drift apart.
+const DECAY_HELP_TEXT: &str = "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail.";
+
+/// Next `(is_open, is_suppressed)` for the Decay `(?)` trigger when it is
+/// activated by click/tap or by Enter/Space.
+///
+/// Toggling OFF must **latch suppression**, not merely clear `--open`. The
+/// trigger still holds focus immediately after the activation, and
+/// `:focus-within` is one of the CSS reveal conditions — clearing `--open`
+/// alone therefore leaves the bubble on screen and the second tap looks
+/// broken. On touch there is no hover and no Escape key, so re-tapping the
+/// trigger is the *only* dismissal available, and WCAG 2.1 SC 1.4.13
+/// "Dismissible" requires a dismissal that does not move pointer hover or
+/// keyboard focus (tapping elsewhere moves focus, so it does not count).
+///
+/// Turning ON clears suppression so an explicit open wins over a prior
+/// Escape-dismissal. `onfocusout` clears both, so leaving the trigger re-arms
+/// the affordance for the next visit.
+///
+/// Because each branch sets one flag and clears the other, the only two
+/// outputs are `(false, true)` and `(true, false)` — never `(true, true)`.
+/// `decay_help_class` relies on that.
+fn next_decay_help_state(is_open: bool) -> (bool, bool) {
+    if is_open {
+        (false, true)
+    } else {
+        (true, false)
+    }
+}
+
+/// Class string for the Decay `(?)` help trigger, given whether its tooltip is
+/// click/tap-latched open and/or Escape-suppressed.
+///
+/// `--open` forces the tooltip visible (touch devices have no hover, so a tap
+/// latches it); `--suppressed` forces it hidden even while the trigger keeps
+/// keyboard focus. Suppression is what makes *both* dismissals observable —
+/// Escape, and a second tap/activation — because `:focus-within` would
+/// otherwise keep the bubble on screen while the trigger stays focused.
+/// Mirrors `announce_help_class` in `preferences_settings_panel.rs`, the
+/// shipped instance of this pattern.
+///
+/// **The branch order is load-bearing.** Production never reaches
+/// `(true, true)` — both writers clear one flag as they set the other (see
+/// `next_decay_help_state`, and the Escape branch on the trigger) — so testing
+/// suppression first is defensive against that input, not required by it. But
+/// the resulting precedence is a pinned contract
+/// (`decay_help_class_escape_suppression_wins_over_open`): should the pair ever
+/// arise, Escape must win, because emitting `--open` would keep the bubble on
+/// screen and make the dismissal look like a no-op. Swapping the two branches
+/// compiles and fails that test.
+fn decay_help_class(is_open: bool, is_suppressed: bool) -> &'static str {
+    if is_suppressed {
+        "settings-info-icon speaker-highlight-help-icon speaker-highlight-help-icon--suppressed"
+    } else if is_open {
+        "settings-info-icon speaker-highlight-help-icon speaker-highlight-help-icon--open"
+    } else {
+        "settings-info-icon speaker-highlight-help-icon"
+    }
+}
+
 #[component]
 pub fn AppearanceSettingsPanel() -> Element {
     let mut theme_ctx = use_context::<ThemePreferenceCtx>();
@@ -209,6 +274,16 @@ pub fn AppearanceSettingsPanel() -> Element {
     let mut custom_theme_ctx =
         try_use_context::<CustomThemeCtx>().unwrap_or(CustomThemeCtx(fallback_custom_theme));
     let mut import_error: Signal<Option<String>> = use_signal(|| None);
+
+    // Decay `(?)` help affordance (issue 1871). Touch has no hover, so a
+    // tap/click latches the tooltip open; hover and keyboard focus reveal it
+    // through CSS alone. Both dismissals — Escape, and a second
+    // tap/Enter/Space — suppress a still-focused tooltip without blurring the
+    // trigger and without closing the settings modal, which is what WCAG 2.1
+    // SC 1.4.13 "Dismissible" requires (a dismissal that moves focus does not
+    // count, and on touch the re-tap is the only one available).
+    let mut decay_help_open = use_signal(|| false);
+    let mut decay_help_suppressed = use_signal(|| false);
 
     let preset_colors = [
         GlowColor::White,
@@ -986,16 +1061,92 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
 
                             div { class: "appearance-slider-row",
-                                label { class: "appearance-slider-label",
-                                    "Decay "
+                                // The `(?)` trigger is a sibling of the label, not a
+                                // child of it: were the label ever wired to the slider
+                                // with `for`/`id`, nested help text would be folded into
+                                // the slider's accessible name.
+                                div { class: "appearance-slider-label-group",
+                                    label { class: "appearance-slider-label", "Decay" }
                                     span {
-                                        class: "settings-info-icon speaker-highlight-help-icon",
-                                        "data-tooltip": "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail.",
-                                        "aria-label": "Decay help",
+                                        class: decay_help_class(decay_help_open(), decay_help_suppressed()),
+                                        role: "button",
+                                        tabindex: 0,
+                                        "aria-label": "About the Decay setting",
+                                        "aria-describedby": "speaker-highlight-decay-tip",
                                         "data-testid": "speaker-highlight-decay-help",
+                                        onclick: move |evt: Event<MouseData>| {
+                                            evt.stop_propagation();
+                                            let (open, suppressed) = next_decay_help_state(
+                                                decay_help_open(),
+                                            );
+                                            decay_help_open.set(open);
+                                            decay_help_suppressed.set(suppressed);
+                                        },
+                                        onkeydown: move |evt: Event<KeyboardData>| {
+                                            let key = evt.key();
+                                            if is_keyboard_activation_key(&key) {
+                                                evt.prevent_default();
+                                                evt.stop_propagation();
+                                                let (open, suppressed) = next_decay_help_state(
+                                                    decay_help_open(),
+                                                );
+                                                decay_help_open.set(open);
+                                                decay_help_suppressed.set(suppressed);
+                                            } else if key == Key::Escape && !decay_help_suppressed() {
+                                                // First Escape while the tooltip shows: dismiss ONLY
+                                                // the tooltip. Stop propagation so the modal's own
+                                                // Escape handler (device_settings_modal.rs) does not
+                                                // close the modal, and do NOT blur — focus stays on
+                                                // the trigger. A second Escape finds the tooltip
+                                                // already suppressed, falls through and bubbles, so
+                                                // the modal closes as usual.
+                                                evt.stop_propagation();
+                                                decay_help_open.set(false);
+                                                decay_help_suppressed.set(true);
+                                            }
+                                        },
+                                        onfocusout: move |_| {
+                                            decay_help_open.set(false);
+                                            decay_help_suppressed.set(false);
+                                        },
                                         "(?)"
+                                        // `role="button"` is children-presentational, so this
+                                        // child's `role="tooltip"` is INERT: the AX tree reports
+                                        // it as `{role: "none", ignored: true}`. Do not "fix"
+                                        // that — `aria-describedby` above does 100% of the work
+                                        // (an `aria-describedby` target contributes its text
+                                        // even when unrendered and even when its own role is
+                                        // dropped). The role is kept only as authoring intent.
+                                        // Children-presentational is also what guarantees this
+                                        // full sentence-pair explanation can never leak into the
+                                        // trigger's accessible name; the explicit `aria-label`
+                                        // above is the second guard.
+                                        span {
+                                            id: "speaker-highlight-decay-tip",
+                                            class: "speaker-highlight-help-tip",
+                                            role: "tooltip",
+                                            "data-testid": "speaker-highlight-decay-help-text",
+                                            {DECAY_HELP_TEXT}
+                                        }
                                     }
                                 }
+                                // DELIBERATE: this slider carries no
+                                // `aria-describedby`. The `(?)` trigger above
+                                // already exposes the full explanation and is
+                                // the immediately preceding stop in both DOM
+                                // and tab order, so pointing the slider at the
+                                // same `#speaker-highlight-decay-tip` would
+                                // replay the whole explanation at two
+                                // consecutive tab stops. The choice is "once
+                                // vs. twice", not "described vs. undescribed".
+                                //
+                                // This is NOT the sibling-not-child concern in
+                                // the comment above: `aria-describedby` never
+                                // contributes to the accessible NAME, so it
+                                // could not pollute this slider's name the way
+                                // nesting the trigger inside the `label` would.
+                                // Different problem — do not conflate them, and
+                                // do not "fix" this omission as an oversight.
                                 input {
                                     r#type: "range",
                                     class: "appearance-slider",
@@ -1226,6 +1377,107 @@ fn slider_fill_style(value_0_1: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decay_help_class_resting_state_carries_no_modifier() {
+        let class = decay_help_class(false, false);
+        // The CSS reveal + suppression rules are all keyed off this base class.
+        assert!(class.contains("speaker-highlight-help-icon"));
+        assert!(
+            !class.contains("--open"),
+            "unexpected open modifier: {class}"
+        );
+        assert!(
+            !class.contains("--suppressed"),
+            "unexpected suppressed modifier: {class}"
+        );
+    }
+
+    #[test]
+    fn decay_help_class_latched_open_adds_open_modifier() {
+        let class = decay_help_class(true, false);
+        assert!(
+            class.contains("speaker-highlight-help-icon--open"),
+            "tap/click latch must force the tooltip visible: {class}"
+        );
+        assert!(!class.contains("--suppressed"));
+    }
+
+    #[test]
+    fn decay_help_toggling_on_opens_and_clears_suppression() {
+        // An explicit open must beat a prior Escape-dismissal.
+        assert_eq!(next_decay_help_state(false), (true, false));
+    }
+
+    #[test]
+    fn decay_help_toggling_off_latches_suppression() {
+        // The regression this pins: clearing `--open` alone is NOT a dismissal.
+        // The trigger still holds focus right after the tap, and `:focus-within`
+        // is a CSS reveal condition, so the bubble would stay on screen. Touch
+        // has no hover and no Escape key, so this re-tap is the only dismissal
+        // that does not move focus — which is precisely what WCAG 2.1 SC 1.4.13
+        // "Dismissible" demands. Restore the old `suppressed = false;
+        // open = !open` and this fails on the second element.
+        assert_eq!(next_decay_help_state(true), (false, true));
+    }
+
+    #[test]
+    fn decay_help_toggle_off_renders_the_suppressed_modifier() {
+        // End-to-end through the production class builder: the state the
+        // off-toggle produces must be the state CSS keys its hide rule off.
+        let (is_open, is_suppressed) = next_decay_help_state(true);
+        let class = decay_help_class(is_open, is_suppressed);
+        assert!(
+            class.contains("speaker-highlight-help-icon--suppressed"),
+            "a second tap must render the suppressed modifier, since only that \
+             rule out-specifies `:focus-within`: {class}"
+        );
+    }
+
+    #[test]
+    fn decay_help_toggle_round_trip_returns_to_a_revealing_state() {
+        // Tap-open → tap-closed → tap-open again. The middle state latches
+        // suppression, so the third tap must clear it or the affordance would
+        // stay dead for the rest of the visit.
+        let (open_1, suppressed_1) = next_decay_help_state(false);
+        assert!(open_1 && !suppressed_1);
+        let (open_2, suppressed_2) = next_decay_help_state(open_1);
+        assert!(!open_2 && suppressed_2);
+        let (open_3, suppressed_3) = next_decay_help_state(open_2);
+        assert!(
+            open_3 && !suppressed_3,
+            "re-tapping a suppressed trigger must reopen it"
+        );
+        assert!(
+            decay_help_class(open_3, suppressed_3).contains("speaker-highlight-help-icon--open")
+        );
+    }
+
+    #[test]
+    fn decay_help_class_escape_suppression_wins_over_open() {
+        // Escape must beat the open latch. The trigger keeps focus after
+        // Escape, so leaving `--open` on would keep the bubble on screen via
+        // both the latch and `:focus-within`, making Escape look like a no-op
+        // (WCAG 2.1 SC 1.4.13 "Dismissible").
+        let class = decay_help_class(true, true);
+        assert!(
+            class.contains("speaker-highlight-help-icon--suppressed"),
+            "suppressed state must be reflected in the class: {class}"
+        );
+        assert!(
+            !class.contains("--open"),
+            "an Escape-suppressed trigger must not also be latched open: {class}"
+        );
+    }
+
+    #[test]
+    fn decay_help_text_is_the_single_source_for_the_explanation() {
+        // The visible `role="tooltip"` element and the accessible description
+        // both render this one constant, so they cannot drift. Guard the two
+        // endpoints the copy exists to explain.
+        assert!(DECAY_HELP_TEXT.contains("0%"), "{DECAY_HELP_TEXT}");
+        assert!(DECAY_HELP_TEXT.contains("100%"), "{DECAY_HELP_TEXT}");
+    }
 
     #[test]
     fn preview_silent_duration_zero_decay_is_short() {

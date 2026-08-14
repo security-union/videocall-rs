@@ -2,6 +2,23 @@ import { test, expect, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
+// The two always-mounted action-bar live regions (`.controls` children, NOT
+// descendants of the nav). `action_bar_announce` writes into the second one.
+const LIVE_REGIONS = '.controls .visually-hidden[role="status"][aria-live="polite"]';
+
+// Must match `ACTION_BAR_RESET_ANNOUNCEMENT` in
+// dioxus-ui/src/components/attendants.rs (issue 1765).
+const RESET_ANNOUNCEMENT = "Action bar reset to default layout.";
+
+// Must match `ACTION_BAR_SLOT_HINT_ID` in the same file (issue 1765).
+const SLOT_HINT_ID = "action-bar-slot-reorder-hint";
+
+// Every customizable slot's PRIMARY button (the `−` remove button is a sibling
+// with class `action-bar-remove-btn`, not `video-control-button`, so it is
+// excluded).
+const SLOT_PRIMARY_BUTTONS =
+  ".video-controls-container .action-bar-slot-wrapper[data-slot] > button.video-control-button";
+
 test.describe("Action bar customize mode", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -46,7 +63,11 @@ test.describe("Action bar customize mode", () => {
   async function openDockMenu(page: Page): Promise<void> {
     await page.locator(".video-controls-container").hover();
     await page.waitForTimeout(300);
-    const toggleBtn = page.locator('.dock-position-wrapper button[aria-haspopup="listbox"]');
+    // Address the trigger by its stable id, not by `aria-haspopup`: issue 1762
+    // re-roled the popup from listbox to menu, so the haspopup VALUE is now the
+    // subject of a dedicated assertion (see "dock menu exposes menu semantics")
+    // rather than a navigation handle every helper depends on.
+    const toggleBtn = page.locator("#dock-menu-trigger");
     await expect(toggleBtn).toBeVisible({ timeout: 10_000 });
     await toggleBtn.click();
     await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 5_000 });
@@ -85,7 +106,7 @@ test.describe("Action bar customize mode", () => {
 
   async function enterCustomizeMode(page: Page): Promise<void> {
     await openDockMenu(page);
-    const customizeOption = page.locator('.glass-select-option[role="option"]', {
+    const customizeOption = page.locator(".glass-select-option", {
       hasText: "Customize",
     });
     await customizeOption.click();
@@ -1004,7 +1025,7 @@ test.describe("Action bar customize mode", () => {
     page,
   }) => {
     // WCAG 2.1.1 regression: before this fix the dock-menu options
-    // (Bottom/Left/Right, Turn Hiding On/Off, Customize, Reset to Default,
+    // (Bottom/Left/Right, auto-hide, Customize, Reset to Default,
     // Action Bar…) were `<div role="option">` with only `onclick` — no
     // `tabindex`, no `onkeydown`. A keyboard-only user could not enter
     // customize mode or reset the bar at all.
@@ -1027,31 +1048,47 @@ test.describe("Action bar customize mode", () => {
     await page.keyboard.press("Space");
     await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 3_000 });
 
-    // Every rendered .glass-select-option must be tab-focusable
-    // (tabindex="0") — the presence of that attribute is exactly what was
-    // missing pre-fix. Separators are naturally excluded from the selector.
+    // issue 1762: ROVING tabindex, not "tabindex=0 on everything".
+    //
+    // The pre-fix code put `tabindex="0"` on all seven items. That is the
+    // listbox-era model and it is wrong under `role="menu"`: a menu is an
+    // application-mode widget where Tab is expected to LEAVE, so seven tab
+    // stops made Tab walk the items with the menu still open, and the seventh
+    // Tab landed on a control behind the still-open `z-index: 1000` popup
+    // (WCAG 2.4.11 Focus Not Obscured). Under the APG menu pattern exactly one
+    // item is in the tab sequence and the rest are `tabindex="-1"`.
     const options = page.locator(".dock-position-wrapper .glass-select-menu .glass-select-option");
     const optionCount = await options.count();
     expect(optionCount).toBeGreaterThanOrEqual(6); // Bottom, Left, Right, autohide, Customize, Reset, Action Bar…
     const tabindices = await options.evaluateAll((els) =>
       els.map((el) => el.getAttribute("tabindex")),
     );
-    for (const t of tabindices) {
-      expect(t, 'every .glass-select-option must have tabindex="0"').toBe("0");
-    }
+    expect(
+      tabindices.filter((t) => t === "0").length,
+      `exactly ONE .glass-select-option may be in the tab sequence (APG menu roving ` +
+        `tabindex); got ${JSON.stringify(tabindices)}`,
+    ).toBe(1);
+    expect(
+      tabindices.filter((t) => t === "-1").length,
+      "every non-roving .glass-select-option must be programmatically focusable " +
+        '(tabindex="-1"), never missing the attribute entirely',
+    ).toBe(optionCount - 1);
+    expect(tabindices[0], "the menu opens with the roving position on the FIRST item").toBe("0");
 
-    // The three dock-position options must carry aria-selected reflecting
-    // the current dock_position (Bottom is the default).
-    const bottomAriaSelected = await options
+    // The three dock-position options must carry aria-checked reflecting the
+    // current dock_position (Bottom is the default). They were `aria-selected`
+    // until issue 1762 re-roled them from `option` to `menuitemradio`, on which
+    // `aria-selected` is not a supported attribute.
+    const bottomAriaChecked = await options
       .filter({ hasText: "Bottom" })
       .first()
-      .getAttribute("aria-selected");
-    expect(bottomAriaSelected).toBe("true");
-    const leftAriaSelected = await options
+      .getAttribute("aria-checked");
+    expect(bottomAriaChecked).toBe("true");
+    const leftAriaChecked = await options
       .filter({ hasText: "Left" })
       .first()
-      .getAttribute("aria-selected");
-    expect(leftAriaSelected).toBe("false");
+      .getAttribute("aria-checked");
+    expect(leftAriaChecked).toBe("false");
 
     // ArrowDown from the trigger focuses the first option; ArrowDown twice
     // more must advance across two options (arrow navigation via the
@@ -1066,14 +1103,72 @@ test.describe("Action bar customize mode", () => {
     await page.keyboard.press("ArrowDown");
     await expect(options.nth(1)).toBeFocused({ timeout: 2_000 });
 
+    // The roving position must MOVE WITH focus, not stay parked on item 0.
+    // If it drifted, the single tab stop would sit on an item the user is not
+    // on — the defect roving tabindex exists to prevent.
+    await expect
+      .poll(
+        async () =>
+          options.evaluateAll((els) => els.map((el) => el.getAttribute("tabindex")).join(",")),
+        { timeout: 2_000 },
+      )
+      .toMatch(/^-1,0,/);
+
     // ArrowUp goes back to Bottom.
     await page.keyboard.press("ArrowUp");
     await expect(options.first()).toBeFocused({ timeout: 2_000 });
+    await expect
+      .poll(
+        async () =>
+          options.evaluateAll((els) => els.map((el) => el.getAttribute("tabindex")).join(",")),
+        { timeout: 2_000 },
+      )
+      .toMatch(/^0,-1,/);
 
     // Escape closes the menu and returns focus to the trigger.
     await page.keyboard.press("Escape");
     await expect(page.locator(".glass-select-menu")).not.toBeVisible({ timeout: 3_000 });
     await expect(trigger).toBeFocused({ timeout: 2_000 });
+  });
+
+  test("Tab inside the dock menu closes it and returns focus to the trigger", async ({ page }) => {
+    // issue 1762 / WAI-ARIA APG menu pattern. `role="menu"` shipped without the
+    // menu keyboard model: the keydown handler covered Escape/Arrows/Home/End
+    // but NOT Tab, and all seven items kept `tabindex="0"`. A keyboard or
+    // screen-reader user in application mode presses Tab expecting focus to
+    // leave and the menu to close; instead focus walked all seven items with
+    // the menu still open, then landed on a control BEHIND the still-open
+    // `z-index: 1000` popup — WCAG 2.4.11 Focus Not Obscured on top of a 2.4.3
+    // focus-order oddity.
+    //
+    // Deleting the `Key::Tab` branch from the menu's `onkeydown` fails this
+    // test: the menu stays visible and focus lands on the second option.
+    await joinMeeting(page, "dock_menu_tab_closes");
+
+    await page.locator(".video-controls-container").hover();
+    await page.waitForTimeout(300);
+    const trigger = page.locator("#dock-menu-trigger");
+    await trigger.focus();
+    await page.keyboard.press("Space");
+    const menu = page.locator(".glass-select-menu");
+    await expect(menu).toBeVisible({ timeout: 3_000 });
+
+    // Move focus INTO the menu — Tab is only intercepted by the menu-level
+    // handler, so the key must be pressed while an option has focus.
+    const options = page.locator(".dock-position-wrapper .glass-select-menu .glass-select-option");
+    await page.keyboard.press("ArrowDown");
+    await expect(options.first()).toBeFocused({ timeout: 2_000 });
+
+    await page.keyboard.press("Tab");
+
+    await expect(menu, "Tab must dismiss the menu, not walk its items").not.toBeVisible({
+      timeout: 3_000,
+    });
+    await expect(
+      trigger,
+      "Tab must hand focus back to the trigger so the browser resumes the tab " +
+        "sequence from the menu's owner, never from behind the popup",
+    ).toBeFocused({ timeout: 2_000 });
   });
 
   test("keyboard user can enter customize mode via the dock menu (Enter on Customize)", async ({
@@ -1236,6 +1331,16 @@ test.describe("Action bar customize mode", () => {
       after,
       "Reset to Default must clear the persisted layout when activated via keyboard",
     ).toBeNull();
+
+    // issue 1765: the KEYBOARD activation path must also push a confirmation
+    // into the action-bar live region. Reverting the
+    // `action_bar_announce.set(ACTION_BAR_RESET_ANNOUNCEMENT..)` line in the
+    // Reset option's `onkeydown` leaves both regions empty and fails here.
+    const liveTexts = await page.locator(LIVE_REGIONS).allTextContents();
+    expect(
+      liveTexts.join(" | "),
+      "Reset via keyboard must announce the reset to screen readers",
+    ).toContain(RESET_ANNOUNCEMENT);
   });
 
   test("customize-mode aria-live regions stay mounted and only their text toggles", async ({
@@ -1393,5 +1498,408 @@ test.describe("Action bar customize mode", () => {
       trigger,
       "Escape must exit customize mode AND return focus to #dock-menu-trigger",
     ).toBeFocused({ timeout: 3_000 });
+  });
+  // ───────────────────────────────────────────────────────────────────────
+  // issue 1762 — dock menu semantics
+  // ───────────────────────────────────────────────────────────────────────
+
+  test("dock menu is a NAMED menu whose items reflect what each one does", async ({ page }) => {
+    // Before this fix the popup was `role="listbox"` with `role="option"`
+    // children and NO accessible name, so a screen reader announced an
+    // unnamed listbox and told the user they were picking a value — while
+    // half the items ("Customize", "Reset to Default", "Action Bar…") are
+    // commands that select nothing.
+    //
+    // Reverting any of `role="menu"`, the `aria-label`, `menuitemradio`,
+    // `menuitemcheckbox`, `menuitem`, or `role="separator"` fails this test.
+    await joinMeeting(page, "dock_menu_semantics");
+    await openDockMenu(page);
+
+    const trigger = page.locator("#dock-menu-trigger");
+    await expect(trigger, "the trigger must advertise the popup it actually opens").toHaveAttribute(
+      "aria-haspopup",
+      "menu",
+    );
+
+    const menu = page.locator(".dock-position-wrapper .glass-select-menu");
+    await expect(menu).toHaveAttribute("role", "menu");
+    const menuLabel = (await menu.getAttribute("aria-label")) ?? "";
+    expect(
+      menuLabel.trim().length,
+      'role="menu" must have an accessible name, otherwise AT announces an unnamed menu',
+    ).toBeGreaterThan(0);
+
+    // No listbox semantics may survive anywhere under the dock wrapper.
+    await expect(page.locator('.dock-position-wrapper [role="listbox"]')).toHaveCount(0);
+    await expect(page.locator('.dock-position-wrapper [role="option"]')).toHaveCount(0);
+
+    const item = (text: string | RegExp) =>
+      menu.locator(".glass-select-option").filter({ hasText: text }).first();
+
+    // Dock positions ARE a value choice → single-select radio group.
+    for (const pos of ["Bottom", "Left", "Right"]) {
+      await expect(item(pos), `${pos} must be a menuitemradio`).toHaveAttribute(
+        "role",
+        "menuitemradio",
+      );
+    }
+    // Bottom is the default dock position; the other two must read unchecked.
+    await expect(item("Bottom")).toHaveAttribute("aria-checked", "true");
+    await expect(item("Left")).toHaveAttribute("aria-checked", "false");
+    await expect(item("Right")).toHaveAttribute("aria-checked", "false");
+
+    // Auto-hide is a persisted boolean → checkbox item, with a STABLE NOUN
+    // label. The old imperative label ("Turn Hiding On"/"Turn Hiding Off")
+    // flipped in lock-step with `aria-checked`, so the name and the state
+    // cancelled and a screen reader announced the inverse of the truth at BOTH
+    // settings — "Turn Hiding Off, check box, checked" while hiding was ON
+    // (WCAG 4.1.2). A noun leaves `aria-checked` as the sole state signal, and
+    // the `.selected` class paints the matching visible ✓.
+    const autohide = item("Auto-hide action bar");
+    await expect(autohide).toHaveAttribute("role", "menuitemcheckbox");
+    await expect(
+      autohide,
+      "auto-hide defaults to OFF on a fresh profile, so the checkbox reads unchecked",
+    ).toHaveAttribute("aria-checked", "false");
+    await expect(
+      autohide,
+      "unchecked must not paint the ✓ that .glass-select-option.selected::before adds",
+    ).not.toHaveClass(/\bselected\b/);
+
+    // Everything else invokes an action and selects nothing → plain menuitem.
+    //
+    // "Action Bar…" must be matched by a case-SENSITIVE regex, not a string:
+    // Playwright's string `hasText` is case-insensitive, so `"Action Bar"` also
+    // matches the "Auto-hide action bar" checkbox item — and since that item
+    // comes first in DOM order, `.first()` would return the checkbox and this
+    // assertion would read `menuitemcheckbox`.
+    const commands: Array<[string, string | RegExp]> = [
+      ["Customize", "Customize"],
+      ["Reset to Default", "Reset to Default"],
+      ["Action Bar…", /Action Bar/],
+    ];
+    for (const [name, matcher] of commands) {
+      await expect(item(matcher), `${name} must be a plain menuitem`).toHaveAttribute(
+        "role",
+        "menuitem",
+      );
+    }
+
+    // Separators inside a `menu` must be exposed as separators, not as
+    // anonymous generics that AT cannot group by.
+    const separators = menu.locator(".glass-select-separator");
+    expect(await separators.count()).toBeGreaterThan(0);
+    const sepRoles = await separators.evaluateAll((els) =>
+      els.map((el) => el.getAttribute("role")),
+    );
+    for (const r of sepRoles) {
+      expect(r, "every .glass-select-separator inside role=menu must be role=separator").toBe(
+        "separator",
+      );
+    }
+  });
+
+  test("re-roling the dock menu did not break Home/End roving focus", async ({ page }) => {
+    // The keyboard helpers (`focus_glass_option_at`) match on the
+    // `.glass-select-option` CLASS, never on role, so the issue-1762 role
+    // change must leave navigation untouched. ArrowDown/ArrowUp are covered
+    // by "dock menu options are keyboard-operable"; this pins Home/End,
+    // which resolve through `focus_glass_option_at(".dock-position-wrapper")`.
+    await joinMeeting(page, "dock_menu_home_end");
+    await openDockMenu(page);
+
+    const options = page.locator(".dock-position-wrapper .glass-select-menu .glass-select-option");
+    const count = await options.count();
+    expect(count).toBeGreaterThanOrEqual(6);
+
+    // Enter the menu, then jump to the last item and back to the first.
+    await options.first().focus();
+    await expect(options.first()).toBeFocused();
+
+    await page.keyboard.press("End");
+    await expect(options.nth(count - 1)).toBeFocused({ timeout: 2_000 });
+
+    await page.keyboard.press("Home");
+    await expect(options.first()).toBeFocused({ timeout: 2_000 });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // issue 1765 — customize-mode a11y polish
+  // ───────────────────────────────────────────────────────────────────────
+
+  test("a repeated (held) arrow key still suppresses the page-scroll default", async ({ page }) => {
+    // The nav-level onkeydown used to `return` on `KeyboardEvent.repeat`
+    // BEFORE calling prevent_default(), so every OS auto-repeat of a HELD
+    // arrow key fell through to the browser default and scrolled the meeting
+    // view behind the customize backdrop.
+    //
+    // Playwright cannot produce OS-level auto-repeat: `keyboard.down()` emits
+    // exactly one keydown with repeat=false, and a *synthetic* untrusted event
+    // never triggers the browser's own scroll. So a "scrollY did not change"
+    // assertion would pass on the broken code too and prove nothing. What IS
+    // observable — and is precisely the bug — is whether the handler cancels
+    // the event on the repeat path. `dispatchEvent` returns false exactly when
+    // preventDefault() was called, so this asserts the fix directly.
+    //
+    // Moving `if ke.repeat() { return; }` back above `evt.prevent_default()`
+    // flips `repeatPrevented` to false and fails this test.
+    await joinMeeting(page, "held_arrow_no_scroll");
+    await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
+    await reloadToGrid(page);
+    await enterCustomizeMode(page);
+
+    const chatInner = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="chat"] > button')
+      .first();
+    await expect(chatInner).toBeVisible({ timeout: 5_000 });
+    await chatInner.focus();
+    await expect(chatInner).toBeFocused();
+
+    const readOrder = async () =>
+      page
+        .locator(".video-controls-container .action-bar-slot-wrapper[data-slot]")
+        .evaluateAll((els) =>
+          els
+            .map((el) => ({
+              slot: el.getAttribute("data-slot") as string,
+              order: parseInt(window.getComputedStyle(el as HTMLElement).order || "0", 10),
+            }))
+            .sort((a, b) => a.order - b.order)
+            .map((s) => s.slot),
+        );
+
+    const dispatchArrow = (repeat: boolean) =>
+      page.evaluate((isRepeat) => {
+        const el = document.activeElement as HTMLElement | null;
+        if (!el) return null;
+        const evt = new KeyboardEvent("keydown", {
+          key: "ArrowRight",
+          code: "ArrowRight",
+          bubbles: true,
+          cancelable: true,
+          repeat: isRepeat,
+        });
+        // dispatchEvent() === false  <=>  preventDefault() was called.
+        return !el.dispatchEvent(evt);
+      }, repeat);
+
+    // Control: a FIRST press (repeat=false) is cancelled — this already
+    // worked before the fix and guards against the assertion mechanism
+    // itself silently reporting "prevented" for every event.
+    const beforeFirst = await readOrder();
+    const firstPrevented = await dispatchArrow(false);
+    expect(firstPrevented, "a first (non-repeat) arrow press must cancel the browser default").toBe(
+      true,
+    );
+    await page.waitForTimeout(150);
+    const afterFirst = await readOrder();
+    expect(
+      afterFirst.indexOf("chat"),
+      "the non-repeat press must still move the slot exactly one position",
+    ).toBe(beforeFirst.indexOf("chat") + 1);
+
+    // The bug: an auto-repeat of the same held key.
+    await chatInner.focus();
+    const repeatPrevented = await dispatchArrow(true);
+    expect(
+      repeatPrevented,
+      "an auto-repeat arrow (held key) must ALSO cancel the browser default, " +
+        "otherwise the meeting view scrolls behind the customize backdrop",
+    ).toBe(true);
+
+    // ...and it must still be ignored for reordering: suppressing the default
+    // must not turn a held key into a fast-forward through the whole bar.
+    await page.waitForTimeout(150);
+    const afterRepeat = await readOrder();
+    expect(
+      afterRepeat,
+      "an auto-repeat event must not move the slot (single press = single step)",
+    ).toEqual(afterFirst);
+  });
+
+  test("Reset to Default announces the reset to screen readers", async ({ page }) => {
+    // Reset restored the default layout silently: nothing was pushed into the
+    // always-mounted `action_bar_announce` live region, so an AT user got no
+    // confirmation anything had happened. Reverting the
+    // `action_bar_announce.set(ACTION_BAR_RESET_ANNOUNCEMENT..)` line in the
+    // Reset option's `onclick` fails this test.
+    await joinMeeting(page, "reset_announces");
+    await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
+    await reloadToGrid(page);
+
+    // Make the reset a REAL undo: reorder a slot first (each arrow press
+    // persists immediately), then leave customize mode — which also clears
+    // the live region, so any text seen later is genuinely new.
+    await enterCustomizeMode(page);
+    const chatInner = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="chat"] > button')
+      .first();
+    await chatInner.focus();
+    await page.keyboard.press("ArrowRight");
+    await page.waitForTimeout(200);
+    const reordered = await page.evaluate(() => localStorage.getItem("vc_action_bar_layout"));
+    expect(reordered, "the reorder must have persisted a layout for Reset to undo").not.toBeNull();
+
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".video-controls-container.customize-mode")).not.toBeVisible({
+      timeout: 5_000,
+    });
+    const clearedTexts = await page.locator(LIVE_REGIONS).allTextContents();
+    expect(
+      clearedTexts.join(" | "),
+      "leaving customize mode must silence the reorder live region first",
+    ).not.toContain(RESET_ANNOUNCEMENT);
+
+    // Now activate Reset with the pointer.
+    await openDockMenu(page);
+    await page.locator(".glass-select-option").filter({ hasText: "Reset to Default" }).click();
+
+    // The reset really happened...
+    await expect
+      .poll(async () => page.evaluate(() => localStorage.getItem("vc_action_bar_layout")), {
+        timeout: 5_000,
+      })
+      .toBeNull();
+
+    // ...and it was announced.
+    await expect
+      .poll(async () => (await page.locator(LIVE_REGIONS).allTextContents()).join(" | "), {
+        timeout: 5_000,
+      })
+      .toContain(RESET_ANNOUNCEMENT);
+
+    // issue 1762: the POINTER path must restore focus too. Clicking a
+    // `tabindex`-bearing div focuses it in Chrome, so unmounting the menu
+    // afterwards dropped focus to <body> — the keyboard path already called
+    // `focus_element_by_id("dock-menu-trigger")` and the click path did not.
+    // Dropping that call from the Reset `onclick` fails here.
+    await expect(
+      page.locator("#dock-menu-trigger"),
+      "activating a menu item with the pointer must leave focus on the trigger, not <body>",
+    ).toBeFocused({ timeout: 3_000 });
+  });
+
+  test("a SECOND consecutive Reset still mutates the live region", async ({ page }) => {
+    // issue 1765, the part the first Reset fix missed. The announcement is a
+    // CONSTANT string, and `dioxus-core`'s `diff_vtext` emits `set_node_text`
+    // only when `left.value != right.value`. Writing the identical text a
+    // second time produced no DOM mutation, so no announcement — the user
+    // pressed Reset twice and heard it once. Nothing clears the region in
+    // between either: the clearing `use_effect` fires on a `customize_mode`
+    // transition, and Reset lives in the menu that only renders while
+    // customize mode is OFF.
+    //
+    // The fix is an alternating invisible U+00A0 suffix keyed on a nonce the
+    // writers bump on every write. This test asserts the TEXT NODE CHANGED
+    // between the two presses — which is the only thing a live region reacts
+    // to. Reverting `action_bar_announce_text` to return the message verbatim
+    // makes both reads identical and fails here.
+    await joinMeeting(page, "reset_twice_announces");
+    await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
+    await reloadToGrid(page);
+
+    const readRegion = async () => (await page.locator(LIVE_REGIONS).allTextContents()).join(" | ");
+
+    await openDockMenu(page);
+    await page.locator(".glass-select-option").filter({ hasText: "Reset to Default" }).click();
+    await expect.poll(readRegion, { timeout: 5_000 }).toContain(RESET_ANNOUNCEMENT);
+    const afterFirst = await readRegion();
+
+    // Second press, no state change in between.
+    await openDockMenu(page);
+    await page.locator(".glass-select-option").filter({ hasText: "Reset to Default" }).click();
+    await expect.poll(readRegion, { timeout: 5_000 }).not.toBe(afterFirst);
+
+    const afterSecond = await readRegion();
+    // Still the same message to a listener — the differentiator is whitespace.
+    expect(afterSecond).toContain(RESET_ANNOUNCEMENT);
+    expect(
+      afterSecond.replace(/\s+/g, " ").trim(),
+      "the two renders must differ only by invisible whitespace; anything audible " +
+        "would be read out as part of the confirmation",
+    ).toBe(afterFirst.replace(/\s+/g, " ").trim());
+  });
+
+  test("customize-mode slot buttons expose the arrow-key reorder hint", async ({ page }) => {
+    // The "arrow keys move the slot" instruction was announced exactly once,
+    // on customize-mode entry. A user who Tabbed to a slot later had no way
+    // to discover the affordance. Every slot's primary button now carries an
+    // `aria-describedby` pointing at a hidden hint, so the description is
+    // read whenever focus lands on a slot.
+    //
+    // Reverting either the `describedby: slot_describedby` props or the
+    // hint element itself fails this test.
+    await joinMeeting(page, "slot_reorder_hint");
+    await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
+    await reloadToGrid(page);
+    await page.locator(".video-controls-container").hover();
+
+    // Outside customize mode neither the hint nor any reference exists — the
+    // description must not be parked on every control for the whole call.
+    const micBtn = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="mic"] > button')
+      .first();
+    await expect(micBtn).toBeVisible({ timeout: 5_000 });
+    expect(
+      await micBtn.getAttribute("aria-describedby"),
+      "no reorder description outside customize mode",
+    ).toBeNull();
+    await expect(page.locator(`#${SLOT_HINT_ID}`)).toHaveCount(0);
+
+    await enterCustomizeMode(page);
+
+    // Every rendered slot's primary button points at the hint.
+    const describedBy = await page
+      .locator(SLOT_PRIMARY_BUTTONS)
+      .evaluateAll((els) => els.map((el) => el.getAttribute("aria-describedby")));
+    expect(
+      describedBy.length,
+      "the customize-mode bar must render several slot buttons",
+    ).toBeGreaterThan(2);
+    for (const d of describedBy) {
+      expect(d, "every customize-mode slot button must be described by the reorder hint").toBe(
+        SLOT_HINT_ID,
+      );
+    }
+
+    // The referenced element exists exactly once and names the affordance.
+    const hint = page.locator(`#${SLOT_HINT_ID}`);
+    await expect(hint, "aria-describedby must not dangle").toHaveCount(1);
+    await expect(hint).toContainText(/arrow keys/i);
+    await expect(hint).toContainText("Home");
+    await expect(hint).toContainText("End");
+
+    // ...and it must stay TERSE. The slot loop is keyed, so a keyboard reorder
+    // moves the DOM node and blurs it; the handler re-focuses on a 0ms timeout.
+    // Focus therefore genuinely re-lands on every arrow press and this
+    // description is respoken every time, before the live region adds
+    // "… moved to position N of M." At the original 21 words, moving a slot
+    // five positions cost roughly 150 spoken words, and on customize entry the
+    // user heard the 45-word entry instruction immediately followed by this
+    // near-identical text. The entry region carries the full explanation; this
+    // only has to remind.
+    const hintWords = ((await hint.textContent()) ?? "").trim().split(/\s+/).length;
+    expect(
+      hintWords,
+      "the per-slot reorder hint is respoken on EVERY arrow press — keep it under " +
+        "12 words and leave the full explanation to the customize-entry live region",
+    ).toBeLessThanOrEqual(12);
+
+    // The hint is a description target, never a live region of its own —
+    // otherwise it would be announced spontaneously on customize entry, on
+    // top of the instructions region that already does that job.
+    const hintRoles = await hint.evaluateAll((els) =>
+      els.map((el) => [el.getAttribute("role"), el.getAttribute("aria-live")]),
+    );
+    expect(hintRoles[0]).toEqual([null, null]);
+
+    // Leaving customize mode takes both the references and the hint away.
+    // Escape is handled by the nav, so focus must be inside the bar.
+    await micBtn.focus();
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".video-controls-container.customize-mode")).not.toBeVisible({
+      timeout: 5_000,
+    });
+    await expect(page.locator(`#${SLOT_HINT_ID}`)).toHaveCount(0);
   });
 });

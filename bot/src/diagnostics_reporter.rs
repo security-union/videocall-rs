@@ -119,11 +119,11 @@ pub fn spawn_diagnostics_reporter(
             let mut emitted = 0usize;
             for (sender_id, counters) in &sender_counters {
                 // Skip senders with no observable traffic in the last window.
-                if counters.video_packets == 0 && counters.audio_packets == 0 {
+                if !should_emit_any(counters) {
                     continue;
                 }
 
-                if counters.video_packets > 0 {
+                if should_emit_video(counters) {
                     let bytes = match build_wrapper(
                         user_id,
                         &user_id_bytes,
@@ -183,6 +183,22 @@ pub fn spawn_diagnostics_reporter(
             config.client_config.user_id
         );
     });
+}
+
+/// Whether a sender has any observable traffic worth a DIAGNOSTICS packet.
+///
+/// Liveness reads ARRIVAL (bytes), not the rung-filtered frame count: `video_packets`
+/// is filtered (#2206) and sits at zero for the whole availability window after a
+/// ladder shed, which would stop emitting this packet's UNFILTERED bitrate payload
+/// while frames are still arriving on the base rung.
+pub(crate) fn should_emit_any(counters: &SenderHealthCounters) -> bool {
+    should_emit_video(counters) || counters.audio_packets > 0
+}
+
+/// Whether to emit the VIDEO half. Same arrival-not-decode rule as
+/// [`should_emit_any`]; see there for why.
+pub(crate) fn should_emit_video(counters: &SenderHealthCounters) -> bool {
+    counters.video_bytes > 0
 }
 
 /// Build a serialized `PacketWrapper { packet_type = DIAGNOSTICS, ... }`
@@ -341,5 +357,42 @@ mod tests {
         assert_eq!(bytes_to_kbps(125), 1);
         // Huge byte count should saturate at u32::MAX rather than wrapping.
         assert_eq!(bytes_to_kbps(u64::MAX), u32::MAX);
+    }
+
+    /// The state #2206 creates: the shed top rung is still inside the availability
+    /// window, so the rung-filtered frame count is 0 while bytes keep arriving.
+    const POST_SHED: SenderHealthCounters = SenderHealthCounters {
+        audio_packets: 0,
+        video_packets: 0,
+        audio_bytes: 0,
+        video_bytes: 2000,
+    };
+
+    #[test]
+    fn a_shed_ladder_still_emits_because_liveness_reads_arrival() {
+        assert!(should_emit_any(&POST_SHED));
+        assert!(should_emit_video(&POST_SHED));
+    }
+
+    #[test]
+    fn a_silent_sender_emits_nothing() {
+        let silent = SenderHealthCounters::default();
+        assert!(!should_emit_any(&silent));
+        assert!(!should_emit_video(&silent));
+    }
+
+    #[test]
+    fn an_audio_only_sender_emits_but_not_the_video_half() {
+        let audio_only = SenderHealthCounters {
+            audio_packets: 50,
+            video_packets: 0,
+            audio_bytes: 4000,
+            video_bytes: 0,
+        };
+        assert!(should_emit_any(&audio_only));
+        assert!(
+            !should_emit_video(&audio_only),
+            "no video bytes means no VIDEO packet, even though the sender is live"
+        );
     }
 }

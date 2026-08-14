@@ -11,11 +11,11 @@ on:
       - 'actix-api/**'
       - 'videocall-types/**'
       - 'protobuf/**'
-      - Dockerfile.actix
       - Cargo.lock
       - Cargo.toml
-      - flake.nix
-      - flake.lock
+      - default.nix
+      - release.nix
+      - 'nix/**'
 
 jobs:
   push_to_registry:
@@ -23,15 +23,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         id: checkout
+
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: videocall-rs
+          # pull works tokenless (public cache); push activates once the
+          # CACHIX_AUTH_TOKEN repo secret exists
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Log in to Docker Hub
         uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-      
+
       - name: Extract SHA
         id: extract_sha
         run: echo "sha8=$(echo ${GITHUB_SHA::8})" >> "$GITHUB_OUTPUT"
@@ -40,16 +48,16 @@ jobs:
         id: extract_branch
         run: echo "branch=$(echo ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}} | sed 's/\//-/g')" >> "$GITHUB_OUTPUT"
 
+      # nix.dev flow: docker load < $(nix-build …) — the same release.nix attr
+      # `make image-media-server` builds locally.
       - name: Build and push API Docker image
-        uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
-        with:
-          context: .
-          file: Dockerfile.actix
-          push: true
-          tags: |
-            securityunion/videocall-media-server:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
-            securityunion/videocall-media-server:latest
-          build-args: |
-            GIT_SHA=${{ steps.extract_sha.outputs.sha8 }}
-            GIT_BRANCH=${{ steps.extract_branch.outputs.branch }}
-            BUILD_TIMESTAMP=${{ github.event.head_commit.timestamp }}
+        run: |
+          script=$(nix-build release.nix -A images.media-server --no-out-link \
+            --argstr gitSha "${{ steps.extract_sha.outputs.sha8 }}" \
+            --argstr gitBranch "${{ steps.extract_branch.outputs.branch }}" \
+            --argstr buildTimestamp "${{ github.event.head_commit.timestamp }}")
+          "$script" | docker load
+          docker tag videocall/media-server:dev securityunion/videocall-media-server:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+          docker tag videocall/media-server:dev securityunion/videocall-media-server:latest
+          docker push securityunion/videocall-media-server:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+          docker push securityunion/videocall-media-server:latest

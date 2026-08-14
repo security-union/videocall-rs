@@ -6,10 +6,12 @@ use dioxus::prelude::*;
 ///
 /// - `level`: 0..=5, number of filled bars.
 /// - `lost`: when true, all bars are gray and a red diagonal slash is drawn.
+/// - `unmeasured`: when true, all bars are gray without the lost slash.
 #[component]
 pub fn SignalBarsIcon(
     #[props(default = 5)] level: u8,
     #[props(default = false)] lost: bool,
+    #[props(default = false)] unmeasured: bool,
 ) -> Element {
     let level = level.min(5);
 
@@ -64,7 +66,7 @@ pub fn SignalBarsIcon(
                 }
             }
             // Red diagonal slash when signal is lost
-            if lost || level == 0 {
+            if lost || (level == 0 && !unmeasured) {
                 line {
                     x1: "0.5",
                     y1: "3",

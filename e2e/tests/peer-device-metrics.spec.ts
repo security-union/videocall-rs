@@ -111,6 +111,7 @@ async function joinMeetingAs(
   meetingId: string,
   username: string,
   cameraOn = true,
+  extraInitScript?: string,
 ): Promise<Page> {
   const page = await context.newPage();
   if (cameraOn) {
@@ -121,6 +122,17 @@ async function joinMeetingAs(
         /* storage may be unavailable before origin navigation */
       }
     });
+  }
+  // #2095: an optional page-world script installed BEFORE any app script runs
+  // (so it can shim a native constructor the wasm glue resolves at call time).
+  // Passed as a SOURCE STRING, not a function: Playwright serialises function
+  // init scripts with `Function.prototype.toString()` AFTER TS transpilation, so
+  // any downlevelled helper (`class`, spread over a Uint8Array, ...) would emit
+  // references to TS runtime helpers that do not exist in the page. A raw string
+  // is evaluated verbatim. Same hazard documented in
+  // `diagnostics-heartbeat-tab-visibility.spec.ts`.
+  if (extraInitScript) {
+    await page.addInitScript({ content: extraInitScript });
   }
 
   await page.goto("/");
@@ -221,6 +233,7 @@ async function standUpTwoPeerCall(
   browsers: Browser[],
   uiURL: string,
   meetingId: string,
+  guestInitScript?: string,
 ): Promise<MeetingMember[]> {
   const profiles = [
     { email: "host-dev@videocall.rs", name: "DevHost" },
@@ -248,7 +261,13 @@ async function standUpTwoPeerCall(
   await clickJoinAndEnterGrid(members[0].page);
 
   // Guest joins. Handle direct-join / waiting-room / auto-join.
-  members[1].page = await joinMeetingAs(members[1].context, meetingId, profiles[1].name);
+  members[1].page = await joinMeetingAs(
+    members[1].context,
+    meetingId,
+    profiles[1].name,
+    true,
+    guestInitScript,
+  );
 
   const joinButton = members[1].page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const waitingRoom = members[1].page.getByText("Waiting to be admitted");
@@ -386,6 +405,127 @@ async function openDiagnosticsDrawer(page: Page) {
  * `0%` for nearly everyone), so it must NEVER appear as a device-row label.
  */
 const ALWAYS_AVAILABLE_DEVICE_LABELS = ["OS", "Device", "Cores", "Architecture", "Memory"];
+
+// ────────────────────────────────────────────────────────────────────────────
+// #2095 (security): envelope-identity forgery harness
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The session id the forging peer claims. Arbitrary, but must not collide with a
+ * real relay-assigned session (those come from a v4 UUID's low 64 bits, so a
+ * small decimal constant effectively cannot collide).
+ */
+const FORGED_SESSION_ID = 987654321;
+const FORGED_USER_ID = "victim@videocall.rs";
+
+/**
+ * Page-world script that rewrites every OUTBOUND HEALTH `PacketWrapper` this page
+ * sends so the envelope claims `FORGED_SESSION_ID` / `FORGED_USER_ID` instead of
+ * the sender's real identity. This is the exact malicious-client behaviour of
+ * issue #2095.
+ *
+ * ## Why this shape
+ *
+ * * **A source STRING, not a function.** Playwright serialises function init
+ *   scripts through `Function.prototype.toString()` AFTER the TS transpile, so a
+ *   `class`/spread/`for..of` downlevel would reference TS runtime helpers that do
+ *   not exist in the page. Verbatim source sidesteps that entirely.
+ * * **`Proxy` + `Reflect.construct`, not `class extends WebSocket`.** Same
+ *   constraint, and the pattern already proven by
+ *   `diagnostics-heartbeat-tab-visibility.spec.ts`'s `Worker` shim.
+ * * **Shim `window.WebSocket`.** `videocall-transport`'s WS transport calls
+ *   `WebSocket::new` on the MAIN thread (`websocket.rs`), and the wasm-bindgen
+ *   glue resolves the free `WebSocket` binding from the global at CALL time —
+ *   so an `addInitScript` shim installed before the wasm module boots is seen.
+ *   `createAuthenticatedContext` already pins the transport to WebSocket
+ *   (`vc_transport_preference=websocket`), which since #2045 is also the product
+ *   default, so this covers the primary transport.
+ * * **Append rather than rewrite in place.** protobuf takes LAST-wins for a
+ *   repeated scalar, so appending `user_id` (field 2, wire type 2) and
+ *   `session_id` (field 4, wire type 0) overrides whatever the client wrote —
+ *   no varint surgery on the existing buffer, and it works whether or not the
+ *   client emitted the field at all (a real client leaves `session_id` at the
+ *   proto3 default 0, which is not serialised).
+ * * **Sniff `08 06`.** protobuf-rust serialises fields in field-number order, so
+ *   a HEALTH wrapper always begins with field 1 (`0x08`) = `HEALTH` (`0x06`).
+ *   Restricting the rewrite to HEALTH keeps the media path untouched, so the
+ *   call itself stays healthy while the attack runs.
+ *
+ * `window.__vcForgedHealthCount` counts successful rewrites. The test ASSERTS it
+ * is non-zero before drawing any conclusion — otherwise "no forged row appeared"
+ * would pass vacuously on a shim that never fired, which is the classic false
+ * green this repo's review rules call out.
+ */
+const FORGE_HEALTH_IDENTITY_INIT_SCRIPT = `
+(() => {
+  const FORGED_SESSION = ${FORGED_SESSION_ID};
+  const FORGED_USER = ${JSON.stringify(FORGED_USER_ID)};
+  window.__vcForgedHealthCount = 0;
+
+  function varint(value) {
+    const out = [];
+    let v = value;
+    while (v > 127) {
+      out.push((v & 0x7f) | 0x80);
+      v = Math.floor(v / 128);
+    }
+    out.push(v & 0x7f);
+    return out;
+  }
+
+  function forge(bytes) {
+    // Outer field 1 (packet_type) varint == 6 (HEALTH): tag 0x08, value 0x06.
+    if (bytes.length < 2 || bytes[0] !== 0x08 || bytes[1] !== 0x06) {
+      return null;
+    }
+    const user = new TextEncoder().encode(FORGED_USER);
+    const extra = [];
+    extra.push(0x12);                       // field 2 (user_id), wire type 2
+    Array.prototype.push.apply(extra, varint(user.length));
+    Array.prototype.push.apply(extra, Array.prototype.slice.call(user));
+    extra.push(0x20);                       // field 4 (session_id), wire type 0
+    Array.prototype.push.apply(extra, varint(FORGED_SESSION));
+
+    const out = new Uint8Array(bytes.length + extra.length);
+    out.set(bytes, 0);
+    out.set(new Uint8Array(extra), bytes.length);
+    return out;
+  }
+
+  const NativeWebSocket = window.WebSocket;
+  window.WebSocket = new Proxy(NativeWebSocket, {
+    construct(target, args, newTarget) {
+      const ws = Reflect.construct(target, args, newTarget);
+      const nativeSend = NativeWebSocket.prototype.send;
+      Object.defineProperty(ws, "send", {
+        configurable: true,
+        writable: true,
+        value: function (data) {
+          try {
+            let bytes = null;
+            if (data instanceof ArrayBuffer) {
+              bytes = new Uint8Array(data);
+            } else if (ArrayBuffer.isView(data)) {
+              bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+            }
+            if (bytes) {
+              const forged = forge(bytes);
+              if (forged) {
+                window.__vcForgedHealthCount += 1;
+                return nativeSend.call(ws, forged);
+              }
+            }
+          } catch (e) {
+            /* fall through to the untouched frame */
+          }
+          return nativeSend.call(ws, data);
+        },
+      });
+      return ws;
+    },
+  });
+})();
+`;
 
 test.describe("Per-peer device / hardware metrics (#1482)", () => {
   // Heavy: two camera-on WebCodecs renderers + a full ~5 s health-interval wait
@@ -667,6 +807,134 @@ test.describe("Per-peer device / hardware metrics (#1482)", () => {
       for (const label of labels) {
         expect(knownLabels, `unexpected device-row label "${label}"`).toContain(label);
       }
+    } finally {
+      for (const m of members) {
+        if (m.page) {
+          await m.page.close().catch(() => undefined);
+        }
+        await m.context.close().catch(() => undefined);
+      }
+      await Promise.all(browsers.map((b) => b.close().catch(() => undefined)));
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // #2095 (SECURITY) — device-info attribution must survive a forged envelope.
+  //
+  // BEHAVIOR UNDER TEST: the relay now re-stamps `PacketWrapper.session_id` AND
+  // `PacketWrapper.user_id` with the publishing session's AUTHENTICATED identity
+  // on the broadcast path (`chat_server::Handler<ClientMessage>` ->
+  // `packet_handler::stamp_wrapper_for_broadcast`).
+  //
+  // WHY IT WAS BROKEN BEFORE: `session_id` was stamped FILL-IF-ZERO and
+  // `user_id` was never stamped, so a forged NON-ZERO envelope reached every
+  // peer intact. That matters specifically for HEALTH, because
+  // `client_diagnostics::trim_health_packet_for_peers` strips the inner identity
+  // scalars from the peer-facing copy — leaving the OUTER envelope as the only
+  // attribution the receiving UI has. `video_call_client.rs` keys
+  // `set_peer_device_info(response.session_id, ..)` off it, and the same
+  // envelope feeds `ensure_peer(session_id, user_id)`. So a forged id both
+  // mis-attributed the device panel AND minted a ghost peer (with its own
+  // decoder Workers) in every participant's browser.
+  //
+  // WHAT THIS ASSERTS on the RECEIVING host:
+  //   1. the forgery actually ran (guards against a vacuous pass if the
+  //      WebSocket shim ever stops intercepting);
+  //   2. real device info still arrives (the feature is not merely broken);
+  //   3. NO device block exists for the forged session id; and
+  //   4. NO extra peer tile was minted (the ghost-peer half).
+  //
+  // MUTATION PROOF — RUN, not asserted. This spec was executed against BOTH a
+  // pre-#2095 relay and a #2095 relay:
+  //   * pre-#2095 relay  -> FAILS at assertion 3, with
+  //     `[data-testid="diag-device-peer-987654321"]` resolving to 1 element:
+  //     the ghost device block really does render in the victim's drawer.
+  //     Reaching assertion 3 at all also proves assertions 1 and 2 held, i.e.
+  //     the WebSocket shim genuinely fired and real device info was flowing —
+  //     so the pass on fixed code is not vacuous.
+  //   * #2095 relay      -> PASSES.
+  //
+  // HOW TO RE-RUN THE MUTATION SIDE without rebuilding the docker stack (the
+  // fix is server-side, and the stack's relay is baked from its bind-mounted
+  // clone): start a relay from the branch under test on a spare port —
+  //   ACTIX_PORT=8099 NATS_URL=127.0.0.1:4222 DATABASE_ENABLED=false \
+  //   FEATURE_MEETING_MANAGEMENT=true JWT_SECRET=dev-jwt-secret-change-me \
+  //   cargo run --bin websocket_server
+  // — and point both browser contexts at it by calling
+  // `routeDownlinkThroughProxy(ctx, "ws://localhost:8099")` from
+  // `helpers/downlink-impair` inside `standUpTwoPeerCall` (it rewrites
+  // `window.__APP_CONFIG.wsUrl` through BOTH config layers, which is what makes
+  // the override survive `config.local.js`). Running the spec unmodified then
+  // targets the stack's relay, giving the other side of the comparison. That
+  // hook is deliberately NOT committed here: the spec must stay stack-agnostic.
+  // ──────────────────────────────────────────────────────────────────────────
+  test("a forged envelope session_id cannot mis-attribute peer device info", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_devmetrics_forge_${Date.now()}`;
+
+    const browsers = await Promise.all([
+      chromium.launch({ args: BROWSER_ARGS }),
+      chromium.launch({ args: BROWSER_ARGS }),
+    ]);
+    const members: MeetingMember[] = [];
+
+    try {
+      // The GUEST is the malicious client; the HOST is the victim receiver whose
+      // UI we inspect.
+      members.push(
+        ...(await standUpTwoPeerCall(
+          browsers,
+          uiURL,
+          meetingId,
+          FORGE_HEALTH_IDENTITY_INIT_SCRIPT,
+        )),
+      );
+      const hostPage = members[0].page;
+      const guestPage = members[1].page;
+
+      // (1) The forgery actually ran. HealthPackets fire on a ~5 s timer, so poll
+      // through at least one interval. Without this the rest of the test could
+      // pass on a shim that silently never intercepted.
+      await expect
+        .poll(
+          async () =>
+            guestPage
+              .evaluate(() => (window as unknown as Record<string, number>).__vcForgedHealthCount)
+              .catch(() => 0),
+          {
+            timeout: 45_000,
+            message: "the guest must have rewritten at least one outbound HEALTH envelope",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      const drawer = await openDiagnosticsDrawer(hostPage);
+      const deviceContainer = drawer.locator("details.diag-device");
+      await expect(deviceContainer).toBeVisible({ timeout: 45_000 });
+      const deviceSummary = deviceContainer.locator(".diag-disclosure-summary");
+      await expect(deviceSummary).toHaveText(/^Per-peer hardware \(\d+\)$/);
+      await deviceSummary.click();
+      await expect(deviceContainer).toHaveAttribute("open", "");
+
+      // (2) Real device info still arrives — exactly one per-peer block, the
+      // guest's, carrying a real device fact. A fix that dropped forged HEALTH
+      // entirely (rather than re-attributing it) would fail here.
+      const peerBlocks = deviceContainer.locator('[data-testid^="diag-device-peer-"]');
+      await expect(peerBlocks).toHaveCount(1, { timeout: 45_000 });
+      await expect(
+        peerBlocks.locator(".diag-device-row-label", { hasText: "Cores" }),
+      ).toBeVisible();
+
+      // (3) The forged session id must NOT appear as a device block.
+      await expect(
+        deviceContainer.locator(`[data-testid="diag-device-peer-${FORGED_SESSION_ID}"]`),
+      ).toHaveCount(0);
+
+      // (4) ...and no ghost tile was minted for it. The host still sees exactly
+      // the one real remote peer.
+      await expect(hostPage.locator("#grid-container .canvas-container")).toHaveCount(1);
     } finally {
       for (const m of members) {
         if (m.page) {

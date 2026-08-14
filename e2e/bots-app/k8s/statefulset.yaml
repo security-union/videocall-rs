@@ -1,0 +1,337 @@
+# statefulset.yaml — the videocall-bots fleet (Increment 2, #2035/#2072).
+#
+# Runs N one-bot-per-pod headless clock-mode bots in ns `bot-load`, each with a
+# DISTINCT test-account identity (pod ordinal → BOT_EMAIL_<N> from the
+# `bot-accounts` Secret) and a per-pod capability cap (BOT_HW_CONCURRENCY → 3
+# simulcast layers). All join the labsworkspace `bottest` room. Stacks on
+# Increment 1 (k8s/bot-pod.yaml) — same hardened pod shape, same image.
+#
+# WHY a StatefulSet (not a Deployment): pods need STABLE, ordinal-indexed
+# identities. The entrypoint derives its ordinal from the pod hostname
+# (videocall-bots-<N>) and selects that ordinal's account — so a Deployment's
+# random pod-name suffixes would not give a deterministic ordinal→account map.
+#
+# LIFECYCLE (important): a StatefulSet pod's restartPolicy is always `Always`
+# (K8s forbids Never here). So if a bot exits (TTL reached, or crash) the
+# container RESTARTS. For a soak run set TTL=infinite (below) so the bot never
+# self-exits; STOP the fleet by scaling to 0 (or deleting the StatefulSet):
+#   kubectl -n bot-load scale statefulset/videocall-bots --replicas=0
+# A restarted pod keeps its ordinal, hence its account — no identity churn.
+#
+# PREREQS (see the deploy sequence in the PR/report):
+#   1. namespace.yaml applied (ns bot-load + ResourceQuota)
+#   2. `hclcr-io` imagePullSecret copied into bot-load (see bot-pod.yaml header)
+#   3. `bot-accounts` Secret created (see k8s/bot-accounts.example.yaml) with one
+#      BOT_EMAIL_<N>/BOT_PASSWORD_<N> pair per replica ordinal (0..replicas-1)
+#   4. `bot-ctl-token` Secret created (see k8s/bot-ctl-token.example.yaml) — the
+#      single fleet-wide bearer token for the control API (Increment 3, #2072)
+#
+# ⚠️ UPGRADING AN EXISTING FLEET TO THIS MANIFEST NEEDS A DELETE+RECREATE.
+# `volumeClaimTemplates` is IMMUTABLE on a live StatefulSet: K8s only permits
+# updates to replicas / ordinals / template / updateStrategy /
+# revisionHistoryLimit / persistentVolumeClaimRetentionPolicy / minReadySeconds,
+# so `kubectl apply` against a fleet created BEFORE the run-artifacts claim
+# existed fails with "updates to statefulset spec for fields other than ... are
+# forbidden" (verified by server dry-run, 2026-07-31). Recreate, keeping the
+# controller object only — the pods are stateless bots, nothing is lost:
+#   kubectl -n bot-load delete sts videocall-bots --cascade=orphan   # keep pods up
+#   kubectl -n bot-load apply -f k8s/statefulset.yaml                # re-adopts them
+# (or simply `scale --replicas=0`, `delete sts`, `apply`, `scale` back up).
+# A FRESH namespace needs none of this — a plain `apply` creates it correctly.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: videocall-bots
+  namespace: bot-load
+  labels:
+    app.kubernetes.io/name: videocall-bot
+    app.kubernetes.io/instance: videocall-bots
+    app.kubernetes.io/component: bot-fleet
+    app.kubernetes.io/part-of: videocall
+spec:
+  serviceName: videocall-bots
+  # Fleet size. Each replica needs its own provisioned account in bot-accounts
+  # (ordinals 0..replicas-1). Scaling up beyond the number of accounts makes the
+  # new pods fail fast at startup (entrypoint: "ordinal N has no provisioned
+  # account") — provision the account first, then scale.
+  # ⚠ THE BOT_HW_CONCURRENCY=10 RATIONALE BELOW NEEDS >= 8 REPLICAS. Below 7
+  # decoded peers both ladders pick the top rung and the third rung is pure
+  # encode cost on the same 4-core budget it exists to protect. Scale before
+  # measuring (README fleet runbook); 3 is a deliberate start-small default.
+  replicas: 3
+  # The bots are independent — no start/stop ordering between them — so bring
+  # them up (and tear them down) in parallel rather than one-at-a-time. Ordinal
+  # identity is still stable; only the OrderedReady gating is dropped.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: videocall-bot
+      app.kubernetes.io/instance: videocall-bots
+  template:
+    metadata:
+      labels:
+        # `instance` distinguishes this fleet from Increment 1's standalone pod
+        # (which shares name/component/part-of) so the headless Service selector
+        # does not accidentally scoop that pod into this fleet's DNS.
+        app.kubernetes.io/name: videocall-bot
+        app.kubernetes.io/instance: videocall-bots
+        app.kubernetes.io/component: bot-fleet
+        app.kubernetes.io/part-of: videocall
+    spec:
+      # This pod never calls the K8s API (it drives a browser against external
+      # sites) — don't hand a compromised Chrome the default ServiceAccount token.
+      automountServiceAccountToken: false
+      # Harbor pull secret (reused hclcr-io creds, copied into this namespace).
+      imagePullSecrets:
+        - name: hclcr-io
+      # Non-root at the pod level. Chromium runs WITHOUT --no-sandbox (see
+      # src/bot.ts CHROME_ARGS), so it uses the setuid chrome-sandbox, which
+      # requires a non-root caller. uid 1000 == the image's `pwuser`.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: bot
+          # Harbor (hclcr.io/hcllabs) — pulled via the pod-level `hclcr-io`
+          # imagePullSecret. `:latest` is what build.sh pushes for the iteration
+          # loop; for a reproducible/pinned run replace it with the dated tag
+          # build.sh also emits (0.1.0-YYYYMMDD-<sha7>).
+          image: hclcr.io/hcllabs/videocall-bots-app:latest
+          # Always-pull so a re-pushed dev `:latest` is re-fetched on restart.
+          imagePullPolicy: Always
+          # Container securityContext (Increment 3, #2072): grant ONLY CAP_NET_ADMIN.
+          # It is now USED — the /netem control endpoint shells out to `tc`
+          # (iproute2, already in the image) to shape THIS pod's own network, which
+          # requires CAP_NET_ADMIN. Deliberately NOT set here:
+          #   • allowPrivilegeEscalation — left at its DEFAULT (true). Chromium runs
+          #     WITHOUT --no-sandbox and needs the setuid chrome-sandbox; setting it
+          #     false turns on no_new_privs, which breaks the sandbox launch. Do NOT
+          #     "harden" this to false — it will crash every bot.
+          #   • privileged / hostNetwork / other caps — not needed; least privilege.
+          # tc shapes only the pod's OWN net namespace, so NET_ADMIN's blast radius
+          # is this pod alone. We ADD NET_ADMIN to the default capability set — we
+          # do NOT `drop: ["ALL"]`: the setuid chrome-sandbox helper needs default
+          # caps (SYS_CHROOT/SETUID/SETGID) in the bounding set, and dropping ALL
+          # would strip them and break the sandbox. That is why Inc1/Inc2 relied on
+          # the default set (no container securityContext) — this only extends it.
+          # NOTE (deploy-time validation): a capability added via `capabilities.add`
+          # on a NON-root (uid 1000) container reaches an exec'd child (`tc`) only if
+          # the runtime propagates it to the process AMBIENT set — this MUST be
+          # verified in-cluster. `tc` is granted `cap_net_admin+eip` via `setcap`
+          # at image-build time (Dockerfile) so this non-root (uid 1000) pod can
+          # actually shape eth0 — NET_ADMIN via capabilities.add lands only in the
+          # bounding set (K8s sets no ambient caps), so the file cap is required.
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          env:
+            - name: MEETING_URL
+              value: "https://app.videocall.labsworkspace.fnxlabs.com/meeting/bottest"
+            - name: TTL
+              value: "infinite"
+            - name: BOT_AUTH
+              value: "form-login"
+            # Per-pod identity. `ordinal` = derive the replica index from the pod
+            # hostname (videocall-bots-<N>) and select BOT_EMAIL_<N>/
+            # BOT_PASSWORD_<N> from the bot-accounts Secret; handle = bot-<N>.
+            # (BOT_PARTICIPANT is intentionally NOT set here — a shared template
+            # value would collide across all pods; the entrypoint derives it.)
+            - name: BOT_IDENTITY_MODE
+              value: "ordinal"
+            # Point the resource sampler (#2032) at the PERSISTENT volume below.
+            # WITHOUT this the entrypoint defaults BOT_RUN_DIR to /tmp/bots-run —
+            # the container filesystem — and every artifact dies with the pod on
+            # scale-down (that is exactly what was lost on the 2026-07-31 #2143
+            # run). Must stay in sync with the `run-artifacts` volumeMount path.
+            - name: BOT_RUN_DIR
+              value: "/var/lib/bots-run"
+            # Keep the CLEARTEXT ctl bearer token OFF the retained PVC (#2157).
+            # The token file (ctl-<pid>.token, mode 0600) defaults to BOT_RUN_DIR
+            # — which the line above just made a PVC that a StatefulSet NEVER
+            # reclaims, so the credential would outlive the workload and survive a
+            # rotation of the bot-ctl-token Secret. This sends ONLY the token to
+            # the pod-lifetime `ctl-state` emptyDir below; the #2032 resource CSVs
+            # still go to BOT_RUN_DIR (the PVC), which is the whole point of that
+            # volume and must not regress. Must stay in sync with the `ctl-state`
+            # volumeMount path.
+            - name: BOT_CTL_STATE_DIR
+              value: "/var/lib/bots-ctl"
+            # Capability cap → simulcast layer cap. 10 fake cores → 3 rungs
+            # (client check: <6→1, 6..9→2, >=10→3).
+            #
+            # Three, not two: a 2-rung [low, hd] ladder leaves the #1256 tile lid
+            # no middle rung, so each receiver decodes hd per peer. This caps what
+            # a bot PUBLISHES — the decode saving is COLLECTIVE and needs >= 7
+            # decoded peers, so it does NOT hold at the committed replicas (see
+            # the warning at `replicas:`).
+            #
+            # #2248 carries the figures and three consequences that are not
+            # obvious here: it is ALSO the SCREEN ceiling (`host.rs` feeds one
+            # capability value to both encoders, making a 1440p rung reachable);
+            # it is reported as `client_cores`, so it moves
+            # `videocall_client_cpu_throttled` with no change in real CPU; and the
+            # band's dense end has only ~2px of margin.
+            - name: BOT_HW_CONCURRENCY
+              value: "10"
+            # Receiver low-power caps (issues #2068/#2069, increment 5) are
+            # DELIBERATELY UNSET here: the fleet default is a REALISTIC
+            # full-decode client, so a run reproduces the same total-room decode
+            # load (and any decode-saturation freeze) a real participant would.
+            # ⚠ Conditional on 3 rungs: once receivers lid to the middle rung the
+            # relay's LAYER_HINT union can shed publishers toward [low, standard],
+            # so the fleet UNDER-loads. Confirm
+            # videocall_encoder_active_layers{media_kind="camera"} reads 3.
+            # They are OPT-IN levers — enable them ONLY to trade realism for
+            # scale (cap per-bot DECODE + PAINT CPU so the box holds more bots
+            # while you load the SERVER with many participants). To opt in, add:
+            #   - name: BOT_MAX_RECEIVED_LAYER   # 0 = base rung only (cuts decode)
+            #     value: "0"
+            #   - name: BOT_SKIP_CANVAS_PAINT    # decode-and-drop (cuts paint only)
+            #     value: "true"
+            # Injected at launch as window.__APP_CONFIG overrides (the client
+            # parses that once + prod config.js freezes it, so they are NOT
+            # runtime-toggleable); effect requires the DEPLOYED client to carry
+            # videocall-client PR #2078 (bot logs a post-join assertion either way).
+            # Control server (Increment 3, #2072). Setting BOT_CTL_PORT turns the
+            # control server ON in the entrypoint; it binds 0.0.0.0 so the headless
+            # Service name resolves to it on the pod network. The token is a single
+            # fleet-wide shared secret (bot-ctl-token); the entrypoint fails fast if
+            # BOT_CTL_PORT is set but the token is empty (never an unauthenticated
+            # bind). Keep BOT_CTL_PORT in sync with the containerPort + Service port.
+            - name: BOT_CTL_PORT
+              value: "8080"
+            - name: BOT_CTL_BIND
+              value: "0.0.0.0"
+            - name: BOT_CTL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: bot-ctl-token
+                  key: token
+          # Control-API port. Named `ctl` so the Service can target it by name.
+          # Reachable ONLY in-cluster (headless Service DNS) — no Ingress/LB fronts
+          # it — and every request requires the bot-ctl-token bearer token.
+          ports:
+            - name: ctl
+              containerPort: 8080
+              protocol: TCP
+          # Inject the WHOLE bot-accounts Secret (BOT_EMAIL_0/BOT_PASSWORD_0, …)
+          # into every pod's env; the entrypoint picks only THIS ordinal's pair.
+          # A StatefulSet shares one pod template, so per-pod secretKeyRef
+          # selection is not possible — envFrom + ordinal indirection is the
+          # mechanism. (Blast-radius note in the report/Warnings.)
+          envFrom:
+            - secretRef:
+                name: bot-accounts
+          resources:
+            requests:
+              cpu: "1500m"
+              memory: "1.5Gi"
+            limits:
+              # CPU limit set high (not 2) so CFS throttling of the bursty
+              # headless-Chrome encoder can't self-induce a false
+              # RESOURCE_STARVED fps verdict — the signal this tool measures.
+              # The namespace ResourceQuota requires a limit, so it's generous
+              # rather than omitted.
+              cpu: "4"
+              memory: "2Gi"
+          volumeMounts:
+            # Headless Chrome shared memory. Default container /dev/shm is 64Mi,
+            # a classic crash/OOM gotcha. src/bot.ts also passes
+            # --disable-dev-shm-usage (so Chrome prefers /tmp), making this mount
+            # defense-in-depth. A `medium: Memory` emptyDir is charged to the pod
+            # memory limit, so it MUST stay well under the burst headroom
+            # (limit 2Gi − request 1.5Gi = 512Mi): a dshm cap equal to the whole
+            # band would leave zero OOM margin if /dev/shm ever filled while Chrome
+            # sat at its request floor. 256Mi keeps a real margin, and since
+            # --disable-dev-shm-usage already diverts Chrome to /tmp this cap is
+            # rarely approached — 256Mi is ample.
+            - name: dshm
+              mountPath: /dev/shm
+            # Resource-sampler artifacts (issue #2032): the run's *-raw.csv /
+            # *-derived.csv / report. BOT_RUN_DIR (the CLI's --assets-dir)
+            # defaults to /tmp/bots-run, which is the CONTAINER filesystem — so
+            # before this volume existed, `scale --replicas=0` DESTROYED every
+            # bot's captured resource data. That happened on the 2026-07-31 run
+            # (issue #2143): the per-bot CSVs were lost, which made a
+            # pod-vs-Prometheus cross-check of the CPU numbers impossible after
+            # the fact.
+            #
+            # Each ordinal gets its OWN PVC via volumeClaimTemplates, and a
+            # StatefulSet keeps `<claim>-<pod>` across restarts AND across a
+            # scale-to-0/scale-back-up cycle, so artifacts survive teardown and a
+            # later run can still collect them. Mounted at a dedicated path (NOT
+            # /tmp) so only the artifacts are persisted — Chrome's scratch in
+            # /tmp stays ephemeral, which is what we want.
+            - name: run-artifacts
+              mountPath: /var/lib/bots-run
+            # Ctl-token scratch (issue #2157). Holds ONLY ctl-<pid>.token — the
+            # cleartext fleet-wide control-API bearer token — pointed here by
+            # BOT_CTL_STATE_DIR above. An emptyDir shares the POD's lifetime, so
+            # the credential is destroyed when the pod is (a `scale --replicas=0`
+            # included), which is what makes rotating the bot-ctl-token Secret
+            # actually invalidate every on-disk copy again. Deliberately NOT the
+            # run-artifacts PVC (which persists by design) and deliberately NOT
+            # `medium: Memory` — a tmpfs emptyDir is charged against the pod's
+            # memory limit, and the 2Gi−1.5Gi burst headroom is already budgeted
+            # for /dev/shm (256Mi); a ~200-byte token does not warrant eating
+            # into it. Node-disk backing is fine: the file is 0600 and gone with
+            # the pod. sizeLimit is a cheap blast-radius cap on the node's
+            # ephemeral storage — one token file is well under 1Mi.
+            # NON-ROOT WRITES: kubelet creates an emptyDir mount point 0777, so
+            # this uid-1000 pod can write it with NO fsGroup — the same basis on
+            # which the `dshm` emptyDir above already works for Chrome in this
+            # very pod. If a token write ever fails with EACCES, add
+            # `fsGroup: 1000` to the pod securityContext (the fix the #2072
+            # projected ctl-token Secret needed) rather than loosening the mode.
+            - name: ctl-state
+              mountPath: /var/lib/bots-ctl
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+        - name: ctl-state
+          emptyDir:
+            sizeLimit: 1Mi
+  # Per-ordinal PVCs for the resource-sampler artifacts (issue #2032/#2143).
+  #
+  # RECLAIM: a StatefulSet does NOT delete these when the fleet is scaled to 0 or
+  # the StatefulSet itself is deleted — that PERSISTENCE IS THE POINT (it is what
+  # makes the artifacts survivable), but it means the PVCs must be cleaned up
+  # DELIBERATELY when a run's data is no longer wanted:
+  #   kubectl -n bot-load delete pvc -l app.kubernetes.io/name=videocall-bot
+  # Sized 1Gi: the sampler writes a handful of CSV rows per second per bot, so a
+  # multi-hour soak is single-digit MB; 1Gi is the smallest sane NFS allocation
+  # and leaves room for many retained runs.
+  #
+  # STORAGE CLASS: `dynamicnfs` (labs-infra nfs-subdir-external-provisioner,
+  # RWX-capable, ALLOWVOLUMEEXPANSION). Chosen over the `thin` (vSphere CSI)
+  # default because NFS-backed claims can be read from another pod/node without
+  # rescheduling onto the volume's node — handy for collecting artifacts after a
+  # run. ReadWriteOnce is still the right access mode: exactly one bot pod writes
+  # its own claim.
+  #
+  # NON-ROOT WRITES — VERIFIED, no fsGroup needed. The pod runs as uid/gid
+  # 1000 and this repo has been bitten before by a non-root pod unable to read a
+  # projected file (the #2072 ctl-token needed fsGroup:1000 + mode 0440). So this
+  # was probed on qsk8s rather than assumed: a uid-1000 busybox pod with NO
+  # fsGroup wrote the claim successfully, because the nfs-subdir provisioner
+  # creates each subdirectory mode 0777 (probe output: `drwxrwxrwx  root root`,
+  # then `-rw-r--r-- 1000 1000 probe.csv`, WRITE_OK). If the storage class is
+  # ever changed to one that provisions root-owned 0755 directories, this will
+  # start failing with EACCES and the pod will need `fsGroup: 1000`.
+  volumeClaimTemplates:
+    - metadata:
+        name: run-artifacts
+        labels:
+          app.kubernetes.io/name: videocall-bot
+          app.kubernetes.io/instance: videocall-bots
+          app.kubernetes.io/component: bot-fleet
+          app.kubernetes.io/part-of: videocall
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: dynamicnfs
+        resources:
+          requests:
+            storage: 1Gi

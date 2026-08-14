@@ -18,7 +18,7 @@
 
 use super::super::connection::{
     ConnectionController, ConnectionLostReason, ConnectionManagerOptions, ConnectionState,
-    MediaStreamKey,
+    MediaStreamKey, SessionIdHistory,
 };
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use super::layer_preference_sender::LayerPreferenceSender;
@@ -56,8 +56,11 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
+use videocall_types::protos::meeting_timer_packet::MeetingTimerPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use super::meeting_timer::MeetingTimerState;
+use super::raise_hand::raise_hand_display_name_bytes;
 use super::reactions::{
     resolve_reaction_display_name, validate_custom_emoji, REACTION_DISPLAY_NAME_MAX_CHARS,
 };
@@ -68,6 +71,7 @@ use videocall_types::protos::layer_preference_packet::{
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::peer_event::PeerEvent;
+use videocall_types::protos::raise_hand_packet::RaiseHandPacket;
 use videocall_types::protos::reaction_packet::reaction_packet::ReactionType;
 use videocall_types::protos::reaction_packet::ReactionPacket;
 use videocall_types::protos::rsa_packet::RsaPacket;
@@ -99,8 +103,6 @@ fn generate_instance_id() -> String {
         u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
     )
 }
-
-const MAX_SESSION_ID_HISTORY: usize = 16;
 
 /// How long (ms) the early-seed sampler stays armed after a peer first joins
 /// (issue #1179, Part B). The 5s monitor tick owns steady-state adaptation; this
@@ -210,6 +212,37 @@ impl std::fmt::Debug for RefreshRoomTokenCallback {
 /// stays under clippy's `type_complexity` bar at every use site.
 pub type ReactionCallback = Callback<(u64, i32, String, Option<String>)>;
 
+/// Callback payload for an inbound peer RAISE_HAND (issue 2135):
+/// `(sender_session_id, raised, raised_at_ms, resolved_name)`.
+///
+/// `raised` is an absolute LEVEL, not a toggle — a consumer must ASSIGN it, never
+/// flip its own bit, or one duplicated packet inverts that peer's state
+/// permanently. `raised_at_ms` is the SENDER's wall clock and is ADVISORY
+/// DISPLAY-ORDERING ONLY (forgeable; see the proto doc) — consumers must
+/// tie-break equal values on `sender_session_id` so every participant renders
+/// the same order. `resolved_name` is cache-authoritative with a sanitized
+/// in-packet fallback, already control-stripped and length-capped.
+///
+/// Aliased so the 4-tuple callback stays under clippy's `type_complexity` bar at
+/// every use site.
+pub type RaiseHandCallback = Callback<(u64, bool, u64, String)>;
+
+/// Callback payload for an inbound MEETING_TIMER (issue 2136): the host's
+/// room-global timer STATE, already `duration_ms`-clamped by
+/// [`MeetingTimerState::from_packet`].
+///
+/// Unlike [`RaiseHandCallback`] this carries NO sender identity, deliberately.
+/// A meeting timer is room-global state ("5:00 remaining"), not a per-participant
+/// attribution, and the relay's host gate already established that whoever sent
+/// it was entitled to — so the envelope `session_id` matters only to the fan-out's
+/// self-skip and would be misleading to hand to a consumer.
+///
+/// The consumer must ASSIGN this state, never toggle, and must run it through
+/// [`should_apply`](crate::client::meeting_timer::should_apply) first: the
+/// WebTransport datagram path reorders, and a stale START landing after a CANCEL
+/// would otherwise resurrect a timer the host already stopped.
+pub type MeetingTimerCallback = Callback<MeetingTimerState>;
+
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
 /// initialise the client.  Pass an instance of this struct to
@@ -223,6 +256,24 @@ pub struct VideoCallClientOptions {
     pub max_received_layer: Option<u32>,
     /// Keep receive/decode active but skip painting decoded video frames.
     pub skip_canvas_paint: bool,
+    /// Which CAMERA simulcast ladder this DEPLOYMENT's publishers encode against
+    /// (`experimentalReducedLadder`, issue #1768). Supplied by the consumer because
+    /// `videocall-client` cannot read `window.__APP_CONFIG` — the dioxus-ui passes
+    /// `crate::constants::camera_ladder_variant()` here, exactly as it does for
+    /// `max_received_layer` / `skip_canvas_paint`.
+    ///
+    /// Affects RECEIVER-SIDE READOUTS ONLY (issue #2156): it is forwarded to
+    /// `PeerDecodeManager::set_camera_ladder_variant` and consumed by the two display
+    /// snapshot producers so a receiver's rung labels, `{w}x{h}` and `~kbps` describe
+    /// the stream it is actually decoding (a `Reduced` deployment otherwise labels a
+    /// 960×540 @ ~900 kbps stream "720p · ~1.5M"). Layer SELECTION never reads it —
+    /// simulcast is EXACT-MATCH here, so the #1256 tile-size lid stays pinned to
+    /// `LadderVariant::Default`.
+    ///
+    /// Defaults are not derived: pass `LadderVariant::Default` for the shipped
+    /// ladder. Every construction site must set it, or that surface silently renders
+    /// Default-labelled readouts on a Reduced deployment.
+    pub camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant,
     pub on_peer_added: Callback<String>,
     pub on_peer_first_frame: Callback<(String, MediaType)>,
     pub on_peer_removed: Option<Callback<String>>,
@@ -341,13 +392,14 @@ pub struct VideoCallClientOptions {
     /// #1884). Emits `(sender_session_id, reaction_enum_i32, resolved_name)`:
     /// - `sender_session_id` is the envelope session_id — the attribution anchor
     ///   the client resolves against its display-name cache, not the in-packet
-    ///   name. For REACTION specifically the relay stamps this UNCONDITIONALLY
-    ///   with the sender's authenticated session before fan-out (see
-    ///   `stamp_reaction_for_broadcast` in actix-api), so — unlike the general
-    ///   envelope session_id, which is only relay-stamped when the client sends 0
-    ///   and is otherwise client-forgeable — a REACTION's sender_session_id is a
-    ///   trustworthy identity anchor: a peer cannot forge a reaction attributed
-    ///   to someone else;
+    ///   name. For REACTION the relay stamps it UNCONDITIONALLY with the sender's
+    ///   authenticated session before fan-out (`stamp_reaction_for_broadcast` in
+    ///   actix-api), so a peer cannot forge a reaction attributed to someone
+    ///   else. Since #2095 the general envelope session_id carries the same
+    ///   guarantee — `stamp_wrapper_for_broadcast` overwrites it (and `user_id`)
+    ///   for EVERY fanned-out packet type — so this is no longer a
+    ///   REACTION-specific property; before #2095 it was, because the generic
+    ///   path only filled the field when the client sent 0;
     /// - `reaction_enum_i32` is a defined `ReactionType` value (1..=12) — the
     ///   client already dropped `UNSPECIFIED`/unknown, so the UI can map it to
     ///   an emoji/label directly;
@@ -362,6 +414,46 @@ pub struct VideoCallClientOptions {
     /// The client never fires this for the local user's OWN reaction (the relay
     /// self-skips the sender); the UI renders its own echo on click instead.
     pub on_reaction: Option<ReactionCallback>,
+
+    /// Fired for every inbound peer RAISE_HAND (issue 2135) with
+    /// `(sender_session_id, raised, raised_at_ms, resolved_name)`.
+    ///
+    /// Unlike [`on_reaction`](Self::on_reaction) — which delivers an EPHEMERAL
+    /// event — this delivers persistent STATE, so the consumer must ASSIGN the
+    /// level rather than toggle, and must clear a session's entry when that
+    /// session leaves (the relay keeps no hand registry and broadcasts nothing on
+    /// departure).
+    ///
+    /// Fires only for peers: the relay self-skips the sender on the fan-out, and
+    /// this arm additionally self-skips on `own_session_id` / `own_session_ids`
+    /// so a self-stamped packet leaking through the transport self-filter during
+    /// a re-election cannot double-render the local user's own hand.
+    pub on_raise_hand: Option<RaiseHandCallback>,
+
+    /// Fired for every inbound MEETING_TIMER (issue 2136) with the host's
+    /// room-global timer state.
+    ///
+    /// Like [`on_raise_hand`](Self::on_raise_hand) this delivers persistent STATE
+    /// rather than an event, so the consumer must ASSIGN it. Two differences that
+    /// matter:
+    ///
+    ///  * There is no per-session dimension and nothing to clear on departure.
+    ///    A host LEAVING does not stop the timer on clients already showing it:
+    ///    `ends_at_ms` is self-sufficient, and stopping on host-leave would let a
+    ///    wifi blip kill a presenter's clock with no way to tell "left" from
+    ///    "reconnecting". The consumer is expected to drop its copy on its OWN
+    ///    reconnect and re-acquire it from the next heartbeat, which does mean a
+    ///    viewer that reconnects after the host is gone loses the countdown for
+    ///    good — the accepted price of not counting down to an audible expiry
+    ///    after a CANCEL that was missed while offline (a cancel has no heartbeat
+    ///    behind it to repair it).
+    ///  * The host does NOT receive its own timer back (the relay self-skips the
+    ///    sender), so the host UI renders a local echo, exactly as it does for its
+    ///    own reaction.
+    ///
+    /// Fires for peers only, and only after the relay's host gate has accepted the
+    /// sender — a non-host's packet never reaches any client.
+    pub on_meeting_timer: Option<MeetingTimerCallback>,
 
     /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
     /// silently discarded and no peer decoder workers are created.  Only
@@ -463,6 +555,8 @@ struct InnerOptions {
     on_peer_left: Option<Callback<(String, String, String)>>,
     on_peer_joined: Option<Callback<(String, String, String)>>,
     on_reaction: Option<ReactionCallback>,
+    on_raise_hand: Option<RaiseHandCallback>,
+    on_meeting_timer: Option<MeetingTimerCallback>,
     on_display_name_changed: Option<Callback<(String, String, u64)>>,
     decode_media: bool,
 }
@@ -512,8 +606,18 @@ struct Inner {
     /// Without this match, antonio would step down video when jay is the throttled
     /// sender. The history covers the reconnect race-window where SESSION_ASSIGNED
     /// for a new session id may not have landed yet at the moment a CONGESTION
-    /// targeting it arrives. Bounded to `MAX_SESSION_ID_HISTORY`.
-    session_id_history: std::collections::VecDeque<u64>,
+    /// targeting it arrives. Bounded by [`SessionIdHistory`], which owns the
+    /// cap and the eviction policy.
+    ///
+    /// Issue #625: shared by handle with the `ConnectionManager`, whose
+    /// transport-level self-filter consults it so a packet stamped with a session
+    /// id we held before a reconnect is recognised as ours. This `Inner` is the
+    /// sole writer (the `SESSION_ASSIGNED` arm below); the manager only reads.
+    /// Ownership lives HERE rather than in the manager because
+    /// `connect_with_rtt_testing` discards and rebuilds the whole
+    /// `ConnectionController` when recycling a `Failed` one, while `Inner`
+    /// survives — a manager-owned history would reset on that very path.
+    own_session_ids: Rc<RefCell<SessionIdHistory>>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so we deduplicate within a short time window to avoid firing
@@ -1034,10 +1138,22 @@ fn freshness_skip_within_switch_window(now_ms: u64, last_switch_ms: u64) -> bool
 /// the skip's own timestamp is the cleanest correlation point.
 #[cfg(target_arch = "wasm32")]
 fn spawn_layer_switch_freshness_observer(inner: &Rc<RefCell<Inner>>) {
+    use videocall_diagnostics::{recv_loop_action, RecvLoopAction};
+
     let inner_weak = Rc::downgrade(inner);
     wasm_bindgen_futures::spawn_local(async move {
         let mut receiver = subscribe_global_diagnostics();
-        while let Ok(event) = receiver.recv().await {
+        loop {
+            // Issue 2174: a bare `while let Ok(..)` here died permanently on the
+            // first `Overflowed`, which is recoverable — see
+            // `videocall_diagnostics::recv_loop_action`.
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(e) => match recv_loop_action(&e) {
+                    RecvLoopAction::Continue => continue,
+                    RecvLoopAction::Break => break,
+                },
+            };
             if event.subsystem != "video" {
                 continue;
             }
@@ -1748,6 +1864,8 @@ impl VideoCallClient {
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
                     on_reaction: options.on_reaction.clone(),
+                    on_raise_hand: options.on_raise_hand.clone(),
+                    on_meeting_timer: options.on_meeting_timer.clone(),
                     decode_media: options.decode_media,
                 },
                 connection_controller: connection_controller.clone(),
@@ -1757,7 +1875,7 @@ impl VideoCallClient {
                 },
                 own_session_id: None,
                 last_reconnect_reconciled_session: None,
-                session_id_history: std::collections::VecDeque::new(),
+                own_session_ids: Rc::new(RefCell::new(SessionIdHistory::default())),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -2166,6 +2284,12 @@ impl VideoCallClient {
             // callback so the manager can preempt token expiry from inside
             // re-election. See discussion #562.
             refresh_room_token_callback: self.options.refresh_room_token_callback.clone(),
+            // Issue #625: hand the manager a HANDLE on `Inner`'s session-id
+            // history, not a copy. This method is also the reconnect path — it
+            // discards a `Failed` controller and builds a fresh manager above —
+            // and sharing by handle is what carries the ids we held before that
+            // reconnect into the new manager's self-filter.
+            own_session_ids: self.inner.borrow().own_session_ids.clone(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -2268,6 +2392,10 @@ impl VideoCallClient {
         }
         peer_decode_manager.set_vad_threshold(opts.vad_threshold);
         peer_decode_manager.set_skip_canvas_paint(opts.skip_canvas_paint);
+        // Issue #2156: receiver-side READOUT ladder. Set here (construction) rather
+        // than lazily, so every display snapshot from the first render onward already
+        // resolves against the deployment's ladder.
+        peer_decode_manager.set_camera_ladder_variant(opts.camera_ladder_variant);
         peer_decode_manager
     }
 
@@ -2679,6 +2807,34 @@ impl VideoCallClient {
         false
     }
 
+    /// Is this client currently DECODING the peer's video/screen? (issue #2190)
+    ///
+    /// Reads `Peer::visible`, the exact flag `set_active_decode_set` writes and that
+    /// `should_decode_visible_peer` gates decode on — so this is decode-set membership, not
+    /// a render-mode guess. `false` for a peer the decode budget has parked, in which case
+    /// `Peer::decode` returns `SKIPPED` for both VIDEO and SCREEN and (since #2190) no frame
+    /// is counted, so the receive-side fps for that peer legitimately reads 0.
+    ///
+    /// The UI needs this to avoid scoring an unmeasured stream: a signal meter that averaged
+    /// in a 0 for a peer WE chose not to decode badged a healthy participant as
+    /// "connection lost". The render-mode flag (`force_avatar`) is NOT a substitute — the
+    /// active screen sharer is force-inserted into the decode set regardless of its ranking
+    /// bucket, so a ranked-out sharer renders as an avatar tile while genuinely decoding.
+    ///
+    /// Unknown peer (not yet in the manager) reads `false`: nothing is being decoded for it.
+    pub fn is_decoding_peer(&self, key: &str) -> bool {
+        let sid: u64 = match key.parse() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(&sid) {
+                return peer.visible;
+            }
+        }
+        false
+    }
+
     pub fn is_screen_share_enabled_for_peer(&self, key: &str) -> bool {
         let sid: u64 = match key.parse() {
             Ok(v) => v,
@@ -2712,6 +2868,26 @@ impl VideoCallClient {
         false
     }
 
+    /// The peer's last known audio level.
+    ///
+    /// **Always returns `0.0` in production.** It reads `Peer::audio_level`,
+    /// whose only three non-test writes all assign `0.0` (`Peer::new`, the
+    /// heartbeat arm of `Peer::decode`, and `Peer::force_media_off`); the
+    /// decoder's measured intensity lives in `VadState` and is broadcast on the
+    /// `peer_speaking` diagnostics event instead, never copied back here.
+    ///
+    /// Issue 2224 removed this crate's last caller — `dioxus-ui`'s `PeerTile`
+    /// seeded its glow signals from it, which could only ever write a zero and
+    /// did so ungated. Subscribe to `peer_speaking` for a real level.
+    ///
+    /// Retained rather than deleted because `videocall-client` is a published
+    /// library and this is public API; removing it is a semver-major change
+    /// that wants its own version bump. The attribute is what stops it being
+    /// silently dead: internal callers are gone, so it warns nobody here, but
+    /// any external consumer gets told at compile time.
+    #[deprecated(
+        note = "always returns 0.0 — `Peer::audio_level` has no non-zero producer;                 subscribe to the `peer_speaking` diagnostics event for a measured level"
+    )]
     pub fn audio_level_for_peer(&self, key: &str) -> f32 {
         if let Ok(inner) = self.inner.try_borrow() {
             return inner.peer_decode_manager.peer_audio_level(key);
@@ -2920,7 +3096,8 @@ impl VideoCallClient {
     /// [`PeerDecodeManager::received_layer_snapshot`]. Panic-safe; cheap to poll
     /// each render. The UI polls this like the other per-frame accessors.
     ///
-    /// At the 1-layer default (flag off) this reports layer 0 / base — no error.
+    /// With an explicit 1-layer (flag-off) configuration this reports layer 0 /
+    /// base — no error.
     pub fn received_layer_snapshot(&self, kind: PrefMediaKind) -> Option<ReceivedLayerSnapshot> {
         let now_ms = js_sys::Date::now() as u64;
         self.inner.try_borrow_mut().ok().and_then(|mut inner| {
@@ -3188,12 +3365,16 @@ impl VideoCallClient {
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
         output_fps: Arc<AtomicU32>,
+        // #2147: the SCREEN encoder's output-fps atom (previously log-only, so a
+        // screen-encoder stall had no publisher-side signal at all).
+        screen_output_fps: Arc<AtomicU32>,
         camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
+        camera_layer_metrics: crate::encode::CameraLayerMetricSource,
         // #1561: screen + audio layer metrics
         effective_screen_layers: u32,
         active_screen_layers: Rc<AtomicU32>,
@@ -3210,12 +3391,14 @@ impl VideoCallClient {
                         screen_tier,
                         screen_active,
                         output_fps,
+                        screen_output_fps,
                         camera_transitions,
                         screen_transitions,
                         climb_limiter_snapshot,
                         dwell_samples,
                         effective_video_layers,
                         active_video_layers,
+                        camera_layer_metrics,
                         effective_screen_layers,
                         active_screen_layers,
                         effective_audio_layers,
@@ -3655,6 +3838,125 @@ impl VideoCallClient {
         };
         self.send_packet(wrapper);
         true
+    }
+
+    /// Broadcast this client's absolute RAISED-HAND LEVEL to the room (issue
+    /// 2135).
+    ///
+    /// Modeled on [`send_reaction`](Self::send_reaction): build a
+    /// `RaiseHandPacket`, wrap it with `packet_type = RAISE_HAND`, and dispatch
+    /// on the reliable Control stream. `session_id` is left at 0 deliberately —
+    /// the relay STAMPS it from the authenticated session before fan-out
+    /// (`stamp_raise_hand_for_broadcast`, plus the unconditional generic stamp
+    /// from #2124), which is what makes attribution unforgeable. The relay
+    /// self-skips this sender on the fan-out, so the UI renders its own hand
+    /// optimistically and never waits for the wire.
+    ///
+    /// `raised` is an absolute LEVEL, never a toggle: re-sending the same value
+    /// is a harmless no-op for every consumer, which is exactly what makes the
+    /// re-announce protocol safe. `raised_at_ms` is the wall clock of the
+    /// sender's false→true transition and MUST be passed through verbatim on a
+    /// re-announce — re-stamping it would move this participant to the back of
+    /// every peer's queue whenever anyone joins. Pass `0` when lowering.
+    ///
+    /// The inner `RaiseHandPacket` is CLEARTEXT — deliberately NOT E2EE-sealed
+    /// even when E2EE is on — because the relay must read it to enforce ingress
+    /// validation, and a raised hand is broadcast-public by definition.
+    ///
+    /// This method does NOT self-throttle. The UI gates every send through
+    /// [`crate::client::raise_hand::RaiseHandAnnouncer`] first, which COALESCES
+    /// (rather than drops) an over-rate request — a dropped RAISE_HAND would
+    /// lose a state transition the relay has no registry to repair.
+    pub fn send_raise_hand(&self, raised: bool, raised_at_ms: u64) {
+        // The cosmetic name rides along ONLY on a RAISE — see
+        // `raise_hand_display_name_bytes` for why, and for the char-not-byte cap.
+        let display_name = raise_hand_display_name_bytes(
+            raised,
+            &self.options.display_name,
+            REACTION_DISPLAY_NAME_MAX_CHARS,
+        );
+        let packet = RaiseHandPacket {
+            raised,
+            // The proto documents this as meaningless while lowered; normalize
+            // to 0 so a stale stamp can never ride out on a LOWER.
+            raised_at_ms: if raised { raised_at_ms } else { 0 },
+            display_name,
+            ..Default::default()
+        };
+        let data = match packet.write_to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize RaiseHandPacket: {e}");
+                return;
+            }
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::RAISE_HAND.into(),
+            user_id: self.options.user_id.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+        self.send_packet(wrapper);
+    }
+
+    /// Broadcast the room's MEETING TIMER state (issue 2136). HOST ONLY.
+    ///
+    /// Modeled on [`send_raise_hand`](Self::send_raise_hand): build a
+    /// `MeetingTimerPacket`, wrap it with `packet_type = MEETING_TIMER`, and
+    /// dispatch on the reliable Control stream. `session_id` and `user_id` are
+    /// left for the relay to stamp.
+    ///
+    /// AUTHORIZATION IS THE RELAY'S, NOT THIS METHOD'S. The relay gates on its
+    /// live per-room presence mirror (`meeting_participants.is_host`, kept fresh
+    /// by the `internal.meeting_host_changed` fanout) and silently drops a packet
+    /// from anyone else — a modified client cannot inject a timer. This method
+    /// therefore does not check host-ness: it CANNOT do so soundly, because the
+    /// only host signal available here is a JWT claim frozen at token-mint time
+    /// that is wrong in both directions after a transfer-host. The UI gates the
+    /// CONTROLS on a live host signal so the affordance matches the authority;
+    /// that gate is cosmetic, and this comment exists so nobody mistakes it for
+    /// the enforcement point.
+    ///
+    /// The caller owns `ends_at_ms` and `updated_at_ms` and MUST pass them
+    /// through VERBATIM on every heartbeat and repeat of the same state —
+    /// re-stamping either one breaks a different guarantee (`ends_at_ms` would
+    /// leak a host clock step into a timer viewers already sampled;
+    /// `updated_at_ms` would defeat the receiver's last-writer-wins comparator).
+    /// [`MeetingTimerScheduler`](crate::client::meeting_timer::MeetingTimerScheduler)
+    /// preserves both by construction; drive this from it rather than by hand.
+    ///
+    /// The inner packet is CLEARTEXT even under E2EE — the relay must read it to
+    /// enforce ingress validation, and a meeting timer is broadcast-public by
+    /// definition. It carries no string field, so unlike REACTION/RAISE_HAND
+    /// there is nothing attacker-controlled to truncate or escape.
+    ///
+    /// Does NOT self-throttle: the scheduler above enforces the cadence, and its
+    /// worst case is pinned against the relay's own budget constant.
+    pub fn send_meeting_timer(&self, state: MeetingTimerState) {
+        let packet = MeetingTimerPacket {
+            running: state.running,
+            // The proto documents both as meaningless while stopped; normalize to
+            // 0 so a stale end instant can never ride out on a CANCEL and be
+            // rendered by a peer that mis-handles `running`.
+            ends_at_ms: if state.running { state.ends_at_ms } else { 0 },
+            duration_ms: if state.running { state.duration_ms } else { 0 },
+            updated_at_ms: state.updated_at_ms,
+            ..Default::default()
+        };
+        let data = match packet.write_to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize MeetingTimerPacket: {e}");
+                return;
+            }
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING_TIMER.into(),
+            user_id: self.options.user_id.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+        self.send_packet(wrapper);
     }
 
     /// Ensure the `SharedAudioContext` is initialised and expose it together
@@ -4424,11 +4726,26 @@ impl Inner {
                     response.session_id
                 );
                 self.own_session_id = Some(response.session_id);
-                if !self.session_id_history.contains(&response.session_id) {
-                    if self.session_id_history.len() >= MAX_SESSION_ID_HISTORY {
-                        self.session_id_history.pop_front();
-                    }
-                    self.session_id_history.push_back(response.session_id);
+                // Sole writer of the shared history (#625). The ConnectionManager's
+                // transport self-filter reads this handle, so recording here is what
+                // lets it recognise this id as ours after a later reconnect has
+                // moved `own_session_id` on.
+                //
+                // `try_borrow_mut`, not `borrow_mut`, to stay symmetric with the
+                // reader in `connection_manager::create_inbound_media_callback`,
+                // which fails open. No conflict is possible today (the reader's
+                // borrow is released before it emits, and the event loop is
+                // single-threaded), so this branch is unreachable — but a future
+                // change that held a read across the emit would otherwise surface
+                // here as a PANIC rather than as the reader's fail-open. Missing
+                // one record degrades the filter to `own_session_id` for that id;
+                // panicking would take down the call.
+                match self.own_session_ids.try_borrow_mut() {
+                    Ok(mut history) => history.record(response.session_id),
+                    Err(_) => warn!(
+                        "session-id history busy; not recording session {} (#625)",
+                        response.session_id
+                    ),
                 }
 
                 if let Ok(cc) = self.connection_controller.try_borrow() {
@@ -4942,7 +5259,7 @@ impl Inner {
                 // ids. Only step down if we are the throttled one; cross-session
                 // signals are noise to us.
                 let is_self_targeted = self.own_session_id == Some(response.session_id)
-                    || self.session_id_history.contains(&response.session_id);
+                    || self.own_session_ids.borrow().contains(response.session_id);
 
                 if is_self_targeted {
                     warn!(
@@ -4973,7 +5290,7 @@ impl Inner {
                 // before acting. A cross-session hint is noise — and ignoring it
                 // prevents a peer from suppressing our ladder.
                 let is_self_targeted = self.own_session_id == Some(response.session_id)
-                    || self.session_id_history.contains(&response.session_id);
+                    || self.own_session_ids.borrow().contains(response.session_id);
 
                 if !is_self_targeted {
                     debug!(
@@ -5110,7 +5427,7 @@ impl Inner {
                 // DOWNLINK_CONGESTION is noise — acting on it would step down our
                 // receive preferences in response to a PEER's congestion.
                 let is_self_targeted = self.own_session_id == Some(response.session_id)
-                    || self.session_id_history.contains(&response.session_id);
+                    || self.own_session_ids.borrow().contains(response.session_id);
 
                 if !is_self_targeted {
                     debug!(
@@ -5165,12 +5482,12 @@ impl Inner {
                 // self-filter can still let a self-stamped packet through during
                 // an election, so guard here too. Mirror the sibling
                 // CONGESTION/LAYER_HINT arms: skip when the envelope session_id is
-                // our current session OR any recent one in `session_id_history`,
+                // our current session OR any recent one in `own_session_ids`,
                 // so a self-reaction stamped with a superseded session_id after a
                 // re-election is not double-rendered (local echo + wire). The
                 // sender renders its own echo locally on click, never from the wire.
                 if self.own_session_id == Some(response.session_id)
-                    || self.session_id_history.contains(&response.session_id)
+                    || self.own_session_ids.borrow().contains(response.session_id)
                 {
                     return peer_status;
                 }
@@ -5210,10 +5527,12 @@ impl Inner {
                                     // fan-out (stamp_reaction_for_broadcast in
                                     // actix-api), so it is a TRUSTWORTHY identity
                                     // anchor here — a peer cannot forge a reaction
-                                    // attributed to another participant (the general
-                                    // "stamped only when the client sends 0" rule,
-                                    // which leaves other cleartext types forgeable,
-                                    // does not apply to REACTION). The in-packet
+                                    // attributed to another participant. Issue 2095
+                                    // extended that guarantee to EVERY broadcast
+                                    // packet type (stamp_wrapper_for_broadcast), so
+                                    // the old "stamped only when the client sends 0"
+                                    // rule — which left other cleartext types
+                                    // forgeable — no longer holds anywhere. The in-packet
                                     // display_name remains a sanitized cosmetic
                                     // fallback ONLY, never identity.
                                     let cached = self
@@ -5235,6 +5554,115 @@ impl Inner {
                     },
                     Err(e) => {
                         debug!("Failed to parse REACTION packet: {e}");
+                    }
+                }
+            }
+            Ok(PacketType::MEETING_TIMER) => {
+                // #2136: the host's meeting-timer STATE, re-broadcast room-wide.
+                // The inner packet is CLEARTEXT (the relay size-capped it, parsed
+                // it, and bounded `duration_ms` at ingress, and its HOST GATE
+                // already established the sender was entitled to send it); we
+                // re-parse here and IGNORE anything unreadable, so a bug or a
+                // downgrade on either side fails safe.
+                //
+                // NO self-skip guard here, unlike the REACTION and RAISE_HAND arms
+                // above, and the difference is deliberate. Those two render
+                // PER-PARTICIPANT state, so a self-packet leaking through the
+                // transport self-filter during a re-election (issue 625) would
+                // paint the local user as a second, phantom participant. A meeting
+                // timer is ROOM-GLOBAL: applying our own timer state to our own
+                // view of the room's timer is an idempotent no-op, because the
+                // packet is a LEVEL and the state is the one we authored. There
+                // is nothing a self-packet could duplicate.
+                //
+                // Ordering is handled by the CONSUMER via `should_apply`, not
+                // here: the arm has no access to the applied state, and putting a
+                // partial comparator in two places is how the two drift apart.
+                //
+                // ROLLING-DEPLOY NOTE: an OLDER peer whose generated enum has no
+                // 19 does not reach this arm at all — its `enum_value()` returns
+                // `Err(19)` and it takes the `Err` arm below, logging `error!`
+                // once per ~5s heartbeat for the life of every timer, per
+                // participant. This arm cannot prevent that (the old build is
+                // already shipped); it is called out so the volume is expected
+                // rather than diagnosed as a new fault, and so nobody "fixes" it
+                // by making the host stop heartbeating.
+                match MeetingTimerPacket::parse_from_bytes(&response.data) {
+                    Ok(timer) => {
+                        if let Some(cb) = &self.options.on_meeting_timer {
+                            // `from_packet` clamps `duration_ms` INDEPENDENTLY of
+                            // the relay — a peer may be running an older or newer
+                            // one than we reason about, exactly as for REACTION's
+                            // `custom_emoji`.
+                            cb.emit(MeetingTimerState::from_packet(&timer));
+                        }
+                    }
+                    Err(e) => {
+                        // Debug, not error: a malformed payload is something the
+                        // relay's ingress parse should already have dropped, and
+                        // logging at error level here would let a forged packet
+                        // spam our console once per heartbeat.
+                        debug!("Failed to parse MEETING_TIMER packet: {e}");
+                    }
+                }
+            }
+            Ok(PacketType::RAISE_HAND) => {
+                // #2135: a peer's absolute raised-hand LEVEL, re-broadcast to the
+                // room on the media fan-out. The inner RaiseHandPacket is
+                // CLEARTEXT (the relay size-capped and parse-validated it at
+                // ingress); we re-parse here and IGNORE anything unreadable, so a
+                // bug/downgrade on either side fails safe.
+                //
+                // Self-skip: the relay never re-broadcasts us our OWN hand (it
+                // self-skips the source on the fan-out), but the transport
+                // self-filter can still let a self-stamped packet through during
+                // an election (issue 625), so guard here too. Mirrors the
+                // REACTION arm above: skip when the envelope session_id is our
+                // current session OR any recent one in `own_session_ids`, so a
+                // self-packet stamped with a superseded session_id after a
+                // re-election is not rendered as a SECOND, phantom participant
+                // with a raised hand (the local user's own hand is tracked
+                // optimistically in the UI, never from the wire).
+                if self.own_session_id == Some(response.session_id)
+                    || self.own_session_ids.borrow().contains(response.session_id)
+                {
+                    return peer_status;
+                }
+                match RaiseHandPacket::parse_from_bytes(&response.data) {
+                    Ok(hand) => {
+                        if let Some(cb) = &self.options.on_raise_hand {
+                            // Attribution anchor: the envelope session_id. Since
+                            // #2124 (issue 2095) the relay stamps it
+                            // UNCONDITIONALLY from the authenticated session on
+                            // the single fan-out funnel, so a peer cannot raise a
+                            // hand on someone else's behalf. The in-packet
+                            // display_name is a sanitized COSMETIC fallback only,
+                            // for the pre-join cache race where a re-announce can
+                            // outrun our PARTICIPANT_JOINED list reply.
+                            //
+                            // The resolver is `resolve_reaction_display_name`
+                            // ON PURPOSE, not a raise-hand-specific copy: the
+                            // proto documents display_name as having the SAME
+                            // threat model and the SAME <=64-char render cap as
+                            // ReactionPacket.display_name, so sharing the
+                            // function keeps the control-stripping and the cap
+                            // from drifting apart between the two surfaces.
+                            let cached = self
+                                .peer_decode_manager
+                                .get_peer_display_name(&response.session_id.to_string());
+                            let name = resolve_reaction_display_name(cached, &hand.display_name);
+                            // `hand.raised` is a LEVEL: the consumer ASSIGNS it.
+                            // `raised_at_ms` is advisory display ordering only —
+                            // forgeable, never authorization (see the proto).
+                            cb.emit((response.session_id, hand.raised, hand.raised_at_ms, name));
+                        }
+                    }
+                    Err(e) => {
+                        // Debug, not error: a malformed payload is something the
+                        // relay's ingress parse should already have dropped, and
+                        // logging at error level here would let a peer spam our
+                        // console once per forged packet.
+                        debug!("Failed to parse RAISE_HAND packet: {e}");
                     }
                 }
             }
@@ -5358,6 +5786,7 @@ impl VideoCallClient {
             enable_webtransport: false,
             max_received_layer: None,
             skip_canvas_paint: false,
+            camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant::Default,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -5398,6 +5827,8 @@ impl VideoCallClient {
             on_display_name_changed: None,
             on_peer_joined: None,
             on_reaction: None,
+            on_raise_hand: None,
+            on_meeting_timer: None,
             decode_media: true,
             is_guest: false,
             allow_post_rebase_retry: true,
@@ -5443,6 +5874,7 @@ mod disconnect_tests {
             enable_webtransport: false,
             max_received_layer: None,
             skip_canvas_paint: false,
+            camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant::Default,
             user_id: "drop_test_user".to_string(),
             display_name: "Drop Tester".to_string(),
             is_guest: false,
@@ -5482,6 +5914,8 @@ mod disconnect_tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_reaction: None,
+            on_raise_hand: None,
+            on_meeting_timer: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
@@ -5652,6 +6086,7 @@ mod dedup_tests {
             enable_webtransport: false,
             max_received_layer: None,
             skip_canvas_paint: false,
+            camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant::Default,
             user_id: "dedup_test_user".to_string(),
             display_name: "Dedup Tester".to_string(),
             is_guest: false,
@@ -5687,6 +6122,8 @@ mod dedup_tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_reaction: None,
+            on_raise_hand: None,
+            on_meeting_timer: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
@@ -6049,6 +6486,46 @@ mod cooldown_reset_hardening_tests {
         );
     }
 
+    /// Issue #2156: `VideoCallClientOptions::camera_ladder_variant` must actually
+    /// REACH the `PeerDecodeManager`, which is what makes every receiver-side rung
+    /// label / `{w}x{h}` / `~kbps` readout describe the real stream.
+    ///
+    /// This is the options→manager seam. Without it the field could be added, plumbed
+    /// through four UI construction sites, and still be dead — the exact class of
+    /// silent-no-op the #1768 review caught.
+    ///
+    /// MUTATION: delete the
+    /// `peer_decode_manager.set_camera_ladder_variant(opts.camera_ladder_variant)`
+    /// line from `create_peer_decoder_manager` and the Reduced assertion fails.
+    #[test]
+    fn camera_ladder_variant_option_reaches_the_peer_decode_manager() {
+        use crate::adaptive_quality_constants::LadderVariant;
+
+        let reduced = build_test_client_full(None, false, LadderVariant::Reduced);
+        assert_eq!(
+            reduced
+                .inner
+                .borrow()
+                .peer_decode_manager
+                .camera_ladder_variant_for_test(),
+            LadderVariant::Reduced,
+            "the Reduced option must reach the manager, or every receiver readout \
+             silently keeps the shipped 720p labels (#2156)"
+        );
+
+        // Default is the shipped behaviour, and must NOT be reported as Reduced.
+        let shipped = build_test_client_full(None, false, LadderVariant::Default);
+        assert_eq!(
+            shipped
+                .inner
+                .borrow()
+                .peer_decode_manager
+                .camera_ladder_variant_for_test(),
+            LadderVariant::Default,
+            "the Default option must stay Default (default-OFF guarantee)"
+        );
+    }
+
     /// #2068 P1-B: a persisted user receive-`min` ABOVE the operator ceiling must
     /// not defeat the ceiling. `set_receive_layer_bounds` routes video/screen
     /// through `apply_receive_ceiling`, which clamps `min` down so the range can't
@@ -6096,11 +6573,24 @@ mod cooldown_reset_hardening_tests {
         max_received_layer: Option<u32>,
         skip_canvas_paint: bool,
     ) -> VideoCallClient {
+        build_test_client_full(
+            max_received_layer,
+            skip_canvas_paint,
+            crate::adaptive_quality_constants::LadderVariant::Default,
+        )
+    }
+
+    fn build_test_client_full(
+        max_received_layer: Option<u32>,
+        skip_canvas_paint: bool,
+        camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant,
+    ) -> VideoCallClient {
         VideoCallClient::new(VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
             max_received_layer,
             skip_canvas_paint,
+            camera_ladder_variant,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -6135,6 +6625,8 @@ mod cooldown_reset_hardening_tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_reaction: None,
+            on_raise_hand: None,
+            on_meeting_timer: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
@@ -7051,6 +7543,26 @@ fn suppresses_peer_creation_for_packet(response: &PacketWrapper, decode_media: b
     if response.packet_type == PacketType::REACTION.into() {
         return true;
     }
+    // #2135: a RAISE_HAND is room-wide participant STATE rendered as a badge /
+    // roster entry, NOT a participant tile — the same reasoning as REACTION
+    // directly above, and the same failure mode if omitted: a camera-off
+    // participant who only raises a hand would get a spurious empty tile. It is
+    // MORE reachable here than for reactions, because a raised-hand client
+    // RE-ANNOUNCES its state on every peer-join, so the packet arrives even from
+    // participants who are otherwise silent. Its sender name resolves via the
+    // display-name cache, independent of any tile.
+    if response.packet_type == PacketType::RAISE_HAND.into() {
+        return true;
+    }
+    // #2136: a MEETING_TIMER is room-global state rendered as a single shared
+    // countdown, NOT a participant tile — the same reasoning as REACTION above,
+    // and MORE reachable here. A host with its camera off broadcasts one of these
+    // every ~5s for the whole life of a timer, so without this suppression the
+    // very first heartbeat would mint a spurious empty tile for the host and the
+    // heartbeat would keep it alive.
+    if response.packet_type == PacketType::MEETING_TIMER.into() {
+        return true;
+    }
     let is_self_addressed_control = response.packet_type == PacketType::CONGESTION.into()
         || response.packet_type == PacketType::LAYER_HINT.into();
     suppresses_peer_creation(
@@ -7179,12 +7691,50 @@ mod self_peer_suppression_tests {
     /// tile. ADVERSARIAL: remove the early-return in
     /// `suppresses_peer_creation_for_packet` and this flips (the packet would be
     /// treated like foreign MEDIA and create a peer).
+    /// #2135: a RAISE_HAND is room-wide participant STATE rendered as a badge /
+    /// roster entry, NOT a participant tile. Same failure mode as REACTION below
+    /// and MORE reachable: a raised-hand client re-announces on every peer-join,
+    /// so the packet arrives even from otherwise-silent participants — a
+    /// camera-off participant who only raises a hand would get a spurious empty
+    /// tile. ADVERSARIAL (mutation): remove the `PacketType::RAISE_HAND`
+    /// early-return in `suppresses_peer_creation_for_packet` and this flips (the
+    /// packet is treated like foreign MEDIA and creates a peer).
+    #[test]
+    fn wiring_raise_hand_packet_is_suppressed() {
+        // Nonzero session, foreign-looking user_id, decode on: ONLY the
+        // packet_type derivation can suppress this, so it pins that wiring.
+        let p = packet(PacketType::RAISE_HAND, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "RAISE_HAND must be suppressed purely on packet type (state, not a tile)"
+        );
+    }
+
     #[test]
     fn wiring_reaction_packet_is_suppressed() {
         let p = packet(PacketType::REACTION, 42, b"alice@example.com");
         assert!(
             suppresses_peer_creation_for_packet(&p, true),
             "a REACTION must never create a peer tile (it renders as a floating overlay)"
+        );
+    }
+
+    /// #2136: a MEETING_TIMER must never create a peer tile.
+    ///
+    /// More reachable than the REACTION case above: a host with its camera off
+    /// broadcasts one of these every ~5s for the whole life of a timer, so
+    /// without the suppression the very first heartbeat mints a spurious empty
+    /// tile for the host and the heartbeat then keeps it alive for the duration.
+    ///
+    /// MUTATION PROOF: delete the `PacketType::MEETING_TIMER` arm from
+    /// `suppresses_peer_creation_for_packet` and this fails.
+    #[test]
+    fn wiring_meeting_timer_packet_is_suppressed() {
+        let p = packet(PacketType::MEETING_TIMER, 42, b"host@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "a MEETING_TIMER must never create a peer tile — it is room-global state \
+             rendered as one shared countdown, not a participant"
         );
     }
 

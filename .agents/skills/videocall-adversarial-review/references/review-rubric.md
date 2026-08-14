@@ -56,7 +56,7 @@ Apply all relevant checks:
 - **Recovery**: Ensure consecutive-success counters, cooldowns, and hysteresis cannot wedge under the condition they are meant to escape. Prefer bounded or decaying exits.
 - **Cross-layer contract**: Verify client assumptions against server behavior and vice versa.
 - **Security**: Review trust boundaries, authorization, information leakage, panic paths, untrusted URLs, and input parsing. For OAuth/auth, check open redirects, single-use CSRF state consumption, `unwrap()` in HTTP handlers, and error leakage.
-- **Claims**: Verify comments, logs, test names, docs, and PR descriptions against executable code.
+- **Claims**: Verify comments, logs, test names, docs, and PR descriptions against executable code; a *runtime* claim must have been run, not read. Measure comment volume too — the gate is stated under "CI, Conflicts, And Verdict".
 - **Root pattern**: Search for every occurrence of the same bug or risky pattern. Distinguish intentional variants from missed fixes.
 
 ## Existing Conversation Audit
@@ -78,7 +78,8 @@ Before forming a PR verdict, read all formal reviews, issue comments, inline com
 - A CI-plumbing PR must demonstrate the newly enabled check actually runs and passes.
 - Check GitHub mergeability immediately before the verdict. Conflicts always block approval because conflict resolution changes the reviewed result.
 - Approve only when there are no blockers, required tests are adequate, required CI is green, and the PR is mergeable.
-- Request changes for code blockers or missing required tests. For self-authored PRs, use a comment when GitHub prevents self-review and apply the equivalent blocking labels.
+- Comment volume over the whole PR, never one commit: over ~10% of added lines always blocks approval; the remedy is deletion, not rewording. Comments the author cannot delete do not count — licence headers, generated output, public-API doc comments.
+- Request changes for code blockers, a comment-volume breach, or missing required tests. For self-authored PRs, use a comment when GitHub prevents self-review and apply the equivalent blocking labels.
 
 ## Output
 

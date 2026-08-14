@@ -30,6 +30,12 @@ import {
 import { formatDuration, parseDuration, type Ttl } from "../ttl";
 import { extractBearerToken, tokensMatch } from "./auth";
 import {
+  type NetemAction,
+  type NetemApplyResult,
+  NetemValidationError,
+  resolveNetemRequest,
+} from "./netem";
+import {
   createPrepAssetsJob,
   type PrepAssetsJob,
   type PrepAssetsOptions,
@@ -101,6 +107,17 @@ export interface OrchestratorControlSurface {
   setCameraOff(botId: string, cameraOff: boolean): Promise<void>;
   /** Click in-meeting screen-share toggle. `share === true` means share active. */
   setScreenShare(botId: string, share: boolean): Promise<void>;
+  /**
+   * Apply (or clear) OS-level `tc`/netem shaping on the pod's own
+   * network interface. OPTIONAL: the method is present ONLY when the
+   * orchestrator was started with netem enabled (the per-pod single-bot
+   * deployment). It is deliberately absent in dashboard / multi-bot
+   * mode — the orchestrator there runs on an operator's own host, where
+   * shelling `tc` against a real interface would impair the operator's
+   * network, not a bot's. The `/netem` route replies 501 when this is
+   * unset. See {@link ./netem}.
+   */
+  setNetem?(action: NetemAction): Promise<NetemApplyResult>;
   /** Spawn a duplicate; returns the new bot's id. */
   duplicateBot(
     sourceBotId: string,
@@ -242,6 +259,19 @@ export interface ControlServerOptions {
   token: string;
   surface: OrchestratorControlSurface;
   /**
+   * Address the HTTP control server binds to. Defaults to `127.0.0.1`
+   * (loopback) for backward-compatibility — the historical behavior,
+   * reachable only from the same host. A pod that must be driven by an
+   * in-cluster conductor sets `0.0.0.0` so the server is reachable from
+   * other pods.
+   *
+   * SECURITY (hard requirement): when `bindAddress` is NON-loopback,
+   * {@link startControlServer} REFUSES to start unless a non-empty
+   * `token` is supplied — there is no unauthenticated remote control
+   * surface. See {@link isLoopbackBindAddress}.
+   */
+  bindAddress?: string;
+  /**
    * Directory that holds persisted run-profile JSON files (one
    * per profile, under `<runDir>/profiles/`). When unset, the
    * `/profiles*` endpoints reply 503. Phase 5.1 feature.
@@ -370,11 +400,61 @@ interface RouteResult {
 }
 
 /**
+ * Address the control server binds to when {@link ControlServerOptions.bindAddress}
+ * is unset. Loopback — reachable only from the same host, matching the
+ * pre-cross-pod behavior.
+ */
+export const DEFAULT_BIND_ADDRESS = "127.0.0.1";
+
+/**
+ * Is `addr` a loopback bind address (reachable only from the same host)?
+ *
+ * Treated as loopback: any `127.0.0.0/8` address (`127.0.0.1`,
+ * `127.0.0.2`, …), the IPv6 loopback `::1`, and the literal
+ * `localhost`. EVERYTHING else — including the wildcard binds `0.0.0.0`
+ * / `::`, and any specific routable IP or hostname — is treated as
+ * NON-loopback (fail-safe: when unsure, require a token).
+ *
+ * This gate is what enforces "no unauthenticated remote control": a
+ * non-loopback bind without a token is refused at startup.
+ */
+export function isLoopbackBindAddress(addr: string): boolean {
+  const a = addr.trim().toLowerCase();
+  if (a === "localhost" || a === "::1") return true;
+  // Bracketed IPv6 loopback, e.g. "[::1]".
+  if (a === "[::1]") return true;
+  // IPv4 127.0.0.0/8. Match the dotted-quad shape and check the first octet.
+  if (/^127(\.\d{1,3}){3}$/.test(a)) return true;
+  return false;
+}
+
+/**
  * Spin up the HTTP control server on `port` (0 ⇒ pick free port).
  * Resolves once `listen` callback has fired and the actual bound
  * port is known.
+ *
+ * Rejects synchronously (before binding) if `bindAddress` is
+ * non-loopback and no token is supplied — see the SECURITY note on
+ * {@link ControlServerOptions.bindAddress}.
  */
 export function startControlServer(opts: ControlServerOptions): Promise<ControlServerHandle> {
+  const bindAddress = opts.bindAddress ?? DEFAULT_BIND_ADDRESS;
+  // SECURITY GATE (hard requirement): never expose an unauthenticated
+  // control surface to the network. A loopback bind is only reachable
+  // from the same host, so an empty token there is a (locked-down)
+  // developer convenience; a non-loopback bind is reachable by other
+  // pods/hosts, so it MUST carry a token. `token` is typed as a string
+  // but we guard against an empty/whitespace value defensively — a
+  // caller that passes `token: ""` with `0.0.0.0` is a bug we refuse to
+  // let boot rather than silently expose.
+  if (!isLoopbackBindAddress(bindAddress) && opts.token.trim().length === 0) {
+    return Promise.reject(
+      new Error(
+        `control server: refusing to bind to non-loopback address "${bindAddress}" without a token — ` +
+          "remote control requires authentication (set a token, or bind to 127.0.0.1 for local-only access)",
+      ),
+    );
+  }
   // Per-process state for the SSO recapture endpoints. Lives on the
   // server handle (closed-over here) so each `startControlServer` call
   // gets its own map — important for the in-process tests.
@@ -434,7 +514,7 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
       });
     });
     server.once("error", reject);
-    server.listen(opts.port, "127.0.0.1", () => {
+    server.listen(opts.port, bindAddress, () => {
       server.off("error", reject);
       const addr = server.address();
       if (addr === null || typeof addr === "string") {
@@ -534,6 +614,10 @@ async function handleRequest(
       sendJson(res, 400, { error: err.message });
       return;
     }
+    if (err instanceof NetemValidationError) {
+      sendJson(res, 400, { error: err.message });
+      return;
+    }
     if (err instanceof ProfileNotFoundError) {
       sendJson(res, 404, { error: err.message });
       return;
@@ -600,6 +684,24 @@ async function route(
   }
   if (method === "GET" && pathname === "/assets/manifest") {
     return assetsManifestRoute(opts, assetsManifestState);
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // OS-level netem shaping of the pod's own interface (issue #2072
+  // Increment 3). Top-level (NOT under /bots/:id): each pod runs a
+  // single local bot, and netem shapes the whole interface, not one
+  // browser. `POST /netem` applies a profile or raw params; `DELETE
+  // /netem` clears. Both reply 501 when the orchestrator was not
+  // started with netem enabled (dashboard / operator-host mode).
+  // ──────────────────────────────────────────────────────────────────
+  if (pathname === "/netem") {
+    if (method === "POST") {
+      const body = await readJsonBody(req);
+      return netemApplyRoute(surface, body);
+    }
+    if (method === "DELETE") {
+      return netemClearRoute(surface);
+    }
   }
 
   // Prep-assets background job endpoints. SSE stream is handled
@@ -1185,6 +1287,44 @@ async function share(
   }
   await surface.setScreenShare(botId, body.share);
   return { status: 200, body: { botId, share: body.share } };
+}
+
+/**
+ * Render a netem apply result as the JSON the client sees. `argv` is
+ * echoed so a conductor (and `ctl`) can log exactly what `tc` ran.
+ */
+function netemResult(result: NetemApplyResult): RouteResult {
+  return { status: 200, body: { op: result.op, label: result.label, argv: result.argv } };
+}
+
+async function netemApplyRoute(
+  surface: OrchestratorControlSurface,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  if (surface.setNetem === undefined) {
+    throw new ControlServerError(
+      501,
+      "netem not enabled on this orchestrator — start the pod-mode `run` with --ctl-netem (requires NET_ADMIN + iproute2)",
+    );
+  }
+  let action: NetemAction;
+  try {
+    action = resolveNetemRequest(body);
+  } catch (e) {
+    if (e instanceof NetemValidationError) throw new ControlServerError(400, e.message);
+    throw e;
+  }
+  return netemResult(await surface.setNetem(action));
+}
+
+async function netemClearRoute(surface: OrchestratorControlSurface): Promise<RouteResult> {
+  if (surface.setNetem === undefined) {
+    throw new ControlServerError(
+      501,
+      "netem not enabled on this orchestrator — start the pod-mode `run` with --ctl-netem (requires NET_ADMIN + iproute2)",
+    );
+  }
+  return netemResult(await surface.setNetem({ op: "clear", label: "clear" }));
 }
 
 async function launchOne(

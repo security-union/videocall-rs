@@ -18,7 +18,7 @@
 //! Reports a summary line at `INFO` level every 10 seconds.
 
 use crate::keyframe_requester::KeyframeRequester;
-use crate::layer_preference_sender::LayerPreferenceSender;
+use crate::layer_preference_sender::{LayerPreferenceSender, PinMediaKind};
 use crate::rtt_probe::RttProbeState;
 use crate::viewport_sender::ViewportSender;
 use protobuf::Message;
@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
+use videocall_aq::constants::{LAYER_AVAILABILITY_WINDOW_MS, SIMULCAST_MAX_LAYERS};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -42,6 +43,13 @@ pub struct SenderHealthCounters {
     pub audio_bytes: u64,
     pub video_bytes: u64,
 }
+
+/// How long a rung stays "arriving" after its last packet.
+///
+/// Shares its definition with `videocall-client`'s
+/// `LayerAvailability::DEFAULT_WINDOW_MS` so bot and browser cannot drift on which
+/// rungs a source is offering (#2206).
+const RUNG_WINDOW: Duration = Duration::from_millis(LAYER_AVAILABILITY_WINDOW_MS);
 
 /// Tracks inbound packet statistics for quality-of-service diagnostics.
 #[derive(Default)]
@@ -64,6 +72,15 @@ pub struct InboundStats {
     audio_arrivals: Vec<f64>,
     // A/V sync dropped: browser audio uses Date.now() ms, video uses EncodedVideoChunk µs — cross-unit delta is meaningless. Re-add when browser wire format is unified.
     parse_errors: u64,
+    /// Last-seen instant per (source session_id, simulcast rung); a rung is "arriving"
+    /// while its last observation is within [`RUNG_WINDOW`]. Lets `video_packets`
+    /// count what the bot WOULD decode rather than every rung the relay forwards —
+    /// the relay fails open, so an unfiltered count reads the ladder sum (#2206).
+    ///
+    /// Keyed by SESSION, not user: one user on two devices is two independent
+    /// sources the browser selects layers for separately, and a `u64` key also
+    /// avoids cloning the sender name on every video packet.
+    rung_last_seen: HashMap<(u64, u32), Instant>,
     /// Per-sender counters for health reporting (accumulated between drains).
     health_counters: HashMap<String, SenderHealthCounters>,
     /// Total inbound packets since last health drain (all types).
@@ -178,6 +195,52 @@ impl InboundStats {
         }
     }
 
+    /// Highest rung arriving from `session_id` within the window. `0` when nothing is
+    /// recent — the bandwidth-safe default, and the same answer
+    /// `LayerAvailability::highest_available` gives on an empty map.
+    ///
+    /// SCOPE, because the obvious reading is wrong: this matches an UNCAPPED receiver —
+    /// 1-on-1, pinned, or screen-share. It does NOT match a browser in a multi-tile
+    /// grid, where the #1256 rendered-tile lid caps the chooser one or more rungs below
+    /// the top (which rung depends on tile size and the viewer's density mode). The bot
+    /// also re-derives per packet where the browser only consults availability on its
+    /// ~5s tick. Every residual error runs OPTIMISTIC, in exactly the many-participant
+    /// regime bots simulate.
+    ///
+    /// Freshness is tested inside the lookup rather than pruned first, so this is at
+    /// most `SIMULCAST_MAX_LAYERS` direct lookups — O(1) in publisher count — and
+    /// eviction is left to [`Self::reset`].
+    fn highest_arriving_rung(&self, session_id: u64, now: Instant) -> u32 {
+        (0..SIMULCAST_MAX_LAYERS as u32)
+            .rev()
+            .find(|rung| {
+                self.rung_last_seen
+                    .get(&(session_id, *rung))
+                    .is_some_and(|seen| now.duration_since(*seen) <= RUNG_WINDOW)
+            })
+            .unwrap_or(0)
+    }
+
+    /// The rung this bot would decode from `session_id`.
+    ///
+    /// With `--pin-layer N` the receiver's exact-match guard stays on N: the relay
+    /// never drops rung 0, so deriving from arrivals would fall back to 0 and count
+    /// frames the browser would SKIP. So an explicit pin wins over observation.
+    /// Only a VIDEO-scoped pin steers this count. The relay keys its drop on
+    /// `(source, kind)`, so an audio- or screen-scoped pin leaves the video ladder
+    /// fully forwarded — applying its rung here would under-report video by the
+    /// ladder ratio while the pinned rung might never arrive at all.
+    fn decoded_rung_for(&self, session_id: u64, now: Instant) -> u32 {
+        if let Some(pinned) = self
+            .layer_preference_sender
+            .as_ref()
+            .and_then(|lps| lps.pinned_layer_for(PinMediaKind::Video))
+        {
+            return pinned;
+        }
+        self.highest_arriving_rung(session_id, now)
+    }
+
     // `_my_user_id` is retained in the signature (many callers pass it) but is
     // no longer used: DIAGNOSTICS filtering-by-sender moved out with the AQ
     // fan-in removal (issue #1108).
@@ -195,6 +258,7 @@ impl InboundStats {
             self.bump_parse_error("wrapper");
             return;
         };
+        let session_id = wrapper.session_id;
 
         // DIAGNOSTICS packets: counted for inbound-stats accounting only.
         //
@@ -262,12 +326,13 @@ impl InboundStats {
         // already intercepted and returned above, so it never reaches here.
         //
         // NOTE: this gating is VIEWPORT-only. The LAYER_PREFERENCE filter is
-        // per-(source,kind) and applies to VIDEO/SCREEN/AUDIO, and the bot cannot
-        // observe the per-layer of an inbound packet — so layer-preference
-        // fail-open is NOT detectable from inbound media. The layer-preference
-        // sender therefore keeps its original re-assert-every-reset-window
-        // behaviour (heals fail-open within one window at the cost of a periodic
-        // control packet); #1006 is scoped to the VIEWPORT re-assert only.
+        // per-(source,kind) and applies to VIDEO/SCREEN/AUDIO. Since #2206 the bot
+        // DOES read `simulcast_layer_id` on inbound video, so symptom-gating this
+        // one is now tractable — but it is not implemented: the signal would need to
+        // distinguish "relay forgot my preference" from a publisher that legitimately
+        // shed the pinned rung. The layer-preference sender therefore keeps its
+        // re-assert-every-reset-window behaviour (heals fail-open within one window
+        // at the cost of a periodic control packet); #1006 is VIEWPORT-only.
         let is_video = media.media_type.enum_value() == Ok(MediaType::VIDEO);
 
         // Feed the relay-stamped source session_id to the viewport sender so it
@@ -322,14 +387,45 @@ impl InboundStats {
             Ok(MediaType::VIDEO) => {
                 #[cfg(feature = "metrics")]
                 self.bump_received("video");
-                self.video_packets += 1;
+
+                // #2206: count only the rung this bot would DECODE, mirroring the
+                // browser's EXACT-MATCH guard. Bytes and arrivals stay unfiltered —
+                // those measure what the link actually delivered, which is the
+                // honest figure for a receiver the relay is fanning every rung to.
+                // Rung freshness uses the MONOTONIC clock: a backward NTP step makes a
+                // wall-clock delta negative, holding stale rungs past the window. `now_ms`
+                // stays wall-clock because the arrival series it feeds reports absolute
+                // times. Sampled here, not per packet — only VIDEO needs it.
+                let now = Instant::now();
+                let rung = wrapper.simulcast_layer_id;
+                // `simulcast_layer_id` is publisher-controlled cleartext, so an
+                // out-of-ladder value must never become a map entry: cycling unique
+                // ids would mint one entry per packet. Off-ladder rungs are also
+                // undecodable, so they are not counted.
+                //
+                // DIVERGES from the client's `clamp_observed_layer_id`, which collapses an
+                // off-ladder id onto the top rung's availability where the bot discards
+                // it, so the fleet cannot see the resulting browser freeze (#2245).
+                let on_ladder = (rung as usize) < SIMULCAST_MAX_LAYERS;
+                let would_decode = if on_ladder {
+                    self.rung_last_seen.insert((session_id, rung), now);
+                    rung == self.decoded_rung_for(session_id, now)
+                } else {
+                    false
+                };
+
                 self.video_bytes += media.data.len() as u64;
                 self.video_arrivals.push(now_ms);
+                if would_decode {
+                    self.video_packets += 1;
+                }
 
                 // Accumulate health counters for this sender
                 let hc = self.health_counters.entry(sender.clone()).or_default();
-                hc.video_packets += 1;
                 hc.video_bytes += media.data.len() as u64;
+                if would_decode {
+                    hc.video_packets += 1;
+                }
 
                 if media.frame_type == "key" {
                     self.video_keyframes += 1;
@@ -385,7 +481,7 @@ impl InboundStats {
 
         info!(
             "[{}] RX STATS (10s): audio={} pkts ({:.0} KB, ia_stddev={:.1}ms, gaps={}), \
-             video={} pkts ({} key, {:.0} KB, ia_stddev={:.1}ms, gaps={}), \
+             video={} decoded-rung pkts ({} key, {:.0} KB, ia_stddev={:.1}ms, gaps={} — all rungs), \
              heartbeat={}, errors={}",
             user_id,
             self.audio_packets,
@@ -414,6 +510,14 @@ impl InboundStats {
         let max_audio_seq = std::mem::take(&mut self.max_audio_seq);
         let max_video_seq = std::mem::take(&mut self.max_video_seq);
         let sender_names = std::mem::take(&mut self.sender_names);
+        // Rolling 4s availability window — dropping it on the 10s diagnostic reset
+        // would repeat the ramp and inflate the next health sample (#2206). Stale
+        // entries are evicted HERE rather than on the packet path: `reset` runs every
+        // 10s in both pin and observation modes, so this is the one sweep that bounds
+        // the map against per-reconnect `session_id` churn.
+        let mut rung_last_seen = std::mem::take(&mut self.rung_last_seen);
+        let sweep_now = Instant::now();
+        rung_last_seen.retain(|_, seen| sweep_now.duration_since(*seen) <= RUNG_WINDOW);
         let rtt_probe = self.rtt_probe.take();
         let keyframe_requester = self.keyframe_requester.take();
         let viewport_sender = self.viewport_sender.take();
@@ -428,6 +532,7 @@ impl InboundStats {
         self.max_audio_seq = max_audio_seq;
         self.max_video_seq = max_video_seq;
         self.sender_names = sender_names;
+        self.rung_last_seen = rung_last_seen;
         self.rtt_probe = rtt_probe;
         self.keyframe_requester = keyframe_requester;
         self.viewport_sender = viewport_sender;
@@ -472,12 +577,12 @@ impl InboundStats {
         // `has_sent`, and rate-limited, exactly like the viewport re-assert.
         //
         // NOTE: unlike the viewport re-assert above, this is NOT gated on an
-        // observed fail-open symptom. Layer-preference fail-open is per-(source,
-        // kind) and the bot cannot observe the per-layer of an inbound packet,
-        // so there is no inbound signal that distinguishes "relay forgot my
-        // layer preference" from a healthy connection. It therefore retains the
-        // re-assert-every-window behaviour (heals within one window at the cost
-        // of a periodic control packet); #1006's symptom-gating is VIEWPORT-only.
+        // observed fail-open symptom. Since #2206 the per-rung arrival IS visible on
+        // inbound video, so a gate is now buildable — but an arriving non-pinned rung
+        // does not by itself distinguish "relay forgot my preference" from a
+        // publisher that shed the pinned rung, so it retains the
+        // re-assert-every-window behaviour (heals within one window at the cost of a
+        // periodic control packet); #1006's symptom-gating is VIEWPORT-only.
         if let Some(ref mut lps) = self.layer_preference_sender {
             lps.resend_on_reconnect();
         }
@@ -585,6 +690,414 @@ mod tests {
             ..Default::default()
         };
         wrapper.write_to_bytes().unwrap()
+    }
+
+    /// Same as [`make_media_packet`] but stamps the outer wrapper's
+    /// `simulcast_layer_id` — set by the PUBLISHER per layer and forwarded verbatim
+    /// by the relay, which does not rewrite or validate it.
+    fn make_video_packet_on_rung(
+        sender: &str,
+        session_id: u64,
+        seq: u64,
+        timestamp: f64,
+        rung: u32,
+    ) -> Vec<u8> {
+        let mut wrapper = PacketWrapper::parse_from_bytes(&make_media_packet(
+            sender,
+            MediaType::VIDEO,
+            seq,
+            timestamp,
+        ))
+        .unwrap();
+        wrapper.simulcast_layer_id = rung;
+        wrapper.session_id = session_id;
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    const ALICE: u64 = 11;
+    const BOB: u64 = 22;
+
+    #[test]
+    fn video_packets_counts_one_rung_not_the_ladder_sum() {
+        // #2206: the relay fails open and forwards EVERY rung to a healthy
+        // receiver, so an unfiltered count reads the ladder sum — an 8 fps 3-rung
+        // camera measured ~52. The browser skips non-selected rungs before decode
+        // and has counted DECODED frames since #2190; the bot must match or one
+        // proto field means two things by producer.
+        let mut stats = InboundStats::default();
+
+        // Warm-up frame: while the top rung is not yet observed, the lower rungs ARE
+        // momentarily the highest arriving one and count. Measure the steady state
+        // after the ladder is known, not across it.
+        //
+        // Not the same shape as the browser's join ramp: `LayerChooser` is
+        // unconstrained at cold start and returns `highest_available` on its first
+        // window, so its ramp comes from `selected_video_layer` initialising to 0 and
+        // only moving on the ~5s monitor tick — a step, not a 3-packet over-count.
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+        let after_warmup = stats.video_packets;
+
+        let frames = 8u64;
+        for seq in 1..=frames {
+            for rung in 0..3u32 {
+                let data =
+                    make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung);
+                stats.record_packet("bot", &data);
+            }
+        }
+
+        assert_eq!(
+            stats.video_packets - after_warmup,
+            frames,
+            "steady state must count ONE rung's frames, not all three"
+        );
+        // Bytes and arrivals stay unfiltered — they measure what the link
+        // delivered, which is the honest figure for a fanned-out receiver.
+        let total_packets = (frames + 1) * 3;
+        assert_eq!(stats.video_arrivals.len() as u64, total_packets);
+        assert_eq!(stats.video_bytes, total_packets * 100);
+    }
+
+    #[test]
+    fn video_packets_tracks_the_top_rung_per_sender_independently() {
+        // Two senders offering different ladder depths must not pool their rungs.
+        let mut stats = InboundStats::default();
+        // Establish alice's 3-rung ladder before measuring (see the ramp note above).
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+        let base = stats.video_packets;
+
+        for seq in 1..=4u64 {
+            for rung in 0..3u32 {
+                stats.record_packet(
+                    "bot",
+                    &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung),
+                );
+            }
+            // bob publishes one layer, so rung 0 IS his top and every frame counts.
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("bob", BOB, seq, 1000.0 + seq as f64, 0),
+            );
+        }
+        // alice contributes 4 (one per frame), bob 4 — pooling the two senders'
+        // rungs would make bob's rung-0 frames fail alice's top-rung test.
+        assert_eq!(stats.video_packets - base, 8);
+    }
+
+    #[test]
+    fn video_packets_follows_the_top_rung_rate_not_the_base_rate() {
+        // The rungs run at DIFFERENT rates (the camera ladder is 7/15/30 fps), so
+        // which rung is counted changes the number — this is what distinguishes
+        // "highest arriving" from "base only". A healthy unconstrained receiver
+        // fails open to the best available layer, so the bot must report the TOP
+        // rung's rate; reporting the base would under-state a real client.
+        let mut stats = InboundStats::default();
+
+        // Establish the ladder, then emit 12 top-rung frames for every 3 base ones
+        // (a 4:1 rate ratio, the shape of 30 fps vs 7 fps).
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+        let base = stats.video_packets;
+
+        let top_frames = 12u64;
+        for i in 1..=top_frames {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, i, 1000.0 + i as f64, 2),
+            );
+            if i % 4 == 0 {
+                stats.record_packet(
+                    "bot",
+                    &make_video_packet_on_rung("alice", ALICE, i, 1000.0 + i as f64, 0),
+                );
+            }
+        }
+
+        let counted = stats.video_packets - base;
+        // The base rung is interleaved at 1/4 the top rung's rate, so following the
+        // wrong one reads `top_frames / 4` — the equality below discriminates them.
+        assert_eq!(
+            counted, top_frames,
+            "must follow the TOP rung's rate, not the base rung's"
+        );
+    }
+
+    #[test]
+    fn a_shed_top_rung_expires_so_the_new_top_is_selected() {
+        // The window is load-bearing, not decoration: if a shed rung never expires
+        // the bot keeps expecting a rung that stopped arriving and counts ZERO from
+        // that sender — the metric freezes while frames still flow.
+        //
+        // Drives `highest_arriving_rung` directly rather than through
+        // `record_packet`: that samples `Instant::now()`, so every packet in a unit
+        // test lands on the same instant and nothing can age out.
+        let mut stats = InboundStats::default();
+        let t0 = Instant::now();
+        for rung in 0..3u32 {
+            stats.rung_last_seen.insert((ALICE, rung), t0);
+        }
+        assert_eq!(stats.highest_arriving_rung(ALICE, t0), 2);
+
+        // Rungs 1 and 2 shed; only rung 0 keeps arriving.
+        let later = t0 + RUNG_WINDOW + Duration::from_millis(1);
+        stats.rung_last_seen.insert((ALICE, 0), later);
+        assert_eq!(
+            stats.highest_arriving_rung(ALICE, later),
+            0,
+            "once the shed rungs age out, rung 0 IS the top arriving rung"
+        );
+
+        // Aged-out entries are IGNORED by the probe (above) and swept by `reset`,
+        // which is the only eviction site now that freshness is folded into the
+        // lookup — see `highest_arriving_rung`.
+        assert!(
+            stats.rung_last_seen.contains_key(&(ALICE, 2)),
+            "the probe must not evict; that is reset's job"
+        );
+    }
+
+    #[test]
+    fn reset_sweeps_aged_rungs_so_the_map_cannot_grow_without_bound() {
+        // The map is keyed by `session_id`, which is re-minted per transport actor, so
+        // every reconnect orphans up to SIMULCAST_MAX_LAYERS entries. `reset` runs every
+        // 10s in BOTH pin and observation modes and is the only thing that reclaims
+        // them: `highest_arriving_rung` no longer prunes, and in pin mode
+        // `decoded_rung_for` returns before ever reaching it.
+        let mut stats = InboundStats::default();
+        let stale = Instant::now() - (RUNG_WINDOW + Duration::from_millis(1));
+        for session in 0..50u64 {
+            for rung in 0..3u32 {
+                stats.rung_last_seen.insert((session, rung), stale);
+            }
+        }
+        let fresh_session = 999u64;
+        stats
+            .rung_last_seen
+            .insert((fresh_session, 1), Instant::now());
+        assert_eq!(stats.rung_last_seen.len(), 151);
+
+        stats.reset();
+
+        assert_eq!(
+            stats.rung_last_seen.len(),
+            1,
+            "every aged entry must be reclaimed, not merely ignored"
+        );
+        assert!(
+            stats.rung_last_seen.contains_key(&(fresh_session, 1)),
+            "a rung still inside the window must SURVIVE reset — dropping it would \
+             repeat the ramp and inflate the next health sample (#2206)"
+        );
+    }
+
+    #[test]
+    fn rung_window_matches_the_client_availability_window() {
+        // Both this crate and `videocall-client` derive from
+        // `videocall_aq::constants::LAYER_AVAILABILITY_WINDOW_MS`, so they cannot silently
+        // disagree. What remains hand-written, and is what this asserts, is the
+        // ms -> Duration conversion.
+        assert_eq!(
+            RUNG_WINDOW,
+            Duration::from_millis(LAYER_AVAILABILITY_WINDOW_MS),
+            "the window must be derived from the shared constant, not redefined"
+        );
+    }
+
+    #[test]
+    fn the_drained_health_counter_is_rung_filtered_too() {
+        // `fps_received` is built from the PER-SENDER health counters, not the
+        // diagnostic total — so filtering only `self.video_packets` would leave the
+        // actually-reported telemetry reading the ladder sum.
+        let mut stats = InboundStats::default();
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+        let (warm, _) = stats.drain_health_counters();
+        let warm_count = warm.get("alice").map(|c| c.video_packets).unwrap_or(0);
+
+        let frames = 6u64;
+        for seq in 1..=frames {
+            for rung in 0..3u32 {
+                stats.record_packet(
+                    "bot",
+                    &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung),
+                );
+            }
+        }
+        let (drained, _) = stats.drain_health_counters();
+        let c = drained.get("alice").expect("alice must be present");
+        assert_eq!(
+            c.video_packets, frames,
+            "the REPORTED counter must count one rung, not the ladder sum"
+        );
+        // Bytes stay unfiltered here too, which is what liveness reads.
+        assert_eq!(c.video_bytes, frames * 3 * 100);
+        // The first frame's three rungs all count: each is the top rung SEEN SO FAR at
+        // the moment it lands. That ramp is inherent to observing arrivals and is why
+        // `reset` preserves the window rather than restarting it.
+        assert_eq!(
+            warm_count, 3,
+            "the warm-up frame over-counts by the ladder depth"
+        );
+    }
+
+    /// Build an `InboundStats` whose layer-preference sender pins `layer` for `kind`.
+    fn stats_pinned(layer: u32, kind: PinMediaKind) -> InboundStats {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut stats = InboundStats::default();
+        stats.set_layer_preference_sender(LayerPreferenceSender::new(
+            "bot".to_string(),
+            Some(layer),
+            kind,
+            tx,
+        ));
+        stats
+    }
+
+    /// Feed `frames` frames of a full 3-rung ladder from ALICE.
+    fn feed_full_ladder(stats: &mut InboundStats, frames: u64) {
+        for seq in 1..=frames {
+            for rung in 0..3u32 {
+                stats.record_packet(
+                    "bot",
+                    &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_video_pin_steers_the_video_count() {
+        // The pin branch's reason for existing: the relay never drops rung 0, so
+        // deriving from arrivals would fall back to base and count frames the browser
+        // would SKIP. With a VIDEO pin on rung 0, only rung 0 counts.
+        let mut stats = stats_pinned(0, PinMediaKind::Video);
+        let frames = 5u64;
+        feed_full_ladder(&mut stats, frames);
+        assert_eq!(
+            stats.video_packets, frames,
+            "a video pin must select exactly the pinned rung"
+        );
+    }
+
+    #[test]
+    fn a_non_video_pin_does_not_steer_the_video_count() {
+        // The relay keys its drop on (source, KIND). An audio- or screen-scoped pin
+        // leaves the VIDEO ladder fully forwarded, so applying its rung to video would
+        // under-report by the ladder ratio — and with a rung that never arrives (rung 2
+        // against a single-rung publisher) it would report ZERO forever on a healthy
+        // stream. Video must fall back to observing arrivals.
+        for kind in [PinMediaKind::Audio, PinMediaKind::Screen] {
+            let mut stats = stats_pinned(0, kind);
+            let frames = 5u64;
+            feed_full_ladder(&mut stats, frames);
+            // Observation path: the top arriving rung (2) is counted once per frame,
+            // plus the ladder-depth ramp on the first frame.
+            assert_eq!(
+                stats.video_packets,
+                frames + 2,
+                "{kind:?} pin must NOT pin the video count to rung 0 (would read {frames})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pin_for_a_rung_that_never_arrives_reports_zero_not_base() {
+        // The other half of the pin contract: a shed pinned rung must read as the
+        // starvation it is, not fall back to base. This is why `decoded_rung_for`
+        // returns the REQUESTED rung in pin mode.
+        let mut stats = stats_pinned(2, PinMediaKind::Video);
+        for seq in 1..=5u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, 0),
+            );
+        }
+        assert_eq!(
+            stats.video_packets, 0,
+            "a pinned rung that never arrives is starvation, not base-rung health"
+        );
+        assert!(
+            stats.video_bytes > 0,
+            "bytes stay unfiltered so liveness still sees the stream"
+        );
+    }
+
+    #[test]
+    fn an_off_ladder_rung_is_neither_counted_nor_recorded() {
+        // `simulcast_layer_id` is forgeable and unbounded. One packet claiming
+        // u32::MAX must not become a map entry (cardinality inflation on a per-packet
+        // scan) and must not win `max()` — which would zero every honest frame from
+        // that sender for the whole availability window.
+        let mut stats = InboundStats::default();
+        stats.record_packet(
+            "bot",
+            &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, u32::MAX),
+        );
+        assert_eq!(stats.video_packets, 0, "an off-ladder rung is undecodable");
+        assert!(
+            stats.rung_last_seen.is_empty(),
+            "an off-ladder rung must not create a map entry"
+        );
+
+        // The BOUNDARY, not just a far-out value: `rung == SIMULCAST_MAX_LAYERS` is the
+        // first invalid id, so this is what distinguishes `<` from `<=` in the guard.
+        let mut boundary = InboundStats::default();
+        boundary.record_packet(
+            "bot",
+            &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, SIMULCAST_MAX_LAYERS as u32),
+        );
+        assert_eq!(
+            boundary.video_packets, 0,
+            "rung == SIMULCAST_MAX_LAYERS is off-ladder (valid ids are 0..SIMULCAST_MAX_LAYERS)"
+        );
+        assert!(
+            boundary.rung_last_seen.is_empty(),
+            "the boundary rung must not create a map entry either"
+        );
+
+        // And honest frames that follow are unaffected.
+        for seq in 1..=4u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, 0),
+            );
+        }
+        assert_eq!(
+            stats.video_packets, 4,
+            "the forged rung must not poison max()"
+        );
+    }
+
+    #[test]
+    fn a_single_rung_sender_is_fully_counted() {
+        // The pinned / single-stream case (`--pin-layer`, or a publisher with one
+        // layer): every packet is the top arriving rung, so nothing is filtered.
+        let mut stats = InboundStats::default();
+        for seq in 0..5 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("carol", 33, seq, 1000.0 + seq as f64, 0),
+            );
+        }
+        assert_eq!(stats.video_packets, 5);
     }
 
     #[test]

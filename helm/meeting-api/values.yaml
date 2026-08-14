@@ -79,12 +79,17 @@ env:
     value: "nats://nats:4222"
   - name: SERVICE_VERSION_URLS
     value: ""
+# See the note in helm/global/us-east/meeting-api/values.yaml: below 1000m the
+# cgroup quota floors `available_parallelism()` to 1, pinning tokio to a single
+# worker thread and the Argon2 verifier (issue #1613) to a single permit. Memory
+# is unchanged — the verifier's peak is bounded by its semaphore, not the CPU
+# limit.
 resources:
   limits:
-    cpu: "200m"
+    cpu: "1000m"
     memory: "256Mi"
   requests:
-    cpu: "100m"
+    cpu: "250m"
     memory: "128Mi"
 podAnnotations: {}
 podSecurityContext: {}

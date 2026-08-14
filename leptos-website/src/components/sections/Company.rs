@@ -53,21 +53,19 @@ pub fn CompanySection() -> impl IntoView {
                         </dl>
                     </div>
 
-                    // Mission patch
-                    <figure class="flex flex-col gap-4">
-                        <div class="overflow-hidden rounded border border-line bg-bg-s1">
-                            <img
-                                src="/images/mission-patch.jpg"
-                                width="720"
-                                height="720"
-                                loading="lazy"
-                                decoding="async"
-                                alt="videocall.rs mission patch: embroidered badge of a camera robot streaming video"
-                                class="block w-full h-auto aspect-square object-cover"
-                            />
-                        </div>
+                    // Mascot
+                    <figure class="flex flex-col items-center gap-4">
+                        <img
+                            src="/images/rover-mascot.png"
+                            width="640"
+                            height="598"
+                            loading="lazy"
+                            decoding="async"
+                            alt="The videocall.rs rover mascot: a four-legged camera robot"
+                            class="block w-full max-w-[360px] h-auto"
+                        />
                         <figcaption class="data flex items-center gap-2">
-                            <span aria-hidden="true">"MISSION PATCH · REAL-TIME VIDEO TRANSPORT"</span>
+                            <span aria-hidden="true">"UNIT 01 · FIELD CAMERA ROVER"</span>
                         </figcaption>
                     </figure>
                 </div>

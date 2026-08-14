@@ -47,11 +47,11 @@ pub fn SystemSection() -> impl IntoView {
                 <div class="grid gap-px bg-line border border-line rounded-panel overflow-hidden md:grid-cols-2 lg:grid-cols-12">
                     <BentoTile
                         caption="MESSAGING · NATS PUB/SUB"
-                        title="One publisher, every subscriber"
-                        body="A NATS pub/sub backbone moves media between relay servers. One publisher fans out to every subscriber in the meeting."
+                        title="Relays around the world, one mesh"
+                        body="A NATS pub/sub backbone moves end-to-end-encrypted media between relay servers around the world. One publisher, every subscriber."
                         span="md:col-span-2 lg:col-span-7 lg:row-span-2"
                     >
-                        <FanoutArt/>
+                        <RelayGlobeArt/>
                     </BentoTile>
 
                     <BentoTile
@@ -141,46 +141,107 @@ fn WaveformArt() -> impl IntoView {
     }
 }
 
-/// NATS pub/sub fan-out: one publisher pushes packets along dashed paths to
-/// five subscriber/server nodes. Nodes are servers, not robots.
+/// NATS pub/sub as a relay globe: an orthographic wireframe world with relay
+/// nodes at real city positions, media arcing between them along the marching
+/// packet-dash idiom. New York is the publisher (oxide, pulsing); the rest are
+/// subscriber relays that flash as media arrives.
+///
+/// Projection (orthographic, R=100), centered at lat0 = 25°N, lon0 = -40°W:
+///   Δlon = lon − lon0
+///   x =  R·cos(lat)·sin(Δlon)
+///   y = −R·(cos(lat0)·sin(lat) − sin(lat0)·cos(lat)·cos(Δlon))
+///   visible ⇔ sin(lat0)·sin(lat) + cos(lat0)·cos(lat)·cos(Δlon) > 0
+/// The six coordinates below are that formula evaluated once and hardcoded
+/// (New York, Mexico City, São Paulo, London, Frankfurt, Lagos — all visible).
 #[component]
-fn FanoutArt() -> impl IntoView {
-    let targets: [i32; 5] = [18, 44, 70, 96, 122];
+fn RelayGlobeArt() -> impl IntoView {
+    // Projected (x, y, is_source). Source is New York.
+    let nodes: [(f64, f64, bool); 6] = [
+        (-42.4, -32.5, true), // New York   (40.7, -74.0)
+        (-81.0, -9.7, false), // Mexico City(19.4, -99.1)
+        (-10.5, 74.6, false), // São Paulo  (-23.5, -46.6)
+        (39.9, -50.7, false), // London     (51.5, -0.1)
+        (48.2, -51.6, false), // Frankfurt  (50.1, 8.7)
+        (68.3, 20.3, false),  // Lagos      (6.5, 3.4)
+    ];
+
+    // Media arcs (quadratic béziers) bulging outward from the globe surface:
+    // (x0, y0, cx, cy, x1, y1). Control points sit radially outside each chord.
+    let arcs: [(f64, f64, f64, f64, f64, f64); 5] = [
+        (-42.4, -32.5, -2.0, -66.0, 39.9, -50.7), // New York → London
+        (-42.4, -32.5, -82.5, -28.2, -81.0, -9.7), // New York → Mexico City
+        (-42.4, -32.5, -45.2, 36.0, -10.5, 74.6), // New York → São Paulo
+        (39.9, -50.7, 54.5, -63.3, 48.2, -51.6),  // London → Frankfurt
+        (48.2, -51.6, 79.5, -21.4, 68.3, 20.3),   // Frankfurt → Lagos
+    ];
+
+    // Longitude meridians (ry = 100, rx shrinking) and latitude parallels
+    // (rx = 100, ry shrinking) — the standard orthographic wireframe look.
+    let longitudes: [f64; 3] = [26.0, 54.0, 82.0];
+    let latitudes: [f64; 2] = [32.0, 64.0];
+
     view! {
-        <svg viewBox="0 0 240 140" class="w-full h-full max-h-44" fill="none" aria-hidden="true">
-            {targets
+        <svg viewBox="-120 -120 240 240" class="w-full h-full max-h-56" fill="none" aria-hidden="true">
+            // Globe body + graticule (static).
+            <circle cx="0" cy="0" r="100" fill="var(--surface-2)" opacity="0.45"></circle>
+            {longitudes
+                .into_iter()
+                .map(|rx| {
+                    view! {
+                        <ellipse cx="0" cy="0" rx=rx ry="100" stroke="var(--line)" stroke-width="0.75"></ellipse>
+                    }
+                })
+                .collect_view()}
+            {latitudes
+                .into_iter()
+                .map(|ry| {
+                    view! {
+                        <ellipse cx="0" cy="0" rx="100" ry=ry stroke="var(--line)" stroke-width="0.75"></ellipse>
+                    }
+                })
+                .collect_view()}
+            <line x1="-100" y1="0" x2="100" y2="0" stroke="var(--line)" stroke-width="0.75"></line>
+            <circle cx="0" cy="0" r="100" stroke="var(--line-strong)" stroke-width="1"></circle>
+
+            // Media arcs — marching dashes from publisher to relays.
+            {arcs
                 .into_iter()
                 .enumerate()
-                .map(|(i, y)| {
+                .map(|(i, (x0, y0, cx, cy, x1, y1))| {
                     view! {
                         <path
                             class="packet-path"
-                            d=format!("M32 70 C110 70, 130 {y}, 202 {y}")
+                            d=format!("M{x0} {y0} Q{cx} {cy} {x1} {y1}")
                             stroke="var(--fg-3)"
-                            stroke-width="1.5"
-                            style=format!("animation-delay:{}ms", i as i32 * -240)
+                            stroke-width="1.25"
+                            style=format!("animation-delay:{}ms", i as i32 * -300)
                         ></path>
                     }
                 })
                 .collect_view()}
 
-            <circle class="source-node" cx="24" cy="70" r="7" fill="var(--signal)"></circle>
-
-            {targets
+            // Relay nodes — publisher pulses oxide; subscribers flash on arrival.
+            {nodes
                 .into_iter()
                 .enumerate()
-                .map(|(i, y)| {
-                    view! {
-                        <rect
-                            class="arrive-node"
-                            x="200"
-                            y=y - 4
-                            width="8"
-                            height="8"
-                            rx="1.5"
-                            fill="var(--fg-3)"
-                            style=format!("animation-delay:{}ms", i as i32 * -320)
-                        ></rect>
+                .map(|(i, (x, y, is_source))| {
+                    if is_source {
+                        view! {
+                            <circle class="source-node" cx=x cy=y r="4.5" fill="var(--signal)"></circle>
+                        }
+                        .into_any()
+                    } else {
+                        view! {
+                            <circle
+                                class="arrive-node"
+                                cx=x
+                                cy=y
+                                r="3.5"
+                                fill="var(--fg-2)"
+                                style=format!("animation-delay:{}ms", i as i32 * -260)
+                            ></circle>
+                        }
+                        .into_any()
                     }
                 })
                 .collect_view()}

@@ -31,7 +31,8 @@ pub fn CompanySection() -> impl IntoView {
                     <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"Transparent development, from the transport layer up. Read the code, run it yourself, and extend it."</p>
                 </RevealOnView>
 
-                <div class="grid lg:grid-cols-2 gap-6 mt-12 items-start">
+                <RevealOnView class="mt-12">
+                <div class="grid lg:grid-cols-2 gap-6 items-start">
                     // Mission
                     <div class="panel">
                         <h3 class="text-h3 text-fg">"Our mission"</h3>
@@ -39,13 +40,24 @@ pub fn CompanySection() -> impl IntoView {
                             "Make real-time audio and video accessible, performant, and reliable through open-source infrastructure that anyone can read, run, and extend."
                         </p>
 
+                        // The left vertical rules draw downward on reveal, staggered.
                         <dl class="mt-8 divide-y divide-line">
-                            <div class="border-l border-line pl-4 py-4">
+                            <div class="relative pl-4 py-4">
+                                <span
+                                    class="draw-y absolute left-0 top-0 bottom-0 w-px bg-line-strong"
+                                    style="transition-delay:120ms"
+                                    aria-hidden="true"
+                                ></span>
                                 <span class="section-index" aria-hidden="true">"Principle / 01"</span>
                                 <dt class="text-fg font-medium mt-2">"Open source first"</dt>
                                 <dd class="text-fg-2 mt-1">"Transparency and community-driven development, in the open."</dd>
                             </div>
-                            <div class="border-l border-line pl-4 py-4">
+                            <div class="relative pl-4 py-4">
+                                <span
+                                    class="draw-y absolute left-0 top-0 bottom-0 w-px bg-line-strong"
+                                    style="transition-delay:240ms"
+                                    aria-hidden="true"
+                                ></span>
                                 <span class="section-index" aria-hidden="true">"Principle / 02"</span>
                                 <dt class="text-fg font-medium mt-2">"Built with Rust"</dt>
                                 <dd class="text-fg-2 mt-1">"One language from server to browser, for performance and reliability."</dd>
@@ -69,6 +81,7 @@ pub fn CompanySection() -> impl IntoView {
                         </figcaption>
                     </figure>
                 </div>
+                </RevealOnView>
 
                 // Join
                 <div class="panel mt-6 md:flex md:items-center md:justify-between gap-6">

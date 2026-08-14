@@ -19,6 +19,7 @@
 pub mod CodeExample;
 //pub mod DarkModeToggle;
 pub mod CTAButton;
+pub mod CountUp;
 pub mod Footer;
 pub mod HeroHeader;
 pub mod LiveCallPanel;

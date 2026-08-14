@@ -30,7 +30,8 @@ pub fn PricingSection() -> impl IntoView {
                     <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"Self-host the entire stack, or let us operate it for you."</p>
                 </RevealOnView>
 
-                <div class="grid md:grid-cols-2 gap-6 max-w-4xl mt-12">
+                <RevealOnView class="mt-12">
+                <div class="grid md:grid-cols-2 gap-6 max-w-4xl">
                     <PricingCard
                         title="Self-Hosted"
                         price="Free"
@@ -44,6 +45,7 @@ pub fn PricingSection() -> impl IntoView {
                         button_text="Get the Helm chart"
                         button_href="https://github.com/security-union/videocall-rs/tree/main/helm"
                         highlighted=false
+                        delay=0
                     />
 
                     <PricingCard
@@ -59,8 +61,10 @@ pub fn PricingSection() -> impl IntoView {
                         button_text="Contact sales"
                         button_href="mailto:support@securityunion.dev"
                         highlighted=true
+                        delay=90
                     />
                 </div>
+                </RevealOnView>
             </div>
         </section>
     }
@@ -75,19 +79,28 @@ fn PricingCard(
     #[prop(into)] button_text: String,
     #[prop(into)] button_href: String,
     #[prop(default = false)] highlighted: bool,
+    /// Stagger for the reveal-in cascade + the recommended rule draw-in (ms).
+    delay: i32,
 ) -> impl IntoView {
     // The one licensed accent here: a 2px signal top border on the recommended
-    // tier, plus a mono RECOMMENDED tag. Everything else stays monochrome.
+    // tier (drawn in on reveal), plus a mono RECOMMENDED tag. Everything else
+    // stays monochrome. `card-lift` adds the transform-only hover lift; the
+    // panel is a `reveal-item` so it joins the staggered reveal cascade.
     let card_class = if highlighted {
-        "panel border-t-2 border-t-signal flex flex-col order-first md:order-none"
+        "panel card-lift reveal-item relative flex flex-col order-first md:order-none"
     } else {
-        "panel flex flex-col"
+        "panel card-lift reveal-item relative flex flex-col"
     };
     let button_class = if highlighted { "btn-solid" } else { "btn-line" };
 
     view! {
-        <div class=card_class>
+        <div class=card_class style=format!("transition-delay:{delay}ms")>
             {highlighted.then(|| view! {
+                <span
+                    class="draw-x absolute top-0 left-0 right-0 h-[2px] bg-signal"
+                    style=format!("transition-delay:{}ms", delay + 200)
+                    aria-hidden="true"
+                ></span>
                 <span class="eyebrow text-signal">"Recommended"</span>
             })}
 

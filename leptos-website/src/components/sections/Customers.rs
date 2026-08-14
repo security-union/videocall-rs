@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::CountUp::CountUp;
 use crate::components::Reveal::RevealOnView;
 use leptos::prelude::*;
 
@@ -34,10 +35,10 @@ pub fn CustomersSection() -> impl IntoView {
 
                 // Readout row — large figures on one ruled strip, hairline dividers.
                 <div class="grid sm:grid-cols-2 md:grid-cols-4 border bone-border rounded-panel overflow-hidden divide-y sm:divide-y-0 sm:divide-x bone-divide bone-surface mt-12">
-                    <Readout number="1.7K" unit="GitHub stars" />
-                    <Readout number="170" unit="Forks" />
-                    <Readout number="490+" unit="Commits" />
-                    <Readout number="1000" unit="Peak call, single meeting" />
+                    <Readout target=1.7 decimals=1 suffix="K" unit="GitHub stars" />
+                    <Readout target=170.0 decimals=0 suffix="" unit="Forks" />
+                    <Readout target=490.0 decimals=0 suffix="+" unit="Commits" />
+                    <Readout target=1000.0 decimals=0 suffix="" unit="Peak call, single meeting" />
                 </div>
 
                 {testimonials_section()}
@@ -47,10 +48,17 @@ pub fn CustomersSection() -> impl IntoView {
 }
 
 #[component]
-fn Readout(number: &'static str, unit: &'static str) -> impl IntoView {
+fn Readout(
+    target: f64,
+    decimals: u8,
+    #[prop(into)] suffix: String,
+    unit: &'static str,
+) -> impl IntoView {
     view! {
         <div class="px-6 py-10 text-center">
-            <div class="text-4xl md:text-5xl font-medium tracking-tight bone-ink">{number}</div>
+            <div class="text-4xl md:text-5xl font-medium tracking-tight bone-ink">
+                <CountUp target=target decimals=decimals suffix=suffix />
+            </div>
             <div class="eyebrow bone-ink-3 mt-3">{unit}</div>
         </div>
     }

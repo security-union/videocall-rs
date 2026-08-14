@@ -572,6 +572,59 @@
     }
   }
 
+  /* ---- Section B · reveal-driven draw-ins + item stagger ------------- *
+   * These use the descendant combinator (a space), NOT `> *`, so they reach
+   * real items through the island's <leptos-children> wrapper regardless of
+   * its display. The collapsed/hidden initial state is gated behind
+   * `.reveal-armed`, which the island only adds once motion is confirmed
+   * allowed — so no-JS and reduced-motion render the final drawn/visible
+   * frame. Per-item stagger is an inline `transition-delay` at the call site. */
+  .reveal.reveal-armed .draw-x {
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .reveal.reveal-armed.in-view .draw-x {
+    transform: scaleX(1);
+  }
+  .reveal.reveal-armed .draw-y {
+    transform: scaleY(0);
+    transform-origin: top;
+    transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .reveal.reveal-armed.in-view .draw-y {
+    transform: scaleY(1);
+  }
+  .reveal.reveal-armed .reveal-item {
+    opacity: 0;
+    transform: translateY(16px);
+    transition:
+      opacity 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .reveal.reveal-armed.in-view .reveal-item {
+    opacity: 1;
+    transform: none;
+  }
+
+  /* Card lift — hover micro-interaction (transform only). Used on the
+     developer cards and the pricing tiers. */
+  .card-lift {
+    transition:
+      transform 0.2s ease-out,
+      border-color 0.2s ease-out,
+      background-color 0.2s ease-out;
+  }
+  .card-lift:hover {
+    transform: translateY(-2px);
+  }
+  /* When a card is BOTH a reveal-item and a card-lift (pricing tiers), the
+     settled `.in-view` rule pins `transform: none` at a higher specificity —
+     this scoped hover rule out-specifies it so the lift still works at rest. */
+  .reveal.reveal-armed.in-view .card-lift:hover {
+    transform: translateY(-2px);
+  }
+
   /* ---- Move C · inverted bone band ----------------------------------- *
    * All ratios computed on #EDEBE6 (AA/AAA per the spec). The bright oxide
    * survives only as a decorative rule; oxide *text* uses the darkened
@@ -629,6 +682,17 @@
     .reveal.reveal-armed.in-view .spark-path {
       stroke-dashoffset: 0 !important;
       animation: none !important;
+    }
+    /* Section B reveal draw-ins + staggers freeze at their final frame. */
+    .draw-x,
+    .draw-y,
+    .reveal-item,
+    .card-lift {
+      transition: none !important;
+      transform: none !important;
+    }
+    .reveal-item {
+      opacity: 1 !important;
     }
   }
 }

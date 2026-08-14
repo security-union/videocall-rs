@@ -16,18 +16,26 @@
  * conditions.
  */
 
+use crate::components::Reveal::RevealOnView;
 use crate::icons::DigitalOceanIcon;
 use leptos::prelude::*;
 
 #[component]
 pub fn Footer() -> impl IntoView {
     view! {
-        <footer class="border-t border-line px-6 md:px-10 py-12">
+        <footer class="px-6 md:px-10 py-12">
             <div class="max-w-content mx-auto">
+                // The section seam draws itself in as the footer enters view.
+                <RevealOnView class="mb-10">
+                    <hr class="rule draw-x" aria-hidden="true" />
+                </RevealOnView>
                 <div class="flex flex-col md:flex-row justify-between items-start gap-8 mb-10">
                     <div>
                         <img class="h-8 w-auto opacity-70" src="/images/videocall_logo.svg" alt="videocall.rs" />
-                        <p class="eyebrow mt-4">"Real-time audio + video infrastructure · MIT / Apache-2.0"</p>
+                        <p class="eyebrow mt-4 flex items-center gap-2">
+                            <span class="live-dot" aria-hidden="true"></span>
+                            "Real-time audio + video infrastructure · MIT / Apache-2.0"
+                        </p>
                     </div>
 
                     <nav aria-label="Footer">

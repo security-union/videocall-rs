@@ -455,6 +455,15 @@
     }
   }
 
+  /* The VEO rover clips frame the character low, feet on the bottom edge.
+   * Lift + slightly shrink the media (video and static fallback alike) so the
+   * robot clears the caption line; the exposed edges are black-on-black. */
+  .rover-frame video,
+  .rover-frame img {
+    transform: translateY(-5%) scale(0.9);
+    transform-origin: 50% 0%;
+  }
+
   /* Mono corner caption (bottom-left name, bottom-right one-liner). */
   .media-caption {
     font-family: var(--font-mono);

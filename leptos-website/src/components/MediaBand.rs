@@ -66,7 +66,7 @@ pub fn RoverBand() -> impl IntoView {
     view! {
         <div class="media-band">
             <figure
-                class="media-frame"
+                class="media-frame rover-frame"
                 role="img"
                 aria-label="The videocall.rs field-camera rover, a four-legged camera robot"
             >

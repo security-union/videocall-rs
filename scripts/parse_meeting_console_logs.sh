@@ -60,7 +60,7 @@
 # | Connection lost / No valid connections      | connection_lost | videocall-client                                       |
 # | datagram dropped                            | datagram_drops | videocall-client (WT transport)                        |
 # | handshake failed / Opening handshake failed | handshake_failures | videocall-client (WT transport)                     |
-# | Speaking changed: false -> true             | speaking_transitions (VAD proxy for "actually spoke") | videocall-client mic/VAD        |
+# | Speaking changed: false -> true             | speaking_transitions (open-mic energy, NOT speech)    | videocall-client mic/VAD        |
 # | audio health (buffer: Nms) for peer: X      | audio_buffer_median_ms per peer   | videocall-client/src/health_reporter.rs |
 # | "level":"preamble"                          | cores / memory / platform / etc. | videocall-client console-logger initialization |
 #
@@ -226,6 +226,30 @@ KEY_EVENTS_GREP='DIOXUS-UI: Creating VideoCallClient|Elected connection |Baselin
 # Separate pattern for error-level lines
 ERROR_GREP='"level":"error"'
 
+# Identity is the `zgrep -H` FILE prefix, not the session key (which merges ids
+# sharing a prefix); session ts is `[0-9]+` — a fixed width leaves the filename.
+CENSUS_JQ='
+(index(".log.gz:")) as $i
+| if $i == null then "PARSEFAIL"
+  else
+    (.[:$i] | split("/") | last
+      | sub("_[0-9]+_([0-9]{5}|[0-9a-f]{16})$"; "")) as $who
+    | (.[$i+8:] | ltrimstr(":")) as $raw
+    | ($raw | try fromjson catch null) as $o
+    | if $o == null then "PARSEFAIL"
+      else
+        (($o.msg // "") | split("\n")) as $l
+        | (($l[0] // "") as $h
+           | if ($h | test("^panicked at "))
+             then ($h + " " + (($l[1] // "") | ltrimstr(" ")))
+             else $h end) as $sig
+        | $who + "\t" + $sig
+      end
+  end'
+
+census_total_errors=0
+census_parse_fails=0
+census_corrupt_chunks=0
 for key in "${ALL_KEYS[@]}"; do
   email="${key%%::*}"
   session_ts="${key##*::}"
@@ -273,15 +297,56 @@ for key in "${ALL_KEYS[@]}"; do
   implausible=$(zcat "${files[@]}" 2>/dev/null | \
     grep -c "Discarding implausible RTT" 2>/dev/null || true)
 
-  # Pass 3: error count
-  error_count=$(zcat "${files[@]}" 2>/dev/null | \
-    grep -c "$ERROR_GREP" 2>/dev/null || true)
+  # Pass 3: error lines
+  err_lines="$TMPDIR_WORK/err_lines.txt"
+  zgrep_err="$TMPDIR_WORK/zgrep_err.txt"
+  if zgrep -H "$ERROR_GREP" "${files[@]}" > "$err_lines" 2>"$zgrep_err"; then
+    zgrep_status=0
+  else
+    zgrep_status=$?
+  fi
+  error_count=$(wc -l < "$err_lines" | tr -d ' ')
+  # A truncated .log.gz decompresses partially, so the counted reconciliation
+  # below cannot see that loss. Detected from zgrep's exit >=2 or a gzip
+  # diagnostic (exit 1 is "no matches", normal); a zgrep reporting neither cannot.
+  if [[ "$zgrep_status" -ge 2 ]] \
+     || grep -qiE "unexpected end of file|invalid compressed data|not in gzip format" \
+          "$zgrep_err" 2>/dev/null; then
+    census_corrupt_chunks=$((census_corrupt_chunks + 1))
+  fi
+  census_total_errors=$((census_total_errors + error_count))
+
+  if [[ "$error_count" -gt 0 ]]; then
+    jq -Rr "$CENSUS_JQ" < "$err_lines" 2>/dev/null > "$TMPDIR_WORK/census_raw.txt" || true
+    # AT MOST one line per input, so (errors - emitted) also covers a branch that
+    # emits nothing and jq dying mid-stream: neither leaves a row or a PARSEFAIL.
+    census_raw_lines=$(wc -l < "$TMPDIR_WORK/census_raw.txt" | tr -d ' ')
+    census_delta=$(( $(grep -c '^PARSEFAIL$' "$TMPDIR_WORK/census_raw.txt" || true) + error_count - census_raw_lines ))
+    # Clamp: one negative session would cancel a real loss elsewhere.
+    [[ "$census_delta" -lt 0 ]] && census_delta=0
+    census_parse_fails=$((census_parse_fails + census_delta))
+    grep -v '^PARSEFAIL$' "$TMPDIR_WORK/census_raw.txt" \
+      | "$AWK" -F'\t' '
+          $2 ~ /^[[:space:]]*at / || $2 ~ /wasm-function\[/ || $2 ~ /^Stack:/ { next }
+          {
+            who = $1
+            sig = $2
+            for (i = 3; i <= NF; i++) sig = sig " " $i   # a tab inside the msg
+            # A tab corrupts the KEY (the grouping pass splits on tab); CR the row.
+            gsub(/[\t\r]/, " ", sig)
+            # Durations BEFORE ids: a >=6-digit duration would match the id rule
+            # first and split one defect across two rows. Small ints kept: 401≠500.
+            gsub(/[0-9]+(\.[0-9]+)?(ms|s|kbps|fps|%)/, "<n>&", sig)
+            gsub(/<n>[0-9]+(\.[0-9]+)?/, "<n>", sig)
+            gsub(/[0-9]{6,}/, "<id>", sig)
+            if (length(sig) > 100) sig = substr(sig, 1, 100) "…"
+            if (sig != "") print who "\t" sig
+          }' >> "$TMPDIR_WORK/error_census.tsv" || true
+  fi
 
   # Pass 3b: speaking_transitions — count VAD false->true transitions.
-  # A good proxy for "did the user actually speak?" Low/zero means
-  # muted or listen-only; high (100+) means active speaker. Useful
-  # when triaging audio complaints: listeners with 0 transitions
-  # aren't contributing to the audio mix.
+  # RMS threshold on the raw mic stream, so this is open-mic energy, NOT
+  # speech. Never use it to establish who was talking.
   speaking_transitions=$(zcat "${files[@]}" 2>/dev/null | \
     grep -cF "Speaking changed: false -> true" 2>/dev/null || true)
 
@@ -852,6 +917,69 @@ for s in "${session_jsons[@]}"; do
   fi
   echo "| ${email} | ${name} | ${start} | ${ttype}(${tid}) | ${rtt}ms | ${net_display} | ${bat_display} | ${reelect} | ${chunks} | ${kf_req} | ${pli_rx} | ${aq_display} | ${pid_display} | ${speak} | ${buf_display} | ${errs} | ${end_status} | ${cores}${cores_flag} | ${platform} | ${concurrent}${concurrent_flag} |"
 done
+
+echo ""
+
+CENSUS_MAX_ROWS=40
+echo "### Error Census (grouped by message, ranked by participants affected)"
+echo ""
+census_file="$TMPDIR_WORK/error_census.tsv"
+census_rows=0
+[[ -s "$census_file" ]] && census_rows=$(wc -l < "$census_file" | tr -d ' ')
+
+if [[ "${census_total_errors:-0}" -eq 0 && "${census_corrupt_chunks:-0}" -gt 0 ]]; then
+  echo "⚠ **${census_corrupt_chunks} session(s) had a truncated or corrupt \`.log.gz\` and NO error lines were recoverable from them.** This section cannot say the meeting was clean."
+elif [[ "${census_total_errors:-0}" -eq 0 ]]; then
+  echo "_No error-level lines in any of the ${#ALL_KEYS[@]} sessions._"
+else
+  if [[ "${census_corrupt_chunks:-0}" -gt 0 ]]; then
+    echo "⚠ **${census_corrupt_chunks} session(s) had a truncated or corrupt \`.log.gz\`.** Those chunks decompressed only partially, so an UNKNOWN number of error lines never reached the census and are counted nowhere. Treat every count below as a lower bound."
+    echo ""
+  fi
+  if [[ "${census_parse_fails:-0}" -gt 0 ]]; then
+    echo "⚠ **${census_parse_fails} error line(s) could not be parsed, or were lost, and are MISSING from the census below** (malformed JSON, a non-object record, or \`jq\` dying mid-stream on a full disk). Counts here are a lower bound."
+    echo ""
+  fi
+  if [[ "$census_rows" -eq 0 ]]; then
+    echo "⚠ **Census produced NO rows despite ${census_total_errors} error line(s) counted.** Every signature was dropped, or the census pipeline failed. Do NOT read this as a clean meeting."
+    echo ""
+  fi
+
+  if [[ "$census_rows" -gt 0 ]]; then
+    emitted=0
+    multi_session=0
+    while IFS=$'\t' read -r sess_count cnt sig; do
+      [[ -z "$sig" ]] && continue
+      emitted=$((emitted + 1))
+      if [[ "$emitted" -eq 1 ]]; then
+        echo "| Count | People | Message |"
+        echo "|-------|--------|---------|"
+      fi
+      flag=""
+      if [[ "$sess_count" -gt 1 ]]; then
+        flag=" ⚠"
+        multi_session=$((multi_session + 1))
+      fi
+      if [[ "$emitted" -gt "$CENSUS_MAX_ROWS" ]]; then
+        continue
+      fi
+      printf '| %s | %s%s | %s |\n' "$cnt" "$sess_count" "$flag" "${sig//|/\\|}"
+    done < <("$AWK" -F'\t' '
+        { n[$2]++; if (!seen[$2 SUBSEP $1]++) sess[$2]++ }
+        END { for (s in n) printf "%d\t%d\t%s\n", sess[s], n[s], s }
+      ' "$census_file" | sort -t$'\t' -k1,1rn -k2,2rn)
+
+    echo ""
+    if [[ "$emitted" -gt "$CENSUS_MAX_ROWS" ]]; then
+      echo "_… $((emitted - CENSUS_MAX_ROWS)) further signature(s) omitted (ranked below the top ${CENSUS_MAX_ROWS}). High row counts usually mean a message interpolates an id the normaliser does not collapse._"
+    fi
+    if [[ "$multi_session" -gt 0 ]]; then
+      echo "⚠ **${multi_session} signature(s) affect MORE THAN ONE person — shared defects, not user oddities.** Sweep one with \`mlog <room>/<date> --who '<pattern>'\` before filing so the issue carries the real victim count."
+    elif [[ "$emitted" -gt 0 && "${census_parse_fails:-0}" -eq 0 && "${census_corrupt_chunks:-0}" -eq 0 ]]; then
+      echo "_Every error signature is confined to a single participant._"
+    fi
+  fi
+fi
 
 echo ""
 

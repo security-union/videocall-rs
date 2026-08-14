@@ -1,0 +1,31 @@
+# Shared defaults only. Cluster-specific values go in the cluster's file -- see README.
+
+postgresql:
+  auth:
+    enablePostgresUser: true
+    existingSecret: postgres-credentials
+    secretKeys:
+      adminPasswordKey: postgres-password
+      userPasswordKey: password
+    username: postgres
+
+  metrics:
+    enabled: false
+
+  primary:
+    persistence:
+      enabled: true
+      annotations:
+        # Retains the PVC through `helm uninstall`.
+        helm.sh/resource-policy: keep
+
+    service:
+      type: ClusterIP
+      ports:
+        postgresql: 5432
+
+  backup:
+    enabled: false
+
+  readReplicas:
+    replicaCount: 0

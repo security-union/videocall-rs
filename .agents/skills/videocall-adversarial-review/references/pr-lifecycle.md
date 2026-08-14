@@ -63,7 +63,7 @@ For rollup/consolidation PRs, check out the integration head and compile the who
 Post one formal review tied to the current head:
 
 - **APPROVE** only with adequate required tests, green required CI, no conflicts, and no blockers.
-- **REQUEST_CHANGES** for code blockers, missing required tests, conflicts, or merge-blocking CI.
+- **REQUEST_CHANGES** for code blockers, a comment-volume breach, missing required tests, conflicts, or merge-blocking CI.
 - **COMMENT** when reviewing a self-authored PR that GitHub will not allow the author to approve/request changes. Labels must still reflect the substantive result.
 
 Make the result scannable with `[x] Approved` or `[ ] Changes required`, then list findings first. Include a prior-finding audit with one line per sub-point when prior feedback exists. Never silently disagree with or replay prior feedback.
@@ -89,7 +89,7 @@ Terminal invariants:
 - `MERGE APPROVED` is incompatible with `NEEDS CHANGES`, `NEEDS TESTS`, and `RESOLVE CONFLICTS`.
 - Missing required tests applies `NEEDS TESTS` and blocks approval.
 - Conflicts apply `RESOLVE CONFLICTS` and block approval.
-- Code blockers apply `NEEDS CHANGES`.
+- Code blockers and a comment-volume breach apply `NEEDS CHANGES`.
 - Every completed review has at least one terminal verdict label.
 
 ## Responding To A REQUEST_CHANGES Verdict

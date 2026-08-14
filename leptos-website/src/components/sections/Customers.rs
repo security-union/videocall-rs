@@ -22,19 +22,22 @@ use leptos::prelude::*;
 #[component]
 pub fn CustomersSection() -> impl IntoView {
     view! {
-        <section id="customers" aria-labelledby="adoption-title" class="px-6 md:px-10 py-24 md:py-32">
+        // Move C — the one inverted bone band. Palette flip to bone/near-black
+        // resets the eye mid-page; every token clears WCAG AA on #EDEBE6.
+        <section id="customers" aria-labelledby="adoption-title" class="band-bone px-6 md:px-10 py-24 md:py-32">
             <div class="max-w-content mx-auto">
-                <RevealOnView>
-                    <p class="section-index" aria-hidden="true">"05 — Adoption"</p>
-                    <h2 id="adoption-title" class="text-h2 text-fg mt-4">"Growing where it's measured"</h2>
-                    <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"Numbers sourced straight from the repository."</p>
+                <RevealOnView class="">
+                    <p class="section-index bone-ink-3" aria-hidden="true">"06 — Adoption"</p>
+                    <h2 id="adoption-title" class="text-h2 bone-ink mt-4">"Growing where it's measured"</h2>
+                    <p class="text-body-lg bone-ink-2 mt-4 max-w-2xl">"Open source, and used in production. Numbers sourced straight from the repository."</p>
                 </RevealOnView>
 
                 // Readout row — large figures on one ruled strip, hairline dividers.
-                <div class="grid md:grid-cols-3 border border-line rounded-panel overflow-hidden divide-y md:divide-y-0 md:divide-x divide-line mt-12">
+                <div class="grid sm:grid-cols-2 md:grid-cols-4 border bone-border rounded-panel overflow-hidden divide-y sm:divide-y-0 sm:divide-x bone-divide bone-surface mt-12">
                     <Readout number="1.7K" unit="GitHub stars" />
                     <Readout number="170" unit="Forks" />
                     <Readout number="490+" unit="Commits" />
+                    <Readout number="1000" unit="Peak call, single meeting" />
                 </div>
 
                 {testimonials_section()}
@@ -47,8 +50,8 @@ pub fn CustomersSection() -> impl IntoView {
 fn Readout(number: &'static str, unit: &'static str) -> impl IntoView {
     view! {
         <div class="px-6 py-10 text-center">
-            <div class="text-4xl md:text-5xl font-medium tracking-tight text-fg">{number}</div>
-            <div class="eyebrow mt-3">{unit}</div>
+            <div class="text-4xl md:text-5xl font-medium tracking-tight bone-ink">{number}</div>
+            <div class="eyebrow bone-ink-3 mt-3">{unit}</div>
         </div>
     }
 }

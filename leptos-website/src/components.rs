@@ -21,6 +21,7 @@ pub mod CodeExample;
 pub mod CTAButton;
 pub mod Footer;
 pub mod HeroHeader;
+pub mod LiveCallPanel;
 pub mod Page;
 pub mod Reveal;
 pub mod SpeedStats;
@@ -32,6 +33,7 @@ pub mod sections {
     pub mod Developers;
     pub mod Pricing;
     pub mod SupportedPlatforms;
+    pub mod System;
 }
 
 pub use CTAButton::*;

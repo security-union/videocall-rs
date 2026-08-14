@@ -221,7 +221,7 @@
   /* Failure mode is "visible": without JS, or before arming, content shows. */
   .reveal.reveal-armed > * {
     opacity: 0;
-    transform: translateY(12px);
+    transform: translateY(16px);
     transition:
       opacity 0.5s cubic-bezier(0.22, 1, 0.36, 1),
       transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
@@ -235,8 +235,23 @@
   .reveal.reveal-armed > *:nth-child(4) {
     transition-delay: 180ms;
   }
+  /* Deepened stagger so 5–6-item grids (bento, readouts) fully cascade. */
+  .reveal.reveal-armed > *:nth-child(5) {
+    transition-delay: 240ms;
+  }
+  .reveal.reveal-armed > *:nth-child(6) {
+    transition-delay: 300ms;
+  }
   .reveal.reveal-armed.in-view > * {
     opacity: 1;
+    transform: none;
+  }
+
+  /* Section-index count-in: the mono index leads, sliding in from the left. */
+  .reveal.reveal-armed > .section-index {
+    transform: translateY(16px) translateX(-6px);
+  }
+  .reveal.reveal-armed.in-view > .section-index {
     transform: none;
   }
 
@@ -255,7 +270,371 @@
   }
 }
 
-leptos-island {
+/* ====================================================================== *
+ * Aliveness layer — live-call panel, system bento, rover field, bone band.
+ * All motion is transform/opacity first (sparkline/multicast use tiny
+ * stroke-dashoffset paths). Every keyframe is frozen under reduced-motion at
+ * the bottom of this block. Byte cost is zero: no video, no fonts, no libs.
+ * ====================================================================== */
+@layer components {
+  /* ---- Move A · live-call instrument panel --------------------------- */
+  .lcp-tile {
+    transition:
+      border-color 0.24s ease-out,
+      box-shadow 0.24s ease-out;
+  }
+  /* Speaking glow — mirrors the app's VAD tile highlight. Small tile, so the
+     box-shadow cost is negligible; it is paired with meter motion + the LIVE
+     word, never the sole signal. */
+  .lcp-tile.is-active {
+    border-color: var(--signal);
+    box-shadow:
+      0 0 0 1px var(--signal),
+      0 0 24px -6px var(--signal);
+  }
+
+  /* Audio meters — GPU transform only. Inactive tiles animate calmly; the
+     active tile runs the full range via the .is-active override below. */
+  .lcp-bar {
+    transform-origin: bottom;
+    transform: scaleY(0.3);
+    animation-name: meter-quiet;
+    animation-duration: 700ms;
+    animation-timing-function: ease-in-out;
+    animation-iteration-count: infinite;
+  }
+  .lcp-tile.is-active .lcp-bar:nth-child(1) {
+    animation-name: meter-a;
+    animation-duration: 640ms;
+    animation-delay: -120ms;
+  }
+  .lcp-tile.is-active .lcp-bar:nth-child(2) {
+    animation-name: meter-b;
+    animation-duration: 820ms;
+    animation-delay: -360ms;
+  }
+  .lcp-tile.is-active .lcp-bar:nth-child(3) {
+    animation-name: meter-c;
+    animation-duration: 560ms;
+    animation-delay: -200ms;
+  }
+  .lcp-tile.is-active .lcp-bar:nth-child(4) {
+    animation-name: meter-d;
+    animation-duration: 900ms;
+    animation-delay: -480ms;
+  }
+  @keyframes meter-a {
+    0%,
+    100% {
+      transform: scaleY(0.25);
+    }
+    50% {
+      transform: scaleY(0.95);
+    }
+  }
+  @keyframes meter-b {
+    0%,
+    100% {
+      transform: scaleY(0.35);
+    }
+    45% {
+      transform: scaleY(0.75);
+    }
+  }
+  @keyframes meter-c {
+    0%,
+    100% {
+      transform: scaleY(0.2);
+    }
+    55% {
+      transform: scaleY(0.85);
+    }
+  }
+  @keyframes meter-d {
+    0%,
+    100% {
+      transform: scaleY(0.4);
+    }
+    50% {
+      transform: scaleY(0.6);
+    }
+  }
+  @keyframes meter-quiet {
+    0%,
+    100% {
+      transform: scaleY(0.2);
+    }
+    50% {
+      transform: scaleY(0.34);
+    }
+  }
+
+  /* REC blink — header/footer clock + the rover tile chip. */
+  .rec-dot {
+    animation: rec-blink 1.4s steps(2, jump-none) infinite;
+  }
+  @keyframes rec-blink {
+    0% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.25;
+    }
+    100% {
+      opacity: 1;
+    }
+  }
+
+  /* ---- Move B · system bento ----------------------------------------- */
+  /* Waveform — mirrored around a centerline (origin center). */
+  .wave-bar {
+    transform-origin: center;
+    transform: scaleY(0.4);
+    animation-duration: 800ms;
+    animation-timing-function: ease-in-out;
+    animation-iteration-count: infinite;
+  }
+  .wave-bar:nth-child(5n + 1) {
+    animation-name: wave-a;
+    animation-delay: -100ms;
+  }
+  .wave-bar:nth-child(5n + 2) {
+    animation-name: wave-b;
+    animation-delay: -320ms;
+    animation-duration: 700ms;
+  }
+  .wave-bar:nth-child(5n + 3) {
+    animation-name: wave-c;
+    animation-delay: -540ms;
+    animation-duration: 920ms;
+  }
+  .wave-bar:nth-child(5n + 4) {
+    animation-name: wave-d;
+    animation-delay: -260ms;
+    animation-duration: 640ms;
+  }
+  .wave-bar:nth-child(5n + 5) {
+    animation-name: wave-e;
+    animation-delay: -700ms;
+    animation-duration: 860ms;
+  }
+  @keyframes wave-a {
+    0%,
+    100% {
+      transform: scaleY(0.2);
+    }
+    50% {
+      transform: scaleY(0.9);
+    }
+  }
+  @keyframes wave-b {
+    0%,
+    100% {
+      transform: scaleY(0.3);
+    }
+    50% {
+      transform: scaleY(0.7);
+    }
+  }
+  @keyframes wave-c {
+    0%,
+    100% {
+      transform: scaleY(0.15);
+    }
+    50% {
+      transform: scaleY(1);
+    }
+  }
+  @keyframes wave-d {
+    0%,
+    100% {
+      transform: scaleY(0.35);
+    }
+    50% {
+      transform: scaleY(0.6);
+    }
+  }
+  @keyframes wave-e {
+    0%,
+    100% {
+      transform: scaleY(0.25);
+    }
+    50% {
+      transform: scaleY(0.8);
+    }
+  }
+
+  /* Multicast fan-out — dashes march outward from source to N nodes. */
+  .packet-path {
+    stroke-dasharray: 4 6;
+    animation: packet-flow 1.6s linear infinite;
+  }
+  @keyframes packet-flow {
+    to {
+      stroke-dashoffset: -20;
+    }
+  }
+  .source-node {
+    animation: source-pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes source-pulse {
+    0%,
+    100% {
+      opacity: 0.55;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  .arrive-node {
+    opacity: 0.35;
+    animation: node-arrive 1.6s ease-in-out infinite;
+  }
+  @keyframes node-arrive {
+    0%,
+    70%,
+    100% {
+      opacity: 0.35;
+    }
+    85% {
+      opacity: 1;
+    }
+  }
+
+  /* Latency sparkline — draws in once when its reveal enters view, then the
+     endpoint dot pulses. Fallback (no JS / reduced): rendered fully drawn. */
+  .spark-path {
+    stroke-dasharray: 400;
+    stroke-dashoffset: 0;
+  }
+  .reveal.reveal-armed .spark-path {
+    stroke-dashoffset: 400;
+  }
+  .reveal.reveal-armed.in-view .spark-path {
+    animation: spark-draw 900ms ease-out forwards;
+  }
+  @keyframes spark-draw {
+    to {
+      stroke-dashoffset: 0;
+    }
+  }
+  .spark-dot {
+    animation: spark-pulse 2s ease-in-out infinite;
+  }
+  @keyframes spark-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.4;
+    }
+  }
+
+  /* VP9 tile — macroblocks "encode" in a staggered opacity ripple. */
+  .vp9-block {
+    opacity: 0.15;
+    animation: vp9-encode 1.8s ease-in-out infinite;
+  }
+  @keyframes vp9-encode {
+    0%,
+    100% {
+      opacity: 0.15;
+    }
+    50% {
+      opacity: 0.7;
+    }
+  }
+
+  /* Off-screen subtrees skip render AND their CSS animations entirely.
+   * contain-intrinsic-size keeps scroll geometry stable before first paint;
+   * `auto` remembers the real size afterwards. */
+  #system {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 1400px;
+  }
+  .lcp-cv {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 520px;
+  }
+
+  /* ---- Rover mascot idle bob (brand, Company section) ---------------- */
+  .rover-bob {
+    animation: rover-bob 6s ease-in-out infinite;
+  }
+  @keyframes rover-bob {
+    0%,
+    100% {
+      transform: translateY(0);
+    }
+    50% {
+      transform: translateY(-3px);
+    }
+  }
+
+  /* ---- Move C · inverted bone band ----------------------------------- *
+   * All ratios computed on #EDEBE6 (AA/AAA per the spec). The bright oxide
+   * survives only as a decorative rule; oxide *text* uses the darkened
+   * --bone-signal so it clears 4.5:1. */
+  .band-bone {
+    background: #edebe6;
+    color: #16151a;
+  }
+  .bone-ink {
+    color: #16151a;
+  }
+  .bone-ink-2 {
+    color: #4e4b45;
+  }
+  .bone-ink-3 {
+    color: #6e6a62;
+  }
+  .bone-surface {
+    background: #e3e0d8;
+  }
+  .bone-border {
+    border-color: rgba(22, 21, 26, 0.16);
+  }
+  .bone-divide > * + * {
+    border-color: rgba(22, 21, 26, 0.16);
+  }
+  .band-bone *:focus-visible {
+    outline-color: #a8471f;
+  }
+
+  /* ---- Reduced-motion: every new keyframe freezes at its final frame -- */
+  @media (prefers-reduced-motion: reduce) {
+    .lcp-bar,
+    .lcp-tile.is-active .lcp-bar {
+      animation: none !important;
+      transform: scaleY(0.5) !important;
+    }
+    .rec-dot,
+    .wave-bar,
+    .packet-path,
+    .source-node,
+    .arrive-node,
+    .spark-dot,
+    .vp9-block,
+    .rover-bob {
+      animation: none !important;
+    }
+    .vp9-block {
+      opacity: 0.4 !important;
+    }
+    .arrive-node {
+      opacity: 1 !important;
+    }
+    .reveal.reveal-armed .spark-path,
+    .reveal.reveal-armed.in-view .spark-path {
+      stroke-dashoffset: 0 !important;
+      animation: none !important;
+    }
+  }
+}
+
+leptos-island,
+leptos-children {
   display: contents;
 }
 

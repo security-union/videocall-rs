@@ -25,10 +25,10 @@ pub fn CompanySection() -> impl IntoView {
     view! {
         <section id="company" aria-labelledby="company-title" class="px-6 md:px-10 py-24 md:py-32">
             <div class="max-w-content mx-auto">
-                <RevealOnView>
-                    <p class="section-index" aria-hidden="true">"04 — Company"</p>
+                <RevealOnView class="">
+                    <p class="section-index" aria-hidden="true">"05 — Company"</p>
                     <h2 id="company-title" class="text-h2 text-fg mt-4">"Open source, built in Rust"</h2>
-                    <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"Transparent development, from the transport layer up."</p>
+                    <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"Transparent development, from the transport layer up. Read the code, run it yourself, and extend it."</p>
                 </RevealOnView>
 
                 <div class="grid lg:grid-cols-2 gap-6 mt-12 items-start">
@@ -36,7 +36,7 @@ pub fn CompanySection() -> impl IntoView {
                     <div class="panel">
                         <h3 class="text-h3 text-fg">"Our mission"</h3>
                         <p class="text-fg-2 mt-4 leading-relaxed">
-                            "Make real-time video accessible, performant, and reliable through open-source infrastructure that anyone can read, run, and extend."
+                            "Make real-time audio and video accessible, performant, and reliable through open-source infrastructure that anyone can read, run, and extend."
                         </p>
 
                         <dl class="mt-8 divide-y divide-line">
@@ -53,7 +53,7 @@ pub fn CompanySection() -> impl IntoView {
                         </dl>
                     </div>
 
-                    // Mascot
+                    // Mascot — brand, not a product claim; a gentle idle bob.
                     <figure class="flex flex-col items-center gap-4">
                         <img
                             src="/images/rover-mascot.png"
@@ -62,7 +62,7 @@ pub fn CompanySection() -> impl IntoView {
                             loading="lazy"
                             decoding="async"
                             alt="The videocall.rs rover mascot: a four-legged camera robot"
-                            class="block w-full max-w-[360px] h-auto"
+                            class="rover-bob block w-full max-w-[360px] h-auto"
                         />
                         <figcaption class="data flex items-center gap-2">
                             <span aria-hidden="true">"UNIT 01 · FIELD CAMERA ROVER"</span>

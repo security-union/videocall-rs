@@ -21,6 +21,7 @@ use crate::components::sections::Customers::CustomersSection;
 use crate::components::sections::Developers::DevelopersSection;
 use crate::components::sections::Pricing::PricingSection;
 use crate::components::sections::SupportedPlatforms::SupportedPlatformsSection;
+use crate::components::sections::System::SystemSection;
 
 // Removed unused import
 use crate::components::HeroHeader::*;
@@ -41,11 +42,13 @@ pub async fn perform_markdown_code_to_html(markdown: String) -> Result<String, S
 #[component]
 pub fn Home() -> impl IntoView {
     view! {
-        <Title text="videocall.rs — Rust WebTransport Video Infrastructure"/>
+        <Title text="videocall.rs — Full-stack real-time audio and video, in Rust"/>
         <Page>
             <SiteNav/>
             <main id="content">
                 <Hero/>
+                <div class="rule"></div>
+                <SystemSection/>
                 <div class="rule"></div>
                 <SupportedPlatformsSection/>
                 <div class="rule"></div>

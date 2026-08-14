@@ -24,8 +24,8 @@ pub fn PricingSection() -> impl IntoView {
     view! {
         <section id="pricing" aria-labelledby="pricing-title" class="px-6 md:px-10 py-24 md:py-32">
             <div class="max-w-content mx-auto">
-                <RevealOnView>
-                    <p class="section-index" aria-hidden="true">"06 — Deployment"</p>
+                <RevealOnView class="">
+                    <p class="section-index" aria-hidden="true">"07 — Deployment"</p>
                     <h2 id="pricing-title" class="text-h2 text-fg mt-4">"Run it yourself, or have us run it"</h2>
                     <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"Self-host the entire stack, or let us operate it for you."</p>
                 </RevealOnView>

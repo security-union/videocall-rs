@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::LiveCallPanel::LiveCallPanel;
 use leptos::prelude::*;
 use leptos_router::components::A;
 
@@ -71,29 +72,23 @@ pub fn SiteNav() -> impl IntoView {
     }
 }
 
-/// Left-aligned editorial hero. Type, a hairline rule, and a chrome-less code
-/// panel carry the whole thing — no raster art, no glow, no gradient fills.
+/// Left-aligned editorial hero. Type, a hairline rule, and the live-call
+/// instrument panel carry the whole thing — no raster art, no glow, no gradient
+/// fills. The panel is the page's one aliveness island (the CLI snippet it
+/// replaced lives on in the System bento below).
 #[component]
 pub fn Hero() -> impl IntoView {
-    let code_html = r##"<span class="hl-comment"># Stream video to a room</span>
-<span class="hl-fn">videocall-cli</span> stream \
-  <span class="hl-keyword">--user-id</span> <span class="hl-string">"robot-01"</span> \
-  <span class="hl-keyword">--meeting-id</span> <span class="hl-string">"control-room"</span> \
-  <span class="hl-keyword">--video-device-index</span> <span class="hl-type">0</span> \
-  <span class="hl-keyword">--resolution</span> <span class="hl-type">1280x720</span> \
-  <span class="hl-keyword">--fps</span> <span class="hl-type">30</span>"##;
-
     view! {
         <section aria-labelledby="hero-title" class="px-6 md:px-10 pt-16 pb-20 md:pt-24 md:pb-28">
             <div class="max-w-content mx-auto">
-                <p class="eyebrow">"01 — Real-time video infrastructure"</p>
+                <p class="eyebrow">"01 — Real-time audio + video infrastructure"</p>
 
                 <h1 id="hero-title" class="text-display text-fg mt-6 max-w-4xl">
-                    "Move video across the network with measured latency."
+                    "Real-time audio and video. The whole system, in Rust."
                 </h1>
 
                 <p class="text-body-lg text-fg-2 mt-6 max-w-2xl">
-                    "Open-source transport for live video. WebTransport over QUIC, with a WebSocket fallback. Built in Rust for browsers, robots, and embedded devices."
+                    "videocall.rs is an opinionated, full-stack system for streaming live audio and video. Batteries included: Rust relay servers, a browser client, a native CLI, and iOS and Android SDKs, with auth, meeting management, metrics, and a Helm deploy. Run a video conference for your team, or stream from embedded devices in the field with the CLI. You deploy a system, not a codec."
                 </p>
 
                 <div class="flex flex-col sm:flex-row gap-3 mt-8">
@@ -102,30 +97,23 @@ pub fn Hero() -> impl IntoView {
                 </div>
 
                 // Dividing rule carrying the single live node — the one moment of
-                // color above the fold.
+                // color above the fold; it also anchors the live-call panel.
                 <div class="flex items-center gap-3 mt-14 mb-8">
                     <span class="live-dot" aria-hidden="true"></span>
                     <span class="eyebrow text-signal">"Live"</span>
                     <span class="rule flex-1"></span>
                 </div>
 
-                // Chrome-less code panel — real mono caption bar, no traffic lights.
-                <div class="rounded-panel border border-line bg-bg-code overflow-hidden">
-                    <div class="flex items-center justify-between px-4 py-2.5 border-b border-line">
-                        <span class="font-mono text-xs text-fg-3">"videocall-cli · stream"</span>
-                        <span class="font-mono text-xs text-fg-3 tracking-wider">"QUIC / WEBTRANSPORT"</span>
-                    </div>
-                    <pre class="p-5 md:p-6 text-[13px] md:text-[15px] leading-7 font-mono overflow-x-auto">
-                        <code inner_html=code_html></code>
-                    </pre>
-                </div>
+                // The live-call instrument panel — the primary aliveness move.
+                <LiveCallPanel/>
 
                 // Spec row — mono facts, hairline dividers, one ink color.
                 <div class="flex flex-wrap gap-y-3 mt-8">
-                    <span class="eyebrow pr-4">"E2E encrypted"</span>
-                    <span class="eyebrow border-l border-line px-4">"WebTransport + WS"</span>
-                    <span class="eyebrow border-l border-line px-4">"JWT / SSO"</span>
-                    <span class="eyebrow border-l border-line px-4">"MIT / Apache-2.0"</span>
+                    <span class="eyebrow pr-4">"AUDIO + VIDEO"</span>
+                    <span class="eyebrow border-l border-line px-4">"OPUS + VP9, PURE RUST"</span>
+                    <span class="eyebrow border-l border-line px-4">"WEBTRANSPORT / WS"</span>
+                    <span class="eyebrow border-l border-line px-4">"E2E ENCRYPTED"</span>
+                    <span class="eyebrow border-l border-line px-4">"MIT / APACHE-2.0"</span>
                 </div>
             </div>
         </section>

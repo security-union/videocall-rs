@@ -27,7 +27,19 @@ use leptos::prelude::*;
 /// final visible state. A single `IntersectionObserver` toggles `in-view` and
 /// disconnects each element after its first reveal, so nothing keeps observing.
 #[island]
-pub fn RevealOnView(children: Children) -> impl IntoView {
+pub fn RevealOnView(
+    /// Extra classes for the reveal wrapper — spacing only (e.g. `"mt-12"`).
+    /// Do NOT put grid/flex layout classes here: island children arrive
+    /// wrapped in a `<leptos-children>` element, so a grid on the wrapper
+    /// would see one child. `leptos-children` is `display: contents` (see
+    /// input.css), which lets the stagger selectors reach the real items, but
+    /// layout containers belong on a plain div inside the island (see
+    /// System.rs). Required (islands can't serialize an optional/defaulted
+    /// prop cleanly), so every call site states it explicitly.
+    #[prop(into)]
+    class: String,
+    children: Children,
+) -> impl IntoView {
     let node: NodeRef<leptos::html::Div> = NodeRef::new();
 
     #[cfg(feature = "hydrate")]
@@ -97,7 +109,7 @@ pub fn RevealOnView(children: Children) -> impl IntoView {
     }
 
     view! {
-        <div node_ref=node class="reveal">
+        <div node_ref=node class=format!("reveal {class}")>
             {children()}
         </div>
     }

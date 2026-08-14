@@ -24,10 +24,10 @@ pub fn DevelopersSection() -> impl IntoView {
     view! {
         <section id="developers" aria-labelledby="developers-title" class="px-6 md:px-10 py-24 md:py-32">
             <div class="max-w-content mx-auto">
-                <RevealOnView>
-                    <p class="section-index" aria-hidden="true">"03 — Developers"</p>
+                <RevealOnView class="">
+                    <p class="section-index" aria-hidden="true">"04 — Developers"</p>
                     <h2 id="developers-title" class="text-h2 text-fg mt-4">"Three ways to ship"</h2>
-                    <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"One transport, three surfaces to build on."</p>
+                    <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"One system, three surfaces to build on. Library, headless CLI, and native mobile."</p>
                 </RevealOnView>
 
                 // Ruled grid: the hairline gap between cells forms a continuous
@@ -36,7 +36,7 @@ pub fn DevelopersSection() -> impl IntoView {
                     <DeveloperCard
                         index="01"
                         title="videocall-rs"
-                        description="Core Rust library. WebTransport support, WebSocket fallback, and low-level media control."
+                        description="Core Rust library. WebTransport and WebSocket transport, end-to-end encryption, and the pure-Rust VP9 and Opus media pipeline."
                         link_text="Explore on GitHub →"
                         link_href="https://github.com/security-union/videocall-rs"
                     />
@@ -49,9 +49,9 @@ pub fn DevelopersSection() -> impl IntoView {
                     />
                     <DeveloperCard
                         index="03"
-                        title="WebTransport"
-                        description="QUIC transport with automatic WebSocket fallback."
-                        link_text="Read the transport docs →"
+                        title="videocall-sdk"
+                        description="iOS and Android bindings over UniFFI. Bring real-time audio and video into a native app."
+                        link_text="Read the SDK docs →"
                         link_href="https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md"
                     />
                 </div>

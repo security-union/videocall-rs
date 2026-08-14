@@ -27,7 +27,7 @@ pub fn Footer() -> impl IntoView {
                 <div class="flex flex-col md:flex-row justify-between items-start gap-8 mb-10">
                     <div>
                         <img class="h-8 w-auto opacity-70" src="/images/videocall_logo.svg" alt="videocall.rs" />
-                        <p class="eyebrow mt-4">"Real-time video infrastructure · MIT / Apache-2.0"</p>
+                        <p class="eyebrow mt-4">"Real-time audio + video infrastructure · MIT / Apache-2.0"</p>
                     </div>
 
                     <nav aria-label="Footer">

@@ -1,66 +1,25 @@
-
-/* Animations */
-@keyframes shine {
-  0% { left: -100%; }
-  100% { left: 100%; }
-}
-
-.animate-shine {
-  animation: shine 2s ease-in-out;
-}
-
-@keyframes pulse-slow {
-  0%, 100% { opacity: 0.6; }
-  50% { opacity: 1; }
-}
-
-.animate-pulse-slow {
-  animation: pulse-slow 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-}
-
-@keyframes float {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-10px); }
-}
-
-.animate-float {
-  animation: float 5s ease-in-out infinite;
-}
-
-/* Focus styles */
+/* Focus — oxide signal ring on every interactive element. */
 *:focus-visible {
-  outline: 2px solid #007AFF;
+  outline: 2px solid var(--signal);
   outline-offset: 2px;
+  border-radius: 2px;
 }
 
-/* Scrollbar styling */
+/* Scrollbar — monochrome, no accent fills. */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  background: rgba(28, 28, 30, 0.3);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(0, 122, 255, 0.4);
+  background: rgba(242, 242, 240, 0.14);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 122, 255, 0.6);
-}
-
-/* Utility classes */
-.text-shadow {
-  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-}
-
-.hover-lift {
-  transition: transform 0.3s ease;
-}
-
-.hover-lift:hover {
-  transform: translateY(-2px);
+  background: rgba(242, 242, 240, 0.24);
 }

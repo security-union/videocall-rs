@@ -1,0 +1,38 @@
+# videocall.rs
+
+> Open-source, low-latency video conferencing platform and streaming API written entirely in Rust. A WebRTC alternative built on WebTransport (HTTP/3 / QUIC) with automatic WebSocket fallback. Runs in the browser, on native devices via a CLI, and on mobile via iOS/Android SDKs. Self-hostable, dual-licensed MIT/Apache-2.0.
+
+Key facts:
+- Media transport is WebTransport (QUIC/HTTP3) with a WebSocket fallback; no ICE, STUN, TURN, or SDP signaling.
+- End-to-end encrypted media (hybrid RSA/AES); the relay server forwards ciphertext only.
+- Written end-to-end in Rust: server, browser client (Dioxus/WebAssembly), and native client.
+- Demonstrated scaling to 1000 users in a single call.
+- Targets browser calls, robotics/embedded streaming (Raspberry Pi, Jetson), and mobile.
+
+## Docs
+
+- [README (overview, install, self-hosting)](https://github.com/security-union/videocall-rs/blob/main/README.md)
+- [Architecture](https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md)
+- [Nix build system](https://github.com/security-union/videocall-rs/blob/main/docs/nix-architecture.md)
+- [Meeting ownership & workflow](https://github.com/security-union/videocall-rs/blob/main/docs/MEETING_OWNERSHIP.md)
+- [Meeting API reference](https://github.com/security-union/videocall-rs/blob/main/docs/MEETING_API.md)
+- [Hosted documentation](https://docs.videocall.rs)
+
+## Repositories & crates
+
+- [GitHub: security-union/videocall-rs](https://github.com/security-union/videocall-rs)
+- [videocall-cli (native headless streaming client)](https://crates.io/crates/videocall-cli)
+- [videocall-client (browser/native client library)](https://crates.io/crates/videocall-client)
+- [videocall-types (shared protobuf types)](https://crates.io/crates/videocall-types)
+- [videocall-codecs (pure-Rust codec wrappers)](https://crates.io/crates/videocall-codecs)
+
+## Examples
+
+- [videocall-cli usage (stream from a camera / Raspberry Pi)](https://github.com/security-union/videocall-rs/blob/main/videocall-cli/README.md)
+- [videocall-sdk (iOS Swift and Android Kotlin bindings)](https://github.com/security-union/videocall-rs/blob/main/videocall-sdk/README.md)
+
+## Optional
+
+- [Website](https://videocall.rs)
+- [Discord community](https://discord.gg/JP38NRe4CJ)
+- [Talk: Scaling to 1000 Users Per Call](https://youtu.be/LWwOSZJwEJI)

@@ -41,17 +41,22 @@ pub async fn perform_markdown_code_to_html(markdown: String) -> Result<String, S
 #[component]
 pub fn Home() -> impl IntoView {
     view! {
-        <Title text="Ultra-low-latency Video API for Developers"/>
+        <Title text="videocall.rs — Rust WebTransport Video Infrastructure"/>
         <Page>
-            <HeroHeader/>
-
-            <div class="max-w-6xl mx-auto relative space-y-28 py-20 px-6">
+            <SiteNav/>
+            <main id="content">
+                <Hero/>
+                <div class="rule"></div>
                 <SupportedPlatformsSection/>
+                <div class="rule"></div>
                 <DevelopersSection/>
+                <div class="rule"></div>
                 <CompanySection/>
+                <div class="rule"></div>
                 <CustomersSection/>
+                <div class="rule"></div>
                 <PricingSection/>
-            </div>
+            </main>
         </Page>
     }
 }

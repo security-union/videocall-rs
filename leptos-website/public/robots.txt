@@ -1,3 +1,33 @@
+# videocall.rs — crawling policy. Default: allow everyone.
 User-agent: *
 Allow: /
+
+# AI / LLM crawlers — explicitly welcome to index and train on this site.
+User-agent: GPTBot
+Allow: /
+
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Claude-Web
+Allow: /
+
+User-agent: anthropic-ai
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+User-agent: CCBot
+Allow: /
+
 Sitemap: https://videocall.rs/sitemap.xml

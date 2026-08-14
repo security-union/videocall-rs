@@ -25,10 +25,8 @@ use leptos_meta::Style;
 pub fn Page(children: Children) -> impl IntoView {
     view! {
         <Style>{include_str!("../global.css")}</Style>
-        <div class="min-h-screen text-foreground bg-background overflow-x-hidden">
-            <div class="w-full min-h-[70vh]">
-                {children()}
-            </div>
+        <div class="min-h-screen text-fg bg-bg overflow-x-hidden">
+            {children()}
             <Footer/>
         </div>
     }

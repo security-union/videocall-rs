@@ -17,87 +17,89 @@
  */
 
 use crate::components::CTAButton::{ButtonSize, ButtonVariant, CTAButton};
+use crate::components::Reveal::RevealOnView;
 use leptos::prelude::*;
 
 #[component]
 pub fn CompanySection() -> impl IntoView {
     view! {
-        <section id="company" class="relative">
-            <div class="text-center mb-16">
-                <h2 class="text-4xl md:text-5xl font-semibold tracking-tight mb-4">"Company"</h2>
-                <p class="text-lg md:text-xl text-white/50 max-w-2xl mx-auto">"Building the future of real-time communication"</p>
-            </div>
+        <section id="company" aria-labelledby="company-title" class="px-6 md:px-10 py-24 md:py-32">
+            <div class="max-w-content mx-auto">
+                <RevealOnView>
+                    <p class="section-index" aria-hidden="true">"04 — Company"</p>
+                    <h2 id="company-title" class="text-h2 text-fg mt-4">"Open source, built in Rust"</h2>
+                    <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"Transparent development, from the transport layer up."</p>
+                </RevealOnView>
 
-            <div class="grid md:grid-cols-2 gap-8 lg:gap-12">
-                // Our Mission Card
-                <div class="card-apple h-full">
-                    <div class="mb-6">
-                        <div class="flex items-center mb-6">
-                            <div class="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center mr-4">
-                                <svg class="w-5 h-5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2 2m0 0l2 2m-2-2v12" />
-                                </svg>
-                            </div>
-                            <h3 class="text-2xl font-semibold text-foreground">"Our Mission"</h3>
-                        </div>
-
-                        <p class="text-foreground-secondary text-lg mb-8 leading-relaxed">
-                            "We're building the future of real-time communication. Our mission is to make video conferencing more accessible, performant, and reliable through open-source innovation."
+                <div class="grid lg:grid-cols-2 gap-6 mt-12 items-start">
+                    // Mission
+                    <div class="panel">
+                        <h3 class="text-h3 text-fg">"Our mission"</h3>
+                        <p class="text-fg-2 mt-4 leading-relaxed">
+                            "Make real-time video accessible, performant, and reliable through open-source infrastructure that anyone can read, run, and extend."
                         </p>
+
+                        <dl class="mt-8 divide-y divide-line">
+                            <div class="border-l border-line pl-4 py-4">
+                                <span class="section-index" aria-hidden="true">"Principle / 01"</span>
+                                <dt class="text-fg font-medium mt-2">"Open source first"</dt>
+                                <dd class="text-fg-2 mt-1">"Transparency and community-driven development, in the open."</dd>
+                            </div>
+                            <div class="border-l border-line pl-4 py-4">
+                                <span class="section-index" aria-hidden="true">"Principle / 02"</span>
+                                <dt class="text-fg font-medium mt-2">"Built with Rust"</dt>
+                                <dd class="text-fg-2 mt-1">"One language from server to browser, for performance and reliability."</dd>
+                            </div>
+                        </dl>
                     </div>
 
-                    <div class="space-y-6">
-                        <div class="border-l-4 border-primary pl-4">
-                            <h4 class="text-lg font-semibold text-foreground mb-2">"Open Source First"</h4>
-                            <p class="text-foreground-secondary">"We believe in transparency and community-driven development."</p>
+                    // Mission patch
+                    <figure class="flex flex-col gap-4">
+                        <div class="overflow-hidden rounded border border-line bg-bg-s1">
+                            <img
+                                src="/images/mission-patch.jpg"
+                                width="720"
+                                height="720"
+                                loading="lazy"
+                                decoding="async"
+                                alt="videocall.rs mission patch: embroidered badge of a camera robot streaming video"
+                                class="block w-full h-auto aspect-square object-cover"
+                            />
                         </div>
-
-                        <div class="border-l-4 border-primary pl-4">
-                            <h4 class="text-lg font-semibold text-foreground mb-2">"Built with Rust"</h4>
-                            <p class="text-foreground-secondary">"Leveraging Rust's performance and reliability for better video calls."</p>
-                        </div>
-                    </div>
+                        <figcaption class="data flex items-center gap-2">
+                            <span aria-hidden="true">"MISSION PATCH · REAL-TIME VIDEO TRANSPORT"</span>
+                        </figcaption>
+                    </figure>
                 </div>
 
-                // Join Us Card
-                <div class="card-apple h-full">
-                    <div class="mb-6">
-                        <div class="flex items-center mb-6">
-                            <div class="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center mr-4">
-                                <svg class="w-5 h-5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-                                </svg>
-                            </div>
-                            <h3 class="text-2xl font-semibold text-foreground">"Join Us"</h3>
-                        </div>
-
-                        <p class="text-foreground-secondary text-lg mb-8 leading-relaxed">
-                            "We're always looking for talented individuals who share our passion for building great software."
+                // Join
+                <div class="panel mt-6 md:flex md:items-center md:justify-between gap-6">
+                    <div class="md:max-w-xl">
+                        <h3 class="text-h3 text-fg">"Join us"</h3>
+                        <p class="text-fg-2 mt-4 leading-relaxed">
+                            "We are always looking for engineers who care about real-time systems and open infrastructure."
                         </p>
                     </div>
 
-                    <div class="space-y-4 mt-auto">
+                    <div class="flex flex-col sm:flex-row gap-3 mt-6 md:mt-0 shrink-0">
                         <CTAButton
                             variant=ButtonVariant::Primary
                             size=ButtonSize::Medium
                             href=Some("https://github.com/security-union/videocall-rs".to_string())
-                            class="w-full justify-center".to_string()
+                            class="w-full sm:w-auto".to_string()
                         >
-                            "View Open Positions"
+                            "View open positions"
                         </CTAButton>
-
                         <CTAButton
                             variant=ButtonVariant::Secondary
                             size=ButtonSize::Medium
-                            href=Some("https://discord.gg/XRdt6WfZyf".to_string())
-                            class="w-full justify-center".to_string()
+                            href=Some("https://discord.gg/JP38NRe4CJ".to_string())
+                            class="w-full sm:w-auto gap-2".to_string()
                         >
-                            <div class="flex items-center">
-                                <svg class="w-5 h-5 mr-2 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                                </svg>
-                                "Join our Discord"
-                            </div>
+                            <svg class="w-4 h-4 text-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                            </svg>
+                            "Join Discord"
                         </CTAButton>
                     </div>
                 </div>

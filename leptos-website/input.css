@@ -3,12 +3,43 @@
 @tailwind utilities;
 
 @layer base {
+  :root {
+    /* Ink / surface — warm-neutral near-black. */
+    --bg: #0a0a0b;
+    --surface-1: #111113;
+    --surface-2: #17171a;
+    --surface-code: #0d0d0f;
+
+    /* Foreground — warm grey ramp. */
+    --fg: #f2f2f0;
+    --fg-2: #a1a1a0;
+    --fg-3: #6e6e6d;
+    --fg-4: #3a3a3b;
+
+    /* Hairlines. */
+    --line: rgba(242, 242, 240, 0.1);
+    --line-strong: rgba(242, 242, 240, 0.18);
+
+    /* Oxide signal accent — live / active / focus only. */
+    --signal: #d96b3c;
+    --signal-quiet: rgba(217, 107, 60, 0.14);
+
+    /* Status readouts only. */
+    --ok: #8fa98a;
+    --warn: #c9a227;
+    --err: #b5493b;
+
+    --font-sans: "Helvetica Neue", Helvetica, Arial, "Segoe UI", system-ui, sans-serif;
+    --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Monaco, monospace;
+  }
+
   html {
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
-    background-color: #000000;
-    color: #f5f5f7;
+    font-family: var(--font-sans);
+    background-color: var(--bg);
+    color: var(--fg);
     font-size: 16px;
-    line-height: 1.5;
+    line-height: 1.55;
+    letter-spacing: normal;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     scroll-behavior: smooth;
@@ -17,138 +48,257 @@
   body {
     margin: 0;
     min-height: 100vh;
-    background-color: #000000;
+    background-color: var(--bg);
   }
 
-  * { box-sizing: border-box; }
+  * {
+    box-sizing: border-box;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+  }
 }
 
 @layer components {
-  /* Hero gradient — animated shimmer */
-  .hero-gradient {
-    background: linear-gradient(135deg, #2997ff 0%, #a855f7 40%, #2997ff 80%);
-    background-size: 200% auto;
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    animation: gradient-shift 4s ease-in-out infinite;
+  /* ---- Typography roles ------------------------------------------------ */
+  .text-display {
+    font-size: clamp(2.75rem, 6vw, 5rem);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.05;
+  }
+  .text-h2 {
+    font-size: clamp(2rem, 3.5vw, 3rem);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.05;
+  }
+  .text-h3 {
+    font-size: clamp(1.25rem, 1.6vw, 1.5rem);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+  }
+  .text-body-lg {
+    font-size: clamp(1.0625rem, 1.2vw, 1.25rem);
+    font-weight: 400;
+    line-height: 1.55;
   }
 
-  @keyframes gradient-shift {
-    0%, 100% { background-position: 0% center; }
-    50% { background-position: 100% center; }
+  /* Mono micro-label. Used for eyebrows and section indices. */
+  .eyebrow,
+  .section-index {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    line-height: 1;
+    color: var(--fg-3);
   }
 
-  /* Hero buttons — Apple style */
-  .hero-btn-primary {
-    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
-    @apply px-8 py-3.5 text-[15px];
-    background: #2997ff;
-    color: #fff;
-  }
-  .hero-btn-primary:hover {
-    background: #0077ed;
-    transform: scale(1.02);
+  /* Mono data readout. */
+  .data {
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    letter-spacing: 0.02em;
+    color: var(--fg-3);
   }
 
-  .hero-btn-secondary {
-    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
-    @apply px-8 py-3.5 text-[15px];
-    color: #2997ff;
+  /* ---- Structural primitives ------------------------------------------ */
+  /* Full-bleed 1px signal rule between sections. */
+  .rule {
+    height: 1px;
+    width: 100%;
+    background: var(--line);
+    border: 0;
+  }
+
+  .panel {
+    background: var(--surface-1);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 1.5rem;
+    transition:
+      border-color 0.2s ease-out,
+      background-color 0.2s ease-out;
+  }
+  @media (min-width: 768px) {
+    .panel {
+      padding: 2rem;
+    }
+  }
+  .panel:hover {
+    border-color: var(--line-strong);
+    background: var(--surface-2);
+  }
+
+  /* ---- Buttons (padding supplied by caller) --------------------------- */
+  .btn-solid {
+    @apply inline-flex items-center justify-center rounded-sm font-medium;
+    background: var(--fg);
+    color: var(--bg);
+    transition: background-color 0.16s ease-out;
+  }
+  .btn-solid:hover {
+    background: #ffffff;
+  }
+
+  .btn-line {
+    @apply inline-flex items-center justify-center rounded-sm font-medium;
+    color: var(--fg);
     background: transparent;
-    border: 1px solid rgba(41, 151, 255, 0.3);
+    border: 1px solid var(--line-strong);
+    transition:
+      border-color 0.16s ease-out,
+      background-color 0.16s ease-out;
   }
-  .hero-btn-secondary:hover {
-    background: rgba(41, 151, 255, 0.08);
-    border-color: rgba(41, 151, 255, 0.5);
-  }
-
-  /* Section buttons */
-  .btn-primary {
-    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
-    @apply px-6 py-3 text-[15px];
-    background: #2997ff;
-    color: #fff;
-  }
-  .btn-primary:hover { background: #0077ed; }
-
-  .btn-secondary {
-    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
-    @apply px-6 py-3 text-[15px];
-    color: #f5f5f7;
+  .btn-line:hover {
+    border-color: var(--fg);
     background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-  }
-  .btn-secondary:hover {
-    background: rgba(255, 255, 255, 0.08);
-    border-color: rgba(255, 255, 255, 0.16);
   }
 
-  /* Apple-style surface card — no visible border */
-  .card-apple {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    border-radius: 1.25rem;
-    padding: 2rem;
-    transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+  .btn-ghost {
+    @apply inline-flex items-center justify-center font-medium;
+    color: var(--fg-2);
+    background: transparent;
+    transition: color 0.16s ease-out;
   }
-  .card-apple:hover {
-    background: rgba(255, 255, 255, 0.06);
-    transform: translateY(-2px);
+  .btn-ghost:hover {
+    color: var(--fg);
   }
 
-  /* Typography — Apple scale */
-  .text-hero     { @apply text-5xl md:text-6xl lg:text-7xl font-bold tracking-tight; }
-  .text-headline { @apply text-3xl md:text-4xl lg:text-5xl font-semibold tracking-tight; }
-  .text-subheadline { @apply text-xl md:text-2xl font-medium; }
-  .text-body-large  { @apply text-lg md:text-xl leading-relaxed; }
-  .text-body        { @apply text-base leading-relaxed; }
-  .text-caption     { @apply text-sm; color: rgba(255,255,255,0.5); }
+  /* ---- Live dot — the only looping animation on the page -------------- */
+  .live-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: var(--signal);
+    animation: live-pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes live-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  /* ---- Nav underline — one licensed use of the accent ----------------- */
+  .nav-link {
+    position: relative;
+    color: var(--fg-3);
+    transition: color 0.16s ease-out;
+  }
+  .nav-link::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    bottom: -6px;
+    height: 1px;
+    width: 100%;
+    background: var(--signal);
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform 0.2s ease-out;
+  }
+  .nav-link:hover,
+  .nav-link:focus-visible {
+    color: var(--fg);
+  }
+  .nav-link:hover::after,
+  .nav-link:focus-visible::after {
+    transform: scaleX(1);
+  }
+
+  /* ---- Scroll reveal (armed only after the island hydrates) ----------- */
+  /* Failure mode is "visible": without JS, or before arming, content shows. */
+  .reveal.reveal-armed > * {
+    opacity: 0;
+    transform: translateY(12px);
+    transition:
+      opacity 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .reveal.reveal-armed > *:nth-child(2) {
+    transition-delay: 60ms;
+  }
+  .reveal.reveal-armed > *:nth-child(3) {
+    transition-delay: 120ms;
+  }
+  .reveal.reveal-armed > *:nth-child(4) {
+    transition-delay: 180ms;
+  }
+  .reveal.reveal-armed.in-view > * {
+    opacity: 1;
+    transform: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .live-dot {
+      animation: none;
+    }
+    .nav-link::after {
+      transition: none;
+    }
+    .reveal.reveal-armed > * {
+      opacity: 1 !important;
+      transform: none !important;
+      transition: none !important;
+    }
+  }
 }
 
-leptos-island { display: contents; }
-
-/* Code syntax highlighting */
-.hl-comment { color: #6e7681; }
-.hl-keyword { color: #ff7b72; }
-.hl-type    { color: #79c0ff; }
-.hl-fn      { color: #d2a8ff; }
-.hl-string  { color: #a5d6ff; }
-
-/* Legacy syntax classes */
-.hh1  { color: #ff7b72; }
-.hh2  { color: #79c0ff; }
-.hh3  { color: #d2a8ff; }
-.hh4  { color: #d2a8ff; }
-.hh5  { color: #ff7b72; }
-.hh6  { color: rgba(255,255,255,0.4); }
-.hh7  { color: #79c0ff; }
-.hh8  { color: rgba(255,255,255,0.7); }
-.hh9  { color: rgba(255,255,255,0.7); }
-.hh10 { color: rgba(255,255,255,0.7); }
-.hh11 { color: #a5d6ff; }
-.hh12 { color: #a5d6ff; }
-.hh13 { color: #ff7b72; }
-.hh14 { color: #79c0ff; }
-.hh15 { color: #79c0ff; }
-.hh16 { color: rgba(255,255,255,0.9); }
-.hh17 { color: #ffa657; }
-.hh18 { color: #ffa657; }
-.hh19 { color: #6e7681; }
-.hh20 { color: #d2a8ff; }
-.hh21 { color: #ff7b72; }
-
-/* Code block */
-.code-block {
-  background: rgba(255,255,255,0.03);
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 0.75rem;
-  padding: 1rem;
-  overflow-x: auto;
+leptos-island {
+  display: contents;
 }
-.code-block .code-block-inner {
-  font-family: 'SF Mono', 'Fira Code', Menlo, Monaco, monospace;
+
+/* Code syntax highlighting — desaturated toward the monochrome system. */
+.hl-comment {
+  color: var(--fg-3);
+}
+.hl-keyword {
+  color: var(--fg);
+  font-weight: 600;
+}
+.hl-type {
+  color: var(--fg-2);
+}
+.hl-fn {
+  color: var(--signal);
+}
+.hl-string {
+  color: var(--fg-2);
+}
+
+/* Marquee edge fade. */
+.mask-edge-fade {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 1) 48px,
+    rgba(0, 0, 0, 1) calc(100% - 48px),
+    rgba(0, 0, 0, 0) 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 1) 48px,
+    rgba(0, 0, 0, 1) calc(100% - 48px),
+    rgba(0, 0, 0, 0) 100%
+  );
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: 100% 100%;
+  mask-size: 100% 100%;
+}
+
+pre i {
   font-style: normal;
 }
-
-pre i { font-style: normal; }

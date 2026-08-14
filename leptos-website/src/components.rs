@@ -22,6 +22,7 @@ pub mod CTAButton;
 pub mod Footer;
 pub mod HeroHeader;
 pub mod Page;
+pub mod Reveal;
 pub mod SpeedStats;
 
 // Section components
@@ -38,3 +39,4 @@ pub use CodeExample::*;
 pub use Footer::*;
 pub use HeroHeader::*;
 pub use Page::*;
+pub use Reveal::*;

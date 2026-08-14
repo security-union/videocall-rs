@@ -8,44 +8,39 @@ module.exports = {
         "4xl": "1920px",
       },
       fontFamily: {
-        sans: ['-apple-system', 'BlinkMacSystemFont', '"SF Pro Display"', '"Helvetica Neue"', 'system-ui', 'sans-serif'],
-        mono: ['"SF Mono"', '"Fira Code"', 'Menlo', 'Monaco', 'monospace'],
+        // System grotesque for display/body — ships zero font bytes.
+        sans: ['"Helvetica Neue"', "Helvetica", "Arial", '"Segoe UI"', "system-ui", "sans-serif"],
+        // Monospace does the instrumentation work: indices, readouts, code.
+        mono: ['"SF Mono"', '"JetBrains Mono"', '"Fira Code"', "Menlo", "Monaco", "monospace"],
       },
       colors: {
-        primary: {
-          DEFAULT: "#2997ff",
-          dark: "#0077ed",
-        },
-        background: {
-          DEFAULT: "#000000",
-          secondary: "#1d1d1f",
-          tertiary: "#2d2d2f",
-        },
-        foreground: {
-          DEFAULT: "#f5f5f7",
-          secondary: "rgba(255,255,255,0.5)",
-          tertiary: "rgba(255,255,255,0.3)",
-          quaternary: "rgba(255,255,255,0.16)",
-        },
-        border: {
-          DEFAULT: "rgba(255,255,255,0.08)",
-          secondary: "rgba(255,255,255,0.14)",
-        },
-        success: "#30d158",
-        warning: "#ff9f0a",
-        error:   "#ff453a",
-        info:    "#2997ff",
+        // Warm-neutral near-black ink/surface ramp.
+        bg: { DEFAULT: "#0A0A0B", s1: "#111113", s2: "#17171A", code: "#0D0D0F" },
+        // Warm grey foreground ramp.
+        fg: { DEFAULT: "#F2F2F0", 2: "#A1A1A0", 3: "#6E6E6D", 4: "#3A3A3B" },
+        // Oxide signal accent — live/active/focus only.
+        signal: { DEFAULT: "#D96B3C", quiet: "rgba(217,107,60,0.14)" },
+        // Hairlines.
+        line: { DEFAULT: "rgba(242,242,240,0.10)", strong: "rgba(242,242,240,0.18)" },
+        // Status readouts only, never decoration.
+        ok: "#8FA98A",
+        warn: "#C9A227",
+        err: "#B5493B",
       },
       borderRadius: {
-        'none': '0',
-        'sm': '0.25rem',
-        'DEFAULT': '0.5rem',
-        'md': '0.75rem',
-        'lg': '1rem',
-        'xl': '1.25rem',
-        '2xl': '1.5rem',
-        '3xl': '2rem',
-        'full': '9999px',
+        none: "0",
+        sm: "2px",
+        DEFAULT: "4px",
+        md: "4px",
+        panel: "6px",
+        full: "9999px",
+      },
+      fontSize: {
+        eyebrow: ["0.75rem", { lineHeight: "1", letterSpacing: "0.16em" }],
+        data: ["0.8125rem", { lineHeight: "1.4", letterSpacing: "0.02em" }],
+      },
+      maxWidth: {
+        content: "1200px",
       },
     },
   },

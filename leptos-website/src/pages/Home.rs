@@ -25,6 +25,7 @@ use crate::components::sections::System::SystemSection;
 
 // Removed unused import
 use crate::components::HeroHeader::*;
+use crate::components::MediaBand::{GlobeBand, RoverBand};
 use crate::components::Page::*;
 use leptos::prelude::*;
 use leptos_meta::Title;
@@ -46,14 +47,18 @@ pub fn Home() -> impl IntoView {
         <Page>
             <SiteNav/>
             <main id="content">
+                // Alternating rhythm: media band -> editorial -> media -> editorial.
+                // Hairline `.rule` seams sit ONLY between two contained editorial
+                // bands; a full-bleed media band's black edge does its own
+                // separating, so no rule is placed adjacent to one.
                 <Hero/>
-                <div class="rule"></div>
+                <GlobeBand/>
                 <SystemSection/>
                 <div class="rule"></div>
                 <SupportedPlatformsSection/>
                 <div class="rule"></div>
                 <DevelopersSection/>
-                <div class="rule"></div>
+                <RoverBand/>
                 <CompanySection/>
                 <div class="rule"></div>
                 <CustomersSection/>

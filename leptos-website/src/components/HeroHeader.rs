@@ -55,7 +55,7 @@ pub fn SiteNav() -> impl IntoView {
                                 </a>
                                 <a
                                     href="https://github.com/security-union/videocall-rs"
-                                    class="flex items-center gap-1.5 px-2.5 py-1 rounded-sm border border-line hover:border-line-strong transition-colors text-fg-3 hover:text-fg"
+                                    class="flex items-center gap-1.5 text-fg-3 hover:text-fg transition-colors"
                                     aria-label="Star videocall-rs on GitHub"
                                 >
                                     <img class="h-3.5 w-3.5 grayscale" src="/images/github_logo.svg" alt="" aria-hidden="true" />
@@ -80,6 +80,8 @@ pub fn SiteNav() -> impl IntoView {
 pub fn Hero() -> impl IntoView {
     view! {
         <section aria-labelledby="hero-title" class="px-6 md:px-10 pt-16 pb-20 md:pt-24 md:pb-28">
+            // Text is contained; the media below breaks wider so it, not the
+            // copy, is the dominant element. Text above, media below, media larger.
             <div class="max-w-content mx-auto">
                 <p class="eyebrow">"01 — Real-time audio + video infrastructure"</p>
 
@@ -88,7 +90,7 @@ pub fn Hero() -> impl IntoView {
                 </h1>
 
                 <p class="text-body-lg text-fg-2 mt-6 max-w-2xl">
-                    "videocall.rs is an opinionated, full-stack system for streaming live audio and video. Batteries included: Rust relay servers, a browser client, a native CLI, and iOS and Android SDKs, with auth, meeting management, metrics, and a Helm deploy. Run a video conference for your team, or stream from embedded devices in the field with the CLI. You deploy a system, not a codec."
+                    "videocall.rs is an opinionated, full-stack system for streaming live audio and video. Batteries included: Rust relay media servers and a meetings API for auth and host controls, a browser client, a native CLI, metrics, and a Helm deploy. Run a video conference for your team, or stream from embedded devices in the field with the CLI. You deploy a system, not a codec."
                 </p>
 
                 <div class="flex flex-col sm:flex-row gap-3 mt-8">
@@ -98,16 +100,23 @@ pub fn Hero() -> impl IntoView {
 
                 // Dividing rule carrying the single live node — the one moment of
                 // color above the fold; it also anchors the live-call panel.
-                <div class="flex items-center gap-3 mt-14 mb-8">
+                <div class="flex items-center gap-3 mt-14">
                     <span class="live-dot" aria-hidden="true"></span>
                     <span class="eyebrow text-signal">"Live"</span>
                     <span class="rule flex-1"></span>
                 </div>
+            </div>
 
-                // The live-call instrument panel — the primary aliveness move.
+            // The live-call instrument panel — the primary aliveness move. It
+            // widens past the text measure toward full-bleed (the section
+            // gutters are the only inset) so it reads as the dominant media, not
+            // a boxed inset.
+            <div class="max-w-[1360px] mx-auto mt-8">
                 <LiveCallPanel/>
+            </div>
 
-                // Spec row — mono facts, hairline dividers, one ink color.
+            // Spec row — mono facts, hairline dividers, one ink color.
+            <div class="max-w-content mx-auto">
                 <div class="flex flex-wrap gap-y-3 mt-8">
                     <span class="eyebrow pr-4">"AUDIO + VIDEO"</span>
                     <span class="eyebrow border-l border-line px-4">"OPUS + VP9, PURE RUST"</span>

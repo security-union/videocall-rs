@@ -207,7 +207,7 @@ pub fn LiveCallPanel() -> impl IntoView {
             node_ref=node
             role="img"
             aria-label="An animated mock of a live videocall.rs call: four participant tiles including a field rover, with live audio meters and connection telemetry."
-            class="lcp-cv rounded-panel border border-line bg-bg-code overflow-hidden"
+            class="lcp-cv border-y border-line bg-bg-code overflow-hidden"
         >
             // Header row.
             <div

@@ -25,45 +25,42 @@ pub fn DevelopersSection() -> impl IntoView {
         <section id="developers" aria-labelledby="developers-title" class="px-6 md:px-10 py-24 md:py-32">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
-                    <p class="section-index" aria-hidden="true">"04 — Developers"</p>
+                    <p class="section-index" aria-hidden="true">"05 — Developers"</p>
                     <h2 id="developers-title" class="text-h2 text-fg mt-4">"Three ways to ship"</h2>
-                    <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"One system, three surfaces to build on. Library, headless CLI, and native mobile."</p>
+                    <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"One system, three surfaces to build on. The full stack, a headless CLI, and the embeddable client crate."</p>
                 </RevealOnView>
 
-                // Ruled grid: the hairline gap between cells forms a continuous
-                // engineering-table seam. On reveal, each card's top hairline
-                // draws in left-to-right, staggered across the row.
-                <RevealOnView class="mt-12">
-                <div class="grid md:grid-cols-3 gap-px bg-line border border-line rounded-panel overflow-hidden">
-                    <DeveloperCard
+                // Three surfaces as numbered editorial rows, separated by
+                // hairline seams — no cards, no cell borders, no hover lift.
+                <div class="mt-14 md:mt-16 border-t border-line">
+                    <DeveloperRow
                         index="01"
                         title="videocall-rs"
                         description="Core Rust library. WebTransport and WebSocket transport, end-to-end encryption, and the pure-Rust VP9 and Opus media pipeline."
                         link_text="Explore on GitHub →"
                         link_href="https://github.com/security-union/videocall-rs"
-                        delay=0
                     />
-                    <DeveloperCard
+                    <div class="rule"></div>
+                    <DeveloperRow
                         index="02"
                         title="videocall-cli"
                         description="Headless streaming for robotics and IoT. Stream from a Raspberry Pi, Jetson, or a server."
                         link_text="Install from crates.io →"
                         link_href="https://crates.io/crates/videocall-cli"
-                        delay=90
                     />
-                    <DeveloperCard
+                    <div class="rule"></div>
+                    <DeveloperRow
                         index="03"
-                        title="videocall-sdk"
-                        description="iOS and Android bindings over UniFFI. Bring real-time audio and video into a native app."
-                        link_text="Read the SDK docs →"
-                        link_href="https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md"
-                        delay=180
+                        title="videocall-client"
+                        description="Embed the client in your own web app. The transport, end-to-end encryption, and media pipeline as a Rust crate, compiled to WebAssembly."
+                        link_text="Install from crates.io →"
+                        link_href="https://crates.io/crates/videocall-client"
                     />
                 </div>
-                </RevealOnView>
 
-                // Community strip — mono readouts on a single hairline-ruled panel.
-                <div class="panel mt-6 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6">
+                // Community strip — a bare editorial row with a hairline
+                // top-seam, mono readouts, and a single line to GitHub.
+                <div class="border-t border-line pt-8 mt-8 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6">
                     <div class="max-w-2xl">
                         <h3 class="text-h3 text-fg">"Built in the open"</h3>
                         <p class="text-fg-2 mt-2">"Read the code, file issues, or send a patch."</p>
@@ -86,26 +83,23 @@ pub fn DevelopersSection() -> impl IntoView {
 }
 
 #[component]
-fn DeveloperCard(
+fn DeveloperRow(
     index: &'static str,
     title: &'static str,
     description: &'static str,
     link_text: &'static str,
     link_href: &'static str,
-    /// Stagger for the top-hairline draw-in, in milliseconds.
-    delay: i32,
 ) -> impl IntoView {
     view! {
-        <div class="card-lift relative bg-bg-s1 hover:bg-bg-s2 p-6 md:p-8 h-full flex flex-col">
-            <span
-                class="draw-x absolute top-0 left-0 right-0 h-px bg-line-strong"
-                style=format!("transition-delay:{delay}ms")
-                aria-hidden="true"
-            ></span>
-            <span class="section-index" aria-hidden="true">{index}</span>
-            <h3 class="text-h3 text-fg mt-4">{title}</h3>
-            <p class="text-sm text-fg-2 leading-relaxed mt-3">{description}</p>
-            <a href=link_href class="btn-ghost text-sm mt-auto pt-6">{link_text}</a>
+        <div class="grid md:grid-cols-12 gap-x-8 gap-y-3 py-8 items-baseline">
+            <div class="md:col-span-4 lg:col-span-3 flex items-baseline gap-3">
+                <span class="section-index" aria-hidden="true">{index}</span>
+                <h3 class="text-h3 text-fg">{title}</h3>
+            </div>
+            <p class="md:col-span-5 lg:col-span-6 text-sm text-fg-2 leading-relaxed">{description}</p>
+            <div class="md:col-span-3 md:text-right">
+                <a href=link_href class="btn-ghost text-sm">{link_text}</a>
+            </div>
         </div>
     }
 }

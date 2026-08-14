@@ -23,6 +23,7 @@ pub mod CountUp;
 pub mod Footer;
 pub mod HeroHeader;
 pub mod LiveCallPanel;
+pub mod MediaBand;
 pub mod Page;
 pub mod Reveal;
 pub mod SpeedStats;

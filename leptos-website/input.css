@@ -190,31 +190,14 @@
     }
   }
 
-  /* ---- Nav underline — one licensed use of the accent ----------------- */
+  /* ---- Nav link — monochrome; no oxide underline (accent discipline) --- */
   .nav-link {
-    position: relative;
     color: var(--fg-3);
     transition: color 0.16s ease-out;
-  }
-  .nav-link::after {
-    content: "";
-    position: absolute;
-    left: 0;
-    bottom: -6px;
-    height: 1px;
-    width: 100%;
-    background: var(--signal);
-    transform: scaleX(0);
-    transform-origin: left;
-    transition: transform 0.2s ease-out;
   }
   .nav-link:hover,
   .nav-link:focus-visible {
     color: var(--fg);
-  }
-  .nav-link:hover::after,
-  .nav-link:focus-visible::after {
-    transform: scaleX(1);
   }
 
   /* ---- Scroll reveal (armed only after the island hydrates) ----------- */
@@ -259,9 +242,6 @@
     .live-dot {
       animation: none;
     }
-    .nav-link::after {
-      transition: none;
-    }
     .reveal.reveal-armed > * {
       opacity: 1 !important;
       transform: none !important;
@@ -283,14 +263,12 @@
       border-color 0.24s ease-out,
       box-shadow 0.24s ease-out;
   }
-  /* Speaking glow — mirrors the app's VAD tile highlight. Small tile, so the
-     box-shadow cost is negligible; it is paired with meter motion + the LIVE
-     word, never the sole signal. */
+  /* Speaking ring — mirrors the app's VAD tile highlight. A 1px oxide ring,
+     no blur, no glow (the media-led restructure bans glows): it is paired with
+     meter motion + the LIVE word, never the sole signal. */
   .lcp-tile.is-active {
     border-color: var(--signal);
-    box-shadow:
-      0 0 0 1px var(--signal),
-      0 0 24px -6px var(--signal);
+    box-shadow: 0 0 0 1px var(--signal);
   }
 
   /* Audio meters — GPU transform only. Inactive tiles animate calmly; the
@@ -551,25 +529,64 @@
    * `auto` remembers the real size afterwards. */
   #system {
     content-visibility: auto;
-    contain-intrinsic-size: auto 1400px;
+    contain-intrinsic-size: auto 900px;
   }
   .lcp-cv {
     content-visibility: auto;
     contain-intrinsic-size: auto 520px;
   }
 
-  /* ---- Rover mascot idle bob (brand, Company section) ---------------- */
-  .rover-bob {
-    animation: rover-bob 6s ease-in-out infinite;
+  /* ---- Media-led restructure · full-bleed media bands ---------------- *
+   * The core new primitive: a full-bleed black band carrying a square media
+   * frame (globe / rover video, with an SVG or poster fallback). Media IS the
+   * page; the black around the square is the frame, not empty space. No border,
+   * no radius, no shadow on the frame. Off-screen bands cost nothing via
+   * content-visibility; the video islands additionally pause playback off-screen. */
+  .media-band {
+    width: 100%;
+    background: var(--bg);
+    position: relative;
+    padding-top: 7rem;
+    padding-bottom: 7rem;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 720px;
   }
-  @keyframes rover-bob {
-    0%,
-    100% {
-      transform: translateY(0);
+  @media (min-width: 768px) {
+    .media-band {
+      padding-top: 9rem;
+      padding-bottom: 9rem;
     }
-    50% {
-      transform: translateY(-3px);
+  }
+
+  /* Square frame, centered, responsive width. Both source clips are square
+     (globe 720², rover 640²); the square is centered on black and never
+     stretched. aspect-square + a fixed width box = zero CLS. */
+  .media-frame {
+    position: relative;
+    margin-inline: auto;
+    overflow: hidden;
+    aspect-ratio: 1 / 1;
+    width: min(92vw, 460px);
+  }
+  @media (min-width: 640px) {
+    .media-frame {
+      width: min(72vw, 560px);
     }
+  }
+  @media (min-width: 1024px) {
+    .media-frame {
+      width: min(48vw, 640px);
+    }
+  }
+
+  /* Mono corner caption (bottom-left name, bottom-right one-liner). */
+  .media-caption {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    line-height: 1.3;
+    color: var(--fg-3);
   }
 
   /* ---- Section B · reveal-driven draw-ins + item stagger ------------- *
@@ -594,35 +611,6 @@
   }
   .reveal.reveal-armed.in-view .draw-y {
     transform: scaleY(1);
-  }
-  .reveal.reveal-armed .reveal-item {
-    opacity: 0;
-    transform: translateY(16px);
-    transition:
-      opacity 0.5s cubic-bezier(0.22, 1, 0.36, 1),
-      transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
-  }
-  .reveal.reveal-armed.in-view .reveal-item {
-    opacity: 1;
-    transform: none;
-  }
-
-  /* Card lift — hover micro-interaction (transform only). Used on the
-     developer cards and the pricing tiers. */
-  .card-lift {
-    transition:
-      transform 0.2s ease-out,
-      border-color 0.2s ease-out,
-      background-color 0.2s ease-out;
-  }
-  .card-lift:hover {
-    transform: translateY(-2px);
-  }
-  /* When a card is BOTH a reveal-item and a card-lift (pricing tiers), the
-     settled `.in-view` rule pins `transform: none` at a higher specificity —
-     this scoped hover rule out-specifies it so the lift still works at rest. */
-  .reveal.reveal-armed.in-view .card-lift:hover {
-    transform: translateY(-2px);
   }
 
   /* ---- Move C · inverted bone band ----------------------------------- *
@@ -668,8 +656,7 @@
     .source-node,
     .arrive-node,
     .spark-dot,
-    .vp9-block,
-    .rover-bob {
+    .vp9-block {
       animation: none !important;
     }
     .vp9-block {
@@ -683,16 +670,11 @@
       stroke-dashoffset: 0 !important;
       animation: none !important;
     }
-    /* Section B reveal draw-ins + staggers freeze at their final frame. */
+    /* Section B reveal draw-ins freeze at their final frame. */
     .draw-x,
-    .draw-y,
-    .reveal-item,
-    .card-lift {
+    .draw-y {
       transition: none !important;
       transform: none !important;
-    }
-    .reveal-item {
-      opacity: 1 !important;
     }
   }
 }
@@ -714,7 +696,7 @@ leptos-children {
   color: var(--fg-2);
 }
 .hl-fn {
-  color: var(--signal);
+  color: var(--fg);
 }
 .hl-string {
   color: var(--fg-2);

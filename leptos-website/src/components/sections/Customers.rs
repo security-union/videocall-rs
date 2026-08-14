@@ -28,13 +28,14 @@ pub fn CustomersSection() -> impl IntoView {
         <section id="customers" aria-labelledby="adoption-title" class="band-bone px-6 md:px-10 py-24 md:py-32">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
-                    <p class="section-index bone-ink-3" aria-hidden="true">"06 — Adoption"</p>
+                    <p class="section-index bone-ink-3" aria-hidden="true">"07 — Adoption"</p>
                     <h2 id="adoption-title" class="text-h2 bone-ink mt-4">"Growing where it's measured"</h2>
-                    <p class="text-body-lg bone-ink-2 mt-4 max-w-2xl">"Open source, and used in production. Numbers sourced straight from the repository."</p>
+                    <p class="text-body-lg bone-ink-2 mt-4 max-w-xl">"Open source, and used in production. Numbers sourced straight from the repository."</p>
                 </RevealOnView>
 
-                // Readout row — large figures on one ruled strip, hairline dividers.
-                <div class="grid sm:grid-cols-2 md:grid-cols-4 border bone-border rounded-panel overflow-hidden divide-y sm:divide-y-0 sm:divide-x bone-divide bone-surface mt-12">
+                // Readout row — big figures sit directly on the bone with vertical
+                // hairline seams only. No box, no surface fill: a printed stat page.
+                <div class="grid sm:grid-cols-2 md:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x bone-divide mt-12">
                     <Readout target=1.7 decimals=1 suffix="K" unit="GitHub stars" />
                     <Readout target=170.0 decimals=0 suffix="" unit="Forks" />
                     <Readout target=490.0 decimals=0 suffix="+" unit="Commits" />

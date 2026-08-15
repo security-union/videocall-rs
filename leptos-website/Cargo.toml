@@ -50,6 +50,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "Document",
     "DomTokenList",
     "EventTarget",
+    "NodeList",
     "IntersectionObserver",
     "IntersectionObserverEntry",
     "IntersectionObserverInit",

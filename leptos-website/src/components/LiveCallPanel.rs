@@ -73,16 +73,23 @@ pub fn LiveCallPanel() -> impl IntoView {
                 return;
             };
 
-            // UNIT 01's camera feed lives inside this panel; the same start/stop
-            // lifecycle below drives its playback (no separate observer). Absent
-            // under no-JS/reduced-motion paths, so `None` is fine — the poster
-            // (static mascot) simply stays.
-            let video: Rc<Option<web_sys::HtmlVideoElement>> = Rc::new(
-                el.query_selector(".lcp-feed")
-                    .ok()
-                    .flatten()
-                    .and_then(|e| e.dyn_into::<web_sys::HtmlVideoElement>().ok()),
-            );
+            // The fleet's camera feeds live inside this panel; the same start/stop
+            // lifecycle below drives every feed's playback (no separate observer).
+            // Empty under no-JS/reduced-motion paths, so an empty Vec is fine — each
+            // feed's poster (a static frame) simply stays.
+            let videos: Rc<Vec<web_sys::HtmlVideoElement>> = Rc::new({
+                let mut v = Vec::new();
+                if let Ok(list) = el.query_selector_all(".lcp-feed") {
+                    for i in 0..list.length() {
+                        if let Some(node) = list.item(i) {
+                            if let Ok(video) = node.dyn_into::<web_sys::HtmlVideoElement>() {
+                                v.push(video);
+                            }
+                        }
+                    }
+                }
+                v
+            });
 
             let glow_id: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
             let tel_id: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
@@ -109,9 +116,9 @@ pub fn LiveCallPanel() -> impl IntoView {
                 let tel_cb = tel_cb.clone();
                 let glow_id = glow_id.clone();
                 let tel_id = tel_id.clone();
-                let video = video.clone();
+                let videos = videos.clone();
                 Rc::new(move || {
-                    if let Some(v) = video.as_ref() {
+                    for v in videos.iter() {
                         // `play()` returns a Promise that can reject (e.g. the
                         // tab lost autoplay eligibility); nothing to do, drop it.
                         let _ = v.play();
@@ -138,9 +145,9 @@ pub fn LiveCallPanel() -> impl IntoView {
                 let win = win.clone();
                 let glow_id = glow_id.clone();
                 let tel_id = tel_id.clone();
-                let video = video.clone();
+                let videos = videos.clone();
                 Rc::new(move || {
-                    if let Some(v) = video.as_ref() {
+                    for v in videos.iter() {
                         let _ = v.pause();
                     }
                     if let Some(id) = glow_id.take() {
@@ -215,19 +222,38 @@ pub fn LiveCallPanel() -> impl IntoView {
     };
     let rec_clock = move || format!("REC {:02}:{:02}", rec.get() / 60, rec.get() % 60);
 
-    // Tile config: (caption, kind) where kind picks the drawn subject.
+    // Tile config: (caption, feed) — the four-robot Mars fleet, each tile a live
+    // camera feed. UNIT 01 keeps its original mascot clip; 02–04 are field footage.
     let tiles = [
         ("UNIT 01", TileSubject::Rover),
-        ("OPERATOR", TileSubject::Silhouette),
-        ("DASH", TileSubject::Avatar("DL")),
-        ("RELAY", TileSubject::Avatar("OP")),
+        (
+            "UNIT 02 · FPV",
+            TileSubject::Feed {
+                src: "/videos/unit-02-fpv.webm",
+                poster: "/videos/unit-02-fpv-poster.jpg",
+            },
+        ),
+        (
+            "UNIT 03 · SCOUT",
+            TileSubject::Feed {
+                src: "/videos/unit-03-aerial.webm",
+                poster: "/videos/unit-03-aerial-poster.jpg",
+            },
+        ),
+        (
+            "UNIT 04 · MAST",
+            TileSubject::Feed {
+                src: "/videos/unit-04-mast.webm",
+                poster: "/videos/unit-04-mast-poster.jpg",
+            },
+        ),
     ];
 
     view! {
         <figure
             node_ref=node
             role="img"
-            aria-label="An animated mock of a live videocall.rs call: four participant tiles including a field rover, with live audio meters and connection telemetry."
+            aria-label="An animated mock of a live videocall.rs call: four robot camera feeds from a field fleet, with live audio meters and connection telemetry."
             class="lcp-cv border-y border-line bg-bg-code overflow-hidden"
         >
             // Header row.
@@ -299,25 +325,27 @@ pub fn LiveCallPanel() -> impl IntoView {
     }
 }
 
-/// The drawn subject inside a participant tile — no photos, near-zero bytes.
+/// The camera feed inside a fleet tile. Every feed is started/stopped by the
+/// island's lifecycle (IntersectionObserver + visibilitychange) and never plays
+/// under reduced motion or no-JS, where the poster (a static frame) shows
+/// instead. All clips are small looping webm; no `autoplay` attribute.
 #[derive(Clone, Copy)]
 enum TileSubject {
+    /// UNIT 01's mascot clip — a near-square render letterboxed against the tile
+    /// with `object-contain` so its dark backdrop reads as the feed.
     Rover,
-    Silhouette,
-    Avatar(&'static str),
+    /// UNITs 02–04 — real 4:3 field footage that fills the tile with
+    /// `object-cover` (matched aspect, so no crop of note and no letterbox).
+    Feed {
+        src: &'static str,
+        poster: &'static str,
+    },
 }
 
 impl TileSubject {
     fn into_view(self) -> AnyView {
         match self {
             TileSubject::Rover => view! {
-                // UNIT 01's "camera feed": a short looping clip of the rover.
-                // No `autoplay` attribute — playback is started/stopped by the
-                // island's existing lifecycle (IntersectionObserver +
-                // visibilitychange), and never at all under reduced motion or
-                // no-JS, where the transparent poster (the static mascot) shows
-                // instead. `object-contain` letterboxes the square clip against
-                // the dark tile so its black backdrop reads as the feed.
                 <video
                     class="lcp-feed w-full h-full object-contain p-2"
                     width="640"
@@ -332,15 +360,17 @@ impl TileSubject {
                 ></video>
             }
             .into_any(),
-            TileSubject::Silhouette => view! {
-                <svg viewBox="0 0 64 64" class="w-1/2 h-1/2 text-fg-4" fill="currentColor" aria-hidden="true">
-                    <circle cx="32" cy="23" r="11"></circle>
-                    <path d="M13 60c0-11 8.5-18 19-18s19 7 19 18z"></path>
-                </svg>
-            }
-            .into_any(),
-            TileSubject::Avatar(initials) => view! {
-                <span class="font-mono text-lg md:text-xl text-fg-3 tracking-wider">{initials}</span>
+            TileSubject::Feed { src, poster } => view! {
+                <video
+                    class="lcp-feed w-full h-full object-cover"
+                    src=src
+                    poster=poster
+                    loop=true
+                    muted=true
+                    playsinline=true
+                    preload="none"
+                    aria-hidden="true"
+                ></video>
             }
             .into_any(),
         }

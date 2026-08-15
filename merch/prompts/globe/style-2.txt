@@ -1,0 +1,10 @@
+Using the attached image as the exact style and composition reference, reproduce this same cinematic holographic wireframe dot-matrix Earth globe with the SAME dark oxide palette, SAME stippled warm-grey continents, SAME thin warm-grey graticule, SAME burnt rust-orange glowing relay nodes and glowing arcs, SAME #0A0A0B near-black background, SAME centered square framing.
+
+Make ONLY these refinements:
+- Every burnt rust-orange (#D96B3C) light-arc must begin at one relay node and end at another relay node that are BOTH clearly on the visible front face of the globe. NO arcs that trail off the edge into empty black space, no arcs connecting to points behind or off the sphere.
+- Keep about 6 or 7 relay nodes on major cities across North America, South America, Europe, and West Africa, each with a soft warm-orange bloom.
+- Draw about 5 clean graceful arcs that bulge gently outward from the sphere surface, each with a small bright traveling highlight, forming a tidy connected mesh across the visible face.
+- Continents as fine glowing dot-matrix stipple, never solid fill, never photoreal.
+- The globe sits fully inside the frame with generous even margin.
+
+Premium tech-brand hero visual, GitHub-homepage-globe caliber. Moody, high detail, soft edge falloff. NO text, NO labels, NO UI, NO chrome.

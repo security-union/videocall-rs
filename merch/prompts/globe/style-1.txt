@@ -1,0 +1,11 @@
+A cinematic holographic wireframe globe of Earth, floating centered in deep near-black space. Premium tech-brand hero visual, GitHub-homepage-globe caliber, but in a dark oxide palette.
+
+The globe: continents rendered as a fine DOT-MATRIX of tiny glowing warm-grey dots (a stippled point-cloud landmass), NOT photoreal satellite imagery, NOT solid fill. Oceans are empty dark. A faint warm-grey wireframe graticule of longitude meridians and latitude parallels wraps the sphere, thin translucent hologram linework. The sphere has a subtle rim-light glow on its edge.
+
+Relay nodes: about seven small BURNT RUST-ORANGE (#D96B3C) glowing pinpoint dots sit on major world cities across the visible face (North America, South America, Europe, West Africa), each with a soft warm-orange bloom/halo like a lit beacon.
+
+Media arcs: several thin luminous BURNT RUST-ORANGE (#D96B3C) light-arcs curve gracefully up off the globe surface and connect pairs of relay nodes, glowing like fiber-optic trails of encrypted data, with a bright traveling highlight along each arc.
+
+Background: solid #0A0A0B near-black, a few extremely sparse faint stars, deep cinematic negative space around the globe. Volumetric subtle atmospheric haze.
+
+Composition: globe perfectly centered, square 1:1 framing, generous even margin all around so the sphere sits fully inside the frame. Moody, premium, high detail, soft focus falloff at edges. NO text, NO labels, NO UI, NO chrome, NO country names.

@@ -34,7 +34,7 @@ pub fn SystemSection() -> impl IntoView {
                     <p class="section-index" aria-hidden="true">"03 — System"</p>
                     <h2 id="system-title" class="text-h2 text-fg mt-4">"One system, end to end"</h2>
                     <p class="text-body-lg text-fg-2 mt-4 max-w-xl">
-                        "Not a codec you wire up yourself. A media plane that forwards encrypted-in-transit media, a separate control plane for auth and host controls, a browser and native client, the pure-Rust audio and video pipeline, and the metrics to see it all working."
+                        "A media plane forwards media over NATS. A separate control plane handles auth, meeting lifecycle, host controls, and the waiting room. Browser, native, and CLI clients. Pure-Rust Opus and VP9. Prometheus metrics."
                     </p>
                 </RevealOnView>
 
@@ -62,7 +62,7 @@ pub fn SystemSection() -> impl IntoView {
                     <div class="rule"></div>
                     <SpecRow
                         label="Audio · Opus + NetEQ"
-                        fact="Opus encode in pure Rust, with a NetEQ adaptive jitter buffer in every browser to hold a call together on a bad network."
+                        fact="Opus encode in pure Rust. A NetEQ adaptive jitter buffer in every browser client."
                     />
                     <div class="rule"></div>
                     <SpecRow

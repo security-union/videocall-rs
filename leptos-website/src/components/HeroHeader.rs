@@ -94,7 +94,7 @@ pub fn Hero() -> impl IntoView {
                 </h1>
 
                 <p class="text-body-lg text-fg-2 mt-6 max-w-2xl">
-                    "videocall.rs is an opinionated, full-stack system for streaming live audio and video. Batteries included: Rust relay media servers and a meetings API for auth and host controls, a browser client, a native CLI, metrics, and a Helm deploy. Run a video conference for your team, or stream from embedded devices in the field with the CLI. You deploy a system, not a codec."
+                    "videocall.rs is a full-stack system for real-time audio and video, written in Rust. Relay servers, a meetings API with auth and host controls, a browser client, a native CLI, metrics, Helm charts. Run meetings in the browser. Stream from embedded devices with the CLI. Self-host the whole thing. MIT / Apache-2.0."
                 </p>
 
                 <div class="flex flex-col sm:flex-row gap-3 mt-8">

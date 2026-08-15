@@ -22,7 +22,7 @@ use leptos::prelude::*;
 #[component]
 pub fn PricingSection() -> impl IntoView {
     view! {
-        <section id="pricing" aria-labelledby="pricing-title" class="px-6 md:px-10 py-24 md:py-32">
+        <section id="pricing" aria-labelledby="pricing-title" class="px-6 md:px-10 py-16 md:py-24">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
                     <p class="section-index" aria-hidden="true">"08 — Deployment"</p>
@@ -33,7 +33,7 @@ pub fn PricingSection() -> impl IntoView {
                 // Two editorial columns split by a single hairline — no cards,
                 // no lift. The recommended tier is marked with a monochrome tag
                 // and a weight cue, not an accent border (accent discipline).
-                <div class="grid md:grid-cols-2 max-w-4xl mt-14 md:mt-16 divide-y md:divide-y-0 md:divide-x divide-line">
+                <div class="grid md:grid-cols-2 max-w-4xl mt-10 md:mt-12 divide-y md:divide-y-0 md:divide-x divide-line">
                     <PricingColumn
                         title="Self-Hosted"
                         price="Free"

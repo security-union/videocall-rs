@@ -25,7 +25,7 @@ use crate::components::sections::System::SystemSection;
 
 // Removed unused import
 use crate::components::HeroHeader::*;
-use crate::components::MediaBand::{GlobeBand, RoverBand};
+use crate::components::MediaBand::GlobeBand;
 use crate::components::Page::*;
 use leptos::prelude::*;
 use leptos_meta::Title;
@@ -58,7 +58,7 @@ pub fn Home() -> impl IntoView {
                 <SupportedPlatformsSection/>
                 <div class="rule"></div>
                 <DevelopersSection/>
-                <RoverBand/>
+                <div class="rule"></div>
                 <CompanySection/>
                 <div class="rule"></div>
                 <CustomersSection/>

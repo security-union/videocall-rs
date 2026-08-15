@@ -34,8 +34,12 @@ pub fn SiteNav() -> impl IntoView {
                 >
                     <div class="max-w-content mx-auto px-6 md:px-10">
                         <div class="flex justify-between items-center h-14">
-                            <A href="/" attr:class="flex-shrink-0 transition-opacity hover:opacity-80" attr:aria-label="videocall.rs home">
-                                <img class="h-8 w-auto" src="/images/videocall_logo.svg" alt="videocall.rs" />
+                            <A
+                                href="/"
+                                attr:class="flex-shrink-0 font-medium text-fg text-[15px] tracking-tight transition-opacity hover:opacity-80"
+                                attr:aria-label="videocall.rs home"
+                            >
+                                "videocall.rs"
                             </A>
 
                             <div class="hidden md:flex items-center gap-8">
@@ -79,7 +83,7 @@ pub fn SiteNav() -> impl IntoView {
 #[component]
 pub fn Hero() -> impl IntoView {
     view! {
-        <section aria-labelledby="hero-title" class="px-6 md:px-10 pt-16 pb-20 md:pt-24 md:pb-28">
+        <section aria-labelledby="hero-title" class="px-6 md:px-10 pt-12 pb-16 md:pt-16 md:pb-20">
             // Text is contained; the media below breaks wider so it, not the
             // copy, is the dominant element. Text above, media below, media larger.
             <div class="max-w-content mx-auto">
@@ -100,7 +104,7 @@ pub fn Hero() -> impl IntoView {
 
                 // Dividing rule carrying the single live node — the one moment of
                 // color above the fold; it also anchors the live-call panel.
-                <div class="flex items-center gap-3 mt-14">
+                <div class="flex items-center gap-3 mt-10">
                     <span class="live-dot" aria-hidden="true"></span>
                     <span class="eyebrow text-signal">"Live"</span>
                     <span class="rule flex-1"></span>

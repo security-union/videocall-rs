@@ -22,7 +22,7 @@ use leptos::prelude::*;
 #[component]
 pub fn DevelopersSection() -> impl IntoView {
     view! {
-        <section id="developers" aria-labelledby="developers-title" class="px-6 md:px-10 py-24 md:py-32">
+        <section id="developers" aria-labelledby="developers-title" class="px-6 md:px-10 py-16 md:py-24">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
                     <p class="section-index" aria-hidden="true">"05 — Developers"</p>
@@ -32,7 +32,7 @@ pub fn DevelopersSection() -> impl IntoView {
 
                 // Three surfaces as numbered editorial rows, separated by
                 // hairline seams — no cards, no cell borders, no hover lift.
-                <div class="mt-14 md:mt-16 border-t border-line">
+                <div class="mt-10 md:mt-12 border-t border-line">
                     <DeveloperRow
                         index="01"
                         title="videocall-rs"

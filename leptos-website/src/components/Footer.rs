@@ -31,7 +31,7 @@ pub fn Footer() -> impl IntoView {
                 </RevealOnView>
                 <div class="flex flex-col md:flex-row justify-between items-start gap-8 mb-10">
                     <div>
-                        <img class="h-8 w-auto opacity-70" src="/images/videocall_logo.svg" alt="videocall.rs" />
+                        <p class="font-medium text-fg text-[15px] tracking-tight">"videocall.rs"</p>
                         <p class="eyebrow mt-4 flex items-center gap-2">
                             <span class="live-dot" aria-hidden="true"></span>
                             "Real-time audio + video infrastructure · MIT / Apache-2.0"

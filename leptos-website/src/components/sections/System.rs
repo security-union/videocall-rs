@@ -28,7 +28,7 @@ use leptos::prelude::*;
 #[component]
 pub fn SystemSection() -> impl IntoView {
     view! {
-        <section id="system" aria-labelledby="system-title" class="px-6 md:px-10 py-24 md:py-32">
+        <section id="system" aria-labelledby="system-title" class="px-6 md:px-10 py-16 md:py-24">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
                     <p class="section-index" aria-hidden="true">"03 — System"</p>
@@ -40,7 +40,7 @@ pub fn SystemSection() -> impl IntoView {
 
                 // The spec list. Rows are separated by hairline `.rule` seams —
                 // no cell borders, no backgrounds, no cards.
-                <div class="mt-14 md:mt-16 border-t border-line">
+                <div class="mt-10 md:mt-12 border-t border-line">
                     <SpecRow
                         label="Media plane · NATS pub/sub"
                         fact="actix-api relay servers forward end-to-end-encrypted media over a NATS pub/sub backbone, worldwide. One publisher, every subscriber — the mesh above."

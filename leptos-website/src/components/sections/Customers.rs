@@ -25,7 +25,7 @@ pub fn CustomersSection() -> impl IntoView {
     view! {
         // Move C — the one inverted bone band. Palette flip to bone/near-black
         // resets the eye mid-page; every token clears WCAG AA on #EDEBE6.
-        <section id="customers" aria-labelledby="adoption-title" class="band-bone px-6 md:px-10 py-24 md:py-32">
+        <section id="customers" aria-labelledby="adoption-title" class="band-bone px-6 md:px-10 py-16 md:py-24">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
                     <p class="section-index bone-ink-3" aria-hidden="true">"07 — Adoption"</p>

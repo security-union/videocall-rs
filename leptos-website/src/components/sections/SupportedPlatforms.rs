@@ -34,7 +34,7 @@ use web_sys::{window, HtmlElement};
 #[component]
 pub fn SupportedPlatformsSection() -> impl IntoView {
     view! {
-        <section id="supported-platforms" aria-labelledby="platforms-title" class="px-6 md:px-10 py-24 md:py-32">
+        <section id="supported-platforms" aria-labelledby="platforms-title" class="px-6 md:px-10 py-16 md:py-24">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
                     <p class="section-index" aria-hidden="true">"03 — Platforms"</p>

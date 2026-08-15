@@ -27,7 +27,7 @@ use leptos::prelude::*;
 pub fn GlobeBand() -> impl IntoView {
     view! {
         <section class="media-band" aria-labelledby="globe-title">
-            <div class="max-w-content mx-auto px-6 md:px-10 mb-12 md:mb-16">
+            <div class="max-w-content mx-auto px-6 md:px-10 mb-8 md:mb-10">
                 <RevealOnView class="">
                     <p class="section-index" aria-hidden="true">"02 — Media plane"</p>
                     <h2 id="globe-title" class="text-h2 text-fg mt-4 max-w-4xl">
@@ -45,55 +45,52 @@ pub fn GlobeBand() -> impl IntoView {
                 >
                     <RelayGlobeArt/>
                 </MediaVideo>
-                <span class="media-caption absolute bottom-3 left-3" aria-hidden="true">
-                    "Media plane"
-                </span>
+                // Attribution sits where the "Media plane" label used to (that
+                // label is already carried by the band header). A real link so
+                // it is keyboard-reachable; monochrome, hover to fg, no oxide.
+                <a
+                    class="media-caption nats-credit absolute bottom-3 left-3"
+                    href="https://nats.io"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                >
+                    "Powered by NATS.io"
+                </a>
                 <span class="media-caption absolute bottom-3 right-3 text-right" aria-hidden="true">
                     "One publisher · every subscriber"
                 </span>
             </div>
-        </section>
-    }
-}
 
-/// Full-bleed brand band: the field-camera rover, framed on black. A single
-/// clip plays eagerly; on each `ended` the island rotates to a different clip
-/// at random (no `loop`), so the rover feels alive without ever preloading more
-/// than the active clip. Reduced-motion / no-JS falls back to the static
-/// mascot PNG and fetches no webm.
-#[component]
-pub fn RoverBand() -> impl IntoView {
-    view! {
-        <div class="media-band">
-            <figure
-                class="media-frame rover-frame"
-                role="img"
-                aria-label="The videocall.rs field-camera rover, a four-legged camera robot"
-            >
-                <MediaVideo
-                    poster="/videos/rover-wiggle-poster.jpg"
-                    src="/videos/rover-wiggle.webm"
-                    rotation="/videos/rover-wiggle.webm,/videos/rover-curious-scan.webm,/videos/rover-happy-hop.webm"
-                    loop_video=false
-                >
-                    <img
-                        src="/images/rover-mascot.png"
-                        width="640"
-                        height="598"
-                        loading="lazy"
-                        decoding="async"
-                        alt=""
-                        class="w-full h-full object-contain p-4"
-                    />
-                </MediaVideo>
-                <span class="media-caption absolute bottom-3 left-3" aria-hidden="true">
-                    "Unit 01"
-                </span>
-                <span class="media-caption absolute bottom-3 right-3 text-right" aria-hidden="true">
-                    "Field camera rover"
-                </span>
-            </figure>
-        </div>
+            // How the media plane actually uses NATS. A contained editorial row
+            // in the site voice: mono micro-labels + one plain fact each,
+            // hairline seams only (no cards, no borders, no bento). Grounded in
+            // the actix-api relay's NATS pub/sub: per-meeting subjects, relay-to-
+            // relay forwarding, and ciphertext-only transit.
+            <div class="max-w-content mx-auto px-6 md:px-10 mt-8 md:mt-10">
+                <RevealOnView class="">
+                    <ul class="grid md:grid-cols-3 border-t border-line divide-y md:divide-y-0 md:divide-x divide-line">
+                        <li class="py-6 md:py-0 md:px-8 md:first:pl-0 md:last:pr-0">
+                            <p class="section-index">"Subject per meeting"</p>
+                            <p class="text-sm text-fg-2 leading-relaxed mt-3 max-w-sm">
+                                "Each meeting is a NATS subject. A relay publishes a frame once and every relay subscribed to that meeting receives it."
+                            </p>
+                        </li>
+                        <li class="py-6 md:py-0 md:px-8 md:first:pl-0 md:last:pr-0">
+                            <p class="section-index">"Relay to relay"</p>
+                            <p class="text-sm text-fg-2 leading-relaxed mt-3 max-w-sm">
+                                "Participants can land on different relay servers anywhere in the world. NATS carries the media between them, so they still share one meeting."
+                            </p>
+                        </li>
+                        <li class="py-6 md:py-0 md:px-8 md:first:pl-0 md:last:pr-0">
+                            <p class="section-index">"Ciphertext only"</p>
+                            <p class="text-sm text-fg-2 leading-relaxed mt-3 max-w-sm">
+                                "Everything crossing the backbone is end-to-end encrypted. The relays forward ciphertext and never hold the keys."
+                            </p>
+                        </li>
+                    </ul>
+                </RevealOnView>
+            </div>
+        </section>
     }
 }
 

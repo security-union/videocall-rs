@@ -73,6 +73,17 @@ pub fn LiveCallPanel() -> impl IntoView {
                 return;
             };
 
+            // UNIT 01's camera feed lives inside this panel; the same start/stop
+            // lifecycle below drives its playback (no separate observer). Absent
+            // under no-JS/reduced-motion paths, so `None` is fine — the poster
+            // (static mascot) simply stays.
+            let video: Rc<Option<web_sys::HtmlVideoElement>> = Rc::new(
+                el.query_selector(".lcp-feed")
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.dyn_into::<web_sys::HtmlVideoElement>().ok()),
+            );
+
             let glow_id: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
             let tel_id: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
             let on_screen = Rc::new(Cell::new(false));
@@ -98,7 +109,13 @@ pub fn LiveCallPanel() -> impl IntoView {
                 let tel_cb = tel_cb.clone();
                 let glow_id = glow_id.clone();
                 let tel_id = tel_id.clone();
+                let video = video.clone();
                 Rc::new(move || {
+                    if let Some(v) = video.as_ref() {
+                        // `play()` returns a Promise that can reject (e.g. the
+                        // tab lost autoplay eligibility); nothing to do, drop it.
+                        let _ = v.play();
+                    }
                     if glow_id.get().is_none() {
                         if let Ok(id) = win.set_interval_with_callback_and_timeout_and_arguments_0(
                             (*glow_cb).as_ref().unchecked_ref(),
@@ -121,7 +138,11 @@ pub fn LiveCallPanel() -> impl IntoView {
                 let win = win.clone();
                 let glow_id = glow_id.clone();
                 let tel_id = tel_id.clone();
+                let video = video.clone();
                 Rc::new(move || {
+                    if let Some(v) = video.as_ref() {
+                        let _ = v.pause();
+                    }
                     if let Some(id) = glow_id.take() {
                         win.clear_interval_with_handle(id);
                     }
@@ -290,14 +311,25 @@ impl TileSubject {
     fn into_view(self) -> AnyView {
         match self {
             TileSubject::Rover => view! {
-                <img
-                    src="/images/rover-mascot.png"
+                // UNIT 01's "camera feed": a short looping clip of the rover.
+                // No `autoplay` attribute — playback is started/stopped by the
+                // island's existing lifecycle (IntersectionObserver +
+                // visibilitychange), and never at all under reduced motion or
+                // no-JS, where the transparent poster (the static mascot) shows
+                // instead. `object-contain` letterboxes the square clip against
+                // the dark tile so its black backdrop reads as the feed.
+                <video
+                    class="lcp-feed w-full h-full object-contain p-2"
                     width="640"
                     height="598"
-                    decoding="async"
-                    alt=""
-                    class="w-full h-full object-contain p-2"
-                />
+                    src="/videos/rover-wiggle.webm"
+                    poster="/images/rover-mascot.png"
+                    loop=true
+                    muted=true
+                    playsinline=true
+                    preload="none"
+                    aria-hidden="true"
+                ></video>
             }
             .into_any(),
             TileSubject::Silhouette => view! {

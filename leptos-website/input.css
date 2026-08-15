@@ -519,6 +519,16 @@
   .stack-scrolly[data-active="4"] .stack-slab[data-i="4"] .stack-edge {
     stroke: var(--signal);
   }
+  .stack-name {
+    transition: fill 0.3s ease;
+  }
+  .stack-scrolly[data-active="0"] .stack-slab[data-i="0"] .stack-name,
+  .stack-scrolly[data-active="1"] .stack-slab[data-i="1"] .stack-name,
+  .stack-scrolly[data-active="2"] .stack-slab[data-i="2"] .stack-name,
+  .stack-scrolly[data-active="3"] .stack-slab[data-i="3"] .stack-name,
+  .stack-scrolly[data-active="4"] .stack-slab[data-i="4"] .stack-name {
+    fill: var(--fg);
+  }
   .stack-scrolly[data-active="0"] .stack-connector[data-i="0"],
   .stack-scrolly[data-active="1"] .stack-connector[data-i="1"],
   .stack-scrolly[data-active="2"] .stack-connector[data-i="2"],

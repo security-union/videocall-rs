@@ -303,6 +303,20 @@ fn StackSvg() -> impl IntoView {
                             >
                                 {LAYERS[i].0}
                             </text>
+                            // Layer name, centered on the lid. Same mono voice
+                            // as the section indices; the active slab's name
+                            // brightens via CSS keyed off `data-active`.
+                            <text
+                                class="font-mono stack-name"
+                                x=X0 + SKEW / 2.0 + W / 2.0
+                                y=y + DEPTH / 2.0 + 4.0
+                                font-size="11"
+                                letter-spacing="1.5"
+                                text-anchor="middle"
+                                fill="var(--fg-2)"
+                            >
+                                {LAYERS[i].1.to_uppercase()}
+                            </text>
                         </g>
                     }
                 })

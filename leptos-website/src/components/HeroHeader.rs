@@ -125,7 +125,7 @@ pub fn Hero() -> impl IntoView {
                     <span class="eyebrow pr-4">"AUDIO + VIDEO"</span>
                     <span class="eyebrow border-l border-line px-4">"OPUS + VP9, PURE RUST"</span>
                     <span class="eyebrow border-l border-line px-4">"WEBTRANSPORT / WS"</span>
-                    <span class="eyebrow border-l border-line px-4">"E2E ENCRYPTED"</span>
+                    <span class="eyebrow border-l border-line px-4">"TLS / QUIC ENCRYPTED"</span>
                     <span class="eyebrow border-l border-line px-4">"MIT / APACHE-2.0"</span>
                 </div>
             </div>

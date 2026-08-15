@@ -289,7 +289,7 @@ pub fn LiveCallPanel() -> impl IntoView {
                 class="flex items-center justify-between gap-3 px-4 py-2.5 border-t border-line font-mono text-[11px] md:text-xs text-fg-3"
                 aria-hidden="true"
             >
-                <span class="tracking-wide truncate">"4 CONNECTED · WEBTRANSPORT / QUIC · E2E ENCRYPTED"</span>
+                <span class="tracking-wide truncate">"4 CONNECTED · WEBTRANSPORT / QUIC · TLS 1.3"</span>
                 <span class="flex items-center gap-1.5 flex-shrink-0">
                     <span class="rec-dot text-signal">"\u{25CF}"</span>
                     <span class="tabular-nums">{rec_clock}</span>

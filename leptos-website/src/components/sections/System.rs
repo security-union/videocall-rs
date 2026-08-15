@@ -34,7 +34,7 @@ pub fn SystemSection() -> impl IntoView {
                     <p class="section-index" aria-hidden="true">"03 — System"</p>
                     <h2 id="system-title" class="text-h2 text-fg mt-4">"One system, end to end"</h2>
                     <p class="text-body-lg text-fg-2 mt-4 max-w-xl">
-                        "Not a codec you wire up yourself. A media plane that forwards end-to-end-encrypted media, a separate control plane for auth and host controls, a browser and native client, the pure-Rust audio and video pipeline, and the metrics to see it all working."
+                        "Not a codec you wire up yourself. A media plane that forwards encrypted-in-transit media, a separate control plane for auth and host controls, a browser and native client, the pure-Rust audio and video pipeline, and the metrics to see it all working."
                     </p>
                 </RevealOnView>
 
@@ -43,7 +43,7 @@ pub fn SystemSection() -> impl IntoView {
                 <div class="mt-10 md:mt-12 border-t border-line">
                     <SpecRow
                         label="Media plane · NATS pub/sub"
-                        fact="actix-api relay servers forward end-to-end-encrypted media over a NATS pub/sub backbone, worldwide. One publisher, every subscriber — the mesh above."
+                        fact="actix-api relay servers forward media over a NATS pub/sub backbone, worldwide. One publisher, every subscriber — the mesh above."
                     />
                     <div class="rule"></div>
                     <SpecRow
@@ -55,7 +55,7 @@ pub fn SystemSection() -> impl IntoView {
                     <div class="rule"></div>
                     <SpecRow
                         label="Control plane · meeting-api"
-                        fact="Login, meeting lifecycle, host controls, and the waiting room live in a separate Axum API. The media plane just moves ciphertext."
+                        fact="Login, meeting lifecycle, host controls, and the waiting room live in a separate Axum API. The media plane just moves media frames."
                     >
                         <ControlPlaneArt/>
                     </SpecRow>

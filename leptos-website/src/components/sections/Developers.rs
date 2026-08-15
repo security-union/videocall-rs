@@ -36,7 +36,7 @@ pub fn DevelopersSection() -> impl IntoView {
                     <DeveloperRow
                         index="01"
                         title="videocall-rs"
-                        description="Core Rust library. WebTransport and WebSocket transport, end-to-end encryption, and the pure-Rust VP9 and Opus media pipeline."
+                        description="Core Rust library. WebTransport and WebSocket transport, encrypted in transit with TLS 1.3 and QUIC, and the pure-Rust VP9 and Opus media pipeline."
                         link_text="Explore on GitHub →"
                         link_href="https://github.com/security-union/videocall-rs"
                     />
@@ -52,7 +52,7 @@ pub fn DevelopersSection() -> impl IntoView {
                     <DeveloperRow
                         index="03"
                         title="videocall-client"
-                        description="Embed the client in your own web app. The transport, end-to-end encryption, and media pipeline as a Rust crate, compiled to WebAssembly."
+                        description="Embed the client in your own web app. The transport, encrypted in transit, and media pipeline as a Rust crate, compiled to WebAssembly."
                         link_text="Install from crates.io →"
                         link_href="https://crates.io/crates/videocall-client"
                     />

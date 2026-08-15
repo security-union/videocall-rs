@@ -65,7 +65,7 @@ pub fn App() -> impl IntoView {
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "Any",
       "url": "https://videocall.rs/",
-      "description": "An opinionated, full-stack system for streaming real-time audio and video in Rust. Relay media servers, a meetings API for auth and host controls, a browser client, and a native CLI. WebTransport over QUIC with a WebSocket fallback — no ICE, STUN, TURN, or SDP. End-to-end encrypted and self-hostable. MIT / Apache-2.0.",
+      "description": "An opinionated, full-stack system for streaming real-time audio and video in Rust. Relay media servers, a meetings API for auth and host controls, a browser client, and a native CLI. WebTransport over QUIC with a WebSocket fallback — no ICE, STUN, TURN, or SDP. Encrypted in transit with TLS 1.3 and QUIC, and self-hostable. MIT / Apache-2.0.",
       "codeRepository": "https://github.com/security-union/videocall-rs",
       "license": [
         "https://opensource.org/licenses/MIT",
@@ -122,7 +122,7 @@ pub fn App() -> impl IntoView {
           "name": "How is it different from LiveKit, Jitsi, or mediasoup?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Those stacks are WebRTC selective-forwarding units. videocall.rs forwards media over WebTransport/QUIC instead of WebRTC, is written end-to-end in Rust, and requires no STUN/TURN/ICE infrastructure."
+            "text": "Those stacks are WebRTC selective-forwarding units. videocall.rs forwards media over WebTransport/QUIC instead of WebRTC, is written entirely in Rust, and requires no STUN/TURN/ICE infrastructure."
           }
         },
         {
@@ -138,7 +138,7 @@ pub fn App() -> impl IntoView {
           "name": "Is the media encrypted?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Yes. Media is end-to-end encrypted between participants with a hybrid RSA/AES scheme. The relay server forwards ciphertext only and has no access to keys or plaintext."
+            "text": "Media is encrypted in transit: WebSocket connections use TLS 1.3, and WebTransport uses QUIC's built-in TLS 1.3 encryption. The relay server forwards media between participants; it is not end-to-end encrypted."
           }
         },
         {
@@ -154,7 +154,7 @@ pub fn App() -> impl IntoView {
           "name": "Does it have meeting management and auth built in?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Yes. A separate Axum control plane, meeting-api, owns login and auth (JWT, SSO/OAuth), meeting lifecycle and ownership, host controls, and the waiting room. The media plane just forwards ciphertext, so authorization and access control stay off the streaming path."
+            "text": "Yes. A separate Axum control plane, meeting-api, owns login and auth (JWT, SSO/OAuth), meeting lifecycle and ownership, host controls, and the waiting room. The media plane just forwards media frames, so authorization and access control stay off the streaming path."
           }
         }
       ]
@@ -167,7 +167,7 @@ pub fn App() -> impl IntoView {
         <Title formatter text="videocall.rs — Full-stack real-time audio and video, in Rust"/>
         <Meta
             name="description"
-            content="Full-stack real-time audio and video in Rust: relay media servers, a meetings API for auth, a browser client, and a CLI. E2E encrypted, self-hostable."
+            content="Full-stack real-time audio and video in Rust: relay media servers, a meetings API for auth, a browser client, and a CLI. Encrypted in transit, self-hostable."
         />
         <Meta
             name="keywords"
@@ -182,7 +182,7 @@ pub fn App() -> impl IntoView {
         <Meta property="og:site_name" content="videocall.rs"/>
         <Meta property="og:url" content="https://videocall.rs/"/>
         <Meta property="og:title" content="videocall.rs — Full-stack real-time audio and video, in Rust"/>
-        <Meta property="og:description" content="Deploy a system, not a codec. Real-time audio and video in Rust — relay media servers, a meetings API, a browser client, and a CLI. For video conferences, and for streaming from embedded devices in the field. WebTransport/QUIC with WebSocket fallback, end-to-end encrypted, self-hostable."/>
+        <Meta property="og:description" content="Deploy a system, not a codec. Real-time audio and video in Rust — relay media servers, a meetings API, a browser client, and a CLI. For video conferences, and for streaming from embedded devices in the field. WebTransport/QUIC with WebSocket fallback, encrypted in transit, self-hostable."/>
         <Meta property="og:image" content="https://videocall.rs/images/og-image.png"/>
 
         // Twitter
@@ -191,7 +191,7 @@ pub fn App() -> impl IntoView {
         <Meta property="twitter:creator" content="@videocallrs"/>
         <Meta property="twitter:url" content="https://videocall.rs/"/>
         <Meta property="twitter:title" content="videocall.rs — Full-stack real-time audio and video, in Rust"/>
-        <Meta property="twitter:description" content="Deploy a system, not a codec. Real-time audio and video in Rust — relay media servers, a meetings API, a browser client, and a CLI. For video conferences, and for streaming from embedded devices in the field. WebTransport/QUIC with WebSocket fallback, end-to-end encrypted, self-hostable."/>
+        <Meta property="twitter:description" content="Deploy a system, not a codec. Real-time audio and video in Rust — relay media servers, a meetings API, a browser client, and a CLI. For video conferences, and for streaming from embedded devices in the field. WebTransport/QUIC with WebSocket fallback, encrypted in transit, self-hostable."/>
         <Meta property="twitter:image" content="https://videocall.rs/images/og-image.png"/>
 
         <Router>

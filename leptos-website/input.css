@@ -442,16 +442,16 @@
     margin-inline: auto;
     overflow: hidden;
     aspect-ratio: 1 / 1;
-    width: min(92vw, 460px);
+    width: min(85vw, 420px);
   }
   @media (min-width: 640px) {
     .media-frame {
-      width: min(72vw, 560px);
+      width: min(60vw, 460px);
     }
   }
   @media (min-width: 1024px) {
     .media-frame {
-      width: min(48vw, 640px);
+      width: min(40vw, 500px);
     }
   }
 

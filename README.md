@@ -45,7 +45,7 @@ videocall.rs gives you the building blocks for real-time video communication wit
 
 - **Software professionals** building custom video applications on a type-safe Rust API, from web apps to autonomous-vehicle feeds.
 - **Robotics and IoT engineers** streaming low-latency video from drones, robots, and embedded devices using the lightweight [`videocall-cli`](https://github.com/security-union/videocall-rs/blob/main/videocall-cli/README.md) and the mobile SDKs.
-- **Teams that want to self-host** their own conferencing infrastructure with JWT authentication, SSO/OAuth, and end-to-end encryption, deployed with the provided Helm charts.
+- **Teams that want to self-host** their own conferencing infrastructure with JWT authentication, SSO/OAuth, and transport encryption (TLS 1.3 / QUIC), deployed with the provided Helm charts.
 
 The same core powers browser calls at [videocall.rs](https://videocall.rs) and has been demonstrated scaling to [1000 users in a single call](https://youtu.be/LWwOSZJwEJI).
 
@@ -53,7 +53,7 @@ The same core powers browser calls at [videocall.rs](https://videocall.rs) and h
 
 - **Low latency by design.** Media travels over WebTransport (QUIC/HTTP3), which avoids head-of-line blocking and recovers from packet loss faster than TCP-based transports.
 - **WebTransport with WebSocket fallback.** Clients negotiate WebTransport where available and fall back to WebSockets automatically for compatibility.
-- **End-to-end encryption.** Media frames are encrypted client-side with a hybrid RSA/AES scheme; the server forwards ciphertext and never sees plaintext. See [Security](#security).
+- **Encrypted in transit.** WebSocket connections use TLS 1.3 and WebTransport uses QUIC's built-in TLS 1.3, so media is encrypted between each client and the relay. See [Security](#security).
 - **Browser, native, and mobile clients.** A Dioxus/WebAssembly web UI, a native `videocall-cli` for headless streaming, and `videocall-sdk` bindings for iOS and Android.
 - **Horizontally scalable.** A NATS pub/sub backbone lets WebSocket and WebTransport servers scale independently behind a load balancer.
 - **Self-hostable.** Kubernetes Helm charts, a fully native dev stack, and reproducible container images built with Nix.
@@ -76,7 +76,7 @@ Yes, on Chromium-based browsers (Chrome, Edge, Brave) and Safari (macOS and iOS)
 
 ### How is it different from LiveKit, Jitsi, or mediasoup?
 
-Those stacks are WebRTC selective-forwarding units. videocall.rs forwards media over WebTransport/QUIC instead of WebRTC, is written end-to-end in Rust (server, browser client, and native client), and requires no STUN/TURN/ICE infrastructure. See [How it compares](#how-it-compares).
+Those stacks are WebRTC selective-forwarding units. videocall.rs forwards media over WebTransport/QUIC instead of WebRTC, is written entirely in Rust (server, browser client, and native client), and requires no STUN/TURN/ICE infrastructure. See [How it compares](#how-it-compares).
 
 ### Can I stream from a Raspberry Pi?
 
@@ -84,7 +84,7 @@ Yes. `videocall-cli` is a headless native client that streams from a camera on R
 
 ### Is the media encrypted?
 
-Yes. Media is end-to-end encrypted between participants with a hybrid RSA/AES scheme. The relay server forwards ciphertext and has no access to keys or plaintext. Transport is additionally protected by TLS 1.3 (WebSocket) and QUIC encryption (WebTransport).
+Media is encrypted in transit. WebSocket connections use TLS 1.3, and WebTransport uses QUIC's built-in TLS 1.3 encryption, so media is protected between each client and the relay. The relay server forwards media between participants; it is not end-to-end encrypted.
 
 ## Why WebTransport instead of WebRTC?
 
@@ -336,8 +336,7 @@ Design goals still in progress (minimizing data copies on the media path, furthe
 
 ## Security
 
-- **End-to-end encryption.** Each client generates an RSA key pair and an AES key; AES keys are exchanged peer-to-peer wrapped under RSA, and media frames are encrypted with AES before transmission. The server forwards ciphertext and never has access to keys or plaintext.
-- **Transport security.** WebSocket connections use TLS 1.3; WebTransport inherits QUIC's built-in encryption.
+- **Transport security.** WebSocket connections use TLS 1.3; WebTransport inherits QUIC's built-in TLS 1.3 encryption. Media is encrypted between each client and the relay, but not end-to-end: the relay forwards decrypted media between participants.
 - **Authentication.** JWT-based access control with SSO/OAuth integration.
 - **Access controls.** Meeting ownership, waiting rooms, and host controls (see [Meeting management](#meeting-management)).
 
@@ -371,7 +370,7 @@ The Dioxus frontend uses a three-layer testing pyramid, all running in a real br
 |---|---|---|
 | Unit | `MediaDeviceList` logic: hot-plug, fallback, device switching | `videocall-client/src/media_devices/media_device_list.rs` |
 | Component | Isolated Dioxus components with mock `MediaDeviceInfo` objects | `dioxus-ui/tests/device_selector.rs`, `dioxus-ui/tests/video_control_buttons.rs` |
-| Integration | Real Chrome fake devices rendered end-to-end | `dioxus-ui/tests/device_integration.rs` |
+| Integration | Real Chrome fake devices rendered through the full pipeline | `dioxus-ui/tests/device_integration.rs` |
 
 ```bash
 # Run UI component tests natively (requires Chrome + chromedriver)

@@ -52,6 +52,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "EventTarget",
     "IntersectionObserver",
     "IntersectionObserverEntry",
+    "IntersectionObserverInit",
     "Node",
 ] }
 js-sys = { version = "0.3", optional = true }

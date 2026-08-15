@@ -402,14 +402,136 @@
 
   /* Off-screen subtrees skip render AND their CSS animations entirely.
    * contain-intrinsic-size keeps scroll geometry stable before first paint;
-   * `auto` remembers the real size afterwards. */
-  #system {
-    content-visibility: auto;
-    contain-intrinsic-size: auto 820px;
-  }
+   * `auto` remembers the real size afterwards. (The System band is NOT
+   * content-visibility'd: it hosts a tall sticky scroll-spy, and paint/size
+   * containment breaks sticky and mis-sizes the scroll region.) */
   .lcp-cv {
     content-visibility: auto;
     contain-intrinsic-size: auto 520px;
+  }
+
+  /* ---- System · exploded layered stack + scroll-spy ------------------ *
+   * Desktop: a sticky SVG stack beside five description blocks; an island
+   * writes `data-active` on `.stack-scrolly` and CSS does the rest. With the
+   * attribute absent (SSR / no-JS / reduced-motion / mobile) every slab is fully
+   * lit and nothing animates — the honest static fallback. */
+  .stack-svg {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  @media (min-width: 1024px) {
+    .stack-scrolly {
+      display: grid;
+      grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+      gap: 4rem;
+      align-items: start;
+    }
+  }
+  /* Mobile: the stack renders once above the blocks, centred and capped. */
+  .stack-sticky {
+    max-width: 320px;
+    margin: 0 auto 2.5rem;
+  }
+  @media (min-width: 1024px) {
+    .stack-sticky {
+      position: sticky;
+      top: 6rem;
+      max-width: none;
+      margin: 0;
+    }
+    /* The whole stack must stay visible while pinned: cap the rendered
+     * height to the viewport under the sticky offset and let
+     * preserveAspectRatio letterbox the drawing. Without this the SVG
+     * scales to column width and the active slab can sit off-screen. */
+    .stack-sticky svg {
+      display: block;
+      width: 100%;
+      height: min(calc(100vh - 9rem), 640px);
+    }
+  }
+  /* Mobile blocks read as a plain document, hairline-separated. */
+  .stack-block + .stack-block {
+    margin-top: 2.5rem;
+    padding-top: 2.5rem;
+    border-top: 1px solid var(--line);
+  }
+  @media (min-width: 1024px) {
+    /* Desktop: each block owns a scroll moment. 48vh keeps the next block's
+     * edge in view while one is centered — the column never reads empty. */
+    .stack-block {
+      min-height: 48vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .stack-block:first-child {
+      min-height: 34vh;
+      justify-content: flex-end;
+    }
+    .stack-block:last-child {
+      min-height: 34vh;
+      justify-content: flex-start;
+    }
+    .stack-block + .stack-block {
+      margin-top: 0;
+      padding-top: 0;
+      border-top: 0;
+    }
+  }
+
+  /* Slab + connector transitions. Neutral state: every slab lit, no lift. */
+  .stack-slab {
+    transition:
+      opacity 0.45s ease,
+      transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .stack-edge {
+    transition: stroke 0.3s ease;
+  }
+  .stack-block-label {
+    transition: color 0.3s ease;
+  }
+  .stack-connector {
+    stroke: var(--fg-4);
+    stroke-width: 1.25;
+    stroke-dasharray: 4 6;
+  }
+
+  /* Active state (attribute present): dim the stack, then relight + lift the
+   * matched slab, oxide its lid edge, march its outgoing connector, and turn its
+   * block label oxide. Oxide is licensed here as a live "you are here" marker. */
+  .stack-scrolly[data-active] .stack-slab {
+    opacity: 0.5;
+  }
+  .stack-scrolly[data-active="0"] .stack-slab[data-i="0"],
+  .stack-scrolly[data-active="1"] .stack-slab[data-i="1"],
+  .stack-scrolly[data-active="2"] .stack-slab[data-i="2"],
+  .stack-scrolly[data-active="3"] .stack-slab[data-i="3"],
+  .stack-scrolly[data-active="4"] .stack-slab[data-i="4"] {
+    opacity: 1;
+    transform: translateY(-6px);
+  }
+  .stack-scrolly[data-active="0"] .stack-slab[data-i="0"] .stack-edge,
+  .stack-scrolly[data-active="1"] .stack-slab[data-i="1"] .stack-edge,
+  .stack-scrolly[data-active="2"] .stack-slab[data-i="2"] .stack-edge,
+  .stack-scrolly[data-active="3"] .stack-slab[data-i="3"] .stack-edge,
+  .stack-scrolly[data-active="4"] .stack-slab[data-i="4"] .stack-edge {
+    stroke: var(--signal);
+  }
+  .stack-scrolly[data-active="0"] .stack-connector[data-i="0"],
+  .stack-scrolly[data-active="1"] .stack-connector[data-i="1"],
+  .stack-scrolly[data-active="2"] .stack-connector[data-i="2"],
+  .stack-scrolly[data-active="3"] .stack-connector[data-i="3"] {
+    stroke: var(--signal);
+    animation: packet-flow 1.6s linear infinite;
+  }
+  .stack-scrolly[data-active="0"] .stack-block[data-i="0"] .stack-block-label,
+  .stack-scrolly[data-active="1"] .stack-block[data-i="1"] .stack-block-label,
+  .stack-scrolly[data-active="2"] .stack-block[data-i="2"] .stack-block-label,
+  .stack-scrolly[data-active="3"] .stack-block[data-i="3"] .stack-block-label,
+  .stack-scrolly[data-active="4"] .stack-block[data-i="4"] .stack-block-label {
+    color: var(--signal);
   }
 
   /* ---- Media-led restructure · full-bleed media bands ---------------- *
@@ -545,6 +667,18 @@
     .draw-y {
       transition: none !important;
       transform: none !important;
+    }
+    /* System stack: no lift, no dim, no marching connector. The island also
+     * refuses to wire the scroll-spy under reduced-motion, so `data-active`
+     * never appears; these freezes are the belt-and-braces. */
+    .stack-slab,
+    .stack-edge,
+    .stack-block-label {
+      transition: none !important;
+      transform: none !important;
+    }
+    .stack-connector {
+      animation: none !important;
     }
   }
 }

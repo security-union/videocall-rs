@@ -19,12 +19,49 @@
 use crate::components::Reveal::RevealOnView;
 use leptos::prelude::*;
 
-/// System band, told as a quiet engineering spec sheet rather than a bento of
-/// glowing tiles: a header, then one row per subsystem — a mono label paired
-/// with a one-line fact, rows separated by hairline seams. Two subsystems carry
-/// a small monochrome inline diagram (the transport and the control plane); the
-/// media plane's diagram now lives, animated, in the globe band above, so here
-/// it is a single row that points at it.
+/// System band, told as an exploded 2.5D stack rather than a flat spec list.
+/// Five isometric slabs — clients on top, control plane at the bottom — read in
+/// data-flow order, and on desktop a scroll-spy lights the slab that matches the
+/// description block nearest the viewport centre. Without JavaScript, under
+/// `prefers-reduced-motion`, and on mobile the whole stack renders fully lit and
+/// the blocks read as a plain document (the honest, static fallback).
+///
+/// The five layers, top (nearest the user) to bottom (nearest the metal):
+///   01 Clients · 02 Media pipeline · 03 Transport · 04 Media plane · 05 Control
+/// Every fact below matches a verified claim already made elsewhere on the site.
+const LAYERS: [(&str, &str, &str, &str); 5] = [
+    (
+        "01",
+        "Clients",
+        "Browser to embedded board",
+        "A Dioxus web client in the browser, compiled to WebAssembly — no install. videocall-cli streams from embedded Linux boards like the Raspberry Pi and Jetson.",
+    ),
+    (
+        "02",
+        "Media pipeline",
+        "Codecs written in Rust",
+        "Opus audio and VP9 video, encoded and decoded in pure Rust. A NetEQ adaptive jitter buffer runs in every browser client.",
+    ),
+    (
+        "03",
+        "Transport",
+        "QUIC first, WebSocket as backup",
+        "WebTransport over QUIC where the network allows it, an automatic WebSocket fallback where it does not. No ICE, STUN, TURN, or SDP.",
+    ),
+    (
+        "04",
+        "Media plane",
+        "One publisher, every relay",
+        "Relay servers forward every media frame over the NATS mesh. One publisher, every subscriber — the mesh in the band above.",
+    ),
+    (
+        "05",
+        "Control plane",
+        "Auth and lifecycle, kept separate",
+        "A separate meeting-api handles auth and SSO, meeting lifecycle, host controls, and the waiting room. Prometheus metrics export across the stack.",
+    ),
+];
+
 #[component]
 pub fn SystemSection() -> impl IntoView {
     view! {
@@ -38,134 +75,238 @@ pub fn SystemSection() -> impl IntoView {
                     </p>
                 </RevealOnView>
 
-                // The spec list. Rows are separated by hairline `.rule` seams —
-                // no cell borders, no backgrounds, no cards.
-                <div class="mt-10 md:mt-12 border-t border-line">
-                    <SpecRow
-                        label="Media plane · NATS pub/sub"
-                        fact="actix-api relay servers forward media over a NATS pub/sub backbone, worldwide. One publisher, every subscriber — the mesh above."
-                    />
-                    <div class="rule"></div>
-                    <SpecRow
-                        label="Transport · WebTransport / QUIC"
-                        fact="WebTransport over QUIC where the network allows it, an automatic WebSocket fallback where it does not. No ICE, STUN, TURN, or SDP."
-                    >
-                        <TransportArt/>
-                    </SpecRow>
-                    <div class="rule"></div>
-                    <SpecRow
-                        label="Control plane · meeting-api"
-                        fact="Login, meeting lifecycle, host controls, and the waiting room live in a separate Axum API. The media plane just moves media frames."
-                    >
-                        <ControlPlaneArt/>
-                    </SpecRow>
-                    <div class="rule"></div>
-                    <SpecRow
-                        label="Audio · Opus + NetEQ"
-                        fact="Opus encode in pure Rust. A NetEQ adaptive jitter buffer in every browser client."
-                    />
-                    <div class="rule"></div>
-                    <SpecRow
-                        label="Video · pure-Rust VP9"
-                        fact="A VP9 encoder and decoder written in Rust. No native codec dependency."
-                    />
-                    <div class="rule"></div>
-                    <SpecRow
-                        label="Web UI · Dioxus + WASM"
-                        fact="A meeting client compiled to WebAssembly with Dioxus. No install."
-                    />
-                    <div class="rule"></div>
-                    <SpecRow
-                        label="Metrics · Prometheus / Grafana"
-                        fact="Latency, bitrate, and connection health export to Prometheus and Grafana."
-                    />
-                </div>
+                <SystemStack/>
             </div>
         </section>
     }
 }
 
-/// One subsystem row: a mono label on the left, a one-line fact on the right,
-/// and an optional small monochrome diagram beneath the fact.
-#[component]
-fn SpecRow(
-    label: &'static str,
-    fact: &'static str,
-    #[prop(optional)] children: Option<Children>,
-) -> impl IntoView {
+/// The interactive layered stack. One island: a sticky SVG of five isometric
+/// slabs beside five description blocks. A single `IntersectionObserver` watches
+/// the blocks (desktop, motion allowed) and drives one shared `active` signal;
+/// CSS does every visual change off the `data-active` attribute it writes.
+///
+/// `active = None` is the neutral, all-lit state. It is what SSR renders (the
+/// attribute is simply absent), what no-JS keeps, and what the island leaves in
+/// place under reduced-motion or below the `lg` breakpoint — so the fallback is
+/// always a fully-lit, static stack with no dimming and no animation.
+#[island]
+pub fn SystemStack() -> impl IntoView {
+    // Active layer index; None ≡ every slab lit (the SSR / fallback state).
+    let active = RwSignal::new(Option::<usize>::None);
+
+    // One node ref per description block — the scroll-spy's observation targets.
+    let block_refs: [NodeRef<leptos::html::Div>; 5] = [
+        NodeRef::new(),
+        NodeRef::new(),
+        NodeRef::new(),
+        NodeRef::new(),
+        NodeRef::new(),
+    ];
+
+    #[cfg(feature = "hydrate")]
+    {
+        use wasm_bindgen::closure::Closure;
+        use wasm_bindgen::JsCast;
+
+        Effect::new(move |_| {
+            let Some(win) = web_sys::window() else {
+                return;
+            };
+
+            // Reduced-motion: wire nothing; the stack stays fully lit and still.
+            if let Ok(Some(mql)) = win.match_media("(prefers-reduced-motion: reduce)") {
+                if mql.matches() {
+                    return;
+                }
+            }
+
+            // Scroll-spy is a desktop (lg+) affordance. On narrow viewports the
+            // stack renders once, non-interactive, all layers lit.
+            match win.match_media("(min-width: 1024px)") {
+                Ok(Some(mql)) if mql.matches() => {}
+                _ => return,
+            }
+
+            // Reading every ref subscribes this effect to their mounts, so it
+            // re-runs and proceeds once the blocks hydrate.
+            let mut els = Vec::with_capacity(block_refs.len());
+            for r in block_refs.iter() {
+                let Some(el) = r.get() else {
+                    return;
+                };
+                els.push(el);
+            }
+
+            // The block whose centre band the viewport centre crosses becomes
+            // active. A thin center strip (rootMargin shrinks the root to ~4%
+            // tall through the middle) keeps at most one block intersecting.
+            let cb = Closure::wrap(Box::new(
+                move |entries: js_sys::Array, _obs: web_sys::IntersectionObserver| {
+                    for entry in entries.iter() {
+                        let entry: web_sys::IntersectionObserverEntry = entry.unchecked_into();
+                        if entry.is_intersecting() {
+                            if let Some(idx) = entry
+                                .target()
+                                .get_attribute("data-i")
+                                .and_then(|s| s.parse::<usize>().ok())
+                            {
+                                active.set(Some(idx));
+                            }
+                        }
+                    }
+                },
+            )
+                as Box<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>);
+
+            let opts = web_sys::IntersectionObserverInit::new();
+            opts.set_root_margin("-48% 0px -48% 0px");
+            if let Ok(io) =
+                web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &opts)
+            {
+                for el in &els {
+                    io.observe(el);
+                }
+                // A persistent scroll-spy for a page-lifetime section: keep the
+                // observer and its callback alive; nothing to disconnect.
+                cb.forget();
+                std::mem::forget(io);
+            }
+        });
+    }
+
+    // `data-active` is present only once the scroll-spy sets an index. Absent on
+    // SSR / no-JS / reduced-motion / mobile → CSS leaves every slab fully lit.
+    let data_active = move || active.get().map(|i| i.to_string());
+
     view! {
-        <div class="grid md:grid-cols-12 gap-x-8 gap-y-3 py-6 md:py-7 items-start">
-            <p class="section-index md:col-span-4 lg:col-span-3">{label}</p>
-            <div class="md:col-span-8 lg:col-span-9">
-                <p class="text-sm text-fg-2 leading-relaxed max-w-2xl">{fact}</p>
-                {children
-                    .map(|c| {
+        <div class="stack-scrolly mt-10 md:mt-14" data-active=data_active>
+            <div class="stack-sticky" aria-hidden="true">
+                <StackSvg/>
+            </div>
+            <div class="stack-blocks">
+                {LAYERS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (idx, label, title, fact))| {
                         view! {
-                            <div class="mt-5 max-w-xs" aria-hidden="true">
-                                {c()}
+                            <div class="stack-block" data-i=i.to_string() node_ref=block_refs[i]>
+                                <p class="section-index stack-block-label">
+                                    {*idx}" — "{*label}
+                                </p>
+                                <h3 class="text-h3 text-fg mt-3">{*title}</h3>
+                                <p class="text-sm text-fg-2 leading-relaxed mt-3 max-w-md">
+                                    {*fact}
+                                </p>
                             </div>
                         }
-                    })}
+                    })
+                    .collect_view()}
             </div>
         </div>
     }
 }
 
-/// Transport diagram: a QUIC path (active, marching dashes) above a WebSocket
-/// fallback path (dim, static), between a client and a relay endpoint. Fully
-/// monochrome — the accent lives only in live indicators and the media, not in
-/// an inline spec diagram.
+/// The exploded stack itself: five isometric slabs (flat parallelogram lid +
+/// two thin side faces), stacked with vertical gaps and joined by thin vertical
+/// connectors down which data flows. Purely geometric and decorative — the SVG
+/// is `aria-hidden`; the description blocks are the real content. Every stateful
+/// visual (lift, dim, oxide edge, marching connector) is CSS keyed off the
+/// parent `data-active`, so this markup is static.
 #[component]
-fn TransportArt() -> impl IntoView {
+fn StackSvg() -> impl IntoView {
+    // 2.5D projection constants. The lid is a parallelogram shifted right by
+    // SKEW over its depth; THICK is the visible side-face height; PITCH is the
+    // slab-to-slab vertical stride (bigger than the slab so gaps show).
+    const X0: f64 = 56.0;
+    const W: f64 = 200.0;
+    const SKEW: f64 = 32.0;
+    const DEPTH: f64 = 40.0;
+    const THICK: f64 = 13.0;
+    const PITCH: f64 = 84.0;
+    const Y0: f64 = 22.0;
+    let conn_x = X0 + W / 2.0;
+
     view! {
-        <svg viewBox="0 0 240 104" class="w-full h-full max-h-20" fill="none" aria-hidden="true">
-            <rect x="6" y="42" width="16" height="20" rx="2" fill="var(--fg-3)"></rect>
-            <rect x="218" y="42" width="16" height="20" rx="2" fill="var(--fg-3)"></rect>
+        <svg
+            class="stack-svg"
+            viewBox="0 0 320 424"
+            fill="none"
+            role="presentation"
+            aria-hidden="true"
+        >
+            // Connectors first, so the slabs paint over their ends.
+            {(0..4)
+                .map(|i| {
+                    let y_bottom = Y0 + i as f64 * PITCH + DEPTH + THICK;
+                    let y_next = Y0 + (i as f64 + 1.0) * PITCH;
+                    view! {
+                        <line
+                            class="stack-connector"
+                            data-i=i.to_string()
+                            x1=conn_x
+                            y1=y_bottom
+                            x2=conn_x
+                            y2=y_next
+                        ></line>
+                    }
+                })
+                .collect_view()}
 
-            // QUIC — active primary path.
-            <path
-                class="packet-path"
-                d="M22 52 C86 22, 154 22, 218 52"
-                stroke="var(--fg-2)"
-                stroke-width="1.5"
-            ></path>
-            // WebSocket — dim static fallback path.
-            <path
-                d="M22 52 C86 82, 154 82, 218 52"
-                stroke="var(--fg-4)"
-                stroke-width="1.5"
-                stroke-dasharray="3 5"
-            ></path>
+            {(0..5)
+                .map(|i| {
+                    let y = Y0 + i as f64 * PITCH;
+                    // Lid parallelogram (top-left, top-right, bottom-right, bottom-left).
+                    let (tlx, tly) = (X0 + SKEW, y);
+                    let (trx, try_) = (X0 + SKEW + W, y);
+                    let (brx, bry) = (X0 + W, y + DEPTH);
+                    let (blx, bly) = (X0, y + DEPTH);
+                    // Dropped edges for the two side faces.
+                    let (brdx, brdy) = (X0 + W, y + DEPTH + THICK);
+                    let (bldx, bldy) = (X0, y + DEPTH + THICK);
+                    let (trdx, trdy) = (X0 + SKEW + W, y + THICK);
 
-            <text x="120" y="14" text-anchor="middle" class="font-mono" font-size="8" letter-spacing="1" fill="var(--fg-2)">"QUIC"</text>
-            <text x="120" y="99" text-anchor="middle" class="font-mono" font-size="8" letter-spacing="1" fill="var(--fg-3)">"WS FALLBACK"</text>
-        </svg>
-    }
-}
-
-/// Control-plane diagram: a queued waiting room on the left, the meeting-api
-/// gate (dashed control boundary) in the middle, and one admitted participant
-/// past it on the right. Monochrome — the admit path marches through the gate,
-/// the admitted node breathes on opacity only.
-#[component]
-fn ControlPlaneArt() -> impl IntoView {
-    view! {
-        <svg viewBox="0 0 240 100" class="w-full h-full max-h-20" fill="none" aria-hidden="true">
-            // Waiting room — three queued participants.
-            <circle cx="26" cy="50" r="5" fill="var(--fg-3)"></circle>
-            <circle cx="46" cy="50" r="5" fill="var(--fg-3)"></circle>
-            <circle cx="66" cy="50" r="5" fill="var(--fg-3)"></circle>
-
-            // Admit path marching through the gate.
-            <path class="packet-path" d="M74 50 H160" stroke="var(--fg-3)" stroke-width="1.25"></path>
-
-            // The meeting-api control boundary.
-            <line x1="120" y1="20" x2="120" y2="80" stroke="var(--line-strong)" stroke-width="1.5" stroke-dasharray="3 5"></line>
-
-            // Admitted participant, past the gate.
-            <circle class="source-node" cx="176" cy="50" r="6" fill="var(--fg-2)"></circle>
-
-            <text x="120" y="12" text-anchor="middle" class="font-mono" font-size="8" letter-spacing="1" fill="var(--fg-3)">"ADMIT"</text>
+                    let front = format!(
+                        "M{blx} {bly} L{brx} {bry} L{brdx} {brdy} L{bldx} {bldy} Z",
+                    );
+                    let right = format!(
+                        "M{trx} {try_} L{brx} {bry} L{brdx} {brdy} L{trdx} {trdy} Z",
+                    );
+                    let lid = format!(
+                        "M{tlx} {tly} L{trx} {try_} L{brx} {bry} L{blx} {bly} Z",
+                    );
+                    view! {
+                        <g class="stack-slab" data-i=i.to_string()>
+                            // Front face (darkest) and right face (mid) give thickness.
+                            <path d=front fill="var(--bg)" stroke="var(--line)" stroke-width="1"></path>
+                            <path
+                                d=right
+                                fill="var(--surface-1)"
+                                stroke="var(--line)"
+                                stroke-width="1"
+                            ></path>
+                            // Lid (lightest) doubles as the oxide-able active edge.
+                            <path
+                                class="stack-edge"
+                                d=lid
+                                fill="var(--surface-2)"
+                                stroke="var(--line-strong)"
+                                stroke-width="1"
+                            ></path>
+                            <text
+                                class="font-mono"
+                                x=X0 - 26.0
+                                y=y + DEPTH - 2.0
+                                font-size="11"
+                                letter-spacing="1"
+                                fill="var(--fg-3)"
+                            >
+                                {LAYERS[i].0}
+                            </text>
+                        </g>
+                    }
+                })
+                .collect_view()}
         </svg>
     }
 }

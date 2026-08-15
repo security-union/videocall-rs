@@ -63,28 +63,29 @@ pub fn GlobeBand() -> impl IntoView {
 
             // How the media plane actually uses NATS. A contained editorial row
             // in the site voice: mono micro-labels + one plain fact each,
-            // hairline seams only (no cards, no borders, no bento). Grounded in
-            // the actix-api relay's NATS pub/sub: per-meeting subjects, relay-to-
-            // relay forwarding, and subscribe-before-signal ordering.
-            <div class="max-w-content mx-auto px-6 md:px-10 mt-8 md:mt-10">
+            // hairline seams only (no cards, no borders, no bento). Width is
+            // capped near the frame's optical width and centered with it — the
+            // band keeps ONE alignment system. Items keep vertical padding at
+            // every breakpoint so the top hairline never crowds the labels.
+            <div class="max-w-4xl mx-auto px-6 md:px-10 mt-8 md:mt-10">
                 <RevealOnView class="">
                     <ul class="grid md:grid-cols-3 border-t border-line divide-y md:divide-y-0 md:divide-x divide-line">
-                        <li class="py-6 md:py-0 md:px-8 md:first:pl-0 md:last:pr-0">
+                        <li class="py-6 md:px-8 md:first:pl-0 md:last:pr-0">
                             <p class="section-index text-sm">"Subject per meeting"</p>
                             <p class="text-base text-fg-2 leading-loose mt-3 max-w-sm">
                                 "Each meeting is a NATS subject. A relay publishes a frame once and every relay subscribed to that meeting receives it."
                             </p>
                         </li>
-                        <li class="py-6 md:py-0 md:px-8 md:first:pl-0 md:last:pr-0">
+                        <li class="py-6 md:px-8 md:first:pl-0 md:last:pr-0">
                             <p class="section-index text-sm">"Relay to relay"</p>
                             <p class="text-base text-fg-2 leading-loose mt-3 max-w-sm">
                                 "Participants can land on different relay servers anywhere in the world. NATS carries the media between them, so they still share one meeting."
                             </p>
                         </li>
-                        <li class="py-6 md:py-0 md:px-8 md:first:pl-0 md:last:pr-0">
-                            <p class="section-index text-sm">"Subscribe first"</p>
+                        <li class="py-6 md:px-8 md:first:pl-0 md:last:pr-0">
+                            <p class="section-index text-sm">"Scale out"</p>
                             <p class="text-base text-fg-2 leading-loose mt-3 max-w-sm">
-                                "The relay subscribes to a meeting's subject before it tells anyone the meeting started. No missed first frame."
+                                "Add relay servers to add capacity. WebSocket and WebTransport relays scale independently behind a load balancer. One call has run with 1000 participants."
                             </p>
                         </li>
                     </ul>

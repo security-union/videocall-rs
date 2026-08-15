@@ -29,6 +29,9 @@ use leptos::prelude::*;
 /// The five layers, top (nearest the user) to bottom (nearest the metal):
 ///   01 Clients · 02 Media pipeline · 03 Transport · 04 Media plane · 05 Control
 /// Every fact below matches a verified claim already made elsewhere on the site.
+// Ordered as a call actually happens: a client authenticates against the
+// control plane and gets admitted, then media is encoded, carried by the
+// transport, and fanned out by the media plane.
 const LAYERS: [(&str, &str, &str, &str); 5] = [
     (
         "01",
@@ -38,27 +41,27 @@ const LAYERS: [(&str, &str, &str, &str); 5] = [
     ),
     (
         "02",
+        "Control plane",
+        "Sign in, get admitted",
+        "meeting-api handles auth and SSO, meeting lifecycle, host controls, and the waiting room before a single frame moves. Prometheus metrics export across the stack.",
+    ),
+    (
+        "03",
         "Media pipeline",
         "Codecs written in Rust",
         "Opus audio and VP9 video, encoded and decoded in pure Rust. A NetEQ adaptive jitter buffer runs in every browser client.",
     ),
     (
-        "03",
+        "04",
         "Transport",
         "QUIC first, WebSocket as backup",
         "WebTransport over QUIC where the network allows it, an automatic WebSocket fallback where it does not. No ICE, STUN, TURN, or SDP.",
     ),
     (
-        "04",
+        "05",
         "Media plane",
         "One publisher, every relay",
         "Relay servers forward every media frame over the NATS mesh. One publisher, every subscriber — the mesh in the band above.",
-    ),
-    (
-        "05",
-        "Control plane",
-        "Auth and lifecycle, kept separate",
-        "A separate meeting-api handles auth and SSO, meeting lifecycle, host controls, and the waiting room. Prometheus metrics export across the stack.",
     ),
 ];
 

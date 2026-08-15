@@ -154,7 +154,7 @@ pub fn App() -> impl IntoView {
           "name": "Does it have meeting management and auth built in?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Yes. A separate Axum control plane, meeting-api, owns login and auth (JWT, SSO/OAuth), meeting lifecycle and ownership, host controls, and the waiting room. The media plane just forwards media frames, so authorization and access control stay off the streaming path."
+            "text": "Yes. A separate Axum control plane, meeting-api, owns login and auth (JWT, SSO/OAuth), meeting lifecycle and ownership, host controls, and the waiting room. The mesh plane just forwards media frames, so authorization and access control stay off the streaming path."
           }
         }
       ]

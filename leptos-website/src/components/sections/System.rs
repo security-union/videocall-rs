@@ -55,11 +55,11 @@ const LAYERS: [(&str, &str, &str, &str); 5] = [
         "04",
         "Transport",
         "QUIC first, WebSocket as backup",
-        "WebTransport over QUIC where the network allows it, an automatic WebSocket fallback where it does not. No ICE, STUN, TURN, or SDP.",
+        "WebTransport over QUIC where the network allows it, an automatic WebSocket fallback where it does not. Encrypted in transit with TLS 1.3, and every connection is authorized with a JWT. No ICE, STUN, TURN, or SDP.",
     ),
     (
         "05",
-        "Media plane",
+        "Mesh plane",
         "One publisher, every relay",
         "Relay servers forward every media frame over the NATS mesh. One publisher, every subscriber — the mesh in the band above.",
     ),
@@ -74,7 +74,7 @@ pub fn SystemSection() -> impl IntoView {
                     <p class="section-index" aria-hidden="true">"03 — System"</p>
                     <h2 id="system-title" class="text-h2 text-fg mt-4">"One system, end to end"</h2>
                     <p class="text-body-lg text-fg-2 mt-4 max-w-xl">
-                        "A media plane forwards media over NATS. A separate control plane handles auth, meeting lifecycle, host controls, and the waiting room. Browser, native, and CLI clients. Pure-Rust Opus and VP9. Prometheus metrics."
+                        "A mesh plane forwards media over NATS. A separate control plane handles auth, meeting lifecycle, host controls, and the waiting room. Browser, native, and CLI clients. Pure-Rust Opus and VP9. Prometheus metrics."
                     </p>
                 </RevealOnView>
 

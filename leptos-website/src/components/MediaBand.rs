@@ -29,7 +29,7 @@ pub fn GlobeBand() -> impl IntoView {
         <section class="media-band" aria-labelledby="globe-title">
             <div class="max-w-content mx-auto px-6 md:px-10 mb-8 md:mb-10">
                 <RevealOnView class="">
-                    <p class="section-index" aria-hidden="true">"02 — Media plane"</p>
+                    <p class="section-index" aria-hidden="true">"02 — Mesh plane"</p>
                     <h2 id="globe-title" class="text-h2 text-fg mt-4 max-w-4xl">
                         "Relays around the world, one mesh"
                     </h2>

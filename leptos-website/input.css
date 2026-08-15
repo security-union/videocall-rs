@@ -459,19 +459,15 @@
   @media (min-width: 1024px) {
     /* Desktop: each block owns a scroll moment. 48vh keeps the next block's
      * edge in view while one is centered — the column never reads empty. */
+    /* Every block follows the same rule — same height, content centered —
+     * so every block-to-block gap is identical: half of one block's slack
+     * plus half of the next's. Special-casing the first/last block halves
+     * their neighboring gap and reads as uneven spacing. */
     .stack-block {
       min-height: 48vh;
       display: flex;
       flex-direction: column;
       justify-content: center;
-    }
-    .stack-block:first-child {
-      min-height: 34vh;
-      justify-content: flex-end;
-    }
-    .stack-block:last-child {
-      min-height: 34vh;
-      justify-content: flex-start;
     }
     .stack-block + .stack-block {
       margin-top: 0;

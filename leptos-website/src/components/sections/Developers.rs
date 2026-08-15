@@ -58,6 +58,13 @@ pub fn DevelopersSection() -> impl IntoView {
                     />
                 </div>
 
+                // Two commands to first frame. Real, copy-pasteable, from the
+                // README — no mock editor, no fake preview.
+                <div class="border-t border-line pt-8 mt-8">
+                    <p class="section-index" aria-hidden="true">"Zero to first frame"</p>
+                    <pre class="mt-4 p-4 bg-bg-code border border-line overflow-x-auto text-[13px] leading-6 font-mono text-fg-2"><code>"cargo install videocall-cli\nvideocall-cli stream --user-id cam-01 --meeting-id demo --video-device-index 0"</code></pre>
+                </div>
+
                 // Community strip — a bare editorial row with a hairline
                 // top-seam, mono readouts, and a single line to GitHub.
                 <div class="border-t border-line pt-8 mt-8 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6">

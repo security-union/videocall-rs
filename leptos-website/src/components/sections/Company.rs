@@ -69,9 +69,9 @@ pub fn CompanySection() -> impl IntoView {
                 // Join — a bare row with a hairline top-seam and the two CTAs.
                 <div class="border-t border-line pt-8 mt-12 md:flex md:items-center md:justify-between gap-6">
                     <div class="md:max-w-xl">
-                        <h3 class="text-h3 text-fg">"Join us"</h3>
+                        <h3 class="text-h3 text-fg">"Contribute"</h3>
                         <p class="text-fg-2 mt-4 leading-relaxed">
-                            "We are always looking for engineers who care about real-time systems and open infrastructure."
+                            "We are not hiring. We take code. Pick an issue, send a patch, argue with us on Discord."
                         </p>
                     </div>
 
@@ -79,10 +79,10 @@ pub fn CompanySection() -> impl IntoView {
                         <CTAButton
                             variant=ButtonVariant::Primary
                             size=ButtonSize::Medium
-                            href=Some("https://github.com/security-union/videocall-rs".to_string())
+                            href=Some("https://github.com/security-union/videocall-rs/issues".to_string())
                             class="w-full sm:w-auto".to_string()
                         >
-                            "View open positions"
+                            "Pick an issue"
                         </CTAButton>
                         <CTAButton
                             variant=ButtonVariant::Secondary

@@ -151,3 +151,15 @@ crossfade the head over the tail —
   operation, download the file URI with the key header.
 - Harness: `videoeditor-genai` crate (`~/Documents/videoeditor`) for stills;
   plain curl for VEO.
+
+## 5. Relay globe v2 — programmatic perfect loop (shipped)
+
+The VEO globe's rotation never completed, so the loop read as a reset. The
+shipped `relay-globe.webm` is instead rendered programmatically by
+`relay-globe-render.py` (this directory): Natural Earth 110m land sampled to a
+dot-matrix, orthographic projection sweeping exactly one 360° revolution over
+the clip, ~18 relay cities (six across the US) with 8-12 arcs visible at any
+moment, every pulse phased at an integer multiple of the rotation period —
+frame N equals frame 0 by construction. Re-render with
+`nix-shell -p "python3.withPackages (p: [p.pillow p.numpy])" ffmpeg` and tweak
+the constants at the top of the script (cities, arcs, glow, rotation seconds).

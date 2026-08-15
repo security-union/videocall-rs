@@ -85,7 +85,7 @@ pub fn GlobeBand() -> impl IntoView {
                         <li class="py-6 md:px-8 md:first:pl-0 md:last:pr-0">
                             <p class="section-index text-sm">"Scale out"</p>
                             <p class="text-base text-fg-2 leading-loose mt-3 max-w-sm">
-                                "Add relay servers to add capacity. WebSocket and WebTransport relays scale independently behind a load balancer. One call has run with 1000 participants."
+                                "Add relay servers to add capacity. WebSocket and WebTransport relays scale independently behind a load balancer. Demonstrated with 1000 participants in a single meeting."
                             </p>
                         </li>
                     </ul>

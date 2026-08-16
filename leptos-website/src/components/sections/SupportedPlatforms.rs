@@ -37,7 +37,7 @@ pub fn SupportedPlatformsSection() -> impl IntoView {
         <section id="supported-platforms" aria-labelledby="platforms-title" class="px-6 md:px-10 py-16 md:py-24">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
-                    <p class="section-index" aria-hidden="true">"03 — Platforms"</p>
+                    <p class="section-index" aria-hidden="true">"05 — Platforms"</p>
                     <h2 id="platforms-title" class="text-h2 text-fg mt-4">"Runs where your hardware runs"</h2>
                     <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">
                         "From a browser tab to an embedded Linux board. Chromium and Safari on the desktop and on iOS, and headless capture on a Raspberry Pi or Jetson."

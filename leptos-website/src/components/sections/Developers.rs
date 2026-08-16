@@ -51,8 +51,8 @@ pub fn DevelopersSection() -> impl IntoView {
         <section id="developers" aria-labelledby="developers-title" class="px-6 md:px-10 py-16 md:py-24">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
-                    <p class="section-index" aria-hidden="true">"05 — Developers"</p>
-                    <h2 id="developers-title" class="text-h2 text-fg mt-4">"Three ways to ship"</h2>
+                    <p class="section-index" aria-hidden="true">"02 — Test"</p>
+                    <h2 id="developers-title" class="text-h2 text-fg mt-4">"Three ways to test"</h2>
                     <p class="text-body-lg text-fg-2 mt-4 max-w-2xl">"Try it, run it, build on it. Three ways in, ordered by how far you want to go: stream from a device, run the whole stack, or embed the client."</p>
                 </RevealOnView>
 

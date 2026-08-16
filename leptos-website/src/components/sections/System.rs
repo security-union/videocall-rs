@@ -71,7 +71,7 @@ pub fn SystemSection() -> impl IntoView {
         <section id="system" aria-labelledby="system-title" class="px-6 md:px-10 py-16 md:py-24">
             <div class="max-w-content mx-auto">
                 <RevealOnView class="">
-                    <p class="section-index" aria-hidden="true">"03 — System"</p>
+                    <p class="section-index" aria-hidden="true">"04 — System"</p>
                     <h2 id="system-title" class="text-h2 text-fg mt-4">"One system, end to end"</h2>
                     <p class="text-body-lg text-fg-2 mt-4 max-w-xl">
                         "A mesh plane forwards media over NATS. A separate control plane handles auth, meeting lifecycle, host controls, and the waiting room. Browser, native, and CLI clients. Pure-Rust Opus and VP9. Prometheus metrics."

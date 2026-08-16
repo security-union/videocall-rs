@@ -52,12 +52,12 @@ pub fn Home() -> impl IntoView {
                 // bands; a full-bleed media band's black edge does its own
                 // separating, so no rule is placed adjacent to one.
                 <Hero/>
+                <div class="rule"></div>
+                <DevelopersSection/>
                 <GlobeBand/>
                 <SystemSection/>
                 <div class="rule"></div>
                 <SupportedPlatformsSection/>
-                <div class="rule"></div>
-                <DevelopersSection/>
                 <div class="rule"></div>
                 <CompanySection/>
                 <div class="rule"></div>

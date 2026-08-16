@@ -44,7 +44,7 @@ pub fn SiteNav() -> impl IntoView {
 
                             <div class="hidden md:flex items-center gap-8">
                                 <NavLink href="#supported-platforms" text="Platforms" />
-                                <NavLink href="#developers" text="Developers" />
+                                <NavLink href="#developers" text="Test" />
                                 <NavLink href="#company" text="Company" />
                                 <NavLink href="#pricing" text="Pricing" />
                             </div>
@@ -188,7 +188,7 @@ fn MobileMenu() -> impl IntoView {
         )>
             <div class="px-6 py-5 space-y-1">
                 <MobileNavLink href="#supported-platforms" text="Platforms" on_click=move || menu_open.set(false) />
-                <MobileNavLink href="#developers" text="Developers" on_click=move || menu_open.set(false) />
+                <MobileNavLink href="#developers" text="Test" on_click=move || menu_open.set(false) />
                 <MobileNavLink href="#company" text="Company" on_click=move || menu_open.set(false) />
                 <MobileNavLink href="#pricing" text="Pricing" on_click=move || menu_open.set(false) />
             </div>

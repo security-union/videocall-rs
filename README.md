@@ -484,7 +484,7 @@ Hosting for the public videocall.rs instance is supported by DigitalOcean. Using
 
 <a href="https://www.digitalocean.com/?refcode=6de4e19c5193&utm_campaign=Referral_Invite&utm_medium=Referral_Program&utm_source=badge"><img src="https://web-platforms.sfo2.cdn.digitaloceanspaces.com/WWW/Badge%201.svg" alt="DigitalOcean Referral Badge" height="40"></a>
 
-[![Star History Chart](https://api.star-history.com/svg?repos=security-union/videocall-rs&type=Date)](https://star-history.com/#security-union/videocall-rs&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=security-union/videocall-rs&type=Date)](https://star-history.dera.page/#security-union/videocall-rs&Date)
 
 ## License
 

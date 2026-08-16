@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0](https://github.com/security-union/videocall-rs/compare/bot-v1.2.0...bot-v1.3.0) - 2026-08-13
+
+### Added
+
+- pure-Rust VP9 codec (encoder + decoder) — remove C libvpx from videocall-cli & bot ([#884](https://github.com/security-union/videocall-rs/pull/884))
+
+### Other
+
+- Classic Nix everywhere: no flakes, no Dockerfiles, and a native dev stack ([#897](https://github.com/security-union/videocall-rs/pull/897))
+
 ## [1.2.0](https://github.com/security-union/videocall-rs/compare/bot-v1.1.3...bot-v1.2.0) - 2026-06-30
 
 ### Added

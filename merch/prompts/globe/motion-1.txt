@@ -1,0 +1,10 @@
+A cinematic holographic dot-matrix Earth globe, centered, on a solid near-black background. The camera is completely static and locked off — no zoom, no push, no pan, no parallax. Do not change the framing.
+
+Motion, all subtle and continuous and seamless:
+- The globe rotates very slowly and steadily on its vertical axis, west to east, an almost imperceptible drift — only a few degrees over the whole shot so it reads as a living hologram, not a spinning ball.
+- Along the thin burnt rust-orange arcs connecting the glowing relay nodes, small bright pulses of orange light continuously launch from one node, travel smoothly along the arc, and arrive at the other node — like packets of encrypted media flowing across the mesh.
+- Each relay node gently pulses and blooms brighter the instant a light-pulse arrives at it, then settles.
+- The warm-grey dot-matrix continents and wireframe graticule shimmer faintly, a soft holographic flicker.
+- A few extremely sparse background stars twinkle very subtly. No new elements enter the frame.
+
+Mood: premium, moody, high-tech, quiet. Deep near-black space, refined burnt rust-orange accents only. No text, no labels, no UI, no captions, no camera movement.

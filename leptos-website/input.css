@@ -3,12 +3,43 @@
 @tailwind utilities;
 
 @layer base {
+  :root {
+    /* Ink / surface — warm-neutral near-black. */
+    --bg: #0a0a0b;
+    --surface-1: #111113;
+    --surface-2: #17171a;
+    --surface-code: #0d0d0f;
+
+    /* Foreground — warm grey ramp. */
+    --fg: #f2f2f0;
+    --fg-2: #a1a1a0;
+    --fg-3: #6e6e6d;
+    --fg-4: #3a3a3b;
+
+    /* Hairlines. */
+    --line: rgba(242, 242, 240, 0.1);
+    --line-strong: rgba(242, 242, 240, 0.18);
+
+    /* Oxide signal accent — live / active / focus only. */
+    --signal: #d96b3c;
+    --signal-quiet: rgba(217, 107, 60, 0.14);
+
+    /* Status readouts only. */
+    --ok: #8fa98a;
+    --warn: #c9a227;
+    --err: #b5493b;
+
+    --font-sans: "Helvetica Neue", Helvetica, Arial, "Segoe UI", system-ui, sans-serif;
+    --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Monaco, monospace;
+  }
+
   html {
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
-    background-color: #000000;
-    color: #f5f5f7;
+    font-family: var(--font-sans);
+    background-color: var(--bg);
+    color: var(--fg);
     font-size: 16px;
-    line-height: 1.5;
+    line-height: 1.55;
+    letter-spacing: normal;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     scroll-behavior: smooth;
@@ -17,138 +48,685 @@
   body {
     margin: 0;
     min-height: 100vh;
-    background-color: #000000;
+    background-color: var(--bg);
   }
 
-  * { box-sizing: border-box; }
+  * {
+    box-sizing: border-box;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+  }
 }
 
 @layer components {
-  /* Hero gradient — animated shimmer */
-  .hero-gradient {
-    background: linear-gradient(135deg, #2997ff 0%, #a855f7 40%, #2997ff 80%);
-    background-size: 200% auto;
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    animation: gradient-shift 4s ease-in-out infinite;
+  /* ---- Typography roles ------------------------------------------------ */
+  .text-display {
+    font-size: clamp(2.75rem, 6vw, 5rem);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.05;
+  }
+  .text-h2 {
+    font-size: clamp(2rem, 3.5vw, 3rem);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.05;
+  }
+  .text-h3 {
+    font-size: clamp(1.25rem, 1.6vw, 1.5rem);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+  }
+  .text-body-lg {
+    font-size: clamp(1.0625rem, 1.2vw, 1.25rem);
+    font-weight: 400;
+    line-height: 1.55;
   }
 
-  @keyframes gradient-shift {
-    0%, 100% { background-position: 0% center; }
-    50% { background-position: 100% center; }
+  /* Mono micro-label. Used for eyebrows and section indices. */
+  .eyebrow,
+  .section-index {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    line-height: 1;
+    color: var(--fg-3);
   }
 
-  /* Hero buttons — Apple style */
-  .hero-btn-primary {
-    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
-    @apply px-8 py-3.5 text-[15px];
-    background: #2997ff;
-    color: #fff;
-  }
-  .hero-btn-primary:hover {
-    background: #0077ed;
-    transform: scale(1.02);
+  /* Mono data readout. */
+  .data {
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    letter-spacing: 0.02em;
+    color: var(--fg-3);
   }
 
-  .hero-btn-secondary {
-    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
-    @apply px-8 py-3.5 text-[15px];
-    color: #2997ff;
+  /* ---- Structural primitives ------------------------------------------ */
+  /* Full-bleed 1px signal rule between sections. */
+  .rule {
+    height: 1px;
+    width: 100%;
+    background: var(--line);
+    border: 0;
+  }
+
+  .panel {
+    background: var(--surface-1);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 1.5rem;
+    transition:
+      border-color 0.2s ease-out,
+      background-color 0.2s ease-out;
+  }
+  @media (min-width: 768px) {
+    .panel {
+      padding: 2rem;
+    }
+  }
+  .panel:hover {
+    border-color: var(--line-strong);
+    background: var(--surface-2);
+  }
+
+  /* ---- Buttons (padding supplied by caller) --------------------------- */
+  .btn-solid {
+    @apply inline-flex items-center justify-center rounded-sm font-medium;
+    background: var(--fg);
+    color: var(--bg);
+    transition: background-color 0.16s ease-out;
+  }
+  .btn-solid:hover {
+    background: #ffffff;
+  }
+
+  .btn-line {
+    @apply inline-flex items-center justify-center rounded-sm font-medium;
+    color: var(--fg);
     background: transparent;
-    border: 1px solid rgba(41, 151, 255, 0.3);
+    border: 1px solid var(--line-strong);
+    transition:
+      border-color 0.16s ease-out,
+      background-color 0.16s ease-out;
   }
-  .hero-btn-secondary:hover {
-    background: rgba(41, 151, 255, 0.08);
-    border-color: rgba(41, 151, 255, 0.5);
-  }
-
-  /* Section buttons */
-  .btn-primary {
-    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
-    @apply px-6 py-3 text-[15px];
-    background: #2997ff;
-    color: #fff;
-  }
-  .btn-primary:hover { background: #0077ed; }
-
-  .btn-secondary {
-    @apply inline-flex items-center justify-center rounded-full font-medium transition-all duration-200;
-    @apply px-6 py-3 text-[15px];
-    color: #f5f5f7;
+  .btn-line:hover {
+    border-color: var(--fg);
     background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-  }
-  .btn-secondary:hover {
-    background: rgba(255, 255, 255, 0.08);
-    border-color: rgba(255, 255, 255, 0.16);
   }
 
-  /* Apple-style surface card — no visible border */
-  .card-apple {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    border-radius: 1.25rem;
-    padding: 2rem;
-    transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+  .btn-ghost {
+    @apply inline-flex items-center justify-center font-medium;
+    color: var(--fg-2);
+    background: transparent;
+    transition: color 0.16s ease-out;
   }
-  .card-apple:hover {
-    background: rgba(255, 255, 255, 0.06);
-    transform: translateY(-2px);
+  .btn-ghost:hover {
+    color: var(--fg);
   }
 
-  /* Typography — Apple scale */
-  .text-hero     { @apply text-5xl md:text-6xl lg:text-7xl font-bold tracking-tight; }
-  .text-headline { @apply text-3xl md:text-4xl lg:text-5xl font-semibold tracking-tight; }
-  .text-subheadline { @apply text-xl md:text-2xl font-medium; }
-  .text-body-large  { @apply text-lg md:text-xl leading-relaxed; }
-  .text-body        { @apply text-base leading-relaxed; }
-  .text-caption     { @apply text-sm; color: rgba(255,255,255,0.5); }
+  /* ---- Live dot — the only looping animation on the page -------------- */
+  .live-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: var(--signal);
+    animation: live-pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes live-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  /* ---- Nav link — monochrome; no oxide underline (accent discipline) --- */
+  .nav-link {
+    color: var(--fg-3);
+    transition: color 0.16s ease-out;
+  }
+  .nav-link:hover,
+  .nav-link:focus-visible {
+    color: var(--fg);
+  }
+
+  /* ---- Scroll reveal (armed only after the island hydrates) ----------- */
+  /* Failure mode is "visible": without JS, or before arming, content shows. */
+  .reveal.reveal-armed > * {
+    opacity: 0;
+    transform: translateY(16px);
+    transition:
+      opacity 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .reveal.reveal-armed > *:nth-child(2) {
+    transition-delay: 60ms;
+  }
+  .reveal.reveal-armed > *:nth-child(3) {
+    transition-delay: 120ms;
+  }
+  .reveal.reveal-armed > *:nth-child(4) {
+    transition-delay: 180ms;
+  }
+  /* Deepened stagger so 5–6-item grids (bento, readouts) fully cascade. */
+  .reveal.reveal-armed > *:nth-child(5) {
+    transition-delay: 240ms;
+  }
+  .reveal.reveal-armed > *:nth-child(6) {
+    transition-delay: 300ms;
+  }
+  .reveal.reveal-armed.in-view > * {
+    opacity: 1;
+    transform: none;
+  }
+
+  /* Section-index count-in: the mono index leads, sliding in from the left. */
+  .reveal.reveal-armed > .section-index {
+    transform: translateY(16px) translateX(-6px);
+  }
+  .reveal.reveal-armed.in-view > .section-index {
+    transform: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .live-dot {
+      animation: none;
+    }
+    .reveal.reveal-armed > * {
+      opacity: 1 !important;
+      transform: none !important;
+      transition: none !important;
+    }
+  }
 }
 
-leptos-island { display: contents; }
+/* ====================================================================== *
+ * Aliveness layer — live-call panel, relay-globe fallback, media bands,
+ * bone band. All motion is transform/opacity first (the multicast fallback
+ * uses tiny stroke-dashoffset paths). Every keyframe is frozen under
+ * reduced-motion at the bottom of this block.
+ * ====================================================================== */
+@layer components {
+  /* ---- Move A · live-call instrument panel --------------------------- */
+  .lcp-tile {
+    transition:
+      border-color 0.24s ease-out,
+      box-shadow 0.24s ease-out;
+  }
+  /* Speaking ring — mirrors the app's VAD tile highlight. A 1px oxide ring,
+     no blur, no glow (the media-led restructure bans glows): it is paired with
+     meter motion + the LIVE word, never the sole signal. */
+  .lcp-tile.is-active {
+    border-color: var(--signal);
+    box-shadow: 0 0 0 1px var(--signal);
+  }
 
-/* Code syntax highlighting */
-.hl-comment { color: #6e7681; }
-.hl-keyword { color: #ff7b72; }
-.hl-type    { color: #79c0ff; }
-.hl-fn      { color: #d2a8ff; }
-.hl-string  { color: #a5d6ff; }
+  /* Audio meters — GPU transform only. Inactive tiles animate calmly; the
+     active tile runs the full range via the .is-active override below. */
+  .lcp-bar {
+    transform-origin: bottom;
+    transform: scaleY(0.3);
+    animation-name: meter-quiet;
+    animation-duration: 700ms;
+    animation-timing-function: ease-in-out;
+    animation-iteration-count: infinite;
+  }
+  .lcp-tile.is-active .lcp-bar:nth-child(1) {
+    animation-name: meter-a;
+    animation-duration: 640ms;
+    animation-delay: -120ms;
+  }
+  .lcp-tile.is-active .lcp-bar:nth-child(2) {
+    animation-name: meter-b;
+    animation-duration: 820ms;
+    animation-delay: -360ms;
+  }
+  .lcp-tile.is-active .lcp-bar:nth-child(3) {
+    animation-name: meter-c;
+    animation-duration: 560ms;
+    animation-delay: -200ms;
+  }
+  .lcp-tile.is-active .lcp-bar:nth-child(4) {
+    animation-name: meter-d;
+    animation-duration: 900ms;
+    animation-delay: -480ms;
+  }
+  @keyframes meter-a {
+    0%,
+    100% {
+      transform: scaleY(0.25);
+    }
+    50% {
+      transform: scaleY(0.95);
+    }
+  }
+  @keyframes meter-b {
+    0%,
+    100% {
+      transform: scaleY(0.35);
+    }
+    45% {
+      transform: scaleY(0.75);
+    }
+  }
+  @keyframes meter-c {
+    0%,
+    100% {
+      transform: scaleY(0.2);
+    }
+    55% {
+      transform: scaleY(0.85);
+    }
+  }
+  @keyframes meter-d {
+    0%,
+    100% {
+      transform: scaleY(0.4);
+    }
+    50% {
+      transform: scaleY(0.6);
+    }
+  }
+  @keyframes meter-quiet {
+    0%,
+    100% {
+      transform: scaleY(0.2);
+    }
+    50% {
+      transform: scaleY(0.34);
+    }
+  }
 
-/* Legacy syntax classes */
-.hh1  { color: #ff7b72; }
-.hh2  { color: #79c0ff; }
-.hh3  { color: #d2a8ff; }
-.hh4  { color: #d2a8ff; }
-.hh5  { color: #ff7b72; }
-.hh6  { color: rgba(255,255,255,0.4); }
-.hh7  { color: #79c0ff; }
-.hh8  { color: rgba(255,255,255,0.7); }
-.hh9  { color: rgba(255,255,255,0.7); }
-.hh10 { color: rgba(255,255,255,0.7); }
-.hh11 { color: #a5d6ff; }
-.hh12 { color: #a5d6ff; }
-.hh13 { color: #ff7b72; }
-.hh14 { color: #79c0ff; }
-.hh15 { color: #79c0ff; }
-.hh16 { color: rgba(255,255,255,0.9); }
-.hh17 { color: #ffa657; }
-.hh18 { color: #ffa657; }
-.hh19 { color: #6e7681; }
-.hh20 { color: #d2a8ff; }
-.hh21 { color: #ff7b72; }
+  /* REC blink — header/footer clock + the rover tile chip. */
+  .rec-dot {
+    animation: rec-blink 1.4s steps(2, jump-none) infinite;
+  }
+  @keyframes rec-blink {
+    0% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.25;
+    }
+    100% {
+      opacity: 1;
+    }
+  }
 
-/* Code block */
-.code-block {
-  background: rgba(255,255,255,0.03);
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 0.75rem;
-  padding: 1rem;
-  overflow-x: auto;
+  /* Multicast fan-out — dashes march outward from source to N nodes. */
+  .packet-path {
+    stroke-dasharray: 4 6;
+    animation: packet-flow 1.6s linear infinite;
+  }
+  @keyframes packet-flow {
+    to {
+      stroke-dashoffset: -20;
+    }
+  }
+  .source-node {
+    animation: source-pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes source-pulse {
+    0%,
+    100% {
+      opacity: 0.55;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  .arrive-node {
+    opacity: 0.35;
+    animation: node-arrive 1.6s ease-in-out infinite;
+  }
+  @keyframes node-arrive {
+    0%,
+    70%,
+    100% {
+      opacity: 0.35;
+    }
+    85% {
+      opacity: 1;
+    }
+  }
+
+  /* Off-screen subtrees skip render AND their CSS animations entirely.
+   * contain-intrinsic-size keeps scroll geometry stable before first paint;
+   * `auto` remembers the real size afterwards. (The System band is NOT
+   * content-visibility'd: it hosts a tall sticky scroll-spy, and paint/size
+   * containment breaks sticky and mis-sizes the scroll region.) */
+  .lcp-cv {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 520px;
+  }
+
+  /* ---- System · exploded layered stack + scroll-spy ------------------ *
+   * Desktop: a sticky SVG stack beside five description blocks; an island
+   * writes `data-active` on `.stack-scrolly` and CSS does the rest. With the
+   * attribute absent (SSR / no-JS / reduced-motion / mobile) every slab is fully
+   * lit and nothing animates — the honest static fallback. */
+  .stack-svg {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  @media (min-width: 1024px) {
+    .stack-scrolly {
+      display: grid;
+      grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+      gap: 4rem;
+      align-items: start;
+    }
+  }
+  /* Mobile: the stack renders once above the blocks, centred and capped. */
+  .stack-sticky {
+    max-width: 320px;
+    margin: 0 auto 2.5rem;
+  }
+  @media (min-width: 1024px) {
+    .stack-sticky {
+      position: sticky;
+      top: 6rem;
+      max-width: none;
+      margin: 0;
+    }
+    /* The whole stack must stay visible while pinned: cap the rendered
+     * height to the viewport under the sticky offset and let
+     * preserveAspectRatio letterbox the drawing. Without this the SVG
+     * scales to column width and the active slab can sit off-screen. */
+    .stack-sticky svg {
+      display: block;
+      width: 100%;
+      height: min(calc(100vh - 9rem), 640px);
+    }
+  }
+  /* Mobile blocks read as a plain document, hairline-separated. */
+  .stack-block + .stack-block {
+    margin-top: 2.5rem;
+    padding-top: 2.5rem;
+    border-top: 1px solid var(--line);
+  }
+  @media (min-width: 1024px) {
+    /* Desktop: each block owns a scroll moment. 48vh keeps the next block's
+     * edge in view while one is centered — the column never reads empty. */
+    /* Every block follows the same rule — same height, content centered —
+     * so every block-to-block gap is identical: half of one block's slack
+     * plus half of the next's. Special-casing the first/last block halves
+     * their neighboring gap and reads as uneven spacing. */
+    .stack-block {
+      min-height: 48vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .stack-block + .stack-block {
+      margin-top: 0;
+      padding-top: 0;
+      border-top: 0;
+    }
+  }
+
+  /* Slab + connector transitions. Neutral state: every slab lit, no lift. */
+  .stack-slab {
+    transition:
+      opacity 0.45s ease,
+      transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .stack-edge {
+    transition: stroke 0.3s ease;
+  }
+  .stack-block-label {
+    transition: color 0.3s ease;
+  }
+  .stack-connector {
+    stroke: var(--fg-4);
+    stroke-width: 1.25;
+    stroke-dasharray: 4 6;
+  }
+
+  /* Active state (attribute present): dim the stack, then relight + lift the
+   * matched slab, oxide its lid edge, march its outgoing connector, and turn its
+   * block label oxide. Oxide is licensed here as a live "you are here" marker. */
+  .stack-scrolly[data-active] .stack-slab {
+    opacity: 0.5;
+  }
+  .stack-scrolly[data-active="0"] .stack-slab[data-i="0"],
+  .stack-scrolly[data-active="1"] .stack-slab[data-i="1"],
+  .stack-scrolly[data-active="2"] .stack-slab[data-i="2"],
+  .stack-scrolly[data-active="3"] .stack-slab[data-i="3"],
+  .stack-scrolly[data-active="4"] .stack-slab[data-i="4"] {
+    opacity: 1;
+    transform: translateY(-6px);
+  }
+  .stack-scrolly[data-active="0"] .stack-slab[data-i="0"] .stack-edge,
+  .stack-scrolly[data-active="1"] .stack-slab[data-i="1"] .stack-edge,
+  .stack-scrolly[data-active="2"] .stack-slab[data-i="2"] .stack-edge,
+  .stack-scrolly[data-active="3"] .stack-slab[data-i="3"] .stack-edge,
+  .stack-scrolly[data-active="4"] .stack-slab[data-i="4"] .stack-edge {
+    stroke: var(--signal);
+  }
+  .stack-name {
+    transition: fill 0.3s ease;
+  }
+  .stack-scrolly[data-active="0"] .stack-slab[data-i="0"] .stack-name,
+  .stack-scrolly[data-active="1"] .stack-slab[data-i="1"] .stack-name,
+  .stack-scrolly[data-active="2"] .stack-slab[data-i="2"] .stack-name,
+  .stack-scrolly[data-active="3"] .stack-slab[data-i="3"] .stack-name,
+  .stack-scrolly[data-active="4"] .stack-slab[data-i="4"] .stack-name {
+    fill: var(--fg);
+  }
+  .stack-scrolly[data-active="0"] .stack-connector[data-i="0"],
+  .stack-scrolly[data-active="1"] .stack-connector[data-i="1"],
+  .stack-scrolly[data-active="2"] .stack-connector[data-i="2"],
+  .stack-scrolly[data-active="3"] .stack-connector[data-i="3"] {
+    stroke: var(--signal);
+    animation: packet-flow 1.6s linear infinite;
+  }
+  .stack-scrolly[data-active="0"] .stack-block[data-i="0"] .stack-block-label,
+  .stack-scrolly[data-active="1"] .stack-block[data-i="1"] .stack-block-label,
+  .stack-scrolly[data-active="2"] .stack-block[data-i="2"] .stack-block-label,
+  .stack-scrolly[data-active="3"] .stack-block[data-i="3"] .stack-block-label,
+  .stack-scrolly[data-active="4"] .stack-block[data-i="4"] .stack-block-label {
+    color: var(--signal);
+  }
+
+  /* ---- Media-led restructure · full-bleed media bands ---------------- *
+   * The core new primitive: a full-bleed black band carrying a square media
+   * frame (globe / rover video, with an SVG or poster fallback). Media IS the
+   * page; the black around the square is the frame, not empty space. No border,
+   * no radius, no shadow on the frame. NO content-visibility here: browsers
+   * defer c-v rendering during scroll transit, which painted the band as a
+   * viewport-tall black void mid-scroll. One paused video is cheap; the island
+   * still pauses playback off-screen. */
+  .media-band {
+    width: 100%;
+    background: var(--bg);
+    position: relative;
+    padding-top: 4rem;
+    padding-bottom: 4rem;
+  }
+  @media (min-width: 768px) {
+    .media-band {
+      padding-top: 6rem;
+      padding-bottom: 6rem;
+    }
+  }
+
+  /* Square frame, centered, responsive width. Both source clips are square
+     (globe 720², rover 640²); the square is centered on black and never
+     stretched. aspect-square + a fixed width box = zero CLS. */
+  .media-frame {
+    position: relative;
+    margin-inline: auto;
+    overflow: hidden;
+    aspect-ratio: 1 / 1;
+    width: min(85vw, 420px);
+  }
+  @media (min-width: 640px) {
+    .media-frame {
+      width: min(60vw, 460px);
+    }
+  }
+  @media (min-width: 1024px) {
+    .media-frame {
+      width: min(40vw, 500px);
+    }
+  }
+
+  /* Mono corner caption (bottom-left name, bottom-right one-liner). */
+  .media-caption {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    line-height: 1.3;
+    color: var(--fg-3);
+  }
+
+  /* NATS attribution caption: a real link, so it hovers to fg (monochrome, no
+   * oxide) and stays keyboard-reachable — the rest of the caption row is
+   * decorative aria-hidden text. */
+
+  /* ---- Section B · reveal-driven draw-ins + item stagger ------------- *
+   * These use the descendant combinator (a space), NOT `> *`, so they reach
+   * real items through the island's <leptos-children> wrapper regardless of
+   * its display. The collapsed/hidden initial state is gated behind
+   * `.reveal-armed`, which the island only adds once motion is confirmed
+   * allowed — so no-JS and reduced-motion render the final drawn/visible
+   * frame. Per-item stagger is an inline `transition-delay` at the call site. */
+  .reveal.reveal-armed .draw-x {
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .reveal.reveal-armed.in-view .draw-x {
+    transform: scaleX(1);
+  }
+  .reveal.reveal-armed .draw-y {
+    transform: scaleY(0);
+    transform-origin: top;
+    transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .reveal.reveal-armed.in-view .draw-y {
+    transform: scaleY(1);
+  }
+
+  /* ---- Move C · inverted bone band ----------------------------------- *
+   * All ratios computed on #EDEBE6 (AA/AAA per the spec). The bright oxide
+   * survives only as a decorative rule; oxide *text* uses the darkened
+   * --bone-signal so it clears 4.5:1. */
+  .band-bone {
+    background: #edebe6;
+    color: #16151a;
+  }
+  .bone-ink {
+    color: #16151a;
+  }
+  .bone-ink-2 {
+    color: #4e4b45;
+  }
+  .bone-ink-3 {
+    color: #6e6a62;
+  }
+  .bone-divide > * + * {
+    border-color: rgba(22, 21, 26, 0.16);
+  }
+  .band-bone *:focus-visible {
+    outline-color: #a8471f;
+  }
+
+  /* ---- Reduced-motion: every new keyframe freezes at its final frame -- */
+  @media (prefers-reduced-motion: reduce) {
+    .lcp-bar,
+    .lcp-tile.is-active .lcp-bar {
+      animation: none !important;
+      transform: scaleY(0.5) !important;
+    }
+    .rec-dot,
+    .packet-path,
+    .source-node,
+    .arrive-node {
+      animation: none !important;
+    }
+    .arrive-node {
+      opacity: 1 !important;
+    }
+    /* Section B reveal draw-ins freeze at their final frame. */
+    .draw-x,
+    .draw-y {
+      transition: none !important;
+      transform: none !important;
+    }
+    /* System stack: no lift, no dim, no marching connector. The island also
+     * refuses to wire the scroll-spy under reduced-motion, so `data-active`
+     * never appears; these freezes are the belt-and-braces. */
+    .stack-slab,
+    .stack-edge,
+    .stack-block-label {
+      transition: none !important;
+      transform: none !important;
+    }
+    .stack-connector {
+      animation: none !important;
+    }
+  }
 }
-.code-block .code-block-inner {
-  font-family: 'SF Mono', 'Fira Code', Menlo, Monaco, monospace;
+
+leptos-island,
+leptos-children {
+  display: contents;
+}
+
+/* Code syntax highlighting — desaturated toward the monochrome system. */
+.hl-comment {
+  color: var(--fg-3);
+}
+.hl-keyword {
+  color: var(--fg);
+  font-weight: 600;
+}
+.hl-type {
+  color: var(--fg-2);
+}
+.hl-fn {
+  color: var(--fg);
+}
+.hl-string {
+  color: var(--fg-2);
+}
+
+/* Marquee edge fade. */
+.mask-edge-fade {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 1) 48px,
+    rgba(0, 0, 0, 1) calc(100% - 48px),
+    rgba(0, 0, 0, 0) 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 1) 48px,
+    rgba(0, 0, 0, 1) calc(100% - 48px),
+    rgba(0, 0, 0, 0) 100%
+  );
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: 100% 100%;
+  mask-size: 100% 100%;
+}
+
+pre i {
   font-style: normal;
 }
-
-pre i { font-style: normal; }

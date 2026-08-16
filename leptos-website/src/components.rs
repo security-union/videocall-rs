@@ -19,9 +19,14 @@
 pub mod CodeExample;
 //pub mod DarkModeToggle;
 pub mod CTAButton;
+pub mod CopyButton;
+pub mod CountUp;
 pub mod Footer;
 pub mod HeroHeader;
+pub mod LiveCallPanel;
+pub mod MediaBand;
 pub mod Page;
+pub mod Reveal;
 pub mod SpeedStats;
 
 // Section components
@@ -31,6 +36,7 @@ pub mod sections {
     pub mod Developers;
     pub mod Pricing;
     pub mod SupportedPlatforms;
+    pub mod System;
 }
 
 pub use CTAButton::*;
@@ -38,3 +44,4 @@ pub use CodeExample::*;
 pub use Footer::*;
 pub use HeroHeader::*;
 pub use Page::*;
+pub use Reveal::*;

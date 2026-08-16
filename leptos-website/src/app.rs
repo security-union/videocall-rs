@@ -19,7 +19,7 @@
 use crate::error_template::ErrorTemplate;
 use crate::pages::Home::Home;
 use leptos::prelude::*;
-use leptos_meta::{provide_meta_context, Meta, MetaTags, Stylesheet, Title};
+use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet, Title};
 use leptos_router::{
     components::{Route, Router, Routes},
     SsrMode, StaticSegment,
@@ -49,48 +49,184 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 
 #[component]
 pub fn App() -> impl IntoView {
-    let formatter = |text| format!("{text} - videocall.rs");
+    // Identity formatter: the page <Title> already carries the brand, and the
+    // title tag must stay under ~60 characters.
+    let formatter = |text: String| text;
     provide_meta_context();
 
-    let json_ld = r#"
+    // Clean JSON-LD graph — no fabricated ratings. SoftwareApplication +
+    // Organization + a FAQPage whose answers track the repository README.
+    let json_ld = r#"{
+  "@context": "https://schema.org",
+  "@graph": [
     {
-        "@context": "https://schema.org",
-        "@type": "SoftwareApplication",
-        "name": "videocall.rs",
-        "operatingSystem": "Any",
-        "applicationCategory": "DeveloperApplication",
-        "offers": {
-            "@type": "Offer",
-            "price": "0",
-            "priceCurrency": "USD"
+      "@type": "SoftwareApplication",
+      "name": "videocall.rs",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Any",
+      "url": "https://videocall.rs/",
+      "dateModified": "2026-08-16",
+      "description": "A full-stack system for real-time audio and video, written in Rust. Relay servers on a NATS mesh plane, a meetings API with auth and host controls, a browser client, and a native CLI. WebTransport over QUIC with an automatic WebSocket fallback. No ICE, STUN, TURN, or SDP. Encrypted in transit with TLS 1.3 and QUIC (not end-to-end encrypted). Self-hostable. MIT / Apache-2.0.",
+      "codeRepository": "https://github.com/security-union/videocall-rs",
+      "license": [
+        "https://opensource.org/licenses/MIT",
+        "https://www.apache.org/licenses/LICENSE-2.0"
+      ],
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "author": { "@id": "https://securityunion.dev/#organization" }
+    },
+    {
+      "@type": "Organization",
+      "@id": "https://securityunion.dev/#organization",
+      "name": "Security Union LLC",
+      "url": "https://securityunion.dev",
+      "logo": "https://videocall.rs/images/videocall_logo.svg",
+      "sameAs": [
+        "https://github.com/security-union/videocall-rs",
+        "https://discord.gg/JP38NRe4CJ",
+        "https://www.youtube.com/@dario.lencina"
+      ]
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Is videocall.rs a WebRTC replacement?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "For most server-mediated audio and video, yes. videocall.rs is a full-stack system and does not use WebRTC's peer-connection stack. Media flows over WebTransport (QUIC/HTTP3), or a WebSocket fallback, to a Rust relay server that forwards packets to other participants. It drops ICE, STUN/TURN, and SDP negotiation entirely."
+          }
         },
-        "description": "Open source, ultra-low-latency video conferencing API and platform built with Rust. Supports WebTransport and WebSocket.",
-        "aggregateRating": {
-            "@type": "AggregateRating",
-            "ratingValue": "5",
-            "ratingCount": "1"
+        {
+          "@type": "Question",
+          "name": "How do I try videocall.rs?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Two commands with the native CLI: run 'cargo install videocall-cli', then 'videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0'. Open https://app.videocall.rs/meeting/<id> in a browser with the same meeting id and the camera and browser share one call. To run the whole stack instead, git clone the repository and run 'make dev'."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does it use NATS?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. The media (mesh) plane is built on NATS pub/sub. Each meeting is a NATS subject: a relay publishes a frame once and every relay subscribed to that meeting receives it, which is how participants on different relay servers around the world share a single meeting."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can I self-host it?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. The repository ships Helm charts for Kubernetes and a fully native local dev stack. Production container images are built reproducibly with Nix."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does it work in the browser?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes, on Chromium-based browsers (Chrome, Edge, Brave) and Safari on macOS and iOS. Firefox is not currently supported."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How is it different from LiveKit, Jitsi, or mediasoup?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Those stacks are WebRTC selective-forwarding units. videocall.rs forwards media over WebTransport/QUIC instead of WebRTC, is written entirely in Rust, and requires no STUN/TURN/ICE infrastructure."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can I stream from a Raspberry Pi?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. videocall-cli is a headless native client that streams from a camera on Raspberry Pi, Jetson Nano, and other embedded Linux devices."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is the media encrypted?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Media is encrypted in transit: WebSocket connections use TLS 1.3, and WebTransport uses QUIC's built-in TLS 1.3 encryption. The relay server forwards media between participants; it is not end-to-end encrypted."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does it handle audio?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Voice is encoded with Opus in pure Rust. Every browser client runs a NetEQ-style adaptive jitter buffer to stay intelligible over lossy, high-latency networks."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does it have meeting management and auth built in?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. A separate Axum control plane, meeting-api, owns login and auth (JWT, SSO/OAuth), meeting lifecycle and ownership, host controls, and the waiting room. The mesh plane just forwards media frames, so authorization and access control stay off the streaming path."
+          }
         }
+      ]
+    },
+    {
+      "@type": "HowTo",
+      "name": "Stream a camera with videocall-cli",
+      "description": "Stream a camera into a videocall.rs meeting from any machine with the native CLI, then join the same meeting from a browser.",
+      "totalTime": "PT2M",
+      "tool": [
+        { "@type": "HowToTool", "name": "videocall-cli" }
+      ],
+      "step": [
+        {
+          "@type": "HowToStep",
+          "position": 1,
+          "name": "Install the CLI and start streaming",
+          "text": "Run 'cargo install videocall-cli', then 'videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0' to publish the camera into a meeting.",
+          "url": "https://crates.io/crates/videocall-cli"
+        },
+        {
+          "@type": "HowToStep",
+          "position": 2,
+          "name": "Join from a browser",
+          "text": "Open https://app.videocall.rs/meeting/<id> in a Chromium or Safari browser using the same meeting id, and the camera and browser share one call.",
+          "url": "https://app.videocall.rs/"
+        }
+      ]
     }
-    "#;
+  ]
+}"#;
 
     view! {
         <Stylesheet id="leptos" href="/pkg/leptos_website.css"/>
-        <Title formatter/>
+        <Title formatter text="videocall.rs — Full-stack real-time audio and video, in Rust"/>
         <Meta
             name="description"
-            content="Open source, ultra-low-latency video conferencing API and platform built with Rust. Perfect for software professionals, robotics, and embedded devices. Supports WebTransport with WebSocket fallback."
+            content="Full-stack real-time audio and video in Rust: relay media servers, a meetings API for auth, a browser client, and a CLI. Encrypted in transit, self-hostable."
         />
         <Meta
             name="keywords"
-            content="video conferencing api, rust video streaming, webtransport, websocket, low latency video, robotics video control, embedded video streaming, open source video platform, software professionals, video robotics"
+            content="webtransport video, rust video streaming, quic video, webrtc alternative, websocket fallback, self-hosted video conferencing, robotics video streaming, embedded video, open source video infrastructure, real-time audio streaming, opus audio, multicast video, robot video streaming, robotics fleet video, full-stack video system, self-hosted conferencing, meeting management api"
         />
+        <Link rel="canonical" href="https://videocall.rs/"/>
+        // Machine-readable summaries for LLM crawlers: a short index and the
+        // full-content companion (llms.txt convention).
+        <Link rel="alternate" type_="text/markdown" href="/llms.txt"/>
+        <Link rel="alternate" type_="text/markdown" href="/llms-full.txt"/>
 
         // Open Graph / Facebook
         <Meta property="og:type" content="website"/>
         <Meta property="og:site_name" content="videocall.rs"/>
         <Meta property="og:url" content="https://videocall.rs/"/>
-        <Meta property="og:title" content="videocall.rs - Ultra-low-latency Video Conferencing API"/>
-        <Meta property="og:description" content="Open source, ultra-low-latency video conferencing API and platform built with Rust. Perfect for software professionals, robotics, and embedded devices."/>
+        <Meta property="og:title" content="videocall.rs — Full-stack real-time audio and video, in Rust"/>
+        <Meta property="og:description" content="Full-stack real-time audio and video in Rust. Relay servers, a meetings API with auth and host controls, a browser client, and a native CLI. Run meetings in the browser. Stream from embedded devices with the CLI. WebTransport/QUIC with WebSocket fallback. Encrypted in transit. Self-hostable. MIT / Apache-2.0."/>
         <Meta property="og:image" content="https://videocall.rs/images/og-image.png"/>
 
         // Twitter
@@ -98,8 +234,8 @@ pub fn App() -> impl IntoView {
         <Meta property="twitter:site" content="@videocallrs"/>
         <Meta property="twitter:creator" content="@videocallrs"/>
         <Meta property="twitter:url" content="https://videocall.rs/"/>
-        <Meta property="twitter:title" content="videocall.rs - Ultra-low-latency Video Conferencing API"/>
-        <Meta property="twitter:description" content="Open source, ultra-low-latency video conferencing API and platform built with Rust. Perfect for software professionals, robotics, and embedded devices."/>
+        <Meta property="twitter:title" content="videocall.rs — Full-stack real-time audio and video, in Rust"/>
+        <Meta property="twitter:description" content="Full-stack real-time audio and video in Rust. Relay servers, a meetings API with auth and host controls, a browser client, and a native CLI. Run meetings in the browser. Stream from embedded devices with the CLI. WebTransport/QUIC with WebSocket fallback. Encrypted in transit. Self-hostable. MIT / Apache-2.0."/>
         <Meta property="twitter:image" content="https://videocall.rs/images/og-image.png"/>
 
         <Router>

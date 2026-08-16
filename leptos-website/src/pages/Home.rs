@@ -21,9 +21,11 @@ use crate::components::sections::Customers::CustomersSection;
 use crate::components::sections::Developers::DevelopersSection;
 use crate::components::sections::Pricing::PricingSection;
 use crate::components::sections::SupportedPlatforms::SupportedPlatformsSection;
+use crate::components::sections::System::SystemSection;
 
 // Removed unused import
 use crate::components::HeroHeader::*;
+use crate::components::MediaBand::GlobeBand;
 use crate::components::Page::*;
 use leptos::prelude::*;
 use leptos_meta::Title;
@@ -41,17 +43,28 @@ pub async fn perform_markdown_code_to_html(markdown: String) -> Result<String, S
 #[component]
 pub fn Home() -> impl IntoView {
     view! {
-        <Title text="Ultra-low-latency Video API for Developers"/>
+        <Title text="videocall.rs — Full-stack real-time audio and video, in Rust"/>
         <Page>
-            <HeroHeader/>
-
-            <div class="max-w-6xl mx-auto relative space-y-28 py-20 px-6">
-                <SupportedPlatformsSection/>
+            <SiteNav/>
+            <main id="content">
+                // Alternating rhythm: media band -> editorial -> media -> editorial.
+                // Hairline `.rule` seams sit ONLY between two contained editorial
+                // bands; a full-bleed media band's black edge does its own
+                // separating, so no rule is placed adjacent to one.
+                <Hero/>
+                <div class="rule"></div>
                 <DevelopersSection/>
+                <GlobeBand/>
+                <SystemSection/>
+                <div class="rule"></div>
+                <SupportedPlatformsSection/>
+                <div class="rule"></div>
                 <CompanySection/>
+                <div class="rule"></div>
                 <CustomersSection/>
+                <div class="rule"></div>
                 <PricingSection/>
-            </div>
+            </main>
         </Page>
     }
 }

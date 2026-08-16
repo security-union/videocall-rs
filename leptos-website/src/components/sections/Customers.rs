@@ -16,57 +16,68 @@
  * conditions.
  */
 
+use crate::components::CountUp::CountUp;
+use crate::components::Reveal::RevealOnView;
 use leptos::prelude::*;
 
 #[component]
 pub fn CustomersSection() -> impl IntoView {
     view! {
-        <section id="customers" class="relative">
-            <div class="text-center mb-16">
-                <h2 class="text-4xl md:text-5xl font-semibold tracking-tight mb-4">"Trusted By"</h2>
-                <p class="text-lg md:text-xl text-white/50 max-w-2xl mx-auto">"Growing community of developers and organizations"</p>
+        // Move C — the one inverted bone band. Palette flip to bone/near-black
+        // resets the eye mid-page; every token clears WCAG AA on #EDEBE6.
+        <section id="customers" aria-labelledby="adoption-title" class="band-bone px-6 md:px-10 py-16 md:py-24">
+            <div class="max-w-content mx-auto">
+                <RevealOnView class="">
+                    <p class="section-index bone-ink-3" aria-hidden="true">"07 — Adoption"</p>
+                    <h2 id="adoption-title" class="text-h2 bone-ink mt-4">"Growing where it's measured"</h2>
+                    <p class="text-body-lg bone-ink-2 mt-4 max-w-xl">"Open source, and used in production. Numbers sourced straight from the repository."</p>
+                </RevealOnView>
+
+                // Readout row — big figures sit directly on the bone with vertical
+                // hairline seams only. No box, no surface fill: a printed stat page.
+                <div class="grid sm:grid-cols-2 md:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x bone-divide mt-12">
+                    <Readout target=1.7 decimals=1 suffix="K" unit="GitHub stars" />
+                    <Readout target=170.0 decimals=0 suffix="" unit="Forks" />
+                    <Readout target=490.0 decimals=0 suffix="+" unit="Commits" />
+                    <Readout target=20.0 decimals=0 suffix="+" unit="Contributors" />
+                </div>
+
+                {testimonials_section()}
             </div>
-
-            // Stats Grid
-            <div class="grid md:grid-cols-3 gap-8 lg:gap-12 mb-20">
-                <StatCard
-                    number="500+"
-                    label="Active Users"
-                    icon_path="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"
-                />
-
-                <StatCard
-                    number="1.6K+"
-                    label="GitHub Stars"
-                    icon_path="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z"
-                />
-
-                <StatCard
-                    number="280+"
-                    label="Commits"
-                    icon_path="M10 1a9 9 0 100 18A9 9 0 0010 1zm0 16a7 7 0 100-14 7 7 0 000 14zm1-11a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z"
-                />
-            </div>
-
-            {testimonials_section()}
         </section>
+    }
+}
+
+#[component]
+fn Readout(
+    target: f64,
+    decimals: u8,
+    #[prop(into)] suffix: String,
+    unit: &'static str,
+) -> impl IntoView {
+    view! {
+        <div class="px-6 py-10 text-center">
+            <div class="text-4xl md:text-5xl font-medium tracking-tight bone-ink">
+                <CountUp target=target decimals=decimals suffix=suffix />
+            </div>
+            <div class="eyebrow bone-ink-3 mt-3">{unit}</div>
+        </div>
     }
 }
 
 #[cfg(feature = "testimonials")]
 fn testimonials_section() -> impl IntoView {
     view! {
-        <div class="grid md:grid-cols-2 gap-8 lg:gap-12">
+        <div class="grid md:grid-cols-2 gap-6 mt-6">
             <TestimonialCard
-                quote="The performance and reliability of videocall.rs has been exceptional. The WebTransport implementation makes a real difference in latency."
+                quote="The WebTransport implementation makes a real difference in latency, and the reliability has been exceptional."
                 author="Sarah Chen"
-                role="Tech Lead at DevCorp"
+                role="Tech Lead, DevCorp"
             />
-
             <TestimonialCard
-                quote="Being open source and built with Rust gives us confidence in both the security and performance of the platform."
+                quote="Open source and built in Rust gives us confidence in both the security and the performance of the platform."
                 author="Mark Thompson"
-                role="CTO at StartupX"
+                role="CTO, StartupX"
             />
         </div>
     }
@@ -74,49 +85,16 @@ fn testimonials_section() -> impl IntoView {
 
 #[cfg(not(feature = "testimonials"))]
 fn testimonials_section() -> impl IntoView {
-    view! {
-        // Testimonials section disabled - enable with "testimonials" feature flag
-    }
-}
-
-#[component]
-fn StatCard(number: &'static str, label: &'static str, icon_path: &'static str) -> impl IntoView {
-    view! {
-        <div class="card-apple text-center group hover:scale-[1.02] transition-transform duration-200">
-            <div class="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-6">
-                <svg class="w-8 h-8 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d=icon_path />
-                </svg>
-            </div>
-            <div class="text-4xl font-bold text-foreground mb-2 group-hover:text-primary transition-colors">{number}</div>
-            <div class="text-foreground-secondary">{label}</div>
-        </div>
-    }
+    // Testimonials are disabled; enable with the "testimonials" feature flag.
 }
 
 #[cfg(feature = "testimonials")]
 #[component]
 fn TestimonialCard(quote: &'static str, author: &'static str, role: &'static str) -> impl IntoView {
     view! {
-        <div class="card-apple group hover:scale-[1.02] transition-transform duration-200">
-            <div class="mb-6">
-                <svg class="w-8 h-8 text-primary/30 mb-4" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M14.017 21v-7.391c0-5.704 3.731-9.57 8.983-10.609l.995 2.151c-2.432.917-3.995 3.638-3.995 5.849h4v10h-9.983zm-14.017 0v-7.391c0-5.704 3.748-9.57 9-10.609l.996 2.151c-2.433.917-3.996 3.638-3.996 5.849h4v10h-10z"/>
-                </svg>
-                <p class="text-foreground-secondary text-lg leading-relaxed mb-6">{quote}</p>
-            </div>
-
-            <div class="flex items-center">
-                <div class="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center mr-4">
-                    <svg class="w-6 h-6 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.121 17.804A13.937 13.937 0 0112 16c2.5 0 4.847.655 6.879 1.804M15 10a3 3 0 11-6 0 3 3 0 016 0zm6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                </div>
-                <div>
-                    <div class="font-semibold text-foreground">{author}</div>
-                    <div class="text-sm text-foreground-secondary">{role}</div>
-                </div>
-            </div>
+        <div class="panel">
+            <p class="text-fg-2 text-lg leading-relaxed">{quote}</p>
+            <div class="data mt-6">{author}" · "{role}</div>
         </div>
     }
 }

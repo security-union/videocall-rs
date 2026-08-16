@@ -1,0 +1,47 @@
+# videocall.rs
+
+> An opinionated, full-stack system for real-time audio and video, written entirely in Rust. A WebRTC alternative built on WebTransport (HTTP/3 / QUIC) with an automatic WebSocket fallback — no ICE, STUN, TURN, or SDP. Relay media servers form a mesh plane over NATS pub/sub; a separate control plane (meeting-api) owns auth/SSO, meeting lifecycle, host controls, and the waiting room. Runs in the browser (Dioxus/WebAssembly) and on embedded Linux via a CLI. Self-hostable with Helm, dual-licensed MIT/Apache-2.0.
+
+Key facts:
+- Media transport is WebTransport (QUIC/HTTP3) with an automatic WebSocket fallback; there is no ICE, STUN, TURN, or SDP signaling.
+- Two planes: a media (mesh) plane where relay servers forward every frame over a NATS pub/sub backbone ("Powered by NATS.io"), and a separate control plane (meeting-api) that owns login/auth (JWT, SSO/OAuth), meeting lifecycle and ownership, host controls, and the waiting room — so authorization stays off the streaming path.
+- Encrypted in transit only: WebSocket uses TLS 1.3 and WebTransport uses QUIC's built-in TLS 1.3. The relay forwards media between participants; it is NOT end-to-end encrypted.
+- Audio and video codecs are pure Rust: Opus for audio, VP9 for video. Every browser client runs a NetEQ-style adaptive jitter buffer. Prometheus metrics export across the stack.
+- Written entirely in Rust: relay servers, meeting-api control plane, browser client (Dioxus/WebAssembly), and a native CLI.
+- Scales out horizontally: add relay servers to add capacity. WebSocket and WebTransport relays scale independently behind a load balancer, and NATS pub/sub fans each published frame out across the relays that share a meeting.
+- Three ways to test, ordered by commitment: (1) stream a camera with videocall-cli in two commands, (2) `git clone && make dev` to run the whole native stack, (3) `cargo add videocall-client` to embed the client in your own WebAssembly app.
+- Browser support is Chromium (Chrome, Edge, Brave) and Safari on macOS and iOS. Firefox is not supported.
+
+## Full content
+
+- [llms-full.txt — the complete site narrative in markdown](https://videocall.rs/llms-full.txt)
+
+## Try it (three ways)
+
+- Stream a camera in two commands: `cargo install videocall-cli` then `videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0`, then open `https://app.videocall.rs/meeting/<id>` in a browser.
+- Run the whole stack natively: `git clone https://github.com/security-union/videocall-rs.git && cd videocall-rs && make dev`, then open `http://localhost:3001/meeting/you/demo`.
+- Embed the client: `cargo add videocall-client` and build on the same transport and media pipeline in your own Rust/WASM app.
+
+## Docs
+
+- [README (overview, install, self-hosting)](https://github.com/security-union/videocall-rs/blob/main/README.md)
+- [Architecture](https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md)
+- [Meeting API reference](https://github.com/security-union/videocall-rs/blob/main/docs/MEETING_API.md)
+- [Meeting ownership & workflow](https://github.com/security-union/videocall-rs/blob/main/docs/MEETING_OWNERSHIP.md)
+- [Nix build system](https://github.com/security-union/videocall-rs/blob/main/docs/nix-architecture.md)
+- [Hosted documentation](https://docs.videocall.rs)
+
+## Repositories & crates
+
+- [GitHub: security-union/videocall-rs](https://github.com/security-union/videocall-rs)
+- [videocall-cli (native headless streaming client)](https://crates.io/crates/videocall-cli)
+- [videocall-client (browser/native client library)](https://crates.io/crates/videocall-client)
+- [videocall-types (shared protobuf types)](https://crates.io/crates/videocall-types)
+- [videocall-codecs (pure-Rust codec wrappers)](https://crates.io/crates/videocall-codecs)
+- Other crates in the repo: videocall-sdk (iOS Swift / Android Kotlin bindings) — present in the tree, not a headline capability.
+
+## Optional
+
+- [Website](https://videocall.rs)
+- [Live demo](https://app.videocall.rs)
+- [Discord community](https://discord.gg/JP38NRe4CJ)

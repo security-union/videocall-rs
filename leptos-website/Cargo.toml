@@ -43,10 +43,24 @@ web-sys = { version = "0.3", optional = true, features = [
     "Window",
     "Element",
     "HtmlElement",
+    "HtmlDivElement",
+    "HtmlButtonElement",
+    "HtmlMediaElement",
+    "HtmlVideoElement",
+    "Navigator",
+    "Clipboard",
+    "Crypto",
     "CssStyleDeclaration",
     "Document",
+    "DomTokenList",
+    "EventTarget",
+    "NodeList",
+    "IntersectionObserver",
+    "IntersectionObserverEntry",
+    "IntersectionObserverInit",
     "Node",
 ] }
+js-sys = { version = "0.3", optional = true }
 serde = "1.0.218"
 
 [features]
@@ -61,6 +75,7 @@ hydrate = [
 	"leptos/hydrate",
 	"leptos/islands",
 	"dep:web-sys",
+	"dep:js-sys",
 ]
 ssr = [
 	"dep:axum",

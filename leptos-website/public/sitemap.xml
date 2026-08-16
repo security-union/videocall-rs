@@ -2,11 +2,13 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
         <loc>https://videocall.rs/</loc>
+        <lastmod>2026-08-16</lastmod>
         <changefreq>weekly</changefreq>
         <priority>1.0</priority>
     </url>
     <url>
         <loc>https://videocall.rs/docs/</loc>
+        <lastmod>2026-08-16</lastmod>
         <changefreq>monthly</changefreq>
         <priority>0.8</priority>
     </url>

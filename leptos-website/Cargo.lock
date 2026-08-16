@@ -1275,6 +1275,7 @@ dependencies = [
  "console_error_panic_hook",
  "femark",
  "http",
+ "js-sys",
  "leptos",
  "leptos_axum",
  "leptos_macro",

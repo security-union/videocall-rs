@@ -19,7 +19,8 @@
 use leptos::either::Either;
 use leptos::prelude::*;
 
-/// Apple-style button variants
+/// Button variants mapped onto the redesign's rectilinear primitives:
+/// `Primary` → solid, `Secondary` → hairline outline, `Tertiary` → ghost link.
 #[derive(Clone, PartialEq)]
 pub enum ButtonVariant {
     Primary,
@@ -27,7 +28,8 @@ pub enum ButtonVariant {
     Tertiary,
 }
 
-/// Apple-style button sizes
+/// Button sizes. These supply padding + text size; the variant supplies the
+/// surface, so the two never fight over the same properties.
 #[derive(Clone, PartialEq)]
 pub enum ButtonSize {
     Small,
@@ -44,18 +46,18 @@ pub fn CTAButton(
     #[prop(default = None)] href: Option<String>,
     #[prop(default = false)] disabled: bool,
 ) -> impl IntoView {
-    let base_classes = "inline-flex items-center justify-center font-medium transition-all duration-200 ease-out focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed";
+    let base_classes = "disabled:opacity-50 disabled:cursor-not-allowed";
 
     let variant_classes = match variant {
-        ButtonVariant::Primary => "btn-primary",
-        ButtonVariant::Secondary => "btn-secondary",
-        ButtonVariant::Tertiary => "text-primary hover:opacity-70",
+        ButtonVariant::Primary => "btn-solid",
+        ButtonVariant::Secondary => "btn-line",
+        ButtonVariant::Tertiary => "btn-ghost",
     };
 
     let size_classes = match size {
         ButtonSize::Small => "px-4 py-2 text-sm",
-        ButtonSize::Medium => "px-6 py-3 text-[15px]",
-        ButtonSize::Large => "px-8 py-4 text-base",
+        ButtonSize::Medium => "px-5 py-2.5 text-[15px]",
+        ButtonSize::Large => "px-6 py-3.5 text-base",
     };
 
     let combined_class = format!(

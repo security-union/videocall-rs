@@ -47,7 +47,7 @@ videocall.rs gives you the building blocks for real-time video communication wit
 - **Robotics and IoT engineers** streaming low-latency video from drones, robots, and embedded devices using the lightweight [`videocall-cli`](https://github.com/security-union/videocall-rs/blob/main/videocall-cli/README.md) and the mobile SDKs.
 - **Teams that want to self-host** their own conferencing infrastructure with JWT authentication, SSO/OAuth, and transport encryption (TLS 1.3 / QUIC), deployed with the provided Helm charts.
 
-The same core powers browser calls at [videocall.rs](https://videocall.rs) and has been demonstrated scaling to [1000 users in a single call](https://youtu.be/LWwOSZJwEJI).
+The same core powers browser calls at [videocall.rs](https://videocall.rs).
 
 ## Features
 
@@ -323,7 +323,7 @@ Details: [Meeting Ownership & Workflow](https://github.com/security-union/videoc
 videocall.rs is engineered for real-time streaming across a range of hardware and networks:
 
 - **One-on-one and small groups:** a mesh-style topology with adaptive quality driven by per-receiver diagnostics (packet loss, latency, jitter, estimated bandwidth).
-- **Large conferences:** the NATS-backed forwarding architecture has been demonstrated with [1000 participants in a single call](https://youtu.be/LWwOSZJwEJI).
+- **Large conferences:** the NATS-backed forwarding architecture scales out horizontally — add relay servers for capacity, with WebSocket and WebTransport relays scaling independently behind a load balancer.
 
 Implementation choices that support this:
 

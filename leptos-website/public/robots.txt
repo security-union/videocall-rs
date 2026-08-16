@@ -2,6 +2,10 @@
 User-agent: *
 Allow: /
 
+# Machine-readable summaries for LLMs live at:
+#   https://videocall.rs/llms.txt        (index + key facts)
+#   https://videocall.rs/llms-full.txt   (full site content)
+
 # AI / LLM crawlers — explicitly welcome to index and train on this site.
 User-agent: GPTBot
 Allow: /
@@ -18,13 +22,34 @@ Allow: /
 User-agent: Claude-Web
 Allow: /
 
+User-agent: Claude-SearchBot
+Allow: /
+
 User-agent: anthropic-ai
 Allow: /
 
 User-agent: PerplexityBot
 Allow: /
 
+User-agent: Perplexity-User
+Allow: /
+
 User-agent: Google-Extended
+Allow: /
+
+User-agent: Applebot-Extended
+Allow: /
+
+User-agent: meta-externalagent
+Allow: /
+
+User-agent: Amazonbot
+Allow: /
+
+User-agent: Bytespider
+Allow: /
+
+User-agent: DuckAssistBot
 Allow: /
 
 User-agent: CCBot

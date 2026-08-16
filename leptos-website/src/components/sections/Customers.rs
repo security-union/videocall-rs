@@ -39,7 +39,7 @@ pub fn CustomersSection() -> impl IntoView {
                     <Readout target=1.7 decimals=1 suffix="K" unit="GitHub stars" />
                     <Readout target=170.0 decimals=0 suffix="" unit="Forks" />
                     <Readout target=490.0 decimals=0 suffix="+" unit="Commits" />
-                    <Readout target=1000.0 decimals=0 suffix="" unit="Peak call, single meeting" />
+                    <Readout target=20.0 decimals=0 suffix="+" unit="Contributors" />
                 </div>
 
                 {testimonials_section()}

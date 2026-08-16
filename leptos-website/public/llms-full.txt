@@ -1,0 +1,264 @@
+# videocall.rs — Full-stack real-time audio and video, in Rust
+
+> This is the complete, machine-readable account of videocall.rs, mirroring the
+> content at https://videocall.rs. It is the full-content companion to
+> https://videocall.rs/llms.txt (per the llms.txt convention). Everything below
+> is factual and reflects the site as of 2026-08-16.
+
+videocall.rs is an opinionated, full-stack system for real-time audio and video,
+written entirely in Rust. It is a WebRTC alternative: media flows over
+WebTransport (HTTP/3 / QUIC) to Rust relay servers that forward it to other
+participants, with an automatic WebSocket fallback where QUIC is blocked. There
+is no ICE, STUN, TURN, or SDP negotiation anywhere in the stack.
+
+- Website: https://videocall.rs
+- Live demo: https://app.videocall.rs
+- Source: https://github.com/security-union/videocall-rs
+- License: MIT OR Apache-2.0
+- Maintainer: Security Union LLC (https://securityunion.dev)
+
+## Hero
+
+Eyebrow: Real-time audio + video infrastructure.
+
+Headline: Real-time audio and video. The whole system, in Rust.
+
+videocall.rs is a full-stack system for real-time audio and video, written in
+Rust. Relay servers, a meetings API with auth and host controls, a browser
+client, a native CLI, metrics, Helm charts. Run meetings in the browser. Stream
+from embedded devices with the CLI. Self-host the whole thing. MIT / Apache-2.0.
+
+At a glance: Audio + video · Opus + VP9, pure Rust · WebTransport / WebSocket ·
+TLS / QUIC encrypted in transit · MIT / Apache-2.0.
+
+## The system, end to end
+
+A mesh plane forwards media over NATS. A separate control plane handles auth,
+meeting lifecycle, host controls, and the waiting room. Browser, native, and CLI
+clients. Pure-Rust Opus and VP9. Prometheus metrics. The system reads in five
+layers, ordered the way a call actually happens — a client authenticates against
+the control plane and is admitted, then media is encoded, carried by the
+transport, and fanned out by the mesh plane.
+
+### 01 — Clients (browser to embedded board)
+
+A Dioxus web client runs in the browser, compiled to WebAssembly — no install.
+videocall-cli streams from embedded Linux boards like the Raspberry Pi and
+Jetson.
+
+### 02 — Control plane (sign in, get admitted)
+
+meeting-api handles auth and SSO, meeting lifecycle, host controls, and the
+waiting room before a single frame moves. Prometheus metrics export across the
+stack. Because authorization lives in this separate control plane, it stays off
+the streaming path.
+
+### 03 — Media pipeline (codecs written in Rust)
+
+Opus audio and VP9 video, encoded and decoded in pure Rust. A NetEQ-style
+adaptive jitter buffer runs in every browser client to stay intelligible over
+lossy, high-latency networks.
+
+### 04 — Transport (QUIC first, WebSocket as backup)
+
+WebTransport over QUIC where the network allows it, an automatic WebSocket
+fallback where it does not. Encrypted in transit with TLS 1.3, and every
+connection is authorized with a JWT. No ICE, STUN, TURN, or SDP.
+
+### 05 — Mesh plane (one publisher, every relay)
+
+Relay servers forward every media frame over the NATS mesh. One publisher, every
+subscriber.
+
+## The mesh plane: relays around the world, one mesh
+
+The media plane is built on NATS pub/sub ("Powered by NATS.io").
+
+- Subject per meeting: Each meeting is a NATS subject. A relay publishes a frame
+  once and every relay subscribed to that meeting receives it.
+- Relay to relay: Participants can land on different relay servers anywhere in
+  the world. NATS carries the media between them, so they still share one
+  meeting.
+- Scale out: Add relay servers to add capacity. WebSocket and WebTransport
+  relays scale independently behind a load balancer, and NATS fans each
+  published frame out across the relays that share a meeting.
+
+## Encryption (stated plainly)
+
+Media is encrypted in transit only. WebSocket connections use TLS 1.3, and
+WebTransport uses QUIC's built-in TLS 1.3. The relay server forwards media
+between participants; the system is NOT end-to-end encrypted.
+
+## Three ways to test
+
+Try it, run it, build on it — three ways in, ordered by how far you want to go.
+
+### 01 — TRY: stream a camera in two commands
+
+For the roboticist with a Pi on the desk. No browser, no build — just a camera
+and a meeting id.
+
+```
+cargo install videocall-cli
+videocall-cli stream --user-id cam-01 --meeting-id <meeting-id> --video-device-index 0
+```
+
+Then open `https://app.videocall.rs/meeting/<meeting-id>` in any browser. Same
+meeting id, so the Pi's camera and your browser land in the same call.
+
+### 02 — RUN: the whole system on your machine
+
+For evaluating the full stack end to end — media servers, meeting API, and UI —
+before you commit to anything.
+
+```
+git clone https://github.com/security-union/videocall-rs.git
+cd videocall-rs
+make dev
+```
+
+The entire stack — Postgres, NATS, the relays, meeting-api, and the UI — runs
+natively with hot reload. Open `http://localhost:3001/meeting/you/demo` and you
+are in the call. Going to production? The repo ships Helm charts.
+
+### 03 — BUILD: embed the client in your own app
+
+For building a custom client on the same transport and media pipeline, compiled
+to WebAssembly.
+
+```
+cargo add videocall-client
+```
+
+```rust
+use videocall_client::{VideoCallClient, VideoCallClientOptions};
+
+let mut client = VideoCallClient::new(VideoCallClientOptions {
+    user_id: "cam-01".into(),
+    meeting_id: "demo".into(),
+    webtransport_urls: vec!["https://localhost:4433".into()],
+    websocket_urls: vec!["ws://localhost:8080".into()],
+    enable_webtransport: true,
+    // …peer + connection callbacks and tuning — see docs.rs
+});
+client.connect().unwrap();
+```
+
+Transport negotiation, encoding, and peer rendering are handled; you own the UI.
+The full options struct and callbacks are on https://docs.rs/videocall-client.
+
+## Platforms — runs where your hardware runs
+
+From a browser tab to an embedded Linux board. Chromium and Safari on the
+desktop and on iOS, and headless capture on a Raspberry Pi or Jetson.
+Specifically: Chrome, Chromium, Brave, Edge, Safari, macOS, iOS, Linux,
+Raspberry Pi. Firefox is not currently supported.
+
+- Open in browser: https://app.videocall.rs
+- Install the CLI: https://crates.io/crates/videocall-cli
+
+## Company — open source, built in Rust
+
+Transparent development, from the transport layer up. Read the code, run it
+yourself, and extend it.
+
+Mission: make real-time audio and video accessible, performant, and reliable
+through open-source infrastructure that anyone can read, run, and extend.
+
+- Open source first: transparency and community-driven development, in the open.
+- Built with Rust: one language from server to browser, for performance and
+  reliability.
+
+We are not hiring. We take code. Pick an issue, send a patch, argue with us on
+Discord. Built in the open: 490+ commits, 20+ contributors, 170 forks.
+
+## Adoption — numbers sourced from the repository
+
+- 1.7K GitHub stars
+- 170 forks
+- 490+ commits
+- 20+ contributors
+
+## Deployment — run it yourself, or have us run it
+
+- Self-Hosted (Free): complete source code, Kubernetes Helm charts, community
+  support; you manage updates and security. Get the Helm chart:
+  https://github.com/security-union/videocall-rs/tree/main/helm
+- Enterprise (Custom): custom SLA terms, dedicated support team, custom feature
+  development, on-premise deployment options. Contact:
+  support@securityunion.dev
+
+## FAQ
+
+**Is videocall.rs a WebRTC replacement?**
+For most server-mediated audio and video, yes. videocall.rs is a full-stack
+system and does not use WebRTC's peer-connection stack. Media flows over
+WebTransport (QUIC/HTTP3), or a WebSocket fallback, to a Rust relay server that
+forwards packets to other participants. It drops ICE, STUN/TURN, and SDP
+negotiation entirely.
+
+**How do I try videocall.rs?**
+Two commands with the native CLI: `cargo install videocall-cli`, then
+`videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0`.
+Open `https://app.videocall.rs/meeting/<id>` in a browser with the same meeting
+id and the camera and browser share one call. To run the whole stack instead,
+`git clone` the repo and `make dev`.
+
+**Does it use NATS?**
+Yes. The media (mesh) plane is built on NATS pub/sub. Each meeting is a NATS
+subject: a relay publishes a frame once and every relay subscribed to that
+meeting receives it, which is how participants on different relay servers around
+the world share one meeting. The site credits it as "Powered by NATS.io".
+
+**How does it scale to large meetings?**
+Scale is horizontal: add relay servers to add capacity. WebSocket and
+WebTransport relays scale independently behind a load balancer, and NATS pub/sub
+fans each published frame out across the relays that share a meeting.
+
+**Can I self-host it?**
+Yes. The repository ships Helm charts for Kubernetes and a fully native local dev
+stack. Production container images are built reproducibly with Nix.
+
+**Does it work in the browser?**
+Yes, on Chromium-based browsers (Chrome, Edge, Brave) and Safari on macOS and
+iOS. Firefox is not currently supported.
+
+**How is it different from LiveKit, Jitsi, or mediasoup?**
+Those stacks are WebRTC selective-forwarding units. videocall.rs forwards media
+over WebTransport/QUIC instead of WebRTC, is written entirely in Rust, and
+requires no STUN/TURN/ICE infrastructure.
+
+**Can I stream from a Raspberry Pi?**
+Yes. videocall-cli is a headless native client that streams from a camera on
+Raspberry Pi, Jetson Nano, and other embedded Linux devices.
+
+**Is the media encrypted?**
+Media is encrypted in transit: WebSocket connections use TLS 1.3, and
+WebTransport uses QUIC's built-in TLS 1.3 encryption. The relay server forwards
+media between participants; it is not end-to-end encrypted.
+
+**How does it handle audio?**
+Voice is encoded with Opus in pure Rust. Every browser client runs a NetEQ-style
+adaptive jitter buffer to stay intelligible over lossy, high-latency networks.
+
+**Does it have meeting management and auth built in?**
+Yes. A separate Axum control plane, meeting-api, owns login and auth (JWT,
+SSO/OAuth), meeting lifecycle and ownership, host controls, and the waiting room.
+The mesh plane just forwards media frames, so authorization and access control
+stay off the streaming path.
+
+## Links
+
+- Website: https://videocall.rs
+- Live demo: https://app.videocall.rs
+- GitHub: https://github.com/security-union/videocall-rs
+- Hosted documentation: https://docs.videocall.rs
+- Architecture: https://github.com/security-union/videocall-rs/blob/main/docs/ARCHITECTURE.md
+- Meeting API reference: https://github.com/security-union/videocall-rs/blob/main/docs/MEETING_API.md
+- Meeting ownership & workflow: https://github.com/security-union/videocall-rs/blob/main/docs/MEETING_OWNERSHIP.md
+- Nix build system: https://github.com/security-union/videocall-rs/blob/main/docs/nix-architecture.md
+- videocall-cli: https://crates.io/crates/videocall-cli
+- videocall-client: https://crates.io/crates/videocall-client
+- videocall-types: https://crates.io/crates/videocall-types
+- videocall-codecs: https://crates.io/crates/videocall-codecs
+- Discord community: https://discord.gg/JP38NRe4CJ

@@ -65,7 +65,8 @@ pub fn App() -> impl IntoView {
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "Any",
       "url": "https://videocall.rs/",
-      "description": "A full-stack system for real-time audio and video, written in Rust. Relay servers, a meetings API with auth and host controls, a browser client, and a native CLI. WebTransport over QUIC with an automatic WebSocket fallback. No ICE, STUN, TURN, or SDP. Encrypted in transit with TLS 1.3 and QUIC. Self-hostable. MIT / Apache-2.0.",
+      "dateModified": "2026-08-16",
+      "description": "A full-stack system for real-time audio and video, written in Rust. Relay servers on a NATS mesh plane, a meetings API with auth and host controls, a browser client, and a native CLI. WebTransport over QUIC with an automatic WebSocket fallback. No ICE, STUN, TURN, or SDP. Encrypted in transit with TLS 1.3 and QUIC (not end-to-end encrypted). Self-hostable. MIT / Apache-2.0.",
       "codeRepository": "https://github.com/security-union/videocall-rs",
       "license": [
         "https://opensource.org/licenses/MIT",
@@ -99,6 +100,22 @@ pub fn App() -> impl IntoView {
           "acceptedAnswer": {
             "@type": "Answer",
             "text": "For most server-mediated audio and video, yes. videocall.rs is a full-stack system and does not use WebRTC's peer-connection stack. Media flows over WebTransport (QUIC/HTTP3), or a WebSocket fallback, to a Rust relay server that forwards packets to other participants. It drops ICE, STUN/TURN, and SDP negotiation entirely."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I try videocall.rs?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Two commands with the native CLI: run 'cargo install videocall-cli', then 'videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0'. Open https://app.videocall.rs/meeting/<id> in a browser with the same meeting id and the camera and browser share one call. To run the whole stack instead, git clone the repository and run 'make dev'."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does it use NATS?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. The media (mesh) plane is built on NATS pub/sub. Each meeting is a NATS subject: a relay publishes a frame once and every relay subscribed to that meeting receives it, which is how participants on different relay servers around the world share a single meeting."
           }
         },
         {
@@ -158,6 +175,31 @@ pub fn App() -> impl IntoView {
           }
         }
       ]
+    },
+    {
+      "@type": "HowTo",
+      "name": "Stream a camera with videocall-cli",
+      "description": "Stream a camera into a videocall.rs meeting from any machine with the native CLI, then join the same meeting from a browser.",
+      "totalTime": "PT2M",
+      "tool": [
+        { "@type": "HowToTool", "name": "videocall-cli" }
+      ],
+      "step": [
+        {
+          "@type": "HowToStep",
+          "position": 1,
+          "name": "Install the CLI and start streaming",
+          "text": "Run 'cargo install videocall-cli', then 'videocall-cli stream --user-id cam-01 --meeting-id <id> --video-device-index 0' to publish the camera into a meeting.",
+          "url": "https://crates.io/crates/videocall-cli"
+        },
+        {
+          "@type": "HowToStep",
+          "position": 2,
+          "name": "Join from a browser",
+          "text": "Open https://app.videocall.rs/meeting/<id> in a Chromium or Safari browser using the same meeting id, and the camera and browser share one call.",
+          "url": "https://app.videocall.rs/"
+        }
+      ]
     }
   ]
 }"#;
@@ -174,8 +216,10 @@ pub fn App() -> impl IntoView {
             content="webtransport video, rust video streaming, quic video, webrtc alternative, websocket fallback, self-hosted video conferencing, robotics video streaming, embedded video, open source video infrastructure, real-time audio streaming, opus audio, multicast video, robot video streaming, robotics fleet video, full-stack video system, self-hosted conferencing, meeting management api"
         />
         <Link rel="canonical" href="https://videocall.rs/"/>
-        // Machine-readable summary for LLM crawlers.
+        // Machine-readable summaries for LLM crawlers: a short index and the
+        // full-content companion (llms.txt convention).
         <Link rel="alternate" type_="text/markdown" href="/llms.txt"/>
+        <Link rel="alternate" type_="text/markdown" href="/llms-full.txt"/>
 
         // Open Graph / Facebook
         <Meta property="og:type" content="website"/>

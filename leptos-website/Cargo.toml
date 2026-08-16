@@ -49,6 +49,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "HtmlVideoElement",
     "Navigator",
     "Clipboard",
+    "Crypto",
     "CssStyleDeclaration",
     "Document",
     "DomTokenList",

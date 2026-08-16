@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/security-union/videocall-rs/compare/videocall-transport-v0.2.0...videocall-transport-v0.2.1) - 2026-08-13
+
+### Other
+
+- updated the following local packages: videocall-types
+
 ## [0.2.0](https://github.com/security-union/videocall-rs/compare/videocall-transport-v0.1.2...videocall-transport-v0.2.0) - 2026-06-30
 
 ### Other

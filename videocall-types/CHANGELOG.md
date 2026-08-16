@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.1](https://github.com/security-union/videocall-rs/compare/videocall-types-v6.0.0...videocall-types-v6.0.1) - 2026-08-13
+
+### Other
+
+- Classic Nix everywhere: no flakes, no Dockerfiles, and a native dev stack ([#897](https://github.com/security-union/videocall-rs/pull/897))
+
+### Security
+
+- patch remaining open Dependabot alerts (medium/low) ([#907](https://github.com/security-union/videocall-rs/pull/907))
+
 ## [6.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v5.0.0...videocall-types-v6.0.0) - 2026-06-30
 
 ### Fixed

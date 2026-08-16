@@ -45,17 +45,6 @@ pub fn GlobeBand() -> impl IntoView {
                 >
                     <RelayGlobeArt/>
                 </MediaVideo>
-                // Attribution sits where the "Media plane" label used to (that
-                // label is already carried by the band header). A real link so
-                // it is keyboard-reachable; monochrome, hover to fg, no oxide.
-                <a
-                    class="media-caption nats-credit absolute bottom-3 left-3"
-                    href="https://nats.io"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                >
-                    "Powered by NATS.io"
-                </a>
                 <span class="media-caption absolute bottom-3 right-3 text-right" aria-hidden="true">
                     "One publisher · every subscriber"
                 </span>
@@ -89,6 +78,30 @@ pub fn GlobeBand() -> impl IntoView {
                             </p>
                         </li>
                     </ul>
+
+                    // Attribution, done the way vendors do it: a quiet eyebrow
+                    // and the official mark, linked. The color logo's white
+                    // letterforms read cleanly on the near-black ground.
+                    <div class="border-t border-line mt-2 pt-8 pb-2 flex items-center justify-center gap-5">
+                        <span class="section-index">"Powered by"</span>
+                        <a
+                            href="https://nats.io"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            class="opacity-80 hover:opacity-100 transition-opacity"
+                            aria-label="NATS.io"
+                        >
+                            <img
+                                src="/images/nats-horizontal-color.png"
+                                alt="NATS"
+                                width="360"
+                                height="93"
+                                loading="lazy"
+                                decoding="async"
+                                class="h-7 w-auto"
+                            />
+                        </a>
+                    </div>
                 </RevealOnView>
             </div>
         </section>

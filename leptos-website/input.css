@@ -596,13 +596,6 @@
   /* NATS attribution caption: a real link, so it hovers to fg (monochrome, no
    * oxide) and stays keyboard-reachable — the rest of the caption row is
    * decorative aria-hidden text. */
-  .nats-credit {
-    transition: color 0.16s ease-out;
-  }
-  .nats-credit:hover,
-  .nats-credit:focus-visible {
-    color: var(--fg);
-  }
 
   /* ---- Section B · reveal-driven draw-ins + item stagger ------------- *
    * These use the descendant combinator (a space), NOT `> *`, so they reach

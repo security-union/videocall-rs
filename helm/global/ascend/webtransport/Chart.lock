@@ -1,6 +1,0 @@
-dependencies:
-- name: rustlemania-webtransport
-  repository: file://../../../rustlemania-webtransport
-  version: 0.1.0
-digest: sha256:75b2d43b95042e0d5d05ac754ac59bed961f74a9bac7abf902b5fa5562638b1f
-generated: "2026-04-01T13:48:20.249102615-04:00"

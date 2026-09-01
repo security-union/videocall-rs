@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { parse as parseYaml } from "yaml";
 
+import { conductLine, sanitizeLogLine } from "../log-line";
 import { type CtlClientConfig, ctlRequest } from "./client";
 import { NetemValidationError, resolveNetemRequest } from "./netem";
 import { type BotSnapshot } from "./registry";
@@ -125,7 +126,16 @@ export interface ParsedScenario {
   entries: ParsedEntry[];
 }
 
-const NETEM_PARAM_KEYS = ["profile", "delayMs", "jitterMs", "lossPct", "rateKbit"] as const;
+/** Must cover every raw key {@link resolveNetemRequest} accepts, or YAML silently drops it. */
+const NETEM_PARAM_KEYS = [
+  "profile",
+  "delayMs",
+  "jitterMs",
+  "lossPct",
+  "rateKbit",
+  "downlinkRateKbit",
+  "limitPkts",
+] as const;
 
 /**
  * Collect the netem-relevant keys present on a raw entry into a request
@@ -291,9 +301,14 @@ export interface ConductorClient {
   /** `POST /bots/:id/leave` — graceful leave. */
   leave(): Promise<void>;
   /** `POST /netem` — apply a profile or raw shaping params. */
-  applyNetem(body: Record<string, unknown>): Promise<void>;
+  applyNetem(body: Record<string, unknown>): Promise<NetemOutcome>;
   /** `DELETE /netem` — remove all shaping. */
-  clearNetem(): Promise<void>;
+  clearNetem(): Promise<NetemOutcome>;
+}
+
+/** What a netem action reports back; every other action reports nothing. */
+export interface NetemOutcome {
+  mirrorRemoved: boolean;
 }
 
 /**
@@ -309,20 +324,27 @@ export type ConductorClientFactory = (
  * every `ControlCall` variant — adding a variant without a case here is a
  * compile error.
  */
-export async function applyAction(client: ConductorClient, call: ControlCall): Promise<void> {
+export async function applyAction(
+  client: ConductorClient,
+  call: ControlCall,
+): Promise<NetemOutcome | undefined> {
   switch (call.kind) {
     case "mute":
-      return client.mute(call.muted);
+      await client.mute(call.muted);
+      return undefined;
     case "camera":
-      return client.setCameraOff(call.off);
+      await client.setCameraOff(call.off);
+      return undefined;
     case "share":
-      return client.setScreenShare(call.on);
+      await client.setScreenShare(call.on);
+      return undefined;
     case "netem":
       return client.applyNetem(call.body);
     case "netem-clear":
       return client.clearNetem();
     case "leave":
-      return client.leave();
+      await client.leave();
+      return undefined;
   }
 }
 
@@ -464,6 +486,11 @@ export function buildSchedule(
 
 // ── The runner ───────────────────────────────────────────────────────────
 
+/** Budget for the control API to answer /healthz (one per scheduled host). */
+export const READINESS_TIMEOUT_MS = 120_000;
+
+export const READINESS_POLL_INTERVAL_MS = 2_000;
+
 /** Injectable monotonic clock (ms). Production uses `Date.now`. */
 export interface Clock {
   now(): number;
@@ -477,6 +504,8 @@ export interface ConductDeps {
   clock: Clock;
   sleep: SleepFn;
   log: (line: string) => void;
+  /** `GET /healthz` probe: true on 2xx, false otherwise. Absent ⇒ gate skipped. */
+  fetchHealthz?: (host: string, port: number) => Promise<boolean>;
 }
 
 export interface ConductSummary {
@@ -487,6 +516,36 @@ export interface ConductSummary {
   /** Calls that threw (logged, non-fatal — the run continues). */
   failed: number;
   dryRun: boolean;
+}
+
+/**
+ * Hold t0 until each scheduled pod's control API answers /healthz, else throw
+ * naming the silent pods. Skipped: no `fetchHealthz`, no hosts, `timeoutMs <= 0`.
+ */
+async function awaitFleetReady(
+  hosts: string[],
+  port: number,
+  deps: ConductDeps,
+  timeoutMs: number,
+): Promise<void> {
+  if (!deps.fetchHealthz || hosts.length === 0 || timeoutMs <= 0) return;
+  const deadline = deps.clock.now() + timeoutMs;
+  const remaining = new Set(hosts);
+  deps.log(conductLine(`awaiting readiness of ${remaining.size} pod(s) (timeout ${timeoutMs}ms)`));
+  while (remaining.size > 0 && deps.clock.now() < deadline) {
+    for (const host of [...remaining]) {
+      if (await deps.fetchHealthz(host, port)) remaining.delete(host);
+    }
+    if (remaining.size > 0 && deps.clock.now() < deadline) {
+      await deps.sleep(READINESS_POLL_INTERVAL_MS);
+    }
+  }
+  if (remaining.size > 0) {
+    throw new Error(
+      `${remaining.size} pod(s) never answered /healthz within ${timeoutMs}ms: ${[...remaining].join(", ")}`,
+    );
+  }
+  deps.log(conductLine("all pods ready"));
 }
 
 /**
@@ -519,26 +578,37 @@ async function runSchedule(
       clients.set(sc.host, client);
     }
 
-    deps.log(`[t+${sc.atMs}ms] bot ${sc.bot} (${sc.host}) -> ${describeCall(sc.call)}`);
+    deps.log(
+      sanitizeLogLine(`[t+${sc.atMs}ms] bot ${sc.bot} (${sc.host}) -> ${describeCall(sc.call)}`),
+    );
     try {
-      await applyAction(client, sc.call);
+      const outcome = await applyAction(client, sc.call);
       fired += 1;
+      if (outcome?.mirrorRemoved === true) {
+        deps.log(
+          sanitizeLogLine(
+            `  ! bot ${sc.bot} (${sc.host}) ${describeCall(sc.call)} removed this pod's startup ingress mirror — its downlink is now UNSHAPED`,
+          ),
+        );
+      }
     } catch (e) {
       failed += 1;
       deps.log(
-        `  ! bot ${sc.bot} (${sc.host}) ${describeCall(sc.call)} failed: ${(e as Error).message}`,
+        sanitizeLogLine(
+          `  ! bot ${sc.bot} (${sc.host}) ${describeCall(sc.call)} failed: ${(e as Error).message}`,
+        ),
       );
     }
   }
 
-  deps.log(`conduct: done - ${fired} action(s) fired, ${failed} failed`);
+  deps.log(conductLine(`done - ${fired} action(s) fired, ${failed} failed`));
   return { planned: schedule.length, fired, failed, dryRun: false };
 }
 
 /** Print the resolved schedule (host + action + offset). No calls issued. */
 export function printSchedule(schedule: ScheduledCall[], log: (line: string) => void): void {
   for (const sc of schedule) {
-    log(`[t+${sc.atMs}ms] bot ${sc.bot} (${sc.host}) -> ${describeCall(sc.call)}`);
+    log(sanitizeLogLine(`[t+${sc.atMs}ms] bot ${sc.bot} (${sc.host}) -> ${describeCall(sc.call)}`));
   }
 }
 
@@ -559,6 +629,7 @@ export async function conductScenario(params: {
   port: number;
   dryRun: boolean;
   token?: string;
+  readinessTimeoutMs?: number;
   deps: ConductDeps;
 }): Promise<ConductSummary> {
   const { deps } = params;
@@ -566,12 +637,14 @@ export async function conductScenario(params: {
   const schedule = buildSchedule(scenario.entries, params.hostOpts);
 
   deps.log(
-    `conduct: room=${scenario.room ?? "(unspecified)"} - ${schedule.length} scheduled action(s) across ${countBots(schedule)} bot(s)`,
+    conductLine(
+      `room=${scenario.room ?? "(unspecified)"} - ${schedule.length} scheduled action(s) across ${countBots(schedule)} bot(s)`,
+    ),
   );
 
   if (params.dryRun) {
     printSchedule(schedule, deps.log);
-    deps.log("conduct: dry-run - no control calls issued");
+    deps.log(conductLine("dry-run - no control calls issued"));
     return { planned: schedule.length, fired: 0, failed: 0, dryRun: true };
   }
 
@@ -580,6 +653,14 @@ export async function conductScenario(params: {
       "a control token is required to run a scenario (pass --token-file or set BOT_CTL_TOKEN); use --dry-run to preview without a token",
     );
   }
+
+  const uniqueHosts = [...new Set(schedule.map((s) => s.host))];
+  await awaitFleetReady(
+    uniqueHosts,
+    params.port,
+    deps,
+    params.readinessTimeoutMs ?? READINESS_TIMEOUT_MS,
+  );
 
   return runSchedule(schedule, { ...deps, port: params.port, token: params.token });
 }
@@ -604,7 +685,7 @@ class HttpConductorClient implements ConductorClient {
     if (this.botIdPromise === null) {
       this.botIdPromise = this.resolveBotId().catch((e) => {
         // Do NOT cache a REJECTED lookup. A first action at t=0 can hit the pod
-        // mid-boot (Service publishNotReadyAddresses + no readiness probe → DNS
+        // mid-boot (Service publishNotReadyAddresses means DNS
         // resolves before the ctl server binds) → GET /bots refuses. Caching that
         // rejection would poison every later mute/camera/share/leave for this pod
         // for the whole scenario. Reset so a later scheduled action retries.
@@ -649,13 +730,19 @@ class HttpConductorClient implements ConductorClient {
     await ctlRequest(this.config, "POST", `/bots/${encodeURIComponent(id)}/leave`);
   }
 
-  async applyNetem(body: Record<string, unknown>): Promise<void> {
-    await ctlRequest(this.config, "POST", "/netem", body);
+  async applyNetem(body: Record<string, unknown>): Promise<NetemOutcome> {
+    return netemOutcome(await ctlRequest(this.config, "POST", "/netem", body));
   }
 
-  async clearNetem(): Promise<void> {
-    await ctlRequest(this.config, "DELETE", "/netem");
+  async clearNetem(): Promise<NetemOutcome> {
+    return netemOutcome(await ctlRequest(this.config, "DELETE", "/netem"));
   }
+}
+
+/** An older pod omits the field; absent is reported as no mirror, never as one. */
+function netemOutcome(res: unknown): NetemOutcome {
+  const o = (res ?? {}) as { mirrorRemoved?: unknown };
+  return { mirrorRemoved: o.mirrorRemoved === true };
 }
 
 /** Production factory: real HTTP calls via {@link ctlRequest}. */
@@ -673,6 +760,7 @@ interface ConductCommandOptions {
   tokenFile?: string;
   dnsSuffix: string;
   dryRun: boolean;
+  readinessTimeout: string;
 }
 
 /**
@@ -709,10 +797,25 @@ export function registerConductCommand(program: Command): void {
       "Print the resolved schedule (bot host + action + time) without connecting to any pod.",
       false,
     )
+    .option(
+      "--readiness-timeout <ms>",
+      "How long to wait (ms) for each scheduled pod's control API to answer /healthz before anchoring t0. Set 0 to skip the gate.",
+      String(READINESS_TIMEOUT_MS),
+    )
     .action(async (opts: ConductCommandOptions) => {
       const port = Number.parseInt(opts.port, 10);
       if (!Number.isFinite(port) || port <= 0 || port > 65535) {
-        console.error(`conduct: --port must be a positive integer (got "${opts.port}")`);
+        console.error(conductLine(`--port must be a positive integer (got "${opts.port}")`));
+        process.exit(2);
+      }
+
+      const readinessTimeoutMs = Number.parseInt(opts.readinessTimeout, 10);
+      if (!Number.isFinite(readinessTimeoutMs) || readinessTimeoutMs < 0) {
+        console.error(
+          conductLine(
+            `--readiness-timeout must be a non-negative integer in ms (got "${opts.readinessTimeout}")`,
+          ),
+        );
         process.exit(2);
       }
 
@@ -721,7 +824,7 @@ export function registerConductCommand(program: Command): void {
         scenarioText = readFileSync(opts.scenario, "utf8");
       } catch (e) {
         console.error(
-          `conduct: cannot read scenario file "${opts.scenario}": ${(e as Error).message}`,
+          conductLine(`cannot read scenario file "${opts.scenario}": ${(e as Error).message}`),
         );
         process.exit(2);
       }
@@ -732,7 +835,7 @@ export function registerConductCommand(program: Command): void {
           token = readFileSync(opts.tokenFile, "utf8").trim();
         } catch (e) {
           console.error(
-            `conduct: cannot read --token-file "${opts.tokenFile}": ${(e as Error).message}`,
+            conductLine(`cannot read --token-file "${opts.tokenFile}": ${(e as Error).message}`),
           );
           process.exit(2);
         }
@@ -745,6 +848,16 @@ export function registerConductCommand(program: Command): void {
         clock: { now: () => Date.now() },
         sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
         log: (line) => console.log(line),
+        fetchHealthz: async (host, healthPort) => {
+          try {
+            const res = await fetch(`http://${host}:${healthPort}/healthz`, {
+              signal: AbortSignal.timeout(READINESS_POLL_INTERVAL_MS),
+            });
+            return res.ok;
+          } catch {
+            return false;
+          }
+        },
       };
 
       try {
@@ -758,6 +871,7 @@ export function registerConductCommand(program: Command): void {
           port,
           dryRun: opts.dryRun,
           token,
+          readinessTimeoutMs,
           deps,
         });
         // A live run with any failed call exits non-zero so CI / a wrapper
@@ -767,10 +881,10 @@ export function registerConductCommand(program: Command): void {
         }
       } catch (e) {
         if (e instanceof ScenarioValidationError) {
-          console.error(`conduct: ${e.message}`);
+          console.error(conductLine(e.message));
           process.exit(2);
         }
-        console.error(`conduct: ${(e as Error).message}`);
+        console.error(conductLine((e as Error).message));
         process.exit(1);
       }
     });

@@ -23,9 +23,8 @@ use crate::components::canvas_generator::{
     generate_for_peer, AudioLevels, PinnedTile, SignalPopupHandlers, TileMode,
 };
 use crate::components::media_metrics_overlay::{
-    next_overlay_fps, overlay_audio_kbps, overlay_audio_kbps_display,
-    overlay_audio_kbps_from_status, overlay_painted_fps_sample, parse_resolution,
-    MediaMetricsOverlay, MediaMetricsOverlayCtx, ScreenMetricsOverlay,
+    next_overlay_fps, overlay_audio_kbps, overlay_audio_kbps_display, overlay_painted_fps_sample,
+    parse_resolution, MediaMetricsOverlay, MediaMetricsOverlayCtx, ScreenMetricsOverlay,
 };
 use crate::components::signal_quality::{
     PeerSignalHistory, SampleData, SignalInfo, SignalMeterMode, SignalPopupPosition,
@@ -40,7 +39,9 @@ use futures::future::AbortHandle;
 use futures::future::Abortable;
 use gloo_timers::callback::Timeout;
 use videocall_client::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
-use videocall_client::audio_constants::{MIC_HOLD_DURATION_MS, UI_AUDIO_LEVEL_DELTA};
+use videocall_client::audio_constants::{
+    ui_level_write_is_visible, MIC_HOLD_DURATION_MS, UI_AUDIO_LEVEL_DELTA,
+};
 use videocall_client::decode::peer_decoder::SUBSYSTEM_VIDEO_PAINTED;
 use videocall_diagnostics::{
     recv_loop_action, subscribe, DiagEvent, Metric, MetricValue, RecvLoopAction,
@@ -205,14 +206,6 @@ pub fn PeerTile(
     let mut fps_painted = use_signal(|| 0.0_f64);
     let mut expand_rate = use_signal(|| 0.0_f64);
     let mut video_bitrate = use_signal(|| 0.0_f64);
-    // Issue #1769: received-audio nominal kbps for THIS peer, fed from the
-    // `peer_status` heartbeat's `audio_enabled` flag (the same authoritative
-    // audio-on/off signal that drives the mic icon) using the base received-audio
-    // layer nominal. The media-metrics overlay reads this signal directly instead
-    // of scanning `per_peer_received_snapshots()` on every render — see the
-    // overlay payload below. Also feeds the drawer chart's `SampleData`
-    // (previously always 0, since this signal was never populated).
-    let mut audio_bitrate = use_signal(|| 0.0_f64);
     let mut audio_buffer_ms = use_signal(|| 0.0_f64);
     let mut screen_fps = use_signal(|| 0.0_f64);
     let mut screen_bitrate = use_signal(|| 0.0_f64);
@@ -232,8 +225,6 @@ pub fn PeerTile(
     // All three default to 0 / empty so older publishers (and the
     // unconstrained-tier path on newer publishers) skip the Cause line.
     let mut screen_encoder_target_bitrate = use_signal(|| 0_u32);
-    let mut screen_adaptive_tier = use_signal(String::new);
-    let mut screen_cause_hint = use_signal(String::new);
     // Current transport for this peer ("webtransport" / "websocket" /
     // "unknown"), sourced from the `peer_status` diagnostics metric. Stored
     // as a per-tile signal because each `PeerTile` only renders its own
@@ -363,9 +354,6 @@ pub fn PeerTile(
         // Initialize from client snapshot
         let initial_audio_on = effect_client.is_audio_enabled_for_peer(&peer_id_owned);
         audio_enabled.set(initial_audio_on);
-        // The rung is only known from `peer_status`, so seed `None`: one heartbeat
-        // of "—" beats a base-rung figure that is wrong for rungs 1 and 2 (#2132).
-        audio_bitrate.set(overlay_audio_kbps(initial_audio_on, None));
         video_enabled.set(effect_client.is_video_enabled_for_peer(&peer_id_owned));
         screen_enabled.set(effect_client.is_screen_share_enabled_for_peer(&peer_id_owned));
         // Issue 2224: `audio_level` / `mic_audio_level` are deliberately NOT
@@ -439,7 +427,6 @@ pub fn PeerTile(
                     &mut fps_painted,
                     &mut expand_rate,
                     &mut video_bitrate,
-                    &mut audio_bitrate,
                     &mut audio_buffer_ms,
                     &mut screen_fps,
                     &mut screen_bitrate,
@@ -448,8 +435,6 @@ pub fn PeerTile(
                     &mut screen_resolution,
                     &mut screen_source_resolution,
                     &mut screen_encoder_target_bitrate,
-                    &mut screen_adaptive_tier,
-                    &mut screen_cause_hint,
                     &mut peer_transport,
                     &last_peer_status,
                 );
@@ -516,7 +501,7 @@ pub fn PeerTile(
                     video_fps: *fps_received.peek(),
                     video_bitrate_kbps: *video_bitrate.peek(),
                     video_resolution: res,
-                    audio_bitrate_kbps: *audio_bitrate.peek(),
+                    audio_bitrate_kbps: overlay_audio_kbps(),
                     audio_expand_rate: *expand_rate.peek(),
                     audio_buffer_ms: *audio_buffer_ms.peek(),
                     screen_enabled: sample_screen_en,
@@ -525,8 +510,6 @@ pub fn PeerTile(
                     screen_resolution: screen_resolution.peek().clone(),
                     screen_source_resolution: screen_source_resolution.peek().clone(),
                     screen_encoder_target_bitrate_kbps: *screen_encoder_target_bitrate.peek(),
-                    screen_adaptive_tier: screen_adaptive_tier.peek().clone(),
-                    screen_cause_hint: screen_cause_hint.peek().clone(),
                     peer_status_age_ms,
                     latency_ms: *latency_ms.peek(),
                     audio_enabled: *audio_enabled.peek(),
@@ -848,22 +831,14 @@ pub fn PeerTile(
             //     drawn to the canvas, NOT the decode-call `fps_received` bucket,
             //     so the readout matches what the viewer sees (capped at the source
             //     rate once #1783 coalesces late-frame bursts to one draw);
-            //   * audio kbps — the #1769 `audio_bitrate` signal, driven off the
-            //     `peer_status` heartbeat's audio-on flag (the same signal as the
-            //     mic icon). This replaces the former per-render
-            //     `per_peer_received_snapshots()` scan; the snapshot path still
-            //     backs the diagnostics drawer / signal popup, it is just no longer
-            //     walked here.
+            //   * audio kbps — always the em-dash for a remote peer.
             let resolution = parse_resolution(&video_resolution());
             let fps_now = fps_painted();
-            let audio_kbps = audio_bitrate();
             Some(MediaMetricsOverlay {
                 is_self: false,
                 resolution,
                 fps: (fps_now > 0.0).then_some(fps_now),
-                // Em-dash fallback for a genuinely-absent value (audio off, or no
-                // rung arriving → signal is 0).
-                audio_kbps: overlay_audio_kbps_display(audio_kbps),
+                audio_kbps: overlay_audio_kbps_display(overlay_audio_kbps()),
             })
         }
     } else {
@@ -974,12 +949,8 @@ const HEARTBEAT_SOURCED_GLOW_LEVEL: f32 = 0.5;
 ///   finely-graded value to its owner" has no owner left to defer to.
 /// * **Nothing in that band is visually graded either.** Where the level
 ///   enters `calculate_glow_params` (`canvas_generator.rs`) at all, it enters
-///   as `BASE + level * K`, before per-setting scaling and clamping — so a
-///   level of `0.01` contributes **at most 1 %** of the level-driven range of
-///   any term it appears in, and less wherever the clamp bites (at the default
-///   brightness the border alpha is pinned at its `1.0` ceiling for every
-///   level). `inner_spread` is a hardcoded `0.0` and carries no level term at
-///   all. What renders is the floor of the ramp, nothing like the mid-scale
+///   as `BASE + level * K`, and `inner_spread` is a hardcoded `0.0` with no
+///   level term at all. What renders is the floor of the ramp, not the mid-scale
 ///   [`HEARTBEAT_SOURCED_GLOW_LEVEL`] a heartbeat-only speaker is meant to
 ///   get.
 ///
@@ -997,12 +968,12 @@ const HEARTBEAT_SOURCED_GLOW_LEVEL: f32 = 0.5;
 /// 2. `0.05 -> 0.008`, a fade-out: the producer emits it because
 ///    `|0.008 - 0.05| = 0.042` clears its own `AUDIO_LEVEL_DELTA_THRESHOLD`
 ///    (0.02), and this crate writes it because `0.042` clears
-///    `UI_AUDIO_LEVEL_DELTA` (0.01). The signal parks on `0.008`.
+///    `UI_AUDIO_LEVEL_DELTA` too. The signal parks on `0.008`.
 ///
 /// The physical precondition is narrow but real: `rms_to_intensity` is a `sqrt`
 /// curve, so an intensity of `0.008` needs `rms ~= 0.0200051` at the deployed
 /// `vadThreshold = 0.02` — a fade-out that stalls within ~5 micro of the
-/// threshold. (`GLOW_DARK_CEILING` itself sits at `rms = 0.020008`.) Then the
+/// threshold. (`GLOW_DARK_CEILING` itself sits at `rms = 0.020128`.) Then the
 /// fast path dies with the signal parked there.
 const GLOW_DARK_CEILING: f32 = UI_AUDIO_LEVEL_DELTA;
 
@@ -1027,7 +998,7 @@ fn holds_live_glow(current: f32) -> bool {
 /// always land, even from a `prev` inside the delta, or a tile could be left
 /// lit by a level too small to clear the gate on its way down.
 fn glow_write_reaches_signal(lvl: f32, prev: f32) -> bool {
-    (lvl == 0.0 && prev != 0.0) || (lvl - prev).abs() > UI_AUDIO_LEVEL_DELTA
+    (lvl == 0.0 && prev != 0.0) || ui_level_write_is_visible(lvl, prev)
 }
 
 /// Resolve the glow level for a peer from the `audio_level` float, the
@@ -1519,7 +1490,6 @@ fn handle_diagnostics_event(
     fps_painted: &mut Signal<f64>,
     expand_rate: &mut Signal<f64>,
     video_bitrate: &mut Signal<f64>,
-    audio_bitrate: &mut Signal<f64>,
     audio_buffer_ms: &mut Signal<f64>,
     screen_fps: &mut Signal<f64>,
     screen_bitrate: &mut Signal<f64>,
@@ -1528,8 +1498,6 @@ fn handle_diagnostics_event(
     screen_resolution: &mut Signal<String>,
     screen_source_resolution: &mut Signal<String>,
     screen_encoder_target_bitrate: &mut Signal<u32>,
-    screen_adaptive_tier: &mut Signal<String>,
-    screen_cause_hint: &mut Signal<String>,
     peer_transport: &mut Signal<Option<String>>,
     last_peer_status_ts: &Rc<RefCell<f64>>,
 ) {
@@ -1566,17 +1534,6 @@ fn handle_diagnostics_event(
             if let Some(a) = audio {
                 if a != *audio_enabled.peek() {
                     audio_enabled.set(a);
-                }
-                // Issue #1769: drive the received-audio kbps off the SAME
-                // authoritative audio-on flag that sets the mic icon, so the
-                // overlay's audio field agrees with the mic state. #2132: the rung
-                // rides this same event, so the readout tracks the layer actually
-                // being decoded instead of always reporting the base. `peer_status`
-                // fires once per 5 s heartbeat per peer (plus on media-state
-                // transitions), so gate the `.set()` on an actual change.
-                let ab = overlay_audio_kbps_from_status(a, &evt.metrics, peer_id);
-                if (*audio_bitrate.peek() - ab).abs() > f64::EPSILON {
-                    audio_bitrate.set(ab);
                 }
             }
             if let Some(v) = video {
@@ -1800,8 +1757,6 @@ fn handle_diagnostics_event(
             // but cheap.
             let mut to_peer: Option<String> = None;
             let mut bitrate: Option<u32> = None;
-            let mut tier: Option<String> = None;
-            let mut hint: Option<String> = None;
             let mut media_type_str: Option<String> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
@@ -1809,8 +1764,6 @@ fn handle_diagnostics_event(
                     ("encoder_target_bitrate_kbps", MetricValue::F64(v)) => {
                         bitrate = Some(v.round().max(0.0) as u32);
                     }
-                    ("adaptive_tier", MetricValue::Text(t)) => tier = Some(t.to_string()),
-                    ("cause_hint", MetricValue::Text(t)) => hint = Some(t.to_string()),
                     ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.to_string()),
                     _ => {}
                 }
@@ -1824,16 +1777,6 @@ fn handle_diagnostics_event(
             if let Some(b) = bitrate {
                 if *screen_encoder_target_bitrate.peek() != b {
                     screen_encoder_target_bitrate.set(b);
-                }
-            }
-            if let Some(t) = tier {
-                if *screen_adaptive_tier.peek() != t {
-                    screen_adaptive_tier.set(t);
-                }
-            }
-            if let Some(h) = hint {
-                if *screen_cause_hint.peek() != h {
-                    screen_cause_hint.set(h);
                 }
             }
         }
@@ -1885,7 +1828,7 @@ fn update_mic_audio_level(
         // Cancel any pending silence timeout — speaker is still active.
         mic_hold_timeout.borrow_mut().take();
         let prev = *mic_audio_level.peek();
-        if (level - prev).abs() > UI_AUDIO_LEVEL_DELTA {
+        if ui_level_write_is_visible(level, prev) {
             mic_audio_level.set(level);
         }
     } else {
@@ -2125,7 +2068,7 @@ mod tests {
     /// crate's: `0.0 -> 0.05` rides the VAD's `false -> true` toggle, then
     /// `0.05 -> 0.008` is a fade-out whose delta of `0.042` clears the
     /// producer's `AUDIO_LEVEL_DELTA_THRESHOLD` (0.02) and the write gate's
-    /// `UI_AUDIO_LEVEL_DELTA` (0.01) alike, parking the signal on `0.008`
+    /// `UI_AUDIO_LEVEL_DELTA` alike, parking the signal on `0.008`
     /// (intensity `0.008` = `rms ~= 0.0200051` at `vadThreshold = 0.02`). Under
     /// the old exact-zero boundary every subsequent heartbeat took the "already
     /// glowing" branch and returned `None`, so a peer whose decoder fast path
@@ -2271,6 +2214,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_tile_write_gate_is_wider_than_the_producers_emit_gate() {
+        use videocall_client::audio_constants::AUDIO_LEVEL_DELTA_THRESHOLD;
+        let inside_the_band = (AUDIO_LEVEL_DELTA_THRESHOLD + UI_AUDIO_LEVEL_DELTA) / 2.0;
+        assert!(
+            inside_the_band > AUDIO_LEVEL_DELTA_THRESHOLD,
+            "issue 2289: the write gate must be strictly wider than the emit gate, or \
+             there is no move the producer emits and this tile can decline to repaint"
+        );
+        assert!(
+            !glow_write_reaches_signal(0.50 + inside_the_band, 0.50),
+            "a move of {inside_the_band} must not repaint the tile"
+        );
+    }
+
     /// Issue 2224, end to end: a peer whose fast path dies with the signal
     /// parked on a residue, still sending `is_speaking = true` every 5 s.
     ///
@@ -2292,11 +2250,6 @@ mod tests {
     /// never calls `refreshes_glow_deadman`.
     #[test]
     fn a_dead_fast_path_over_a_residue_is_lit_by_the_next_heartbeat() {
-        // Where `0.0 -> 0.05 -> 0.008` leaves the signal: the second step's
-        // delta of 0.042 clears the producer's 0.02 emit gate and this crate's
-        // 0.01 write gate alike. The fast path then dies, so nothing else can
-        // move it.
-        //
         // See `GLOW_DARK_CEILING` for the full trace, including why the two
         // gates have to be checked separately.
         let parked = 0.008_f32;

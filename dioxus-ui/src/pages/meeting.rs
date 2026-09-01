@@ -20,7 +20,7 @@ use crate::components::meeting_password_prompt::{
     next_prompt_state, password_prompt_reason, MeetingPasswordPrompt, PasswordPromptReason,
     PasswordPromptState,
 };
-use crate::components::waiting_room::WaitingRoom;
+use crate::components::waiting_room::{meeting_has_started, WaitingRoom, START_WATCH_INTERVAL_MS};
 use crate::constants::{
     actix_websocket_base, e2ee_enabled, oauth_enabled, webtransport_enabled, webtransport_host_base,
 };
@@ -30,7 +30,9 @@ use crate::context::{
     resolve_transport_config, save_display_name_to_storage, validate_display_name, DisplayNameCtx,
     HostRefreshNonceCtx, TransportPreferenceCtx,
 };
-use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
+use crate::meeting_api::{
+    get_meeting_guest_info, get_meeting_info, join_meeting, JoinError, JoinMeetingResponse,
+};
 use crate::theme::color as theme_color;
 use dioxus::prelude::*;
 use videocall_client::Callback as VcCallback;
@@ -247,8 +249,6 @@ pub fn MeetingPage(id: String) -> Element {
                 enable_webtransport: effective_wt_enabled,
                 max_received_layer: crate::constants::max_received_layer(),
                 skip_canvas_paint: crate::constants::skip_canvas_paint(),
-                // Issue #2156: deployment CAMERA ladder for receiver-side READOUTS.
-                camera_ladder_variant: crate::constants::camera_ladder_variant(),
                 // Issue #1884: this is the pre-meeting OBSERVER client (waiting for
                 // the meeting to start) — it renders no in-call reaction overlay,
                 // so it takes no reaction callback.
@@ -720,7 +720,11 @@ pub fn MeetingPage(id: String) -> Element {
         move |_| {
             let meeting_id = meeting_id.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = crate::meeting_api::leave_meeting(&meeting_id).await;
+                crate::meeting_api::leave_within_deadline(
+                    &meeting_id,
+                    crate::meeting_api::leave_meeting(&meeting_id),
+                )
+                .await;
                 if let Some(w) = web_sys::window() {
                     let _ = w.location().set_href("/");
                 }
@@ -745,6 +749,39 @@ pub fn MeetingPage(id: String) -> Element {
                 // — not `NotJoined` — so this effect cannot re-fire underneath
                 // the prompt.
                 on_join(None);
+            }
+        });
+    }
+
+    // Polling safety net for `WaitingForMeeting` (issue #2262): the activation
+    // push is otherwise the only way out, and the `MeetingNotActive` arm above
+    // enters that state with an empty token, which builds no observer at all.
+    {
+        let meeting_id = id.clone();
+        let on_join = on_join_meeting.clone();
+        use_future(move || {
+            let meeting_id = meeting_id.clone();
+            let mut on_join = on_join.clone();
+            async move {
+                loop {
+                    gloo_timers::future::TimeoutFuture::new(START_WATCH_INTERVAL_MS).await;
+                    let waiting = meeting_status
+                        .try_peek()
+                        .map(|status| matches!(&*status, MeetingStatus::WaitingForMeeting { .. }))
+                        .unwrap_or(false);
+                    if !waiting {
+                        continue;
+                    }
+                    match get_meeting_info(&meeting_id).await {
+                        Ok(info) if meeting_has_started(&info.state) => {
+                            log::info!("Start watch: meeting is active, re-joining");
+                            let password = pending_password.try_peek().ok().and_then(|p| p.clone());
+                            on_join(password);
+                        }
+                        Ok(_) => {}
+                        Err(e) => log::warn!("Start watch: meeting state check failed: {e}"),
+                    }
+                }
             }
         });
     }

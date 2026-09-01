@@ -15,17 +15,40 @@
  *   5. late-join re-announce — a hand raised BEFORE you arrived still reaches
  *      you, which is the other half of the "tile not displayed" clause
  *
- * TAGGING: deliberately UNTAGGED (no `@bvt0` / `@bvt1`), matching the sibling
- * two-browser reaction specs in `two-users-meeting.spec.ts`, which carry the
- * same note. bvt is the fast per-PR smoke set and already pays for exactly one
- * two-browser meeting boot; three more would roughly double it. These therefore
- * run ONLY under `--project=dioxus`:
+ * A SECOND `describe` follows for issue 2329 — the AUDIBLE cue for the same
+ * transitions. It is a separate block because what it pins is disjoint from the
+ * above (an audio graph, not a rendered surface) while the harness is identical,
+ * so it reuses `setHandRaised` / `wakeControls` / `newParticipantWithInit`
+ * outright rather than forking a second copy that would drift. See that block's
+ * own header for what it proves and what it deliberately does not.
+ *
+ * TAGGING: everything here is UNTAGGED (no `@bvt0` / `@bvt1`) with ONE named
+ * exception, below. The default matches the sibling two-browser reaction specs
+ * in `two-users-meeting.spec.ts`, which carry the same note: bvt is the fast
+ * per-PR smoke set and already pays for exactly one two-browser meeting boot,
+ * and three more would roughly double it. The 2329 block inherits that for the
+ * same reason and then some — two of its four tests need a THIRD browser. These
+ * therefore run ONLY under `--project=dioxus`:
  *
  *     make e2e SPEC=raise-hand
  *
  * and must be validated that way (local docker stack) or via a `/run-e2e`
  * dioxus dispatch on the PR — a per-PR "Playwright bvt1" green does NOT cover
  * them.
+ *
+ * THE EXCEPTION — `joining a room where two hands are already up chimes
+ * nothing` is tagged `@bvt1`, and it is the only test in this file that is. It
+ * buys per-PR coverage for a regression class this repository has ALREADY
+ * shipped once: issue 2276, a per-participant storm on initial roster replay,
+ * is open at the time of writing. The pure gate logic is covered natively by
+ * `raised_hands.rs`'s own `#[test]`s (which per-PR CI does run), but the WIRING
+ * it depends on — that `on_connected` really stamps `connected_at_ms`, that the
+ * inbound `on_raise_hand` arm really consults it, and that a real relay replay
+ * really lands inside the 2500 ms that window was sized for — is a live,
+ * multi-process fact reachable from nowhere else. It costs the smoke set one
+ * three-browser boot, which is a deliberate and reviewed price. Do not tag the
+ * other three to match: the marginal value is lower and the marginal cost is
+ * the same.
  *
  * HARNESS: `enterTwoUserMeeting` / `joinMeetingFromPage` come from
  * `helpers/two-user-meeting.ts` — the same join dance the `@bvt1`
@@ -48,6 +71,16 @@ import {
   guestJoinsMeeting,
   joinMeetingFromPage,
 } from "../helpers/two-user-meeting";
+import {
+  HAND_TONE_HIGH,
+  HAND_TONE_HIGH_LABEL,
+  HAND_TONE_LOW,
+  HAND_TONE_LOW_LABEL,
+  HandTone,
+  LOWERED_PAIR,
+  RAISED_PAIR,
+  TONE_EPSILON,
+} from "../helpers/hand-chime-tones";
 
 // ---------------------------------------------------------------------------
 // Selectors
@@ -1003,6 +1036,766 @@ test.describe("Raise hand (issue 2135)", () => {
         actionBox!.y,
         "the pill's Show all button must not sit under the banner",
       ).toBeGreaterThanOrEqual(bannerBox!.y + bannerBox!.height);
+    } finally {
+      await hostBrowser.close();
+      await guestBrowser.close();
+    }
+  });
+});
+
+// ===========================================================================
+// Issue 2329 — the raise / lower hand CHIME
+// ===========================================================================
+
+/**
+ * Record every value the page passes to `AudioParam.setValueAtTime`, so the hand
+ * chimes can be observed.
+ *
+ * WHAT THIS PROVES AND WHAT IT DOES NOT. Copied from the identical spy in
+ * `meeting-timer.spec.ts`, including its contract: no browser test can assert
+ * that sound left a speaker; what it CAN assert is that the app built the audio
+ * graph for the cue. `play_tone_pair` (`attendants.rs`) drives TWO oscillators
+ * and sets each one's frequency with `set_value_at_time`, so the recorded values
+ * carry both the pitches AND the order they were requested in — and order is the
+ * entire distinction between the two hand chimes, which are retrogrades of each
+ * other (B5 -> E6 up, E6 -> B5 down). A spy that only counted occurrences could
+ * not tell "hand raised" from "hand lowered" at all.
+ *
+ * Patching the PROTOTYPE rather than the `AudioContext` constructor is
+ * deliberate and is why this is trustworthy: the real audio graph still runs, so
+ * nothing about the app's behaviour changes and the spy can never itself become
+ * the reason an assertion passes.
+ *
+ * Its own buffer (`__vcHandTones`) rather than meeting-timer's `__vcTimerTones`,
+ * so neither spec can ever patch over the other's recording.
+ */
+const HAND_TONE_SPY = `
+  (() => {
+    window.__vcHandTones = [];
+    const proto = window.AudioParam && window.AudioParam.prototype;
+    if (!proto || typeof proto.setValueAtTime !== 'function') return;
+    const original = proto.setValueAtTime;
+    proto.setValueAtTime = function (value, when) {
+      try { window.__vcHandTones.push(value); } catch (_) { /* never break audio */ }
+      return original.call(this, value, when);
+    };
+  })();
+`;
+
+/**
+ * The pitches, their note names, the two ordered pairs they form, and the
+ * matching tolerance all come from `helpers/hand-chime-tones.ts` — see that
+ * module for why they are shared rather than declared here.
+ *
+ * They mirror `play_hand_raised` / `play_hand_lowered` in `attendants.rs`:
+ *
+ *     play_tone_pair(987.77,  1318.51, 0.09, 0.15)   // raised:  B5 -> E6
+ *     play_tone_pair(1318.51, 987.77,  0.09, 0.12)   // lowered: E6 -> B5
+ *
+ * Assertions below are written against `RAISED_PAIR` / `LOWERED_PAIR` rather
+ * than literal note names, so a future repitch cannot leave a stale string in
+ * an expectation. The names also say more than the notes would: what is being
+ * pinned is a musical SHAPE — an ascending pair, and its retrograde.
+ */
+
+/**
+ * `HAND_SOUND_SETTLE_MS` in `raised_hands.rs` — the anti-storm window. For this
+ * long after our OWN connect, inbound hand levels are treated as the roster
+ * still filling in and chime NOTHING.
+ */
+const HAND_SOUND_SETTLE_MS = 2_500;
+
+/** `HAND_SOUND_MIN_INTERVAL_MS` in `raised_hands.rs` — the chime rate gate. */
+const HAND_SOUND_MIN_INTERVAL_MS = 600;
+
+/**
+ * How long a page sits still before a chime count is read.
+ *
+ * Comfortably past the settle window, and it has to be: the window is anchored
+ * on the page's own `on_connected`, and the join dance's own sleeps mean it has
+ * *probably* elapsed by the time the harness returns — "probably" being exactly
+ * the kind of implicit timing this repo keeps having to de-flake. Waiting it out
+ * explicitly makes the elapsed time a fact rather than an inference.
+ *
+ * It is also what gives an exact-zero assertion its teeth: a deferred or queued
+ * chime (rather than a dropped one) would have landed by now, so "still zero"
+ * means suppressed, not merely late.
+ */
+const PAST_SETTLE_MS = HAND_SOUND_SETTLE_MS + 3_000;
+
+/**
+ * Long enough for a peer's re-announce to have crossed the room. The sender
+ * defers every re-announce by `RAISE_HAND_REANNOUNCE_COALESCE_MS` (750 ms,
+ * `raise_hand.rs`) so a join wave costs one packet, so the ceiling is that
+ * deferral plus fan-out.
+ */
+const REANNOUNCE_SETTLE_MS = 4_000;
+
+/**
+ * Slack before reading a count that must be zero for a reason OTHER than
+ * timing.
+ *
+ * A chime is decided and emitted synchronously inside the same `on_raise_hand`
+ * handler that writes the roster the banner renders from, so by the time the
+ * banner has changed the audio decision has already been made — there is no race
+ * left to lose. This is margin for a slow machine, not a wait for an event.
+ */
+const CHIME_SETTLE_MS = 2_000;
+
+/** Plain-text storage key + value for the chime preference (`context.rs`). */
+const HAND_SOUND_PREF_KEY = "vc_appearance_hand_raise_sound";
+
+/**
+ * Seed the chime preference OFF, in the CURRENT storage format.
+ *
+ * `save_appearance_settings_to_storage` writes `bool.to_string()` and
+ * `apply_notification_prefs` reads `value != "false"` — plain text, NOT
+ * CBOR/zlib (see the `read_local_storage` helper and its sibling keys in
+ * `context.rs`). Seeding a retired format would leave the default-on build
+ * running while the test believed it had muted it, which is how a whole spec
+ * ends up measuring nothing.
+ *
+ * The test that uses this proves the seed took, rather than assuming it: it
+ * asserts the rendered toggle is UNCHECKED before touching it.
+ */
+const HAND_SOUND_OFF_SEED = `localStorage.setItem("${HAND_SOUND_PREF_KEY}", "false");`;
+
+/**
+ * The hand-chime tones this page has synthesized, IN ORDER.
+ *
+ * Filters the raw `setValueAtTime` recording down to the two hand pitches, which
+ * drops the gain values the same spy also captures (0.15 / 0.12 for these
+ * chimes) and the join / leave chimes' 523.25 / 659.25 / 440 Hz — so a join
+ * chime landing mid-test cannot be mistaken for a hand chime, and equally cannot
+ * mask one.
+ *
+ * The hand band (B5-E6, 988-1319 Hz) also sits clear of the meeting-timer expiry
+ * cue's 880 Hz, so the two features share no frequency at all. That separation
+ * is deliberate and is depended on from the other side too — see the
+ * `AUDIO_TONE_SPY` doc in `meeting-timer.spec.ts`.
+ *
+ * Every pitch, label and tolerance is passed IN as an argument rather than
+ * closed over: this callback is serialized into the browser, where the module's
+ * imports do not exist.
+ */
+async function handToneSequence(page: Page): Promise<HandTone[]> {
+  // Annotated rather than inferred. `page.evaluate` widens an inline argument's
+  // string literals to `string`, so without this the labels arrive in the
+  // callback as plain strings and `out` — declared `HandTone[]` — would accept
+  // anything pushed into it. Naming the type keeps the callback's result honest:
+  // a sequence of note names, not of arbitrary strings.
+  //
+  // It is NOT what protects against a repitch. Renaming a note in the shared
+  // module needs no change here at all: the labels, the `HandTone` union and
+  // both ordered pairs derive from the same two constants, so a rename
+  // propagates on its own. Checked by mutation, not assumed.
+  const spec: {
+    low: number;
+    high: number;
+    eps: number;
+    lowLabel: HandTone;
+    highLabel: HandTone;
+  } = {
+    low: HAND_TONE_LOW,
+    high: HAND_TONE_HIGH,
+    eps: TONE_EPSILON,
+    lowLabel: HAND_TONE_LOW_LABEL,
+    highLabel: HAND_TONE_HIGH_LABEL,
+  };
+
+  return page.evaluate(({ low, high, eps, lowLabel, highLabel }) => {
+    const tones = (window as Window & { __vcHandTones?: number[] }).__vcHandTones ?? [];
+    const out: HandTone[] = [];
+    for (const value of tones) {
+      if (Math.abs(value - low) < eps) {
+        out.push(lowLabel);
+      } else if (Math.abs(value - high) < eps) {
+        out.push(highLabel);
+      }
+    }
+    return out;
+  }, spec);
+}
+
+/**
+ * Fail loudly unless the tone spy is actually installed on this page.
+ *
+ * THE VACUITY GUARD for every exact-zero assertion below. An `addInitScript`
+ * that never ran (wrong context, navigation before the script, a rename) leaves
+ * `__vcHandTones` undefined; `handToneSequence` then returns `[]` forever and
+ * "zero chimes" becomes indistinguishable from "spy broken". Asserting rather
+ * than returning a sentinel means a failure stops the test at the cause instead
+ * of surfacing as a confusing pass.
+ *
+ * BOTH halves are checked, because they can fail apart. The buffer existing only
+ * proves the init script RAN — the script sets it before doing anything else and
+ * then bails out early if `AudioParam.prototype.setValueAtTime` is missing, so a
+ * bailed-out run leaves a buffer that is real, empty, and permanently so. The
+ * patch is confirmed separately by looking for the buffer's name in the
+ * installed function's own source, which native code cannot contain.
+ */
+async function assertToneSpyInstalled(page: Page, who: string): Promise<void> {
+  const state = await page.evaluate(() => {
+    const setter = window.AudioParam?.prototype?.setValueAtTime;
+    return {
+      buffer: Array.isArray((window as Window & { __vcHandTones?: number[] }).__vcHandTones),
+      patched:
+        typeof setter === "function" &&
+        Function.prototype.toString.call(setter).includes("__vcHandTones"),
+    };
+  });
+  expect(state.buffer, `${who}: the tone spy's recording buffer must exist`).toBe(true);
+  expect(state.patched, `${who}: AudioParam.setValueAtTime must be the patched recorder`).toBe(
+    true,
+  );
+}
+
+/**
+ * Drive `page` into a meeting the host has already started, under an arbitrary
+ * display name.
+ *
+ * `guestJoinsMeeting` (helpers/two-user-meeting.ts) does exactly this, but hard-
+ * codes "GuestUser" — and the two anti-storm tests need a THIRD name in a room
+ * that already contains a host and a guest. This body is that helper's, in
+ * order, with the name parameterised and the host-side settle assertions
+ * dropped: they are about the pair, and here the host already has peers on
+ * screen from the earlier join.
+ */
+async function participantJoins(
+  hostPage: Page,
+  page: Page,
+  meetingId: string,
+  displayName: string,
+): Promise<void> {
+  await fillAndSubmitJoinForm(page, meetingId, displayName);
+  await page.waitForTimeout(1500);
+  const result = await joinMeetingFromPage(page);
+
+  if (result === "waiting") {
+    const admitButton = hostPage.getByTitle("Admit").first();
+    await expect(admitButton).toBeVisible({ timeout: 20_000 });
+    await hostPage.waitForTimeout(1000);
+    await admitButton.dispatchEvent("click");
+    await hostPage.waitForTimeout(3000);
+
+    const joinButton = page.getByRole("button", { name: /Join Meeting|Start Meeting/ });
+    const grid = page.locator("#grid-container");
+    const postAdmit = await Promise.race([
+      joinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),
+      grid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
+    ]);
+    if (postAdmit === "join-button") {
+      await page.waitForTimeout(1000);
+      await joinButton.click();
+      await page.waitForTimeout(3000);
+    }
+  }
+
+  await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+  // Peer connectivity established — raised hands ride the same media fan-out,
+  // so this is the point after which a re-announce can actually arrive.
+  await expect(page.locator("#grid-container .canvas-container").first()).toBeVisible({
+    timeout: 30_000,
+  });
+}
+
+/**
+ * Open the in-call device-settings modal on the Preferences tab, where the
+ * announcement matrix (and the hand-chime switch) lives.
+ *
+ * The sequence is the one join-leave-notifications.spec.ts and
+ * meeting-settings.spec.ts both drive; only the leading `wakeControls` is local,
+ * because these pages have been sitting idle long enough for the action bar to
+ * auto-hide.
+ */
+async function openPreferencesTab(page: Page): Promise<void> {
+  await wakeControls(page);
+  await page.locator('[data-testid="open-settings"]').click();
+  await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+  await page.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+  await expect(page.locator("#settings-panel-preferences")).toBeVisible({ timeout: 5_000 });
+}
+
+/** Close the device-settings modal again. */
+async function closeSettings(page: Page): Promise<void> {
+  await page.locator('button[aria-label="Close settings"]').click();
+  await expect(page.locator(".device-settings-modal")).not.toBeVisible({ timeout: 5_000 });
+}
+
+/**
+ * The hand-raise chime — issue 2329.
+ *
+ * The issue asks for "a subtle sound any time someone raises their hand", both
+ * directions. The interesting half is not that it sounds; it is the three cases
+ * where it must NOT, all of which are CROSS-PARTICIPANT and therefore reachable
+ * only from a second (or third) browser:
+ *
+ *   1. cross-peer chime   — the ask itself, plus the retrograde on the way down
+ *   2. arrival is silent  — walking into a room with hands already up costs ZERO
+ *                           chimes, not one per raised hand (the issue 2276
+ *                           shape, in audio)
+ *   3. re-announce silent — a peer re-stating a hand that is already up, which
+ *                           every join in the room provokes, must say nothing
+ *   4. the preference     — the switch actually gates it, in both directions
+ *
+ * WHY THESE CANNOT BE UNIT TESTS. The decision function `hand_sound_to_play` is
+ * pure and already has thorough `#[test]` coverage in `raised_hands.rs` — the
+ * settle window, the rate gate, the level transitions, the wall-clock backwards
+ * step. What none of that can reach is the WIRING: that `on_connected` really
+ * stamps `connected_at_ms`, that the inbound `on_raise_hand` arm really consults
+ * it, that a real relay replay really lands inside the window it was sized for,
+ * and that a real re-announce is really a `true -> true` at the receiver. Every
+ * one of those is a live, multi-process fact. A unit test can model this hazard;
+ * only this file can reproduce it.
+ *
+ * EXACT ZEROES AND THEIR CONTROLS. Two tests assert an exact count of zero, and
+ * a zero is only worth as much as the proof that the same page WOULD have
+ * recorded a chime under the same conditions. Each therefore carries a positive
+ * control on the very same page, spy and inbound path — a real chime, asserted
+ * as an exact sequence, immediately after the zero window closes — plus
+ * `assertToneSpyInstalled` up front. A silent stack, a dead spy and a working
+ * suppression are three different states, and these tests distinguish them.
+ *
+ * PRESENCE BEFORE MEASUREMENT. Before any tone assertion, the RENDERED
+ * consequence of the same packet is asserted first (the banner, its
+ * `data-hand-count`, its attribution). Without that, "no chime" could equally
+ * mean "no packet", and every one of these tests would pass on a room where
+ * nothing happened at all.
+ */
+test.describe("Raise-hand chime (issue 2329)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  /**
+   * THE ISSUE'S REQUIREMENT: someone else raises a hand, and you hear it.
+   *
+   * The raise and the lower are asserted as ORDERED pairs, not as counts, which
+   * is what makes them distinguishable at all — `play_hand_raised` and
+   * `play_hand_lowered` use the same two pitches and differ only in direction,
+   * so a count-based assertion would pass with the two chimes swapped and a user
+   * would hear "hand lowered" every time a hand went up.
+   *
+   * WHY IT FAILS ON THE UN-FIXED CODE: no `play_tone_pair` call exists on the
+   * raised-hand path at all, so `__vcHandTones` never contains 987.77 or
+   * 1318.51 and the first sequence assertion reads `[]` against `RAISED_PAIR`.
+   *
+   * The cumulative sequence (rather than a fresh buffer per phase) also pins
+   * that NOTHING ELSE chimed in between: an implementation that chimed on every
+   * roster write — a late display name resolving, a re-render — would show extra
+   * pairs here, not merely the right ones.
+   */
+  test("a peer raising their hand chimes here, and lowering it plays the retrograde", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_hand_chime_pair_${Date.now()}`;
+    const hostBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const guestBrowser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostPage = await newParticipant(hostBrowser, "host@videocall.rs", "HostUser", uiURL);
+      // Only the guest LISTENS; the host is just the hand.
+      const guestPage = await newParticipantWithInit(
+        guestBrowser,
+        "guest@videocall.rs",
+        "GuestUser",
+        uiURL,
+        [HAND_TONE_SPY],
+      );
+      await enterTwoUserMeeting(hostPage, guestPage, meetingId);
+      await assertToneSpyInstalled(guestPage, "guest");
+
+      // Clear of the anti-storm window before anything is measured, so a chime
+      // that does not sound below is a suppressed one and not a gated one.
+      await guestPage.waitForTimeout(PAST_SETTLE_MS);
+
+      // Nothing has chimed yet. The guest DID hear a join chime moments ago —
+      // that one is 523.25 / 659.25 Hz and is filtered out, which is the point.
+      expect(
+        await handToneSequence(guestPage),
+        "no hand chime may sound before any hand is raised",
+      ).toEqual([]);
+
+      // ── RAISE.
+      await setHandRaised(hostPage, true);
+
+      // PRESENCE FIRST: the packet reached this page and rendered. Without this
+      // the tone assertion below could be measuring a room where the wire never
+      // delivered anything.
+      const banner = guestPage.locator(BANNER);
+      await expect(banner).toBeVisible({ timeout: CROSS_PEER_TIMEOUT });
+      await expect(banner).toHaveAttribute("data-hand-count", "1", {
+        timeout: CROSS_PEER_TIMEOUT,
+      });
+      await expect(guestPage.locator(BANNER_TEXT)).toHaveText("HostUser raised their hand", {
+        timeout: CROSS_PEER_TIMEOUT,
+      });
+
+      await expect
+        .poll(async () => handToneSequence(guestPage), {
+          timeout: CROSS_PEER_TIMEOUT,
+          message: "a peer's raise must synthesize the ASCENDING B5 -> E6 pair on this page",
+        })
+        .toEqual(RAISED_PAIR);
+
+      // ── LOWER, spaced clear of the rate gate so the second chime is entitled
+      // to speak. Inside HAND_SOUND_MIN_INTERVAL_MS it would be DROPPED (not
+      // queued), and this test would be asserting the rate limiter by accident.
+      await guestPage.waitForTimeout(HAND_SOUND_MIN_INTERVAL_MS + 400);
+      await setHandRaised(hostPage, false);
+
+      // The banner unmounts entirely when no hand is up — hence count 0, not
+      // "not visible" (see `RaisedHandsBanner`, which renders nothing at all).
+      await expect(guestPage.locator(BANNER)).toHaveCount(0, { timeout: CROSS_PEER_TIMEOUT });
+
+      // The retrograde, appended to what was already there. Asserting the whole
+      // sequence rather than just the tail is what proves the lower chime is
+      // DIFFERENT from the raise: swap the two functions and this reads
+      // `[...RAISED_PAIR, ...RAISED_PAIR]`.
+      await expect
+        .poll(async () => handToneSequence(guestPage), {
+          timeout: CROSS_PEER_TIMEOUT,
+          message: "a peer's lower must synthesize the DESCENDING E6 -> B5 pair",
+        })
+        .toEqual([...RAISED_PAIR, ...LOWERED_PAIR]);
+    } finally {
+      await hostBrowser.close();
+      await guestBrowser.close();
+    }
+  });
+
+  /**
+   * THE MOST VALUABLE ASSERTION IN THIS FILE: arriving in a room where hands are
+   * already up must cost ZERO chimes.
+   *
+   * There is no hand registry anywhere in the system, so a joiner learns the
+   * room's raised hands only because every peer holding one RE-ANNOUNCES it. Two
+   * hands already up therefore deliver two `raised = true` packets that are, to
+   * the arriving client, brand-new entries arriving in a burst — packet for
+   * packet indistinguishable from two people raising at once. That is precisely
+   * the shape of issue 2276 (14 stacked toasts on entering a populated meeting),
+   * and it is why TWO hands are up here rather than one: it separates the three
+   * plausible outcomes instead of two. Correct is 0. A naive per-packet chime is
+   * 2. A debounce — the obvious wrong fix — collapses to 1 and is still wrong,
+   * because nobody just raised anything.
+   *
+   * WHY IT FAILS ON THE UN-FIXED CODE: drop the `!is_self &&
+   * !hand_roster_settled(...)` arm from `hand_sound_gate_open`, set
+   * `HAND_SOUND_SETTLE_MS` to 0, or make `hand_roster_settled` answer `true` for
+   * a `None` stamp, and the replay chimes on arrival — the observer's sequence
+   * reads four tones instead of none.
+   *
+   * Note which mutation this does NOT catch, so it is not credited with more
+   * than it does: deleting the `connected_at_ms` re-stamp in `on_connected`
+   * leaves the stamp `None`, which `hand_roster_settled` reads as "not settled"
+   * and which therefore MUTES the channel permanently. That fails the other
+   * three tests in this block, not this one — a gate that never opens is not a
+   * storm.
+   *
+   * NOT VACUOUS, on three counts: the spy is asserted installed; the replay is
+   * asserted to have ARRIVED (`data-hand-count` = 2, both names attributed)
+   * before the silence is measured; and the positive control at the end shows
+   * this exact page, spy and inbound path producing a real chime seconds later.
+   */
+  test("joining a room where two hands are already up chimes nothing @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(300_000);
+
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_hand_chime_storm_${Date.now()}`;
+    const hostBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const peerBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const observerBrowser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostPage = await newParticipant(hostBrowser, "host@videocall.rs", "HostUser", uiURL);
+      const peerPage = await newParticipant(peerBrowser, "guest@videocall.rs", "GuestUser", uiURL);
+      // The observer is the only listener: it is the one that ARRIVES.
+      const observerPage = await newParticipantWithInit(
+        observerBrowser,
+        "observer@videocall.rs",
+        "ObserverUser",
+        uiURL,
+        [HAND_TONE_SPY],
+      );
+
+      // ── Two hands go up BEFORE the observer exists, so nothing it later hears
+      // can have come from a live transition it witnessed.
+      await enterTwoUserMeeting(hostPage, peerPage, meetingId);
+      await setHandRaised(hostPage, true);
+      await setHandRaised(peerPage, true);
+      await expect(hostPage.locator(BANNER)).toHaveAttribute("data-hand-count", "2", {
+        timeout: CROSS_PEER_TIMEOUT,
+      });
+
+      // ── The observer arrives into that room.
+      await participantJoins(hostPage, observerPage, meetingId, "ObserverUser");
+      await assertToneSpyInstalled(observerPage, "observer");
+
+      // PRESENCE FIRST, and it is doing real work here: it proves the replay
+      // ARRIVED. Without it, "zero chimes" would be equally satisfied by a room
+      // that told the observer nothing, which is the failure this test would
+      // then be silently reporting as a pass.
+      const banner = observerPage.locator(BANNER);
+      await expect(banner).toBeVisible({ timeout: CROSS_PEER_TIMEOUT });
+      await expect(banner).toHaveAttribute("data-hand-count", "2", {
+        timeout: CROSS_PEER_TIMEOUT,
+      });
+      // Both raisers are attributed. Asserted with `toContainText` rather than a
+      // fixed sentence because the exact copy and its ordering are already
+      // pinned by the banner tests above; what matters here is only that two
+      // distinct, named hands were replayed.
+      const bannerText = observerPage.locator(BANNER_TEXT);
+      await expect(bannerText).toContainText("HostUser", { timeout: CROSS_PEER_TIMEOUT });
+      await expect(bannerText).toContainText("GuestUser", { timeout: CROSS_PEER_TIMEOUT });
+
+      // ── THE ASSERTION. A fixed wait then a single read, deliberately NOT a
+      // poll: a poll would be satisfied by the first sample and would never see
+      // a chime that arrived late. Waiting the window out and reading once is
+      // the only shape that can distinguish "suppressed" from "not yet".
+      await observerPage.waitForTimeout(PAST_SETTLE_MS);
+      expect(
+        await handToneSequence(observerPage),
+        "arriving in a room with hands already up must chime ZERO times, not one per hand",
+      ).toEqual([]);
+
+      // ── POSITIVE CONTROL. Same page, same spy, same inbound path, seconds
+      // later: a genuine transition MUST be audible. Without this the zero above
+      // is indistinguishable from an observer whose audio path is simply dead.
+      await setHandRaised(hostPage, false);
+      await expect(banner).toHaveAttribute("data-hand-count", "1", {
+        timeout: CROSS_PEER_TIMEOUT,
+      });
+      await expect
+        .poll(async () => handToneSequence(observerPage), {
+          timeout: CROSS_PEER_TIMEOUT,
+          message: "a live lower AFTER the settle window must chime on the same page",
+        })
+        .toEqual(LOWERED_PAIR);
+    } finally {
+      await hostBrowser.close();
+      await peerBrowser.close();
+      await observerBrowser.close();
+    }
+  });
+
+  /**
+   * A RE-ANNOUNCE OF AN ALREADY-RAISED HAND IS SILENT.
+   *
+   * Distinct from the test above, and not covered by it. That one is about the
+   * ARRIVING client's settle window; this one is about an ESTABLISHED client,
+   * long past its window, that receives a `raised = true` for a hand it already
+   * has up. Every single join anywhere in the room provokes one of these — the
+   * host re-announces so the newcomer learns about the hand — and the packet is
+   * a plain room broadcast with no target session (`send_raise_hand` in
+   * `video_call_client.rs` builds a `PacketWrapper` with no recipient), so every
+   * OTHER participant receives it too. In a busy meeting that is a chime per
+   * join, per raised hand, forever.
+   *
+   * WHAT THE PACKET LOOKS LIKE AT THE RECEIVER: a `true -> true`, and byte-for-
+   * byte identical to the one that raised the hand in the first place.
+   * `raised_at_ms` is stamped once on the false->true edge and preserved
+   * verbatim across every re-announce (`set_level` in `raise_hand.rs`, pinned by
+   * `raised_at_ms_is_stamped_once_and_preserved_across_reannounce`), and the
+   * display name does not change either. Only the LEVEL can tell the two apart,
+   * and the level says nothing happened.
+   *
+   * WHY IT FAILS ON THE UN-FIXED CODE: any implementation that chimes on the
+   * ARRIVAL of a `raised = true` packet rather than on the transition it
+   * represents. Drop the `was_raised` read at the top of the `on_raise_hand`
+   * arm, or map `(true, true)` to `Some(HandSound::Raised)` in
+   * `hand_sound_for_transition`, and this fires once per join in the room, per
+   * raised hand, forever — the sequence grows a third pair here.
+   *
+   * WHAT IT DOES NOT CATCH, stated rather than glossed: a chime keyed on "did
+   * the roster change" would ALSO stay silent here, because a steady-state
+   * re-announce changes nothing in the roster (see the paragraph above) and the
+   * perf guards short-circuit it. The case that separates those two gates is a
+   * LATE DISPLAY NAME — a `true -> true` that does update the entry in place —
+   * and that one is pinned natively by `a_late_display_name_updates_in_place`
+   * plus the level-keyed decision in `hand_sound_for_transition`. It is not
+   * reachable from here, because the harness has no way to make a name resolve
+   * late on demand.
+   *
+   * THE CONTROL IS THE FIRST CHIME. The host's raise is asserted as a real
+   * ascending pair on the guest BEFORE the latecomer arrives, so the spy, the
+   * audio path and the inbound handler are all demonstrably live on that page;
+   * the assertion afterwards is that the sequence is UNCHANGED, not that it is
+   * empty. And the latecomer's own banner is the receipt that a re-announce was
+   * actually sent — without it, a silent guest would only prove nothing had
+   * happened.
+   */
+  test("a re-announce of an already-raised hand is silent", async ({ baseURL }) => {
+    test.setTimeout(300_000);
+
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_hand_chime_reannounce_${Date.now()}`;
+    const hostBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const guestBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const lateBrowser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostPage = await newParticipant(hostBrowser, "host@videocall.rs", "HostUser", uiURL);
+      const guestPage = await newParticipantWithInit(
+        guestBrowser,
+        "guest@videocall.rs",
+        "GuestUser",
+        uiURL,
+        [HAND_TONE_SPY],
+      );
+      const latePage = await newParticipant(lateBrowser, "late@videocall.rs", "LateUser", uiURL);
+
+      await enterTwoUserMeeting(hostPage, guestPage, meetingId);
+      await assertToneSpyInstalled(guestPage, "guest");
+      await guestPage.waitForTimeout(PAST_SETTLE_MS);
+
+      // ── A real raise, heard once. This doubles as the positive control for
+      // the silence asserted further down.
+      await setHandRaised(hostPage, true);
+      const guestBanner = guestPage.locator(BANNER);
+      await expect(guestBanner).toBeVisible({ timeout: CROSS_PEER_TIMEOUT });
+      await expect(guestBanner).toHaveAttribute("data-hand-count", "1", {
+        timeout: CROSS_PEER_TIMEOUT,
+      });
+      await expect
+        .poll(async () => handToneSequence(guestPage), {
+          timeout: CROSS_PEER_TIMEOUT,
+          message: "the live raise must chime — this is the control for the silence below",
+        })
+        .toEqual(RAISED_PAIR);
+
+      // ── A third participant arrives, which makes the host re-announce.
+      await participantJoins(hostPage, latePage, meetingId, "LateUser");
+
+      // THE RECEIPT that a re-announce actually went out: the latecomer has no
+      // other way to learn about a hand raised before it existed. Assert this
+      // BEFORE the guest's silence, or the silence proves only that nothing
+      // happened.
+      await expect(latePage.locator(BANNER)).toBeVisible({ timeout: CROSS_PEER_TIMEOUT });
+      await expect(latePage.locator(BANNER_TEXT)).toHaveText("HostUser raised their hand", {
+        timeout: CROSS_PEER_TIMEOUT,
+      });
+
+      // ── THE ASSERTION. The guest received the same broadcast — an unchanged
+      // level for a hand it already holds — and must not have chimed for it. The
+      // hand is still up on this page, so the packet was a `true -> true`.
+      await guestPage.waitForTimeout(REANNOUNCE_SETTLE_MS);
+      await expect(guestBanner).toHaveAttribute("data-hand-count", "1");
+      expect(
+        await handToneSequence(guestPage),
+        "a re-announce of an already-raised hand must add no chime",
+      ).toEqual(RAISED_PAIR);
+    } finally {
+      await hostBrowser.close();
+      await guestBrowser.close();
+      await lateBrowser.close();
+    }
+  });
+
+  /**
+   * THE PREFERENCE GATES IT — in both directions.
+   *
+   * Both halves matter and they fail differently. A switch that cannot mute is a
+   * broken promise; a switch that cannot UNMUTE is worse, because the feature is
+   * then permanently off for anyone who ever tried it, and no amount of
+   * mute-only testing would notice.
+   *
+   * WHY IT FAILS ON THE UN-FIXED CODE: drop the `enabled` arm of
+   * `hand_sound_gate_open`, or read the wrong `AppearanceSettings` field at
+   * either call site, and the muted half chimes. Persist the flag without
+   * feeding the live signal to the chime — read it once at mount, say — and the
+   * re-enable half stays silent.
+   *
+   * THE SEED IS PROVEN, NOT ASSUMED. The panel's switch is asserted UNCHECKED
+   * before it is touched. A seed written in a retired storage format would leave
+   * a default-ON build running while this test believed it had muted it, and the
+   * zero below would then be measuring a room where the chime was simply never
+   * provoked — the exact way a whole spec can quietly stop testing anything.
+   *
+   * The banner assertions carry their own weight here too: they show the RAISE
+   * itself is untouched by the preference. Only the audio channel is gated, and
+   * a fix that muted the chime by dropping the packet would fail them.
+   */
+  test("the Sound preference mutes the hand chime, and re-enabling restores it", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_hand_chime_pref_${Date.now()}`;
+    const hostBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const guestBrowser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostPage = await newParticipant(hostBrowser, "host@videocall.rs", "HostUser", uiURL);
+      const guestPage = await newParticipantWithInit(
+        guestBrowser,
+        "guest@videocall.rs",
+        "GuestUser",
+        uiURL,
+        [HAND_SOUND_OFF_SEED, HAND_TONE_SPY],
+      );
+
+      await enterTwoUserMeeting(hostPage, guestPage, meetingId);
+      await assertToneSpyInstalled(guestPage, "guest");
+      await guestPage.waitForTimeout(PAST_SETTLE_MS);
+
+      // ── MUTED. The host raises; the guest must SEE it and not hear it.
+      await setHandRaised(hostPage, true);
+      const banner = guestPage.locator(BANNER);
+      await expect(banner).toBeVisible({ timeout: CROSS_PEER_TIMEOUT });
+      await expect(banner).toHaveAttribute("data-hand-count", "1", {
+        timeout: CROSS_PEER_TIMEOUT,
+      });
+      await expect(guestPage.locator(BANNER_TEXT)).toHaveText("HostUser raised their hand", {
+        timeout: CROSS_PEER_TIMEOUT,
+      });
+
+      await guestPage.waitForTimeout(CHIME_SETTLE_MS);
+      expect(
+        await handToneSequence(guestPage),
+        "with the preference off, a peer's raise must be seen and not heard",
+      ).toEqual([]);
+
+      // ── Turn it back on through the actual control.
+      await openPreferencesTab(guestPage);
+      const matrix = guestPage.locator('[data-testid="announce-matrix"]');
+      const handToggle = matrix.locator('[data-testid="announce-hand-sound"]');
+      await expect(handToggle).toHaveCount(1);
+      // THE SEED RECEIPT — see this test's header. If the localStorage format
+      // above were stale this would be checked, and every assertion in the muted
+      // half would have been vacuous.
+      await expect(handToggle).not.toBeChecked();
+
+      // The checkbox is visually hidden behind a custom switch, so click the
+      // wrapping label, which natively forwards activation to its input. The
+      // input is a CHILD of that label in `preferences_settings_panel.rs`, which
+      // is what makes `:has()` the right relationship here.
+      await matrix.locator('label.glow-switch:has([data-testid="announce-hand-sound"])').click();
+      await expect(handToggle).toBeChecked({ timeout: 5_000 });
+      // Persistence is a ~300 ms debounced effect, hence the poll.
+      await expect
+        .poll(() => guestPage.evaluate((key) => localStorage.getItem(key), HAND_SOUND_PREF_KEY), {
+          timeout: 5_000,
+        })
+        .toBe("true");
+      await closeSettings(guestPage);
+
+      // ── UNMUTED. The next real transition must be audible. It is a LOWER, so
+      // the descending pair is also what proves the newly-enabled channel plays
+      // the right cue rather than merely making noise.
+      await setHandRaised(hostPage, false);
+      await expect(guestPage.locator(BANNER)).toHaveCount(0, { timeout: CROSS_PEER_TIMEOUT });
+      await expect
+        .poll(async () => handToneSequence(guestPage), {
+          timeout: CROSS_PEER_TIMEOUT,
+          message: "re-enabling the preference must restore the chime on the very next transition",
+        })
+        .toEqual(LOWERED_PAIR);
     } finally {
       await hostBrowser.close();
       await guestBrowser.close();

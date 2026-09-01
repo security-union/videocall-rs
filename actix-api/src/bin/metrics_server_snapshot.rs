@@ -64,12 +64,9 @@ async fn metrics_handler(snapshots: web::Data<ServerSnapshots>) -> Result<HttpRe
     let mut buffer = Vec::new();
 
     match encoder.encode(&metric_families, &mut buffer) {
-        Ok(_) => {
-            let output = String::from_utf8_lossy(&buffer);
-            Ok(HttpResponse::Ok()
-                .content_type("text/plain; version=0.0.4")
-                .body(output.to_string()))
-        }
+        Ok(_) => Ok(HttpResponse::Ok()
+            .content_type("text/plain; version=0.0.4")
+            .body(buffer)),
         Err(e) => {
             error!("Failed to encode metrics: {}", e);
             Ok(HttpResponse::InternalServerError().body("Failed to encode metrics"))

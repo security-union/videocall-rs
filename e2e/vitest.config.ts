@@ -16,7 +16,7 @@ import { defineConfig } from "vitest/config";
  */
 export default defineConfig({
   test: {
-    include: ["bots-app/src/**/*.test.ts", "helpers/**/*.test.ts"],
+    include: ["bots-app/src/**/*.test.ts", "helpers/**/*.test.ts", "eslint-rules/**/*.test.mjs"],
     exclude: ["node_modules/**", "bots-app/dashboard/**", "**/*.spec.ts"],
   },
 });

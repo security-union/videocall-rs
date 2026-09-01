@@ -5,5 +5,7 @@ playwright-results.json
 bots-app/run/
 bots-app/dashboard/
 
+.stack-stamps/
+
 # Intentionally-malformed fixture used to test invalid-JSON theme import handling.
 fixtures/themes/invalid.json

@@ -127,25 +127,28 @@ impl PartialEq for ScreenSnapshotReader {
 
 /// The effective simulcast layer setting, for the diagnostics summary line.
 ///
-/// `effective = min(flag, capability)`. Video/screen share the CPU capability
-/// ceiling; audio has its own. Pure data so the formatter is host-testable.
+/// Video/screen: `effective = min(flag, capability)`, sharing the CPU capability
+/// ceiling. Audio is the mic encoder's own published count, independent of the
+/// flag. Pure data so the formatter is host-testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SimulcastSummary {
     /// `experimentalSimulcastMaxLayers` runtime flag value.
     pub flag: u32,
     /// Device CPU capability ceiling for video/screen.
     pub video_capability: u32,
-    /// Device capability ceiling for audio (its own ladder size).
+    /// Audio layers the mic encoder publishes.
     pub audio_capability: u32,
     /// Effective video/screen layers = `min(flag, video_capability)`.
     pub effective_video: u32,
-    /// Effective audio layers = `min(flag, audio_capability)`.
+    /// Audio layers the mic encoder publishes.
     pub effective_audio: u32,
 }
 
 /// Format the simulcast effective-setting summary line, e.g.
-/// `"Video/Screen: 3 layers (flag 3 × device cap 3) · Audio: 3 layers"`. When a
-/// kind is effectively single-layer it reads "off (1 layer)". Pure / host-tested.
+/// `"Video: 3 layers (flag 3 × device cap 3) · Screen: single rung · Audio: 3 layers"`.
+/// When a kind is effectively single-layer it reads "off (1 layer)". Screen
+/// carries its own term because it publishes one rung whatever the flag and the
+/// device sniff say. Pure / host-tested.
 pub fn format_simulcast_summary(s: &SimulcastSummary) -> String {
     let kind_str = |effective: u32, cap: u32| -> String {
         if effective <= 1 {
@@ -155,7 +158,7 @@ pub fn format_simulcast_summary(s: &SimulcastSummary) -> String {
         }
     };
     format!(
-        "Video/Screen: {} · Audio: {}",
+        "Video: {} · Screen: single rung · Audio: {}",
         kind_str(s.effective_video, s.video_capability),
         kind_str(s.effective_audio, s.audio_capability),
     )
@@ -191,26 +194,24 @@ pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
     }
 }
 
-/// Format one RECEIVE per-kind line for a peer, e.g. `"video M · 2/3 · 1280×720"`
-/// or `"audio L · 1/3 · 24 kbps"`. The quality LETTER (Low/Med/High → L/M/H) is
-/// followed by the 1-based position/total. Returns `None` when the kind is not
-/// flowing. Pure / host-tested.
+/// Format one RECEIVE per-kind line for a peer, e.g. `"video M · 2/3 · 1280×720"`.
+/// A peer publishing ONE rung has no position to report, so the line is just
+/// `"screen 1400×700"`. Returns `None` when the kind is not flowing.
+/// Pure / host-tested.
 pub fn format_peer_kind_line(
     kind_label: &str,
     snap: Option<&ReceivedLayerSnapshot>,
 ) -> Option<String> {
     let s = snap?;
-    let letter = layer_quality_label(s.layer_index, s.layer_count, true);
     let detail = if matches!(s.kind, PrefMediaKind::Audio) {
-        format!("{} kbps", s.kbps)
+        format_recv_audio_kbps(s.kbps, " kbps")
     } else {
         format!("{}×{}", s.width, s.height)
     };
-    Some(format!(
-        "{kind_label} {letter} · {}/{} · {detail}",
-        s.layer_index + 1,
-        s.layer_count
-    ))
+    Some(match layer_position_suffix(s.layer_index, s.layer_count) {
+        Some(pos) => format!("{kind_label} {pos} · {detail}"),
+        None => format!("{kind_label} {detail}"),
+    })
 }
 
 /// Format a coarse device-memory tier (GB) trimming a trailing `.0` so the
@@ -403,7 +404,7 @@ pub struct PerfControlsHandle {
     pub video_layer_max: usize,
     /// Effective SCREEN ladder depth (shares the video CPU capability ceiling).
     pub screen_layer_max: usize,
-    /// Effective AUDIO ladder depth (NOT CPU-clamped — audio encode is cheap).
+    /// Audio's published layer count.
     pub audio_layer_max: usize,
 }
 
@@ -469,9 +470,22 @@ pub fn format_send_total_kbps(snap: &SimulcastSendSnapshot) -> u32 {
 /// sensibly. Falls back to `"{w}×{h}"` if a dimension is 0. Pure / host-tested.
 pub fn format_send_layer_short(width: u32, height: u32) -> String {
     if width == 0 || height == 0 {
-        return format!("{width}×{height}");
+        return SEND_LAYER_DIMS_UNKNOWN.to_string();
     }
     format!("{}p", width.min(height))
+}
+
+/// A RECEIVED-audio bitrate label with `unit` appended (`" kbps"` or `"k"`).
+///
+/// `0` is the "no reading" sentinel `received_layer_snapshot` sets for audio, and it
+/// renders [`SEND_LAYER_DIMS_UNKNOWN`] — a publisher's audio rate comes from its own
+/// AQ tier, not from the layer a receiver decodes, so there is no number to show.
+/// Pure / host-tested.
+pub fn format_recv_audio_kbps(kbps: u32, unit: &str) -> String {
+    if kbps == 0 {
+        return format!("{SEND_LAYER_DIMS_UNKNOWN}{unit}");
+    }
+    format!("{kbps}{unit}")
 }
 
 /// Compact bitrate label: `400`→`"400k"`, `1400`→`"1.4M"`, `2500`→`"2.5M"`.
@@ -547,9 +561,12 @@ pub fn received_layer_led_on(layer_id: u32, received_index: u32) -> bool {
 /// Format the RECEIVE per-kind layer spread across peers by quality LETTER, e.g.
 /// `"L–H"`, or a single letter `"H"` when every peer is on the same layer.
 /// `layers` is the list of 0-based `layer_index` values; `count` is the ladder
-/// size for the kind (the basis for the quality letters). Empty → empty string
-/// (caller renders the "not receiving" state). Pure / host-tested.
+/// size for the kind. Empty, or a one-rung ladder with no spread to report →
+/// empty string (caller renders the "not receiving" state). Pure / host-tested.
 pub fn format_receive_spread(layers: &[u32], count: u32) -> String {
+    if count <= 1 {
+        return String::new();
+    }
     let Some(&first) = layers.first() else {
         return String::new();
     };
@@ -743,9 +760,10 @@ pub fn format_audio_receive_summary(n_peers: usize) -> String {
 ///
 /// `layers` is the persisted audio layer COUNT (`None` = Auto / full ladder);
 /// `layer_max` is the effective audio ladder depth. Derived from the SAME
-/// per-kind ladder labels the slider + rung strip use
-/// ([`send_layer_labels`] for `Audio`, lowest-first `["12k","24k","48k"]`), so the
-/// summary's top-layer label can never drift from the rungs.
+/// per-kind ladder labels the slider + rung strip use ([`send_layer_labels`] for
+/// `Audio`), so the summary's top-layer label can never drift from the rungs.
+///
+/// A single-layer ladder has no ceiling to name, so it reads "Sending audio".
 ///
 /// STATE-AWARE (mirrors [`format_send_layer_caption`]): when the mic is ACTIVE the
 /// summary names the TOP currently-published layer (the best quality flowing) —
@@ -762,7 +780,7 @@ pub fn format_audio_send_layer_summary(
     // shipped label rather than calling the config-reading wrapper, which would
     // make this otherwise-pure fn browser-only and break its host tests.
     let labels = send_layer_labels_with_top(PrefMediaKind::Audio, layer_max, "720p");
-    if labels.is_empty() {
+    if labels.len() <= 1 {
         return if source_active {
             "Sending audio".to_string()
         } else {
@@ -838,13 +856,9 @@ pub fn format_send_layer_caption(
 /// CAPTURED SOURCE, and the simulcast ladder's top rung is now `1440p` — so the
 /// copy had to change.
 ///
-/// It deliberately names NO rung. Every numeric ceiling here is a moving target:
-/// `resolve_screen_tier_ceiling` gates the top rungs on the sender's core count
-/// and caps the single-stream path separately, so a share's real maximum depends
-/// on the machine and the stream count. The SOURCE bound is the one that holds
+/// It deliberately names NO rung. The SOURCE bound is the one that holds
 /// unconditionally — `fit_within_preserving_aspect` never upscales, so the encode
-/// can never exceed the captured surface's own size. Stating that, and only that,
-/// is a claim no ladder retune can falsify.
+/// can never exceed the captured surface's own size.
 ///
 /// "Up to" is a CEILING, not a guarantee: the line promises the encode will not
 /// exceed the user's screen, not that it will reach it. The live line replaces
@@ -869,23 +883,22 @@ pub fn format_content_send_summary(snap: Option<&SimulcastSendSnapshot>) -> Stri
 }
 
 /// CONTENT (screen) RECEIVE summary. No peer sharing → `"Nobody is sharing"`;
-/// otherwise `"Pulling full quality · {letter} · {w}×{h}"` for the top-layer
-/// peer, where the letter is the quality tier (L/M/H) of the received layer.
-/// `top` is the highest-layer peer snapshot currently received. Pure.
+/// otherwise `"Pulling full quality · {Q} · {i}/{n} · {w}×{h}"` for the top-layer
+/// peer, dropping the `{Q} · {i}/{n}` when that peer publishes one rung. Pure.
 pub fn format_content_receive_summary(top: Option<&ReceivedLayerSnapshot>) -> String {
     match top {
         None => "Nobody is sharing".to_string(),
-        Some(s) => {
-            let q = layer_quality_label(s.layer_index, s.layer_count, true);
-            format!("Pulling full quality · {q} · {}×{}", s.width, s.height)
-        }
+        Some(s) => match layer_position_suffix(s.layer_index, s.layer_count) {
+            Some(pos) => format!("Pulling full quality · {pos} · {}×{}", s.width, s.height),
+            None => format!("Pulling full quality · {}×{}", s.width, s.height),
+        },
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
 // Issue #1131 — per-peer RECEIVE row rendering (pure / host-tested). The
 // degradation REASON and the absolute quality come from the client
-// (`snap.reason`, `quality_state(layer_index, full_ladder_len)`); these fns map
+// (`snap.reason`, `quality_state(layer_index, snap.layer_count)`); these fns map
 // them to the spec's markup data (CSS modifier, glyph, chip copy, metric text,
 // and the full aria-label sentence). Kept pure so the §3/§4/§5 copy is testable
 // without a DOM.
@@ -960,59 +973,79 @@ pub fn reason_aria_clause(r: DegradeReason) -> &'static str {
     }
 }
 
-/// The per-peer row metric text (§3, Directive 4 SITE 6b). video/screen
-/// `"{res} · ~{kbps} · {Q} · {i}/{n}"`; audio `"{kbps}k · {label} · {Q} · {i}/{n}"`,
-/// where `{Q}` is the quality LETTER (L/M/H via [`layer_quality_label`]) and `n`
-/// is the FULL-ladder length (so the `{i}/{n}` denominator matches the color
-/// basis). `audio_label` is the receive audio rung label (e.g. "mid (24k)")
-/// supplied by the caller (the receive submodule owns that mapping). Pure /
-/// host-tested.
-///
-/// NOTE (#1222): this helper is shared with the signal-quality popup
-/// (`signal_quality.rs`). The drawer layer-name rename (Directive 4) is global,
-/// so the visible `L{i}/{n}` → `{Q} · {i}/{n}` swap propagates to that surface
-/// too; its unit test + doc comment are updated in lockstep (Option A).
-pub fn peer_row_metric(
-    snap: &ReceivedLayerSnapshot,
-    full_ladder_len: u32,
-    audio_label: &str,
-) -> String {
-    let i = snap.layer_index + 1;
-    // Quality LETTER (L/M/H) over the FULL ladder — the internal layer_index
-    // stays 0-based; only the visible chip changes (e2e/protobuf stability).
-    let q = layer_quality_label(snap.layer_index, full_ladder_len, true);
+/// The res/bitrate detail spoken inside a per-peer row's aria sentence. ARIA ONLY —
+/// visual readouts go through [`peer_row_metric`]. An absent reading is SPOKEN here,
+/// never [`SEND_LAYER_DIMS_UNKNOWN`].
+pub fn peer_row_res_or_bitrate(snap: &ReceivedLayerSnapshot) -> String {
     if matches!(snap.kind, PrefMediaKind::Audio) {
-        format!(
-            "{}k · {} · {q} · {i}/{full_ladder_len}",
-            snap.kbps, audio_label
-        )
+        if snap.kbps == 0 {
+            return "bitrate not reported".to_string();
+        }
+        format_recv_audio_kbps(snap.kbps, "k")
+    } else if snap.width == 0 || snap.height == 0 {
+        "resolution not reported".to_string()
     } else {
-        let res = format_send_layer_short(snap.width, snap.height);
-        format!(
-            "{res} · ~{} · {q} · {i}/{full_ladder_len}",
-            format_kbps_compact(snap.kbps)
-        )
+        format_send_layer_short(snap.width, snap.height)
     }
 }
 
+/// The per-peer row metric text (§3, Directive 4 SITE 6b). video/screen
+/// `"{res} · ~{kbps} · {Q} · {i}/{n}"`; audio `"{kbps}k · {label} · {Q} · {i}/{n}"`.
+/// The `{Q} · {i}/{n}` chip is dropped for a one-rung peer — see
+/// [`layer_position_suffix`], which also fixes its basis to the snapshot's own
+/// `layer_count`. `audio_label` is the receive audio rung label supplied by the
+/// caller. Also used by the signal popup. Pure / host-tested.
+pub fn peer_row_metric(snap: &ReceivedLayerSnapshot, audio_label: &str) -> String {
+    let detail = if matches!(snap.kind, PrefMediaKind::Audio) {
+        format!(
+            "{} · {}",
+            format_recv_audio_kbps(snap.kbps, "k"),
+            audio_label
+        )
+    } else {
+        format!(
+            "{} · ~{}",
+            format_send_layer_short(snap.width, snap.height),
+            format_kbps_compact(snap.kbps)
+        )
+    };
+    match layer_position_suffix(snap.layer_index, snap.layer_count) {
+        Some(pos) => format!("{detail} · {pos}"),
+        None => detail,
+    }
+}
+
+/// The `"{Q} · {i}/{n}"` chip for a received layer, or `None` when the peer
+/// publishes a single rung and there is no position to report. Pure.
+pub fn layer_position_suffix(layer_index: u32, layer_count: u32) -> Option<String> {
+    if layer_count <= 1 {
+        return None;
+    }
+    let q = layer_quality_label(layer_index, layer_count, true);
+    Some(format!("{q} · {}/{layer_count}", layer_index + 1))
+}
+
 /// The full per-peer row aria-label sentence (§3). Color is never the sole
-/// signal — this sentence carries label, kind, state, the res/bitrate, the layer
-/// fraction, and (when present) the reason clause. `kind_noun` is the spoken kind
-/// ("video"/"audio"/"shared content"); `res_or_bitrate` is the human detail
-/// ("360p" or "24k"). Pure / host-tested.
+/// signal — this sentence carries label, kind, state, the res/bitrate, and (when
+/// present) the reason clause. The layer clause is included only when the peer
+/// publishes more than one rung. `kind_noun` is the spoken kind; `res_or_bitrate`
+/// is the human detail ("360p" or "24k"). Pure / host-tested.
 pub fn peer_row_aria_label(
     label: &str,
     kind_noun: &str,
     q: QualityState,
     res_or_bitrate: &str,
     layer_1indexed: u32,
-    full_ladder_len: u32,
+    layer_count: u32,
     reason: Option<DegradeReason>,
 ) -> String {
-    let base = format!(
-        "{label}, receiving {kind_noun}, {} quality, {res_or_bitrate}, layer {layer_1indexed} of {full_ladder_len}",
+    let mut base = format!(
+        "{label}, receiving {kind_noun}, {} quality, {res_or_bitrate}",
         quality_state_word(q)
     );
+    if layer_count > 1 {
+        base.push_str(&format!(", layer {layer_1indexed} of {layer_count}"));
+    }
     match reason {
         Some(r) => format!("{base}, {}", reason_aria_clause(r)),
         None => base,
@@ -1153,16 +1186,11 @@ pub const VIDEO_TIER_LABELS: [&str; 8] = [
 /// Retuned lighter in issue 1768 to match `AUDIO_QUALITY_TIERS` (48/24/12/8).
 pub const AUDIO_TIER_LABELS: [&str; 4] = ["48 kbps", "24 kbps", "12 kbps", "8 kbps"];
 
-/// Screen-share tier labels, index 0 = best (2160p) … index 4 = worst (low).
-/// Order MUST match `SCREEN_QUALITY_TIERS` (index 0 = best). Issue #2179 added
-/// the 2160p and 1440p rungs at the TOP, shifting every pre-existing index by
-/// two; the length is load-bearing (`sanitized`, `thumbs_to_bounds`,
-/// `tier_to_meter_level` all scale by it), so it must stay in lockstep with the
-/// AQ table — pinned by `screen_tier_labels_match_aq_ladder_length`.
-pub const SCREEN_TIER_LABELS: [&str; 5] = ["2160p", "1440p", "1080p", "720p", "low"];
+/// Screen-share tier labels; one rung. The length is load-bearing (`sanitized`,
+/// `thumbs_to_bounds`) and pinned by `screen_tier_labels_match_aq_ladder`.
+pub const SCREEN_TIER_LABELS: [&str; 1] = ["Native"];
 
-/// Map an AQ SCREEN rung label (`native` / `1440p` / `high` / `medium` / `low`)
-/// onto the label the panel RENDERS for that rung.
+/// Map an AQ SCREEN rung label onto the label the panel RENDERS for that rung.
 ///
 /// Issue #2179 review (UX SF1): the screen ladder's AQ names mix vocabularies —
 /// two qualitative words and a resolution — so the rendered rung strip and the
@@ -1178,11 +1206,6 @@ pub const SCREEN_TIER_LABELS: [&str; 5] = ["2160p", "1440p", "1080p", "720p", "l
 /// receive LAYER ladders select `low`, never `medium` — so this cannot render two
 /// identical rungs side by side.
 ///
-/// The `native` arm is kept for totality even though review round 3 capped every
-/// encode path at the publish ladder's top (`1440p`): `SCREEN_QUALITY_TIERS[0]`
-/// still exists as the CAPTURE ceiling `getDisplayMedia` requests, so the rung is
-/// real even though no encode ever lands on it. Do not read a `2160p` here as
-/// evidence that a 4K encode is reachable.
 ///
 /// An unrecognised label returns `"?"`, matching `receive::index_label`'s
 /// out-of-range behaviour rather than leaking a wire name into the UI.
@@ -1191,10 +1214,7 @@ pub const SCREEN_TIER_LABELS: [&str; 5] = ["2160p", "1440p", "1080p", "720p", "l
 /// `screen_display_labels_track_aq_rung_heights`.
 pub fn screen_display_label(aq_label: &str) -> &'static str {
     match aq_label {
-        "native" => "2160p",
-        "1440p" => "1440p",
-        "high" => "1080p",
-        "medium" | "low" => "720p",
+        "native" => "Native",
         _ => "?",
     }
 }
@@ -1432,13 +1452,7 @@ pub fn tick_offsets(step_count: usize) -> Vec<f32> {
 // pure mappers convert between the stored count and the ceiling thumb position,
 // and are host-tested so a wording/positioning regression breaks a test.
 
-/// Label for a camera top-rung HEIGHT (issue #1768): `"720p"` for the shipped
-/// ladder, `"540p"` under `experimentalReducedLadder`.
-///
-/// Takes the height rather than reading the config so it stays a PURE, host-testable
-/// fn — `crate::constants::camera_ladder_variant()` touches `window.__APP_CONFIG`
-/// and panics on a native test target. Returns `&'static str` so
-/// [`send_layer_labels`]'s signature (and its 13 call sites) are unchanged.
+/// Label for a camera top-rung HEIGHT: `"720p"` on the shipped ladder.
 ///
 /// An unrecognised height falls back to `"720p"` and `warn!`s. The fallback VALUE is
 /// silently wrong on its own — a future 480p rung would render a `"720p"` pip beside
@@ -1461,53 +1475,17 @@ pub(crate) fn camera_top_rung_label(max_height: u32) -> &'static str {
     }
 }
 
-/// The active camera ladder's top-rung label, resolved from the AQ table for the
-/// deployment's [`LadderVariant`]. Browser-only (reads `window.__APP_CONFIG` via
-/// `camera_ladder_variant`); the pure half is [`camera_top_rung_label`].
-/// MEMOIZED, because this sits on the performance panel's 4 Hz render path.
-///
-/// `camera_ladder_variant()` → `app_config()` returns a CLONE of the ~32-field
-/// `RuntimeConfig` (27 of them heap `String`s): `memoize_ok` caches the PARSE, not
-/// the clone. The panel instantiates `SendLayerCell` three times per render at
-/// 250 ms, so calling through per render meant ~12 config clones/second — exactly
-/// the per-render deserialization cost #1492 was filed to remove.
-///
-/// A `OnceCell` is sound because ALL config layers apply before the wasm boots —
-/// `index.html` runs `config.js` (blocking `<head>` script) and the `config.local.js`
-/// sync-XHR loader, and only then does the deferred `type="module"` bootstrap run. So
-/// by the time any Rust code can call this, the value is final; a page load is the
-/// only way it changes, and that resets this cell with everything else.
-///
-/// (The Helm template additionally `Object.freeze`s `__APP_CONFIG`, which guards
-/// against later MUTATION — but that is not the load-bearing invariant here, and the
-/// committed `dioxus-ui/scripts/config.js` does NOT freeze, so the ordering argument
-/// above is the one that holds everywhere.)
-///
-/// Shared by BOTH directions since issue #2156: the SEND rung strip
-/// ([`send_layer_labels`]) and the RECEIVE rung labels
-/// ([`receive::index_label`]) — so a `Reduced` deployment can no longer render a
-/// "540p" send pip next to a "720p" receive slider end label.
+/// The camera ladder's top-rung label, resolved from the AQ table rather than
+/// hardcoded, and shared by the SEND rung strip and the RECEIVE rung labels so the
+/// two can never disagree.
 pub(crate) fn active_camera_top_rung_label() -> &'static str {
-    use std::cell::OnceCell;
-    thread_local! {
-        static TOP_LABEL: OnceCell<&'static str> = const { OnceCell::new() };
-    }
-    TOP_LABEL.with(|cell| {
-        *cell.get_or_init(|| {
-            use videocall_client::adaptive_quality_constants::{
-                simulcast_layers_for, SIMULCAST_MAX_LAYERS,
-            };
-            let ladder = simulcast_layers_for(
-                SIMULCAST_MAX_LAYERS,
-                crate::constants::camera_ladder_variant(),
-            );
-            camera_top_rung_label(ladder.last().map(|t| t.max_height).unwrap_or(720))
-        })
-    })
+    use videocall_client::adaptive_quality_constants::{simulcast_layers, SIMULCAST_MAX_LAYERS};
+    let ladder = simulcast_layers(SIMULCAST_MAX_LAYERS);
+    camera_top_rung_label(ladder.last().map(|t| t.max_height).unwrap_or(720))
 }
 
-/// Per-kind SEND rung labels for the deployment's active camera ladder. See
-/// [`send_layer_labels_with_top`] for the pure, variant-explicit form.
+/// Per-kind SEND rung labels for the camera ladder. See
+/// [`send_layer_labels_with_top`] for the form that takes the top label explicitly.
 ///
 /// The camera top-rung label is resolved ONLY for [`PrefMediaKind::Video`] — the
 /// Audio and Screen arms ignore it, so resolving it eagerly for them was pure waste
@@ -1531,28 +1509,17 @@ pub fn send_layer_labels(kind: PrefMediaKind, layer_max: usize) -> Vec<&'static 
 /// top]` (issue 1768): `[low]`, `[low, top]`, `[low, standard, top]` for n = 1/2/3 —
 /// note n=2 SKIPS the middle, matching the AQ `spaced_ladder_positions` rule, so we
 /// special-case the count rather than taking a naive prefix. The TOP label is the
-/// `camera_top` argument (720p on the shipped ladder, 540p under
-/// `experimentalReducedLadder`) rather than a hardcoded string, so it cannot
-/// contradict the ladder-derived `send_layer_res_span`.
+/// `camera_top` argument, so it cannot contradict `send_layer_res_span`.
 ///
-/// SCREEN mirrors the AQ `simulcast_screen_layers` SELECTION: 1→`[low]`,
-/// 2→`[low, high]`, 3→`[low, high, 1440p]` (issue #2179 — the ladder is now a
-/// strict prefix chain spaced by resolution, 720p → 1080p → 1440p), so the panel
-/// and the publisher can never disagree about which rung a layer is. The returned
-/// STRINGS are those rungs run through [`screen_display_label`], so the strip
-/// renders `720p / 1080p / 1440p` instead of the AQ mix `low / high / 1440p`.
+/// SCREEN is a single `native` rung, returned through [`screen_display_label`].
 ///
-/// AUDIO mirrors the publisher's CONTIGUOUS audio ladder (`AUDIO_LAYER_KBPS =
-/// [12, 24, 48]` kbps, lowest-first — the mic encoder publishes layers `0..n` with NO
-/// skip, unlike the spaced video/screen ladders): 1→`[12k]`, 2→`[12k, 24k]`,
-/// 3→`[12k, 24k, 48k]`. Both non-camera arms IGNORE `camera_top`.
+/// AUDIO is CONTIGUOUS lowest-first (the mic encoder publishes layers `0..n` with NO
+/// skip, unlike the spaced video/screen ladders): 2→`[12k, 24k]`, 3→`[12k, 24k, 48k]`.
+/// At n=1 the label is non-numeric — the AQ audio tier, not `AUDIO_LAYER_KBPS[0]`,
+/// sets a single-layer publisher's bitrate. Both non-camera arms IGNORE `camera_top`.
 ///
 /// Kept in lockstep with the AQ / publisher ladders here (the AQ tables are behind a
 /// wasm-only crate); a reviewer must keep them in sync. Pure / host-tested.
-///
-/// Split out so the label logic stays PURE and host-testable: the wrapper's
-/// `camera_ladder_variant()` read needs a browser, which would have dragged this
-/// whole function (and its existing host tests) onto the wasm target.
 pub fn send_layer_labels_with_top(
     kind: PrefMediaKind,
     layer_max: usize,
@@ -1561,38 +1528,18 @@ pub fn send_layer_labels_with_top(
     let n = layer_max.clamp(1, 3);
     match kind {
         PrefMediaKind::Screen => {
-            // Mirrors `simulcast_screen_layer_labels` in the AQ crate (lowest
-            // layer first): 1→[low], 2→[low, high], 3→[low, high, 1440p]. The AQ
-            // names stay spelled out here as the SELECTION's identity; each is
-            // rendered through `screen_display_label` so the strip speaks one
-            // vocabulary (issue #2179 review, UX SF1).
-            match n {
-                1 => vec![screen_display_label("low")],
-                2 => vec![screen_display_label("low"), screen_display_label("high")],
-                _ => vec![
-                    screen_display_label("low"),
-                    screen_display_label("high"),
-                    screen_display_label("1440p"),
-                ],
-            }
+            vec![screen_display_label("native")]
         }
-        PrefMediaKind::Audio => {
-            // AUDIO_LAYER_KBPS = [12, 24, 48] kbps (issue 1768), CONTIGUOUS
-            // lowest-first (no skip): the publisher emits layers 0..n in order.
-            match n {
-                1 => vec!["12k"],
-                2 => vec!["12k", "24k"],
-                _ => vec!["12k", "24k", "48k"],
-            }
-        }
+        PrefMediaKind::Audio => match n {
+            // A single-layer publisher runs at the AQ audio TIER, which the
+            // ladder's base does not describe, so the label carries no bitrate.
+            1 => vec![layer_quality_label(0, 1, false)],
+            2 => vec!["12k", "24k"],
+            _ => vec!["12k", "24k", "48k"],
+        },
         PrefMediaKind::Video => {
-            // Camera ladder via spaced_ladder_positions over the ACTIVE variant's
-            // rungs (issue 1768): 1→[low], 2→[low, top] (skip standard),
-            // 3→[low, standard, top]. The top rung's label depends on the deployed
-            // ladder — 720p by default, 540p under `experimentalReducedLadder` — so
-            // it is resolved from the AQ table rather than hardcoded. Without this
-            // the panel would print a "720p" pip next to a ladder-derived
-            // "180p–540p" span (`send_layer_res_span`) and contradict itself.
+            // Camera ladder via spaced_ladder_positions (issue 1768): 1→[low],
+            // 2→[low, top] (skip standard), 3→[low, standard, top].
             match n {
                 1 => vec!["180p"],
                 2 => vec!["180p", camera_top],
@@ -1887,69 +1834,9 @@ pub fn tier_to_meter_level(index: usize, tier_count: usize) -> u8 {
 /// (unknown RTT, unknown transport, unknown content-staleness).
 pub const SEND_LAYER_DIMS_UNKNOWN: &str = "\u{2014}";
 
-/// Convert a SCREEN tier index into a meter level, scaled to the rungs THIS SHARE
-/// can actually reach rather than to the whole ladder.
-///
-/// Issue #2179 review (UX SF2): the ladder grew to five rungs, but no share has
-/// all five available. `fit_within_preserving_aspect` never upscales, so a 1080p
-/// window's best possible rung is `high` (index 2) — scaling by the full ladder
-/// pinned that sharer at 2 of 4 bars while they were doing everything their source
-/// allows, and collapsed `medium` and `low` onto the same single bar. Scaling by
-/// `best_source..=worst` makes FULL bars mean "the best rung this source allows"
-/// and keeps the degraded rungs distinguishable from each other.
-///
-/// `best_source` is the share's PERSISTENT quality ceiling — the best rung this
-/// share may ever reach, composing the captured source's size, the sender's core
-/// count, and (single-stream only) the stream-count cap. The encoder resolves it
-/// with `resolve_screen_tier_ceiling` and publishes it on
-/// `ScreenQualitySnapshot::best_source_tier_index`. It is clamped into the ladder
-/// here, and a `tier_index` BETTER than it (possible for a tick while a source
-/// re-resolve is in flight) saturates at full bars rather than underflowing the
-/// subtraction.
-///
-/// # Why REACHABLE and not DESERVED (issue #2179 review round 2)
-/// The snapshot carries a second rung, `source_tier_index` — what the captured
-/// surface alone needs, ignoring CPU class and stream count. The two diverge
-/// exactly when the sender's hardware or stream count binds, and they drive
-/// DIFFERENT surfaces on purpose:
-/// - this METER uses `best_source_tier_index`, so a share pinned by its machine
-///   reads FULL bars. The bar answers "are you getting everything this share can
-///   give?", and blaming a user's laptop on a quality meter they cannot act on is
-///   noise;
-/// - the receiver's "constrained" Cause line keys off `source_tier_index`, so the
-///   same share DOES get a badge — usually `ladder-limited` since review round 3
-///   capped every path at the publish ladder's 1440p top, or `cpu-pressure` when
-///   the sender's device class is the binding term. That line answers "is
-///   anything being withheld from what this screen needs?" — a different question
-///   with a different honest answer.
-///
-/// A hardware-capped share therefore reads full bars AND shows a cause. That is
-/// not a contradiction; it is two questions. Pinned by
-/// `screen_meter_uses_the_reachable_rung_not_the_deserved_one`.
-///
-/// The numeric readout beneath the meter is deliberately NOT rescaled by any of
-/// this — it keeps reporting the ACTIVE TIER's own numbers, so the bar answers
-/// "how close to this share's best?" while the text answers "what tier is it on?".
-///
-/// Be precise about what that text is: `format_screen_readout` prints
-/// `ScreenQualitySnapshot`'s `width` / `height` / `fps` / `ideal_kbps`, and
-/// `live_screen_snapshot` fills all four from `SCREEN_QUALITY_TIERS[tier_index]`.
-/// They are the tier's NOMINAL parameters, not a measured encode. On the
-/// single-stream path that is also the encoder's configuration. On the SIMULCAST
-/// path it is not: the published rungs come from `simulcast_screen_layers`, and
-/// the base layer takes its dimensions from the tier but its BITRATE from ladder
-/// rung 0 (`low`, 500 kbps), so the printed kbps is the tier's ideal rather than
-/// what layer 0 is budgeted. That mismatch is pre-existing and outside this
-/// change (it is being tracked as a separate follow-up on the simulcast
-/// base-layer geometry contract) — recorded here so nobody reads this readout as
-/// a measurement. Pure / host-tested.
-pub fn screen_meter_level(tier_index: usize, best_source: usize, ladder_len: usize) -> u8 {
-    let worst = ladder_len.saturating_sub(1);
-    let best = best_source.min(worst);
-    // `worst - best` cannot underflow: `best` was just clamped to `worst`.
-    let reachable = worst - best + 1;
-    tier_to_meter_level(tier_index.saturating_sub(best), reachable)
-}
+/// The SCREEN meter level while a share is live: full. Not sharing is
+/// [`EMPTY_METER_LEVEL`].
+pub const SCREEN_LIVE_METER_LEVEL: u8 = MAX_METER_LEVEL;
 
 /// Format the video readout line for the meter: `{w}x{h}·{fps}fps·{kbps}kbps`.
 /// Pure so the readout text is host-tested.
@@ -1974,12 +1861,22 @@ pub fn format_audio_readout(snap: &LiveQualitySnapshot) -> String {
 }
 
 /// Format the screen readout line: `{w}x{h}·{fps}fps·{kbps}kbps` (same shape as
-/// video). Pure.
+/// video), with a ` · capped` suffix when the shared surface was larger than the
+/// encode ceiling. Pure.
+///
+/// Unknown geometry renders [`SEND_LAYER_DIMS_UNKNOWN`] rather than `0x0`.
 pub fn format_screen_readout(snap: &ScreenQualitySnapshot) -> String {
-    format!(
-        "{}x{}·{}fps·{}kbps",
-        snap.width, snap.height, snap.fps, snap.ideal_kbps
-    )
+    let dims = if snap.width > 0 && snap.height > 0 {
+        format!("{}x{}", snap.width, snap.height)
+    } else {
+        SEND_LAYER_DIMS_UNKNOWN.to_string()
+    };
+    let line = format!("{dims}·{}fps·{}kbps", snap.fps, snap.target_bitrate_kbps);
+    if snap.capture_capped {
+        format!("{line} · capped")
+    } else {
+        line
+    }
 }
 
 /// Empty-state meter level: 0 = all bars unlit (no signal), distinct from a
@@ -2032,19 +1929,8 @@ pub fn gauge_state_from_snapshot(
             AUDIO_EMPTY_READOUT.to_string(),
         ),
     };
-    // The SCREEN meter is SOURCE-relative (issue #2179 review, UX SF2): its
-    // denominator is the rungs this share can reach, not the whole ladder. The
-    // video/audio meters stay ladder-relative — a camera can be asked for any
-    // rung, so their full ladder IS reachable.
     let (screen_level, screen_text) = match screen {
-        Some(s) => (
-            screen_meter_level(
-                s.tier_index,
-                s.best_source_tier_index,
-                SCREEN_TIER_LABELS.len(),
-            ),
-            format_screen_readout(s),
-        ),
+        Some(s) => (SCREEN_LIVE_METER_LEVEL, format_screen_readout(s)),
         None => (EMPTY_METER_LEVEL, SCREEN_EMPTY_READOUT.to_string()),
     };
     GaugeState {
@@ -3173,8 +3059,8 @@ pub struct PeerKindSnap {
 const HELP_PERF_INTRO: &str = "Each stream adapts to your connection automatically. Limit what you RECEIVE (saves your download) and what you SEND (saves your upload + CPU). For sending, the base layer is always sent so every viewer can see you; the right handle sets the highest layer you publish — how many layers you send. For receiving, the two handles bound the quality you'll accept. Reset returns to the full automatic range. The meter shows what's flowing right now.";
 
 const HELP_VIDEO_SEND: &str = "Your camera sends several quality versions ('layers') so each viewer gets the best one their connection can handle. The base layer is ALWAYS sent (so every viewer can always see you); the right handle sets the HIGHEST layer you publish — i.e. how many layers you send. Lower it to send fewer top layers (saves your upload + CPU); raise it to send more, up to your device's limit. The encoder still adapts quality within what you allow. Reset returns to the full automatic ladder.";
-const HELP_AUDIO_SEND: &str = "Your mic sends several audio quality versions ('layers') so each listener gets the best one their connection can handle. The base layer is ALWAYS sent (so everyone can always hear you); the right handle sets the HIGHEST audio layer you publish — i.e. how many layers you send. Lower it to send fewer top layers (saves your upload); raise it to send more, up to the audio ladder's limit. Reset returns to the full automatic ladder.";
-const HELP_CONTENT_SEND: &str = "When you share your screen, the base layer is ALWAYS sent so every viewer can follow along. The right handle sets the HIGHEST layer you publish — how many sharpness layers you send. Lower it to send fewer top layers when your upload is tight; raise it for text-heavy screens, up to your device's limit. Reset returns to the full automatic ladder.";
+const HELP_AUDIO_SEND: &str = "Your mic sends a single audio stream, and its bitrate adapts to your connection automatically. There are no quality layers to choose between, so there is nothing to set here.";
+const HELP_CONTENT_SEND: &str = "When you share your screen it is sent as a single stream at the resolution of the window or screen you picked, up to 2560x1440. There are no sharpness layers to choose between, so there is nothing to set here.";
 
 /// The unified Performance settings panel body (#1095 redesign). Three stacked
 /// per-kind cards (Video / Audio / Content), each split into a **Sending** column
@@ -3216,8 +3102,7 @@ pub fn PerformanceSettingsPanel(
     // compile and render a 1-rung (no-op) layer control.
     #[props(default = 1)] video_layer_max: usize,
     #[props(default = 1)] screen_layer_max: usize,
-    /// Audio's effective ladder depth (NOT CPU-clamped — audio encode is cheap),
-    /// typically the full audio ladder even on weak runners.
+    /// Audio's published layer count.
     #[props(default = 1)]
     audio_layer_max: usize,
     /// Whether the MIC is currently capturing (threaded from `host.rs`'s
@@ -3546,10 +3431,9 @@ pub fn peers_for_kind(peers: &[PeerReceiveDiag], kind: PrefMediaKind) -> Vec<Pee
 // ══════════════════════════════════════════════════════════════════════════
 pub mod receive {
     use super::{
-        format_receive_spread, layer_quality_label, level_from_fraction, peer_row_aria_label,
-        peer_row_metric, quality_state_glyph, quality_state_modifier, reason_chip_modifier,
-        reason_chip_text, reason_chip_title, tick_offsets, write_meter_level, write_readout_text,
-        PeerKindSnap,
+        format_receive_spread, level_from_fraction, peer_row_aria_label, peer_row_metric,
+        quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
+        reason_chip_title, tick_offsets, write_meter_level, write_readout_text, PeerKindSnap,
     };
     use dioxus::prelude::*;
     // issue 1164: `WebEventExt::as_web_event` lets the <details> ontoggle handler
@@ -3557,9 +3441,7 @@ pub mod receive {
     // elsewhere in this crate (diagnostics.rs, attendants.rs, home.rs).
     use dioxus::web::WebEventExt;
     use std::rc::Rc;
-    use videocall_client::{
-        max_layers_for_kind, quality_state, PrefMediaKind, ReceivedLayerSnapshot,
-    };
+    use videocall_client::{quality_state, PrefMediaKind, ReceivedLayerSnapshot};
     use wasm_bindgen::JsCast;
 
     /// A cloneable, `PartialEq`-able handle around the per-kind received-snapshot
@@ -3615,33 +3497,9 @@ pub mod receive {
     /// each old index maps to the highest current rung whose ideal bitrate does not
     /// exceed the old rung's.
     ///
-    /// * `0` (`low`, 500) → `0` (`low`, 500) — same rung, same index.
-    /// * `1` (`medium`, 1200) → `0` (`low`, 500) — the current ladder has no 720p
-    ///   rung above `low`, and the next rung up (`high`, 2500) is more than double
-    ///   what the user accepted, so this rounds DOWN. Note this costs no
-    ///   RESOLUTION: `medium` and `low` are both 1280x720 in `SCREEN_QUALITY_TIERS`
-    ///   and differ only in fps / bitrate budget, so the rung the user sees is the
-    ///   same size, just cheaper. The slider shows the new position either way, so
-    ///   a user who wants more can raise it.
-    ///
-    /// Applied to BOTH ends. On `max` (the cap) rounding down is obviously the safe
-    /// direction. On `min` (the floor) it means the receiver will now accept a
-    /// cheaper layer than it used to — also a bandwidth REDUCTION, and the only
-    /// alternative (mapping `min` 1 → 1) would raise the floor's bitrate from 1200
-    /// to 2500, which is precisely the silent doubling this migration exists to
-    /// prevent.
-    /// * `2` (`high`, 2500) → `1` (`high`, 2500) — same rung, new index. This is the
-    ///   silent-doubling case: left alone, index 2 would now mean 1440p at 5000 kbps.
-    /// * anything else — outside the old 3-rung ladder, so there is no rung to
-    ///   preserve: drop to `None` (Auto), which is what `sanitized` would do anyway.
-    ///
-    /// Monotone non-decreasing, so a stored `min <= max` still holds afterwards.
-    /// The bitrate promise is pinned against the production AQ tables by
-    /// `migrated_screen_rung_never_costs_more_than_the_v0_rung`. Pure / host-tested.
     pub fn migrate_screen_index_v0_to_v1(old: u32) -> Option<u32> {
         match old {
-            0 | 1 => Some(0),
-            2 => Some(1),
+            0..=2 => Some(0),
             _ => None,
         }
     }
@@ -3841,34 +3699,23 @@ pub mod receive {
     /// hd = 1280×720 (720p). The middle "360p" is `simulcast_layers(3)[1]`, the
     /// "standard" tier at 640×360.
     ///
-    /// **The TOP entry is variant-dependent** (issue #2156): under
-    /// `experimentalReducedLadder` the camera top rung is 960×540, so the top label
-    /// must read `"540p"`. Do NOT read this table directly for a top-rung label —
-    /// go through [`index_label`] (which resolves the deployment's ladder) or
-    /// [`index_label_with_top`] (pure, variant-explicit). Rungs 0 and 1 are
-    /// byte-identical across variants, deliberately: #1768 lowered only the top.
+    /// Do NOT read this table directly for a TOP-rung label — go through
+    /// [`index_label`], which resolves the top rung from the AQ ladder.
     pub const VIDEO_LAYER_LABELS: [&str; 3] = ["180p", "360p", "720p"];
 
-    /// Screen receive layer labels, index 0 = lowest … 2 = highest.
-    ///
-    /// These mirror `videocall_aq::simulcast_screen_layers(3)`, lowest-first.
-    /// Issue #2179 re-spaced that ladder by RESOLUTION — `low` (1280x720),
-    /// `high` (1920x1080), `1440p` (2560x1440) — replacing the old
-    /// `[low, medium, high]`, whose bottom two rungs were both 1280x720 and
-    /// whose top rung capped a screen receiver at 1080p. Pinned against the
-    /// publisher's ladder by `screen_receive_layer_labels_mirror_the_aq_ladder`.
-    ///
-    /// These are the ladder's IDENTITY (the AQ rung names), NOT what the panel
-    /// renders: [`index_label`] maps each through [`super::screen_display_label`],
-    /// so the slider, its end labels and its `aria-valuetext` read
-    /// `720p / 1080p / 1440p` (issue #2179 review, UX SF1). Read this table
-    /// directly only when you want the AQ name.
-    pub const SCREEN_LAYER_LABELS: [&str; 3] = ["low", "high", "1440p"];
+    /// Screen receive layer labels: one rung, pinned by
+    /// `screen_receive_layer_labels_mirror_the_aq_ladder`. The AQ rung NAME —
+    /// [`index_label`] maps it for display.
+    pub const SCREEN_LAYER_LABELS: [&str; 1] = ["native"];
 
-    /// Audio receive layer labels, index 0 = low (12k) … 2 = high (48k).
-    /// Three rungs to match the publisher's audio ladder (#1082; retuned lighter
-    /// in issue 1768 to 12 / 24 / 48 kbps).
-    pub const AUDIO_LAYER_LABELS: [&str; 3] = ["low (12k)", "mid (24k)", "high (48k)"];
+    /// Audio receive layer labels: ONE rung, mirroring [`SCREEN_LAYER_LABELS`].
+    ///
+    /// This length is [`top_index`]'s only input for audio, so a single entry is what
+    /// keeps `thumbs_to_bounds` from ever emitting a receive `min` above 0 and makes
+    /// [`ReceivePreference::sanitized`] drop a persisted one. A receive `min` of 1 or 2
+    /// against a one-layer publisher silences that peer outright: `KindLayerBounds::clamp`
+    /// RAISES to `min`, and the decode path drops every layer whose id differs.
+    pub const AUDIO_LAYER_LABELS: [&str; 1] = ["as sent"];
 
     /// The labels for a media kind.
     pub fn labels_for(kind: PrefMediaKind) -> &'static [&'static str] {
@@ -3891,25 +3738,12 @@ pub mod receive {
 
     /// Map a layer index to its label for a kind, or `"?"` if out of range.
     ///
-    /// The VIDEO top rung's label is resolved from the DEPLOYMENT's camera ladder
-    /// (issue #2156), so a `experimentalReducedLadder` deployment reads `"540p"`
-    /// where the shipped ladder reads `"720p"`. Browser-only for that reason (it
-    /// calls [`super::active_camera_top_rung_label`], which reads
-    /// `window.__APP_CONFIG`); the pure, host-testable half is
-    /// [`index_label_with_top`]. The lookup is memoized, so this stays cheap on the
-    /// panel's ~4 Hz render path.
+    /// The VIDEO top rung's label comes from [`super::active_camera_top_rung_label`],
+    /// not from [`VIDEO_LAYER_LABELS`].
     ///
     /// The camera top-rung label is resolved ONLY for [`PrefMediaKind::Video`] — the
     /// Audio and Screen arms ignore it, so resolving it eagerly for them would be pure
-    /// waste on the render path AND would make the Audio-only callers (the peer-row
-    /// audio label in `signal_quality.rs`) browser-bound for no reason. Same shape as
-    /// [`super::send_layer_labels`].
-    ///
-    /// # Panics
-    ///
-    /// Panics on a non-wasm target when `kind` is [`PrefMediaKind::Video`], because
-    /// the implicit top-rung lookup reads browser runtime config. Native callers
-    /// should use [`index_label_with_top`].
+    /// waste on the render path. Same shape as [`super::send_layer_labels`].
     pub fn index_label(kind: PrefMediaKind, index: u32) -> &'static str {
         let camera_top = match kind {
             PrefMediaKind::Video => super::active_camera_top_rung_label(),
@@ -3938,9 +3772,6 @@ pub mod receive {
     /// allocation) because `camera_top` is itself `&'static` — the labels come from
     /// [`super::camera_top_rung_label`]'s fixed match arms.
     ///
-    /// `layer_count` / `top_index` need no variant: the two camera ladders are the
-    /// same DEPTH, asserted at compile time in `videocall-aq`
-    /// (`SIMULCAST_VIDEO_LAYERS_REDUCED.len() == SIMULCAST_VIDEO_LAYERS.len()`).
     pub fn index_label_with_top(
         kind: PrefMediaKind,
         index: u32,
@@ -3950,7 +3781,6 @@ pub mod receive {
         let Some(label) = labels.get(index as usize).copied() else {
             return "?";
         };
-        // Only the camera ladder's TOP rung moves with the variant.
         if matches!(kind, PrefMediaKind::Video) && index as usize == labels.len() - 1 {
             return camera_top;
         }
@@ -3990,6 +3820,13 @@ pub mod receive {
         }
     }
 
+    /// Off Auto with a MULTI-position ladder collapsed onto one layer. A one-position
+    /// ladder has nothing to collapse, and `at_full_range` hides the Reset there.
+    pub fn shows_fixed_badge(kind: PrefMediaKind, sub: KindReceivePref) -> bool {
+        let sel = bounds_to_thumbs(kind, sub.min, sub.max);
+        !sub.auto && sel.min_pos == sel.max_pos && top_index(kind) > 0
+    }
+
     /// Derive a kind's `(min, max)` bounds from its slider thumbs. A thumb at its
     /// extreme means "no bound" (`None`) on that end. Both extremes →
     /// `(None, None)` (full range = Auto).
@@ -4026,15 +3863,9 @@ pub mod receive {
 
     /// Concrete span text for the slider readout, e.g. `"180p – 540p"`.
     ///
-    /// Resolves the VIDEO top rung from the deployment's camera ladder (issue #2156),
-    /// so the visible band never contradicts the rung labels beside it. Browser-bound
-    /// for that reason; the pure, variant-explicit form is [`span_text_with_top`].
-    ///
-    /// # Panics
-    ///
-    /// Panics on a non-wasm target when `kind` is [`PrefMediaKind::Video`], because
-    /// the implicit top-rung lookup reads browser runtime config. Native callers
-    /// should use [`span_text_with_top`].
+    /// Resolves the VIDEO top rung from the camera ladder, so the visible band never
+    /// contradicts the rung labels beside it. The form that takes the top label
+    /// explicitly is [`span_text_with_top`].
     pub fn span_text(kind: PrefMediaKind, sel: RangeSel) -> String {
         let camera_top = match kind {
             PrefMediaKind::Video => super::active_camera_top_rung_label(),
@@ -4088,20 +3919,17 @@ pub mod receive {
     }
 
     /// Format the readout line for a received snapshot. Video/screen show
-    /// `"{Q} · {i+1}/{n} · {w}x{h}"`; audio shows `"{Q} · {i+1}/{n} · {kbps} kbps"`,
-    /// where `{Q}` is the quality letter (L/M/H via [`super::layer_quality_label`]).
-    /// Pure.
+    /// `"{Q} · {i+1}/{n} · {w}x{h}"`; audio shows `"{Q} · {i+1}/{n} · {kbps} kbps"`.
+    /// A peer publishing ONE rung has no position to report, so the line is just
+    /// the detail — `"1400x700"`. See [`super::layer_position_suffix`]. Pure.
     pub fn format_readout(snap: &ReceivedLayerSnapshot) -> String {
-        let layer = snap.layer_index + 1;
-        let q = layer_quality_label(snap.layer_index, snap.layer_count, true);
-        match snap.kind {
-            PrefMediaKind::Audio => {
-                format!("{q} · {layer}/{} · {} kbps", snap.layer_count, snap.kbps)
-            }
-            _ => format!(
-                "{q} · {layer}/{} · {}x{}",
-                snap.layer_count, snap.width, snap.height
-            ),
+        let detail = match snap.kind {
+            PrefMediaKind::Audio => super::format_recv_audio_kbps(snap.kbps, " kbps"),
+            _ => format!("{}x{}", snap.width, snap.height),
+        };
+        match super::layer_position_suffix(snap.layer_index, snap.layer_count) {
+            Some(pos) => format!("{pos} · {detail}"),
+            None => detail,
         }
     }
 
@@ -4212,7 +4040,7 @@ pub mod receive {
                 help_testid: TESTID_SCREEN_HELP,
                 vu_testid: TESTID_VU_SCREEN,
                 vu_label: "Receiving shared content",
-                help_body: "You pull the sharpest screen-share layer the presenter offers that fits your download. The left handle sets the lowest quality you'll accept (floor), the right handle the highest (ceiling); it adapts within that band. Reset returns to the full automatic range.",
+                help_body: "A presenter shares one stream at the resolution of the window or screen they picked, so there is no range of layers to choose between and nothing to set here.",
                 id_prefix: "perf-recv-screen",
             },
         }
@@ -4397,8 +4225,7 @@ pub mod receive {
         let meta = recv_meta(kind);
         let sel = bounds_to_thumbs(kind, sub.min, sub.max);
         let range_str = span_text(kind, sel);
-        // Fixed = manual (not Auto) AND both thumbs collapsed to one layer.
-        let is_fixed = !sub.auto && sel.min_pos == sel.max_pos;
+        let is_fixed = shows_fixed_badge(kind, sub);
         // Reset is shown IFF the thumbs are NOT at both extremes (#1131 §D), driven
         // by POSITIONS (not the `auto` flag), so dragging both back to the ends
         // hides it live. `top_index` is the receive ladder's last position.
@@ -4409,20 +4236,23 @@ pub mod receive {
         );
         let (vu_meter_id, vu_readout_id) = meter_ids(kind);
 
-        // §3 per-peer disclosure data (issue #1131). `full_ladder_len` is the
-        // FULL ladder size for this kind (the color basis + the `L i / n`
-        // denominator), NOT the empirically-learned per-peer count. The aggregate
-        // summary reuses `format_receive_spread` over the per-peer layer indices.
-        let full_ladder_len = max_layers_for_kind(kind);
+        // The aggregate spread is scaled by this kind's RECEIVE ladder, so a
+        // single-rung kind reports no spread rather than the ladder's worst letter.
+        let full_ladder_len = layer_count(kind);
         let peer_count = peers.len();
         let spread = format_receive_spread(
             &peers.iter().map(|p| p.snap.layer_index).collect::<Vec<_>>(),
             full_ladder_len,
         );
-        let agg = if peer_count == 1 {
-            format!("1 peer · {spread}")
+        let peers_noun = if peer_count == 1 {
+            "1 peer".to_string()
         } else {
-            format!("{peer_count} peers · {spread}")
+            format!("{peer_count} peers")
+        };
+        let agg = if spread.is_empty() {
+            peers_noun
+        } else {
+            format!("{peers_noun} · {spread}")
         };
         let id_prefix = meta.id_prefix;
 
@@ -4570,9 +4400,7 @@ pub mod receive {
                                     PeerRow {
                                         key: "{p.session_id}",
                                         id_prefix,
-                                        kind,
                                         stream_noun,
-                                        full_ladder_len,
                                         peer: p.clone(),
                                     }
                                 }
@@ -4590,26 +4418,16 @@ pub mod receive {
     /// chip. The whole row carries a full-sentence `aria-label` so color is never
     /// the sole signal.
     #[component]
-    fn PeerRow(
-        id_prefix: &'static str,
-        kind: PrefMediaKind,
-        stream_noun: &'static str,
-        full_ladder_len: u32,
-        peer: PeerKindSnap,
-    ) -> Element {
+    fn PeerRow(id_prefix: &'static str, stream_noun: &'static str, peer: PeerKindSnap) -> Element {
         let snap = peer.snap;
-        let q = quality_state(snap.layer_index, full_ladder_len);
+        let q = quality_state(snap.layer_index, snap.layer_count);
         let q_mod = quality_state_modifier(q);
         let q_glyph = quality_state_glyph(q);
-        // Audio rung label for the metric ("low (12k)"/"mid (24k)"/"high (48k)").
+        // Audio rung label for the metric ("as sent").
         let audio_label = index_label(PrefMediaKind::Audio, snap.layer_index);
-        let metric = peer_row_metric(&snap, full_ladder_len, audio_label);
+        let metric = peer_row_metric(&snap, audio_label);
         // The human res/bitrate detail used inside the aria sentence.
-        let res_or_bitrate = if matches!(kind, PrefMediaKind::Audio) {
-            format!("{}k", snap.kbps)
-        } else {
-            super::format_send_layer_short(snap.width, snap.height)
-        };
+        let res_or_bitrate = super::peer_row_res_or_bitrate(&snap);
         let aria = peer_row_aria_label(
             &peer.label,
             // `stream_noun` is the spoken kind ("video"/"audio"/"shared content").
@@ -4617,7 +4435,7 @@ pub mod receive {
             q,
             &res_or_bitrate,
             snap.layer_index + 1,
-            full_ladder_len,
+            snap.layer_count,
             snap.reason,
         );
         let session_id = peer.session_id;
@@ -4657,12 +4475,12 @@ pub mod receive {
 
         #[test]
         fn layer_counts_and_top_index_per_kind() {
-            // Audio is now 3 rungs to match the publisher ladder (#1082).
             assert_eq!(layer_count(PrefMediaKind::Video), 3);
-            assert_eq!(layer_count(PrefMediaKind::Screen), 3);
-            assert_eq!(layer_count(PrefMediaKind::Audio), 3);
+            assert_eq!(layer_count(PrefMediaKind::Screen), 1);
+            assert_eq!(top_index(PrefMediaKind::Screen), 0);
             assert_eq!(top_index(PrefMediaKind::Video), 2);
-            assert_eq!(top_index(PrefMediaKind::Audio), 2);
+            assert_eq!(layer_count(PrefMediaKind::Audio), 1);
+            assert_eq!(top_index(PrefMediaKind::Audio), 0);
         }
 
         /// The RECEIVE panel's screen ladder must name the same rungs the
@@ -4679,107 +4497,86 @@ pub mod receive {
             );
         }
 
-        /// Issue #2156: the public `index_label` reads `window.__APP_CONFIG` for the
-        /// camera top rung, so the host suite exercises the PURE form. `"720p"` here
-        /// is the shipped ladder's top — the same value
-        /// `active_camera_top_rung_label()` resolves with the flag OFF.
+        /// `"720p"` is the shipped ladder's top rung, i.e. what
+        /// `active_camera_top_rung_label()` resolves to.
         #[test]
         fn index_label_receive_convention_not_inverted() {
             let index_label = |kind, i| index_label_with_top(kind, i, "720p");
             // index 0 = LOWEST quality (left), top index = HIGHEST (right).
             assert_eq!(index_label(PrefMediaKind::Video, 0), "180p");
             assert_eq!(index_label(PrefMediaKind::Video, 2), "720p");
-            // SCREEN renders the display vocabulary, not the AQ rung names
-            // (issue #2179 review): rung 0 is AQ `low`, a 1280x720 rung → "720p".
-            assert_eq!(index_label(PrefMediaKind::Screen, 0), "720p");
-            assert_eq!(index_label(PrefMediaKind::Screen, 1), "1080p");
-            assert_eq!(index_label(PrefMediaKind::Screen, 2), "1440p");
-            assert_eq!(index_label(PrefMediaKind::Audio, 0), "low (12k)");
-            assert_eq!(index_label(PrefMediaKind::Audio, 1), "mid (24k)");
-            assert_eq!(index_label(PrefMediaKind::Audio, 2), "high (48k)");
+            assert_eq!(index_label(PrefMediaKind::Screen, 0), "Native");
+            assert_eq!(index_label(PrefMediaKind::Screen, 1), "?");
+            assert_eq!(index_label(PrefMediaKind::Audio, 0), "as sent");
+            assert_eq!(index_label(PrefMediaKind::Audio, 1), "?");
             assert_eq!(index_label(PrefMediaKind::Audio, 5), "?");
+            // No audio label may name a ladder bitrate: it is not the rate a
+            // publisher sends. Nominals from the production table.
+            for layer in 0..3u32 {
+                let nominal =
+                    videocall_client::decode::layer_chooser::audio_layer_kbps(layer).unwrap();
+                let label = index_label(PrefMediaKind::Audio, layer);
+                assert!(
+                    !label.contains(&format!("{nominal}k")),
+                    "audio label {label:?} names ladder bitrate {nominal}k"
+                );
+            }
         }
 
-        /// Issue #2156 — the CORE of the fix. Under `experimentalReducedLadder` the
-        /// receive VIDEO top rung must read `"540p"`, and ONLY the top rung may move.
-        ///
-        /// The expected top labels are derived from the AQ tables via the SAME
-        /// production fn the browser half uses (`camera_top_rung_label` over
-        /// `simulcast_layers_for`), so this cannot drift from the real ladders — and
-        /// the two arms are asserted DIFFERENT, so a `index_label_with_top` that
-        /// ignored `camera_top` fails.
+        /// The receive VIDEO top-rung label comes from the CAMERA LADDER, not the
+        /// `VIDEO_LAYER_LABELS` const table, and only the top rung is substituted.
         ///
         /// MUTATION: drop the `index as usize == labels.len() - 1` branch from
-        /// `index_label_with_top` (returning the table entry unconditionally) and the
-        /// reduced-arm top assertion fails.
+        /// `index_label_with_top` and the substituted assertion fails.
         #[test]
-        fn reduced_ladder_moves_only_the_receive_video_top_label() {
+        fn receive_video_top_label_comes_from_the_camera_ladder() {
             use videocall_client::adaptive_quality_constants::{
-                simulcast_layers_for, LadderVariant, SIMULCAST_MAX_LAYERS,
+                simulcast_layers, SIMULCAST_MAX_LAYERS,
             };
-            let top_label_for = |variant| {
-                let ladder = simulcast_layers_for(SIMULCAST_MAX_LAYERS, variant);
-                super::super::camera_top_rung_label(
-                    ladder.last().map(|t| t.max_height).unwrap_or(720),
-                )
-            };
-            let shipped = top_label_for(LadderVariant::Default);
-            let reduced = top_label_for(LadderVariant::Reduced);
+            let ladder = simulcast_layers(SIMULCAST_MAX_LAYERS);
+            let shipped = super::super::camera_top_rung_label(
+                ladder.last().map(|t| t.max_height).unwrap_or(720),
+            );
             assert_eq!(shipped, "720p", "the shipped camera top rung is 1280x720");
-            assert_eq!(
-                reduced, "540p",
-                "issue 1768's reduced camera top rung is 960x540"
-            );
-            assert_ne!(
-                shipped, reduced,
-                "if these agree the whole issue 2156 fix is unobservable"
-            );
 
-            // TOP rung: follows the variant. This is the `720p`-vs-`540p` slider end
-            // label / aria-valuetext the issue reports.
+            // A different top label, so the substitution is observable.
+            let other = "540p";
+
+            assert_ne!(shipped, other, "the fixture must discriminate");
             assert_eq!(
                 index_label_with_top(PrefMediaKind::Video, 2, shipped),
                 "720p"
             );
-            assert_eq!(
-                index_label_with_top(PrefMediaKind::Video, 2, reduced),
-                "540p"
-            );
+            assert_eq!(index_label_with_top(PrefMediaKind::Video, 2, other), "540p");
 
-            // NON-top rungs: identical across variants (#1768 lowered only the top).
             for idx in 0..2u32 {
                 assert_eq!(
                     index_label_with_top(PrefMediaKind::Video, idx, shipped),
-                    index_label_with_top(PrefMediaKind::Video, idx, reduced),
-                    "video rung {idx} must not move with the ladder variant"
+                    index_label_with_top(PrefMediaKind::Video, idx, other),
+                    "video rung {idx} must not take the camera_top label"
                 );
             }
 
-            // SCREEN + AUDIO ignore `camera_top` entirely — their ladders are
-            // untouched by #1768. Guards the over-fix the issue explicitly warns off.
             for kind in [PrefMediaKind::Screen, PrefMediaKind::Audio] {
                 for idx in 0..3u32 {
                     assert_eq!(
                         index_label_with_top(kind, idx, shipped),
-                        index_label_with_top(kind, idx, reduced),
-                        "{kind:?} rung {idx} must be variant-invariant"
+                        index_label_with_top(kind, idx, other),
+                        "{kind:?} rung {idx} must ignore camera_top"
                     );
                 }
             }
 
-            // Out-of-range still degrades to "?" under either variant.
-            assert_eq!(index_label_with_top(PrefMediaKind::Video, 9, reduced), "?");
+            assert_eq!(index_label_with_top(PrefMediaKind::Video, 9, other), "?");
         }
 
-        /// The visible band readout must agree with the rung labels beside it under
-        /// BOTH variants (surface 4 in #2156). A partial fix that updated
-        /// `index_label` but left `span_text` reading the const table would render
-        /// "180p – 720p" next to a "540p" end label.
+        /// The visible band readout must agree with the rung labels beside it.
         ///
         /// MUTATION: make `span_text_with_top` call `index_label` (the const-table
-        /// path) instead of `index_label_with_top` and the reduced assertion fails.
+        /// path) instead of `index_label_with_top` and the substituted assertions
+        /// fail.
         #[test]
-        fn span_text_follows_the_camera_ladder_variant() {
+        fn span_text_follows_the_supplied_camera_top_label() {
             let full = RangeSel {
                 min_pos: 0,
                 max_pos: 2,
@@ -4871,13 +4668,13 @@ pub mod receive {
                     max_pos: 2
                 }
             );
-            // Audio also 3 rungs now → 0..2.
+            // Audio is single-rung, so both thumbs collapse onto position 0.
             let sel_a = bounds_to_thumbs(PrefMediaKind::Audio, None, None);
             assert_eq!(
                 sel_a,
                 RangeSel {
                     min_pos: 0,
-                    max_pos: 2
+                    max_pos: 0
                 }
             );
         }
@@ -4904,11 +4701,8 @@ pub mod receive {
             );
         }
 
-        /// Issue #2156: `span_text` now reads the deployment config for the camera
-        /// top rung, so the host suite drives the pure `span_text_with_top`. `"720p"`
-        /// is what `active_camera_top_rung_label()` resolves with the flag OFF (the
-        /// production default); `span_text_follows_the_camera_ladder_variant` covers
-        /// the flag-ON arm.
+        /// `"720p"` is what `active_camera_top_rung_label()` resolves to;
+        /// `span_text_follows_the_supplied_camera_top_label` covers the substitution.
         #[test]
         fn span_text_renders_concrete_endpoints() {
             let span_text = |kind, sel| span_text_with_top(kind, sel, "720p");
@@ -4937,10 +4731,10 @@ pub mod receive {
                     PrefMediaKind::Audio,
                     RangeSel {
                         min_pos: 0,
-                        max_pos: 2
+                        max_pos: 0
                     }
                 ),
-                "low (12k) – high (48k)"
+                "as sent"
             );
         }
 
@@ -4996,7 +4790,7 @@ pub mod receive {
                     auto: false,
                 },
                 audio: KindReceivePref {
-                    min: Some(0),
+                    min: Some(2),
                     max: Some(7),
                     auto: false,
                 },
@@ -5006,8 +4800,86 @@ pub mod receive {
             assert_eq!(clean.video.min, None); // 9 > top(2) dropped
             assert_eq!(clean.video.max, Some(1)); // kept
             assert!(!clean.video.auto);
-            assert_eq!(clean.audio.min, Some(0)); // kept (0 <= top(2))
-            assert_eq!(clean.audio.max, None); // 7 > top(2) dropped
+            // A stored audio `min` is dropped on load, with no version bump.
+            assert_eq!(clean.audio.min, None);
+            assert_eq!(clean.audio.max, None);
+        }
+
+        /// No route from the receive UI or from storage may produce an audio receive
+        /// `min` above the base layer.
+        #[test]
+        fn receive_audio_bounds_can_never_exceed_the_base() {
+            // The slider cannot express a higher floor: its `max` attribute is
+            // `top_index`, and both thumb setters clamp into `0..=max_pos`.
+            assert_eq!(top_index(PrefMediaKind::Audio), 0);
+            for pos in 0..4u32 {
+                let sel = set_min_thumb(
+                    RangeSel {
+                        min_pos: 0,
+                        max_pos: 0,
+                    },
+                    pos,
+                );
+                assert_eq!(
+                    thumbs_to_bounds(PrefMediaKind::Audio, sel).0,
+                    None,
+                    "thumb position {pos} produced an audio receive min"
+                );
+            }
+            // And a pref persisted before #2279 is dropped on load, not carried.
+            for stored_min in [1u32, 2] {
+                let poisoned = ReceivePreference {
+                    version: RECEIVE_PREF_VERSION,
+                    audio: KindReceivePref {
+                        min: Some(stored_min),
+                        max: None,
+                        auto: false,
+                    },
+                    ..ReceivePreference::default()
+                };
+                let clean = poisoned.migrated().sanitized();
+                assert_eq!(
+                    clean.audio.min, None,
+                    "a persisted audio min of {stored_min} survived load"
+                );
+                assert_eq!(clean.effective_bounds(PrefMediaKind::Audio), (None, None));
+                assert!(
+                    !clean.audio.auto,
+                    "premise: `sanitized` carries the manual flag, so nothing is pinned \
+                     while the flag still reads manual"
+                );
+                assert!(
+                    !shows_fixed_badge(PrefMediaKind::Audio, clean.audio),
+                    "an unpinnable audio ladder claimed a user pin"
+                );
+            }
+        }
+
+        #[test]
+        fn a_one_position_ladder_never_shows_the_fixed_badge() {
+            let pinned = KindReceivePref {
+                min: Some(0),
+                max: Some(0),
+                auto: false,
+            };
+            for kind in [PrefMediaKind::Audio, PrefMediaKind::Screen] {
+                assert_eq!(top_index(kind), 0, "premise: {kind:?} has one position");
+                assert!(super::super::at_full_range(0, 0, top_index(kind) as usize));
+                assert!(!shows_fixed_badge(kind, pinned));
+            }
+            let manual = |min, max, auto| KindReceivePref { min, max, auto };
+            assert!(shows_fixed_badge(
+                PrefMediaKind::Video,
+                manual(Some(1), Some(1), false)
+            ));
+            assert!(!shows_fixed_badge(
+                PrefMediaKind::Video,
+                manual(Some(1), Some(1), true)
+            ));
+            assert!(!shows_fixed_badge(
+                PrefMediaKind::Video,
+                manual(Some(0), Some(2), false)
+            ));
         }
 
         #[test]
@@ -5050,10 +4922,12 @@ pub mod receive {
                 layer_count: 3,
                 width: 0,
                 height: 0,
-                kbps: 24,
+                // The production shape: `received_layer_snapshot` reports no audio
+                // bitrate, so the detail is the em-dash, never "0 kbps".
+                kbps: 0,
                 reason: None,
             };
-            assert_eq!(format_readout(&a), "L · 1/3 · 24 kbps");
+            assert_eq!(format_readout(&a), "L · 1/3 · \u{2014} kbps");
             let s = ReceivedLayerSnapshot {
                 kind: PrefMediaKind::Screen,
                 layer_index: 2,
@@ -5142,16 +5016,13 @@ pub mod receive {
 
             let migrated = stored.migrated().sanitized();
             assert_eq!(migrated.version, RECEIVE_PREF_VERSION);
-            // Old `high` (1080p / 2500) is index 1 on the new ladder.
-            assert_eq!(migrated.screen.max, Some(1));
-            // Old `medium` (720p / 1200) rounds DOWN to `low`: the new ladder's
-            // next rung up costs 2500, more than the user accepted.
+            assert_eq!(migrated.screen.max, Some(0));
             assert_eq!(migrated.screen.min, Some(0));
             assert!(!migrated.screen.auto, "the Auto flag is preserved");
             // The user's cap must never LOOSEN.
             assert!(
                 migrated.screen.max.unwrap() < 2,
-                "un-migrated index 2 now means 1440p / 5000 kbps"
+                "an un-migrated index must not survive as a higher rung"
             );
             assert!(migrated.screen.min <= migrated.screen.max);
 
@@ -5188,7 +5059,7 @@ pub mod receive {
         fn screen_index_map_arms_and_monotonicity() {
             assert_eq!(migrate_screen_index_v0_to_v1(0), Some(0));
             assert_eq!(migrate_screen_index_v0_to_v1(1), Some(0));
-            assert_eq!(migrate_screen_index_v0_to_v1(2), Some(1));
+            assert_eq!(migrate_screen_index_v0_to_v1(2), Some(0));
             assert_eq!(migrate_screen_index_v0_to_v1(3), None);
             assert_eq!(migrate_screen_index_v0_to_v1(99), None);
             for a in 0..=2u32 {
@@ -5197,39 +5068,6 @@ pub mod receive {
                     let mb = migrate_screen_index_v0_to_v1(b).unwrap();
                     assert!(ma <= mb, "map must be monotone: {a}->{ma}, {b}->{mb}");
                 }
-            }
-        }
-
-        /// Ground the map in the ACTUAL ladders rather than in three hand-written
-        /// index pairs: the migrated rung's ideal bitrate must never exceed that of
-        /// the rung the user originally chose. Both sides are read from the
-        /// production AQ tables, so a future rung retune that breaks the promise
-        /// fails here rather than shipping as another silent bitrate rise.
-        ///
-        /// MUTATION: point `2 => Some(1)` at `Some(2)` (5000 > 2500) or
-        /// `1 => Some(0)` at `Some(1)` (2500 > 1200) and this fails.
-        #[test]
-        fn migrated_screen_rung_never_costs_more_than_the_v0_rung() {
-            use videocall_client::adaptive_quality_constants::{
-                simulcast_screen_layers, SCREEN_QUALITY_TIERS,
-            };
-            // The PRE-#2179 receive ladder, by AQ label, lowest-first.
-            const V0_LABELS: [&str; 3] = ["low", "medium", "high"];
-            let v1 = simulcast_screen_layers(SCREEN_LAYER_LABELS.len());
-            for (old_idx, old_label) in V0_LABELS.iter().enumerate() {
-                let old_kbps = SCREEN_QUALITY_TIERS
-                    .iter()
-                    .find(|t| t.label == *old_label)
-                    .expect("every v0 rung must still exist in the AQ table")
-                    .ideal_bitrate_kbps;
-                let new_idx = migrate_screen_index_v0_to_v1(old_idx as u32)
-                    .expect("every v0 rung must map onto a v1 rung");
-                let new_kbps = v1[new_idx as usize].ideal_bitrate_kbps;
-                assert!(
-                    new_kbps <= old_kbps,
-                    "v0 rung {old_idx} ('{old_label}', {old_kbps} kbps) migrated to \
-                     v1 rung {new_idx} ({new_kbps} kbps) — that RAISES the cap"
-                );
             }
         }
     }
@@ -5308,7 +5146,7 @@ mod tests {
         };
         assert_eq!(
             format_simulcast_summary(&s),
-            "Video/Screen: 3 layers (flag 3 × device cap 3) · Audio: 3 layers (flag 3 × device cap 3)"
+            "Video: 3 layers (flag 3 × device cap 3) · Screen: single rung · Audio: 3 layers (flag 3 × device cap 3)"
         );
         // A weak device gated to 1 video layer reads "off"; audio independent.
         let weak = SimulcastSummary {
@@ -5320,7 +5158,7 @@ mod tests {
         };
         assert_eq!(
             format_simulcast_summary(&weak),
-            "Video/Screen: off (1 layer) · Audio: 3 layers (flag 3 × device cap 3)"
+            "Video: off (1 layer) · Screen: single rung · Audio: 3 layers (flag 3 × device cap 3)"
         );
         // Flag off entirely → both off.
         let off = SimulcastSummary {
@@ -5332,7 +5170,7 @@ mod tests {
         };
         assert_eq!(
             format_simulcast_summary(&off),
-            "Video/Screen: off (1 layer) · Audio: off (1 layer)"
+            "Video: off (1 layer) · Screen: single rung · Audio: off (1 layer)"
         );
     }
 
@@ -5454,19 +5292,19 @@ mod tests {
             format_peer_kind_line("video", Some(&v)),
             Some("video H · 3/3 · 1280×720".to_string())
         );
-        // Audio → kbps detail.
+        // Audio → the em-dash detail: the resolver reports no bitrate for audio.
         let a = ReceivedLayerSnapshot {
             kind: PrefMediaKind::Audio,
             layer_index: 0,
             layer_count: 3,
             width: 0,
             height: 0,
-            kbps: 24,
+            kbps: 0,
             reason: None,
         };
         assert_eq!(
             format_peer_kind_line("audio", Some(&a)),
-            Some("audio L · 1/3 · 24 kbps".to_string())
+            Some("audio L · 1/3 · \u{2014} kbps".to_string())
         );
         // None → no line.
         assert_eq!(format_peer_kind_line("screen", None), None);
@@ -5577,11 +5415,11 @@ mod tests {
 
     #[test]
     fn send_layer_short_uses_shorter_dimension() {
+        assert_eq!(format_send_layer_short(0, 720), SEND_LAYER_DIMS_UNKNOWN);
+        assert_eq!(format_send_layer_short(0, 0), SEND_LAYER_DIMS_UNKNOWN);
         assert_eq!(format_send_layer_short(640, 360), "360p"); // landscape
         assert_eq!(format_send_layer_short(360, 640), "360p"); // portrait
         assert_eq!(format_send_layer_short(1280, 720), "720p");
-        // Degenerate dim → raw fallback.
-        assert_eq!(format_send_layer_short(0, 720), "0×720");
     }
 
     #[test]
@@ -5605,6 +5443,12 @@ mod tests {
         assert_eq!(format_receive_spread(&[0], 3), "L");
         // Empty → empty string.
         assert_eq!(format_receive_spread(&[], 3), "");
+        // A one-rung ladder has no spread to report, so the Content disclosure
+        // reads "1 peer" rather than the degenerate "1 peer · 1".
+        //
+        // MUTATION: drop the `count <= 1` guard and these render "1".
+        assert_eq!(format_receive_spread(&[0], 1), "");
+        assert_eq!(format_receive_spread(&[0, 0], 1), "");
     }
 
     #[test]
@@ -5764,6 +5608,43 @@ mod tests {
         );
     }
 
+    /// At one audio layer neither the rung label nor the summary names a ladder
+    /// bitrate.
+    #[test]
+    fn audio_send_label_and_summary_name_no_bitrate_at_one_layer() {
+        let labels = send_layer_labels_with_top(PrefMediaKind::Audio, 1, "720p");
+        assert_eq!(labels.len(), 1);
+        let summaries = [
+            format_audio_send_layer_summary(None, 1, true),
+            format_audio_send_layer_summary(None, 1, false),
+            // A persisted ceiling cannot reintroduce a rung at depth 1.
+            format_audio_send_layer_summary(Some(1), 1, true),
+            format_audio_send_layer_summary(Some(3), 1, false),
+        ];
+        assert_eq!(summaries[0], "Sending audio");
+        assert_eq!(summaries[1], "Will send audio when the mic is on");
+        assert_eq!(summaries[2], summaries[0]);
+        assert_eq!(summaries[3], summaries[1]);
+
+        let nominals: Vec<u32> = (0..3)
+            .map(|r| {
+                videocall_client::decode::layer_chooser::audio_layer_kbps(r).expect("on-ladder")
+            })
+            .collect();
+        for text in std::iter::once(labels[0].to_string()).chain(summaries.iter().cloned()) {
+            assert!(
+                !text.chars().any(|c| c.is_ascii_digit()),
+                "one-layer audio copy must carry no number; got {text:?}"
+            );
+            for n in &nominals {
+                assert!(
+                    !text.contains(&format!("{n}k")),
+                    "one-layer audio copy must carry no ladder bitrate; found {n}k in {text:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn content_send_summary_sharing_and_not() {
         // Not sharing → the idle promise. Issue #2179 review: the old copy named a
@@ -5801,7 +5682,7 @@ mod tests {
         };
         assert_eq!(
             format_content_receive_summary(Some(&top)),
-            "Pulling full quality · H · 1920×1080"
+            "Pulling full quality · H · 3/3 · 1920×1080"
         );
         // 2-layer ladder: index 0 is Low → compact "L".
         let low = ReceivedLayerSnapshot {
@@ -5811,7 +5692,7 @@ mod tests {
         };
         assert_eq!(
             format_content_receive_summary(Some(&low)),
-            "Pulling full quality · L · 1920×1080"
+            "Pulling full quality · L · 1/2 · 1920×1080"
         );
     }
 
@@ -6441,160 +6322,23 @@ mod tests {
             target_bitrate_kbps: 2000.0,
         };
         let screen = ScreenQualitySnapshot {
-            // Middle of the 5-rung ladder (#2179) → quality frac 0.5 → level 2.
-            tier_index: SCREEN_TIER_LABELS.len() / 2,
-            // Index 0 as the reachable rung exercises the FULL-LADDER arm of the
-            // source-relative scale (#2179 review) — same level as before the
-            // change. Note review round 3 capped production ceilings at the
-            // ladder top, so a real share no longer publishes 0 here; this is the
-            // arithmetic boundary case, not a reachable configuration.
-            best_source_tier_index: 0,
-            source_tier_index: 0,
             width: 1280,
             height: 720,
             fps: 15,
-            ideal_kbps: 1200,
             target_bitrate_kbps: 1100,
+            capture_capped: false,
         };
         let st = gauge_state_from_snapshot(Some(&snap), Some(&screen));
+        assert_eq!(
+            st.screen_level, SCREEN_LIVE_METER_LEVEL,
+            "issue 2343: a live share publishes its one rung at the surface's own \
+             size, so the meter is full while sharing"
+        );
         assert_eq!(st.video_level, MAX_METER_LEVEL);
         assert_eq!(st.audio_level, 1);
         assert_eq!(st.video_text, "1920x1080·30fps·2500kbps");
         assert_eq!(st.audio_text, "8 kbps");
-        assert_eq!(st.screen_level, 2);
-        assert_eq!(st.screen_text, "1280x720·15fps·1200kbps");
-    }
-
-    /// Issue #2179 review (UX SF2): the screen meter is scaled to the rungs the
-    /// SHARE can reach, not to the whole 5-rung ladder. A 1080p window's best
-    /// possible rung is `high` — `fit_within_preserving_aspect` never upscales —
-    /// so a sharer doing everything their source allows must read FULL bars, not
-    /// 2 of 4.
-    ///
-    /// The ceiling index comes from `resolve_screen_tier_ceiling` — the SAME
-    /// production function the encoder publishes on the snapshot — evaluated
-    /// against a real 1920x1080 capture on a machine roomy enough (16 cores, the
-    /// full 3-rung ladder) that neither the device nor the stream-count term
-    /// binds. So the expectation is the SOURCE term, and it cannot drift from what
-    /// the encoder actually stamps.
-    ///
-    /// MUTATION: revert the denominator to `SCREEN_TIER_LABELS.len()` and the
-    /// full-bars assertion reads 2; drop the source-relative offset and the
-    /// mid-vs-low separation collapses.
-    #[test]
-    fn screen_meter_is_relative_to_the_best_rung_the_source_allows() {
-        use videocall_client::adaptive_quality_constants::resolve_screen_tier_ceiling;
-        let best_1080p = resolve_screen_tier_ceiling(1920, 1080, 16, 3);
-        assert!(
-            best_1080p > 0,
-            "a 1080p source must NOT be able to reach the ladder's top rung — \
-             otherwise this test proves nothing"
-        );
-        let snap = ScreenQualitySnapshot {
-            tier_index: best_1080p,
-            best_source_tier_index: best_1080p,
-            // A 1080p surface DESERVES the 1080p rung, and on this machine it can
-            // also reach it — the common path, where the two agree.
-            source_tier_index: best_1080p,
-            width: 1920,
-            height: 1080,
-            fps: 10,
-            ideal_kbps: 2500,
-            target_bitrate_kbps: 2400,
-        };
-        let st = gauge_state_from_snapshot(None, Some(&snap));
-        assert_eq!(
-            st.screen_level, MAX_METER_LEVEL,
-            "a 1080p source at its best reachable rung must read full bars"
-        );
-        // The readout is NOT rescaled by the source-relative meter: it still prints
-        // the active tier's own nominal numbers. (Nominal, not measured — see
-        // `screen_meter_level`'s doc for the simulcast base-layer caveat.)
-        assert_eq!(st.screen_text, "1920x1080·10fps·2500kbps");
-
-        // Second half of the defect: with the full-ladder denominator the two
-        // rungs below `high` both rounded to a single bar.
-        let n = SCREEN_TIER_LABELS.len();
-        let mid = screen_meter_level(best_1080p + 1, best_1080p, n);
-        let low = screen_meter_level(n - 1, best_1080p, n);
-        assert!(
-            mid > low,
-            "degraded rungs must stay distinguishable: mid={mid}, low={low}"
-        );
-    }
-
-    /// Issue #2179 review round 2: the snapshot carries BOTH a reachable rung
-    /// (`best_source_tier_index`) and a deserved rung (`source_tier_index`), and
-    /// the meter must use the REACHABLE one — a share pinned by its hardware is
-    /// doing all it can and reads full bars, even though the receiver's Cause line
-    /// (which keys off the DESERVED rung) correctly reports it as constrained.
-    ///
-    /// The divergence configuration is derived from the production resolvers so it
-    /// cannot drift: a 4K surface DESERVES `native` (index 0), but review round 3
-    /// caps every path at the publish ladder's top, so nothing can REACH it. The
-    /// core count is deliberately generous (well past every device bar) to prove
-    /// the gap comes from the LADDER cap and not from a low-core artifact. The
-    /// test asserts the two really do differ before relying on the gap, so a
-    /// future change that collapsed them fails loudly here rather than leaving a
-    /// vacuous assertion behind.
-    ///
-    /// MUTATION: point `gauge_state_from_snapshot` at `s.source_tier_index` and
-    /// the full-bars assertion drops.
-    #[test]
-    fn screen_meter_uses_the_reachable_rung_not_the_deserved_one() {
-        use videocall_client::adaptive_quality_constants::{
-            resolve_initial_screen_tier, resolve_screen_tier_ceiling, SCREEN_TIER_NATIVE_MIN_CORES,
-        };
-        // Well past every device bar, so the device term cannot be what binds.
-        let cores = SCREEN_TIER_NATIVE_MIN_CORES * 2;
-        let deserved = resolve_initial_screen_tier(3840, 2160, 0);
-        let reachable = resolve_screen_tier_ceiling(3840, 2160, cores, 3);
-        assert!(
-            reachable > deserved,
-            "this test is only meaningful when something actually binds above the \
-             source rung: deserved={deserved}, reachable={reachable}"
-        );
-
-        let snap = ScreenQualitySnapshot {
-            // Sitting exactly at what its hardware allows.
-            tier_index: reachable,
-            best_source_tier_index: reachable,
-            source_tier_index: deserved,
-            width: 2560,
-            height: 1440,
-            fps: 10,
-            ideal_kbps: 5000,
-            target_bitrate_kbps: 4800,
-        };
-        let st = gauge_state_from_snapshot(None, Some(&snap));
-        assert_eq!(
-            st.screen_level, MAX_METER_LEVEL,
-            "a share at its hardware ceiling is doing all it can — full bars"
-        );
-        // Had the meter used the DESERVED rung it would scale over the whole
-        // ladder and read short; prove that is the value we are NOT using.
-        assert!(
-            screen_meter_level(reachable, deserved, SCREEN_TIER_LABELS.len()) < MAX_METER_LEVEL,
-            "the deserved-rung scale must give a DIFFERENT (lower) answer, \
-             otherwise this test cannot tell the two apart"
-        );
-    }
-
-    /// A `tier_index` BETTER than the published best-source rung can appear for a
-    /// tick (the encoder re-resolves the source when the shared surface changes,
-    /// before the snapshot's best-source field catches up). It must saturate at
-    /// full bars, never underflow the subtraction.
-    #[test]
-    fn screen_meter_saturates_and_clamps_out_of_range_inputs() {
-        assert_eq!(screen_meter_level(0, 2, 5), MAX_METER_LEVEL);
-        // A best-source index past the end of the ladder clamps to the worst rung
-        // instead of producing a zero-width reachable range.
-        assert_eq!(screen_meter_level(4, 99, 5), MAX_METER_LEVEL);
-        // A 4K source (best rung 0) keeps the full-ladder scale, unchanged from
-        // the pre-review behaviour.
-        assert_eq!(screen_meter_level(0, 0, 5), MAX_METER_LEVEL);
-        assert_eq!(screen_meter_level(2, 0, 5), 2);
-        assert_eq!(screen_meter_level(4, 0, 5), 1);
+        assert_eq!(st.screen_text, "1280x720·15fps·1100kbps");
     }
 
     #[test]
@@ -6672,25 +6416,21 @@ mod tests {
     }
 
     /// `with_screen_thumbs` maps slider POSITIONS onto tier INDICES over the
-    /// live `SCREEN_TIER_LABELS` ladder, so the expected index moves with the
-    /// ladder length (#2179 grew it from 3 to 5). Pinning the position→index
-    /// inversion against the production `thumbs_to_bounds` keeps this honest
-    /// without re-implementing the arithmetic here.
+    /// live `SCREEN_TIER_LABELS` ladder — one rung, so neither end bounds anything.
     #[test]
     fn screen_thumbs_map_over_the_live_screen_ladder() {
         let n = SCREEN_TIER_LABELS.len();
+        assert_eq!(n, 1, "issue 2343: the screen ladder is a single rung");
         let sel = RangeSel {
-            min_pos: 1,
-            max_pos: 1,
+            min_pos: 0,
+            max_pos: 0,
         };
         let (best, worst) = thumbs_to_bounds(sel, n);
         let p = PerformancePreference::default().with_screen_thumbs(sel);
         assert_eq!(p.screen_max, best);
         assert_eq!(p.screen_min, worst);
-        // Position 1 on a 5-rung ladder pins the second-WORST tier (positions
-        // run worst→best, so pos 1 == index n-2 == "720p").
-        assert_eq!(p.screen_max, Some(n - 2));
-        assert_eq!(p.screen_min, Some(n - 2));
+        assert_eq!(p.screen_max, None, "the only rung bounds nothing");
+        assert_eq!(p.screen_min, None);
         assert!(!p.screen_auto);
     }
 
@@ -6916,16 +6656,8 @@ mod tests {
         );
     }
 
-    /// Lockstep pin (issue #2179): `SCREEN_TIER_LABELS` is a FIXED-SIZE array
-    /// whose length drives `sanitized`, `thumbs_to_bounds` and the VU-meter
-    /// level scale, and whose order the panel reads as "index 0 = best". Adding
-    /// a rung to `SCREEN_QUALITY_TIERS` without extending this array silently
-    /// mislabels every screen rung, so the length AND the per-index resolution
-    /// mapping are pinned against the PRODUCTION AQ table here.
-    ///
-    /// Mutation guard: reverting `SCREEN_TIER_LABELS` to the 3-entry
-    /// `["1080p", "720p", "low"]` fails the length assert; re-ordering it fails
-    /// the per-index resolution assert.
+    /// Lockstep pin: `SCREEN_TIER_LABELS`'s length drives `sanitized` and
+    /// `thumbs_to_bounds`. MUTATION: re-grow either side without the other.
     #[test]
     fn screen_tier_labels_match_aq_ladder() {
         use videocall_client::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
@@ -6934,23 +6666,12 @@ mod tests {
             SCREEN_QUALITY_TIERS.len(),
             "SCREEN_TIER_LABELS must have one entry per SCREEN_QUALITY_TIERS rung"
         );
-        // Each label must name its rung's HEIGHT (the ladder's worst rung is the
-        // qualitative "low", which shares 720p with the rung above it).
-        for (i, tier) in SCREEN_QUALITY_TIERS.iter().enumerate() {
-            let label = SCREEN_TIER_LABELS[i];
-            if i + 1 == SCREEN_QUALITY_TIERS.len() {
-                assert_eq!(label, "low", "the worst rung keeps its qualitative label");
-            } else {
-                assert_eq!(
-                    label,
-                    format!("{}p", tier.max_height),
-                    "SCREEN_TIER_LABELS[{i}] must name rung '{}' ({}x{})",
-                    tier.label,
-                    tier.max_width,
-                    tier.max_height,
-                );
-            }
-        }
+        assert_eq!(SCREEN_TIER_LABELS.len(), 1);
+        assert_eq!(
+            SCREEN_TIER_LABELS[0],
+            screen_display_label(SCREEN_QUALITY_TIERS[0].label),
+            "the label must be the panel's rendering of the AQ rung"
+        );
     }
 
     /// `send_layer_labels(Screen, n)` is a hand-maintained mirror of the AQ
@@ -6959,65 +6680,24 @@ mod tests {
     /// two against each other so a change to the publisher's ladder cannot leave
     /// the panel naming rungs that are not being published.
     ///
-    /// Since the #2179 review the panel renders the DISPLAY vocabulary, so the
-    /// expectation is built by running the AQ selection through
-    /// `screen_display_label` — the mirror still fails on a ladder change (a new
-    /// rung name maps to a different height, or to `"?"` if unmapped), it just no
-    /// longer demands the panel print the AQ word.
+    /// MUTATION: point the Screen arm of `send_layer_labels_with_top` at another
+    /// rung name and it renders `"?"`.
     #[test]
     fn send_layer_labels_screen_mirror_the_aq_ladder() {
         use videocall_client::adaptive_quality_constants::simulcast_screen_layer_labels;
+        let expected: Vec<&str> = simulcast_screen_layer_labels(1)
+            .iter()
+            .map(|l| screen_display_label(l))
+            .collect();
+        assert!(
+            !expected.contains(&"?"),
+            "the published AQ rung needs a screen_display_label arm"
+        );
         for n in 1..=3 {
-            let expected: Vec<&str> = simulcast_screen_layer_labels(n)
-                .iter()
-                .map(|l| screen_display_label(l))
-                .collect();
             assert_eq!(
                 send_layer_labels(PrefMediaKind::Screen, n),
                 expected,
-                "send_layer_labels(Screen, {n}) must mirror simulcast_screen_layer_labels({n}) \
-                 through screen_display_label"
-            );
-            assert!(
-                !expected.contains(&"?"),
-                "every AQ rung in simulcast_screen_layer_labels({n}) needs a \
-                 screen_display_label arm"
-            );
-        }
-    }
-
-    /// Lockstep pin (issue #2179 review, UX SF1): the panel's rendered SCREEN rung
-    /// labels are the AQ ladder's rungs expressed as HEIGHTS. The expectation is
-    /// derived from the PRODUCTION `simulcast_screen_layers` table, so a rung
-    /// retune — or a `screen_display_label` arm pointed at the wrong height —
-    /// fails here: the display mapping cannot silently desync from the ladder it
-    /// names.
-    ///
-    /// Covers BOTH rendered directions, because the send strip and the receive
-    /// slider reach the mapping through different functions.
-    ///
-    /// MUTATION: point any `screen_display_label` arm at another height, or revert
-    /// either consumer to the raw AQ label, and this fails.
-    #[test]
-    fn screen_display_labels_track_aq_rung_heights() {
-        use videocall_client::adaptive_quality_constants::simulcast_screen_layers;
-        let ladder = simulcast_screen_layers(3);
-        let send = send_layer_labels(PrefMediaKind::Screen, 3);
-        assert_eq!(send.len(), ladder.len());
-        for (i, tier) in ladder.iter().enumerate() {
-            let expected = format!("{}p", tier.max_height);
-            assert_eq!(
-                send[i], expected,
-                "send rung {i} (AQ '{}', {}x{}) must render as its height",
-                tier.label, tier.max_width, tier.max_height
-            );
-            assert_eq!(
-                receive::index_label_with_top(PrefMediaKind::Screen, i as u32, "720p"),
-                expected,
-                "receive rung {i} (AQ '{}', {}x{}) must render as its height",
-                tier.label,
-                tier.max_width,
-                tier.max_height
+                "send_layer_labels(Screen, {n}) must mirror the single published rung"
             );
         }
     }
@@ -7105,15 +6785,9 @@ mod tests {
         assert_eq!(super::send_layer_ceiling_valuetext(1, 1), "1 layer");
     }
 
-    /// Host-testable via `send_layer_labels_with_top` (the pure form): the public
-    /// `send_layer_labels` wrapper resolves the camera top rung from
-    /// `window.__APP_CONFIG`, which panics on a native target.
     #[test]
     fn send_layer_labels_match_per_kind_ladders() {
         use PrefMediaKind::{Audio, Screen, Video};
-        // Default camera ladder top rung (issue #1768: "540p" under
-        // experimentalReducedLadder — covered by
-        // `send_layer_labels_track_the_camera_top_rung` below).
         const TOP: &str = "720p";
         let send_layer_labels = |kind, n| super::send_layer_labels_with_top(kind, n, TOP);
         // VIDEO ladder (spaced, issue 1768): 1→[180p], 2→[180p,720p] (skip 360p),
@@ -7121,36 +6795,23 @@ mod tests {
         assert_eq!(send_layer_labels(Video, 1), vec!["180p"]);
         assert_eq!(send_layer_labels(Video, 2), vec!["180p", "720p"]);
         assert_eq!(send_layer_labels(Video, 3), vec!["180p", "360p", "720p"]);
-        // SCREEN ladder differs: since issue #2179 it is a strict prefix chain
-        // spaced by resolution, and (issue #2179 review, UX SF1) it RENDERS in the
-        // panel's numeric vocabulary rather than the AQ rung names — the AQ
-        // selection 1→[low], 2→[low, high], 3→[low, high, 1440p] displays as
-        // 720p / 1080p / 1440p. The base differs from video (proves per-kind
-        // routing, not a shared prefix).
-        assert_eq!(send_layer_labels(Screen, 1), vec!["720p"]);
-        assert_eq!(send_layer_labels(Screen, 2), vec!["720p", "1080p"]);
-        assert_eq!(send_layer_labels(Screen, 3), vec!["720p", "1080p", "1440p"]);
-        // AUDIO ladder is CONTIGUOUS (no skip — AUDIO_LAYER_KBPS = [12,24,48],
-        // issue 1768): 1→[12k], 2→[12k,24k], 3→[12k,24k,48k]. n=2 keeps the MIDDLE
-        // rung (24k), unlike video/screen which skip it — proves the audio arm
-        // isn't a copy of the spaced ladder.
-        assert_eq!(send_layer_labels(Audio, 1), vec!["12k"]);
+        assert_eq!(send_layer_labels(Screen, 1), vec!["Native"]);
+        assert_eq!(send_layer_labels(Screen, 2), vec!["Native"]);
+        assert_eq!(send_layer_labels(Screen, 3), vec!["Native"]);
+        // AUDIO is CONTIGUOUS: n=2 keeps the MIDDLE rung, where video/screen skip it.
         assert_eq!(send_layer_labels(Audio, 2), vec!["12k", "24k"]);
         assert_eq!(send_layer_labels(Audio, 3), vec!["12k", "24k", "48k"]);
     }
 
-    /// Issue #1768: the SEND rung LABEL must track the deployed camera ladder's top
-    /// rung, so it cannot contradict `send_layer_res_span`, which derives its span
-    /// from the live snapshot. Before this, the label was hardcoded "720p" and a
-    /// reduced-ladder deployment showed a "720p" pip next to a "180p–540p" span.
+    /// The SEND rung LABEL tracks the camera ladder's top rung rather than a
+    /// literal, so it cannot contradict `send_layer_res_span`. The fixture is
+    /// deliberately NOT the shipped `"720p"`, which a hardcoded arm would pass.
     ///
-    /// MUTATION: hardcode the Video arm's top label back to `"720p"` and the reduced
-    /// assertions fail; make `camera_top_rung_label` ignore its argument and the
-    /// 540p case fails.
+    /// MUTATION: hardcode the Video arm's top label and these fail.
     #[test]
     fn send_layer_labels_track_the_camera_top_rung() {
         use PrefMediaKind::Video;
-        // Reduced ladder (540p top): both the n=2 skip form and the full ladder.
+        // A non-shipped top label, so the substitution is observable.
         assert_eq!(
             send_layer_labels_with_top(Video, 3, "540p"),
             vec!["180p", "360p", "540p"]
@@ -7159,24 +6820,20 @@ mod tests {
             send_layer_labels_with_top(Video, 2, "540p"),
             vec!["180p", "540p"]
         );
-        // The base rung is shared across variants and must NOT move.
         assert_eq!(send_layer_labels_with_top(Video, 1, "540p"), vec!["180p"]);
         // Non-camera kinds ignore the camera argument entirely. SCREEN renders the
-        // display vocabulary (issue #2179 review, UX SF1) and is variant-invariant:
-        // `screen_display_label` never consults `camera_top`, so a reduced-ladder
-        // deployment must still read 720p / 1080p / 1440p here.
         assert_eq!(
             send_layer_labels_with_top(PrefMediaKind::Audio, 3, "540p"),
             vec!["12k", "24k", "48k"]
         );
         assert_eq!(
             send_layer_labels_with_top(PrefMediaKind::Screen, 3, "540p"),
-            vec!["720p", "1080p", "1440p"]
+            vec!["Native"]
         );
         assert_eq!(
             send_layer_labels_with_top(PrefMediaKind::Screen, 3, "540p"),
             send_layer_labels_with_top(PrefMediaKind::Screen, 3, "720p"),
-            "the screen ladder must not move with the camera variant"
+            "the screen ladder must not move with the camera top label"
         );
     }
 
@@ -7194,16 +6851,14 @@ mod tests {
         assert_eq!(camera_top_rung_label(999), "720p");
     }
 
-    /// The label and the ladder-derived SPAN must agree — the specific
-    /// self-contradiction this change fixes ("720p" pip beside a "180p–540p" span).
+    /// The pip label and the ladder-derived SPAN must agree.
     #[test]
-    fn send_label_top_agrees_with_the_res_span_under_the_reduced_ladder() {
+    fn send_label_top_agrees_with_the_res_span() {
         use videocall_client::adaptive_quality_constants::{
-            simulcast_layers_for, LadderVariant, SIMULCAST_MAX_LAYERS,
+            simulcast_layers, SIMULCAST_MAX_LAYERS,
         };
         use videocall_client::SimulcastLayerInfo;
-        // Build a snapshot from the REDUCED ladder exactly as the encoder would.
-        let ladder = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Reduced);
+        let ladder = simulcast_layers(SIMULCAST_MAX_LAYERS);
         let snap = SimulcastSendSnapshot {
             simulcast_active: true,
             effective_layers: ladder.len() as u32,
@@ -7251,6 +6906,7 @@ mod tests {
     fn snap(
         kind: PrefMediaKind,
         layer_index: u32,
+        layer_count: u32,
         width: u32,
         height: u32,
         kbps: u32,
@@ -7259,7 +6915,7 @@ mod tests {
         ReceivedLayerSnapshot {
             kind,
             layer_index,
-            layer_count: layer_index + 1,
+            layer_count,
             width,
             height,
             kbps,
@@ -7303,22 +6959,165 @@ mod tests {
         );
     }
 
+    /// Every RECEIVE readout that renders a peer's audio bitrate shows the em-dash,
+    /// and none prints a literal zero — the resolver reports no rate.
+    #[test]
+    fn every_receive_audio_readout_em_dashes_the_bitrate() {
+        let dash = SEND_LAYER_DIMS_UNKNOWN;
+        assert_eq!(format_recv_audio_kbps(0, " kbps"), format!("{dash} kbps"));
+        assert_eq!(format_recv_audio_kbps(0, "k"), format!("{dash}k"));
+        // A nonzero reading still renders, so the sentinel is `0` and not the unit.
+        assert_eq!(format_recv_audio_kbps(48, "k"), "48k");
+
+        // The value the production resolver actually hands these formatters.
+        let live = videocall_client::decode::layer_chooser::received_layer_snapshot(
+            PrefMediaKind::Audio,
+            2,
+            3,
+        );
+        assert_eq!(
+            live.kbps, 0,
+            "premise: the resolver reports no audio bitrate"
+        );
+        for rendered in [
+            format_peer_kind_line("audio", Some(&live)).expect("flowing"),
+            peer_row_metric(&live, receive::index_label(PrefMediaKind::Audio, 2)),
+            receive::format_readout(&live),
+            format_recv_audio_kbps(live.kbps, "k"),
+        ] {
+            assert!(
+                rendered.contains(dash),
+                "audio readout must carry the em-dash; got {rendered:?}"
+            );
+            assert!(
+                !rendered.contains('0'),
+                "audio readout must not print a literal zero; got {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_row_res_or_bitrate_speaks_an_absent_audio_reading_and_sizes_video() {
+        let audio = snap(PrefMediaKind::Audio, 0, 1, 0, 0, 0, None);
+        assert_eq!(peer_row_res_or_bitrate(&audio), "bitrate not reported");
+        let video = snap(PrefMediaKind::Video, 1, 3, 640, 360, 350, None);
+        assert_eq!(peer_row_res_or_bitrate(&video), "360p");
+        let screen = snap(PrefMediaKind::Screen, 0, 1, 1400, 700, 0, None);
+        assert_eq!(peer_row_res_or_bitrate(&screen), "700p");
+    }
+
+    #[test]
+    fn the_aria_sentence_never_carries_a_dashed_clause() {
+        for (kind, noun, width, height, kbps) in [
+            (PrefMediaKind::Audio, "audio", 0, 0, 0),
+            (PrefMediaKind::Video, "video", 0, 0, 350),
+            (PrefMediaKind::Screen, "shared content", 640, 0, 350),
+        ] {
+            let s = snap(kind, 1, 3, width, height, kbps, None);
+            let detail = peer_row_res_or_bitrate(&s);
+            let aria =
+                peer_row_aria_label("Alice", noun, QualityState::Medium, &detail, 2, 3, None);
+            assert!(
+                !aria.contains(SEND_LAYER_DIMS_UNKNOWN),
+                "aria was: {aria:?}"
+            );
+            assert!(aria.contains("not reported"), "aria was: {aria:?}");
+        }
+        let audio = snap(PrefMediaKind::Audio, 1, 3, 0, 0, 0, None);
+        assert_eq!(
+            peer_row_metric(&audio, "as sent"),
+            format!("{SEND_LAYER_DIMS_UNKNOWN}k · as sent · M · 2/3"),
+            "the VISUAL readout keeps the em-dash for the same snapshot"
+        );
+    }
+
     #[test]
     fn peer_row_metric_video_and_audio_shapes() {
         // Video/screen: "{res} · ~{kbps} · {Q} · {i}/{n}" (Directive 4 SITE 6b).
-        // n is the FULL ladder length passed in (3); index 1 of 3 → letter "M",
-        // 1-based position 2. (peer_row_metric is the real e2e-string site; the
-        // rename propagates to signal_quality.rs too — #1222.) Mutating the
-        // `layer_quality_label` letter or the i/n arithmetic breaks this literal.
         // issue 1768: the standard (middle) camera rung is now 640×360 @ ~350 kbps.
-        let v = snap(PrefMediaKind::Video, 1, 640, 360, 350, None);
-        assert_eq!(peer_row_metric(&v, 3, "ignored"), "360p · ~350k · M · 2/3");
-        // Audio: "{kbps}k · {label} · {Q} · {i}/{n}". Middle audio rung = 24 kbps.
-        let a = snap(PrefMediaKind::Audio, 1, 0, 0, 24, None);
+        let v = snap(PrefMediaKind::Video, 1, 3, 640, 360, 350, None);
+        assert_eq!(peer_row_metric(&v, "ignored"), "360p · ~350k · M · 2/3");
+        // Audio: "{kbps}k · {label} · {Q} · {i}/{n}", where the resolver reports no
+        // bitrate — so the leading segment is the em-dash, never "0k".
+        let a = snap(PrefMediaKind::Audio, 1, 3, 0, 0, 0, None);
+        assert_eq!(peer_row_metric(&a, "mid"), "\u{2014}k · mid · M · 2/3");
+    }
+
+    /// MUTATION: give `layer_position_suffix` a `Some` arm for `layer_count <= 1`,
+    /// or point any of these back at a caller-supplied ladder length.
+    #[test]
+    fn one_rung_readouts_carry_no_layer_position() {
+        let s = snap(PrefMediaKind::Screen, 0, 1, 1400, 700, 1176, None);
+
+        assert_eq!(layer_position_suffix(0, 1), None);
+        assert_eq!(peer_row_metric(&s, "ignored"), "700p · ~1.2M");
         assert_eq!(
-            peer_row_metric(&a, 3, "mid (24k)"),
-            "24k · mid (24k) · M · 2/3"
+            format_peer_kind_line("screen", Some(&s)).expect("flowing"),
+            "screen 1400×700"
         );
+        assert_eq!(receive::format_readout(&s), "1400x700");
+        assert_eq!(
+            format_content_receive_summary(Some(&s)),
+            "Pulling full quality · 1400×700"
+        );
+        let aria = peer_row_aria_label(
+            "Antonio",
+            "shared content",
+            QualityState::Optimal,
+            "700p",
+            1,
+            s.layer_count,
+            None,
+        );
+        assert!(!aria.contains("layer"), "aria was: {aria}");
+
+        let three = ReceivedLayerSnapshot {
+            layer_index: 1,
+            layer_count: 3,
+            ..s
+        };
+        assert_eq!(layer_position_suffix(1, 3).unwrap(), "M · 2/3");
+        assert!(peer_row_metric(&three, "ignored").ends_with("M · 2/3"));
+        assert!(format_peer_kind_line("video", Some(&three))
+            .expect("flowing")
+            .contains("M · 2/3"));
+        assert!(receive::format_readout(&three).starts_with("M · 2/3"));
+    }
+
+    /// MUTATION: print a ladder constant instead of `width`/`height`, or drop the
+    /// `capture_capped` suffix.
+    #[test]
+    fn the_screen_readout_reports_the_live_encode_geometry() {
+        let native = ScreenQualitySnapshot {
+            width: 1400,
+            height: 700,
+            fps: 10,
+            target_bitrate_kbps: 1176,
+            capture_capped: false,
+        };
+        assert_eq!(format_screen_readout(&native), "1400x700·10fps·1176kbps");
+
+        // A surface above the ceiling is fitted INTO it, so the capped readout
+        // reports the ceiling — 3840x2160 is not a producible encode geometry.
+        let (cap_w, cap_h) = videocall_client::screen_encode_box_for_capture(3840, 2160);
+        let capped = ScreenQualitySnapshot {
+            width: cap_w,
+            height: cap_h,
+            capture_capped: true,
+            ..native
+        };
+        assert_eq!(
+            format_screen_readout(&capped),
+            format!("{cap_w}x{cap_h}·10fps·1176kbps · capped")
+        );
+        assert_eq!((cap_w, cap_h), (2560, 1440));
+
+        let unknown = ScreenQualitySnapshot {
+            width: 0,
+            height: 0,
+            ..native
+        };
+        assert!(format_screen_readout(&unknown).starts_with(SEND_LAYER_DIMS_UNKNOWN));
     }
 
     #[test]

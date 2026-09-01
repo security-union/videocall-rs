@@ -21,15 +21,25 @@
 use protobuf::Message;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::Sender;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time;
 use tracing::{debug, info, warn};
+
+use videocall_aq::constants::AUDIO_ACTIVE_PPS_GATE;
+
+/// Drain cadence: every published rate is a count over one of these windows.
+const DRAIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Shortest window that can carry a rate — half the drain cadence.
+const MIN_DRAIN_WINDOW_MS: f64 = DRAIN_INTERVAL.as_millis() as f64 / 2.0;
 
 use crate::aq_controller::BotAq;
 use crate::config::{ClientConfig, Transport};
 use crate::inbound_stats::InboundStats;
-use crate::transport::{MediaTypeLabel, OutboundFrame};
+use crate::transport::{
+    MediaTypeLabel, OutboundFrame, OutboundFrameSender, WebSocketStreamByteCounters,
+    WebSocketStreamByteSnapshot,
+};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOpCounters, NetEqStats as PbNetEqStats,
@@ -62,6 +72,10 @@ pub struct HealthReporterConfig {
     /// `websocket_drops_total` or `datagram_drops_total` depending on
     /// transport type.
     pub transport_drops_counter: Arc<AtomicU64>,
+    /// Set by main.rs on WebSocket runs only; nothing bills these counters on
+    /// another transport, so the WebSocket-only `ws_offered_bytes_*` fields stay
+    /// absent there.
+    pub websocket_stream_bytes: Option<Arc<WebSocketStreamByteCounters>>,
     /// Current encoder output FPS written by the video producer. Reports the
     /// target framerate the encoder is configured at (bot always encodes at
     /// target — it does not drop frames).
@@ -86,15 +100,18 @@ pub struct HealthReporterConfig {
 pub fn spawn_health_reporter(
     config: HealthReporterConfig,
     stats: Arc<Mutex<InboundStats>>,
-    packet_sender: Sender<OutboundFrame>,
+    packet_sender: OutboundFrameSender,
     quit: Arc<AtomicBool>,
     aq: Arc<BotAq>,
 ) {
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(1));
+        let mut interval = time::interval(DRAIN_INTERVAL);
+        // `Burst`, the default, fires missed ticks back to back — sliver windows.
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         // Skip the first immediate tick so the first report has a full second
         // of data.
         interval.tick().await;
+        let mut window_start = Instant::now();
 
         info!(
             "Health reporter started for {} in meeting {}",
@@ -108,7 +125,13 @@ pub fn spawn_health_reporter(
                 break;
             }
 
-            // Drain counters accumulated over the last ~1 second.
+            // Skip WITHOUT draining: the counters roll into the next window.
+            let window_ms = window_start.elapsed().as_secs_f64() * 1000.0;
+            if window_ms < MIN_DRAIN_WINDOW_MS {
+                continue;
+            }
+            window_start = Instant::now();
+
             let (sender_counters, total_packets) = {
                 let mut s = stats.lock().unwrap();
                 s.drain_health_counters()
@@ -124,6 +147,7 @@ pub fn spawn_health_reporter(
                 total_packets,
                 packets_sent,
                 &aq,
+                window_ms,
             ) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -178,6 +202,16 @@ pub(crate) fn peer_video_is_live(counters: &crate::inbound_stats::SenderHealthCo
     counters.video_bytes > 0
 }
 
+/// Audio counterpart of [`peer_video_is_live`], on bytes for the same reason.
+pub(crate) fn peer_audio_is_live(counters: &crate::inbound_stats::SenderHealthCounters) -> bool {
+    counters.audio_bytes > 0
+}
+
+/// Whether the DECODED audio is worth scoring; bytes would score 80 while nothing does.
+pub(crate) fn peer_audio_is_scorable(audio_packets_per_sec: f64) -> bool {
+    audio_packets_per_sec >= AUDIO_ACTIVE_PPS_GATE
+}
+
 /// Build a serialized `PacketWrapper` containing a `HealthPacket`.
 fn build_health_packet(
     config: &HealthReporterConfig,
@@ -185,6 +219,7 @@ fn build_health_packet(
     total_packets: u64,
     packets_sent: u64,
     aq: &BotAq,
+    window_ms: f64,
 ) -> anyhow::Result<Vec<u8>> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -347,17 +382,17 @@ fn build_health_packet(
         hp.camera_encoder_frames_submitted_ok = Some(frames_ok);
     }
 
-    // Per-sender peer stats. The drain window is ~1 second, so packet counts
-    // ~ per-second rates.
+    // Divides by the MEASURED window, not a fixed second.
+    let per_sec = |count: u64| count as f64 * 1000.0 / window_ms.max(MIN_DRAIN_WINDOW_MS);
     for (sender_id, counters) in sender_counters {
         let mut ps = PbPeerStats::new();
+        let audio_pps = per_sec(counters.audio_packets);
+        let video_fps = per_sec(counters.video_packets);
 
-        ps.can_listen = counters.audio_packets > 0;
+        ps.can_listen = peer_audio_is_live(counters);
         ps.can_see = peer_video_is_live(counters);
 
         // Video stats. Each inbound MediaPacket(VIDEO) is one encoded frame
-        // (transport reassembles fragments), so video_packets over the ~1s drain
-        // window ≈ frames/sec.
         //
         // `video_packets` counts only the rung this bot would DECODE (#2206) —
         // `InboundStats` filters to the highest arriving rung, mirroring the
@@ -366,19 +401,20 @@ fn build_health_packet(
         //
         // No longer fed to any sender AQ: #1108 Stage 2 removed receiver FPS from
         // the sender loop entirely, so this field is telemetry only.
+        let vs_bitrate_kbps = counters.video_bytes * 8 / 1000; // bytes/s -> kbps
         let mut vs = PbVideoStats::new();
-        vs.fps_received = counters.video_packets as f64;
-        vs.bitrate_kbps = counters.video_bytes * 8 / 1000; // bytes/s -> kbps
+        vs.fps_received = video_fps;
+        vs.bitrate_kbps = vs_bitrate_kbps;
         vs.frames_decoded = counters.video_packets;
         ps.video_stats = ::protobuf::MessageField::some(vs);
 
         // NetEQ stats -- bot does not use NetEQ but populate realistic values.
         let mut ns = PbNetEqStats::new();
-        ns.packets_per_sec = counters.audio_packets as f64;
+        ns.packets_per_sec = audio_pps;
 
         // Populate operation counters with normal_per_sec = audio packets
         let mut oc = PbNetEqOpCounters::new();
-        oc.normal_per_sec = counters.audio_packets as f64;
+        oc.normal_per_sec = audio_pps;
         let mut network = PbNetEqNetwork::new();
         network.operation_counters = ::protobuf::MessageField::some(oc);
         ns.network = ::protobuf::MessageField::some(network);
@@ -387,6 +423,17 @@ fn build_health_packet(
 
         // Audio concealment: bot has perfect playback (0% concealment)
         ps.audio_concealment_pct = 0.0;
+
+        // #2424. Folded UNCONDITIONALLY: the metrics server sets these with
+        // `if let Some(x)`, and its #1092 prune fires only for a peer ABSENT from the
+        // packet — so a PRESENT peer with the field omitted leaves the gauge holding its
+        // previous reading. Bounded by the rung availability window (see
+        // `SenderHealthCounters`), so 0 means "no in-window discontinuity", not "no freeze".
+        ps.video_seq_loss_per_sec = Some(per_sec(counters.video_seq_gaps));
+        ps.audio_datagram_loss_per_sec = Some(match config.transport {
+            Transport::WebTransport => per_sec(counters.audio_seq_gaps),
+            Transport::WebSocket => 0.0,
+        });
 
         // Quality scores.
         //
@@ -400,26 +447,22 @@ fn build_health_packet(
         //
         // So use the browser's SATURATING curve verbatim (#2190,
         // `videocall-client/src/health_reporter.rs`): fps is hardware/rung context, not
-        // quality, above 5 — only near-frozen video is a defect. The browser also
-        // subtracts loss/keyframe penalties the bot cannot compute; omitting those
-        // strictly reduces divergence. Zero is OMITTED, not scored, matching the same
-        // function's `fps <= 0.0 => None`; the full alert note lives there.
+        // quality, above 5 — only near-frozen video is a defect. Zero is OMITTED.
         //
-        // ⚠ THE COST OF THAT PARITY, larger here than in the browser: with `--pin-layer
-        // N`, a pinned rung that stops arriving holds fps at zero INDEFINITELY, not for
-        // one availability window, so a starved selected stream never pulls the call
-        // score down. It stays visible on `videocall_video_fps` (fed from `fps_received`
-        // below) and `can_see`, but not on the alert — remedy tracked as #2249. Scoring
-        // it low here would re-open the bot↔browser divergence this PR exists to close.
-        let audio_quality = (counters.audio_packets > 0).then_some(80.0_f64);
-        let video_fps = counters.video_packets as f64;
-        let video_quality = (video_fps > 0.0).then(|| {
-            if video_fps >= 5.0 {
+        // #2249: `video_bytes` is UNFILTERED while `video_packets` is the decoded rung, so
+        // fps 0 with live bitrate is the browser's receiving-not-decoding signature.
+        let audio_quality = peer_audio_is_scorable(audio_pps).then_some(80.0_f64);
+        let video_quality = if video_fps > 0.0 {
+            Some(if video_fps >= 5.0 {
                 100.0
             } else {
                 video_fps / 5.0 * 50.0
-            }
-        });
+            })
+        } else if vs_bitrate_kbps > 0 {
+            Some(0.0)
+        } else {
+            None
+        };
         // Worst of whichever streams are active — same match arms as the browser's.
         let call_score = match (audio_quality, video_quality) {
             (Some(a), Some(v)) => Some(a.min(v)),
@@ -441,6 +484,10 @@ fn build_health_packet(
         hp.peer_stats.insert(sender_id.clone(), ps);
     }
 
+    if let Some(counters) = &config.websocket_stream_bytes {
+        set_ws_stream_bytes(&mut hp, counters.snapshot());
+    }
+
     let hp_bytes = hp.write_to_bytes()?;
 
     let wrapper = PacketWrapper {
@@ -453,12 +500,26 @@ fn build_health_packet(
     Ok(wrapper.write_to_bytes()?)
 }
 
+/// Sets `ws_offered_bytes_*` only. `ws_dropped_bytes_*` means "discarded by the
+/// browser's 1 MiB `bufferedAmount` guard"; the bot's tungstenite send path has
+/// no such discard gate, so it leaves those fields unset (issue 2520).
+fn set_ws_stream_bytes(hp: &mut PbHealthPacket, bytes: WebSocketStreamByteSnapshot) {
+    let nonzero = |v: u64| (v != 0).then_some(v);
+    hp.ws_offered_bytes_audio = nonzero(bytes.offered_audio);
+    hp.ws_offered_bytes_video = nonzero(bytes.offered_video);
+    hp.ws_offered_bytes_control = nonzero(bytes.offered_control);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_health_packet, peer_video_is_live, HealthReporterConfig};
+    use super::{
+        build_health_packet, peer_audio_is_live, peer_audio_is_scorable, peer_video_is_live,
+        HealthReporterConfig,
+    };
     use crate::aq_controller::BotAq;
     use crate::config::{ClientConfig, Transport};
     use crate::inbound_stats::SenderHealthCounters;
+    use crate::transport::{MediaTypeLabel, WebSocketStreamByteCounters};
     use protobuf::Message;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -466,9 +527,54 @@ mod tests {
     use videocall_aq::clock::{Clock, SystemClock};
     use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-    /// The peer stats the REAL `build_health_packet` produces for one sender.
+    /// Peer stats from the REAL `build_health_packet`, over a nominal 1s window.
     fn peer_stats_for(counters: SenderHealthCounters) -> super::PbPeerStats {
+        peer_stats_for_window(counters, 1000.0)
+    }
+
+    fn peer_stats_for_window(counters: SenderHealthCounters, window_ms: f64) -> super::PbPeerStats {
+        peer_stats_on(counters, window_ms, Transport::WebSocket)
+    }
+
+    fn peer_stats_on(
+        counters: SenderHealthCounters,
+        window_ms: f64,
+        transport: Transport,
+    ) -> super::PbPeerStats {
         let config = HealthReporterConfig {
+            client_config: ClientConfig {
+                user_id: "bot".to_string(),
+                meeting_id: "room".to_string(),
+                enable_audio: true,
+                enable_video: true,
+            },
+            transport,
+            simulated_rtt_ms: None,
+            measured_rtt_ms: None,
+            packets_sent_counter: Arc::new(AtomicU64::new(0)),
+            transport_drops_counter: Arc::new(AtomicU64::new(0)),
+            websocket_stream_bytes: None,
+            encoder_output_fps: Arc::new(AtomicU32::new(0)),
+            encoder_errors_generic: Arc::new(AtomicU64::new(0)),
+            encoder_frames_ok: Arc::new(AtomicU64::new(0)),
+            keyframe_requests_sent: None,
+        };
+        let aq = BotAq::new(Arc::new(SystemClock) as Arc<dyn Clock>);
+        let mut senders = HashMap::new();
+        senders.insert("alice".to_string(), counters);
+
+        let bytes = build_health_packet(&config, &senders, 0, 0, &aq, window_ms)
+            .expect("packet must build");
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).expect("wrapper must parse");
+        let hp = super::PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("health packet must parse");
+        hp.peer_stats.get("alice").expect("alice present").clone()
+    }
+
+    fn health_config_with_ws_counters(
+        counters: Arc<WebSocketStreamByteCounters>,
+    ) -> HealthReporterConfig {
+        HealthReporterConfig {
             client_config: ClientConfig {
                 user_id: "bot".to_string(),
                 meeting_id: "room".to_string(),
@@ -480,20 +586,73 @@ mod tests {
             measured_rtt_ms: None,
             packets_sent_counter: Arc::new(AtomicU64::new(0)),
             transport_drops_counter: Arc::new(AtomicU64::new(0)),
+            websocket_stream_bytes: Some(counters),
             encoder_output_fps: Arc::new(AtomicU32::new(0)),
             encoder_errors_generic: Arc::new(AtomicU64::new(0)),
             encoder_frames_ok: Arc::new(AtomicU64::new(0)),
             keyframe_requests_sent: None,
-        };
-        let aq = BotAq::new(Arc::new(SystemClock) as Arc<dyn Clock>);
-        let mut senders = HashMap::new();
-        senders.insert("alice".to_string(), counters);
+        }
+    }
 
-        let bytes = build_health_packet(&config, &senders, 0, 0, &aq).expect("packet must build");
+    fn health_packet_for_config(config: &HealthReporterConfig) -> super::PbHealthPacket {
+        let aq = BotAq::new(Arc::new(SystemClock) as Arc<dyn Clock>);
+        let bytes = build_health_packet(config, &HashMap::new(), 0, 0, &aq, 1000.0)
+            .expect("packet must build");
         let wrapper = PacketWrapper::parse_from_bytes(&bytes).expect("wrapper must parse");
-        let hp = super::PbHealthPacket::parse_from_bytes(&wrapper.data)
-            .expect("health packet must parse");
-        hp.peer_stats.get("alice").expect("alice present").clone()
+        super::PbHealthPacket::parse_from_bytes(&wrapper.data).expect("health packet must parse")
+    }
+
+    #[test]
+    fn websocket_stream_byte_fields_leave_zero_unset() {
+        let counters = Arc::new(WebSocketStreamByteCounters::default());
+        let config = health_config_with_ws_counters(counters);
+        let hp = health_packet_for_config(&config);
+
+        assert_eq!(hp.ws_offered_bytes_audio, None);
+        assert_eq!(hp.ws_offered_bytes_video, None);
+        assert_eq!(hp.ws_offered_bytes_screen, None);
+        assert_eq!(hp.ws_offered_bytes_control, None);
+        assert_eq!(hp.ws_dropped_bytes_audio, None);
+        assert_eq!(hp.ws_dropped_bytes_video, None);
+        assert_eq!(hp.ws_dropped_bytes_screen, None);
+        assert_eq!(hp.ws_dropped_bytes_control, None);
+    }
+
+    #[test]
+    fn websocket_stream_byte_fields_publish_nonzero_buckets() {
+        let counters = Arc::new(WebSocketStreamByteCounters::default());
+        counters.record_offered(MediaTypeLabel::Audio, 11);
+        counters.record_offered(MediaTypeLabel::Video, 22);
+        counters.record_offered(MediaTypeLabel::Other, 44);
+
+        let config = health_config_with_ws_counters(counters);
+        let hp = health_packet_for_config(&config);
+
+        assert_eq!(hp.ws_offered_bytes_audio, Some(11));
+        assert_eq!(hp.ws_offered_bytes_video, Some(22));
+        assert_eq!(hp.ws_offered_bytes_screen, None);
+        assert_eq!(hp.ws_offered_bytes_control, Some(44));
+    }
+
+    /// The bot has no `bufferedAmount`-equivalent discard gate, so the drop
+    /// fields must stay absent even on a run that offered bytes on every bucket.
+    #[test]
+    fn websocket_dropped_byte_fields_are_never_published() {
+        let counters = Arc::new(WebSocketStreamByteCounters::default());
+        for kind in MediaTypeLabel::ALL {
+            counters.record_offered(kind, 100);
+        }
+
+        let config = health_config_with_ws_counters(counters);
+        let hp = health_packet_for_config(&config);
+
+        assert!(hp.ws_offered_bytes_audio.is_some());
+        assert!(hp.ws_offered_bytes_video.is_some());
+        assert!(hp.ws_offered_bytes_control.is_some());
+        assert_eq!(hp.ws_dropped_bytes_audio, None);
+        assert_eq!(hp.ws_dropped_bytes_video, None);
+        assert_eq!(hp.ws_dropped_bytes_screen, None);
+        assert_eq!(hp.ws_dropped_bytes_control, None);
     }
 
     /// The state this PR creates: the shed top rung is still inside the availability
@@ -503,6 +662,8 @@ mod tests {
         video_packets: 0,
         audio_bytes: 4000,
         video_bytes: 2000,
+        audio_seq_gaps: 0,
+        video_seq_gaps: 0,
     };
 
     #[test]
@@ -516,20 +677,30 @@ mod tests {
     }
 
     #[test]
-    fn a_shed_window_omits_the_video_score_instead_of_publishing_zero() {
-        // The alert-bearing gauge. `video_packets == 0` with bytes flowing must NOT
-        // become `Some(0.0)` on `videocall_call_quality_score` — it would satisfy
-        // `MeetingQualityDegraded` (< 50, for 2m) for a healthy stream, and it would
-        // diverge 80 points from the browser, which returns `None` here since #2190.
+    fn a_receiving_but_not_decoding_window_scores_zero() {
         let ps = peer_stats_for(POST_SHED);
+        assert_eq!(ps.video_quality_score, Some(0.0));
         assert_eq!(
-            ps.video_quality_score, None,
-            "a window we cannot rate must be omitted, not scored 0"
+            ps.call_quality_score,
+            Some(0.0),
+            "the call score must take the stalled video, not fall through to audio"
         );
+    }
+
+    #[test]
+    fn a_window_with_no_video_bytes_at_all_omits_the_score() {
+        let ps = peer_stats_for(SenderHealthCounters {
+            audio_packets: 50,
+            video_packets: 0,
+            audio_bytes: 4000,
+            video_bytes: 0,
+            ..Default::default()
+        });
+        assert_eq!(ps.video_quality_score, None);
         assert_eq!(
             ps.call_quality_score,
             Some(80.0),
-            "call score must fall through to audio alone, matching the browser"
+            "with no video signal the call score is the audio score"
         );
     }
 
@@ -546,6 +717,7 @@ mod tests {
                 video_packets: fps,
                 audio_bytes: 4000,
                 video_bytes: fps * 2000,
+                ..Default::default()
             });
             assert_eq!(
                 ps.video_quality_score,
@@ -571,6 +743,7 @@ mod tests {
             video_packets: 2,
             audio_bytes: 4000,
             video_bytes: 4000,
+            ..Default::default()
         });
         assert_eq!(ps.video_quality_score, Some(20.0));
         assert_eq!(
@@ -581,13 +754,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_rung_starvation_is_deliberately_off_the_quality_alert() {
-        // With `--pin-layer`, `video_packets == 0` while bytes flow is unbounded (the
-        // pinned rung may never return), and the score is still omitted rather than
-        // scored low. `fps_received` carries the starvation instead. Deliberate — see
-        // #2249 before changing this.
+    fn pinned_rung_starvation_reaches_the_quality_alert() {
+        // Unbounded under `--pin-layer`, so unlike the shed window above this one holds
+        // `MeetingQualityDegraded`'s `for: 2m` (#2249).
         let ps = peer_stats_for(POST_SHED);
-        assert_eq!(ps.video_quality_score, None, "omitted, not scored low");
+        assert_eq!(ps.video_quality_score, Some(0.0));
         assert_eq!(
             ps.video_stats.fps_received, 0.0,
             "the starvation must remain observable on the fps gauge's source field"
@@ -604,6 +775,7 @@ mod tests {
             video_packets: 30,
             audio_bytes: 4000,
             video_bytes: 60_000,
+            ..Default::default()
         });
         assert_eq!(ps.video_quality_score, Some(100.0));
         assert_eq!(ps.call_quality_score, Some(80.0));
@@ -618,6 +790,7 @@ mod tests {
             video_packets: 15,
             audio_bytes: 0,
             video_bytes: 30_000,
+            ..Default::default()
         });
         assert_eq!(ps.audio_quality_score, None);
         assert_eq!(ps.video_quality_score, Some(100.0));
@@ -636,6 +809,7 @@ mod tests {
             video_packets: 0,
             audio_bytes: 0,
             video_bytes: 2000,
+            ..Default::default()
         };
         assert!(
             peer_video_is_live(&shed_window),
@@ -645,5 +819,173 @@ mod tests {
 
         // Genuinely nothing arriving.
         assert!(!peer_video_is_live(&SenderHealthCounters::default()));
+    }
+
+    #[test]
+    fn audio_liveness_and_audio_scoring_split_across_a_rung_shed() {
+        let shed_window = SenderHealthCounters {
+            audio_packets: 0,
+            video_packets: 0,
+            audio_bytes: 5000,
+            video_bytes: 0,
+            ..Default::default()
+        };
+        assert!(peer_audio_is_live(&shed_window));
+        assert!(!peer_audio_is_scorable(0.0));
+        assert!(!peer_audio_is_live(&SenderHealthCounters::default()));
+
+        let ps = peer_stats_for(shed_window);
+        assert!(
+            ps.can_listen,
+            "liveness must follow arrivals or a shed blanks it for a whole window"
+        );
+        assert_eq!(
+            ps.audio_quality_score, None,
+            "scoring bytes the receiver cannot decode publishes 80 for starvation"
+        );
+        assert_eq!(
+            ps.call_quality_score, None,
+            "no scorable stream means no call score, not a healthy one"
+        );
+        assert_eq!(
+            ps.neteq_stats.packets_per_sec, 0.0,
+            "the honest starvation signal stays on the decoded count"
+        );
+    }
+
+    #[test]
+    fn the_audio_score_threshold_matches_the_browser_rate_gate() {
+        assert!(!peer_audio_is_scorable(1.999));
+        assert!(peer_audio_is_scorable(2.0));
+        assert!(!peer_audio_is_scorable(0.0));
+    }
+
+    #[test]
+    fn rates_divide_by_the_measured_window_not_a_fixed_second() {
+        let ps = peer_stats_for_window(
+            SenderHealthCounters {
+                audio_packets: 5,
+                video_packets: 5,
+                audio_bytes: 500,
+                video_bytes: 500,
+                ..Default::default()
+            },
+            500.0,
+        );
+        assert_eq!(ps.neteq_stats.packets_per_sec, 10.0);
+        assert_eq!(
+            ps.neteq_stats.network.operation_counters.normal_per_sec,
+            10.0
+        );
+        assert_eq!(ps.video_stats.fps_received, 10.0);
+    }
+
+    #[test]
+    fn a_sliver_window_cannot_explode_the_published_rates() {
+        // `drain_health_counters` is a `mem::take`, so a microsecond window can still
+        // carry a whole post-stall backlog.
+        let ps = peer_stats_for_window(
+            SenderHealthCounters {
+                audio_packets: 100,
+                video_packets: 100,
+                audio_bytes: 10_000,
+                video_bytes: 10_000,
+                ..Default::default()
+            },
+            0.05,
+        );
+        // A plausibility ceiling, not the formula: audio is 50 pkt/s, video 30 fps.
+        const CEILING: f64 = 1000.0;
+        assert!(
+            ps.neteq_stats.packets_per_sec < CEILING,
+            "packets_per_sec exploded: {}",
+            ps.neteq_stats.packets_per_sec
+        );
+        assert!(
+            ps.neteq_stats.network.operation_counters.normal_per_sec < CEILING,
+            "normal_per_sec exploded: {}",
+            ps.neteq_stats.network.operation_counters.normal_per_sec
+        );
+        assert!(
+            ps.video_stats.fps_received < CEILING,
+            "fps_received exploded: {}",
+            ps.video_stats.fps_received
+        );
+    }
+    /// A lossy receive window: 12 video and 9 audio positions skipped.
+    const LOSSY: SenderHealthCounters = SenderHealthCounters {
+        audio_packets: 50,
+        video_packets: 30,
+        audio_bytes: 4000,
+        video_bytes: 60_000,
+        audio_seq_gaps: 9,
+        video_seq_gaps: 12,
+    };
+
+    #[test]
+    fn peer_stats_publish_the_measured_video_loss_rate() {
+        let ps = peer_stats_for(LOSSY);
+        assert_eq!(
+            ps.video_seq_loss_per_sec,
+            Some(12.0),
+            "field 15 must carry the sender's own windowed gap rate"
+        );
+    }
+
+    #[test]
+    fn a_clean_window_publishes_zero_loss_rather_than_omitting_it() {
+        // The chosen semantic: for a peer PRESENT in the packet, an omitted field does
+        // not read as "unknown" downstream — it holds the gauge at its last value.
+        let ps = peer_stats_for(SenderHealthCounters {
+            audio_packets: 50,
+            video_packets: 30,
+            audio_bytes: 4000,
+            video_bytes: 60_000,
+            ..Default::default()
+        });
+        assert_eq!(
+            ps.video_seq_loss_per_sec,
+            Some(0.0),
+            "a clean window must publish 0.0, never absence"
+        );
+        assert_eq!(ps.audio_datagram_loss_per_sec, Some(0.0));
+    }
+
+    #[test]
+    fn a_peer_that_sent_nothing_still_publishes_both_loss_fields() {
+        let ps = peer_stats_for(SenderHealthCounters::default());
+        assert_eq!(ps.video_seq_loss_per_sec, Some(0.0));
+        assert_eq!(ps.audio_datagram_loss_per_sec, Some(0.0));
+    }
+
+    #[test]
+    fn audio_datagram_loss_is_definitionally_zero_on_websocket() {
+        let ps = peer_stats_on(LOSSY, 1000.0, Transport::WebSocket);
+        assert_eq!(ps.audio_datagram_loss_per_sec, Some(0.0));
+        assert_eq!(
+            ps.video_seq_loss_per_sec,
+            Some(12.0),
+            "the video field has no transport gate"
+        );
+    }
+
+    #[test]
+    fn audio_datagram_loss_publishes_the_measured_rate_on_webtransport() {
+        let ps = peer_stats_on(LOSSY, 1000.0, Transport::WebTransport);
+        assert_eq!(ps.audio_datagram_loss_per_sec, Some(9.0));
+    }
+
+    #[test]
+    fn loss_rates_divide_by_the_measured_window_not_a_fixed_second() {
+        let ps = peer_stats_on(LOSSY, 2000.0, Transport::WebTransport);
+        assert_eq!(ps.video_seq_loss_per_sec, Some(6.0));
+        assert_eq!(ps.audio_datagram_loss_per_sec, Some(4.5));
+    }
+
+    #[test]
+    fn a_sliver_window_cannot_explode_the_published_loss_rates() {
+        let ps = peer_stats_on(LOSSY, 1.0, Transport::WebTransport);
+        assert_eq!(ps.video_seq_loss_per_sec, Some(24.0));
+        assert_eq!(ps.audio_datagram_loss_per_sec, Some(18.0));
     }
 }

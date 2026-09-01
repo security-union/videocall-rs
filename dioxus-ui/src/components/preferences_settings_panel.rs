@@ -193,17 +193,24 @@ pub fn PreferencesSettingsPanel() -> Element {
 
                 // ── Section 3: Notifications ─────────────────────────────────
                 //
-                // A 2×2 announcement matrix: rows are the participant events
-                // (joins / leaves), columns are the delivery channels (an
-                // on-screen Message and a Sound). Each of the four cells is one
+                // An announcement matrix: rows are the events (a participant
+                // joins, a participant leaves, and — since issue 2329 — a hand
+                // going up or down), columns are the delivery channels (an
+                // on-screen Message and a Sound). Each cell is one
                 // `.glow-switch`, preserving the original input ids so stored
                 // preferences and existing selectors keep working. The per-cell
                 // meaning is carried by the grid axes: each switch is named via
                 // `aria-labelledby="<row-id> <col-id>"` (e.g. "Participant joins
                 // Message"), and the two column headers carry a reused
                 // `field-label__info` (?) help icon whose tooltip explains the
-                // channel — so the four helper sentences collapse to two column
-                // tooltips.
+                // channel — so the per-cell helper sentences collapse to two
+                // column tooltips.
+                //
+                // The grid is NOT fully populated: the hand row has a Sound cell
+                // and no Message cell, because the raised-hand banner is already
+                // a permanent on-screen message surface for that state and is not
+                // optional. Its Message cell renders a decorative placeholder so
+                // auto-placement keeps the Sound switch under its own column.
                 section { class: "appearance-section",
                     div { class: "appearance-section-header",
                         h3 { class: "appearance-section-title", "Notifications" }
@@ -351,7 +358,13 @@ pub fn PreferencesSettingsPanel() -> Element {
                                     id: "announce-tip-sound",
                                     class: "field-label__tooltip",
                                     role: "tooltip",
-                                    "Play a chime when someone joins or leaves."
+                                    // Issue 2329 added the hand row, so this
+                                    // column no longer describes only joins and
+                                    // leaves. The copy names all three events
+                                    // rather than going vague ("for these
+                                    // events"), because it is the only place the
+                                    // Sound column explains what it covers.
+                                    "Play a chime when someone joins, leaves, or raises their hand."
                                 }
                             }
                         }
@@ -431,6 +444,54 @@ pub fn PreferencesSettingsPanel() -> Element {
                                     let enabled = evt.checked();
                                     appearance_ctx.0.set(AppearanceSettings {
                                         play_exit_sound: enabled,
+                                        ..appearance_ctx.0()
+                                    });
+                                },
+                            }
+                            span { class: "glow-switch-track" }
+                        }
+
+                        // ── Row 3: Hand raised or lowered (issue 2329) ──
+                        //
+                        // Named for the STATE CHANGE rather than for the actor
+                        // ("Participant raises hand") because the one switch
+                        // governs both directions, and a user deciding whether to
+                        // keep it on needs to know it also chimes on the way
+                        // down.
+                        span {
+                            id: "announce-row-hand",
+                            class: "announce-matrix__row-label",
+                            "Hand raised or lowered"
+                        }
+                        // This row has NO Message cell. The raised-hand banner is
+                        // already a persistent, room-wide message surface that
+                        // stays on screen for as long as any hand is up (issue
+                        // 2135), so a transient toast would duplicate a channel
+                        // that never goes away — and it is not optional, so a
+                        // switch here would promise control it cannot deliver.
+                        //
+                        // A placeholder cell is required rather than omitted:
+                        // `.announce-matrix` is a 3-column grid with implicit
+                        // auto-placement, so leaving the cell out would slide the
+                        // Sound switch left into the Message column and misalign
+                        // the whole row. Decorative and `aria-hidden` — there is
+                        // no control here to announce.
+                        span {
+                            class: "announce-matrix__cell-empty",
+                            "aria-hidden": "true",
+                            "—"
+                        }
+                        label { class: "glow-switch",
+                            input {
+                                id: "hand-raise-sound-toggle",
+                                r#type: "checkbox",
+                                "aria-labelledby": "announce-row-hand announce-col-sound",
+                                "data-testid": "announce-hand-sound",
+                                checked: appearance.play_hand_raise_sound,
+                                onchange: move |evt: Event<FormData>| {
+                                    let enabled = evt.checked();
+                                    appearance_ctx.0.set(AppearanceSettings {
+                                        play_hand_raise_sound: enabled,
                                         ..appearance_ctx.0()
                                     });
                                 },

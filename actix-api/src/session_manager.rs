@@ -219,6 +219,38 @@ impl SessionManager {
         wrapper.write_to_bytes().unwrap_or_default()
     }
 
+    /// Build PARTICIPANT_SESSION_RESUMED: `session_id` continues
+    /// `previous_session_id` (#2269). Emitted INSTEAD of a LEFT/JOINED pair.
+    pub fn build_session_resumed_packet(
+        room_id: &str,
+        user_id: &str,
+        session_id: u64,
+        previous_session_id: u64,
+        display_name: &str,
+        is_guest: bool,
+    ) -> Vec<u8> {
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_SESSION_RESUMED.into(),
+            room_id: room_id.to_string(),
+            message: format!("{} resumed the meeting on a new session", user_id),
+            target_user_id: to_user_id_bytes(user_id),
+            session_id,
+            previous_session_id,
+            display_name: display_name.as_bytes().to_vec(),
+            is_guest,
+            ..Default::default()
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
     /// Build PARTICIPANT_LIST_REQUEST packet.
     ///
     /// `requester_instance` is the joiner's CLAIMED per-tab `instance_id` — the
@@ -410,6 +442,45 @@ mod tests {
         assert_eq!(inner.event_type, MeetingEventType::MEETING_ENDED.into());
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.message, "Host left");
+    }
+
+    /// #2269: receivers evict `previous_session_id` and keep `session_id`, so
+    /// swapping them (or defaulting either to `0`) evicts the survivor.
+    #[tokio::test]
+    async fn build_session_resumed_packet_carries_both_session_ids() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let packet = SessionManager::build_session_resumed_packet(
+            "my-room",
+            "bob",
+            /* session_id */ 99,
+            /* previous_session_id */ 42,
+            "Bob Smith",
+            true,
+        );
+        let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
+        assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
+        assert_eq!(wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
+
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::PARTICIPANT_SESSION_RESUMED.into(),
+            "receivers dispatch on event_type; a PARTICIPANT_LEFT here would fire a leave toast"
+        );
+        assert_eq!(inner.room_id, "my-room");
+        assert_eq!(inner.target_user_id, to_user_id_bytes("bob"));
+        assert_eq!(
+            inner.session_id, 99,
+            "session_id must be the SURVIVING session"
+        );
+        assert_eq!(
+            inner.previous_session_id, 42,
+            "previous_session_id must be the SUPERSEDED session — the one receivers evict"
+        );
+        assert_eq!(inner.display_name, b"Bob Smith".to_vec());
+        assert!(inner.is_guest);
     }
 
     #[tokio::test]

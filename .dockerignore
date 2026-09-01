@@ -9,3 +9,6 @@ result-*
 # artifacts into the anonymous-pull shared-registry image. `run/auth/*.json`
 # holds real OAuth session cookies from `bots-app login`/`sso-login`.
 e2e/bots-app/run
+# build.sh mktemps a registry authfile; keep it out even if TMPDIR is in-tree.
+**/auth.json
+**/tmp.*

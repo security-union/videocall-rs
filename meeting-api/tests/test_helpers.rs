@@ -73,6 +73,9 @@ fn build_app_inner(pool: PgPool, dev_user: Option<DevUser>) -> Router {
     let state = AppState {
         db: pool,
         jwt_secret: TEST_JWT_SECRET.to_string(),
+        session_jwt_secret: TEST_JWT_SECRET.to_string(),
+        session_jwt_secret_previous: None,
+        session_previous_secret_expires_at: 0,
         token_ttl_secs: TEST_TOKEN_TTL,
         session_ttl_secs: TEST_SESSION_TTL,
         session_refresh_threshold_secs: 300,

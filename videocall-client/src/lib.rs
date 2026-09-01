@@ -48,8 +48,6 @@
 //!     enable_webtransport: true,
 //!     max_received_layer: None,
 //!     skip_canvas_paint: false,
-//!     // #2156: receiver-side rung LABELS resolve against this ladder.
-//!     camera_ladder_variant: videocall_client::adaptive_quality_constants::LadderVariant::Default,
 //!     on_peer_added: Callback::noop(),
 //!     on_peer_first_frame: Callback::noop(),
 //!     get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
@@ -111,7 +109,6 @@
 //! # let options = VideoCallClientOptions {
 //! #     enable_e2ee: false, enable_webtransport: false, max_received_layer: None,
 //! #     skip_canvas_paint: false,
-//! #     camera_ladder_variant: videocall_client::adaptive_quality_constants::LadderVariant::Default,
 //! #     on_peer_added: Callback::noop(),
 //! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
 //! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), user_id: "user".to_string(),
@@ -156,7 +153,6 @@
 //!     Callback::noop(),
 //!     Callback::noop(), // on_error callback for camera errors
 //!     1,                // max simulcast layers (1 = single stream / off)
-//!     videocall_client::adaptive_quality_constants::LadderVariant::Default, // camera ladder (#1768)
 //! );
 //! let mut microphone = create_microphone_encoder(
 //!     client.clone(),
@@ -241,6 +237,10 @@
 pub mod adaptive_quality_constants {
     pub use videocall_aq::constants::*;
 }
+
+/// The screen encode geometry helpers, re-exported so UI code resolves a share's
+/// geometry with the SAME function the encoder configures itself from.
+pub use videocall_aq::{capture_exceeds_encode_ceiling, screen_encode_box_for_capture};
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;
@@ -266,7 +266,6 @@ pub mod screen_first_render_inject;
 mod test_serial;
 pub mod utils;
 mod wrappers;
-pub use adaptive_quality_constants::initial_screen_tier;
 // Issue 2135: raise-hand send policy. Pure + host-testable; the UI owns one
 // `RaiseHandAnnouncer` and drives it (see the module docs for why this coalesces
 // rather than drops, unlike the reactions self-throttle below).
@@ -299,16 +298,17 @@ pub use connection::{ConnectionLostReason, ConnectionState};
 #[cfg(feature = "netsim")]
 pub use connection::install_netsim_window_hook;
 pub use decode::{
-    create_audio_peer_decoder, max_layers_for_kind, quality_state, AudioPeerDecoderTrait,
-    DegradeReason, KindLayerBounds, PeerDecodeManager, PeerDeviceInfo, PeerReceiveDiag,
-    PrefMediaKind, QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot, TileHint,
-    VideoPeerDecoder,
+    create_audio_peer_decoder, max_layers_for_kind, quality_state, size_cap_layer,
+    AudioPeerDecoderTrait, DegradeReason, KindLayerBounds, PeerDecodeManager, PeerDeviceInfo,
+    PeerReceiveDiag, PrefMediaKind, QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot,
+    TileHint, VideoPeerDecoder,
 };
 pub use encode::{
     create_microphone_encoder, screen_capture_display_constraints,
-    should_retry_screen_capture_without_ceiling, CameraEncoder, LiveQualitySnapshot,
-    MicrophoneEncoderTrait, QualityTierBounds, ScreenEncoder, ScreenQualitySnapshot,
-    ScreenQualityTierBounds, ScreenShareEvent, SimulcastLayerInfo, SimulcastSendSnapshot,
+    should_retry_screen_capture_without_ceiling, AqControlLoopCancel, CameraEncoder,
+    LiveQualitySnapshot, MicrophoneEncoderTrait, QualityTierBounds, ScreenEncoder,
+    ScreenQualitySnapshot, ScreenQualityTierBounds, ScreenShareEvent, SimulcastLayerInfo,
+    SimulcastSendSnapshot,
 };
 pub use media_devices::{
     MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,

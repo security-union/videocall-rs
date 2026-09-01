@@ -136,19 +136,36 @@ impl FromRequestParts<AppState> for AuthUser {
         // Used by server-side OAuth (cookie set by /login/callback) and
         // deployments without an external identity provider.
         // ----------------------------------------------------------------
-        if let Some(token) = extract_session_token(parts, &state.cookie_name) {
-            let claims = token::decode_session_token(&state.jwt_secret, &token)?;
-            if claims
-                .sub
-                .starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX)
-            {
-                tracing::warn!("rejected session token with reserved guest: prefix user_id");
-                return Err(AppError::unauthorized_msg("invalid session token"));
+        let previous_secret = state.previous_session_secret(chrono::Utc::now().timestamp());
+
+        let mut cookie_rejection: Option<AppError> = None;
+        if let Some(cookie_header) = parts
+            .headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+        {
+            for candidate in session_cookie_candidates(cookie_header, &state.cookie_name) {
+                match authenticate_session_token(
+                    &state.session_jwt_secret,
+                    previous_secret,
+                    candidate,
+                ) {
+                    Ok(user) => return Ok(user),
+                    Err(err) => {
+                        cookie_rejection.get_or_insert(err);
+                    }
+                }
             }
-            return Ok(AuthUser {
-                user_id: claims.sub,
-                name: claims.name,
-            });
+        }
+
+        // A session cookie was present but none validated: reject rather than
+        // fall through to Bearer, preserving cookie-over-Bearer precedence.
+        if let Some(err) = cookie_rejection {
+            return Err(err);
+        }
+
+        if let Some(token) = extract_bearer_token(parts) {
+            return authenticate_session_token(&state.session_jwt_secret, previous_secret, &token);
         }
 
         Err(AppError::new(
@@ -175,31 +192,52 @@ fn extract_bearer_token(parts: &Parts) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Extract the raw session JWT from the request.
-///
-/// Checks (in order):
-/// 1. `Cookie: <cookie_name>=<jwt>`
-/// 2. `Authorization: Bearer <jwt>`
-fn extract_session_token(parts: &Parts, cookie_name: &str) -> Option<String> {
-    // 1. Try the configured session cookie name.
-    if let Some(cookie_header) = parts
-        .headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-    {
-        let prefix = format!("{cookie_name}=");
-        for pair in cookie_header.split(';') {
-            let pair = pair.trim();
-            if let Some(value) = pair.strip_prefix(prefix.as_str()) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
+/// Upper bound on how many `<cookie_name>=` values from a single `Cookie`
+/// header the session path will validate. Values past the cap are never
+/// decoded, so one request cannot be made to cost an unbounded number of HMAC
+/// verifications.
+const MAX_SESSION_COOKIE_CANDIDATES: usize = 8;
+
+/// Every non-empty `<cookie_name>=<value>` in the `Cookie` header, in header
+/// order, capped at [`MAX_SESSION_COOKIE_CANDIDATES`]. The same name arrives
+/// more than once when it is set at more than one scope (host-only plus
+/// `Domain=`-scoped), and RFC 6265 sorts by path length and creation time, not
+/// by domain scope — the user's own session is not necessarily first.
+fn session_cookie_candidates<'a>(
+    cookie_header: &'a str,
+    cookie_name: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
+    cookie_header
+        .split(';')
+        .filter_map(move |pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            if name == cookie_name {
+                Some(value.trim())
+            } else {
+                None
             }
-        }
+        })
+        .filter(|value| !value.is_empty())
+        .take(MAX_SESSION_COOKIE_CANDIDATES)
+}
+
+fn authenticate_session_token(
+    jwt_secret: &str,
+    previous_jwt_secret: Option<&str>,
+    token: &str,
+) -> Result<AuthUser, AppError> {
+    let claims = token::decode_session_token(jwt_secret, previous_jwt_secret, token)?;
+    if claims
+        .sub
+        .starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX)
+    {
+        tracing::warn!("rejected session token with reserved guest: prefix user_id");
+        return Err(AppError::unauthorized_msg("invalid session token"));
     }
-    // 2. Fall back to `Authorization: Bearer <token>`.
-    extract_bearer_token(parts)
+    Ok(AuthUser {
+        user_id: claims.sub,
+        name: claims.name,
+    })
 }
 
 /// Extractor for a guest waiting in the lobby. Authenticates via the
@@ -211,13 +249,9 @@ pub struct GuestObserver {
     pub display_name: String,
 }
 
-impl FromRequestParts<AppState> for GuestObserver {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+impl GuestObserver {
+    /// Shared with [`OptionalGuestObserver`] so both accept the same credentials.
+    fn from_bearer(parts: &Parts, state: &AppState) -> Result<Self, AppError> {
         let token = extract_bearer_token(parts)
             .ok_or_else(|| AppError::unauthorized_msg("missing Authorization: Bearer header"))?;
 
@@ -228,6 +262,38 @@ impl FromRequestParts<AppState> for GuestObserver {
             meeting_id: claims.room,
             display_name: claims.display_name,
         })
+    }
+}
+
+impl FromRequestParts<AppState> for GuestObserver {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        GuestObserver::from_bearer(parts, state)
+    }
+}
+
+/// Accepts a guest credential without requiring one, for endpoints a
+/// first-time joiner must still reach.
+///
+/// Infallible by design: absent, malformed, expired and non-guest tokens all
+/// yield `None` rather than a `401`.
+#[derive(Debug)]
+pub struct OptionalGuestObserver(pub Option<GuestObserver>);
+
+impl FromRequestParts<AppState> for OptionalGuestObserver {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(OptionalGuestObserver(
+            GuestObserver::from_bearer(parts, state).ok(),
+        ))
     }
 }
 
@@ -288,6 +354,12 @@ impl FromRequestParts<AppState> for RoomMember {
             AppError::unauthorized_msg("invalid or expired room token")
         })?;
 
+        token::require_token_type(
+            claims.typ.as_deref(),
+            RoomAccessTokenClaims::TOKEN_TYPE,
+            "room",
+        )?;
+
         // Reject observer tokens: `generate_room_token` always sets
         // `room_join: true`, while `generate_observer_token` sets it to
         // `false`. An observer has not been admitted as a participant, so it
@@ -330,6 +402,9 @@ mod tests {
         AppState {
             db,
             jwt_secret: TEST_SECRET.to_string(),
+            session_jwt_secret: TEST_SECRET.to_string(),
+            session_jwt_secret_previous: None,
+            session_previous_secret_expires_at: 0,
             token_ttl_secs: 600,
             session_ttl_secs: 3600,
             session_refresh_threshold_secs: 7200,
@@ -385,6 +460,37 @@ mod tests {
             .unwrap();
         let (mut parts, _) = req.into_parts();
         AuthUser::from_request_parts(&mut parts, &state).await
+    }
+
+    #[tokio::test]
+    async fn the_extractor_accepts_a_previous_key_cookie_only_inside_the_window() {
+        const PREVIOUS_SECRET: &str = "auth-tests-outgoing-secret";
+        let jwt =
+            generate_session_token(PREVIOUS_SECRET, "alice@test.com", "Alice", 3600, 1234).unwrap();
+        let cookie = format!("session={jwt}");
+
+        let mut state = make_test_state();
+        assert!(
+            extract_with_cookie_and_state(Some(&cookie), &state)
+                .await
+                .is_err(),
+            "with no window configured, a pre-rotation cookie must be rejected"
+        );
+
+        state.session_jwt_secret_previous = Some(PREVIOUS_SECRET.to_string());
+        state.session_previous_secret_expires_at = i64::MAX;
+        let auth = extract_with_cookie_and_state(Some(&cookie), &state)
+            .await
+            .expect("an open window must authenticate a pre-rotation cookie");
+        assert_eq!(auth.user_id, "alice@test.com");
+
+        state.session_previous_secret_expires_at = 0;
+        assert!(
+            extract_with_cookie_and_state(Some(&cookie), &state)
+                .await
+                .is_err(),
+            "a closed window must reject a pre-rotation cookie"
+        );
     }
 
     #[tokio::test]
@@ -521,6 +627,169 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Cookie shadowing (#1750): an apex-scoped `session=` cookie planted by a
+    // sibling app arrives in the same Cookie header as the user's own, in an
+    // order the user does not control.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn planted_cookie_before_valid_session_does_not_lock_the_user_out() {
+        let jwt =
+            generate_session_token(TEST_SECRET, "victim@test.com", "Victim", 3600, 1234).unwrap();
+        let auth = extract_with_cookie(Some(&format!("session=planted-by-sibling; session={jwt}")))
+            .await
+            .expect("a planted first cookie must not shadow the user's real session");
+        assert_eq!(auth.user_id, "victim@test.com");
+    }
+
+    #[tokio::test]
+    async fn planted_cookie_after_valid_session_is_ignored() {
+        let jwt =
+            generate_session_token(TEST_SECRET, "victim@test.com", "Victim", 3600, 1234).unwrap();
+        let auth = extract_with_cookie(Some(&format!("session={jwt}; session=planted-by-sibling")))
+            .await
+            .expect("a valid first cookie must still authenticate");
+        assert_eq!(auth.user_id, "victim@test.com");
+    }
+
+    #[tokio::test]
+    async fn all_invalid_session_cookies_still_unauthorized() {
+        let expired =
+            generate_session_token(TEST_SECRET, "victim@test.com", "Victim", -120, 1234).unwrap();
+        let err = extract_with_cookie(Some(&format!("session=garbage; session={expired}")))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::UNAUTHORIZED,
+            "trying every candidate must not become an auth bypass"
+        );
+    }
+
+    #[tokio::test]
+    async fn guest_prefixed_cookie_does_not_block_a_later_valid_session() {
+        let guest_jwt = generate_session_token(
+            TEST_SECRET,
+            &format!("{}abc", videocall_meeting_types::GUEST_USER_ID_PREFIX),
+            "Guest",
+            3600,
+            1234,
+        )
+        .unwrap();
+        let jwt =
+            generate_session_token(TEST_SECRET, "victim@test.com", "Victim", 3600, 1234).unwrap();
+        let auth = extract_with_cookie(Some(&format!("session={guest_jwt}; session={jwt}")))
+            .await
+            .expect("a guest-prefixed candidate must be skipped, not fatal");
+        assert_eq!(auth.user_id, "victim@test.com");
+    }
+
+    #[tokio::test]
+    async fn guest_prefixed_cookie_alone_is_still_rejected() {
+        let guest_jwt = generate_session_token(
+            TEST_SECRET,
+            &format!("{}abc", videocall_meeting_types::GUEST_USER_ID_PREFIX),
+            "Guest",
+            3600,
+            1234,
+        )
+        .unwrap();
+        let err = extract_with_cookie(Some(&format!("session={guest_jwt}")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    // --- candidate cap ------------------------------------------------------
+
+    #[tokio::test]
+    async fn valid_session_at_the_candidate_cap_is_accepted() {
+        let jwt =
+            generate_session_token(TEST_SECRET, "victim@test.com", "Victim", 3600, 1234).unwrap();
+        // 7 planted values, the real session 8th == MAX_SESSION_COOKIE_CANDIDATES.
+        let header = format!("{}session={jwt}", "session=planted; ".repeat(7));
+        let auth = extract_with_cookie(Some(&header))
+            .await
+            .expect("the 8th candidate is within the cap and must be tried");
+        assert_eq!(auth.user_id, "victim@test.com");
+    }
+
+    #[tokio::test]
+    async fn session_cookie_past_the_candidate_cap_is_not_tried() {
+        let jwt =
+            generate_session_token(TEST_SECRET, "victim@test.com", "Victim", 3600, 1234).unwrap();
+        let header = format!("{}session={jwt}", "session=planted; ".repeat(8));
+        let err = extract_with_cookie(Some(&header)).await.unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::UNAUTHORIZED,
+            "candidates past the cap must not be decoded"
+        );
+    }
+
+    #[test]
+    fn candidate_enumeration_stops_at_the_cap() {
+        let header = "session=planted; ".repeat(20);
+        let candidates: Vec<&str> = session_cookie_candidates(&header, "session").collect();
+        assert_eq!(
+            candidates.len(),
+            8,
+            "at most 8 HMAC verifications may be reachable from one Cookie header"
+        );
+    }
+
+    #[test]
+    fn empty_and_foreign_cookie_values_are_not_candidates() {
+        let header = "session=; lang=en; sessionx=nope; session=real";
+        let candidates: Vec<&str> = session_cookie_candidates(header, "session").collect();
+        assert_eq!(candidates, vec!["real"]);
+    }
+
+    // --- Bearer fallback precedence ----------------------------------------
+
+    #[tokio::test]
+    async fn bearer_is_not_tried_when_a_session_cookie_is_present_but_invalid() {
+        let bearer_jwt =
+            generate_session_token(TEST_SECRET, "bearer@test.com", "Bearer", 3600, 1234).unwrap();
+        let state = make_test_state();
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::COOKIE, "session=garbage")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer_jwt}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::UNAUTHORIZED,
+            "cookie-over-Bearer precedence must be unchanged by the shadowing fix"
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_is_used_when_the_session_cookie_is_empty() {
+        let bearer_jwt =
+            generate_session_token(TEST_SECRET, "bearer@test.com", "Bearer", 3600, 1234).unwrap();
+        let state = make_test_state();
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::COOKIE, "session=; lang=en")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer_jwt}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let auth = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("an empty cookie value is not a candidate, so Bearer applies");
+        assert_eq!(auth.user_id, "bearer@test.com");
+    }
+
+    // -----------------------------------------------------------------------
     // Custom cookie name tests (PR preview collision fix)
     // -----------------------------------------------------------------------
 
@@ -654,6 +923,9 @@ mod tests {
         AppState {
             db,
             jwt_secret: TEST_SECRET.to_string(),
+            session_jwt_secret: TEST_SECRET.to_string(),
+            session_jwt_secret_previous: None,
+            session_previous_secret_expires_at: 0,
             token_ttl_secs: 600,
             session_ttl_secs: 3600,
             session_refresh_threshold_secs: 7200,
@@ -1078,6 +1350,68 @@ mod tests {
         assert_eq!(member.meeting_id, "room-B");
     }
 
+    /// Built from `RoomAccessTokenClaims` itself, so every field the verifier's
+    /// serde requires is present and only `typ` can reject it (#2411).
+    fn room_token_with_typ(typ: Option<&str>) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let claims = RoomAccessTokenClaims {
+            sub: "alice@test.com".to_string(),
+            room: "room-A".to_string(),
+            room_join: true,
+            is_host: false,
+            is_guest: false,
+            display_name: "Alice".to_string(),
+            observer: false,
+            end_on_host_leave: true,
+            exp: now + 600,
+            iss: RoomAccessTokenClaims::ISSUER.to_string(),
+            typ: typ.map(str::to_string),
+        };
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn room_member_rejects_session_typed_token_on_the_discriminator() {
+        let err = extract_room_member(Some(&room_token_with_typ(Some(
+            crate::token::SessionTokenClaims::TOKEN_TYPE,
+        ))))
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            err.body.engineering_error.as_deref(),
+            Some("token type mismatch"),
+            "must reject on `typ`, not as a generic room-token decode failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn room_member_accepts_the_same_payload_with_the_room_typ() {
+        // Control: identical claims apart from `typ`.
+        let member = extract_room_member(Some(&room_token_with_typ(Some(
+            RoomAccessTokenClaims::TOKEN_TYPE,
+        ))))
+        .await
+        .expect("room-typed token must authenticate");
+
+        assert_eq!(member.user_id, "alice@test.com");
+    }
+
+    #[tokio::test]
+    async fn room_member_accepts_token_without_typ_as_legacy() {
+        let member = extract_room_member(Some(&room_token_with_typ(None)))
+            .await
+            .expect("pre-#2411 room tokens must keep working");
+
+        assert_eq!(member.user_id, "alice@test.com");
+    }
+
     #[tokio::test]
     async fn room_member_rejects_missing_bearer() {
         let err = extract_room_member(None).await.unwrap_err();
@@ -1153,5 +1487,69 @@ mod tests {
         assert_eq!(member.meeting_id, "room-A");
         // And must NOT equal a different meeting (handler 403s on path "room-B").
         assert_ne!(member.meeting_id, "room-B");
+    }
+
+    async fn extract_optional_guest(token: Option<&str>) -> Option<GuestObserver> {
+        let state = make_test_state();
+        let mut builder = Request::builder().uri("/test").method("POST");
+        if let Some(t) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let req = builder.body(()).unwrap();
+        let (mut parts, _) = req.into_parts();
+        let OptionalGuestObserver(observer) =
+            OptionalGuestObserver::from_request_parts(&mut parts, &state)
+                .await
+                .expect("OptionalGuestObserver is Infallible");
+        observer
+    }
+
+    #[tokio::test]
+    async fn optional_guest_observer_accepts_a_valid_guest_token() {
+        let token = crate::token::generate_observer_token(
+            TEST_SECRET,
+            "guest:2f8f3d3a-6c1e-4b62-9b0f-2a3f5f7f9c11",
+            "room-A",
+            "Guest",
+            true,
+        )
+        .unwrap();
+        let observer = extract_optional_guest(Some(&token))
+            .await
+            .expect("a valid observer token must resolve");
+        assert_eq!(
+            observer.user_id,
+            "guest:2f8f3d3a-6c1e-4b62-9b0f-2a3f5f7f9c11"
+        );
+        assert_eq!(observer.meeting_id, "room-A");
+    }
+
+    #[tokio::test]
+    async fn optional_guest_observer_yields_none_instead_of_rejecting() {
+        assert!(extract_optional_guest(None).await.is_none());
+        assert!(extract_optional_guest(Some("not-a-jwt")).await.is_none());
+
+        let wrong_secret = crate::token::generate_observer_token(
+            "a-different-secret",
+            "guest:2f8f3d3a-6c1e-4b62-9b0f-2a3f5f7f9c11",
+            "room-A",
+            "Guest",
+            true,
+        )
+        .unwrap();
+        assert!(extract_optional_guest(Some(&wrong_secret)).await.is_none());
+
+        let non_guest = generate_room_token(
+            TEST_SECRET,
+            600,
+            "alice@test.com",
+            "room-A",
+            false,
+            "Alice",
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(extract_optional_guest(Some(&non_guest)).await.is_none());
     }
 }

@@ -117,8 +117,8 @@ impl ReactionSelfThrottle {
     /// the rolling-window count allow it; `false` (recording nothing) when
     /// either limit would be exceeded.
     ///
-    /// `now_ms` is a monotonic millisecond clock (e.g. `performance.now()` in
-    /// the browser); passing it in keeps this deterministically host-testable.
+    /// `now_ms` is caller-supplied — the UI passes `js_sys::Date::now()` (WALL clock,
+    /// not `performance.now()`). Both checks below fail CLOSED on a backward step.
     pub fn try_acquire(&mut self, now_ms: f64) -> bool {
         // Evict timestamps that have aged out of the rolling window.
         while let Some(&front) = self.accepted.front() {

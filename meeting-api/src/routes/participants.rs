@@ -24,7 +24,7 @@ use videocall_meeting_types::{
 };
 
 use crate::auth::AuthUser;
-use crate::auth::GuestObserver;
+use crate::auth::{GuestObserver, OptionalGuestObserver};
 use crate::db::meetings::MeetingRow;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
@@ -451,6 +451,13 @@ async fn join_as_attendee(
         // an observer token so the client can receive a push notification when
         // the host activates the meeting.
         let dn = display_name.unwrap_or(fallback_display_name);
+        tracing::info!(
+            meeting_id = %meeting_id,
+            user_id = %user_id,
+            is_guest,
+            waiting_room_enabled = meeting.waiting_room_enabled,
+            "join gated: waiting_for_meeting (meeting is idle)"
+        );
         let observer =
             generate_observer_token(&state.jwt_secret, user_id, meeting_id, dn, is_guest)?;
         let resp = ParticipantStatusResponse {
@@ -575,6 +582,46 @@ async fn join_as_attendee(
     Ok(Json(APIResponse::ok(resp)))
 }
 
+fn new_guest_user_id() -> String {
+    format!(
+        "{}{}",
+        videocall_meeting_types::GUEST_USER_ID_PREFIX,
+        uuid::Uuid::new_v4()
+    )
+}
+
+/// Decide which `guest:{uuid}` identity a `join-guest` request runs as.
+///
+/// A client-supplied `guest_session_id` is honoured only against a guest token
+/// whose `sub` is that identity and whose `room` is this meeting; otherwise the
+/// identity is minted fresh. A non-matching token is ignored, not rejected — a
+/// `401` would strand a client whose stored id and token have drifted apart.
+fn resolve_guest_identity(
+    requested: Option<&str>,
+    observer: Option<&GuestObserver>,
+    meeting_id: &str,
+) -> String {
+    let Some(requested) = requested.filter(|id| {
+        id.strip_prefix(videocall_meeting_types::GUEST_USER_ID_PREFIX)
+            .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok())
+            .is_some()
+    }) else {
+        return new_guest_user_id();
+    };
+
+    match observer {
+        Some(o) if o.user_id == requested && o.meeting_id == meeting_id => requested.to_string(),
+        _ => {
+            tracing::warn!(
+                "join-guest for meeting {meeting_id} claimed guest_session_id {requested} \
+                 without a matching guest token (token presented: {}); minting a fresh identity",
+                observer.is_some()
+            );
+            new_guest_user_id()
+        }
+    }
+}
+
 /// POST /api/v1/meetings/{meeting_id}/join-guest
 ///
 /// Allows a guest user (non-authenticated) to join a meeting if guests are allowed.
@@ -590,6 +637,7 @@ pub async fn join_meeting_as_guest(
     State(state): State<AppState>,
     Path(meeting_id): Path<String>,
     ClientAddr(client_ip): ClientAddr,
+    OptionalGuestObserver(observer): OptionalGuestObserver,
     body: Json<GuestJoinRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let display_name = validate_display_name(&body.display_name)
@@ -601,26 +649,11 @@ pub async fn join_meeting_as_guest(
         _ => return Err(AppError::guests_not_allowed()),
     };
 
-    // Guests are treated as attendees but without a user_id. Use a special
-    // "guest:{uuid}" format for the participant record and tokens.
-    // If the client provided a stable guest_session_id from a previous join,
-    // reuse it.
-    let guest_user_id = match body.guest_session_id.as_deref() {
-        Some(id)
-            if id.starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX)
-                && id
-                    .strip_prefix(videocall_meeting_types::GUEST_USER_ID_PREFIX)
-                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                    .is_some() =>
-        {
-            id.to_string()
-        }
-        _ => format!(
-            "{}{}",
-            videocall_meeting_types::GUEST_USER_ID_PREFIX,
-            uuid::Uuid::new_v4()
-        ),
-    };
+    let guest_user_id = resolve_guest_identity(
+        body.guest_session_id.as_deref(),
+        observer.as_ref(),
+        &meeting_id,
+    );
 
     join_as_attendee(
         &state,
@@ -718,6 +751,8 @@ pub async fn get_guest_status(
         .await?
         .ok_or_else(AppError::not_in_meeting)?;
 
+    let display_name = row.display_name.as_deref().unwrap_or(&user_id);
+
     let token = if row.status == "admitted" {
         Some(generate_room_token(
             &state.jwt_secret,
@@ -725,7 +760,7 @@ pub async fn get_guest_status(
             &user_id,
             &meeting_id,
             false,
-            row.display_name.as_deref().unwrap_or(&user_id),
+            display_name,
             meeting.end_on_host_leave,
             true,
         )?)
@@ -733,7 +768,23 @@ pub async fn get_guest_status(
         None
     };
 
+    // Matched against `waiting` rather than `!= "admitted"`: `rejected`,
+    // `kicked` and `left` are host-side revocations, and re-minting for those
+    // would renew observation the host took away.
+    let observer = if row.status == "waiting" {
+        Some(generate_observer_token(
+            &state.jwt_secret,
+            &user_id,
+            &meeting_id,
+            display_name,
+            true,
+        )?)
+    } else {
+        None
+    };
+
     let mut resp = row.into_participant_status(token);
+    resp.observer_token = observer;
     resp.waiting_room_enabled = meeting.waiting_room_enabled;
     resp.admitted_can_admit = meeting.admitted_can_admit;
     resp.allow_guests = meeting.allow_guests;
@@ -1184,6 +1235,9 @@ mod tests {
             db: sqlx::PgPool::connect_lazy("postgres://invalid/invalid")
                 .expect("connect_lazy never blocks on the network"),
             jwt_secret: "test-secret".to_string(),
+            session_jwt_secret: "test-secret".to_string(),
+            session_jwt_secret_previous: None,
+            session_previous_secret_expires_at: 0,
             token_ttl_secs: 600,
             session_ttl_secs: 3600,
             session_refresh_threshold_secs: 7200,
@@ -1266,5 +1320,95 @@ mod tests {
             format!("{err:?}").contains("RATE_LIMIT_EXCEEDED"),
             "rejection must surface RATE_LIMIT_EXCEEDED, got: {err:?}"
         );
+    }
+
+    const VICTIM: &str = "guest:2f8f3d3a-6c1e-4b62-9b0f-2a3f5f7f9c11";
+    const ROOM: &str = "standup";
+
+    fn observer(user_id: &str, meeting_id: &str) -> crate::auth::GuestObserver {
+        crate::auth::GuestObserver {
+            user_id: user_id.to_string(),
+            meeting_id: meeting_id.to_string(),
+            display_name: "Guest".to_string(),
+        }
+    }
+
+    #[test]
+    fn requested_identity_without_a_token_is_not_granted() {
+        let resolved = super::resolve_guest_identity(Some(VICTIM), None, ROOM);
+        assert_ne!(resolved, VICTIM);
+        assert!(resolved.starts_with(videocall_meeting_types::GUEST_USER_ID_PREFIX));
+    }
+
+    #[test]
+    fn requested_identity_with_a_matching_token_is_resumed() {
+        let token = observer(VICTIM, ROOM);
+        assert_eq!(
+            super::resolve_guest_identity(Some(VICTIM), Some(&token), ROOM),
+            VICTIM
+        );
+    }
+
+    #[test]
+    fn a_token_for_a_different_subject_does_not_grant_the_requested_identity() {
+        let token = observer("guest:9c0b1e77-4d55-4a2e-8f11-6b7d2c4e8a90", ROOM);
+        assert_ne!(
+            super::resolve_guest_identity(Some(VICTIM), Some(&token), ROOM),
+            VICTIM
+        );
+    }
+
+    #[test]
+    fn a_token_for_a_different_meeting_does_not_grant_the_requested_identity() {
+        let token = observer(VICTIM, "some-other-room");
+        assert_ne!(
+            super::resolve_guest_identity(Some(VICTIM), Some(&token), ROOM),
+            VICTIM
+        );
+    }
+
+    #[test]
+    fn a_first_join_mints_a_well_formed_identity() {
+        let resolved = super::resolve_guest_identity(None, None, ROOM);
+        let uuid = resolved
+            .strip_prefix(videocall_meeting_types::GUEST_USER_ID_PREFIX)
+            .expect("minted identity must carry the guest: prefix");
+        uuid::Uuid::parse_str(uuid).expect("minted identity must be a UUID");
+    }
+
+    #[test]
+    fn each_mint_is_a_distinct_identity() {
+        assert_ne!(
+            super::resolve_guest_identity(None, None, ROOM),
+            super::resolve_guest_identity(None, None, ROOM)
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_identity_claim_is_logged_and_a_first_join_is_not() {
+        super::resolve_guest_identity(None, None, ROOM);
+        assert!(!logs_contain("without a matching guest token"));
+
+        super::resolve_guest_identity(Some(VICTIM), None, ROOM);
+        assert!(
+            logs_contain("without a matching guest token"),
+            "a refused guest_session_id claim must be logged"
+        );
+    }
+
+    #[test]
+    fn a_malformed_requested_identity_is_never_honoured() {
+        for bogus in ["victim@example.com", "guest:not-a-uuid", "guest:", ""] {
+            let token = observer(bogus, ROOM);
+            let resolved = super::resolve_guest_identity(Some(bogus), Some(&token), ROOM);
+            assert_ne!(resolved, bogus, "must not honour {bogus:?}");
+            uuid::Uuid::parse_str(
+                resolved
+                    .strip_prefix(videocall_meeting_types::GUEST_USER_ID_PREFIX)
+                    .expect("fallback must carry the guest: prefix"),
+            )
+            .expect("fallback must be a UUID");
+        }
     }
 }

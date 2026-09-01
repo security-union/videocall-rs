@@ -71,7 +71,8 @@
 //! pool defaults to 512 threads; a bare `spawn_blocking` would let 512
 //! concurrent verifications run at ~19 MiB each — ~9.7 GiB against a 256 MiB
 //! container limit, i.e. an instant OOMKill. Offloading *without* bounding is
-//! strictly worse than running inline.
+//! strictly worse than running inline. Hashing costs the same ~19 MiB, so it
+//! takes the *same* permits (issue #2478).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -79,24 +80,25 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::http::HeaderMap;
 use tokio::sync::Semaphore;
 
 use crate::error::AppError;
 
-/// Upper bound on concurrent Argon2 verifications, regardless of core count.
+/// Upper bound on concurrent Argon2 operations, verify and hash alike.
 ///
-/// Each in-flight verification holds ~19 MiB (`m=19456 KiB`). Four permits is
+/// Each in-flight operation holds ~19 MiB (`m=19456 KiB`). Four permits is
 /// ~76 MiB transient, which fits under the service's 256 MiB container limit
 /// alongside its steady-state footprint. Raising this without also raising the
 /// memory limit re-opens the OOMKill vector described in the module docs — the
 /// `const` assertion below makes that a build failure rather than an incident.
-const MAX_VERIFY_PERMITS: usize = 4;
+const MAX_ARGON2_PERMITS: usize = 4;
 
-/// Peak resident memory one in-flight Argon2 verification holds, in MiB —
+/// Peak resident memory one in-flight Argon2 operation holds, in MiB —
 /// the `m=19456 KiB` cost parameter of `Argon2::default()`, rounded up.
-const ARGON2_MIB_PER_VERIFY: usize = 19;
+const ARGON2_MIB_PER_OP: usize = 19;
 
 /// The pod's memory limit, from `helm/meeting-api/values.yaml`
 /// (`resources.limits.memory`). Kept here so the two cannot drift silently.
@@ -109,18 +111,17 @@ const STEADY_STATE_HEADROOM_MIB: usize = 128;
 /// Compile-time guard on the relationship the module docs rely on.
 ///
 /// Deliberately a `const` assertion rather than a test: raising
-/// [`MAX_VERIFY_PERMITS`] past what the container can hold should fail the
+/// [`MAX_ARGON2_PERMITS`] past what the container can hold should fail the
 /// **build**, not a test somebody might not run. If this ever fires, either
 /// lower the permit count or raise `resources.limits.memory` in both
 /// `helm/meeting-api/values.yaml` and the per-region overlay — and update
 /// [`CONTAINER_LIMIT_MIB`] to match.
 const _: () = assert!(
-    MAX_VERIFY_PERMITS * ARGON2_MIB_PER_VERIFY <= CONTAINER_LIMIT_MIB - STEADY_STATE_HEADROOM_MIB,
-    "concurrent Argon2 verifications could exceed the container memory limit"
+    MAX_ARGON2_PERMITS * ARGON2_MIB_PER_OP <= CONTAINER_LIMIT_MIB - STEADY_STATE_HEADROOM_MIB,
+    "concurrent Argon2 operations could exceed the container memory limit"
 );
 
-/// How long a joiner waits for a verification permit before the request is shed
-/// with `503`.
+/// How long a caller waits for an Argon2 permit before it is shed with `503`.
 ///
 /// Sized against the legitimate worst case rather than the median: the
 /// `on_meeting_activated` broadcast makes every waiting attendee re-join at
@@ -130,7 +131,7 @@ const _: () = assert!(
 /// leaves an order of magnitude of headroom before a real meeting sheds. It
 /// still bounds queue depth: sustained overload sheds rather than growing the
 /// queue without limit.
-const VERIFY_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+const ARGON2_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Failed verifications allowed per `(client IP, meeting)` per window.
 const MAX_FAILED_PASSWORD_ATTEMPTS: u32 = 5;
@@ -184,6 +185,13 @@ enum AttemptBilling {
     Refund,
 }
 
+/// Why a bounded Argon2 offload produced no result. `Shed` never ran the work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Argon2Unavailable {
+    Shed,
+    Panicked,
+}
+
 /// Per-instance throttle and concurrency bound for meeting-password checks.
 ///
 /// Held in [`crate::state::AppState`] behind an `Arc`, so every handler on an
@@ -194,20 +202,19 @@ enum AttemptBilling {
 /// per-instance budget multiplies by the replica count** and the throttle needs
 /// to move to a shared store (or the ingress).
 pub struct MeetingPasswordGate {
-    /// Bounds concurrent Argon2 verifications — CPU *and* the ~19 MiB each one
-    /// holds.
-    verify_permits: Semaphore,
+    /// Bounds concurrent Argon2 operations — CPU *and* the ~19 MiB each holds.
+    argon2_permits: Semaphore,
     /// How long to wait for a permit before shedding with `503`.
     queue_timeout: Duration,
     /// Failed attempts per `(client IP, meeting)`: `(window_start, count)`.
     failed_attempts: Mutex<HashMap<(IpAddr, String), (Instant, u32)>>,
     /// Operation counter driving periodic sweeps of `failed_attempts`.
     ops: AtomicU64,
-    /// Highest number of verifications ever in flight at once. Monotonic
+    /// Highest number of Argon2 operations ever in flight at once. Monotonic
     /// (`fetch_max`), so it can be read after the fact without racing the
     /// workers. Exposed for tests and useful as an operational gauge.
     peak_in_flight: AtomicUsize,
-    /// Verifications currently in flight.
+    /// Argon2 operations currently in flight.
     in_flight: AtomicUsize,
 }
 
@@ -221,7 +228,7 @@ impl MeetingPasswordGate {
     /// Build a gate sized to the container's CPU allocation.
     ///
     /// Permits track `available_parallelism()` clamped to
-    /// `1..=MAX_VERIFY_PERMITS`: one permit on the single-core floor a
+    /// `1..=MAX_ARGON2_PERMITS`: one permit on the single-core floor a
     /// sub-1-core cgroup quota produces, up to four when the pod has real CPU.
     /// More permits than cores would not add throughput for a CPU-bound hash —
     /// it would only multiply peak memory.
@@ -229,15 +236,15 @@ impl MeetingPasswordGate {
         let permits = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .clamp(1, MAX_VERIFY_PERMITS);
-        Self::with_config(permits, VERIFY_QUEUE_TIMEOUT)
+            .clamp(1, MAX_ARGON2_PERMITS);
+        Self::with_config(permits, ARGON2_QUEUE_TIMEOUT)
     }
 
     /// Build a gate with explicit bounds. Tests use this to drive the
     /// load-shedding and concurrency-bound paths deterministically.
     pub fn with_config(permits: usize, queue_timeout: Duration) -> Self {
         Self {
-            verify_permits: Semaphore::new(permits),
+            argon2_permits: Semaphore::new(permits),
             queue_timeout,
             failed_attempts: Mutex::new(HashMap::new()),
             ops: AtomicU64::new(0),
@@ -246,14 +253,14 @@ impl MeetingPasswordGate {
         }
     }
 
-    /// Highest concurrent verification count observed since construction.
+    /// Highest concurrent Argon2 operation count observed since construction.
     pub fn peak_in_flight(&self) -> usize {
         self.peak_in_flight.load(Ordering::Relaxed)
     }
 
     /// Permits not currently held.
     pub fn available_permits(&self) -> usize {
-        self.verify_permits.available_permits()
+        self.argon2_permits.available_permits()
     }
 
     /// Verify a join request's password against a meeting's stored Argon2 hash.
@@ -277,7 +284,7 @@ impl MeetingPasswordGate {
     /// - [`AppError::too_many_password_attempts`] (429) — this `(IP, meeting)`
     ///   pair has burned its failure budget for the window.
     /// - [`AppError::verifier_overloaded`] (503) — no verification permit became
-    ///   available within [`VERIFY_QUEUE_TIMEOUT`].
+    ///   available within [`ARGON2_QUEUE_TIMEOUT`].
     ///
     /// # Cost, and what is free
     ///
@@ -350,62 +357,97 @@ impl MeetingPasswordGate {
         }
     }
 
+    /// Hash a meeting password on the blocking pool, bounded by the same permits
+    /// as verification. The only route to [`hash_blocking`].
+    pub async fn hash(&self, plaintext: &str) -> Result<String, AppError> {
+        let plaintext = plaintext.to_owned();
+        match self
+            .run_bounded("hash", move || hash_blocking(&plaintext))
+            .await
+        {
+            Ok(inner) => inner,
+            Err(Argon2Unavailable::Shed) => Err(AppError::password_hasher_overloaded()),
+            Err(Argon2Unavailable::Panicked) => {
+                Err(AppError::internal("password hash task panicked"))
+            }
+        }
+    }
+
+    /// Turn a validated [`PasswordIntent`] into the value the column takes. Call
+    /// only once the caller is known to own the meeting.
+    pub async fn hash_intent(
+        &self,
+        intent: PasswordIntent<'_>,
+    ) -> Result<PasswordUpdate, AppError> {
+        Ok(match intent {
+            PasswordIntent::Unchanged => PasswordUpdate::Unchanged,
+            PasswordIntent::Clear => PasswordUpdate::Clear,
+            PasswordIntent::Set(pw) => PasswordUpdate::Set(self.hash(pw).await?),
+        })
+    }
+
     /// Run the Argon2 verification on the blocking pool, bounded by the
     /// semaphore.
-    ///
-    /// The permit is acquired **before** `spawn_blocking`, never inside it.
-    /// Acquiring inside would park a blocking-pool thread per waiter and
-    /// reintroduce the 512-thread memory blow-up the semaphore exists to
-    /// prevent; acquiring outside parks a cheap async task instead.
     async fn verify_offloaded(
         &self,
         stored: &str,
         candidate: &str,
     ) -> Result<(), (AppError, AttemptBilling)> {
+        let stored = stored.to_owned();
+        let candidate = candidate.to_owned();
+
+        match self
+            .run_bounded("verify", move || verify_blocking(&stored, &candidate))
+            .await
+        {
+            Ok(inner) => inner.map_err(|err| (err, AttemptBilling::Bill)),
+            Err(Argon2Unavailable::Shed) => {
+                Err((AppError::verifier_overloaded(), AttemptBilling::Refund))
+            }
+            Err(Argon2Unavailable::Panicked) => {
+                Err((AppError::invalid_meeting_password(), AttemptBilling::Bill))
+            }
+        }
+    }
+
+    /// Acquire an Argon2 permit, then run `work` on the blocking pool — the sole
+    /// route to Argon2 here, which makes [`MAX_ARGON2_PERMITS`] a process bound.
+    /// Acquiring the permit *inside* `spawn_blocking` would park a pool thread
+    /// per waiter and reintroduce the 512-thread blow-up it exists to prevent.
+    async fn run_bounded<T, F>(&self, op: &'static str, work: F) -> Result<T, Argon2Unavailable>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let permit =
-            match tokio::time::timeout(self.queue_timeout, self.verify_permits.acquire()).await {
+            match tokio::time::timeout(self.queue_timeout, self.argon2_permits.acquire()).await {
                 Ok(Ok(permit)) => permit,
                 Ok(Err(_closed)) => {
-                    // The semaphore is never closed in this codebase; if that
-                    // ever changes, deny rather than let a join through.
-                    tracing::error!("meeting-password verifier semaphore closed; denying join");
-                    return Err((AppError::verifier_overloaded(), AttemptBilling::Refund));
+                    tracing::error!(op, "meeting-password Argon2 semaphore closed; shedding");
+                    return Err(Argon2Unavailable::Shed);
                 }
                 Err(_elapsed) => {
                     tracing::warn!(
+                        op,
                         queue_timeout_secs = self.queue_timeout.as_secs(),
-                        "no Argon2 permit available; shedding join request"
+                        "no Argon2 permit available; shedding request"
                     );
-                    return Err((AppError::verifier_overloaded(), AttemptBilling::Refund));
+                    return Err(Argon2Unavailable::Shed);
                 }
             };
 
         let in_flight = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         self.peak_in_flight.fetch_max(in_flight, Ordering::Relaxed);
 
-        // `spawn_blocking` requires 'static, so the two strings are copied. This
-        // is the only allocation the gate adds, and only on the path that is
-        // already about to spend tens of milliseconds hashing — the no-password
-        // and no-supplied-password short-circuits above never reach it.
-        let stored = stored.to_owned();
-        let candidate = candidate.to_owned();
-
-        let result =
-            tokio::task::spawn_blocking(move || verify_blocking(&stored, &candidate)).await;
+        let result = tokio::task::spawn_blocking(work).await;
 
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
         drop(permit);
 
-        match result {
-            // The candidate really was evaluated, so a rejection bills.
-            Ok(inner) => inner.map_err(|err| (err, AttemptBilling::Bill)),
-            Err(join_err) => {
-                tracing::error!(error = %join_err, "Argon2 verification task panicked");
-                // Fail closed, and bill: we cannot tell whether the task died
-                // before or after doing the work, so assume an attempt.
-                Err((AppError::invalid_meeting_password(), AttemptBilling::Bill))
-            }
-        }
+        result.map_err(|join_err| {
+            tracing::error!(op, error = %join_err, "Argon2 task panicked");
+            Argon2Unavailable::Panicked
+        })
     }
 
     /// Charge one failed-attempt slot against `(client_ip, meeting_id)`.
@@ -521,6 +563,82 @@ fn verify_blocking(stored: &str, candidate: &str) -> Result<(), AppError> {
         .map_err(|_| AppError::invalid_meeting_password())
 }
 
+/// Hash a plaintext meeting password into the PHC string stored in
+/// `meetings.password_hash`. The only place that conversion happens.
+fn hash_blocking(plaintext: &str) -> Result<String, AppError> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(plaintext.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|e| AppError::internal(&format!("password hash error: {e}")))
+}
+
+/// What a `PATCH /api/v1/meetings/{meeting_id}` asks of the stored password
+/// hash. [`Self::Set`] carries the hash, never the plaintext.
+pub enum PasswordUpdate {
+    Unchanged,
+    Set(String),
+    Clear,
+}
+
+/// A validated PATCH body, before any hashing has been paid for.
+pub enum PasswordIntent<'a> {
+    Unchanged,
+    Set(&'a str),
+    Clear,
+}
+
+impl PasswordIntent<'_> {
+    /// Whether this intent changes `meetings.password_hash`.
+    pub fn is_change(&self) -> bool {
+        !matches!(self, Self::Unchanged)
+    }
+}
+
+impl std::fmt::Debug for PasswordIntent<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unchanged => f.write_str("Unchanged"),
+            Self::Set(_) => write!(f, "Set({REDACTED_PLAINTEXT})"),
+            Self::Clear => f.write_str("Clear"),
+        }
+    }
+}
+
+const REDACTED_PLAINTEXT: &str = "<redacted>";
+
+impl std::fmt::Debug for PasswordUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unchanged => f.write_str("Unchanged"),
+            Self::Set(_) => write!(f, "Set({REDACTED_HASH})"),
+            Self::Clear => f.write_str("Clear"),
+        }
+    }
+}
+
+const REDACTED_HASH: &str = "<hash>";
+
+/// Decide what a PATCH body's `password` / `remove_password` pair means. The two
+/// ambiguous bodies are refused. Deliberately free of Argon2 work, so a caller
+/// who is about to get a 400 or a 403 never buys any.
+pub fn parse_password_update(
+    password: Option<&str>,
+    remove_password: Option<bool>,
+) -> Result<PasswordIntent<'_>, AppError> {
+    match (password, remove_password.unwrap_or(false)) {
+        (Some(_), true) => Err(AppError::bad_request(
+            "`password` and `remove_password` are mutually exclusive",
+        )),
+        (None, true) => Ok(PasswordIntent::Clear),
+        (Some(""), false) => Err(AppError::bad_request(
+            "`password` must not be empty; send `remove_password: true` to clear it",
+        )),
+        (Some(pw), false) => Ok(PasswordIntent::Set(pw)),
+        (None, false) => Ok(PasswordIntent::Unchanged),
+    }
+}
+
 /// Resolve the address used to key the failed-attempt throttle.
 ///
 /// # Why the *last* `X-Forwarded-For` entry
@@ -617,21 +735,16 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     use std::net::Ipv4Addr;
     use std::sync::Arc;
 
     const IP: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
     const OTHER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8));
 
-    /// Hash a password exactly the way `create_meeting` does, so these tests
-    /// exercise the real stored-hash format rather than a hand-written fixture.
+    /// Hash a password through the production hasher, so these tests exercise
+    /// the real stored-hash format rather than a hand-written fixture.
     fn hash_like_create_meeting(plaintext: &str) -> String {
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(plaintext.as_bytes(), &salt)
-            .expect("hashing a password with default params cannot fail")
-            .to_string()
+        hash_blocking(plaintext).expect("hashing with default params cannot fail")
     }
 
     /// A gate with generous bounds, for tests about verification semantics
@@ -946,7 +1059,7 @@ mod tests {
 
         // Hold the only permit for longer than the queue timeout.
         let held = gate
-            .verify_permits
+            .argon2_permits
             .try_acquire()
             .expect("a fresh gate has its permit available");
 
@@ -980,7 +1093,7 @@ mod tests {
 
         // Hold the only permit so every attempt below is shed, never verified.
         let held = gate
-            .verify_permits
+            .argon2_permits
             .try_acquire()
             .expect("a fresh gate has its permit available");
 
@@ -1024,7 +1137,7 @@ mod tests {
         let stored = hash_like_create_meeting("s3cret");
 
         let held = gate
-            .verify_permits
+            .argon2_permits
             .try_acquire()
             .expect("a fresh gate has its permit available");
         for _ in 0..(MAX_FAILED_PASSWORD_ATTEMPTS * 2) {
@@ -1037,6 +1150,129 @@ mod tests {
         gate.verify(Some(IP), "m", Some(&stored), Some("s3cret"))
             .await
             .expect("the correct password must still be accepted after a shed storm");
+    }
+
+    /// #2478, hash path: same ticker-lateness shape as its verify twin above.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hashing_does_not_block_the_async_runtime() {
+        let gate = Arc::new(MeetingPasswordGate::with_config(1, Duration::from_secs(30)));
+
+        let worst_lateness = Arc::new(Mutex::new(Duration::ZERO));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let ticker = tokio::spawn({
+            let worst = Arc::clone(&worst_lateness);
+            let stop = Arc::clone(&stop);
+            async move {
+                const PERIOD: Duration = Duration::from_millis(10);
+                let mut last = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(PERIOD).await;
+                    let lateness = last.elapsed().saturating_sub(PERIOD);
+                    let mut w = worst.lock().expect("lateness mutex");
+                    if lateness > *w {
+                        *w = lateness;
+                    }
+                    last = Instant::now();
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let burst_start = Instant::now();
+        let mut handles = Vec::new();
+        for i in 0..12u8 {
+            let gate = Arc::clone(&gate);
+            handles.push(tokio::spawn(async move {
+                gate.hash(&format!("rotate-{i}"))
+                    .await
+                    .expect("hashing with default params cannot fail");
+            }));
+        }
+        for h in handles {
+            h.await.expect("hash task must not panic");
+        }
+        let burst = burst_start.elapsed();
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = ticker.await;
+
+        let worst = *worst_lateness.lock().expect("lateness mutex");
+
+        assert!(
+            worst * 2 < burst,
+            "the runtime stalled during hashing: worst tick lateness {worst:?} is not \
+             comfortably below the {burst:?} burst — the hash is running inline on the \
+             runtime instead of on the blocking pool"
+        );
+        assert!(
+            gate.peak_in_flight() >= 1,
+            "the burst must actually have gone through the bounded offload"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_hashes_never_exceed_the_permit_count() {
+        let gate = Arc::new(MeetingPasswordGate::with_config(2, Duration::from_secs(30)));
+
+        let mut handles = Vec::new();
+        for i in 0..16u8 {
+            let gate = Arc::clone(&gate);
+            handles.push(tokio::spawn(async move {
+                gate.hash(&format!("rotate-{i}"))
+                    .await
+                    .expect("hashing with default params cannot fail");
+            }));
+        }
+        for h in handles {
+            h.await.expect("hash task must not panic");
+        }
+
+        assert!(
+            gate.peak_in_flight() <= 2,
+            "at most 2 Argon2 operations may run at once, observed {}",
+            gate.peak_in_flight()
+        );
+        assert!(
+            gate.peak_in_flight() >= 1,
+            "the test must actually have exercised the hasher"
+        );
+        assert_eq!(
+            gate.available_permits(),
+            2,
+            "every permit must be returned once the burst drains"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_permit_sheds_both_a_hash_and_a_verify() {
+        let gate = MeetingPasswordGate::with_config(1, Duration::from_millis(30));
+        let stored = hash_like_create_meeting("s3cret");
+
+        let held = gate
+            .argon2_permits
+            .try_acquire()
+            .expect("a fresh gate has its permit available");
+
+        let hash_err = gate
+            .hash("rotate-me")
+            .await
+            .expect_err("with no permit available the hash must be shed");
+        assert_eq!(hash_err.body.code, "PASSWORD_HASHER_OVERLOADED");
+        assert_eq!(hash_err.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        let verify_err = gate
+            .verify(Some(IP), "m", Some(&stored), Some("s3cret"))
+            .await
+            .expect_err("the same held permit must shed a verify");
+        assert_eq!(verify_err.body.code, "VERIFIER_OVERLOADED");
+
+        drop(held);
+
+        gate.hash("rotate-me")
+            .await
+            .expect("a returned permit must let the hash through — the shed is transient");
     }
 
     // ── Failed-attempt throttle (MUST FIX b) ─────────────────────────────
@@ -1319,8 +1555,133 @@ mod tests {
             "must allow at least one verification"
         );
         assert!(
-            gate.available_permits() <= MAX_VERIFY_PERMITS,
+            gate.available_permits() <= MAX_ARGON2_PERMITS,
             "must never exceed the memory-derived ceiling"
         );
+    }
+
+    // ── Setting and clearing a password (issue #2207) ────────────────────
+
+    /// Drive both halves of the production path — validate, then hash —
+    /// and return the hash a `Set` came out carrying.
+    async fn expect_set(plaintext: &str) -> String {
+        let intent = parse_password_update(Some(plaintext), None).expect("a plain set must parse");
+        match open_gate()
+            .hash_intent(intent)
+            .await
+            .expect("hashing a parsed set")
+        {
+            PasswordUpdate::Set(hash) => hash,
+            other => panic!("expected a Set update, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_password_set_by_patch_verifies_at_the_join_gate() {
+        let hash = expect_set("correct horse battery staple").await;
+
+        let gate = open_gate();
+        assert!(
+            gate.verify(
+                Some(IP),
+                "m",
+                Some(&hash),
+                Some("correct horse battery staple")
+            )
+            .await
+            .is_ok(),
+            "the password just set must verify"
+        );
+        assert!(
+            gate.verify(Some(OTHER_IP), "m", Some(&hash), Some("something else"))
+                .await
+                .is_err(),
+            "a different password must still be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn hashing_the_same_password_twice_yields_different_hashes() {
+        let first = expect_set("same").await;
+        let second = expect_set("same").await;
+        assert_ne!(first, second, "the salt must be per-hash, not fixed");
+    }
+
+    #[tokio::test]
+    async fn a_set_update_carries_a_hash_not_the_plaintext() {
+        const SECRET: &str = "hunter2-do-not-store-me";
+        let hash = expect_set(SECRET).await;
+        assert!(!hash.contains(SECRET), "the plaintext reached storage");
+        assert!(hash.starts_with("$argon2"), "not a PHC string: {hash}");
+    }
+
+    #[tokio::test]
+    async fn debug_never_prints_the_plaintext_or_the_stored_hash() {
+        const SECRET: &str = "hunter2-do-not-log-me";
+        let intent = parse_password_update(Some(SECRET), None).expect("a set");
+        let parsed = format!("{intent:?}");
+        assert_eq!(parsed, "Set(<redacted>)");
+
+        let hashed = format!(
+            "{:?}",
+            open_gate().hash_intent(intent).await.expect("hashing")
+        );
+        assert_eq!(hashed, "Set(<hash>)");
+    }
+
+    #[tokio::test]
+    async fn remove_password_resolves_to_clear() {
+        let intent = parse_password_update(None, Some(true)).expect("a clear");
+        assert!(intent.is_change(), "clearing changes the column");
+        assert!(matches!(
+            open_gate()
+                .hash_intent(intent)
+                .await
+                .expect("clearing needs no hash"),
+            PasswordUpdate::Clear
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_body_without_password_fields_leaves_it_unchanged() {
+        let intent = parse_password_update(None, None).expect("no password fields");
+        assert!(!intent.is_change(), "an untouched password writes nothing");
+        assert!(matches!(
+            open_gate()
+                .hash_intent(intent)
+                .await
+                .expect("no hashing needed"),
+            PasswordUpdate::Unchanged
+        ));
+
+        let explicit_no = parse_password_update(None, Some(false)).expect("remove_password false");
+        assert!(!explicit_no.is_change());
+    }
+
+    #[test]
+    fn an_empty_password_is_rejected_not_read_as_clear() {
+        let err = parse_password_update(Some(""), None).expect_err("empty must be rejected");
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn setting_and_removing_at_once_is_rejected() {
+        let err = parse_password_update(Some("pw"), Some(true))
+            .expect_err("contradictory body must be rejected");
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unusual_passwords_round_trip_through_the_hasher() {
+        for plaintext in ["  padded  ", "☂ unicode ☂", "a", &"x".repeat(1024)] {
+            let hash = expect_set(plaintext).await;
+            let parsed = PasswordHash::new(&hash).expect("a parseable PHC string");
+            assert!(
+                Argon2::default()
+                    .verify_password(plaintext.as_bytes(), &parsed)
+                    .is_ok(),
+                "the stored hash must verify against exactly what was sent"
+            );
+        }
     }
 }

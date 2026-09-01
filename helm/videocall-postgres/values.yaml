@@ -2,6 +2,7 @@
 
 postgresql:
   auth:
+    database: ""
     enablePostgresUser: true
     existingSecret: postgres-credentials
     secretKeys:
@@ -9,12 +10,19 @@ postgresql:
       userPasswordKey: password
     username: postgres
 
+  # Must stay empty: the subchart's `latest` default would otherwise satisfy the schema.
+  image:
+    tag: ""
+
   metrics:
     enabled: false
 
   primary:
     persistence:
       enabled: true
+      existingClaim: ""
+      storageClass: ""
+      size: ""
       annotations:
         # Retains the PVC through `helm uninstall`.
         helm.sh/resource-policy: keep
@@ -23,6 +31,9 @@ postgresql:
       type: ClusterIP
       ports:
         postgresql: 5432
+    resources:
+      limits: null
+      requests: null
 
   backup:
     enabled: false

@@ -80,6 +80,108 @@ pub(crate) fn screen_share_pinned_tile_size(avail_w: f64, avail_h: f64) -> (f64,
     (tw, th)
 }
 
+/// Freshness (ms) an overflow speaker must beat to displace a VISIBLE speaker in
+/// [`promote_speakers`] (#2273). Equals the `peer_speech_priority` throttle.
+pub(crate) const SPEAKER_PROMOTION_MARGIN_MS: f64 = 5_000.0;
+
+fn selection_tier(camera_on: bool, speaking: bool) -> u8 {
+    match (camera_on, speaking) {
+        (true, true) => 0,
+        (false, true) => 1,
+        (true, false) => 2,
+        (false, false) => 3,
+    }
+}
+
+fn recent_speech(
+    peer: &str,
+    speech_map: &HashMap<String, f64>,
+    now_ms: f64,
+    active_ms: f64,
+) -> Option<f64> {
+    speech_map
+        .get(peer)
+        .copied()
+        .filter(|&ts| now_ms - ts < active_ms)
+}
+
+/// Rank the roster BEFORE the `CANVAS_LIMIT` cut and return the capped
+/// `(session_id, camera_on)` list `attendants.rs` feeds to
+/// `partition_camera_tiles` (issue #2273). Returns the input order untouched
+/// when `capped_real` covers the whole roster.
+pub(crate) fn select_display_candidates(
+    display_peers: &[String],
+    capped_real: usize,
+    camera_on: impl Fn(&str) -> bool,
+    speech_map: &HashMap<String, f64>,
+    join_map: &HashMap<String, f64>,
+    now_ms: f64,
+    active_ms: f64,
+) -> Vec<(String, bool)> {
+    if capped_real >= display_peers.len() {
+        return display_peers
+            .iter()
+            .map(|peer| (peer.clone(), camera_on(peer)))
+            .collect();
+    }
+
+    let mut ranked: Vec<_> = display_peers
+        .iter()
+        .map(|peer| {
+            let cam_on = camera_on(peer);
+            let speech = recent_speech(peer, speech_map, now_ms, active_ms);
+            let key = (
+                selection_tier(cam_on, speech.is_some()),
+                speech.map_or(0.0, |ts| -ts), // negated: freshest speaker first
+                join_map.get(peer).copied().unwrap_or(0.0),
+            );
+            (key, peer.clone(), cam_on)
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        let ((ta, sa, ja), pa, _) = a;
+        let ((tb, sb, jb), pb, _) = b;
+        ta.cmp(tb)
+            .then(sa.partial_cmp(sb).unwrap_or(std::cmp::Ordering::Equal))
+            .then(ja.partial_cmp(jb).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| pa.cmp(pb))
+    });
+    ranked.truncate(capped_real);
+
+    ranked
+        .into_iter()
+        .map(|(_, peer, cam_on)| (peer, cam_on))
+        .collect()
+}
+
+/// Order a camera-OFF group so the `off_to_render` remainder in `attendants.rs`
+/// sheds silent peers first (#2273). Membership only — `build_unified_render_list`
+/// re-sorts by join time, so POSITION is unaffected.
+pub(crate) fn sort_camera_off_window(
+    peers: &mut [String],
+    speech_map: &HashMap<String, f64>,
+    join_map: &HashMap<String, f64>,
+    now_ms: f64,
+    active_ms: f64,
+) {
+    peers.sort_by(|a, b| {
+        let sa = recent_speech(a, speech_map, now_ms, active_ms);
+        let sb = recent_speech(b, speech_map, now_ms, active_ms);
+        let ja = join_map.get(a).copied().unwrap_or(0.0);
+        let jb = join_map.get(b).copied().unwrap_or(0.0);
+        sb.is_some()
+            .cmp(&sa.is_some())
+            .then(
+                sb.unwrap_or(0.0)
+                    .partial_cmp(&sa.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(ja.partial_cmp(&jb).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.cmp(b))
+    });
+}
+
 /// Promote overflow speakers into the visible portion of a tile list.
 ///
 /// When there are more tiles than fit on screen, tiles beyond `visible_count`
@@ -138,10 +240,30 @@ pub(crate) fn promote_speakers(
         .collect();
     swap_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Complementary to `swap_candidates`, so the two index sets are disjoint.
+    let mut stale_speakers: Vec<(usize, f64)> = (0..visible_count)
+        .filter_map(|i| recent_speech(&tiles[i], speech_map, now_ms, active_ms).map(|ts| (i, ts)))
+        .collect();
+    stale_speakers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
     // Swap pairs — all indices are disjoint so order doesn't matter.
     let num_swaps = overflow_speakers.len().min(swap_candidates.len());
     for i in 0..num_swaps {
         tiles.swap(swap_candidates[i].0, overflow_speakers[i].0);
+    }
+
+    // Fallback (#2273): with every visible tile speaking `swap_candidates` is
+    // empty and the loop above promotes nobody, so displace the stalest visible
+    // speaker — only for an overflow speaker `SPEAKER_PROMOTION_MARGIN_MS`
+    // fresher, which makes each swap one-way.
+    for (k, &(overflow_idx, overflow_ts)) in overflow_speakers[num_swaps..].iter().enumerate() {
+        let Some(&(visible_idx, visible_ts)) = stale_speakers.get(k) else {
+            break;
+        };
+        if overflow_ts < visible_ts + SPEAKER_PROMOTION_MARGIN_MS {
+            break;
+        }
+        tiles.swap(visible_idx, overflow_idx);
     }
 }
 
@@ -418,9 +540,6 @@ mod tests {
 
     #[test]
     fn promote_all_visible_are_active_speakers() {
-        // 4 tiles, 2 visible. Both visible peers are active speakers.
-        // peer_3 is also an active overflow speaker.
-        // No candidates → no swaps.
         let mut tiles = make_tiles(4);
         let mut speech = HashMap::new();
         speech.insert("peer_0".into(), 950.0);
@@ -431,7 +550,137 @@ mod tests {
         promote_speakers(&mut tiles, 2, &speech, &HashMap::new(), 1000.0, 500.0);
         assert_eq!(
             tiles, original,
-            "No swaps when all visible tiles are active speakers"
+            "a 20 ms-fresher overflow speaker is under the margin, so no swap"
+        );
+    }
+
+    #[test]
+    fn promote_fallback_margin_brackets_five_seconds() {
+        let now = 1_000_000.0;
+        let visible_ts = now - 20_000.0;
+        let run = |overflow_ts: f64| {
+            let mut tiles = make_tiles(4);
+            let mut speech = HashMap::new();
+            speech.insert("peer_0".into(), visible_ts);
+            speech.insert("peer_1".into(), now - 1_000.0);
+            speech.insert("peer_3".into(), overflow_ts);
+            promote_speakers(&mut tiles, 2, &speech, &HashMap::new(), now, 30_000.0);
+            tiles
+        };
+
+        let declined = run(visible_ts + 4_999.0);
+        assert!(
+            !declined[..2].contains(&"peer_3".to_string()),
+            "4 999 ms fresher is under the 5 000 ms margin: no swap. tiles: {declined:?}"
+        );
+
+        let promoted = run(visible_ts + 5_001.0);
+        assert!(
+            promoted[..2].contains(&"peer_3".to_string()),
+            "5 001 ms fresher clears the 5 000 ms margin: swap. tiles: {promoted:?}"
+        );
+    }
+
+    #[test]
+    fn promote_fallback_pairs_freshest_overflow_with_stalest_visible() {
+        // Asserted on the whole vector so the PAIRING is pinned by position, not
+        // membership: freshest overflow takes the stalest visible speaker's slot.
+        let now = 1_000_000.0;
+        let mut tiles = make_tiles(6);
+        let mut speech = HashMap::new();
+        speech.insert("peer_0".into(), now - 20_000.0); // visible, 2nd stalest
+        speech.insert("peer_1".into(), now - 2_000.0); // visible, freshest
+        speech.insert("peer_2".into(), now - 28_000.0); // visible, stalest
+        speech.insert("peer_4".into(), now - 100.0); // overflow, freshest
+        speech.insert("peer_5".into(), now - 10_000.0); // overflow, 2nd
+
+        promote_speakers(&mut tiles, 3, &speech, &HashMap::new(), now, 30_000.0);
+
+        // peer_1, the freshest visible speaker, is never displaced.
+        assert_eq!(
+            tiles,
+            vec!["peer_5", "peer_1", "peer_4", "peer_3", "peer_2", "peer_0"],
+            "freshest overflow must displace the stalest visible speaker"
+        );
+    }
+
+    #[test]
+    fn promote_falls_back_to_stalest_visible_speaker() {
+        // Open mics: every VISIBLE tile is inside the 30 s window, so pre-#2273
+        // `swap_candidates` was empty and nobody was promoted.
+        let now = 1_000_000.0;
+        let mut tiles = make_tiles(4);
+        let mut speech = HashMap::new();
+        speech.insert("peer_0".into(), now - 25_000.0); // visible, long silent
+        speech.insert("peer_1".into(), now - 1_000.0); // visible, still talking
+        speech.insert("peer_3".into(), now - 200.0); // overflow, talking NOW
+
+        promote_speakers(&mut tiles, 2, &speech, &HashMap::new(), now, 30_000.0);
+
+        let visible = &tiles[..2];
+        assert!(
+            visible.contains(&"peer_3".to_string()),
+            "the peer talking now must be promoted. tiles: {tiles:?}"
+        );
+        assert!(
+            !visible.contains(&"peer_0".to_string()),
+            "the stalest visible speaker is the one displaced. tiles: {tiles:?}"
+        );
+        assert!(
+            visible.contains(&"peer_1".to_string()),
+            "a currently-talking visible peer must not be displaced. tiles: {tiles:?}"
+        );
+    }
+
+    #[test]
+    fn promote_fallback_declines_inside_the_margin() {
+        // Anti-flap (#1923): three talkers inside one margin window; nothing moves.
+        let now = 1_000_000.0;
+        let mut tiles = make_tiles(4);
+        let mut speech = HashMap::new();
+        speech.insert("peer_0".into(), now - 2_000.0);
+        speech.insert("peer_1".into(), now - 1_500.0);
+        speech.insert("peer_3".into(), now - 100.0);
+
+        let original = tiles.clone();
+        promote_speakers(&mut tiles, 2, &speech, &HashMap::new(), now, 30_000.0);
+        assert_eq!(
+            tiles, original,
+            "concurrent talkers inside the margin must not rotate the grid"
+        );
+    }
+
+    #[test]
+    fn promote_fallback_does_not_ping_pong() {
+        // One-way: re-running on its own output must be a fixed point.
+        let now = 1_000_000.0;
+        let mut tiles = make_tiles(4);
+        let mut speech = HashMap::new();
+        speech.insert("peer_0".into(), now - 25_000.0);
+        speech.insert("peer_1".into(), now - 1_000.0);
+        speech.insert("peer_3".into(), now - 200.0);
+
+        promote_speakers(&mut tiles, 2, &speech, &HashMap::new(), now, 30_000.0);
+        let after_first = tiles.clone();
+        promote_speakers(&mut tiles, 2, &speech, &HashMap::new(), now, 30_000.0);
+        assert_eq!(tiles, after_first, "promotion must be idempotent");
+    }
+
+    #[test]
+    fn promote_fallback_is_inert_while_a_silent_visible_tile_exists() {
+        let now = 1_000_000.0;
+        let mut tiles = make_tiles(4);
+        let mut speech = HashMap::new();
+        speech.insert("peer_0".into(), now - 25_000.0);
+        speech.insert("peer_3".into(), now - 200.0);
+
+        promote_speakers(&mut tiles, 2, &speech, &HashMap::new(), now, 30_000.0);
+
+        let visible = &tiles[..2];
+        assert!(visible.contains(&"peer_3".to_string()), "tiles: {tiles:?}");
+        assert!(
+            visible.contains(&"peer_0".to_string()),
+            "a silent visible tile must be displaced before a speaking one. tiles: {tiles:?}"
         );
     }
 
@@ -591,5 +840,218 @@ mod tests {
                 && tiles[2..].contains(&"peer_1".to_string()),
             "silent visible thumbnails are shed first. tiles: {tiles:?}"
         );
+    }
+
+    use crate::components::decode_budget::partition_camera_tiles;
+
+    /// `CANVAS_LIMIT` from `constants.rs`, pinned so the fixture stays 46-vs-30.
+    const CUT: usize = 30;
+    const ACTIVE_MS: f64 = 30_000.0;
+
+    fn bloated_roster() -> (Vec<String>, HashMap<String, f64>) {
+        let peers: Vec<String> = (1..=46).map(|i| i.to_string()).collect();
+        let join = peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.clone(), 1_000.0 + i as f64))
+            .collect();
+        (peers, join)
+    }
+
+    #[test]
+    fn selection_keeps_late_session_id_camera_and_speaking_peers() {
+        // Camera-on peers and the active speaker all sort LATE by session_id —
+        // exactly the peers a plain `take(30)` drops before #1465 can see them.
+        let (peers, join) = bloated_roster();
+        let now = 1_000_000.0;
+        let cameras_on = ["41", "43", "45"];
+        let speaker = "46";
+        let mut speech = HashMap::new();
+        speech.insert(speaker.to_string(), now - 500.0);
+
+        let selected = select_display_candidates(
+            &peers,
+            CUT,
+            |p| cameras_on.contains(&p),
+            &speech,
+            &join,
+            now,
+            ACTIVE_MS,
+        );
+
+        assert_eq!(selected.len(), CUT, "the cut still caps at CANVAS_LIMIT");
+        let ids: Vec<&str> = selected.iter().map(|(p, _)| p.as_str()).collect();
+        for late in cameras_on {
+            assert!(
+                ids.contains(&late),
+                "camera-on peer {late} was shed by the session_id cut. selected: {ids:?}"
+            );
+        }
+        assert!(
+            ids.contains(&speaker),
+            "the active speaker was shed by the session_id cut. selected: {ids:?}"
+        );
+
+        let (camera_on_real, camera_off_real) = partition_camera_tiles(&selected);
+        for late in cameras_on {
+            assert!(
+                camera_on_real.contains(&late.to_string()),
+                "camera-on peer {late} missing from camera_on_real: {camera_on_real:?}"
+            );
+        }
+        assert!(
+            camera_off_real.contains(&speaker.to_string()),
+            "speaker missing from camera_off_real: {camera_off_real:?}"
+        );
+    }
+
+    #[test]
+    fn selection_is_inert_when_the_cut_does_not_bind() {
+        // Anti-flap (#1923): camera/speech must not reshuffle a grid that fits.
+        let peers: Vec<String> = (1..=12).map(|i| i.to_string()).collect();
+        let join: HashMap<String, f64> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.clone(), 1_000.0 + i as f64))
+            .collect();
+        let now = 1_000_000.0;
+        let mut speech = HashMap::new();
+        speech.insert("12".to_string(), now - 100.0);
+
+        let selected = select_display_candidates(
+            &peers,
+            peers.len(),
+            |p| p == "11" || p == "12",
+            &speech,
+            &join,
+            now,
+            ACTIVE_MS,
+        );
+
+        let ids: Vec<String> = selected.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(ids, peers, "roster order must survive a non-binding cut");
+    }
+
+    #[test]
+    fn selection_ranks_live_speaker_above_stale_ghost_session() {
+        // #2267 ghosts keep the timestamp they had when they went away, and sort
+        // FIRST by both session_id and join time.
+        let now = 1_000_000.0;
+        let peers = vec!["7".to_string(), "88".to_string()];
+        let mut join = HashMap::new();
+        join.insert("7".to_string(), 1_000.0); // ghost joined first
+        join.insert("88".to_string(), 9_000.0);
+        let mut speech = HashMap::new();
+        speech.insert("7".to_string(), now - 25_000.0); // frozen, still inside 30 s
+        speech.insert("88".to_string(), now - 300.0); // live speaker
+
+        let selected =
+            select_display_candidates(&peers, 1, |_| false, &speech, &join, now, ACTIVE_MS);
+
+        assert_eq!(
+            selected.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec!["88"],
+            "a live speaker must outrank a stale duplicate session"
+        );
+    }
+
+    #[test]
+    fn selection_prefers_camera_on_over_a_silent_camera_off_peer() {
+        let (peers, join) = bloated_roster();
+        let now = 1_000_000.0;
+        let selected = select_display_candidates(
+            &peers,
+            CUT,
+            |p| p == "46",
+            &HashMap::new(),
+            &join,
+            now,
+            ACTIVE_MS,
+        );
+        let ids: Vec<&str> = selected.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(ids[0], "46", "the only camera-on peer must lead. {ids:?}");
+        assert!(
+            !ids.contains(&"30"),
+            "the silent camera-off tail is what gets shed. {ids:?}"
+        );
+    }
+
+    #[test]
+    fn selection_tier_ranks_speech_above_camera_state() {
+        assert!(
+            selection_tier(true, true) < selection_tier(false, true),
+            "among peers inside the speech window, camera-on leads"
+        );
+        assert!(
+            selection_tier(false, true) < selection_tier(true, false),
+            "a peer inside the speech window outranks any silent peer (issue 2273)"
+        );
+        assert!(
+            selection_tier(true, false) < selection_tier(false, false),
+            "among silent peers, camera-on leads"
+        );
+    }
+
+    #[test]
+    fn selection_keeps_a_live_camera_off_speaker_when_cameras_fill_the_cut() {
+        let (peers, join) = bloated_roster();
+        let now = 1_000_000.0;
+        let cams: Vec<String> = (1..=CUT).map(|i| i.to_string()).collect();
+        let mut speech = HashMap::new();
+        speech.insert("46".to_string(), now - 100.0);
+
+        let selected = select_display_candidates(
+            &peers,
+            CUT,
+            |p| cams.iter().any(|c| c == p),
+            &speech,
+            &join,
+            now,
+            ACTIVE_MS,
+        );
+
+        let ids: Vec<&str> = selected.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(ids.len(), CUT, "the cut still caps at CANVAS_LIMIT");
+        assert!(
+            ids.contains(&"46"),
+            "a peer speaking NOW was shed by {CUT} silent camera-on peers. selected: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"30"),
+            "the latest-joining silent camera-on peer is the shed victim. selected: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn camera_off_window_leads_with_recent_speakers() {
+        let now = 1_000_000.0;
+        let mut off: Vec<String> = (1..=5).map(|i| i.to_string()).collect();
+        let join: HashMap<String, f64> = off
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.clone(), 1_000.0 + i as f64))
+            .collect();
+        let mut speech = HashMap::new();
+        speech.insert("5".to_string(), now - 200.0);
+        speech.insert("4".to_string(), now - 9_000.0);
+        speech.insert("2".to_string(), now - 60_000.0); // outside the window
+
+        sort_camera_off_window(&mut off, &speech, &join, now, ACTIVE_MS);
+
+        assert_eq!(off, vec!["5", "4", "1", "2", "3"], "got {off:?}");
+    }
+
+    #[test]
+    fn camera_off_window_keeps_join_order_with_no_speakers() {
+        let now = 1_000_000.0;
+        let mut off: Vec<String> = vec!["30".into(), "4".into(), "17".into()];
+        let mut join = HashMap::new();
+        join.insert("30".to_string(), 1_000.0);
+        join.insert("4".to_string(), 2_000.0);
+        join.insert("17".to_string(), 3_000.0);
+
+        sort_camera_off_window(&mut off, &HashMap::new(), &join, now, ACTIVE_MS);
+
+        assert_eq!(off, vec!["30", "4", "17"], "join order must be preserved");
     }
 }

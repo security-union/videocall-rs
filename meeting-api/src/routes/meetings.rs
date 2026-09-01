@@ -14,7 +14,6 @@
 //! Handlers for meeting CRUD endpoints.
 
 use crate::search;
-use argon2::PasswordHasher;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -38,6 +37,7 @@ use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
+use crate::password;
 use crate::state::AppState;
 
 const MAX_ATTENDEES: usize = 100;
@@ -98,14 +98,7 @@ pub async fn create_meeting(
     }
 
     let password_hash = match &body.password {
-        Some(pw) if !pw.is_empty() => {
-            let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
-            let hash = argon2::Argon2::default()
-                .hash_password(pw.as_bytes(), &salt)
-                .map_err(|e| AppError::internal(&format!("password hash error: {e}")))?
-                .to_string();
-            Some(hash)
-        }
+        Some(pw) if !pw.is_empty() => Some(state.password_gate.hash(pw).await?),
         _ => None,
     };
 
@@ -544,12 +537,34 @@ pub async fn update_meeting(
     Path(meeting_id): Path<String>,
     Json(body): Json<UpdateMeetingRequest>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
-    let settings_updated = body.waiting_room_enabled.is_some()
+    let toggles_updated = body.waiting_room_enabled.is_some()
         || body.admitted_can_admit.is_some()
         || body.end_on_host_leave.is_some()
         || body.allow_guests.is_some()
         || body.recording_allowed_for_all.is_some()
         || body.chat_allowed_for_all.is_some();
+
+    let mut auto_admitted_user_ids: Vec<String> = Vec::new();
+
+    let intent = password::parse_password_update(body.password.as_deref(), body.remove_password)?;
+    let password_updated = intent.is_change();
+    let settings_updated = toggles_updated || password_updated;
+
+    // Hashing costs ~19 MiB and tens of ms of Argon2. The UPDATE's
+    // `WHERE creator_id = $2` is the authoritative ownership check, but it runs
+    // *after* the hash, so a non-owner would otherwise buy that work with a
+    // request they were always going to be refused. This makes them pay the 403
+    // first; the 404/403 split is the same one the UPDATE's own failure produces.
+    if matches!(intent, password::PasswordIntent::Set(_)) {
+        let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
+            .await?
+            .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+        if row.creator_id.as_deref() != Some(user_id.as_str()) {
+            return Err(AppError::not_owner());
+        }
+    }
+
+    let password_update = state.password_gate.hash_intent(intent).await?;
 
     let row = if settings_updated {
         // Atomically update both settings within a single transaction.
@@ -565,10 +580,14 @@ pub async fn update_meeting(
             body.allow_guests,
             body.recording_allowed_for_all,
             body.chat_allowed_for_all,
+            &password_update,
         )
         .await?
         {
-            Some(row) => row,
+            Some(update) => {
+                auto_admitted_user_ids = update.auto_admitted_user_ids;
+                update.row
+            }
             None => {
                 return Err(
                     match db_meetings::get_by_room_id(&state.db, &meeting_id).await? {
@@ -594,8 +613,26 @@ pub async fn update_meeting(
     search::spawn_repush(&state, row.id, row.room_id.clone());
 
     if settings_updated {
-        // Notify clients (REST refetch trigger).
+        // The bulk admit above emits no per-participant event, and these
+        // clients are listening for PARTICIPANT_ADMITTED (issue #2262).
+        for admitted_user_id in &auto_admitted_user_ids {
+            nats_events::publish_participant_admitted(
+                state.nats.as_ref(),
+                &row.room_id,
+                admitted_user_id,
+            )
+            .await;
+        }
+        if !auto_admitted_user_ids.is_empty() {
+            nats_events::publish_waiting_room_updated(state.nats.as_ref(), &row.room_id).await;
+        }
+
+        // Notify clients (REST refetch trigger); `has_password` is on every
+        // meeting payload, so a password change has to reach them too.
         nats_events::publish_meeting_settings_updated(state.nats.as_ref(), &row.room_id).await;
+    }
+
+    if toggles_updated {
         // Notify every chat_server instance so its in-memory room_policy
         // cache picks up the toggle without waiting for a host reconnect.
         // This is the server-side counterpart that closes the

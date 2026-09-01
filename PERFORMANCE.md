@@ -58,13 +58,18 @@ The adaptive quality system uses 8 tiers, stepping up or down based on network c
 | 6 | very_low | 480x270 | 15 | 250 kbps | 100-400 kbps |
 | 7 | minimal | 426x240 | 10 | 150 kbps | 50-250 kbps |
 
-### Screen Share Quality Tiers
+### Screen Share Quality
 
-| Tier | Label | Resolution | FPS | Ideal Bitrate | Bitrate Range |
-|------|-------|-----------|-----|--------------|---------------|
-| 0 | high | 1920x1080 | 15 | 1500 kbps | 800-2500 kbps |
-| 1 | **medium** | 1280x720 | 10 | 600 kbps | 300-1000 kbps |
-| 2 | low | 854x480 | 5 | 250 kbps | 100-400 kbps |
+Issue #2343 removed the screen resolution ladder. The screen path publishes
+exactly ONE rung (`SCREEN_QUALITY_TIERS`, asserted len == 1); its bitrate is
+computed per share rather than picked from a table.
+
+| Field | Value | Source |
+|-------|-------|--------|
+| Encode ceiling | 2560x1440 | `SCREEN_MAX_ENCODE_WIDTH` / `_HEIGHT` |
+| FPS | 10 | `SCREEN_TARGET_FPS` |
+| Bitrate | `width x height x fps x 0.12 bits/px`, floored at 500 kbps | `screen_bitrate_kbps_for` |
+| Bitrate at the ceiling | 4423 kbps | derived |
 
 ### Bandwidth Per Participant (at default tier)
 
@@ -73,7 +78,8 @@ The adaptive quality system uses 8 tiers, stepping up or down based on network c
 | Video (medium, 480p) | 300-1000 kbps | 300-1000 kbps | 1.5-5 Mbps |
 | Video (hd, 720p) | 800-2500 kbps | 800-2500 kbps | 4-12.5 Mbps |
 | Video (full_hd, 1080p) | 1500-2500 kbps | 1500-2500 kbps | 7.5-12.5 Mbps |
-| Screen Share (medium, 720p) | 300-1000 kbps | 300-1000 kbps | — |
+| Screen Share (720p, 10fps) | ~1105 kbps | ~1105 kbps | — |
+| Screen Share (1440p ceiling) | ~4423 kbps | ~4423 kbps | — |
 
 ### Latency Requirements
 

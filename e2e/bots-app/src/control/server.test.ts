@@ -1,12 +1,22 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
+import { parse as parseYaml } from "yaml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { BotTask } from "../orchestrator";
+import { SD_SOURCE } from "../posture";
 import { generateToken } from "./auth";
-import { applyNetemAction, buildNetemShapeArgs, NETEM_PROFILES, type NetemExec } from "./netem";
+import {
+  applyNetemAction,
+  buildNetemMirrorClearArgs,
+  buildNetemProbeArgs,
+  buildNetemShapeArgs,
+  NETEM_PROFILES,
+  type NetemExec,
+  NetemExecError,
+} from "./netem";
 import {
   DEFAULT_BIND_ADDRESS,
   isLoopbackBindAddress,
@@ -24,6 +34,8 @@ function fakeTask(overrides: Partial<BotTask> = {}): BotTask {
     displayName: "Alice",
     headless: false,
     authBackend: "jwt",
+    sourceGeometry: SD_SOURCE,
+    cameraCycle: null,
     storageStateFile: null,
     ssoStateFile: null,
     manifest: null,
@@ -114,6 +126,29 @@ describe("control server", () => {
     const res = await fetchJson(handle.port, "/healthz");
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true, bots: 0 });
+  });
+
+  it("answers the path k8s/statefulset.yaml probes, with no bearer token (#2349)", async () => {
+    const doc = parseYaml(
+      readFileSync(resolve(import.meta.dirname, "..", "..", "k8s", "statefulset.yaml"), "utf8"),
+    ) as {
+      spec: {
+        template: {
+          spec: { containers: Array<{ readinessProbe?: { exec?: { command?: string[] } } }> };
+        };
+      };
+    };
+    const command = doc.spec.template.spec.containers[0].readinessProbe?.exec?.command;
+    expect(command, "the bot container has no readinessProbe exec.command").toBeInstanceOf(Array);
+    const joined = (command as string[]).join(" ");
+    expect(
+      /\bhttps:\/\//.test(joined),
+      "readinessProbe must fetch http://, not https:// — startControlServer is node:http",
+    ).toBe(false);
+    const probed = /\bhttp:\/\/[^/\s]+(\/\S*)/.exec(joined)?.[1];
+    expect(probed, "the readinessProbe command fetches no http path").toBeTruthy();
+    const res = await fetchJson(handle.port, probed as string);
+    expect(res.status, `kubelet probes ${probed} unauthenticated`).toBe(200);
   });
 
   it("rejects unauthenticated requests with 401", async () => {
@@ -1420,7 +1455,10 @@ describe("POST/DELETE /netem", () => {
    * recording exec, so the endpoint is tested end-to-end (resolve →
    * build → echo argv) without ever shelling `tc`.
    */
-  function netemSurface(iface = "eth0"): {
+  function netemSurface(
+    iface = "eth0",
+    inner?: NetemExec,
+  ): {
     surface: OrchestratorControlSurface;
     calls: Array<{ file: string; args: string[] }>;
   } {
@@ -1428,6 +1466,7 @@ describe("POST/DELETE /netem", () => {
     const calls: Array<{ file: string; args: string[] }> = [];
     const exec: NetemExec = async (file, args) => {
       calls.push({ file, args });
+      if (inner) return inner(file, args);
       return { stdout: "", stderr: "" };
     };
     base.setNetem = (action) => applyNetemAction(action, { iface, exec });
@@ -1450,7 +1489,7 @@ describe("POST/DELETE /netem", () => {
     }
   });
 
-  it("applies a named profile and echoes the exact tc argv", async () => {
+  it("applies a named profile and echoes every command it ran", async () => {
     const tok = generateToken();
     const { surface, calls } = netemSurface("eth0");
     const h = await startControlServer({ port: 0, token: tok, surface });
@@ -1462,13 +1501,23 @@ describe("POST/DELETE /netem", () => {
       });
       expect(res.status).toBe(200);
       const expectedArgs = buildNetemShapeArgs("eth0", NETEM_PROFILES.lossy_mobile!);
+      // Runtime shaping is egress-only, so the response must disclose that it
+      // removed the startup mirror instead of reporting a bidirectional link.
+      // toEqual, not toMatchObject: the body must carry no other field either.
       expect(res.body).toEqual({
         op: "shape",
         label: "lossy_mobile",
-        argv: ["tc", ...expectedArgs],
+        commands: [
+          ["tc", ...expectedArgs],
+          ...buildNetemMirrorClearArgs("eth0").map((c) => [c.file, ...c.args]),
+          ["tc", ...buildNetemProbeArgs("eth0")],
+        ],
+        mirrorRemoved: true,
       });
-      expect(calls).toHaveLength(1);
       expect(calls[0].args).toEqual(expectedArgs);
+      expect(calls.map((c) => c.file)).toContain("ip");
+      // Count pinned, so an added or dropped step cannot pass unnoticed.
+      expect(calls).toHaveLength(buildNetemMirrorClearArgs("eth0").length + 2);
     } finally {
       await h.close();
     }
@@ -1486,6 +1535,27 @@ describe("POST/DELETE /netem", () => {
       expect(res.status).toBe(200);
       expect(res.body).toMatchObject({ op: "clear" });
       expect(calls[0].args).toEqual(["qdisc", "del", "dev", "eth0", "root"]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("replies 500 when a benign-wording clear failure carries no exit status", async () => {
+    const tok = generateToken();
+    const { surface, calls } = netemSurface("eth0", async () => {
+      throw new NetemExecError(
+        "tc qdisc del dev eth0 root failed: no such file or directory",
+        null,
+      );
+    });
+    const h = await startControlServer({ port: 0, token: tok, surface });
+    try {
+      const res = await fetchJson(h.port, "/netem", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${tok}` },
+      });
+      expect(res.status).toBe(500);
+      expect(calls).toHaveLength(1);
     } finally {
       await h.close();
     }

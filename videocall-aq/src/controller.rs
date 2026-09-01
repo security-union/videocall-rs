@@ -21,10 +21,9 @@ use std::sync::Arc;
 
 use crate::clock::{default_clock, Clock};
 use crate::constants::{
-    cap_layers_to_budget, screen_share_camera_ceiling_index, simulcast_layers_for,
-    uplink_budget_kbps, AudioQualityTier, LadderVariant, VideoQualityTier,
-    ENCODER_BACKPRESSURE_SUSTAIN_MS, ENCODER_QUEUE_BACKPRESSURE_CLEAR,
-    ENCODER_QUEUE_BACKPRESSURE_HIGH, LAYER_PROBE_CLEAR_WINDOW_MS,
+    cap_layers_to_budget, screen_share_camera_ceiling_index, simulcast_layers, uplink_budget_kbps,
+    AudioQualityTier, VideoQualityTier, ENCODER_BACKPRESSURE_SUSTAIN_MS,
+    ENCODER_QUEUE_BACKPRESSURE_CLEAR, ENCODER_QUEUE_BACKPRESSURE_HIGH, LAYER_PROBE_CLEAR_WINDOW_MS,
     LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC, LAYER_PROBE_OSCILLATION_WINDOW_MS,
     LAYER_PROBE_PENALTY_BACKOFF, LAYER_PROBE_PENALTY_BASE_MS, LAYER_PROBE_PENALTY_MAX_MS,
     STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_QUALITY_TIERS,
@@ -121,39 +120,6 @@ pub struct EncoderBitrateController {
     /// true, [`set_simulcast_layers`](Self::set_simulcast_layers) builds its
     /// per-layer tiers from the SCREEN ladder rather than the camera ladder.
     is_screen: bool,
-    /// Which CAMERA simulcast ladder this controller budgets against (issue
-    /// #1768). Threaded in at construction from the single read of the
-    /// `experimentalReducedLadder` runtime flag, NOT read from a process-global,
-    /// so there is no "was the flag set yet?" init-order question at any of the
-    /// lifecycle moments this controller is built (cold start, encoder restart,
-    /// Host remount after a reconnect/re-election).
-    ///
-    /// **Load-bearing coupling:** the ENCODER derives its per-layer GEOMETRY from
-    /// this variant while this controller derives the per-layer BITRATE TARGETS
-    /// from it ([`compute_layer_bitrates`](Self::compute_layer_bitrates) → the
-    /// encoder's `set_bitrate` via `shared_layer_bitrates_bps`). If the two
-    /// disagree, the encoder emits 540p rungs configured at the 720p ladder's
-    /// 1500 kbps target (or vice versa) — a real over/under-bitrate on the wire,
-    /// which on a measurement run silently invalidates the very bitrate numbers
-    /// being measured. It would also mis-seed the encoder's per-`'restart` initial
-    /// bitrate and corrupt [`layer_resolution`](Self::layer_resolution), the other
-    /// accessor backed by `layer_tiers` (test-only today, but it would report the
-    /// wrong ladder's geometry to any future caller).
-    ///
-    /// It does NOT, however, cause a spurious layer SHED, and an earlier version of
-    /// this doc claiming a "phantom ceiling" was wrong: [`uplink_budget_kbps`] sums
-    /// the same tiers whose ideals become the targets, so `sum == budget` by
-    /// construction and [`cap_layers_to_budget`] is a no-op under EITHER variant.
-    /// Shed decisions come from encoder-queue backpressure, the union/user caps and
-    /// tier movement — none of which reads the ladder — and the probe-up gate is
-    /// insensitive too while [`LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC`] is `0.0`
-    /// (see `test_reduced_ladder_ramp_still_earns_layers`). Threading the variant
-    /// to both halves is still required; the reason is bitrate correctness.
-    ///
-    /// Ignored when `is_screen` is true: the SCREEN ladder
-    /// ([`crate::constants::simulcast_screen_layers`]) has no variants (#1899 /
-    /// #1903 tune screen rungs separately).
-    ladder_variant: LadderVariant,
 
     // --- Sender encoder backpressure (issue #1108, Phase B) ---
     /// Last sampled max `encode_queue_size()` across the ACTIVE simulcast layers,
@@ -294,47 +260,15 @@ pub struct EncoderBitrateController {
 
 impl EncoderBitrateController {
     /// Create a new bitrate controller using the default `VIDEO_QUALITY_TIERS`
-    /// and the DEFAULT camera simulcast ladder.
-    ///
-    /// Equivalent to [`new_with_ladder`](Self::new_with_ladder) with
-    /// [`LadderVariant::Default`]; callers that must honour the
-    /// reduced-ladder runtime flag (the browser camera encoder) use that
-    /// constructor instead so the controller's uplink budget matches the rungs
-    /// the encoder actually emits (issue #1768).
+    /// and the camera simulcast ladder.
     pub fn new(ideal_bitrate_kbps: u32, target_fps: Arc<AtomicU32>) -> Self {
         Self::with_clock(ideal_bitrate_kbps, target_fps, default_clock())
     }
 
-    /// Create a new bitrate controller for an explicit camera
-    /// [`LadderVariant`] (issue #1768).
-    ///
-    /// The variant MUST be the same one the paired encoder derives its per-layer
-    /// GEOMETRY from: this controller derives the per-layer BITRATE TARGETS from it,
-    /// so a mismatch configures each rung at the other ladder's kbps (e.g. 540p at
-    /// 1500 kbps). It does NOT cause a spurious layer shed — see the
-    /// `ladder_variant` field docs for why that earlier framing was wrong.
-    pub fn new_with_ladder(
-        ideal_bitrate_kbps: u32,
-        target_fps: Arc<AtomicU32>,
-        ladder_variant: LadderVariant,
-    ) -> Self {
-        Self::with_clock_and_ladder(
-            ideal_bitrate_kbps,
-            target_fps,
-            default_clock(),
-            ladder_variant,
-        )
-    }
-
-    /// Create a new bitrate controller with an injected [`Clock`], on the
-    /// DEFAULT camera ladder.
+    /// Create a new bitrate controller with an injected [`Clock`].
     ///
     /// Native callers (e.g. the load-test bot) can pass a [`SystemClock`];
     /// tests can pass a [`TestClock`] for deterministic timestamps.
-    ///
-    /// The native `bot` crate has no `window.__APP_CONFIG`, so it deliberately
-    /// stays on [`LadderVariant::Default`] (issue #1768) — see the
-    /// `LadderVariant` docs for what that means for a mixed-ladder measurement.
     ///
     /// [`SystemClock`]: crate::clock::SystemClock
     /// [`TestClock`]: crate::clock::TestClock
@@ -343,32 +277,15 @@ impl EncoderBitrateController {
         target_fps: Arc<AtomicU32>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        Self::with_clock_and_ladder(
-            ideal_bitrate_kbps,
-            target_fps,
-            clock,
-            LadderVariant::Default,
-        )
-    }
-
-    /// Create a new bitrate controller with an injected [`Clock`] AND an
-    /// explicit camera [`LadderVariant`] (issue #1768).
-    pub fn with_clock_and_ladder(
-        ideal_bitrate_kbps: u32,
-        target_fps: Arc<AtomicU32>,
-        clock: Arc<dyn Clock>,
-        ladder_variant: LadderVariant,
-    ) -> Self {
         let quality_manager =
             AdaptiveQualityManager::with_clock(VIDEO_QUALITY_TIERS, Arc::clone(&clock));
-        // is_screen = false → camera simulcast ladder.
+        // is_screen = false -> camera simulcast ladder.
         Self::build(
             ideal_bitrate_kbps,
             target_fps,
             quality_manager,
             clock,
             false,
-            ladder_variant,
         )
     }
 
@@ -395,17 +312,8 @@ impl EncoderBitrateController {
         let quality_manager =
             AdaptiveQualityManager::new_for_screen_with_clock(video_tiers, Arc::clone(&clock));
         let tier_ideal = quality_manager.current_video_tier().ideal_bitrate_kbps;
-        // is_screen = true so simulcast layer PIDs use the SCREEN ladder. The
-        // camera `ladder_variant` is inert on this path (the screen ladder has no
-        // variants), so pass the Default.
-        Self::build(
-            tier_ideal,
-            target_fps,
-            quality_manager,
-            clock,
-            true,
-            LadderVariant::Default,
-        )
+        // is_screen = true so simulcast layer PIDs use the SCREEN ladder.
+        Self::build(tier_ideal, target_fps, quality_manager, clock, true)
     }
 
     /// Internal constructor shared by `new` and `new_for_screen`.
@@ -413,15 +321,12 @@ impl EncoderBitrateController {
     /// `is_screen` selects which simulcast ladder
     /// [`set_simulcast_layers`](Self::set_simulcast_layers) builds per-layer tiers
     /// from: the SCREEN ladder when `true`, otherwise the camera ladder.
-    /// `ladder_variant` selects WHICH camera ladder (issue #1768) and is inert
-    /// when `is_screen` is true.
     fn build(
         ideal_bitrate_kbps: u32,
         target_fps: Arc<AtomicU32>,
         quality_manager: AdaptiveQualityManager,
         clock: Arc<dyn Clock>,
         is_screen: bool,
-        ladder_variant: LadderVariant,
     ) -> Self {
         Self {
             ideal_bitrate_kbps,
@@ -436,11 +341,6 @@ impl EncoderBitrateController {
             layer_tiers: Vec::new(),
             last_layer_target_bitrates_kbps: Vec::new(),
             is_screen,
-            // Camera ladder variant (issue #1768), threaded in from the caller's
-            // single read of the runtime flag. Never re-read later, so every
-            // ladder resolution in this controller's lifetime uses the SAME
-            // variant the paired encoder was built with.
-            ladder_variant,
             // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
             // (no backpressure); the encode loop overwrites it each tick via
             // observe_encoder_queue_depth(). Both sustain/stabilization timers
@@ -493,7 +393,7 @@ impl EncoderBitrateController {
     /// [`set_simulcast_ceiling_start_at_base`](Self::set_simulcast_ceiling_start_at_base)
     /// (start at the base, earn up); the SCREEN encoder uses
     /// [`set_simulcast_ceiling_start_optimistic`](Self::set_simulcast_ceiling_start_optimistic)
-    /// (seed the `[low, high]` optimistic baseline, issue #1553). Screen has never
+    /// (seed the optimistic baseline, issue #1553). Screen has never
     /// used this all-active seed in production — #1200 moved it to start-at-base,
     /// and #1553 moved it to the optimistic seed.
     pub fn set_simulcast_layers(&mut self, n: usize) {
@@ -535,7 +435,7 @@ impl EncoderBitrateController {
     /// (active == 1, earn every rung), this delegates to
     /// [`AdaptiveQualityManager::set_simulcast_ceiling_start_optimistic`] so the
     /// screen publisher emits `min(initial_active, n)` rungs from frame one. At
-    /// the default seed of 2 that ladder is `[low, high]` (base 720p/500 + the
+    /// at a seed of 2 that ladder is its lowest two rungs (base + the
     /// top 1080p/2500 rung), so the sharp 1080p stream is published immediately —
     /// this exists because the 6 s-clear headroom ramp never climbs on a busy
     /// share in a large meeting, so start-at-base left the screen permanently
@@ -686,19 +586,17 @@ impl EncoderBitrateController {
     }
 
     /// The simulcast layer ladder for this controller: SCREEN ladder when this
-    /// controller drives screen share, otherwise the camera ladder in this
-    /// controller's [`LadderVariant`] (issue #989, Phase 3b; #1768). Both are
-    /// `&'static` and lowest-layer-first.
+    /// controller drives screen share, otherwise the camera ladder (issue #989,
+    /// Phase 3b). Both are `&'static` and lowest-layer-first.
     ///
     /// This is the SINGLE place the controller resolves a ladder — every budget
     /// (`uplink_budget_kbps`), per-layer tier table, and bitrate cap goes through
-    /// it, so the variant cannot be honoured in one calculation and missed in
-    /// another.
+    /// it.
     fn simulcast_ladder(&self, n: usize) -> &'static [VideoQualityTier] {
         if self.is_screen {
             crate::constants::simulcast_screen_layers(n)
         } else {
-            simulcast_layers_for(n, self.ladder_variant)
+            simulcast_layers(n)
         }
     }
 
@@ -1088,19 +986,8 @@ impl EncoderBitrateController {
             } else {
                 self.union_requested_layer_cap.to_string()
             };
-            // Which ladder this controller budgeted against (issue #1768), so a
-            // field log / load-test capture RECORDS the variant instead of
-            // leaving it an unrecorded run variable. Appended LAST so the
-            // existing `union_cap=(\w+)` capture in
-            // `scripts/meeting_quality_xref.py` (unanchored) still matches.
-            let ladder_str = if self.is_screen {
-                "screen"
-            } else {
-                match self.ladder_variant {
-                    LadderVariant::Default => "default",
-                    LadderVariant::Reduced => "reduced",
-                }
-            };
+            // Which ladder family this controller budgets against.
+            let ladder_str = if self.is_screen { "screen" } else { "camera" };
             log::info!(
                 "AQ_STATUS: video_tier={}({}) audio_tier={}({}) target_fps={} \
                  target_bitrate={:.0} encoder_queue_depth={} active_layers={} union_cap={} \
@@ -1243,15 +1130,6 @@ impl EncoderBitrateController {
     /// single-stream mode).
     pub fn simulcast_layer_count(&self) -> usize {
         self.quality_manager.simulcast_layer_count()
-    }
-
-    /// Which CAMERA simulcast ladder this controller is budgeting against
-    /// (issue #1768). Always [`LadderVariant::Default`] for a screen controller
-    /// (the screen ladder has no variants). Exposed so a caller — and the
-    /// encoder↔controller consistency test — can assert the controller and its
-    /// paired encoder were built from the same variant.
-    pub fn ladder_variant(&self) -> LadderVariant {
-        self.ladder_variant
     }
 
     /// Number of simulcast layers currently active (encoded + sent). `1` in
@@ -1576,9 +1454,8 @@ impl EncoderBitrateController {
     /// Seed the video tier at (re)share start (issue #2179).
     ///
     /// # Why this exists
-    /// The screen encoder resolves its starting tier from the CAPTURED SOURCE
-    /// SIZE (`resolve_initial_screen_tier`) and writes it straight into the
-    /// shared tier atomics. The AQ controller, however, is constructed once —
+    /// The screen encoder writes its starting tier straight into the shared tier
+    /// atomics. The AQ controller, however, is constructed once —
     /// long before any capture exists — at `DEFAULT_SCREEN_TIER_INDEX`. Without
     /// this seed the two disagree, and the controller's FIRST tier transition
     /// (in either direction) overwrites the encoder's source-matched tier with
@@ -1610,11 +1487,6 @@ impl EncoderBitrateController {
         if let Some(floor) = best {
             clamped = clamped.max(floor);
         }
-        // Issue #2179 review: the persistent source/device ceiling is a floor on
-        // the index too, and it must bind the SEED as well as the climb —
-        // otherwise a share whose ceiling says "no better than high" could still
-        // be seeded straight onto the 1440p rung and only be pulled back on a
-        // later tick, emitting its first GOP at the forbidden rung.
         if let Some(ceiling) = self.quality_manager.source_ceiling_index() {
             clamped = clamped.max(ceiling);
         }
@@ -1642,10 +1514,7 @@ impl EncoderBitrateController {
     /// Install (or clear) the PERSISTENT source/device quality ceiling for the
     /// current share (issue #2179 review).
     ///
-    /// The screen encoder computes this once per share from
-    /// [`crate::constants::resolve_screen_tier_ceiling`] (captured source size ∨
-    /// CPU class ∨ single-stream cap) and installs it here for the share's whole
-    /// life, clearing it (`None`) on share stop.
+    /// No caller installs a ceiling today; the clamp remains for the API.
     ///
     /// It is a FLOOR on the tier index, so the PID may still step DOWN under
     /// congestion — it simply may never climb PAST it. Without it the source
@@ -1794,11 +1663,13 @@ mod tests {
     /// Build a `TestClock`-backed SCREEN controller (issue #1199 / #1200). Uses
     /// the screen ladder (`new_for_screen_with_clock`) so the per-layer state
     /// mirrors the real `ScreenEncoder::set_encoder_control` path.
-    fn screen_controller_with_clock(clock: &Arc<TestClock>) -> EncoderBitrateController {
+    /// A clock-injected controller for the ladder/probe tests, on the CAMERA
+    /// ladder — those tests need a rung to earn or shed.
+    fn probe_controller_with_clock(clock: &Arc<TestClock>) -> EncoderBitrateController {
         let target_fps = Arc::new(AtomicU32::new(10));
-        EncoderBitrateController::new_for_screen_with_clock(
+        EncoderBitrateController::with_clock(
+            500,
             target_fps,
-            SCREEN_QUALITY_TIERS,
             Arc::clone(clock) as Arc<dyn crate::clock::Clock>,
         )
     }
@@ -2021,49 +1892,6 @@ mod tests {
             shed,
             "sustained encoder backpressure must shed the top active layer (active now {})",
             controller.active_layer_count()
-        );
-    }
-
-    /// Issue #1553 shed-down (controller end-to-end): a SCREEN controller seeded
-    /// at the OPTIMISTIC baseline must, under SUSTAINED encoder backpressure,
-    /// shed all the way DOWN to the floor (1) through the REAL `tick` /
-    /// backpressure path — NOT just via a direct `drop_top_layer` call. This
-    /// proves the higher seed does not block the shed direction (the down side of
-    /// Option B): a genuinely congested device still reaches the single base rung.
-    #[test]
-    fn test_screen_optimistic_seed_sheds_down_to_floor_under_backpressure() {
-        use crate::constants::SCREEN_INITIAL_ACTIVE_LAYERS;
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let mut controller = screen_controller_with_clock(&clock);
-        controller.set_simulcast_ceiling_start_optimistic(3, SCREEN_INITIAL_ACTIVE_LAYERS);
-        let seeded = controller.active_layer_count();
-        assert!(
-            seeded >= 2,
-            "precondition: optimistic seed must start above the floor (got {seeded}) \
-             so the shed-down has somewhere to fall from"
-        );
-
-        // Warm up with zero backpressure (clears the screen warmup window).
-        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 9000.0, 4, 1000.0);
-
-        // Feed sustained HIGH backpressure across spaced ticks; each advances past
-        // the sustain + min-transition guard so a shed can fire each eligible tick.
-        let step =
-            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 500.0;
-        for _ in 0..20 {
-            if controller.active_layer_count() == 1 {
-                break;
-            }
-            t += step;
-            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
-        }
-        assert_eq!(
-            controller.active_layer_count(),
-            1,
-            "sustained backpressure from the optimistic seed must shed all the way \
-             to the floor (base rung) — the shed-down path is not gated by the \
-             higher seed (#1553)"
         );
     }
 
@@ -2783,110 +2611,12 @@ mod tests {
     }
 
     #[test]
-    fn test_screen_controller_uses_screen_simulcast_ladder() {
-        use crate::constants::simulcast_screen_layers;
-        let target_fps = Arc::new(AtomicU32::new(10));
-        let mut controller =
-            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
-        controller.set_simulcast_layers(3);
-        assert!(controller.is_simulcast());
-        let tiers = simulcast_screen_layers(3);
-        assert_eq!(
-            controller.layer_resolution(0),
-            Some((tiers[0].max_width, tiers[0].max_height))
-        );
-        // The top screen layer must be 1440p (issue #2179; distinct from the
-        // camera ladder's 720p top), proving the screen ladder is in use.
-        assert_eq!(controller.layer_resolution(2), Some((2560, 1440)));
-        // …and the middle rung must be the 1080p `high` rung, so the ladder is
-        // spaced by RESOLUTION (720p → 1080p → 1440p) rather than repeating
-        // 720p on two rungs as the pre-#2179 `[low, medium, high]` did.
-        assert_eq!(controller.layer_resolution(1), Some((1920, 1080)));
-    }
-
-    #[test]
-    fn test_new_for_screen_starts_at_midpoint_tier() {
+    fn test_new_for_screen_starts_at_the_single_native_rung() {
         use crate::constants::DEFAULT_SCREEN_TIER_INDEX;
         let target_fps = Arc::new(AtomicU32::new(10));
         let controller = EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
         assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
-    }
-
-    /// Issue #2179: the screen AQ loop seeds the controller with the tier the
-    /// encoder resolved from the CAPTURED SOURCE, so the controller's first
-    /// transition cannot yank a source-matched share back to its own stale
-    /// construction default.
-    ///
-    /// Mutation guards: deleting `set_initial_video_tier`'s `force_video_step_to`
-    /// leaves the controller at `DEFAULT_SCREEN_TIER_INDEX` (first assert
-    /// fails); dropping the `tier_changed` raise makes the encoder never observe
-    /// the seed (second assert fails); dropping the `ideal_bitrate_kbps` resync
-    /// leaves the PID driving toward the old tier's setpoint (third assert
-    /// fails).
-    #[test]
-    fn set_initial_video_tier_seeds_screen_controller_from_source_tier() {
-        use crate::constants::{screen_tier_index_by_label, DEFAULT_SCREEN_TIER_INDEX};
-        let target_fps = Arc::new(AtomicU32::new(10));
-        let mut controller =
-            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
-        assert_eq!(controller.video_tier_index(), DEFAULT_SCREEN_TIER_INDEX);
-
-        let target = screen_tier_index_by_label("1440p");
-        assert!(controller.set_initial_video_tier(target));
-        assert_eq!(controller.video_tier_index(), target);
-        assert!(
-            controller.take_tier_changed(),
-            "the seed must raise tier_changed so the encoder picks up the new dims"
-        );
-        assert_eq!(
-            controller.current_video_tier().max_width,
-            2560,
-            "the controller must now be ON the 1440p rung"
-        );
-        assert_eq!(
-            controller.ideal_bitrate_kbps, SCREEN_QUALITY_TIERS[target].ideal_bitrate_kbps,
-            "the PID setpoint must resync to the seeded tier"
-        );
-
-        // Idempotent: seeding the tier it is already on reports no change.
-        assert!(!controller.set_initial_video_tier(target));
-    }
-
-    /// The seed must never escape a user's send-quality bounds — `best` is a
-    /// FLOOR on the index (best allowed) and `worst` is a CAP.
-    #[test]
-    fn set_initial_video_tier_respects_user_quality_bounds() {
-        use crate::constants::screen_tier_index_by_label;
-        let medium = screen_tier_index_by_label("medium");
-        let native = 0usize;
-
-        // User pinned max quality at `medium`: a 4K source must not jump above it.
-        let mut controller = EncoderBitrateController::new_for_screen(
-            Arc::new(AtomicU32::new(10)),
-            SCREEN_QUALITY_TIERS,
-        );
-        controller.set_video_quality_bounds(Some(medium), None);
-        controller.set_initial_video_tier(native);
-        assert_eq!(
-            controller.video_tier_index(),
-            medium,
-            "the source-derived seed must not step above the user's best/floor bound"
-        );
-
-        // User pinned min quality at `high`: a tiny source must not sink below it.
-        let high = screen_tier_index_by_label("high");
-        let low = SCREEN_QUALITY_TIERS.len() - 1;
-        let mut controller = EncoderBitrateController::new_for_screen(
-            Arc::new(AtomicU32::new(10)),
-            SCREEN_QUALITY_TIERS,
-        );
-        controller.set_video_quality_bounds(None, Some(high));
-        controller.set_initial_video_tier(low);
-        assert_eq!(
-            controller.video_tier_index(),
-            high,
-            "the source-derived seed must not step below the user's worst/cap bound"
-        );
+        assert_eq!(controller.current_video_tier().label, "native");
     }
 
     #[test]
@@ -2947,199 +2677,6 @@ mod tests {
     // (The WS/WT drop-delta -> step_down DECISION is separately pinned by the
     // `evaluate_self_congestion` tests in constants.rs.)
     // =====================================================================
-
-    /// Helper: cold-start a screen controller at the base rung, then earn up to
-    /// 3 active layers via sustained-clear probe ticks, returning the controller
-    /// and the last timestamp used. Mirrors how the live screen ladder reaches a
-    /// multi-layer state before a congestion signal can shed one.
-    fn screen_controller_earned_to_three(
-        clock: &Arc<TestClock>,
-        base_ms: u64,
-    ) -> (EncoderBitrateController, f64) {
-        let mut controller = screen_controller_with_clock(clock);
-        controller.set_simulcast_ceiling_start_at_base(3);
-        let mut t = warm_up(&mut controller, clock, base_ms as f64 + 6000.0, 4, 1000.0);
-        for _ in 0..12 {
-            t += probe_step_ms();
-            tick_at(&mut controller, clock, t, 0);
-            if controller.active_layer_count() == 3 {
-                break;
-            }
-        }
-        assert_eq!(
-            controller.active_layer_count(),
-            3,
-            "precondition: screen ladder must earn up to 3 active layers before the shed test"
-        );
-        (controller, t)
-    }
-
-    /// #1553: a SCREEN controller configured via
-    /// `set_simulcast_ceiling_start_optimistic` must seed the OPTIMISTIC baseline
-    /// (`SCREEN_INITIAL_ACTIVE_LAYERS` = 2 → the `[low, high]` ladder: base `low`
-    /// plus the top `high`/1080p rung; the middle `medium` rung is deferred), NOT
-    /// the base rung (1, the start-at-base camera path the screen path used before
-    /// #1553 and which left it permanently fuzzy) and NOT the full 3-rung ladder
-    /// (the all-rungs-hot slam #1200 removed). Pins the seed against the real
-    /// constant. Contrast with `test_camera_cold_start_is_one_active_layer`, which
-    /// asserts the CAMERA path still cold-starts at 1.
-    #[test]
-    fn test_screen_cold_start_is_optimistic_baseline() {
-        use crate::constants::SCREEN_INITIAL_ACTIVE_LAYERS;
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let mut controller = screen_controller_with_clock(&clock);
-        controller.set_simulcast_ceiling_start_optimistic(3, SCREEN_INITIAL_ACTIVE_LAYERS);
-
-        let expected = SCREEN_INITIAL_ACTIVE_LAYERS.min(3);
-        assert!(
-            (2..3).contains(&expected),
-            "for this 3-rung screen ladder the optimistic seed must sit strictly \
-             between base (1) and the full ladder (3) so the test exercises the \
-             intended middle ground"
-        );
-        assert!(
-            controller.is_simulcast(),
-            "ceiling > 1 must put the screen controller in simulcast mode so the ramp runs"
-        );
-        assert_eq!(
-            controller.simulcast_layer_count(),
-            3,
-            "the screen device ceiling must be configured to 3"
-        );
-        assert_eq!(
-            controller.active_layer_count(),
-            expected,
-            "screen cold start must seed the optimistic baseline ([low, high]: \
-             base + the 1080p top rung, middle deferred), not the base rung \
-             (#1553) and not the full ladder (#1200)"
-        );
-    }
-
-    /// Issue #1229 + #1553: the screen AQ loop is spawned ONCE and outlives
-    /// individual share sessions; while idle it keeps ticking a CLEAR queue, so
-    /// the headroom probe drifts `active_layer_count` UP toward the ceiling. On
-    /// the next (re)share the loop re-seeds by calling
-    /// `set_simulcast_ceiling_start_optimistic` again — which MUST reset the
-    /// active count back to the OPTIMISTIC baseline (`SCREEN_INITIAL_ACTIVE_LAYERS`
-    /// = 2), undoing a prior session's drift in EITHER direction (here: drifted UP
-    /// to the full ladder 3 → pulled back to 2). Post-#1553 the re-arm seeds the
-    /// optimistic baseline, NOT the base rung — that is the whole fix: a re-share
-    /// must not be stuck fuzzy at base waiting for the 6 s ramp.
-    ///
-    /// This test drives the REAL drift (clean ticks ramp the active count up via
-    /// the probe to the FULL ceiling 3), asserts it actually climbed ABOVE the
-    /// optimistic baseline (so the reset is a genuine DOWN move, not a no-op),
-    /// then re-seeds and asserts it dropped back to exactly the baseline. Mutation
-    /// check: if the re-seed call is removed, the final assert fails because the
-    /// active count is still the drifted-up value (3).
-    #[test]
-    fn test_screen_reshare_rearm_resets_drifted_active_count_to_optimistic_baseline() {
-        use crate::constants::SCREEN_INITIAL_ACTIVE_LAYERS;
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let mut controller = screen_controller_with_clock(&clock);
-        let baseline = SCREEN_INITIAL_ACTIVE_LAYERS.min(3);
-
-        // First share: seed the optimistic baseline, then let the probe ramp drift
-        // the active count UP to the full ceiling (3) under a sustained-clear
-        // encoder queue (idle/clean ticks).
-        controller.set_simulcast_ceiling_start_optimistic(3, SCREEN_INITIAL_ACTIVE_LAYERS);
-        assert_eq!(
-            controller.active_layer_count(),
-            baseline,
-            "first share seeds the optimistic baseline"
-        );
-
-        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
-        for _ in 0..12 {
-            t += probe_step_ms();
-            tick_at(&mut controller, &clock, t, 0);
-            if controller.active_layer_count() == 3 {
-                break;
-            }
-        }
-        // The drift MUST actually climb ABOVE the baseline, or the reset below
-        // proves nothing (it would be a no-op rather than a genuine DOWN move).
-        assert!(
-            controller.active_layer_count() > baseline,
-            "precondition: clean ticks must drift the active count above the \
-             optimistic baseline (got {}) so the re-seed reset is genuinely \
-             exercised as a down move",
-            controller.active_layer_count()
-        );
-
-        // Next (re)share: the AQ loop re-seeds the optimistic baseline. This MUST
-        // reset the drifted-up active count back DOWN to the baseline. (Remove
-        // this call → final assert fails: mutation guard.)
-        controller.set_simulcast_ceiling_start_optimistic(3, SCREEN_INITIAL_ACTIVE_LAYERS);
-        assert_eq!(
-            controller.active_layer_count(),
-            baseline,
-            "a re-share re-seed must reset the drifted active count back to the \
-             optimistic baseline (#1553)"
-        );
-    }
-
-    /// #1199 signal 1 (server CONGESTION): a CONGESTION cut on the SCREEN
-    /// controller must shed the top active rung, exactly like the camera.
-    #[test]
-    fn test_screen_congestion_cut_sheds_top_layer() {
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let (mut controller, t) = screen_controller_earned_to_three(&clock, base_ms);
-
-        clock.set_ms((t + 1100.0) as u64);
-        controller.force_congestion_cut();
-        assert_eq!(
-            controller.active_layer_count(),
-            2,
-            "a server CONGESTION cut on the screen publisher must shed the top active rung (#1199)"
-        );
-    }
-
-    /// #1199 signals 2 & 3 (WS send-buffer drops / WT unistream drops): both
-    /// self-trigger `force_video_step_down` on the SCREEN controller, which must
-    /// shed the top active rung. One test covers both because the two drop
-    /// signals route through the identical controller call.
-    #[test]
-    fn test_screen_force_step_down_sheds_top_layer() {
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let (mut controller, t) = screen_controller_earned_to_three(&clock, base_ms);
-
-        clock.set_ms((t + 1100.0) as u64);
-        assert!(controller.force_video_step_down());
-        assert_eq!(
-            controller.active_layer_count(),
-            2,
-            "a WS/WT uplink-drop step-down on the screen publisher must shed the top active rung (#1199)"
-        );
-    }
-
-    /// #1199 requirement 4 (camera-off case): the screen controller's shed is
-    /// entirely self-contained — it depends on NO camera state. This standalone
-    /// screen controller (there is no camera in this test at all) still sheds on
-    /// a CONGESTION cut, proving the live egress (screen) reacts even when the
-    /// camera is off. The runtime wiring that delivers the signal to the screen
-    /// loop while the camera is off (the client sets a SEPARATE screen
-    /// congestion flag, and the screen AQ loop ticks independent of camera
-    /// `enabled`) is exercised end-to-end by the e2e suite; this pins the
-    /// controller-level invariant that the shed needs no camera.
-    #[test]
-    fn test_screen_sheds_with_no_camera_present() {
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let (mut controller, t) = screen_controller_earned_to_three(&clock, base_ms);
-        let active_before = controller.active_layer_count();
-
-        clock.set_ms((t + 1100.0) as u64);
-        controller.force_congestion_cut();
-        assert!(
-            controller.active_layer_count() < active_before,
-            "the screen publisher must shed on CONGESTION with no camera involved (camera-off path, #1199)"
-        );
-    }
 
     #[test]
     fn test_single_stream_force_paths_do_not_touch_layers() {
@@ -4072,200 +3609,28 @@ mod tests {
         );
     }
 
-    // =====================================================================
-    // Ladder variant threading (issue #1768) — the encoder↔controller
-    // consistency guard from LADDER-GATE-DESIGN.md finding #2.
-    // =====================================================================
-
-    /// Build a `TestClock`-backed controller on an explicit [`LadderVariant`].
-    fn controller_with_ladder(
-        ideal: u32,
-        clock: &Arc<TestClock>,
-        variant: LadderVariant,
-    ) -> EncoderBitrateController {
-        let target_fps = Arc::new(AtomicU32::new(30));
-        EncoderBitrateController::with_clock_and_ladder(
-            ideal,
-            target_fps,
-            Arc::clone(clock) as Arc<dyn crate::clock::Clock>,
-            variant,
-        )
-    }
-
-    /// **The encoder↔controller consistency guard.** A `Reduced` controller's
-    /// per-layer targets must come from the REDUCED ladder's ideals, not the default
-    /// ladder's.
+    /// A camera controller's per-layer TARGETS are the shipped camera ladder's
+    /// ideals — the values `compute_layer_bitrates` hands the encoder through
+    /// `shared_layer_bitrates_bps` → `layer.encoder.set_bitrate`.
     ///
-    /// Why this matters: these targets are what the encoder is CONFIGURED with
-    /// (`compute_layer_bitrates` → `shared_layer_bitrates_bps` →
-    /// `layer.encoder.set_bitrate`). If the controller kept the default ladder's
-    /// ideals (top 1500) while the paired encoder emitted the reduced top rung
-    /// (960×540), that rung would be encoded at ~1.7× its intended bitrate — real
-    /// wasted uplink, and on a measurement run it corrupts the bitrate figures the
-    /// run exists to collect.
-    ///
-    /// It would NOT cause a layer shed: budget and targets are both sums over the
-    /// same tiers, so `cap_layers_to_budget` is a no-op either way (see the
-    /// `ladder_variant` field docs).
-    ///
-    /// MUTATION: change `simulcast_ladder()` to ignore `self.ladder_variant` (i.e.
-    /// call `simulcast_layers(n)` / hardcode `LadderVariant::Default`) and the top
-    /// rung assertion flips 900 → 1500 and fails.
+    /// MUTATION: point `simulcast_ladder()` at any other table and the top-rung
+    /// assertion moves off 1500 and fails.
     #[test]
-    fn test_reduced_ladder_controller_budgets_reduced_ideals() {
-        use crate::constants::{
-            simulcast_layers_for, uplink_budget_kbps, SIMULCAST_VIDEO_LAYERS_REDUCED,
-        };
-
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let mut controller = controller_with_ladder(500, &clock, LadderVariant::Reduced);
-        controller.set_simulcast_layers(3);
-
-        let t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
-        tick_at(&mut controller, &clock, t, 0);
-
-        let bitrates = controller.layer_target_bitrates_kbps();
-        assert_eq!(bitrates.len(), 3, "3-rung ladder");
-
-        // Targets come from the REDUCED table, read from the constant itself so a
-        // ladder retune cannot make this test pass against a stale hardcode.
-        let reduced_ideals: Vec<f64> = SIMULCAST_VIDEO_LAYERS_REDUCED
-            .iter()
-            .map(|t| t.ideal_bitrate_kbps as f64)
-            .collect();
-        // The active layers are budget-capped, so compare the ladder the controller
-        // RESOLVED rather than the post-cap numbers: the tier table it built its
-        // targets from must be the reduced one.
-        //
-        // `set_simulcast_layers(3)` above seeds `active_layer_count = 3` (all rungs
-        // hot), so `active` is 3 here and this assertion compares at the full ladder
-        // depth — where the two tables genuinely diverge, which is what makes this
-        // assertion variant-discriminating here and vacuous in a ramping controller.
-        //
-        // NOTE the seed is a TEST convenience, not a production shape: no encoder calls
-        // `set_simulcast_layers` any more. Camera uses
-        // `set_simulcast_ceiling_start_at_base` (active starts at 1 and is earned up),
-        // screen uses `set_simulcast_ceiling_start_optimistic` (#1553); #1200 removed
-        // screen's all-rungs-hot seed. It is used here because the point of this test is
-        // the LADDER TABLE the controller resolved, and the all-hot seed reaches full
-        // depth without simulating a ramp. The consequence is that the budget assertion
-        // is only meaningful at this seed — see the note below the top-rung assertion.
-        let active = controller.active_layer_count();
-        let reduced_budget =
-            uplink_budget_kbps(simulcast_layers_for(3, LadderVariant::Reduced), active);
-        let active_sum: f64 = bitrates[..active].iter().sum();
-        assert!(
-            active_sum <= reduced_budget + 1e-6,
-            "active sum {active_sum} must fit the REDUCED budget {reduced_budget}"
-        );
-
-        // The most ROBUST assertion: the TOP rung's stored target is the reduced ideal
-        // (900), never the default's (1500). The top rung is retained at its tier ideal
-        // even while shed (so a re-add resumes near it), so this reads the ladder table
-        // directly rather than depending on the ACTIVE count — it discriminates the
-        // variant at any active depth, whereas the budget assertion above only does so
-        // at full depth.
-        //
-        // It does still depend on the ladder being 3 rungs DEEP. Both assertions rest on
-        // the `set_simulcast_layers(3)` seed: dropping it leaves the manager in
-        // single-stream mode, `layer_target_bitrates_kbps()` returns empty, and the
-        // `bitrates.len() == 3` precondition above fails first.
-        // That precondition is what keeps this test from degrading silently: without
-        // the seed it fails first, rather than the top-rung assertion passing vacuously.
-        assert_eq!(
-            bitrates[2], reduced_ideals[2],
-            "top rung must carry the REDUCED ideal ({}), not the default ladder's",
-            reduced_ideals[2]
-        );
-        assert_eq!(
-            controller.ladder_variant(),
-            LadderVariant::Reduced,
-            "the controller must report the variant it was built with"
-        );
-        // Sanity on the TABLES: the two ladders' full-depth budgets genuinely differ,
-        // so a retune that collapsed the reduced ladder onto the default one would fail
-        // HERE rather than silently making the variant a no-op.
-        //
-        // Compared at the FULL ladder depth (3), NOT at the live `active` count — even
-        // though `active` happens to be 3 in this test. The ladders' difference is a
-        // property of the TABLES, not of the current operating point: the two share
-        // rungs 0 and 1 byte-for-byte (`low` 320×180@120 and `standard` 640×360@350 in
-        // both), so their budgets are EQUAL at 1 and 2 active rungs and diverge only at
-        // 3. Pinning at a hardcoded depth
-        // keeps this check meaningful even if the seed above changes. Comparing at
-        // the controller's live `active` depth would be vacuous: a ramping controller
-        // sits at 1 active layer, where the two ladders are equal by construction.
-        let reduced_full = uplink_budget_kbps(simulcast_layers_for(3, LadderVariant::Reduced), 3);
-        let default_full = uplink_budget_kbps(simulcast_layers_for(3, LadderVariant::Default), 3);
-        assert!(
-            reduced_full < default_full,
-            "the reduced ladder's full-depth budget must be LOWER than the default's, \
-             or this test cannot discriminate (reduced {reduced_full}, default {default_full})"
-        );
-    }
-
-    /// The DEFAULT arm is inert: a controller built the legacy way
-    /// (`with_clock`, no variant) budgets exactly the shipped ladder, so #1768 is
-    /// byte-identical with the flag off.
-    ///
-    /// MUTATION: make `with_clock` pass `LadderVariant::Reduced` and the top-rung
-    /// assertion flips 1500 → 900 and fails.
-    #[test]
-    fn test_default_ladder_controller_is_unchanged() {
+    fn test_camera_controller_budgets_the_shipped_ladder_ideals() {
         use crate::constants::SIMULCAST_VIDEO_LAYERS;
 
         let base_ms: u64 = 100_000;
         let clock = Arc::new(TestClock::new(base_ms));
-        // Deliberately the LEGACY constructor (`controller_with_clock` →
-        // `with_clock`), i.e. every existing caller including the native bot.
         let mut controller = controller_with_clock(500, &clock);
         controller.set_simulcast_layers(3);
 
         let t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
         tick_at(&mut controller, &clock, t, 0);
 
-        assert_eq!(
-            controller.ladder_variant(),
-            LadderVariant::Default,
-            "the legacy constructor must stay on the shipped ladder"
-        );
         let bitrates = controller.layer_target_bitrates_kbps();
         assert_eq!(
             bitrates[2], SIMULCAST_VIDEO_LAYERS[2].ideal_bitrate_kbps as f64,
-            "the default arm's top rung must still be the shipped ladder's ideal"
-        );
-    }
-
-    /// A SCREEN controller ignores the camera variant entirely: it resolves the
-    /// SCREEN ladder, whose rungs #1768 did not touch (#1899/#1903 tune screen
-    /// keyframes separately). Guards against a future edit routing the screen path
-    /// through the camera variant.
-    ///
-    /// MUTATION: drop the `is_screen` branch in `simulcast_ladder()` and the
-    /// screen controller's targets become camera rungs, failing here.
-    #[test]
-    fn test_screen_controller_ignores_camera_ladder_variant() {
-        use crate::constants::simulcast_screen_layers;
-
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let mut controller = screen_controller_with_clock(&clock);
-        controller.set_simulcast_layers(3);
-
-        let t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
-        tick_at(&mut controller, &clock, t, 0);
-
-        let screen_tiers = simulcast_screen_layers(3);
-        let bitrates = controller.layer_target_bitrates_kbps();
-        assert_eq!(
-            bitrates[2], screen_tiers[2].ideal_bitrate_kbps as f64,
-            "a screen controller must resolve the SCREEN ladder's top rung"
-        );
-        assert_eq!(
-            controller.ladder_variant(),
-            LadderVariant::Default,
-            "the screen path reports the inert Default camera variant"
+            "the top rung's target must be the shipped camera ladder's ideal"
         );
     }
 
@@ -4287,7 +3652,7 @@ mod tests {
     fn probe_refuses_a_rung_inside_the_tier_quiet_window() {
         let base_ms: u64 = 100_000;
         let clock = Arc::new(TestClock::new(base_ms));
-        let mut controller = screen_controller_with_clock(&clock);
+        let mut controller = probe_controller_with_clock(&clock);
         controller.set_simulcast_ceiling_start_at_base(3);
         let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
         assert_eq!(
@@ -4325,94 +3690,6 @@ mod tests {
             controller.active_layer_count(),
             2,
             "the quiet window must RE-OPEN the probe, not pin the ladder at base"
-        );
-    }
-
-    /// Issue #2179 review: the persistent source/device ceiling installed on the
-    /// controller must bind BOTH the share-start seed and the later climb.
-    ///
-    /// Mutation guard: drop the `source_ceiling_index()` clamp from
-    /// `set_initial_video_tier` and the seed lands on `1440p`, failing the first
-    /// assertion.
-    #[test]
-    fn source_tier_ceiling_binds_the_seed_and_the_climb() {
-        use crate::constants::screen_tier_index_by_label;
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let mut controller = screen_controller_with_clock(&clock);
-
-        let high = screen_tier_index_by_label("high");
-        let best_1440p = screen_tier_index_by_label("1440p");
-        controller.set_source_tier_ceiling(Some(high));
-        assert_eq!(controller.source_tier_ceiling(), Some(high));
-
-        // A seed BETTER than the ceiling is pulled back to it.
-        controller.set_initial_video_tier(best_1440p);
-        assert_eq!(
-            controller.video_tier_index(),
-            high,
-            "the seed must never start a share above its persistent ceiling"
-        );
-
-        // A seed WORSE than the ceiling is honoured as-is (the ceiling is a
-        // floor on the index, not a target).
-        let low = screen_tier_index_by_label("low");
-        controller.set_initial_video_tier(low);
-        assert_eq!(controller.video_tier_index(), low);
-
-        // Clearing it (share stop) releases the bound for the next share.
-        controller.set_source_tier_ceiling(None);
-        assert_eq!(controller.source_tier_ceiling(), None);
-        controller.set_initial_video_tier(best_1440p);
-        assert_eq!(controller.video_tier_index(), best_1440p);
-    }
-
-    /// A `Reduced`-ladder publisher must still EARN its upper rungs — the reduced
-    /// ladder must not wedge the #1140/#1141 headroom ramp at the base layer
-    /// (issue #1768). This is a NON-WEDGING test, not a variant-discrimination
-    /// one: `uplink_precondition_for_add` also resolves `simulcast_ladder()`, but
-    /// its gate is `budget_next - budget_now > budget_now *
-    /// LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC` and that constant is currently
-    /// **0.0**, so any rung with a positive ideal passes in EITHER ladder. Swapping
-    /// the ladder there therefore changes nothing today and this test cannot detect
-    /// it — `test_reduced_ladder_controller_budgets_reduced_ideals` is the
-    /// variant-sensitive guard.
-    ///
-    /// It is still load-bearing: it fails if a Reduced controller cannot climb at
-    /// all, which is exactly what a wrong-shaped reduced ladder (e.g. a zero/absent
-    /// upper ideal, or a rung count mismatch slipping past the compile-time depth
-    /// assert) would cause. It would become variant-sensitive only at a
-    /// `LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC` above 1.67 — not merely "above 0" as
-    /// this note used to claim; see that constant's own doc for the shipped
-    /// `next_ideal / budget_now` ratios and why no useful value exists.
-    #[test]
-    fn test_reduced_ladder_ramp_still_earns_layers() {
-        let base_ms: u64 = 100_000;
-        let clock = Arc::new(TestClock::new(base_ms));
-        let mut controller = controller_with_ladder(500, &clock, LadderVariant::Reduced);
-        // Start-at-base (the real CAMERA path), so the ramp must EARN rung 2.
-        controller.set_simulcast_ceiling_start_at_base(3);
-        assert_eq!(
-            controller.active_layer_count(),
-            1,
-            "precondition: start-at-base seeds a single active layer"
-        );
-
-        let mut t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
-        let mut climbed = false;
-        for _ in 0..40 {
-            t += probe_step_ms();
-            tick_at(&mut controller, &clock, t, 0);
-            if controller.active_layer_count() >= 2 {
-                climbed = true;
-                break;
-            }
-        }
-        assert!(
-            climbed,
-            "a Reduced-ladder controller must still earn its second rung under \
-             sustained-clear backpressure (active {})",
-            controller.active_layer_count()
         );
     }
 }

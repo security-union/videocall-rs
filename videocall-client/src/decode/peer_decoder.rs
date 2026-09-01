@@ -39,6 +39,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use videocall_codecs::decoder::WasmDecoder;
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, FrameType, VideoFrame as CodecVideoFrame};
+use videocall_codecs::messages::StreamContext;
 use videocall_codecs::playout::LatestFrameMailbox;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use videocall_types::protos::media_packet::MediaPacket;
@@ -365,6 +366,8 @@ pub struct VideoPeerDecoder {
     /// for the `#[cfg(test)]` accessor, hence the non-test dead-code allow.
     #[cfg_attr(not(test), allow(dead_code))]
     skip_canvas_paint: Rc<Cell<bool>>,
+    /// #2511: `Date::now()` of the last frame the worker handed to main; `0.0` = none yet.
+    last_output_ms: Rc<Cell<f64>>,
     /// Issue #1025: proactive keyframe-request route. The underlying `WasmDecoder`'s
     /// worker-message closure (captured in [`Self::new`]) holds a clone of this `Rc` and,
     /// when the worker posts a `RequestKeyframeMessage`, invokes the inner closure if set.
@@ -422,10 +425,54 @@ pub struct VideoPeerDecoder {
 
 // Trait to handle VideoFrame callbacks in WASM
 trait VideoFrameDecoder {
-    fn push_frame(&self, frame: FrameBuffer);
+    fn push_frame(&self, frame: FrameBuffer, context: Option<StreamContext>);
     fn is_waiting_for_keyframe(&self) -> bool;
     fn flush(&self);
     fn set_stream_context(&self, _from_peer: String, _to_peer: String) {}
+    /// Deliberately WITHOUT a default body (#2524): a defaulted `(0, 0)` let deleting the
+    /// `WasmVideoFrameDecoder` override publish a constant 0 with a green suite.
+    fn freshness_eviction_counts(&self) -> (u64, u64);
+    #[cfg(test)]
+    fn set_freshness_eviction_counts_for_test(&self, _total: u64, _keyframeless: u64) {}
+    /// Only the host-test stand-in records this; a worker-backed decoder cannot read back what
+    /// it posted, and returning `None` would read as "no context passed".
+    #[cfg(test)]
+    fn last_pushed_context(&self) -> Option<StreamContext> {
+        unimplemented!("only NoopDecoder records pushed context")
+    }
+    /// Reads back the TTL this decoder was actually CONSTRUCTED with, so a test observes the
+    /// production call site's argument rather than the helper that computes it.
+    #[cfg(test)]
+    fn boot_replay_ttl_ms(&self) -> f64 {
+        unimplemented!("only a worker-backed decoder carries a boot gate")
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct NoopDecoder {
+    last_context: RefCell<Option<StreamContext>>,
+    freshness_evictions: Cell<(u64, u64)>,
+}
+
+#[cfg(test)]
+impl VideoFrameDecoder for NoopDecoder {
+    fn push_frame(&self, _: FrameBuffer, context: Option<StreamContext>) {
+        *self.last_context.borrow_mut() = context;
+    }
+    fn is_waiting_for_keyframe(&self) -> bool {
+        true
+    }
+    fn flush(&self) {}
+    fn freshness_eviction_counts(&self) -> (u64, u64) {
+        self.freshness_evictions.get()
+    }
+    fn set_freshness_eviction_counts_for_test(&self, total: u64, keyframeless: u64) {
+        self.freshness_evictions.set((total, keyframeless));
+    }
+    fn last_pushed_context(&self) -> Option<StreamContext> {
+        self.last_context.borrow().clone()
+    }
 }
 
 struct WasmVideoFrameDecoder {
@@ -433,8 +480,8 @@ struct WasmVideoFrameDecoder {
 }
 
 impl VideoFrameDecoder for WasmVideoFrameDecoder {
-    fn push_frame(&self, frame: FrameBuffer) {
-        self.decoder.push_frame(frame);
+    fn push_frame(&self, frame: FrameBuffer, context: Option<StreamContext>) {
+        self.decoder.push_frame(frame, context);
     }
 
     fn is_waiting_for_keyframe(&self) -> bool {
@@ -448,6 +495,15 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
     fn set_stream_context(&self, from_peer: String, to_peer: String) {
         self.decoder.set_context(from_peer, to_peer);
     }
+
+    fn freshness_eviction_counts(&self) -> (u64, u64) {
+        self.decoder.freshness_eviction_counts()
+    }
+
+    #[cfg(test)]
+    fn boot_replay_ttl_ms(&self) -> f64 {
+        self.decoder.boot_replay_ttl_ms()
+    }
 }
 
 /// Media-type discriminator passed to [`VideoPeerDecoder::new`]. Distinguishes
@@ -457,8 +513,33 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
 pub const MEDIA_TYPE_CAMERA: &str = "VIDEO";
 pub const MEDIA_TYPE_SCREEN: &str = "SCREEN";
 
+/// Boot-replay TTL for a peer decoder's worker (issue 2572): the publisher's keyframe ceiling for
+/// this media kind. Past that a fresh keyframe is due anyway, so replaying older content cannot
+/// beat waiting for it. Camera and screen ceilings differ deliberately, so this keys off the kind.
+///
+/// Camera must be the ACROSS-TIER ceiling, not the per-tier base: `low`/`very_low`/`minimal`
+/// relax to 5500ms, and a receiver cannot know the publisher's tier or transport.
+pub(crate) fn boot_replay_ttl_ms(media_type: &str) -> f64 {
+    if media_type == MEDIA_TYPE_SCREEN {
+        videocall_aq::constants::SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS
+    } else {
+        videocall_aq::constants::PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS
+    }
+}
+
 pub(crate) fn should_paint(paint_enabled: bool, skip_canvas_paint: bool) -> bool {
     paint_enabled && !skip_canvas_paint
+}
+
+/// Stamp the decoder-OUTPUT clock (issue 2511) and report whether the worker→main offer may
+/// proceed. One call, so the stamp cannot be reordered behind the gate's early return.
+pub(crate) fn stamp_output_and_should_offer(
+    last_output_ms: &Rc<Cell<f64>>,
+    now: f64,
+    paint_enabled: bool,
+) -> bool {
+    last_output_ms.set(now);
+    paint_enabled
 }
 
 /// Decide what `(from_peer, to_peer)` to stamp on a freshly-constructed
@@ -497,6 +578,41 @@ fn resolve_renderer_context(
 }
 
 impl VideoPeerDecoder {
+    /// The last publisher-stamped `(source_width, source_height)` for this stream,
+    /// or `(0, 0)` when unreported. The only receive-side fact about the SENDER's
+    /// real geometry.
+    pub fn reported_source_dims(&self) -> (u32, u32) {
+        *self.last_source_dims.borrow()
+    }
+
+    /// The last publisher-stamped encoder target bitrate (kbps), or `0`.
+    pub fn reported_target_kbps(&self) -> u32 {
+        self.last_encoder_state.borrow().0
+    }
+
+    pub fn freshness_eviction_counts(&self) -> (u64, u64) {
+        self.decoder.freshness_eviction_counts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn boot_replay_ttl_ms_for_test(&self) -> f64 {
+        self.decoder.boot_replay_ttl_ms()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_freshness_evictions_for_test(&self, total: u64, keyframeless: u64) {
+        self.decoder
+            .set_freshness_eviction_counts_for_test(total, keyframeless);
+    }
+
+    /// Seed what a publisher would have stamped, so the readout paths can be
+    /// exercised without a live decode.
+    #[cfg(test)]
+    pub(crate) fn set_reported_for_test(&self, width: u32, height: u32, kbps: u32) {
+        *self.last_source_dims.borrow_mut() = (width, height);
+        self.last_encoder_state.borrow_mut().0 = kbps;
+    }
+
     /// Create a new video decoder with optional canvas element.
     /// Use `set_canvas()` to provide the canvas if not available at construction time.
     ///
@@ -617,13 +733,19 @@ impl VideoPeerDecoder {
         // scheduled frame — mirrors `render_fps::RenderFpsObserver::start`. `None` (no window) makes
         // rAF scheduling a no-op, exactly as before.
         let window_for_offer = web_sys::window();
+        let last_output_ms = Rc::new(Cell::new(0.0f64));
+        let last_output_for_offer = last_output_ms.clone();
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
             // Issue #1183 late-frame race: if painting was disabled on the
             // decode-stop edge, drop this frame WITHOUT holding or painting
             // (still close it to release the GPU/codec resource) so a frame that
             // finished decoding after `clear_canvas()` cannot repaint the wiped
             // tile — and so nothing accumulates in the mailbox for a hidden tile.
-            if !paint_flag.get() {
+            if !stamp_output_and_should_offer(
+                &last_output_for_offer,
+                js_sys::Date::now(),
+                paint_flag.get(),
+            ) {
                 video_frame.close();
                 return;
             }
@@ -668,6 +790,7 @@ impl VideoPeerDecoder {
             // into the correct camera-vs-screen slot by health_reporter. The worker cannot supply
             // this (it only knows peer IDs), so the kind is stamped on the main thread here.
             media_type,
+            boot_replay_ttl_ms(media_type),
         );
 
         let decoder = Box::new(WasmVideoFrameDecoder {
@@ -735,6 +858,7 @@ impl VideoPeerDecoder {
             first_render_fired,
             paint_enabled,
             skip_canvas_paint,
+            last_output_ms,
             keyframe_request_route,
             latest_frame,
             raf_scheduled,
@@ -743,6 +867,10 @@ impl VideoPeerDecoder {
             painted_fps_interval_id,
             _painted_fps_interval_closure: painted_fps_interval_closure,
         })
+    }
+
+    pub fn last_output_ms(&self) -> f64 {
+        self.last_output_ms.get()
     }
 
     /// Set or update the canvas element for rendering. Can be called multiple times.
@@ -850,6 +978,17 @@ impl VideoPeerDecoder {
             }
         }
         self.decoder.set_stream_context(from_peer, to_peer);
+    }
+
+    /// The attribution stamped on every frame posted to the decoder worker (issue 1741).
+    fn worker_stream_context(&self) -> Option<StreamContext> {
+        self.stream_context
+            .borrow()
+            .as_ref()
+            .map(|(from_peer, to_peer)| StreamContext {
+                from_peer: from_peer.clone(),
+                to_peer: to_peer.clone(),
+            })
     }
 
     /// Render video frame using cached canvas and context. Only resizes when dimensions change.
@@ -1111,19 +1250,24 @@ impl VideoPeerDecoder {
         self.keyframe_request_route.borrow().is_some()
     }
 
+    /// Test hook (issue #2328): invoke the INSTALLED route closure exactly as the worker's
+    /// `request_keyframe` message does on wasm (`videocall_codecs::decoder::wasm` calls
+    /// `request_keyframe(head_age_ms)` from its `onmessage` handler). Lets a host test drive the
+    /// real `install_keyframe_request_routes` closure — including its #2328 starvation stamp and
+    /// its #1479 budget gate — rather than a stand-in. No-op when no route is installed, matching
+    /// production.
+    #[cfg(test)]
+    pub(crate) fn fire_keyframe_request_route_for_test(&self, head_age_ms: f64) {
+        if let Some(route) = self.keyframe_request_route.borrow().as_ref() {
+            route(head_age_ms);
+        }
+    }
+
     /// No-op decoder for unit tests — avoids requiring WebCodecs / worker link tags.
     #[cfg(test)]
     pub(crate) fn noop() -> Self {
-        struct NoopDecoder;
-        impl VideoFrameDecoder for NoopDecoder {
-            fn push_frame(&self, _: FrameBuffer) {}
-            fn is_waiting_for_keyframe(&self) -> bool {
-                true
-            }
-            fn flush(&self) {}
-        }
         Self {
-            decoder: Box::new(NoopDecoder),
+            decoder: Box::new(NoopDecoder::default()),
             canvas_renderer: Rc::new(RefCell::new(None)),
             media_type: MEDIA_TYPE_CAMERA,
             last_source_dims: RefCell::new((0, 0)),
@@ -1133,6 +1277,7 @@ impl VideoPeerDecoder {
             first_render_fired: Rc::new(RefCell::new(false)),
             paint_enabled: Rc::new(Cell::new(true)),
             skip_canvas_paint: Rc::new(Cell::new(false)),
+            last_output_ms: Rc::new(Cell::new(0.0)),
             keyframe_request_route: Rc::new(RefCell::new(None)),
             latest_frame: Rc::new(RefCell::new(LatestFrameMailbox::new())),
             raf_scheduled: Rc::new(Cell::new(false)),
@@ -1155,6 +1300,11 @@ impl VideoPeerDecoder {
     #[cfg(test)]
     pub(crate) fn skip_canvas_paint_for_test(&self) -> bool {
         self.skip_canvas_paint.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_output_ms_for_test(&self, ms: f64) {
+        self.last_output_ms.set(ms);
     }
 
     /// issue 508: test seam — overwrite the renderer's cached dimensions so a
@@ -1189,6 +1339,12 @@ impl VideoPeerDecoder {
     #[cfg(test)]
     pub(crate) fn stream_context_for_test(&self) -> Option<(String, String)> {
         self.stream_context.borrow().clone()
+    }
+
+    /// issue 1741: the `context` the production `push_frame` call site passed most recently.
+    #[cfg(test)]
+    pub(crate) fn last_pushed_context_for_test(&self) -> Option<StreamContext> {
+        self.decoder.last_pushed_context()
     }
 }
 
@@ -1318,7 +1474,8 @@ impl PeerDecode for VideoPeerDecoder {
 
             // Use the new ergonomic API - decoder handles jitter buffer internally,
             // and calls our VideoFrame callback for rendering
-            self.decoder.push_frame(frame_buffer);
+            self.decoder
+                .push_frame(frame_buffer, self.worker_stream_context());
         }
 
         // HCL #893: consume the async "first frame rendered" flag set by the
@@ -1977,7 +2134,7 @@ mod tests {
     /// Build a minimal VP8 video `MediaPacket` whose `video_metadata` carries a
     /// decodable codec, so `decode()` reaches the `push_frame` / paint re-enable
     /// path rather than the unknown-codec early return.
-    fn minimal_video_packet() -> Arc<MediaPacket> {
+    pub(super) fn minimal_video_packet() -> Arc<MediaPacket> {
         use videocall_types::protos::media_packet::media_packet::MediaType;
         use videocall_types::protos::media_packet::VideoMetadata;
 
@@ -1995,12 +2152,52 @@ mod tests {
         Arc::new(pkt)
     }
 
+    /// Camera and screen ceilings differ in videocall-aq; collapsing them is a regression.
+    #[test]
+    fn boot_replay_ttl_is_the_publisher_keyframe_interval_per_media_kind() {
+        for tier in 0..videocall_aq::constants::VIDEO_QUALITY_TIERS.len() {
+            for lossless in [false, true] {
+                assert!(
+                    boot_replay_ttl_ms(MEDIA_TYPE_CAMERA)
+                        >= videocall_aq::constants::camera_periodic_keyframe_max_interval_ms(
+                            tier, lossless
+                        ),
+                    "TTL must not expire before tier {tier} (lossless={lossless}) owes a keyframe"
+                );
+            }
+        }
+        assert_eq!(
+            boot_replay_ttl_ms(MEDIA_TYPE_SCREEN),
+            videocall_aq::constants::SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS
+        );
+        assert_ne!(
+            boot_replay_ttl_ms(MEDIA_TYPE_CAMERA),
+            boot_replay_ttl_ms(MEDIA_TYPE_SCREEN),
+            "the two intervals differ in videocall-aq, so the TTL must not collapse them"
+        );
+    }
+
     #[test]
     fn paint_decision_requires_enabled_and_not_skipped() {
         assert!(should_paint(true, false));
         assert!(!should_paint(true, true));
         assert!(!should_paint(false, false));
         assert!(!should_paint(false, true));
+    }
+
+    #[test]
+    fn the_output_clock_is_stamped_even_when_the_offer_is_gated_out() {
+        let clock = Rc::new(Cell::new(0.0f64));
+
+        assert!(stamp_output_and_should_offer(&clock, 1_111.0, true));
+        assert_eq!(clock.get(), 1_111.0);
+
+        assert!(!stamp_output_and_should_offer(&clock, 2_222.0, false));
+        assert_eq!(
+            clock.get(),
+            2_222.0,
+            "a frame dropped at the paint gate was still produced by the decoder"
+        );
     }
 
     /// Decode re-arms the visibility gate without clearing the independent
@@ -2376,6 +2573,633 @@ mod wasm_canvas_tests {
             Some((0, 0)),
             "a genuinely new canvas node must rebuild the renderer (dims reset \
              to zero)"
+        );
+    }
+}
+
+/// Issue 2524: pins the PRODUCTION path from a worker post to
+/// [`VideoPeerDecoder::freshness_eviction_counts`]. Browser-only — it needs a real `Worker`,
+/// driven by a blob-backed script that posts one real worker payload on load.
+#[cfg(test)]
+mod freshness_skip_wiring_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    const WORKER_LINK_ID: &str = "codecs-worker";
+
+    fn document() -> web_sys::Document {
+        web_sys::window()
+            .expect("no window")
+            .document()
+            .expect("no document")
+    }
+
+    fn install_posting_worker(payload_json: &str) -> Option<String> {
+        install_worker_script(&format!(
+            "self.onmessage = () => {{}};\nself.postMessage({payload_json});\n"
+        ))
+    }
+
+    /// Returns the previous `href` to restore: the tag is shared with the other browser tests
+    /// in this crate, which need only `Worker::new` to succeed.
+    pub(super) fn install_worker_script(script: &str) -> Option<String> {
+        let parts = js_sys::Array::new();
+        parts.push(&JsValue::from_str(script));
+        let bag = web_sys::BlobPropertyBag::new();
+        bag.set_type("text/javascript");
+        let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &bag)
+            .expect("create worker blob");
+        let url = web_sys::Url::create_object_url_with_blob(&blob).expect("create blob URL");
+
+        let document = document();
+        let link = match document.get_element_by_id(WORKER_LINK_ID) {
+            Some(existing) => existing,
+            None => {
+                let created = document.create_element("link").expect("create <link>");
+                created.set_id(WORKER_LINK_ID);
+                document
+                    .body()
+                    .expect("no body")
+                    .append_child(&created)
+                    .expect("append <link>");
+                created
+            }
+        };
+        let previous = link.get_attribute("href");
+        link.set_attribute("href", &url).expect("set href");
+        previous
+    }
+
+    pub(super) fn restore_worker_link(previous: Option<String>) {
+        if let Some(link) = document().get_element_by_id(WORKER_LINK_ID) {
+            match previous {
+                Some(href) => link.set_attribute("href", &href).expect("restore href"),
+                None => link.remove(),
+            }
+        }
+    }
+
+    /// Poll until the counts leave `(0, 0)` or the budget expires.
+    async fn counts_after_worker_post(payload_json: &str) -> (u64, u64) {
+        let previous = install_posting_worker(payload_json);
+        let decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA, false)
+            .expect("real decoder must construct once the worker <link> is installed");
+        restore_worker_link(previous);
+
+        for _ in 0..100 {
+            let counts = decoder.freshness_eviction_counts();
+            if counts != (0, 0) {
+                return counts;
+            }
+            gloo_timers::future::TimeoutFuture::new(20).await;
+        }
+        decoder.freshness_eviction_counts()
+    }
+
+    /// Empty peer ids on purpose: this post survives a decoder whose `SetContext` never came.
+    #[wasm_bindgen_test]
+    async fn the_freshness_skip_post_reaches_the_video_peer_decoder() {
+        let counts = counts_after_worker_post(
+            r#"{"kind":"freshness_skip","from_peer":null,"to_peer":null,
+                "head_age_ms":1800.0,"keyframe_seq":null,"dropped":3,
+                "escalated":false,"tick_gap_ms":10.0,
+                "freshness_evictions_total":41,"freshness_evictions_keyframeless_total":37}"#,
+        )
+        .await;
+        assert_eq!(
+            counts,
+            (41, 37),
+            "a real freshness_skip post must reach VideoPeerDecoder::freshness_eviction_counts"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_video_stats_post_reaches_the_video_peer_decoder() {
+        let counts = counts_after_worker_post(
+            r#"{"kind":"video_stats","from_peer":"alice","to_peer":"bob",
+                "frames_buffered":4,"playout_latency_ms":0.0,"playout_stage1_span_ms":0.0,
+                "playout_paint_lag_ms":0.0,"playout_skip_to_live_total":0,
+                "content_staleness_ms":0.0,"keyframe_arrivals_total":2,
+                "freshness_evictions_total":12,"freshness_evictions_keyframeless_total":9}"#,
+        )
+        .await;
+        assert_eq!(
+            counts,
+            (12, 9),
+            "the 1Hz stats post must reach VideoPeerDecoder::freshness_eviction_counts too"
+        );
+    }
+
+    /// `VideoFrame` exists in a Worker, and `WasmDecoder`'s `dyn_into::<VideoFrame>()` arm hands
+    /// it straight to `on_video_frame`.
+    fn install_frame_posting_worker() -> Option<String> {
+        install_worker_script(
+            "self.onmessage = () => {};\n\
+             const c = new OffscreenCanvas(2, 2);\n\
+             c.getContext('2d').fillRect(0, 0, 2, 2);\n\
+             self.postMessage(new VideoFrame(c, { timestamp: 0 }));\n",
+        )
+    }
+
+    /// `disable_paint` runs SYNCHRONOUSLY after construction, so it always precedes the frame:
+    /// the message closure cannot run until this task yields at the first `await`.
+    async fn output_clock_after_worker_frame(disable_paint: bool) -> f64 {
+        let previous = install_frame_posting_worker();
+        let decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA, false)
+            .expect("real decoder must construct once the worker <link> is installed");
+        restore_worker_link(previous);
+        if disable_paint {
+            decoder.clear_canvas();
+        }
+
+        for _ in 0..100 {
+            if decoder.last_output_ms() != 0.0 {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(20).await;
+        }
+        if disable_paint {
+            assert!(
+                !decoder.paint_enabled_for_test(),
+                "precondition: the paint gate must still be shut when the frame lands"
+            );
+        }
+        decoder.last_output_ms()
+    }
+
+    /// issue 2511: pins the PRODUCTION stamp — the closure in `new`, not the extracted helper.
+    #[wasm_bindgen_test]
+    async fn a_real_worker_frame_stamps_the_output_clock() {
+        let stamped = output_clock_after_worker_frame(false).await;
+        assert!(
+            stamped > 0.0,
+            "a real worker->main VideoFrame must stamp the output clock, got {stamped}"
+        );
+    }
+
+    /// issue 2511: ordering at the REAL call site — a `clear_canvas()`'d tile still gets output.
+    #[wasm_bindgen_test]
+    async fn a_gated_out_worker_frame_still_stamps_the_output_clock() {
+        let stamped = output_clock_after_worker_frame(true).await;
+        assert!(
+            stamped > 0.0,
+            "the stamp must precede the paint gate's early return, got {stamped}"
+        );
+    }
+}
+
+/// The Blob worker can withhold `onmessage` and decline the handshake entirely. It reports via a
+/// real `video_stats`: `freshness_evictions_total` = frames accepted, `_keyframeless_total` = contexts.
+#[cfg(test)]
+mod worker_boot_replay_tests {
+    use super::freshness_skip_wiring_tests::{install_worker_script, restore_worker_link};
+    use super::tests::minimal_video_packet;
+    use super::*;
+    use videocall_codecs::decoder::WasmDecoder;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    const POLL_INTERVAL_MS: u32 = 20;
+    const POLL_ATTEMPTS: u32 = 250;
+
+    /// A Blob worker that can be made to boot late, or never to hand over at all.
+    struct FakeWorker {
+        /// `0` installs `onmessage` during the initial script evaluation.
+        install_delay_ms: u32,
+        post_ready: bool,
+        /// Accept a frame only if its sequence exceeds the last accepted one.
+        require_ascending: bool,
+    }
+
+    impl FakeWorker {
+        fn script(&self) -> String {
+            let Self {
+                install_delay_ms,
+                post_ready,
+                require_ascending,
+            } = self;
+            format!(
+                r#"
+let frames = 0;
+let contexts = 0;
+let lastSeq = 0;
+const report = () => self.postMessage({{
+  kind: "video_stats", from_peer: "boot-local", to_peer: "boot-peer",
+  frames_buffered: 0, playout_latency_ms: 0.0, playout_stage1_span_ms: 0.0,
+  playout_paint_lag_ms: 0.0, playout_skip_to_live_total: 0,
+  content_staleness_ms: 0.0, keyframe_arrivals_total: 0,
+  freshness_evictions_total: frames, freshness_evictions_keyframeless_total: contexts
+}});
+const install = () => {{
+  self.onmessage = (e) => {{
+    const d = e.data;
+    if (d && typeof d === "object" && "DecodeFrame" in d) {{
+      const seq = d.DecodeFrame.frame.sequence_number;
+      if (!{require_ascending} || seq > lastSeq) {{ frames += 1; lastSeq = seq; }}
+    }}
+    if (d && typeof d === "object" && "SetContext" in d) {{ contexts += 1; }}
+    report();
+  }};
+  if ({post_ready}) {{ self.postMessage({{ kind: "worker_ready" }}); }}
+  report();
+}};
+if ({install_delay_ms} === 0) {{ install(); }} else {{ setTimeout(install, {install_delay_ms}); }}
+"#
+            )
+        }
+    }
+
+    fn boots_after(install_delay_ms: u32) -> FakeWorker {
+        FakeWorker {
+            install_delay_ms,
+            post_ready: true,
+            require_ascending: false,
+        }
+    }
+
+    async fn poll_counts(
+        read: impl Fn() -> (u64, u64),
+        done: impl Fn((u64, u64)) -> bool,
+    ) -> (u64, u64) {
+        for _ in 0..POLL_ATTEMPTS {
+            let counts = read();
+            if done(counts) {
+                return counts;
+            }
+            gloo_timers::future::TimeoutFuture::new(POLL_INTERVAL_MS).await;
+        }
+        read()
+    }
+
+    async fn sleep(ms: u32) {
+        gloo_timers::future::TimeoutFuture::new(ms).await;
+    }
+
+    /// The real production constructor, with the boot TTL supplied directly so a test does not have
+    /// to outwait a whole publisher keyframe interval.
+    fn decoder_with_ttl(ttl_ms: f64) -> WasmDecoder {
+        WasmDecoder::new_with_video_frame_callback(
+            videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
+            Box::new(|_frame| {}),
+            Box::new(|_head_age_ms| {}),
+            MEDIA_TYPE_CAMERA,
+            ttl_ms,
+        )
+    }
+
+    fn delta_frame(sequence_number: u64) -> videocall_codecs::frame::FrameBuffer {
+        use videocall_codecs::frame::{FrameBuffer, FrameCodec, FrameType, VideoFrame};
+
+        FrameBuffer::new(
+            VideoFrame {
+                sequence_number,
+                frame_type: FrameType::DeltaFrame,
+                codec: FrameCodec::Vp9Profile0Level10Bit8,
+                data: Vec::new(),
+                timestamp: 0.0,
+            },
+            0,
+        )
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_frame_pushed_during_boot_reaches_the_video_frame_callback_worker() {
+        let previous = install_worker_script(&boots_after(150).script());
+        let mut decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA, false)
+            .expect("real decoder must construct once the worker <link> is installed");
+        // No `.await` before the push: same synchronous turn, so the worker has no handler yet.
+        decoder
+            .decode(&minimal_video_packet())
+            .expect("a VP8 packet must reach push_frame");
+        restore_worker_link(previous);
+
+        let (frames, _) = poll_counts(|| decoder.freshness_eviction_counts(), |(f, _)| f > 0).await;
+        assert_eq!(
+            frames, 1,
+            "the frame pushed while the worker was booting must be replayed to it (issue 2572)"
+        );
+    }
+
+    /// Pins the production CALL SITE, not the helper that computes the value: passing camera's
+    /// constant for both kinds leaves a screen decoder silently on 5s with the helper's own lock
+    /// still green.
+    #[wasm_bindgen_test]
+    fn each_media_kind_is_constructed_with_its_own_boot_ttl() {
+        let previous = install_worker_script(&boots_after(150).script());
+        let camera = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA, false)
+            .expect("camera decoder must construct");
+        let screen = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN, false)
+            .expect("screen decoder must construct");
+        restore_worker_link(previous);
+
+        assert_eq!(
+            camera.boot_replay_ttl_ms_for_test(),
+            boot_replay_ttl_ms(MEDIA_TYPE_CAMERA),
+            "the constructor must take the helper's camera value, not a second copy of it"
+        );
+        assert_eq!(
+            screen.boot_replay_ttl_ms_for_test(),
+            videocall_aq::constants::SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS
+        );
+    }
+
+    /// `Decodable::new` builds its OWN `onmessage` closure, hence its own drain.
+    #[wasm_bindgen_test]
+    async fn a_frame_pushed_during_boot_reaches_the_decodable_worker() {
+        use videocall_codecs::decoder::{Decodable, VideoCodec};
+
+        let previous = install_worker_script(&boots_after(150).script());
+        let decoder = <WasmDecoder as Decodable>::new(
+            VideoCodec::Vp9Profile0Level10Bit8,
+            Box::new(|_frame| {}),
+        );
+        decoder.decode(delta_frame(1));
+        restore_worker_link(previous);
+
+        let (frames, _) = poll_counts(|| decoder.freshness_eviction_counts(), |(f, _)| f > 0).await;
+        assert_eq!(
+            frames, 1,
+            "the Decodable constructor's queue must drain on the ready handshake too (issue 2572)"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_boot_queue_past_its_ttl_is_dropped_not_replayed() {
+        let previous = install_worker_script(&boots_after(1000).script());
+        let decoder = decoder_with_ttl(300.0);
+        decoder.push_frame(delta_frame(1), None);
+        restore_worker_link(previous);
+
+        // The handshake is what makes a zero frame count an absence rather than "still booting".
+        poll_counts(
+            || (0, u64::from(decoder.worker_handshake_seen())),
+            |(_, seen)| seen > 0,
+        )
+        .await;
+        assert!(
+            decoder.worker_handshake_seen(),
+            "the worker never handed over, so this test proves nothing"
+        );
+        assert!(
+            decoder.boot_queue_dropped(),
+            "a boot past the TTL must record the discard"
+        );
+        assert_eq!(
+            decoder.freshness_eviction_counts().0,
+            0,
+            "an over-age backlog must be dropped, not flushed (issue 2572)"
+        );
+    }
+
+    /// The fallback when a bound is exceeded is the UN-GATED behaviour, not silence: a worker that
+    /// installs `onmessage` but never hands over must still receive everything sent after the TTL.
+    #[wasm_bindgen_test]
+    async fn a_send_after_the_ttl_expires_still_reaches_a_never_ready_worker() {
+        let previous = install_worker_script(
+            &FakeWorker {
+                install_delay_ms: 0,
+                post_ready: false,
+                require_ascending: false,
+            }
+            .script(),
+        );
+        let decoder = decoder_with_ttl(300.0);
+        decoder.push_frame(delta_frame(1), None);
+        restore_worker_link(previous);
+
+        sleep(500).await;
+        decoder.push_frame(delta_frame(2), None);
+
+        let (frames, _) = poll_counts(|| decoder.freshness_eviction_counts(), |(f, _)| f > 0).await;
+        assert_eq!(
+            frames, 1,
+            "the post-expiry send must reach the worker; latching the gate shut would black the \
+             tile for the whole call, not just the boot (issue 2572)"
+        );
+        assert!(!decoder.worker_handshake_seen());
+        assert!(decoder.boot_queue_dropped());
+    }
+
+    /// `post_frame` relies on replay order to keep a `SetContext` ahead of its frame.
+    #[wasm_bindgen_test]
+    async fn the_replay_preserves_push_order() {
+        let previous = install_worker_script(
+            &FakeWorker {
+                install_delay_ms: 150,
+                post_ready: true,
+                require_ascending: true,
+            }
+            .script(),
+        );
+        let decoder = decoder_with_ttl(5000.0);
+        for seq in 1..=3 {
+            decoder.push_frame(delta_frame(seq), None);
+        }
+        restore_worker_link(previous);
+
+        let (frames, _) =
+            poll_counts(|| decoder.freshness_eviction_counts(), |(f, _)| f >= 3).await;
+        assert_eq!(
+            frames, 3,
+            "the worker accepted only ascending sequences, so a non-FIFO replay drops frames"
+        );
+    }
+
+    /// A reconnect wave fills these queues while the device boots that many wasm modules.
+    #[wasm_bindgen_test]
+    async fn a_boot_queue_past_its_message_cap_is_dropped() {
+        let previous = install_worker_script(&boots_after(150).script());
+        // A long TTL, so only the count bound can fire.
+        let decoder = decoder_with_ttl(60_000.0);
+        let cap = decoder.boot_replay_max_messages() as u64;
+        for seq in 1..=(cap + 1) {
+            decoder.push_frame(delta_frame(seq), None);
+        }
+        restore_worker_link(previous);
+
+        poll_counts(
+            || (0, u64::from(decoder.worker_handshake_seen())),
+            |(_, seen)| seen > 0,
+        )
+        .await;
+        assert!(
+            decoder.worker_handshake_seen(),
+            "the worker never handed over"
+        );
+        assert!(
+            decoder.boot_queue_dropped(),
+            "a backlog longer than the buffer can hold must be discarded, not replayed"
+        );
+        assert_eq!(decoder.freshness_eviction_counts().0, 0);
+    }
+
+    /// The TTL must run from the FIRST enqueue. Restarting it per message means a stream arriving
+    /// every ~33ms never expires and the queue grows for the whole boot.
+    #[wasm_bindgen_test]
+    async fn the_ttl_runs_from_the_first_enqueue_not_the_latest() {
+        let previous = install_worker_script(&boots_after(1000).script());
+        let decoder = decoder_with_ttl(600.0);
+        decoder.push_frame(delta_frame(1), None);
+        restore_worker_link(previous);
+
+        // Each of these lands inside 600ms of its predecessor but not of the first push.
+        sleep(250).await;
+        decoder.push_frame(delta_frame(2), None);
+        sleep(250).await;
+        decoder.push_frame(delta_frame(3), None);
+
+        poll_counts(
+            || (0, u64::from(decoder.worker_handshake_seen())),
+            |(_, seen)| seen > 0,
+        )
+        .await;
+        assert!(
+            decoder.worker_handshake_seen(),
+            "the worker never handed over"
+        );
+        assert_eq!(
+            decoder.freshness_eviction_counts().0,
+            0,
+            "the queue was 1000ms old at hand-over, so its whole 600ms-bounded backlog must be \
+             dropped — a TTL restarted by the later pushes would have replayed all three"
+        );
+    }
+
+    /// FIFO with the context enqueued first, so a settled frame count implies every re-emit up to it.
+    async fn contexts_after_frames(decoder: &WasmDecoder, expected_frames: u64) -> u64 {
+        let (frames, contexts) = poll_counts(
+            || decoder.freshness_eviction_counts(),
+            move |(frames, _)| frames >= expected_frames,
+        )
+        .await;
+        assert_eq!(
+            frames, expected_frames,
+            "the worker must have counted every pushed frame before the re-emits are read"
+        );
+        contexts
+    }
+
+    fn context(from_peer: &str) -> videocall_codecs::messages::StreamContext {
+        videocall_codecs::messages::StreamContext {
+            from_peer: from_peer.to_string(),
+            to_peer: "peer-sid".to_string(),
+        }
+    }
+
+    /// A long TTL and an immediate `onmessage`, so the boot gate replays rather than discards.
+    fn ready_decoder() -> WasmDecoder {
+        let previous = install_worker_script(&boots_after(0).script());
+        let decoder = decoder_with_ttl(60_000.0);
+        restore_worker_link(previous);
+        decoder
+    }
+
+    /// Opens the epoch as peer creation does and spends the ramp; the open is its only stamp.
+    async fn exhaust_ramp(decoder: &WasmDecoder) -> (u32, f64) {
+        let ramp = decoder.context_reemit_ramp_frames();
+        let epoch_open_ms = js_sys::Date::now();
+        decoder.set_context(String::new(), "peer-sid".to_string());
+        for seq in 1..=u64::from(ramp) {
+            decoder.push_frame(delta_frame(seq), Some(context("")));
+        }
+        let contexts = contexts_after_frames(decoder, u64::from(ramp)).await;
+        assert_eq!(
+            contexts,
+            u64::from(ramp) + 1,
+            "the epoch's opening send plus each of the {ramp} ramp frames must re-emit, and no more"
+        );
+        (ramp, epoch_open_ms)
+    }
+
+    /// The discriminating assertions hold only while the epoch's stamp is inside the interval.
+    fn assert_still_inside_the_interval(decoder: &WasmDecoder, epoch_open_ms: f64) {
+        let elapsed = js_sys::Date::now() - epoch_open_ms;
+        assert!(
+            elapsed < decoder.context_reemit_interval_ms(),
+            "setup took {elapsed}ms, so the interval could have admitted this frame"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn every_frame_of_the_opening_ramp_carries_a_context_reemit() {
+        let decoder = ready_decoder();
+        exhaust_ramp(&decoder).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_post_ramp_burst_inside_one_interval_reemits_context_once() {
+        let decoder = ready_decoder();
+        let (ramp, _) = exhaust_ramp(&decoder).await;
+
+        sleep(decoder.context_reemit_interval_ms() as u32 + 200).await;
+        const BURST: u64 = 20;
+        for seq in 1..=BURST {
+            decoder.push_frame(delta_frame(u64::from(ramp) + seq), Some(context("")));
+        }
+        // A second interval cannot elapse inside one synchronous 20-post loop.
+        let contexts = contexts_after_frames(&decoder, u64::from(ramp) + BURST).await;
+        assert_eq!(
+            contexts,
+            u64::from(ramp) + 2,
+            "past the ramp, a burst must produce exactly one re-emit"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_throttle_keeps_ticking_over_consecutive_intervals() {
+        let decoder = ready_decoder();
+        let (ramp, _) = exhaust_ramp(&decoder).await;
+        let interval = decoder.context_reemit_interval_ms() as u32;
+
+        sleep(interval + 200).await;
+        decoder.push_frame(delta_frame(u64::from(ramp) + 1), Some(context("")));
+        const SPACED: u64 = 5;
+        let mut seq = u64::from(ramp) + 1;
+        for _ in 0..SPACED {
+            sleep(interval / 3 + 20).await;
+            seq += 1;
+            decoder.push_frame(delta_frame(seq), Some(context("")));
+        }
+        let contexts = contexts_after_frames(&decoder, seq).await;
+        assert_eq!(
+            contexts,
+            u64::from(ramp) + 3,
+            "two intervals elapsed after the ramp, so exactly two ticks must fire"
+        );
+    }
+
+    /// SESSION_ASSIGNED mid-call: `from_peer` fills in while the gate is throttled.
+    #[wasm_bindgen_test]
+    async fn a_changed_context_reemits_without_waiting_for_the_interval() {
+        let decoder = ready_decoder();
+        let (ramp, epoch_open_ms) = exhaust_ramp(&decoder).await;
+
+        decoder.push_frame(delta_frame(u64::from(ramp) + 1), Some(context("42")));
+        assert_still_inside_the_interval(&decoder, epoch_open_ms);
+        let contexts = contexts_after_frames(&decoder, u64::from(ramp) + 1).await;
+        assert_eq!(
+            contexts,
+            u64::from(ramp) + 2,
+            "a changed context must re-emit mid-throttle"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_rebuilt_decoder_re_ramps_for_the_same_context() {
+        let exhausted = ready_decoder();
+        let (_, epoch_open_ms) = exhaust_ramp(&exhausted).await;
+
+        // No `set_context`: it force-opens an epoch, resetting a SHARED gate and hiding the sharing.
+        let rebuilt = ready_decoder();
+        rebuilt.push_frame(delta_frame(1), Some(context("")));
+        assert_still_inside_the_interval(&rebuilt, epoch_open_ms);
+        let contexts = contexts_after_frames(&rebuilt, 1).await;
+        assert_eq!(
+            contexts, 1,
+            "an owned gate re-ramps; a shared gate is mid-throttle and sends 0"
         );
     }
 }

@@ -57,6 +57,7 @@ async fn main() {
         .init();
 
     info!("Starting WebTransport server with actor-based session handling");
+    sec_api::startup::log_feature_flags();
 
     // Connect to NATS
     let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");

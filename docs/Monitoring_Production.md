@@ -131,11 +131,22 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 |---|---|---|
 | `RelayPacketDrops` | `rate(relay_packet_drops_total[1m]) > 0` for 1m | critical |
 | `RelayNATSLatencyHigh` | NATS publish p99 > 50ms for 2m | warning |
-| `RelayQueueNearFull` | Queue depth > 410/512 for 30s | warning |
+| `RelayQueueNearFullWS` | One receiver's WS `channel="ws"` depth > 819/1024 across a 1m window | warning |
+| `RelayQueueNearFullWT` | One receiver's WT per-primitive depth > 410/512 across a 1m window | warning |
+| `RelayQueueNearFullWSVideoBytes` | One receiver's WS `kind="video"` bytes > 307,200 across a 1m window | warning |
+| `RelayQueueNearFullWSScreenBytes` | One receiver's WS `kind="screen"` bytes > 6,369,062 across a 1m window | warning |
 | `MeetingQualityDegraded` | Avg call quality < 50 for 2m | warning |
 | `LowAudioConnectivity` | Peer can't hear for 1m | critical |
 | `ContainerCPUHigh` | CPU > 85% of limit for 3m | warning |
 | `ContainerMemoryHigh` | Memory > 85% of limit for 3m | warning |
+
+All four `RelayQueueNearFull*` rules are `max by (room, transport, pod, <kind|channel>) (min_over_time(<series>[1m])) > <threshold>` with `for: 15s`. Three properties matter:
+
+- **`*_by_session`, not the room-level gauge.** The room-level `relay_outbound_queue_{depth,bytes}` are written by every session's heartbeat under one label set, so the last writer per scrape wins and an idle peer erases a stalled one.
+- **`max by` drops only `session_id`.** That keeps the per-receiver property — an idle peer's `0` cannot mask a stalled peer — while surviving reconnect churn, since `session_id` is regenerated per *connection* and a bare per-session series would restart the `for` timer on the very reconnect a downlink stall provokes. `pod` is retained for on-call attribution and Alertmanager routing. Per-`session_id` attribution comes from the dashboard panels, not the alert label.
+- **`min_over_time` puts persistence on one receiver.** `for:` binds to the aggregated output, whose identity is constant per room, so `for:` alone asks only that *some* session be over threshold at each evaluation — possibly a different one each time. At `scrape_interval: 15s` a 1m window is 4 samples. Caveat: `min_over_time` mins over the samples that *exist* in the window, so a session that is over threshold for one scrape and then disconnects still yields a high min until its samples age out.
+
+Time-to-page is therefore ~60s (window) + 15s (`for`) ≈ 75s, against ~30s before. That is the deliberate cost of requiring one receiver to actually sustain the condition rather than paging on a room-wide flap.
 
 ## Key Metrics Reference
 
@@ -144,7 +155,10 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 |---|---|---|---|
 | `relay_packet_drops_total` | Counter | room, transport, drop_reason | Packets dropped due to full queue/mailbox |
 | `relay_nats_publish_latency_ms` | Histogram | — | Time to publish media packet to NATS |
-| `relay_outbound_queue_depth` | Gauge | room | WT channel occupancy (default capacity 512, env `WT_OUTBOUND_CHANNEL_CAPACITY`) |
+| `relay_outbound_queue_depth` | Gauge | room, transport | Outbound channel occupancy in SLOTS (WS 1024; WT default 512, env `WT_OUTBOUND_CHANNEL_CAPACITY`). Room-level: every session in the room writes this same series, so each scrape reports one arbitrary session and it does not reliably detect a single backed-up receiver — use `videocall_relay_outbound_queue_depth_by_session` for that. On WT it is the uni+datagram SUM |
+| `videocall_relay_outbound_queue_depth_by_session` | Gauge | room, transport, session_id, channel | Per-receiver outbound occupancy in SLOTS, attributable (#1737). `channel` is `ws` on WebSocket, `unistream` or `datagram` on WebTransport — per primitive, not summed. The four `RelayQueueNearFull*` alerts key off this and its byte sibling, never the room-level pair |
+| `relay_outbound_queue_bytes` | Gauge | room, transport, kind | Outbound channel occupancy in BYTES by kind (`video`\|`screen`\|`other`), WS only. `video` and `screen` are the dimensions the #2261 policy sheds on (80% of 384,000 B; 90% of 7,076,736 B). Audio and control are COUNTED, under `kind="other"` — they are simply never *shed* on bytes, only on slots. Room-level: each scrape reports one arbitrary session, so it does not reliably detect a single backed-up receiver — use `relay_outbound_queue_bytes_by_session` for that |
+| `relay_outbound_queue_bytes_by_session` | Gauge | room, transport, session_id, kind | Per-receiver outbound occupancy in BYTES by kind, WS only (#2593). Same `kind` taxonomy and same byte budgets as `relay_outbound_queue_bytes`, but attributable: one series per receiver, so a receiver sitting at its shed point is not overwritten by an idle peer in the same room. Cardinality is sessions x 3 kinds per live room, swept on session teardown |
 | `relay_active_sessions_per_room` | Gauge | room, transport | Connections per meeting |
 | `relay_room_bytes_total` | Counter | room, direction | Bytes forwarded (use `rate()` for bps) |
 | `relay_viewport_filtered_total` | Counter | room | VIDEO packets dropped by viewport-aware filtering (off-screen source not in receiver's viewport, HCL #988) |
@@ -152,7 +166,7 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 | `relay_viewport_set_size` | Gauge | room | Most recently accepted viewport (desired-streams) set size per room. A collapse toward 0/1 while peers still publish is the wrongly-dropping / "froze my video" signature (HCL #988) |
 | `relay_viewport_updates_total` | Counter | room, outcome | VIEWPORT control-packet update outcomes (`accepted` \| `rate_limited` \| `truncated` \| `ignored_other_subject`) — makes the DoS-guard caps fire visibly without labeling normal fan-out ignores as ownership failures (HCL #988) |
 
-> **Viewport metrics (HCL #988) are Category B (dashboard, not alert page).** They back the "Viewport" panels on the *Relay Health (Server-Side)* row of the meeting-investigation dashboard; investigate "% filtered" spikes and set-size collapse there. No alert rule fires on them — a filtered-VIDEO drop is intentional bandwidth saving, not a fault. Per-source forensics ("who dropped what from whom") are deliberately NOT labels (session IDs are unbounded); enable a scoped `RUST_LOG=...chat_server=debug` on the relay to reconstruct per-room drop detail from the VIDEO-drop debug log.
+> **Viewport metrics (HCL #988) are Category B (dashboard, not alert page).** They back the "Viewport" panels on the *Relay Health (Server-Side)* row of the meeting-investigation dashboard; investigate "% filtered" spikes and set-size collapse there. A filtered-VIDEO drop is intentional bandwidth saving, not a fault; the only rules that fire on this family are `ViewportBlackout` (drops climbing while forwarded is ~zero) and the `ViewportNonVideoInvariantBreach` tripwire, both in `docker/monitoring/prometheus/alert_rules.yml`. Per-source forensics ("who dropped what from whom") are deliberately NOT labels (session IDs are unbounded); enable a scoped `RUST_LOG=...chat_server=debug` on the relay to reconstruct per-room drop detail from the VIDEO-drop debug log.
 
 ### Client quality metrics (via metrics_server)
 | Metric | Description |

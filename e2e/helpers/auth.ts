@@ -13,6 +13,8 @@ export function generateSessionToken(email: string, name: string, ttlSecs: numbe
       exp: now + ttlSecs,
       iat: now,
       iss: "videocall-meeting-backend",
+      // Must match `SessionTokenClaims::TOKEN_TYPE` in meeting-api/src/token.rs.
+      typ: "session",
     },
     JWT_SECRET,
     { algorithm: "HS256" },

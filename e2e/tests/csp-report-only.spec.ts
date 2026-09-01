@@ -154,22 +154,19 @@ test.describe("UI Content-Security-Policy Report-Only", () => {
     // (`make e2e-up`) runs `DIOXUS_SERVE_MODE=dev` → `trunk serve`, which has no
     // custom-header flag (trunk 0.21) and therefore serves NO CSP header. CI runs
     // `static` in BOTH e2e workflows and sets `EXPECT_CSP_HEADER=1` on this step,
-    // so the assertion is HARD in CI (a static-mode regression fails, never skips)
-    // and lenient for a local dev-mode run (skips with a clear message).
-    if (!header) {
-      if (process.env.EXPECT_CSP_HEADER) {
-        throw new Error(
-          "CSP Report-Only header MUST be present when EXPECT_CSP_HEADER is set " +
-            "(static serve mode / CI). Its absence is a regression, not a dev-mode skip.",
-        );
-      }
-      test.skip(
-        true,
-        "CSP header not served in dev-mode (trunk serve) — run the static stack " +
-          "(DIOXUS_SERVE_MODE=static, as CI does) to exercise this assertion.",
-      );
-      return;
-    }
+    // so the assertion is HARD in CI and lenient for a local dev-mode run. `CI`
+    // is a second, independent gate: dropping EXPECT_CSP_HEADER from a workflow
+    // must not silently downgrade this @bvt1 test to a skip.
+    test.skip(
+      !header && !process.env.EXPECT_CSP_HEADER && !process.env.CI,
+      "CSP header not served in dev-mode (trunk serve) — run the static stack " +
+        "(DIOXUS_SERVE_MODE=static, as CI does) to exercise this assertion.",
+    );
+    expect(
+      header,
+      "CSP Report-Only header MUST be present in CI / static serve mode. " +
+        "Its absence is a regression, not a dev-mode skip.",
+    ).toBeTruthy();
 
     expect(header).toContain("default-src 'self'");
     expect(header).toContain("script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'");

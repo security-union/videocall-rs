@@ -29,7 +29,10 @@ export function registerCtlCommands(program: Command, defaultRunDir: string): vo
         'Host the control API is reachable at. Default "127.0.0.1". Set a bot pod\'s in-cluster DNS name (e.g. videocall-bots-3.videocall-bots.bot-load.svc) to drive a remote bot — that pod must have been started with a non-loopback --ctl-bind and a shared token (use with --port + --token).',
       )
       .option("--port <port>", "Override the port from the token file (use with --token).")
-      .option("--token <token>", "Override the bearer token from the token file (use with --port).")
+      .option(
+        "--token <token>",
+        "Override the bearer token from the token file (use with --port). Falls back to the BOT_CTL_TOKEN env var, which keeps the token off argv.",
+      )
       .option(
         "--run-dir <dir>",
         "Override the directory scanned for ctl-*.token files.",
@@ -214,24 +217,29 @@ export function registerCtlCommands(program: Command, defaultRunDir: string): vo
 
   sharedConnOptions(ctl.command("netem"))
     .description(
-      "Apply OS-level tc/netem impairment to the target pod's interface (--profile OR raw --delay/--jitter/--loss/--rate), or remove it with --clear. Requires the pod's control server to have been started with --ctl-netem. Combine with --host to target a specific bot pod.",
+      "Apply OS-level tc/netem impairment to the target pod's interface (--profile OR raw --delay/--jitter/--loss/--rate/--limit), or remove it with --clear. Requires the pod's control server to have been started with --ctl-netem. Combine with --host to target a specific bot pod.",
     )
     .option("--profile <name>", `Named profile (${NETEM_PROFILE_NAMES.join(", ")})`)
     .option("--delay <ms>", "Raw one-way delay in ms")
     .option("--jitter <ms>", "Raw delay jitter in ms (requires --delay)")
     .option("--loss <pct>", "Raw packet loss percent (0-100)")
     .option("--rate <kbit>", "Raw egress rate cap in kbit/s")
+    .option(
+      "--limit <pkts>",
+      "Raw netem queue depth in packets (requires --delay, --loss or --rate)",
+    )
     .option("--clear", "Remove all shaping (restore line rate)", false)
     .action(async (opts: ConnOptions & NetemCmdOptions) => {
       const plan = buildNetemRequest(opts);
       const cfg = await resolveConfig(opts);
-      const res = await ctlRequest<{ op: string; label: string; argv: string[] }>(
-        cfg,
-        plan.method,
-        "/netem",
-        plan.body,
-      );
-      console.log(`netem: ${res.op} (${res.label}) → ${res.argv.join(" ")}`);
+      const res = await ctlRequest<{
+        op: string;
+        label: string;
+        commands: string[][];
+        mirrorRemoved: boolean;
+      }>(cfg, plan.method, "/netem", plan.body);
+      const ran = res.commands.map((c) => c.join(" ")).join("\n  ");
+      console.log(`netem: ${res.op} (${res.label}) mirror_removed=${res.mirrorRemoved}\n  ${ran}`);
     });
 }
 
@@ -241,6 +249,7 @@ export interface NetemCmdOptions {
   jitter?: string;
   loss?: string;
   rate?: string;
+  limit?: string;
   clear?: boolean;
 }
 
@@ -262,11 +271,21 @@ export function buildNetemRequest(opts: NetemCmdOptions): {
     return { method: "POST", body: { profile: opts.profile } };
   }
   const body: Record<string, unknown> = {};
-  if (opts.delay !== undefined) body.delayMs = Number(opts.delay);
-  if (opts.jitter !== undefined) body.jitterMs = Number(opts.jitter);
-  if (opts.loss !== undefined) body.lossPct = Number(opts.loss);
-  if (opts.rate !== undefined) body.rateKbit = Number(opts.rate);
+  if (opts.delay !== undefined) body.delayMs = numericFlag("--delay", opts.delay);
+  if (opts.jitter !== undefined) body.jitterMs = numericFlag("--jitter", opts.jitter);
+  if (opts.loss !== undefined) body.lossPct = numericFlag("--loss", opts.loss);
+  if (opts.rate !== undefined) body.rateKbit = numericFlag("--rate", opts.rate);
+  if (opts.limit !== undefined) body.limitPkts = numericFlag("--limit", opts.limit);
   return { method: "POST", body };
+}
+
+/** Rejects rather than yielding `NaN`, which serialises to a wire `null` the server skips. */
+function numericFlag(flag: string, value: string): number {
+  const parsed = value.trim() === "" ? Number.NaN : Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`ctl netem: ${flag}: expected a number, got "${value}"`);
+  }
+  return parsed;
 }
 
 interface ConnOptions {
@@ -280,7 +299,7 @@ interface ConnOptions {
 /**
  * Resolve the connection config from the supplied CLI options.
  * Priority:
- *   1. `--port` + `--token` (both required when used)
+ *   1. `--port` + `--token` / `BOT_CTL_TOKEN` (a port is always required here)
  *   2. `--state-file <path>` (explicit token-file path)
  *   3. Auto-discovery: most-recent `ctl-*.token` under `--run-dir`
  *
@@ -292,14 +311,17 @@ async function resolveConfig(opts: ConnOptions): Promise<CtlClientConfig> {
   // ⇒ the client defaults to 127.0.0.1 (back-compat).
   const host = opts.host;
   if (opts.port !== undefined || opts.token !== undefined) {
-    if (opts.port === undefined || opts.token === undefined) {
-      throw new Error("ctl: --port and --token must be supplied together");
+    // Read only inside this branch, so an exported BOT_CTL_TOKEN cannot divert
+    // a tokenless `ctl list` off token-file discovery.
+    const token = opts.token ?? process.env.BOT_CTL_TOKEN;
+    if (opts.port === undefined || token === undefined || token.length === 0) {
+      throw new Error("ctl: --port and --token (or BOT_CTL_TOKEN) must be supplied together");
     }
     const port = Number.parseInt(opts.port, 10);
     if (!Number.isFinite(port) || port <= 0 || port > 65535) {
       throw new Error(`ctl: --port must be a positive integer (got "${opts.port}")`);
     }
-    return { host, port, token: opts.token };
+    return { host, port, token };
   }
 
   let tokenFilePath: string | null = opts.stateFile ?? null;
@@ -317,10 +339,11 @@ async function resolveConfig(opts: ConnOptions): Promise<CtlClientConfig> {
 }
 
 /**
- * Render the `ctl list` table. Plain ASCII so it pipes cleanly into
- * `grep` / `awk` and renders identically across terminals.
+ * Render the `ctl list` table. Plain ASCII, header-aligned columns: `k8s/bot-ctl`
+ * locates STATUS by its offset in the header row, so renaming a header or
+ * dropping the padding breaks its parse.
  */
-function printBotsTable(bots: BotSnapshot[]): void {
+export function printBotsTable(bots: BotSnapshot[]): void {
   if (bots.length === 0) {
     console.log("(no bots in registry)");
     return;

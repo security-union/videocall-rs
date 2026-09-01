@@ -5,10 +5,9 @@
 
 //! Waiting Room component - shown to non-host users while waiting for admission.
 //!
-//! Primarily uses an observer WebSocket connection for push notifications.
-//! Falls back to lightweight polling (every 5s) when the observer WebSocket
-//! is not connected -- e.g. empty observer token, connection failure, or
-//! disconnect due to token expiry.
+//! Primarily uses an observer WebSocket connection for push notifications,
+//! backed by polling that never stops: every 5s while that socket is down,
+//! every 15s while it is up.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -25,8 +24,26 @@ use wasm_bindgen::JsCast;
 
 pub type ParticipantStatus = JoinMeetingResponse;
 
-/// Polling interval in milliseconds when observer WebSocket is not connected.
+/// Timer period in milliseconds; see [`should_poll`] for the effective cadence.
 const POLL_INTERVAL_MS: i32 = 5000;
+
+const PUSHED_POLL_EVERY_N_TICKS: u32 = 3;
+
+/// Whether the timer tick numbered `tick` (1-based) should issue an HTTP poll.
+/// A connected socket slows the cadence but never silences it (issue #2262).
+pub(crate) fn should_poll(observer_connected: bool, tick: u32) -> bool {
+    !observer_connected || tick.is_multiple_of(PUSHED_POLL_EVERY_N_TICKS)
+}
+
+/// How often a page sitting in `waiting_for_meeting` re-reads meeting state.
+/// That state has no participant row, so the status endpoints answer
+/// `NOT_IN_MEETING` and the page must read `GET /meetings/{id}` instead.
+pub const START_WATCH_INTERVAL_MS: u32 = 15_000;
+
+/// Whether `state` from `GET /meetings/{id}` is worth a re-join attempt.
+pub fn meeting_has_started(state: &str) -> bool {
+    state == "active"
+}
 
 #[component]
 pub fn WaitingRoom(
@@ -130,10 +147,6 @@ pub fn WaitingRoom(
                 enable_webtransport: effective_wt_enabled,
                 max_received_layer: crate::constants::max_received_layer(),
                 skip_canvas_paint: crate::constants::skip_canvas_paint(),
-                // Issue #2156: deployment CAMERA ladder for receiver-side READOUTS.
-                // The waiting-room observer client renders no perf panel today, but it
-                // is a real receive client and MUST NOT be the one site that drifts.
-                camera_ladder_variant: crate::constants::camera_ladder_variant(),
                 // Issue #1884: waiting-room OBSERVER client — no in-call reaction
                 // overlay, so no reaction callback.
                 on_reaction: None,
@@ -299,18 +312,18 @@ pub fn WaitingRoom(
         });
     }
 
-    // Polling safety net: always poll participant status every
-    // POLL_INTERVAL_MS regardless of observer WebSocket state. The push
-    // path provides instant notification when it works, but polling
-    // ensures we never miss an admission/rejection if a NATS event is lost.
+    // Polling safety net, running whether or not the observer socket is up;
+    // `should_poll` owns the cadence.
     //
     // The interval_id is stored in an Rc<Cell<i32>> so use_drop can
     // clear it when the component unmounts, preventing leaked timers.
     let poll_interval_id: Rc<Cell<i32>> = use_hook(|| Rc::new(Cell::new(-1)));
+    let poll_tick: Rc<Cell<u32>> = use_hook(|| Rc::new(Cell::new(0)));
     {
         let meeting_id = meeting_id.clone();
         let observer_token = observer_token.clone();
         let poll_interval_id = poll_interval_id.clone();
+        let poll_tick = poll_tick.clone();
         let resolved_mount = resolved.clone();
         let resolved_interval = resolved.clone();
         let observer_connected = observer_connected.clone();
@@ -372,12 +385,14 @@ pub fn WaitingRoom(
             let observer_token = observer_token.clone();
             let resolved_interval = resolved_interval.clone();
             let observer_connected = observer_connected.clone();
+            let poll_tick = poll_tick.clone();
             let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
                 if resolved_interval.get() {
                     return;
                 }
-                // Skip redundant HTTP polls while the push channel is live.
-                if observer_connected.get() {
+                let tick = poll_tick.get().wrapping_add(1);
+                poll_tick.set(tick);
+                if !should_poll(observer_connected.get(), tick) {
                     return;
                 }
                 let meeting_id = meeting_id.clone();
@@ -488,5 +503,55 @@ pub fn WaitingRoom(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{meeting_has_started, should_poll, POLL_INTERVAL_MS, PUSHED_POLL_EVERY_N_TICKS};
+
+    #[test]
+    fn only_an_active_meeting_is_worth_re_joining() {
+        assert!(meeting_has_started("active"));
+        assert!(!meeting_has_started("idle"));
+        assert!(!meeting_has_started("ended"));
+        assert!(!meeting_has_started(""));
+    }
+
+    #[test]
+    fn polls_every_tick_while_observer_is_down() {
+        assert!(should_poll(false, 1));
+        assert!(should_poll(false, 2));
+        assert!(should_poll(false, 3));
+        assert!(should_poll(false, 4));
+    }
+
+    #[test]
+    fn connected_observer_slows_polling_but_never_stops_it() {
+        assert!(!should_poll(true, 1));
+        assert!(!should_poll(true, 2));
+        assert!(should_poll(true, 3));
+        assert!(!should_poll(true, 4));
+        assert!(should_poll(true, 6));
+    }
+
+    #[test]
+    fn a_connected_observer_polls_at_least_once_per_minute() {
+        let ticks_per_minute = 60_000 / POLL_INTERVAL_MS as u32;
+        let polls = (1..=ticks_per_minute)
+            .filter(|tick| should_poll(true, *tick))
+            .count();
+        assert!(
+            polls > 0,
+            "a connected observer must still poll within a minute; got {polls} polls \
+             over {ticks_per_minute} ticks"
+        );
+    }
+
+    #[test]
+    fn tick_counter_wraparound_still_polls() {
+        let wrapped = u32::MAX.wrapping_add(1);
+        assert!(should_poll(true, wrapped));
+        assert!(wrapped.is_multiple_of(PUSHED_POLL_EVERY_N_TICKS));
     }
 }

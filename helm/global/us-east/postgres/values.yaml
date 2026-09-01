@@ -1,22 +1,25 @@
 # PostgreSQL configuration for US East region
 
-# Allow AWS ECR images
+# Allow non-default (Docker Hub legacy / digest-pinned) images
 global:
   security:
     allowInsecureImages: true
 
 postgresql:
-  # Use AWS ECR for Bitnami images (Bitnami no longer hosts on Docker Hub)
+  # No version tags exist upstream, so the digest pins; `tag` is schema-required.
   image:
-    registry: public.ecr.aws
+    registry: docker.io
     repository: bitnami/postgresql
-    
+    digest: sha256:db2312d9b243afa8c3b3f5496e478d17d0dff9791d06f3b93b9567abd86ae92f
+    tag: "18.4.0"
+
   # Metrics exporter image
   metrics:
     enabled: true
     image:
-      registry: public.ecr.aws
-      repository: bitnami/postgres-exporter
+      registry: docker.io
+      repository: bitnamilegacy/postgres-exporter
+      tag: 0.17.1-debian-12-r16
     serviceMonitor:
       enabled: false
   

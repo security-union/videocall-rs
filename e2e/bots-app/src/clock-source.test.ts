@@ -4,6 +4,8 @@ import vm from "node:vm";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { SD_SOURCE } from "./posture";
+
 const CLOCK_SOURCE = readFileSync(
   fileURLToPath(new URL("./clock-source.js", import.meta.url)),
   "utf8",
@@ -54,7 +56,10 @@ class FakeMediaStream {
   }
 }
 
-function installClockSource(dimensionsReady: () => boolean): {
+function installClockSource(
+  dimensionsReady: () => boolean,
+  injected?: { width?: unknown; height?: unknown },
+): {
   getUserMedia: (constraints: { video?: boolean; audio?: boolean }) => Promise<FakeMediaStream>;
   audioContextCount: () => number;
   clonedTracks: FakeTrack[];
@@ -66,6 +71,7 @@ function installClockSource(dimensionsReady: () => boolean): {
   canvas: { width: number; height: number };
   redraw: () => void;
   setParticipant: (participant: string) => void;
+  intlCalls: { locale: unknown; options: Record<string, unknown> }[];
 } {
   let audioContexts = 0;
   let redraw = (): void => {
@@ -133,11 +139,21 @@ function installClockSource(dimensionsReady: () => boolean): {
       getUserMedia: vi.fn(),
     },
   };
+  const intlCalls: { locale: unknown; options: Record<string, unknown> }[] = [];
+  const RecordingDateTimeFormat = function (
+    locale: unknown,
+    options: Record<string, unknown>,
+  ): Intl.DateTimeFormat {
+    intlCalls.push({ locale, options });
+    return new Intl.DateTimeFormat(locale as string, options);
+  } as unknown as typeof Intl.DateTimeFormat;
   const sandbox = {
     __CLOCK_PARTICIPANT: "",
+    __CLOCK_WIDTH: injected?.width,
+    __CLOCK_HEIGHT: injected?.height,
     AudioContext: FakeAudioContext,
     Date,
-    Intl,
+    Intl: { DateTimeFormat: RecordingDateTimeFormat },
     MediaStream: FakeMediaStream,
     Promise,
     console,
@@ -164,6 +180,7 @@ function installClockSource(dimensionsReady: () => boolean): {
     setParticipant: (participant: string) => {
       sandbox.__CLOCK_PARTICIPANT = participant;
     },
+    intlCalls,
   };
 }
 
@@ -199,51 +216,112 @@ describe("clock-source getUserMedia width gate", () => {
     expect(x).toBe(canvas.width / 2);
   });
 
-  it("keeps EVERY drawn element inside the canvas, none left absolute", () => {
-    // Parameterised over all three `fillText` calls, not just the label. Reverting
-    // any ONE y-coordinate to its absolute 720p value must fail here: at 480 high,
-    // `330` and `465` are both still < 480, so a per-element assertion passes while
-    // the text is jammed together near the bottom — the silent failure #2171 names.
-    //
-    // The invariant is proportionality: each element must sit at the same FRACTION
-    // of frame height it occupied in the 1280x720 reference layout.
-    const { drawingContext, redraw, setParticipant, canvas } = installClockSource(() => true);
-    setParticipant("Someone");
-    drawingContext.fillText.mockClear();
-    redraw();
+  it.each<[string, { width: number; height: number } | undefined]>([
+    ["the 640x480 default", undefined],
+    ["an injected 1280x720 source", { width: 1280, height: 720 }],
+  ])(
+    "keeps EVERY drawn element inside the canvas at %s, none left absolute",
+    (_label, injected) => {
+      // The invariant is proportionality: each element must sit at the same FRACTION
+      // of frame height it occupied in the 1280x720 reference layout.
+      const { drawingContext, redraw, setParticipant, canvas } = installClockSource(
+        () => true,
+        injected,
+      );
+      setParticipant("Someone");
+      drawingContext.fillText.mockClear();
+      redraw();
 
-    const calls = drawingContext.fillText.mock.calls as [string, number, number, number?][];
-    expect(calls.length).toBe(3);
+      const calls = drawingContext.fillText.mock.calls as [string, number, number, number?][];
+      expect(calls.length).toBe(3);
 
-    // Reference fractions from the authored 1280x720 layout: time 330/720,
-    // date 465/720, name 585/720.
-    const expectedFractions = [330 / 720, 465 / 720, 585 / 720];
-    calls.forEach(([text, x, y], i) => {
-      expect(x).toBe(canvas.width / 2);
-      expect(y).toBeGreaterThan(0);
-      expect(y).toBeLessThan(canvas.height);
-      expect(y / canvas.height).toBeCloseTo(expectedFractions[i], 5);
-      void text;
-    });
+      // Reference fractions from the authored 1280x720 layout: time 330/720,
+      // date 465/720, name 585/720.
+      const expectedFractions = [330 / 720, 465 / 720, 585 / 720];
+      calls.forEach(([text, x, y], i) => {
+        expect(x).toBe(canvas.width / 2);
+        expect(y).toBeGreaterThan(0);
+        expect(y).toBeLessThan(canvas.height);
+        expect(y / canvas.height).toBeCloseTo(expectedFractions[i], 5);
+        void text;
+      });
 
-    // Ordering must stay top-to-bottom with no overlap collapse.
-    const ys = calls.map(([, , y]) => y);
-    expect(ys[0]).toBeLessThan(ys[1]);
-    expect(ys[1]).toBeLessThan(ys[2]);
+      // Ordering must stay top-to-bottom with no overlap collapse.
+      const ys = calls.map(([, , y]) => y);
+      expect(ys[0]).toBeLessThan(ys[1]);
+      expect(ys[1]).toBeLessThan(ys[2]);
 
-    // maxWidth, where present, must stay inside the frame.
-    calls.forEach(([, , , maxWidth]) => {
-      if (maxWidth !== undefined) expect(maxWidth).toBeLessThanOrEqual(canvas.width);
-    });
+      calls.forEach(([, , , maxWidth]) => {
+        expect(maxWidth).toBeLessThanOrEqual(canvas.width);
+      });
+    },
+  );
+
+  it("falls back to SD_SOURCE, in lockstep with posture.ts", () => {
+    const { canvas } = installClockSource(() => true);
+    expect([canvas.width, canvas.height]).toEqual([SD_SOURCE.width, SD_SOURCE.height]);
+    expect([canvas.width, canvas.height]).toEqual([640, 480]);
   });
 
-  it("captures at the geometry real publishers actually send", () => {
-    const { canvas } = installClockSource(() => true);
-    // 21 of 25 observed human publishers emit exactly 640x480; a 1280x720 clock
-    // made every bot ~3x a real user's pixel load (#2171). Pinned because the
-    // relational assertions above are all satisfied at 720p too, so without this
-    // the resolution change has no regression test at all.
-    expect([canvas.width, canvas.height]).toEqual([640, 480]);
+  it.each<[{ width?: unknown; height?: unknown } | undefined, number, number]>([
+    [undefined, 640, 480],
+    [{}, 640, 480],
+    [{ width: "1280", height: "720" }, 640, 480],
+    [{ width: 0, height: -1 }, 640, 480],
+    [{ width: 1280.5, height: 720.5 }, 640, 480],
+    [{ width: 1280, height: 720 }, 1280, 720],
+    [{ width: 1280 }, 1280, 480],
+    [{ height: 720 }, 640, 720],
+  ])("sizes the canvas from the injected geometry per axis: %j (#2236)", (injected, w, h) => {
+    const { canvas } = installClockSource(() => true, injected);
+    expect([canvas.width, canvas.height]).toEqual([w, h]);
+  });
+
+  describe("rendered clock is pinned, not container-resolved (#2294)", () => {
+    const FIXED = "2026-08-18T23:45:07.123Z";
+    const ORIGINAL_TZ = process.env.TZ;
+
+    beforeEach(() => {
+      process.env.TZ = "America/New_York";
+    });
+
+    afterEach(() => {
+      if (ORIGINAL_TZ === undefined) delete process.env.TZ;
+      else process.env.TZ = ORIGINAL_TZ;
+    });
+
+    function drawnTexts(): string[] {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(FIXED));
+      const { drawingContext, redraw } = installClockSource(() => true);
+      drawingContext.fillText.mockClear();
+      redraw();
+      return drawingContext.fillText.mock.calls.map((c) => c[0] as string);
+    }
+
+    it("renders the UTC wall clock, not the container's local time", () => {
+      expect(drawnTexts()[0]).toBe(new Date(FIXED).toISOString().slice(11, 23));
+    });
+
+    it("names the zone in the frame so an offset cannot be misread as a freeze", () => {
+      expect(drawnTexts()[1]).toMatch(/ UTC$/);
+    });
+
+    it("renders the date in the pinned locale's order", () => {
+      expect(drawnTexts()[1]).toMatch(/^18 Aug 2026\b/);
+    });
+
+    it("pins locale, zone and hour cycle on BOTH formatters", () => {
+      const { intlCalls } = installClockSource(() => true);
+
+      expect(intlCalls).toHaveLength(2);
+      for (const { locale, options } of intlCalls) {
+        expect(locale).toBe("en-GB");
+        expect(options.timeZone).toBe("UTC");
+      }
+      expect(intlCalls[0].options.hourCycle).toBe("h23");
+      expect(intlCalls[0].options).not.toHaveProperty("hour12");
+    });
   });
 
   it("rejects and stops tracks when video dimensions never appear", async () => {

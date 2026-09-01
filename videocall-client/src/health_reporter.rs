@@ -84,6 +84,8 @@ pub struct PeerHealthData {
     pub last_camera_stats: Option<Value>,
     /// Screen share video stats (media_type=SCREEN).
     pub last_screen_stats: Option<Value>,
+    pub camera_decode_eligible: Option<bool>,
+    pub screen_decode_eligible: Option<bool>,
     /// Sender's self-reported audio state (from peer heartbeat metadata).
     pub audio_enabled: bool,
     /// Sender's self-reported video state (from peer heartbeat metadata).
@@ -104,15 +106,25 @@ pub struct PeerHealthData {
     /// main-thread stall) — the pathology was previously invisible in every
     /// dashboard. ~0 on WebSocket and on E2EE-on WebTransport (reliable paths).
     ///
-    /// PRESENCE signal — capped at ~64 lost per contiguous gap by the reorder
-    /// window. Read alongside [`Self::wt_datagram_audio_raw_loss_per_sec`].
+    /// A contiguous gap is booked as its positions shift off the reorder window,
+    /// so the ones still inside it — which may yet arrive — are not counted yet.
+    /// Read alongside [`Self::wt_datagram_audio_raw_loss_per_sec`].
     pub wt_datagram_audio_loss_per_sec: f64,
     /// Issue 2031: windowed RAW (uncapped) receive-side audio DATAGRAM loss
     /// (skipped sequences/sec) for this peer. The magnitude companion to
     /// [`Self::wt_datagram_audio_loss_per_sec`]: it sums the sequence-gap sizes
-    /// un-truncated, so a heavy burst reads its true size instead of saturating
-    /// at ~64. Same WebTransport gate and cadence.
+    /// un-truncated at the jump, so it leads by the still-arrivable tail. Same
+    /// WebTransport gate and cadence.
     pub wt_datagram_audio_raw_loss_per_sec: f64,
+    /// #2511: interval MAX of decode-eligible RAW `content_staleness_ms`, accumulated
+    /// upstream of the `fps_received > 0` gate that zeroes the wire field during a freeze.
+    /// `None` means no sample arrived this interval; a sample of `0.0` is recorded as a
+    /// real observation, since `content_staleness_ms` returns it for "at live" AND "no data".
+    pub camera_staleness_max_ms: Option<f64>,
+    pub screen_staleness_max_ms: Option<f64>,
+    /// #2524: interval MAX of `video_seq_max_gap`, in FRAMES. See [`IntervalMaxes`].
+    pub camera_seq_max_gap_max: Option<u64>,
+    pub screen_seq_max_gap_max: Option<u64>,
 }
 
 impl PeerHealthData {
@@ -122,6 +134,8 @@ impl PeerHealthData {
             last_neteq_stats: None,
             last_camera_stats: None,
             last_screen_stats: None,
+            camera_decode_eligible: None,
+            screen_decode_eligible: None,
             audio_enabled: false,
             video_enabled: false,
             last_update_ms: 0,
@@ -131,6 +145,21 @@ impl PeerHealthData {
             decode_errors_total: 0,
             wt_datagram_audio_loss_per_sec: 0.0,
             wt_datagram_audio_raw_loss_per_sec: 0.0,
+            camera_staleness_max_ms: None,
+            screen_staleness_max_ms: None,
+            camera_seq_max_gap_max: None,
+            screen_seq_max_gap_max: None,
+        }
+    }
+
+    /// Read-and-reset, so each export is the interval MAX — neither a point sample nor a
+    /// lifetime latch (#2511, #2524).
+    pub fn take_interval_maxes(&mut self) -> IntervalMaxes {
+        IntervalMaxes {
+            camera_staleness_ms: self.camera_staleness_max_ms.take(),
+            screen_staleness_ms: self.screen_staleness_max_ms.take(),
+            camera_seq_gap_frames: self.camera_seq_max_gap_max.take(),
+            screen_seq_gap_frames: self.screen_seq_max_gap_max.take(),
         }
     }
 
@@ -425,6 +454,39 @@ fn encoder_fps_publish_value(
     }
 }
 
+/// Per-peer interval MAXes drained once per health report. Every field here exists
+/// because the producing diagnostic fires at ~1Hz while the report drains at
+/// `health_interval_ms` (default 5000), so a point sample would discard four windows in
+/// five and then publish whichever one happened to land last (#2511, #2524).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IntervalMaxes {
+    pub camera_staleness_ms: Option<f64>,
+    pub screen_staleness_ms: Option<f64>,
+    pub camera_seq_gap_frames: Option<u64>,
+    pub screen_seq_gap_frames: Option<u64>,
+}
+
+/// Per-peer interval maxes, keyed by peer id (#2511, #2524).
+pub type IntervalMaxMap = HashMap<String, IntervalMaxes>;
+
+/// Read-and-reset every peer's interval maxes (#2511, #2524).
+///
+/// A failed borrow yields an EMPTY map, which folds as "omit the field" — the report
+/// still goes out, one interval short of a sample, rather than publishing a
+/// fabricated `0` that reads as "never stale".
+fn drain_interval_maxes(
+    peer_health_data: &Rc<RefCell<HashMap<String, PeerHealthData>>>,
+) -> IntervalMaxMap {
+    peer_health_data
+        .try_borrow_mut()
+        .map(|mut m| {
+            m.iter_mut()
+                .map(|(peer, d)| (peer.clone(), d.take_interval_maxes()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Advance the "encoder has produced a real sample" latch (#2057). The latch
 /// resets on camera-off and sets once a nonzero fps is observed while the camera
 /// is on; otherwise it carries the previous value. Since #2060 the source atomic
@@ -516,9 +578,15 @@ fn audio_layer_telemetry(
 /// actively delivering audio and its windowed expand/packets concealment ratio
 /// is meaningful; below it the sender is likely in DTX silence and the ratio is
 /// unreliable. Shared by the per-stream `PeerStats::audio_concealment_pct`
-/// computation and the AUDIO_SCALE aggregate (both go through
-/// [`audio_source_sample_from_neteq`]) so the two can never drift apart.
+/// computation, the AUDIO_SCALE aggregate (both go through
+/// [`audio_source_sample_from_neteq`]) and the audio quality-score gate, so they can
+/// never drift apart. Tied to `videocall_aq`'s copy, which the load-test bot reads.
 const AUDIO_ACTIVE_PPS_GATE: f64 = 2.0;
+
+const _: () = assert!(
+    AUDIO_ACTIVE_PPS_GATE == videocall_aq::constants::AUDIO_ACTIVE_PPS_GATE,
+    "AUDIO_ACTIVE_PPS_GATE must match videocall_aq AUDIO_ACTIVE_PPS_GATE"
+);
 
 /// Minimum spacing between AUDIO_SCALE diagnostic lines, in ms. The line is
 /// emitted from the existing health-report loop (whose interval is
@@ -1382,6 +1450,39 @@ impl HealthReporter {
                 }
             }
         }
+        // Decode eligibility is a receiver-side visibility/decode-budget signal. It updates the
+        // gate used by staleness-max accumulation without marking video stats fresh.
+        else if event.subsystem == "decode_eligibility" {
+            if let Ok(mut health_map) = peer_health_data.try_borrow_mut() {
+                let peer_data = health_map
+                    .entry(target_peer.to_string())
+                    .or_insert_with(|| PeerHealthData::new(target_peer.to_string()));
+
+                let is_screen = event.metrics.iter().any(|m| {
+                    m.name == "media_type"
+                        && matches!(&m.value, MetricValue::Text(s) if s == "SCREEN")
+                });
+                let decode_eligible = event.metrics.iter().find_map(|m| {
+                    if m.name == "decode_eligible" {
+                        match &m.value {
+                            MetricValue::U64(v) => Some(*v),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(decode_eligible) = decode_eligible {
+                    let slot = if is_screen {
+                        &mut peer_data.screen_decode_eligible
+                    } else {
+                        &mut peer_data.camera_decode_eligible
+                    };
+                    *slot = Some(decode_eligible != 0);
+                }
+            }
+        }
         // Handle video events
         else if event.subsystem == "video_decoder" || event.subsystem == "video" {
             if let Ok(mut health_map) = peer_health_data.try_borrow_mut() {
@@ -1407,6 +1508,8 @@ impl HealthReporter {
                 };
                 // Always update timestamp
                 video_stats["timestamp_ms"] = json!(event.ts_ms);
+                let mut staleness_sample = None;
+                let mut staleness_decode_eligible = None;
 
                 for metric in &event.metrics {
                     match metric.name {
@@ -1463,6 +1566,22 @@ impl HealthReporter {
                                 video_stats["keyframe_requests_per_sec"] = json!(kf);
                             }
                         }
+                        // #2524: an interval MAX, not the stats blob — see `IntervalMaxes`.
+                        "video_seq_max_gap" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                let slot = if is_screen {
+                                    &mut peer_data.screen_seq_max_gap_max
+                                } else {
+                                    &mut peer_data.camera_seq_max_gap_max
+                                };
+                                *slot = Some(slot.map_or(*v, |m: u64| m.max(*v)));
+                            }
+                        }
+                        "freshness_evictions_total" | "freshness_evictions_keyframeless_total" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                video_stats[metric.name] = json!(v);
+                            }
+                        }
                         // Buffered video playout latency (#1252): total across both receive stages
                         // and its stage-1 attribution. Stored in the camera/screen video_stats
                         // bucket; folded into the health packet only when fps_received > 0.
@@ -1491,6 +1610,7 @@ impl HealthReporter {
                         "content_staleness_ms" => {
                             if let MetricValue::F64(v) = &metric.value {
                                 video_stats["content_staleness_ms"] = json!(v);
+                                staleness_sample = Some(*v);
                             }
                         }
                         // Resync-to-live governor skips (#1252): lifetime cumulative COUNTER (u64),
@@ -1510,7 +1630,54 @@ impl HealthReporter {
                                 video_stats["keyframe_arrivals_total"] = json!(v);
                             }
                         }
+                        // #2511: buckets camera-vs-screen like the playout family.
+                        "freeze_episodes_total" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                video_stats["freeze_episodes_total"] = json!(v);
+                            }
+                        }
+                        "freeze_ms_total" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                video_stats["freeze_ms_total"] = json!(v);
+                            }
+                        }
+                        "max_decode_gap_ms" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                video_stats["max_decode_gap_ms"] = json!(v);
+                            }
+                        }
+                        // #2249: qualifies the freeze branch in `video_quality_score`.
+                        "decode_eligible" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                video_stats["decode_eligible"] = json!(v);
+                                staleness_decode_eligible = Some(*v != 0);
+                                if is_screen {
+                                    peer_data.screen_decode_eligible = Some(*v != 0);
+                                } else {
+                                    peer_data.camera_decode_eligible = Some(*v != 0);
+                                }
+                            }
+                        }
                         _ => {}
+                    }
+                }
+
+                if let Some(v) = staleness_sample {
+                    let latest_decode_eligible = if is_screen {
+                        peer_data.screen_decode_eligible
+                    } else {
+                        peer_data.camera_decode_eligible
+                    };
+                    let decode_eligible = staleness_decode_eligible
+                        .or(latest_decode_eligible)
+                        .or_else(|| decode_eligible_known(&video_stats));
+                    if decode_eligible == Some(true) {
+                        let slot = if is_screen {
+                            &mut peer_data.screen_staleness_max_ms
+                        } else {
+                            &mut peer_data.camera_staleness_max_ms
+                        };
+                        *slot = Some(slot.map_or(v, |m: f64| m.max(v)));
                     }
                 }
 
@@ -1749,6 +1916,7 @@ impl HealthReporter {
                 };
 
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
+                    let interval_maxes = drain_interval_maxes(&peer_health_data);
                     if let Ok(health_map) = peer_health_data.try_borrow() {
                         let self_audio_enabled = Weak::upgrade(&audio_enabled)
                             .and_then(|ae| ae.try_borrow().ok().map(|v| *v))
@@ -2021,6 +2189,7 @@ impl HealthReporter {
                                     videocall_transport::webtransport::incoming_datagram_queue_readback(),
                             },
                             camera_layer_metrics_val,
+                            interval_maxes,
                         );
 
                         if let Some(packet) = health_packet {
@@ -2070,6 +2239,40 @@ impl HealthReporter {
             // Clear the page-level signal after meeting teardown stops the report loop.
             publish_encoder_fps(None);
         });
+    }
+
+    /// Per-stream fields stay UNSET at zero, so absence reads as "this stream
+    /// offered nothing". The two by-state aggregates are set unconditionally: for
+    /// those, zero is the reading that carries the information (issue 2201).
+    fn set_ws_stream_counters(pb: &mut PbHealthPacket) {
+        use crate::connection::MediaStreamKey as K;
+        use videocall_transport::websocket::{
+            websocket_dropped_bytes_for_stream as dropped,
+            websocket_inactive_dropped_bytes_for_stream as inactive_bytes,
+            websocket_inactive_dropped_frames_closed as inactive_closed,
+            websocket_inactive_dropped_frames_closing as inactive_closing,
+            websocket_inactive_dropped_frames_for_stream as inactive_frames,
+            websocket_offered_bytes_for_stream as offered,
+        };
+        let nonzero = |v: u64| (v != 0).then_some(v);
+        pb.ws_offered_bytes_audio = nonzero(offered(K::Audio.as_u8()));
+        pb.ws_offered_bytes_video = nonzero(offered(K::Video.as_u8()));
+        pb.ws_offered_bytes_screen = nonzero(offered(K::Screen.as_u8()));
+        pb.ws_offered_bytes_control = nonzero(offered(K::Control.as_u8()));
+        pb.ws_dropped_bytes_audio = nonzero(dropped(K::Audio.as_u8()));
+        pb.ws_dropped_bytes_video = nonzero(dropped(K::Video.as_u8()));
+        pb.ws_dropped_bytes_screen = nonzero(dropped(K::Screen.as_u8()));
+        pb.ws_dropped_bytes_control = nonzero(dropped(K::Control.as_u8()));
+        pb.ws_inactive_dropped_frames_audio = nonzero(inactive_frames(K::Audio.as_u8()));
+        pb.ws_inactive_dropped_frames_video = nonzero(inactive_frames(K::Video.as_u8()));
+        pb.ws_inactive_dropped_frames_screen = nonzero(inactive_frames(K::Screen.as_u8()));
+        pb.ws_inactive_dropped_frames_control = nonzero(inactive_frames(K::Control.as_u8()));
+        pb.ws_inactive_dropped_bytes_audio = nonzero(inactive_bytes(K::Audio.as_u8()));
+        pb.ws_inactive_dropped_bytes_video = nonzero(inactive_bytes(K::Video.as_u8()));
+        pb.ws_inactive_dropped_bytes_screen = nonzero(inactive_bytes(K::Screen.as_u8()));
+        pb.ws_inactive_dropped_bytes_control = nonzero(inactive_bytes(K::Control.as_u8()));
+        pb.ws_inactive_dropped_frames_by_state_closing = Some(inactive_closing());
+        pb.ws_inactive_dropped_frames_by_state_closed = Some(inactive_closed());
     }
 
     /// Create a health packet from current peer health data
@@ -2143,6 +2346,8 @@ impl HealthReporter {
         // the transport statics in the report loop. `Default` on WebSocket.
         wt_telemetry: WtReceiveTelemetry,
         camera_layer_metrics: Vec<crate::encode::CameraLayerMetric>,
+        // #2511: per-peer `(camera, screen)`. Absent => the wire field is omitted.
+        interval_maxes: IntervalMaxMap,
     ) -> Option<PacketWrapper> {
         // Keep client-wide telemetry flowing even before any peer stats have
         // been observed (solo sessions / warm-up).
@@ -2207,6 +2412,7 @@ impl HealthReporter {
         pb.unistream_bytes_drained_total = Some(unistream_bytes_drained_total);
         pb.unistream_stale_delta_drops_total = Some(unistream_stale_delta_drops_total);
         pb.websocket_drops_total = Some(websocket_drops_total);
+        Self::set_ws_stream_counters(&mut pb);
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
         // Encoder decision inputs (P0)
@@ -2645,15 +2851,18 @@ impl HealthReporter {
         let mut concealment_active_sources = 0_u32;
 
         for (peer_id, health_data) in health_map.iter() {
+            let maxes = interval_maxes.get(peer_id).copied().unwrap_or_default();
+            let (camera_staleness_max, screen_staleness_max) =
+                (maxes.camera_staleness_ms, maxes.screen_staleness_ms);
             // Freshness gate: stats older than 5s are stale (FPS/NetEQ trackers stop
             // emitting DiagEvents when no frames arrive, so timestamps stop advancing).
             let audio_fresh = health_data.last_audio_update_ms > 0
                 && now_ms.saturating_sub(health_data.last_audio_update_ms) < STATS_STALE_MS;
             let camera_fresh = health_data.last_camera_update_ms > 0
                 && now_ms.saturating_sub(health_data.last_camera_update_ms) < STATS_STALE_MS;
-            let video_fresh = camera_fresh
-                || (health_data.last_screen_update_ms > 0
-                    && now_ms.saturating_sub(health_data.last_screen_update_ms) < STATS_STALE_MS);
+            let screen_fresh = health_data.last_screen_update_ms > 0
+                && now_ms.saturating_sub(health_data.last_screen_update_ms) < STATS_STALE_MS;
+            let video_fresh = camera_fresh || screen_fresh;
 
             let mut ps = PbPeerStats::new();
             // can_listen/can_see: receiver-observed. True only while stream is fresh.
@@ -2827,6 +3036,24 @@ impl HealthReporter {
                 {
                     vs.keyframe_arrivals_total = Some(v);
                 }
+                // #2511: outside the fps gate — fps 0 IS the freeze these describe — but
+                // inside the sender's own camera-enabled flag.
+                if health_data.video_enabled {
+                    if let Some(v) = video.get("freeze_episodes_total").and_then(|v| v.as_u64()) {
+                        vs.freeze_episodes_total = Some(v);
+                    }
+                    if let Some(v) = video.get("freeze_ms_total").and_then(|v| v.as_u64()) {
+                        vs.freeze_ms_total = Some(v);
+                    }
+                    if let Some(v) = video.get("max_decode_gap_ms").and_then(|v| v.as_u64()) {
+                        vs.max_decode_gap_ms = Some(v);
+                    }
+                }
+                if let Some(v) = camera_staleness_max {
+                    vs.max_content_staleness_ms = Some(v as u64);
+                }
+                // NOT gated on `video_enabled`, unlike the #2511 freeze family above.
+                fold_loss_diagnostics(&mut vs, video, maxes.camera_seq_gap_frames);
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 
                 // Extract decode_errors_per_sec (windowed rate) from camera video stats
@@ -2914,6 +3141,21 @@ impl HealthReporter {
                 {
                     svs.keyframe_arrivals_total = Some(v);
                 }
+                // Freeze episodes (#2511): deliberately NOT gated on `video_enabled` like the
+                // camera fold — that flag is the CAMERA's, and a share must survive camera-off.
+                if let Some(v) = screen.get("freeze_episodes_total").and_then(|v| v.as_u64()) {
+                    svs.freeze_episodes_total = Some(v);
+                }
+                if let Some(v) = screen.get("freeze_ms_total").and_then(|v| v.as_u64()) {
+                    svs.freeze_ms_total = Some(v);
+                }
+                if let Some(v) = screen.get("max_decode_gap_ms").and_then(|v| v.as_u64()) {
+                    svs.max_decode_gap_ms = Some(v);
+                }
+                if let Some(v) = screen_staleness_max {
+                    svs.max_content_staleness_ms = Some(v as u64);
+                }
+                fold_loss_diagnostics(&mut svs, screen, maxes.screen_seq_gap_frames);
                 ps.screen_video_stats = ::protobuf::MessageField::some(svs);
             }
 
@@ -2959,7 +3201,10 @@ impl HealthReporter {
                 .map(|n| n.packets_per_sec)
                 .unwrap_or(0.0);
 
-            if audio_fresh && audio_packets_per_sec >= 2.0 && health_data.audio_enabled {
+            if audio_fresh
+                && audio_packets_per_sec >= AUDIO_ACTIVE_PPS_GATE
+                && health_data.audio_enabled
+            {
                 let conceal = ps
                     .neteq_stats
                     .as_ref()
@@ -2980,29 +3225,55 @@ impl HealthReporter {
                 ps.audio_quality_score = Some(score);
             }
 
-            // Video quality (0-100): only meaningful when frames are actively arriving.
-            // fps > 0.0 already proves decode CALLS are flowing; video_enabled (sender
-            // self-report from peer_status events) is not required here and would suppress
-            // scores if peer_status hasn't arrived yet.
+            // Video quality (0-100): the WORSE of this peer's camera and screen streams.
             //
             // Freeze observability (#1013): during a freeze, fps_received still reads ~30
             // because decode calls keep firing fire-and-forget, yet the picture is visually
             // frozen because packets are lost and the stream is stuck requesting keyframes.
             // We fold the windowed loss rate and keyframe-request rate into the score so it
             // drops well below 100 in that state.
-            let fps = ps
+            let (cam_fps, cam_kbps) = ps
                 .video_stats
                 .as_ref()
-                .map(|v| v.fps_received)
-                .unwrap_or(0.0);
-            if video_fresh && fps > 0.0 {
-                ps.video_quality_score = video_quality_score(
-                    fps,
+                .map(|v| (v.fps_received, v.bitrate_kbps))
+                .unwrap_or((0.0, 0));
+            let (screen_fps, screen_kbps) = ps
+                .screen_video_stats
+                .as_ref()
+                .map(|v| (v.fps_received, v.bitrate_kbps))
+                .unwrap_or((0.0, 0));
+            let cam_eligible = health_data
+                .camera_decode_eligible
+                .unwrap_or_else(|| decode_eligible_from(&health_data.last_camera_stats));
+            let screen_eligible = health_data
+                .screen_decode_eligible
+                .unwrap_or_else(|| decode_eligible_from(&health_data.last_screen_stats));
+            // Each stream gates on ITS OWN freshness — a retired stream keeps its blob,
+            // so the combined `video_fresh` would go on scoring a dead one.
+            let camera_score = if camera_fresh {
+                video_quality_score(
+                    cam_fps,
+                    cam_kbps,
                     ps.frames_dropped_per_sec,
                     ps.video_seq_loss_per_sec.unwrap_or(0.0),
                     ps.keyframe_requests_per_sec.unwrap_or(0.0),
-                );
-            }
+                    cam_eligible,
+                )
+            } else {
+                None
+            };
+            // fps/downlink terms only: screen's #2524 rates would move call_quality_score.
+            let screen_score = if screen_fresh {
+                video_quality_score(screen_fps, screen_kbps, 0.0, 0.0, 0.0, screen_eligible)
+            } else {
+                None
+            };
+            ps.video_quality_score = match (camera_score, screen_score) {
+                (Some(c), Some(s)) => Some(c.min(s)),
+                (Some(c), None) => Some(c),
+                (None, Some(s)) => Some(s),
+                (None, None) => None,
+            };
 
             // Call quality: worst of whichever streams are active
             let call_score = match (ps.audio_quality_score, ps.video_quality_score) {
@@ -3067,8 +3338,8 @@ impl HealthReporter {
     }
 }
 
-/// Compute the per-peer video quality score (0–100), or `None` when no frames
-/// are flowing.
+/// Compute the per-stream video quality score (0–100), or `None` when nothing is
+/// arriving on the stream at all.
 ///
 /// Freeze observability (#1013): a broadcast-relay stream can read fps ≈ 30
 /// while being visually frozen — decode CALLS keep firing fire-and-forget even
@@ -3083,20 +3354,28 @@ impl HealthReporter {
 ///   continuously asking for keyframes is, by definition, not decoding cleanly,
 ///   so even a *sustained* ≥1 PLI/s is a strong freeze signal: `1 PLI/s → −40`.
 ///
-/// The caller applies the outer `video_fresh && fps > 0.0` guard, so a true
-/// freeze with zero fps yields `None` (Grafana renders a gap) rather than a
-/// misleading 0 — `None` is the correct "no signal" state.
-///
-/// Returns `None` only when `fps <= 0.0` (defensive; the caller already
-/// guards this), otherwise `Some(score)` clamped to `0..=100`.
+/// At `fps == 0` it takes BOTH `bitrate_kbps` and `decode_eligible` to classify (#2249):
+/// no downlink is idle (`None`); a live downlink on a tile we ARE decoding is a freeze
+/// (`0.0`); a live downlink on one we DECLINED to decode is neither (`None`). Omitting the
+/// freeze case left the server's `if let Some(score)` export latching its last healthy
+/// value; scoring the third case 0 is the mirror-image defect, because a not-visible SCREEN
+/// tile keeps receiving — SCREEN is never viewport-filtered by the relay, and
+/// `tick_layer_choosers` advertises no preference for a receiver already tracking the top
+/// rung — so a healthy publisher would read 0 for as long as its tile stays backgrounded.
 fn video_quality_score(
     fps: f64,
+    bitrate_kbps: u64,
     dropped_per_sec: f64,
     loss_per_sec: f64,
     kf_per_sec: f64,
+    decode_eligible: bool,
 ) -> Option<f64> {
     if fps <= 0.0 {
-        return None;
+        return if bitrate_kbps > 0 && decode_eligible {
+            Some(0.0)
+        } else {
+            None
+        };
     }
 
     // Video health: measures whether video is present and stable, not hardware
@@ -3104,21 +3383,8 @@ fn video_quality_score(
     // camera doing auto-exposure correctly.
     //   fps >= 5  → 100  (video is working; FPS is hardware context, not quality)
     //   fps 1–4   → 0–50 (near-frozen; something is likely wrong)
-    // ⚠ #2190 CHANGED THE INPUT TO THIS, AND IT FEEDS AN ALERT. `fps` is now DECODED frames,
-    // not arrivals, so this term moves in both directions and
-    // `videocall_call_quality_score` → `MeetingQualityDegraded`
-    // (`avg by (meeting_id)(...) < 50`, for: 2m) moves with it:
-    //   * MORE firing — a receiver genuinely decoding at 1-4 fps now scores 10-40 where the
-    //     pre-fix ladder sum read >= 5 and pinned this at 100. That `< 50` threshold was tuned
-    //     against the inflated input, so expect an alert-volume step change on rollout in
-    //     multi-rung meetings.
-    //   * LESS firing, which is the dangerous direction — at fps 0 `video_quality_score`
-    //     returns `None`, and `call_quality_score`'s `(Some(a), None) => Some(a)` arm falls
-    //     through to the AUDIO score alone. A frozen-video peer with healthy audio then scores
-    //     high and stops pulling the meeting average down, so the freeze becomes invisible to
-    //     the alert that exists to catch it.
-    // Re-tune the threshold (or add a video-specific alert) before relying on this in a
-    // cluster. Recorded here rather than only in the PR body so it outlives the PR.
+    // ⚠ #2190: `fps` is DECODED frames, so 1-4 fps scores 10-40 where the pre-fix ladder
+    // sum pinned it at 100. `MeetingQualityDegraded`'s `< 50` predates that.
     let video_health = if fps >= 5.0 { 100.0 } else { fps / 5.0 * 50.0 };
 
     // Decode error penalty: 0/s→0, 10+/s→−50.
@@ -3131,6 +3397,45 @@ fn video_quality_score(
 
     let score = (video_health - drop_penalty - loss_penalty - kf_penalty).clamp(0.0, 100.0);
     Some(score)
+}
+
+/// Shared by both media buckets (#2524, #2541). Unconditional, outside the
+/// `fps_received > 0` gate: fps 0 is the freeze these exist to explain. `seq_gap_max` is the
+/// drained interval MAX, not a blob key — see [`IntervalMaxes`].
+fn fold_loss_diagnostics(vs: &mut PbVideoStats, stats: &Value, seq_gap_max: Option<u64>) {
+    let as_u64 = |key: &str| stats.get(key).and_then(|v| v.as_u64());
+    vs.max_seq_gap_frames = seq_gap_max;
+    if let Some(v) = as_u64("freshness_evictions_total") {
+        vs.freshness_evictions_total = Some(v);
+    }
+    if let Some(v) = as_u64("freshness_evictions_keyframeless_total") {
+        vs.freshness_evictions_keyframeless_total = Some(v);
+    }
+    // Per-stream loss / PLI: a camera-only fold is what left screen dark to begin with.
+    let as_f64 = |key: &str| stats.get(key).and_then(|v| v.as_f64());
+    if let Some(v) = as_f64("video_seq_loss_per_sec") {
+        vs.video_seq_loss_per_sec = Some(v);
+    }
+    if let Some(v) = as_f64("keyframe_requests_per_sec") {
+        vs.keyframe_requests_per_sec = Some(v);
+    }
+}
+
+/// Read the #2249 decode-eligibility flag out of a stats blob. Absent => `true`, so a
+/// missing signal fails OPEN into the freeze branch rather than disabling it.
+fn decode_eligible_value(stats: &Value) -> bool {
+    decode_eligible_known(stats).unwrap_or(true)
+}
+
+fn decode_eligible_known(stats: &Value) -> Option<bool> {
+    stats
+        .get("decode_eligible")
+        .and_then(|v| v.as_u64())
+        .map(|v| v != 0)
+}
+
+fn decode_eligible_from(stats: &Option<Value>) -> bool {
+    stats.as_ref().map(decode_eligible_value).unwrap_or(true)
 }
 
 // ===================================================================
@@ -3354,6 +3659,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -3470,6 +3776,7 @@ mod tests {
             HashMap::new(),
             WtReceiveTelemetry::default(),
             Vec::new(),
+            HashMap::new(), // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -3673,6 +3980,7 @@ mod tests {
             HashMap::new(),
             WtReceiveTelemetry::default(),
             Vec::new(),
+            HashMap::new(), // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
         let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
@@ -3770,14 +4078,42 @@ mod tests {
     /// Healthy stream: fps≥5, no loss, no keyframe storm → score 100.
     #[test]
     fn video_quality_score_healthy_is_100() {
-        assert_eq!(video_quality_score(30.0, 0.0, 0.0, 0.0), Some(100.0));
+        assert_eq!(
+            video_quality_score(30.0, 500, 0.0, 0.0, 0.0, true),
+            Some(100.0)
+        );
     }
 
-    /// fps == 0 yields None (absent), not 0 — a freeze with zero fps must show
-    /// a Grafana gap, not a misleading zero.
     #[test]
-    fn video_quality_score_zero_fps_is_none() {
-        assert_eq!(video_quality_score(0.0, 0.0, 0.0, 0.0), None);
+    fn video_quality_score_receiving_but_not_decoding_scores_zero() {
+        assert_eq!(
+            video_quality_score(0.0, 500, 0.0, 0.0, 0.0, true),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn video_quality_score_zero_fps_without_downlink_is_none() {
+        assert_eq!(video_quality_score(0.0, 0, 0.0, 0.0, 0.0, true), None);
+    }
+
+    /// #2249 blocker: at `fps == 0` with a LIVE downlink, `decode_eligible` is the only
+    /// thing separating a freeze from a tile this receiver declined to decode.
+    ///
+    /// MUTATION: dropping `&& decode_eligible` from the `fps <= 0.0` branch makes the
+    /// first assertion read `Some(0.0)` and fail.
+    #[test]
+    fn video_quality_score_ineligible_stream_is_not_a_freeze() {
+        assert_eq!(
+            video_quality_score(0.0, 700, 0.0, 0.0, 0.0, false),
+            None,
+            "we chose not to decode this tile — its publisher is not frozen"
+        );
+        assert_eq!(
+            video_quality_score(0.0, 700, 0.0, 0.0, 0.0, true),
+            Some(0.0),
+            "the same numbers on a tile we ARE decoding is the #2249 freeze"
+        );
     }
 
     /// The core #1013 case: fps reads a healthy ~30 (decode calls still firing)
@@ -3786,7 +4122,7 @@ mod tests {
     #[test]
     fn video_quality_score_drops_during_freeze_with_loss_and_keyframe_storm() {
         // 30 fps, no decode errors, 5 lost/s (-30), 1 PLI/s (-40) => 100-30-40=30.
-        let score = video_quality_score(30.0, 0.0, 5.0, 1.0).expect("fps>0 => Some");
+        let score = video_quality_score(30.0, 500, 0.0, 5.0, 1.0, true).expect("fps>0 => Some");
         assert!(
             score < 80.0,
             "freeze (loss + keyframe storm) should score well below 80, got {score}"
@@ -3798,7 +4134,7 @@ mod tests {
     #[test]
     fn video_quality_score_loss_only_penalty() {
         // 30 fps, 5 lost/s (-30) => 70.
-        let score = video_quality_score(30.0, 0.0, 5.0, 0.0).expect("fps>0 => Some");
+        let score = video_quality_score(30.0, 500, 0.0, 5.0, 0.0, true).expect("fps>0 => Some");
         assert!((score - 70.0).abs() < 1e-9, "expected 70.0, got {score}");
     }
 
@@ -3806,15 +4142,277 @@ mod tests {
     #[test]
     fn video_quality_score_keyframe_storm_only_penalty() {
         // 30 fps, 1 PLI/s (-40) => 60.
-        let score = video_quality_score(30.0, 0.0, 0.0, 1.0).expect("fps>0 => Some");
+        let score = video_quality_score(30.0, 500, 0.0, 0.0, 1.0, true).expect("fps>0 => Some");
         assert!((score - 60.0).abs() < 1e-9, "expected 60.0, got {score}");
     }
 
     /// Penalties saturate and the score clamps at 0, never negative.
     #[test]
     fn video_quality_score_clamps_at_zero() {
-        let score = video_quality_score(30.0, 100.0, 100.0, 100.0).expect("fps>0 => Some");
+        let score =
+            video_quality_score(30.0, 500, 100.0, 100.0, 100.0, true).expect("fps>0 => Some");
         assert_eq!(score, 0.0);
+    }
+
+    fn peer_with_stream_rates(camera: (f64, u64), screen: (f64, u64)) -> PeerHealthData {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.audio_enabled = true;
+        peer.update_audio_stats(json!({
+            "packets_per_sec": 50.0,
+            "network": { "operation_counters": { "expand_per_sec": 0.0 } },
+        }));
+        peer.update_camera_stats(json!({
+            "fps_received": camera.0,
+            "bitrate_kbps": camera.1,
+        }));
+        peer.update_screen_stats(json!({
+            "fps_received": screen.0,
+            "bitrate_kbps": screen.1,
+        }));
+        peer
+    }
+
+    fn health_packet_with_stream_rates(camera: (f64, u64), screen: (f64, u64)) -> PbHealthPacket {
+        health_packet_for_peer(peer_with_stream_rates(camera, screen))
+    }
+
+    fn health_packet_for_peer(peer: PeerHealthData) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            None,
+            0,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            0,
+            [0, 0, 0, 0],
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            HashMap::new(),
+            WtReceiveTelemetry::default(),
+            Vec::new(),
+            HashMap::new(), // staleness_max_ms (#2511)
+        )
+        .expect("create_health_packet returns Some unconditionally");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// The #2249 production reproduction: a perfect call score through a 4-minute
+    /// human-confirmed screen freeze, because the fold read only `ps.video_stats`.
+    #[test]
+    fn screen_freeze_pulls_video_and_call_quality_to_zero() {
+        let pb = health_packet_with_stream_rates((30.0, 900), (0.0, 700));
+        let ps = pb.peer_stats.get("peer-1").expect("peer stats present");
+
+        assert_eq!(
+            ps.video_quality_score,
+            Some(0.0),
+            "screen receiving 700kbps while decoding nothing is a freeze"
+        );
+        assert_eq!(
+            ps.call_quality_score,
+            Some(0.0),
+            "the call score must take the frozen screen, not the healthy audio"
+        );
+    }
+
+    /// The camera half: the old `fps > 0.0` gate left the score absent (latching the
+    /// gauge) and `(Some(a), None) => Some(a)` fell through to audio.
+    #[test]
+    fn camera_freeze_pulls_video_and_call_quality_to_zero() {
+        let pb = health_packet_with_stream_rates((0.0, 900), (0.0, 0));
+        let ps = pb.peer_stats.get("peer-1").expect("peer stats present");
+
+        assert_eq!(ps.video_quality_score, Some(0.0));
+        assert_eq!(
+            ps.call_quality_score,
+            Some(0.0),
+            "a frozen camera must pull the call score down, not fall through to audio"
+        );
+    }
+
+    fn peer_with_screen_eligibility(
+        camera: (f64, u64),
+        screen: (f64, u64),
+        screen_decode_eligible: u64,
+    ) -> PeerHealthData {
+        let mut peer = peer_with_stream_rates(camera, screen);
+        peer.update_screen_stats(json!({
+            "fps_received": screen.0,
+            "bitrate_kbps": screen.1,
+            "decode_eligible": screen_decode_eligible,
+        }));
+        peer
+    }
+
+    /// #2249 blocker: a SECOND, backgrounded screen sharer is `visible == false` with SCREEN
+    /// bytes still arriving. Scoring that 0 pins `videocall_call_quality_score` low for as
+    /// long as the tile stays backgrounded, firing the very `MeetingQualityDegraded` alert
+    /// this PR exists to make trustworthy.
+    ///
+    /// MUTATION: dropping `&& decode_eligible` makes both assertions read `Some(0.0)`.
+    #[test]
+    fn a_backgrounded_screen_tile_does_not_drag_the_call_score_to_zero() {
+        let pb = health_packet_for_peer(peer_with_screen_eligibility((30.0, 900), (0.0, 700), 0));
+        let ps = pb.peer_stats.get("peer-1").expect("peer stats present");
+
+        assert_eq!(
+            ps.video_quality_score,
+            Some(100.0),
+            "the healthy camera is the only stream we are decoding, so it is the whole score"
+        );
+        assert_eq!(
+            ps.call_quality_score,
+            Some(100.0),
+            "a tile we declined to decode must not defame a healthy peer"
+        );
+    }
+
+    /// The same tile with no camera to carry the score: absent, not 0. `None` lets the
+    /// server's `if let Some(score)` export omit the series rather than publish a false floor.
+    #[test]
+    fn a_backgrounded_screen_tile_alone_leaves_video_quality_absent() {
+        let pb = health_packet_for_peer(peer_with_screen_eligibility((0.0, 0), (0.0, 700), 0));
+        let ps = pb.peer_stats.get("peer-1").expect("peer stats present");
+
+        assert_eq!(ps.video_quality_score, None);
+        assert_eq!(
+            ps.call_quality_score,
+            Some(100.0),
+            "with no video we are scoring, the call score is the healthy audio"
+        );
+    }
+
+    /// The anti-wedge guard for the two tests above: an EXPLICITLY eligible screen tile with
+    /// the identical fps/bitrate must still score 0. Without this, an over-broad fix that
+    /// forced `decode_eligible` false everywhere would disable #2249 entirely and still pass.
+    #[test]
+    fn a_decode_eligible_screen_tile_still_scores_zero_when_frozen() {
+        let pb = health_packet_for_peer(peer_with_screen_eligibility((30.0, 900), (0.0, 700), 1));
+        let ps = pb.peer_stats.get("peer-1").expect("peer stats present");
+
+        assert_eq!(
+            ps.video_quality_score,
+            Some(0.0),
+            "a tile we ARE decoding, receiving 700kbps and rendering nothing, is a freeze"
+        );
+        assert_eq!(ps.call_quality_score, Some(0.0));
+    }
+
+    #[test]
+    fn idle_streams_leave_video_quality_absent_and_call_score_on_audio() {
+        let pb = health_packet_with_stream_rates((0.0, 0), (0.0, 0));
+        let ps = pb.peer_stats.get("peer-1").expect("peer stats present");
+
+        assert_eq!(
+            ps.video_quality_score, None,
+            "no downlink on either stream is idle, not a freeze"
+        );
+        assert_eq!(
+            ps.call_quality_score,
+            Some(100.0),
+            "with no video signal the call score is the audio score"
+        );
+    }
+
+    /// An ended stream keeps its blob and its final-window bitrate; only its own
+    /// freshness clock retires it, so gating on `video_fresh` fails here (and below).
+    #[test]
+    fn a_stale_screen_blob_does_not_score_while_the_camera_is_live() {
+        let mut peer = peer_with_stream_rates((30.0, 900), (0.0, 700));
+        peer.last_screen_update_ms = peer.last_screen_update_ms.saturating_sub(60_000);
+        let pb = health_packet_for_peer(peer);
+
+        assert_eq!(
+            pb.peer_stats
+                .get("peer-1")
+                .expect("peer stats present")
+                .video_quality_score,
+            Some(100.0),
+            "an ended screen share must not keep scoring the peer 0"
+        );
+    }
+
+    #[test]
+    fn a_stale_camera_blob_does_not_score_while_the_screen_is_live() {
+        let mut peer = peer_with_stream_rates((0.0, 900), (30.0, 700));
+        peer.last_camera_update_ms = peer.last_camera_update_ms.saturating_sub(60_000);
+        let pb = health_packet_for_peer(peer);
+
+        assert_eq!(
+            pb.peer_stats
+                .get("peer-1")
+                .expect("peer stats present")
+                .video_quality_score,
+            Some(100.0),
+            "a retired camera stream must not keep scoring the peer 0"
+        );
+    }
+
+    #[test]
+    fn video_quality_takes_the_worse_of_camera_and_screen() {
+        let frozen_camera = health_packet_with_stream_rates((0.0, 900), (30.0, 700));
+        assert_eq!(
+            frozen_camera
+                .peer_stats
+                .get("peer-1")
+                .expect("peer stats present")
+                .video_quality_score,
+            Some(0.0)
+        );
+
+        let both_healthy = health_packet_with_stream_rates((30.0, 900), (30.0, 700));
+        assert_eq!(
+            both_healthy
+                .peer_stats
+                .get("peer-1")
+                .expect("peer stats present")
+                .video_quality_score,
+            Some(100.0)
+        );
     }
 
     /// Construct a `HealthPacket` via the production `create_health_packet`
@@ -3893,6 +4491,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -3986,6 +4585,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -4062,6 +4662,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -4180,6 +4781,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -4357,6 +4959,7 @@ mod tests {
             HashMap::new(), // received_layers
             telemetry,
             camera_layer_metrics,
+            HashMap::new(),
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -4597,6 +5200,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -4670,6 +5274,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -4712,6 +5317,876 @@ mod tests {
         );
     }
 
+    /// #2511: the accumulator sits upstream of proto field 9's `fps_received > 0` gate.
+    #[test]
+    fn content_staleness_max_is_the_interval_max_per_bucket_and_resets_on_drain() {
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let staleness_event = |media: &'static str, v: f64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "from_peer",
+                    value: MetricValue::Text(Cow::Borrowed("self")),
+                },
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(media)),
+                },
+                Metric {
+                    name: "content_staleness_ms",
+                    value: MetricValue::F64(v),
+                },
+                Metric {
+                    name: "decode_eligible",
+                    value: MetricValue::U64(1),
+                },
+            ],
+        };
+
+        // Rise then FALL: the peak is neither the first nor the last sample.
+        HealthReporter::process_diagnostics_event(
+            staleness_event("VIDEO", 120.0),
+            &peer_health_data,
+        );
+        HealthReporter::process_diagnostics_event(
+            staleness_event("VIDEO", 4_800.0),
+            &peer_health_data,
+        );
+        HealthReporter::process_diagnostics_event(
+            staleness_event("VIDEO", 90.0),
+            &peer_health_data,
+        );
+        HealthReporter::process_diagnostics_event(
+            staleness_event("SCREEN", 240_000.0),
+            &peer_health_data,
+        );
+
+        let maxes = peer_health_data
+            .borrow_mut()
+            .get_mut("peer-1")
+            .expect("the video arm must have created the peer entry")
+            .take_interval_maxes();
+        let (camera, screen) = (maxes.camera_staleness_ms, maxes.screen_staleness_ms);
+        assert_eq!(
+            camera,
+            Some(4_800.0),
+            "the camera max is the PEAK, not the last sample"
+        );
+        assert_eq!(
+            screen,
+            Some(240_000.0),
+            "the screen bucket must carry its own max, not inherit the camera's"
+        );
+
+        let __maxes = peer_health_data
+            .borrow_mut()
+            .get_mut("peer-1")
+            .expect("peer entry")
+            .take_interval_maxes();
+        let (camera_again, screen_again) =
+            (__maxes.camera_staleness_ms, __maxes.screen_staleness_ms);
+        assert_eq!(
+            (camera_again, screen_again),
+            (None, None),
+            "a drained interval with no fresh sample must OMIT the field, not publish 0 \
+             — a fabricated 0 reads as 'never stale' on the one signal this exists to catch"
+        );
+    }
+
+    #[test]
+    fn content_staleness_max_ignores_decode_ineligible_samples() {
+        use crate::decode::peer_decoder::MEDIA_TYPE_SCREEN;
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let staleness_event = |eligible: u64, staleness_ms: f64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(MEDIA_TYPE_SCREEN)),
+                },
+                Metric {
+                    name: "content_staleness_ms",
+                    value: MetricValue::F64(staleness_ms),
+                },
+                Metric {
+                    name: "decode_eligible",
+                    value: MetricValue::U64(eligible),
+                },
+            ],
+        };
+
+        HealthReporter::process_diagnostics_event(staleness_event(0, 240_000.0), &peer_health_data);
+        HealthReporter::process_diagnostics_event(staleness_event(1, 1_200.0), &peer_health_data);
+
+        let __maxes = peer_health_data
+            .borrow_mut()
+            .get_mut("peer-1")
+            .expect("the video arm must have created the peer entry")
+            .take_interval_maxes();
+        let (_, screen) = (__maxes.camera_staleness_ms, __maxes.screen_staleness_ms);
+
+        assert_eq!(
+            screen,
+            Some(1_200.0),
+            "the hidden-tile peak must not ride out on the first visible report interval"
+        );
+    }
+
+    #[test]
+    fn content_staleness_max_requires_known_decode_eligibility() {
+        use crate::decode::peer_decoder::MEDIA_TYPE_SCREEN;
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let event = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(MEDIA_TYPE_SCREEN)),
+                },
+                Metric {
+                    name: "content_staleness_ms",
+                    value: MetricValue::F64(240_000.0),
+                },
+            ],
+        };
+
+        HealthReporter::process_diagnostics_event(event, &peer_health_data);
+
+        let __maxes = peer_health_data
+            .borrow_mut()
+            .get_mut("peer-1")
+            .expect("the video arm must have created the peer entry")
+            .take_interval_maxes();
+        let (_, screen) = (__maxes.camera_staleness_ms, __maxes.screen_staleness_ms);
+
+        assert_eq!(
+            screen, None,
+            "a staleness sample without a current decode_eligible signal must not \
+             accumulate through the helper's fail-open default"
+        );
+    }
+
+    #[test]
+    fn decode_eligibility_event_gates_staleness_without_marking_video_fresh() {
+        use crate::decode::peer_decoder::MEDIA_TYPE_SCREEN;
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let eligibility_event = |eligible: u64| DiagEvent {
+            subsystem: "decode_eligibility",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(MEDIA_TYPE_SCREEN)),
+                },
+                Metric {
+                    name: "decode_eligible",
+                    value: MetricValue::U64(eligible),
+                },
+            ],
+        };
+        let staleness_event = |staleness_ms: f64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_100,
+            metrics: vec![
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(MEDIA_TYPE_SCREEN)),
+                },
+                Metric {
+                    name: "content_staleness_ms",
+                    value: MetricValue::F64(staleness_ms),
+                },
+            ],
+        };
+
+        HealthReporter::process_diagnostics_event(eligibility_event(0), &peer_health_data);
+        {
+            let health_map = peer_health_data.borrow();
+            let peer = health_map.get("peer-1").expect("peer entry");
+            assert_eq!(
+                peer.last_screen_update_ms, 0,
+                "decode eligibility is not a media-stat sample and must not make video fresh"
+            );
+            assert_eq!(
+                peer.screen_decode_eligible,
+                Some(false),
+                "eligibility event must update the screen gate used by later staleness samples"
+            );
+            assert_eq!(
+                peer.last_screen_stats, None,
+                "eligibility state must not fabricate a media-stats bucket"
+            );
+        }
+
+        HealthReporter::process_diagnostics_event(staleness_event(240_000.0), &peer_health_data);
+        let __maxes = peer_health_data
+            .borrow_mut()
+            .get_mut("peer-1")
+            .expect("peer entry")
+            .take_interval_maxes();
+        let (_, hidden_screen) = (__maxes.camera_staleness_ms, __maxes.screen_staleness_ms);
+        assert_eq!(
+            hidden_screen, None,
+            "a later staleness sample without its own decode_eligible metric must use the \
+             latest visibility gate, not the default-open helper"
+        );
+
+        HealthReporter::process_diagnostics_event(eligibility_event(1), &peer_health_data);
+        HealthReporter::process_diagnostics_event(staleness_event(1_200.0), &peer_health_data);
+        let __maxes = peer_health_data
+            .borrow_mut()
+            .get_mut("peer-1")
+            .expect("peer entry")
+            .take_interval_maxes();
+        let (_, visible_screen) = (__maxes.camera_staleness_ms, __maxes.screen_staleness_ms);
+        assert_eq!(
+            visible_screen,
+            Some(1_200.0),
+            "once visibility reopens the gate, the next worker staleness sample must count"
+        );
+    }
+
+    #[test]
+    fn decode_eligibility_events_do_not_create_video_stats_buckets() {
+        use crate::decode::peer_decoder::{MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let eligibility_event = |media_type: &'static str, eligible: u64| DiagEvent {
+            subsystem: "decode_eligibility",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(media_type)),
+                },
+                Metric {
+                    name: "decode_eligible",
+                    value: MetricValue::U64(eligible),
+                },
+            ],
+        };
+
+        HealthReporter::process_diagnostics_event(
+            eligibility_event(MEDIA_TYPE_CAMERA, 1),
+            &peer_health_data,
+        );
+        HealthReporter::process_diagnostics_event(
+            eligibility_event(MEDIA_TYPE_SCREEN, 0),
+            &peer_health_data,
+        );
+
+        let peer = peer_health_data
+            .borrow()
+            .get("peer-1")
+            .expect("peer entry")
+            .clone();
+        assert_eq!(peer.camera_decode_eligible, Some(true));
+        assert_eq!(peer.screen_decode_eligible, Some(false));
+        assert_eq!(peer.last_camera_stats, None);
+        assert_eq!(peer.last_screen_stats, None);
+
+        let pb = health_packet_for_peer(peer);
+        let stats = pb.peer_stats.get("peer-1").expect("peer stats");
+        assert!(
+            stats.video_stats.is_none(),
+            "camera eligibility alone must not publish an all-zero camera stats bucket"
+        );
+        assert!(
+            stats.screen_video_stats.is_none(),
+            "screen eligibility alone must not publish an all-zero screen stats bucket"
+        );
+    }
+
+    /// #2511 Blocker 3: the drain is the report loop's only producer of the staleness
+    /// map, and a failed borrow must degrade to OMIT.
+    #[test]
+    fn drain_interval_maxes_reads_and_resets_and_omits_when_the_map_is_borrowed() {
+        let map: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut m = map.borrow_mut();
+            let a = m
+                .entry("peer-a".to_string())
+                .or_insert_with(|| PeerHealthData::new("peer-a".to_string()));
+            a.camera_staleness_max_ms = Some(4_800.0);
+            // #2524: seeded too, or dropping their `.take()` turns the interval max into the
+            // lifetime latch this test's own name disclaims — and nothing notices.
+            a.camera_seq_max_gap_max = Some(437);
+            let b = m
+                .entry("peer-b".to_string())
+                .or_insert_with(|| PeerHealthData::new("peer-b".to_string()));
+            b.screen_staleness_max_ms = Some(240_000.0);
+            b.screen_seq_max_gap_max = Some(88);
+        }
+
+        let drained = drain_interval_maxes(&map);
+        assert_eq!(
+            drained.get("peer-a").copied(),
+            Some(IntervalMaxes {
+                camera_staleness_ms: Some(4_800.0),
+                camera_seq_gap_frames: Some(437),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            drained.get("peer-b").copied(),
+            Some(IntervalMaxes {
+                screen_staleness_ms: Some(240_000.0),
+                screen_seq_gap_frames: Some(88),
+                ..Default::default()
+            }),
+            "each peer carries its own set; a shared accumulator would cross them"
+        );
+
+        assert_eq!(
+            drain_interval_maxes(&map).get("peer-a").copied(),
+            Some(IntervalMaxes::default()),
+            "the drain resets, so the export is an INTERVAL max rather than a lifetime latch"
+        );
+
+        let _held = map.borrow();
+        assert!(
+            drain_interval_maxes(&map).is_empty(),
+            "a failed borrow must yield an empty map, which folds as OMIT — never a 0"
+        );
+    }
+
+    /// #2511: both buckets carry freeze counters plus a drained staleness max.
+    fn health_packet_with_freeze_stats(fps_received: f64) -> PbHealthPacket {
+        let mut staleness = IntervalMaxMap::new();
+        staleness.insert(
+            "peer-1".to_string(),
+            IntervalMaxes {
+                camera_staleness_ms: Some(4_800.0),
+                screen_staleness_ms: Some(240_000.0),
+                camera_seq_gap_frames: Some(437),
+                screen_seq_gap_frames: Some(88),
+            },
+        );
+        health_packet_with_freeze_stats_for(fps_received, true, staleness)
+    }
+
+    fn health_packet_with_freeze_stats_for(
+        fps_received: f64,
+        sender_video_enabled: bool,
+        staleness: IntervalMaxMap,
+    ) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.video_enabled = sender_video_enabled;
+        // Distinct per bucket and per field so a transposition is observable.
+        peer.last_camera_stats = Some(json!({
+            "fps_received": fps_received,
+            "freeze_episodes_total": 3u64,
+            "freeze_ms_total": 7_400u64,
+            "max_decode_gap_ms": 5_100u64,
+            "freshness_evictions_total": 31u64,
+            "freshness_evictions_keyframeless_total": 29u64,
+        }));
+        peer.last_screen_stats = Some(json!({
+            "fps_received": fps_received,
+            "freeze_episodes_total": 2u64,
+            "freeze_ms_total": 61_000u64,
+            "max_decode_gap_ms": 58_000u64,
+            "freshness_evictions_total": 6u64,
+            "freshness_evictions_keyframeless_total": 4u64,
+        }));
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            None,
+            0,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            0,
+            [0, 0, 0, 0],
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            HashMap::new(),
+            WtReceiveTelemetry::default(),
+            Vec::new(),
+            staleness, // staleness_max_ms (#2511)
+        )
+        .expect("create_health_packet returns Some unconditionally");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #2511: fps 0 IS the freeze.
+    #[test]
+    fn the_freeze_family_folds_even_when_fps_received_zero() {
+        let pb = health_packet_with_freeze_stats(0.0);
+        let ps = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present");
+        let camera = ps
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+        let screen = ps
+            .screen_video_stats
+            .as_ref()
+            .expect("screen video stats must be present");
+
+        assert_eq!(camera.fps_received, 0.0);
+        assert_eq!(camera.freeze_episodes_total, Some(3));
+        assert_eq!(camera.freeze_ms_total, Some(7_400));
+        assert_eq!(camera.max_decode_gap_ms, Some(5_100));
+        assert_eq!(
+            camera.max_content_staleness_ms,
+            Some(4_800),
+            "the staleness max is drained upstream of field 9's fps gate, so it must \
+             survive fps 0"
+        );
+
+        assert_eq!(screen.fps_received, 0.0);
+        assert_eq!(screen.freeze_episodes_total, Some(2));
+        assert_eq!(screen.freeze_ms_total, Some(61_000));
+        assert_eq!(screen.max_decode_gap_ms, Some(58_000));
+        assert_eq!(screen.max_content_staleness_ms, Some(240_000));
+
+        // Field 9 is untouched: still gated, still 0 at fps 0.
+        assert_eq!(camera.content_staleness_ms, 0.0);
+    }
+
+    /// UNLIKE the #2511 freeze family asserted absent by the test below.
+    #[test]
+    fn the_loss_diagnostics_survive_the_sender_reporting_video_off() {
+        let mut maxes = IntervalMaxMap::new();
+        maxes.insert(
+            "peer-1".to_string(),
+            IntervalMaxes {
+                camera_seq_gap_frames: Some(437),
+                screen_seq_gap_frames: Some(88),
+                ..Default::default()
+            },
+        );
+        let pb = health_packet_with_freeze_stats_for(0.0, false, maxes);
+        let ps = pb.peer_stats.get("peer-1").expect("peer stats");
+        let camera = ps.video_stats.as_ref().expect("camera video stats");
+
+        assert_eq!(
+            camera.freeze_episodes_total, None,
+            "premise: the #2511 freeze family IS gated on video_enabled"
+        );
+        assert_eq!(
+            camera.max_seq_gap_frames,
+            Some(437),
+            "a gate here would blank the burst magnitude across any camera-off period"
+        );
+        assert_eq!(camera.freshness_evictions_total, Some(31));
+        assert_eq!(camera.freshness_evictions_keyframeless_total, Some(29));
+
+        let screen = ps.screen_video_stats.as_ref().expect("screen video stats");
+        assert_eq!(screen.max_seq_gap_frames, Some(88));
+        assert_eq!(screen.freshness_evictions_total, Some(6));
+    }
+
+    /// #2511 Blocker 1: a peer whose camera is OFF stops sending VIDEO. Nothing decodes,
+    /// but nothing is frozen either, and a cumulative counter cannot be corrected after
+    /// the fact — so the freeze family must not be published at all.
+    #[test]
+    fn the_camera_freeze_family_is_omitted_while_the_sender_reports_video_off() {
+        let mut staleness = IntervalMaxMap::new();
+        staleness.insert(
+            "peer-1".to_string(),
+            IntervalMaxes {
+                camera_staleness_ms: Some(4_800.0),
+                screen_staleness_ms: Some(240_000.0),
+                camera_seq_gap_frames: Some(437),
+                screen_seq_gap_frames: Some(88),
+            },
+        );
+        let pb = health_packet_with_freeze_stats_for(0.0, false, staleness);
+        let ps = pb.peer_stats.get("peer-1").expect("peer stats");
+        let camera = ps.video_stats.as_ref().expect("camera video stats");
+
+        assert_eq!(camera.freeze_episodes_total, None);
+        assert_eq!(camera.freeze_ms_total, None);
+        assert_eq!(camera.max_decode_gap_ms, None);
+        assert_eq!(
+            camera.max_content_staleness_ms,
+            Some(4_800),
+            "the staleness max is a per-interval observation, not a cumulative freeze \
+             claim, so it is not gated with the family above"
+        );
+
+        let screen = ps.screen_video_stats.as_ref().expect("screen video stats");
+        assert_eq!(
+            screen.freeze_episodes_total,
+            Some(2),
+            "video_enabled describes the CAMERA; gating the screen bucket on it would \
+             blank a live share whenever the publisher turned their camera off"
+        );
+    }
+
+    /// #2511 Blocker 3: no sample observed this interval => the field is ABSENT, not 0.
+    #[test]
+    fn max_content_staleness_is_omitted_when_no_sample_was_drained() {
+        let pb = health_packet_with_freeze_stats_for(0.0, true, IntervalMaxMap::new());
+        let ps = pb.peer_stats.get("peer-1").expect("peer stats");
+        let camera = ps.video_stats.as_ref().expect("camera video stats");
+        let screen = ps.screen_video_stats.as_ref().expect("screen video stats");
+
+        assert_eq!(
+            camera.max_content_staleness_ms, None,
+            "a 0 here reads as 'never stale', the exact false negative this field exists \
+             to prevent"
+        );
+        assert_eq!(screen.max_content_staleness_ms, None);
+        assert_eq!(
+            camera.freeze_episodes_total,
+            Some(3),
+            "the rest of the bucket must still fold, or this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn freeze_counters_survive_the_metric_to_json_hop_per_bucket() {
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let freeze_event = |media: &'static str, episodes: u64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(media)),
+                },
+                Metric {
+                    name: "freeze_episodes_total",
+                    value: MetricValue::U64(episodes),
+                },
+                Metric {
+                    name: "freeze_ms_total",
+                    value: MetricValue::U64(episodes * 1_000),
+                },
+                Metric {
+                    name: "max_decode_gap_ms",
+                    value: MetricValue::U64(episodes * 700),
+                },
+            ],
+        };
+
+        HealthReporter::process_diagnostics_event(freeze_event("VIDEO", 3), &peer_health_data);
+        HealthReporter::process_diagnostics_event(freeze_event("SCREEN", 2), &peer_health_data);
+
+        let map = peer_health_data.borrow();
+        let peer = map.get("peer-1").expect("peer entry");
+        let read = |bucket: &Option<Value>, key: &str| -> Option<u64> {
+            bucket
+                .as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.as_u64())
+        };
+        assert_eq!(
+            read(&peer.last_camera_stats, "freeze_episodes_total"),
+            Some(3)
+        );
+        assert_eq!(
+            read(&peer.last_camera_stats, "freeze_ms_total"),
+            Some(3_000)
+        );
+        assert_eq!(
+            read(&peer.last_camera_stats, "max_decode_gap_ms"),
+            Some(2_100)
+        );
+        assert_eq!(
+            read(&peer.last_screen_stats, "freeze_episodes_total"),
+            Some(2),
+            "the SCREEN bucket must not inherit the camera's counters"
+        );
+        assert_eq!(
+            read(&peer.last_screen_stats, "freeze_ms_total"),
+            Some(2_000)
+        );
+        assert_eq!(
+            read(&peer.last_screen_stats, "max_decode_gap_ms"),
+            Some(1_400)
+        );
+    }
+
+    /// Pins the hand-written key→field mapping in `set_ws_stream_counters`. Eight
+    /// mutually distinct deltas, so transposing any two keys — or offered with
+    /// dropped — decodes into the wrong field.
+    #[test]
+    fn create_health_packet_maps_each_ws_stream_key_to_its_own_field() {
+        // The netsim-driven bump below writes the process-global transport counters.
+        let _tx_guard = crate::test_serial::lock_transport_stream_counters();
+
+        use crate::connection::MediaStreamKey as K;
+        use videocall_transport::websocket::{
+            force_websocket_bytes_for_stream as bump,
+            websocket_dropped_bytes_for_stream as dropped_now,
+            websocket_offered_bytes_for_stream as offered_now,
+        };
+
+        let (audio, video, screen, control) = (
+            K::Audio.as_u8(),
+            K::Video.as_u8(),
+            K::Screen.as_u8(),
+            K::Control.as_u8(),
+        );
+        let want_offered = [
+            offered_now(audio) + 11,
+            offered_now(video) + 22,
+            offered_now(screen) + 33,
+            offered_now(control) + 44,
+        ];
+        let want_dropped = [
+            dropped_now(audio) + 55,
+            dropped_now(video) + 66,
+            dropped_now(screen) + 77,
+            dropped_now(control) + 88,
+        ];
+        bump(audio, 11, 55);
+        bump(video, 22, 66);
+        bump(screen, 33, 77);
+        bump(control, 44, 88);
+
+        let pb = health_packet_with_unistream_bytes(0, 0, 0);
+
+        assert_eq!(
+            [
+                pb.ws_offered_bytes_audio,
+                pb.ws_offered_bytes_video,
+                pb.ws_offered_bytes_screen,
+                pb.ws_offered_bytes_control,
+            ],
+            want_offered.map(Some),
+            "offered bytes must decode into the field for their own stream key",
+        );
+        assert_eq!(
+            [
+                pb.ws_dropped_bytes_audio,
+                pb.ws_dropped_bytes_video,
+                pb.ws_dropped_bytes_screen,
+                pb.ws_dropped_bytes_control,
+            ],
+            want_dropped.map(Some),
+            "dropped bytes must decode into the field for their own stream key",
+        );
+    }
+
+    /// A zero on the two aggregates is the absence claim they exist to support, so
+    /// it must reach the wire; the per-stream fields stay omitted at zero, matching
+    /// the `ws_offered_bytes_*` precedent and its cardinality cost.
+    #[test]
+    fn create_health_packet_emits_the_ws_inactive_aggregates_at_zero() {
+        let _tx_guard = crate::test_serial::lock_transport_stream_counters();
+
+        use videocall_transport::websocket::reset_websocket_inactive_counters_for_test as reset;
+        reset();
+
+        let pb = health_packet_with_unistream_bytes(0, 0, 0);
+
+        assert_eq!(pb.ws_inactive_dropped_frames_by_state_closing, Some(0));
+        assert_eq!(pb.ws_inactive_dropped_frames_by_state_closed, Some(0));
+        assert_eq!(
+            [
+                pb.ws_inactive_dropped_frames_audio,
+                pb.ws_inactive_dropped_frames_video,
+                pb.ws_inactive_dropped_frames_screen,
+                pb.ws_inactive_dropped_frames_control,
+                pb.ws_inactive_dropped_bytes_audio,
+                pb.ws_inactive_dropped_bytes_video,
+                pb.ws_inactive_dropped_bytes_screen,
+                pb.ws_inactive_dropped_bytes_control,
+            ],
+            [None; 8],
+            "a per-stream zero must stay off the wire",
+        );
+    }
+
+    /// Sibling of the offered/dropped mapping lock above, for the inactive-socket
+    /// family. All ten deltas are mutually distinct, so transposing any two of them
+    /// decodes into the wrong field.
+    #[test]
+    fn create_health_packet_maps_each_ws_inactive_key_to_its_own_field() {
+        let _tx_guard = crate::test_serial::lock_transport_stream_counters();
+
+        use crate::connection::MediaStreamKey as K;
+        use videocall_transport::websocket::{
+            force_websocket_inactive_drop_for_stream as bump,
+            websocket_inactive_dropped_bytes_for_stream as bytes_now,
+            websocket_inactive_dropped_frames_closed as closed_now,
+            websocket_inactive_dropped_frames_closing as closing_now,
+            websocket_inactive_dropped_frames_for_stream as frames_now,
+        };
+
+        let keys = [
+            K::Audio.as_u8(),
+            K::Video.as_u8(),
+            K::Screen.as_u8(),
+            K::Control.as_u8(),
+        ];
+        let plan = [
+            (2u64, 110u64, true),
+            (5, 220, true),
+            (3, 330, false),
+            (6, 440, false),
+        ];
+        let want_frames = [
+            frames_now(keys[0]) + plan[0].0,
+            frames_now(keys[1]) + plan[1].0,
+            frames_now(keys[2]) + plan[2].0,
+            frames_now(keys[3]) + plan[3].0,
+        ];
+        let want_bytes = [
+            bytes_now(keys[0]) + plan[0].0 * plan[0].1,
+            bytes_now(keys[1]) + plan[1].0 * plan[1].1,
+            bytes_now(keys[2]) + plan[2].0 * plan[2].1,
+            bytes_now(keys[3]) + plan[3].0 * plan[3].1,
+        ];
+        let want_closing = closing_now() + plan[0].0 + plan[1].0;
+        let want_closed = closed_now() + plan[2].0 + plan[3].0;
+        for (key, (count, size, closing)) in keys.into_iter().zip(plan) {
+            for _ in 0..count {
+                bump(key, size, closing);
+            }
+        }
+
+        let pb = health_packet_with_unistream_bytes(0, 0, 0);
+
+        assert_eq!(
+            [
+                pb.ws_inactive_dropped_frames_audio,
+                pb.ws_inactive_dropped_frames_video,
+                pb.ws_inactive_dropped_frames_screen,
+                pb.ws_inactive_dropped_frames_control,
+            ],
+            want_frames.map(Some),
+            "inactive frame counts must decode into the field for their own stream key",
+        );
+        assert_eq!(
+            [
+                pb.ws_inactive_dropped_bytes_audio,
+                pb.ws_inactive_dropped_bytes_video,
+                pb.ws_inactive_dropped_bytes_screen,
+                pb.ws_inactive_dropped_bytes_control,
+            ],
+            want_bytes.map(Some),
+            "inactive bytes must decode into the field for their own stream key",
+        );
+        assert_eq!(
+            pb.ws_inactive_dropped_frames_by_state_closing,
+            Some(want_closing)
+        );
+        assert_eq!(
+            pb.ws_inactive_dropped_frames_by_state_closed,
+            Some(want_closed)
+        );
+    }
+
     fn health_packet_with_camera_playout_stats(fps_received: f64) -> PbHealthPacket {
         let mut peer = PeerHealthData::new("peer-1".to_string());
         peer.last_camera_stats = Some(json!({
@@ -4731,6 +6206,10 @@ mod tests {
         let mut health_map = HashMap::new();
         health_map.insert("peer-1".to_string(), peer);
 
+        build_health_packet(health_map)
+    }
+
+    fn build_health_packet(health_map: HashMap<String, PeerHealthData>) -> PbHealthPacket {
         let wrapper = HealthReporter::create_health_packet(
             "session-id-test",
             "meeting-id-test",
@@ -4783,6 +6262,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -5071,6 +6551,193 @@ mod tests {
         );
     }
 
+    /// The `"video"` handler ends in `_ => {}`, so a missing arm silently drops its key —
+    /// which is why these values never left the client (#2524, #2541).
+    #[test]
+    fn loss_and_freshness_keys_survive_the_hop_and_fold_per_bucket() {
+        use crate::decode::peer_decoder::{MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        // Distinct per kind so a bucket misroute (#1641) fails.
+        let make_event = |media_type: &'static str, scale: f64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(media_type)),
+                },
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "video_seq_max_gap",
+                    value: MetricValue::U64(400 + scale as u64),
+                },
+                Metric {
+                    name: "freshness_evictions_total",
+                    value: MetricValue::U64(90 + scale as u64),
+                },
+                Metric {
+                    name: "freshness_evictions_keyframeless_total",
+                    value: MetricValue::U64(40 + scale as u64),
+                },
+            ],
+        };
+
+        let gap_only_event = |media_type: &'static str, gap: u64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 2_000,
+            metrics: vec![
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(media_type)),
+                },
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "video_seq_max_gap",
+                    value: MetricValue::U64(gap),
+                },
+            ],
+        };
+
+        HealthReporter::process_diagnostics_event(
+            make_event(MEDIA_TYPE_SCREEN, 7.0),
+            &peer_health_data,
+        );
+        HealthReporter::process_diagnostics_event(
+            make_event(MEDIA_TYPE_CAMERA, 3.0),
+            &peer_health_data,
+        );
+
+        // A SECOND, smaller gap per kind: the export must be the interval MAX, not the last.
+        HealthReporter::process_diagnostics_event(
+            gap_only_event(MEDIA_TYPE_SCREEN, 1),
+            &peer_health_data,
+        );
+        HealthReporter::process_diagnostics_event(
+            gap_only_event(MEDIA_TYPE_CAMERA, 0),
+            &peer_health_data,
+        );
+
+        let (camera_blob, screen_blob, maxes) = {
+            let mut map = peer_health_data.borrow_mut();
+            let peer = map
+                .get_mut("peer-1")
+                .expect("peer-1 health entry must exist");
+            (
+                peer.last_camera_stats
+                    .clone()
+                    .expect("camera bucket must exist"),
+                peer.last_screen_stats
+                    .clone()
+                    .expect("screen bucket must exist"),
+                peer.take_interval_maxes(),
+            )
+        };
+
+        assert_eq!(
+            maxes.camera_seq_gap_frames,
+            Some(403),
+            "interval MAX, not the trailing 0; None => the ingest arm is gone"
+        );
+        assert_eq!(
+            maxes.screen_seq_gap_frames,
+            Some(407),
+            "the screen bucket keeps its own max, not the camera's"
+        );
+
+        let mut camera = PbVideoStats::new();
+        fold_loss_diagnostics(&mut camera, &camera_blob, maxes.camera_seq_gap_frames);
+        let mut screen = PbVideoStats::new();
+        fold_loss_diagnostics(&mut screen, &screen_blob, maxes.screen_seq_gap_frames);
+
+        assert_eq!(camera.max_seq_gap_frames, Some(403));
+        assert_eq!(screen.max_seq_gap_frames, Some(407));
+        assert_eq!(camera.freshness_evictions_total, Some(93));
+        assert_eq!(camera.freshness_evictions_keyframeless_total, Some(43));
+        assert_eq!(screen.freshness_evictions_total, Some(97));
+        assert_eq!(screen.freshness_evictions_keyframeless_total, Some(47));
+
+        let mut absent = PbVideoStats::new();
+        fold_loss_diagnostics(&mut absent, &json!({}), None);
+        assert_eq!(absent.max_seq_gap_frames, None);
+        assert_eq!(absent.freshness_evictions_total, None);
+    }
+
+    /// #2249: the `decode_eligible` metric must survive the metric->json hop into the right
+    /// per-kind bucket. Nothing else covers this arm — every other test here writes the blob
+    /// directly and bypasses the hop, so deleting the arm would leave them all green while
+    /// production silently fell back to the fail-open `true`.
+    ///
+    /// MUTATION: deleting the ingest arm makes both lookups `None`; swapping the buckets, or
+    /// renaming the metric on either side of the hop, fails the value assertions.
+    #[test]
+    fn decode_eligible_survives_the_metric_to_json_hop_per_bucket() {
+        use crate::decode::peer_decoder::{MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let make_event = |media_type: &'static str, eligible: u64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(media_type)),
+                },
+                Metric {
+                    name: "from_peer",
+                    value: MetricValue::Text(Cow::Borrowed("reporter")),
+                },
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                // The exact metric name `send_diagnostic_packets` emits.
+                Metric {
+                    name: "decode_eligible",
+                    value: MetricValue::U64(eligible),
+                },
+            ],
+        };
+
+        HealthReporter::process_diagnostics_event(
+            make_event(MEDIA_TYPE_SCREEN, 0),
+            &peer_health_data,
+        );
+        HealthReporter::process_diagnostics_event(
+            make_event(MEDIA_TYPE_CAMERA, 1),
+            &peer_health_data,
+        );
+
+        let map = peer_health_data.borrow();
+        let peer = map.get("peer-1").expect("peer-1 health entry must exist");
+
+        assert!(
+            !decode_eligible_from(&peer.last_screen_stats),
+            "the backgrounded SCREEN tile must read NOT eligible through the production              accessor; None here means the ingest arm is gone and the gate never engages"
+        );
+        assert!(
+            decode_eligible_from(&peer.last_camera_stats),
+            "the CAMERA bucket must keep its own value, NOT inherit the screen's 0"
+        );
+    }
+
     /// Issue 2029: `process_diagnostics_event` must surface the per-peer WT
     /// audio-datagram loss sample (peer id + pkt/s) so the subscription loop can
     /// forward it into the connection layer's fallback detector — INCLUDING a
@@ -5236,63 +6903,67 @@ mod tests {
         let mut health_map = HashMap::new();
         health_map.insert("peer-1".to_string(), peer);
 
-        let wrapper = HealthReporter::create_health_packet(
-            "session-id-test",
-            "meeting-id-test",
-            "reporting-peer",
-            "Display Name",
-            &health_map,
-            true,
-            true,
-            None,
-            Some("webtransport".to_string()),
-            Some(42.0),
-            None,
-            None,
-            None,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,   // unistream_stale_delta_drops_total (#1737 Phase 1)
-            0.0, // encoder_queue_depth_report
-            0.0, // encoder_target_bitrate_kbps
-            0,
-            false,
-            0,
-            None, // screen_encoder_output_fps (#2147: unwired => omitted)
-            0,    // effective_video_layers (#1143)
-            0,    // active_video_layers (#1143)
-            Vec::new(),
-            ClimbLimiterSnapshot::default(),
-            Vec::new(),
-            0,
-            0,
-            0,            // rtt_probe_dropped_total
-            0,            // rtt_probe_stale_suppressions_total
-            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
-            Vec::new(),
-            None,
-            ClientMetadata::default(),
-            None, // #1482: client_main_thread_load
-            None,
-            None,
-            0,                             // effective_screen_layers (#1561)
-            0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
-            HashMap::new(),                // received_layers (#1561)
-            WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
-            Vec::new(),                    // camera_layer_metrics (#2170)
-        )
-        .expect("create_health_packet returns Some unconditionally");
+        build_health_packet(health_map)
+    }
 
-        PbHealthPacket::parse_from_bytes(&wrapper.data)
-            .expect("HealthPacket payload must be valid protobuf")
+    /// BOTH streams on ONE peer: with the other bucket empty, a `fold_loss_diagnostics` call
+    /// site reading the wrong blob falls back to the right one and the transposition survives.
+    fn health_packet_with_both_streams_loss_pli() -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.last_camera_stats = Some(json!({
+            "fps_received": 0.0,
+            "video_seq_loss_per_sec": 12.5,
+            "keyframe_requests_per_sec": 2.5,
+        }));
+        peer.last_screen_stats = Some(json!({
+            "fps_received": 0.0,
+            "video_seq_loss_per_sec": 3.25,
+            "keyframe_requests_per_sec": 0.75,
+        }));
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        build_health_packet(health_map)
+    }
+
+    /// #2524: loss and PLI reach BOTH `VideoStats` buckets at fps 0, not just camera.
+    #[test]
+    fn loss_and_pli_fold_into_both_video_stats_buckets_at_fps_zero() {
+        let pb = health_packet_with_both_streams_loss_pli();
+        let peer = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present");
+        let camera = peer
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+        let screen = peer
+            .screen_video_stats
+            .as_ref()
+            .expect("screen video stats must be present");
+
+        assert_eq!(camera.fps_received, 0.0);
+        assert_eq!(camera.video_seq_loss_per_sec, Some(12.5));
+        assert_eq!(camera.keyframe_requests_per_sec, Some(2.5));
+
+        assert_eq!(screen.fps_received, 0.0);
+        assert_eq!(
+            screen.video_seq_loss_per_sec,
+            Some(3.25),
+            "3.25, not the camera's 12.5 — a fold reading the wrong blob fails here"
+        );
+        assert_eq!(
+            screen.keyframe_requests_per_sec,
+            Some(0.75),
+            "0.75, not the camera's 2.5"
+        );
+
+        let mut absent = PbVideoStats::new();
+        fold_loss_diagnostics(&mut absent, &json!({}), None);
+        assert_eq!(absent.video_seq_loss_per_sec, None);
+        assert_eq!(absent.keyframe_requests_per_sec, None);
     }
 
     /// #1660 END-TO-END BLOCKER GUARD: the server's screen playout gauges read
@@ -5428,6 +7099,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("create_health_packet returns Some unconditionally");
 
@@ -5546,6 +7218,7 @@ mod tests {
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
+            HashMap::new(),                // staleness_max_ms (#2511)
         )
         .expect("empty peer map must still produce a packet");
 

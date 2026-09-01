@@ -56,6 +56,9 @@ import {
   enterTwoUserMeeting,
   guestJoinsMeeting,
 } from "../helpers/two-user-meeting";
+// Issue 2329's chime pitches, imported rather than copied — see
+// `handChimeTonesPlayed` for why a local copy here was a silent-failure hazard.
+import { HAND_TONE_HIGH, TONE_EPSILON } from "../helpers/hand-chime-tones";
 
 // ---------------------------------------------------------------------------
 // Selectors
@@ -194,10 +197,30 @@ const URGENCY_STEP_TIMEOUT = 60_000;
  * of THREE oscillators (`FREQ`/`TONES` in `meeting_timer.rs`), so counting 880s
  * is an unambiguous fingerprint of that function having run to completion.
  *
- * 880 is unique to it. The only other synthesized cues in the meeting are the
- * join and leave tone pairs (`play_tone_pair(523.25, 659.25, ...)` and
- * `(659.25, 440.0, ...)` in `attendants.rs`), and the gain values this also
- * records are 0.35 / 0.25 — nothing else in the app touches 880.
+ * 880 IS UNIQUE TO IT. Every synthesized cue in the meeting (`attendants.rs`,
+ * `meeting_timer.rs`) is accounted for here:
+ *
+ *     join          play_tone_pair(523.25,  659.25, ...)
+ *     leave         play_tone_pair(659.25,  440.0,  ...)
+ *     hand raised   play_tone_pair(987.77,  1318.51, ...)
+ *     hand lowered  play_tone_pair(1318.51, 987.77,  ...)
+ *     timer expired 880 x 3
+ *
+ * Nothing but the expiry cue touches 880, so counting 880s remains an
+ * unambiguous fingerprint for `play_timer_expired_sound`.
+ *
+ * THIS PARAGRAPH HAS BEEN WRONG ONCE, which is why the guard below exists.
+ * Issue 2329 briefly pitched the hand chime at A5 (880 Hz) and D6, and for that
+ * window the claim above was false while still reading as true — the counts here
+ * stayed correct only because this spec happens never to raise a hand. The
+ * chime was then moved to B5/E6 specifically to restore this discriminator
+ * rather than leave it depending on an accident. `handChimeTonesPlayed` now
+ * enforces the separation on every run of the expiry test, so a future cue that
+ * lands on 880 fails loudly here instead of silently corrupting the counts.
+ *
+ * The gain values this also records are 0.35 / 0.25 for join/leave and
+ * 0.15 / 0.12 for the hand chimes — all well below 880, so none of them can be
+ * mistaken for a frequency by the filters here.
  *
  * Patching the PROTOTYPE rather than the constructor means the recording is
  * transparent: the real `AudioContext` still runs, so nothing about the app's
@@ -300,6 +323,37 @@ async function expiryTonesPlayed(page: Page): Promise<number> {
     const tones = (window as Window & { __vcTimerTones?: number[] }).__vcTimerTones ?? [];
     return tones.filter((v) => v === 880).length;
   });
+}
+
+/**
+ * How many raise-hand chime tones (issue 2329) the page has synthesized.
+ *
+ * A STANDING DECOUPLING GUARD, kept deliberately even though the hand chime no
+ * longer shares a pitch with the expiry cue. Its job is to make sure it never
+ * does again: `expiryTonesPlayed` is a bare `=== 880`, so the counts asserted in
+ * the expiry test are attributable to the timer only while no other cue emits
+ * 880. That was briefly untrue during issue 2329 (see `AUDIO_TONE_SPY`), and it
+ * was untrue in the worst possible way — invisibly. Five lines that turn a
+ * future re-collision into a loud failure are cheaper than discovering it from
+ * a passing test.
+ *
+ * Detects the hand pair by its HIGH endpoint (E6), which appears in both
+ * directions of the chime, so one filter covers a raise and a lower alike.
+ *
+ * The pitch and tolerance are imported from `helpers/hand-chime-tones.ts`
+ * rather than written here. That is the whole point of the shared module: this
+ * used to be a second hardcoded copy, and a stale copy would match nothing,
+ * count zero, and PASS — reporting "no hand chime interfered" for exactly the
+ * reason that makes the report worthless.
+ */
+async function handChimeTonesPlayed(page: Page): Promise<number> {
+  return page.evaluate(
+    ({ high, eps }) => {
+      const tones = (window as Window & { __vcTimerTones?: number[] }).__vcTimerTones ?? [];
+      return tones.filter((v) => Math.abs(v - high) < eps).length;
+    },
+    { high: HAND_TONE_HIGH, eps: TONE_EPSILON },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -716,6 +770,13 @@ test.describe("Meeting timer (issue 2136)", () => {
         await expiryTonesPlayed(guestPage),
         "the expiry cue must fire ONCE per timer — two heartbeats have landed since",
       ).toBe(3);
+      // ...and every one of those 880s belongs to the timer. Issue 2329's hand
+      // chime uses A5 too, so this is what makes the count above attributable
+      // rather than merely correct-looking. See `AUDIO_TONE_SPY`.
+      expect(
+        await handChimeTonesPlayed(guestPage),
+        "no hand chime may sound in this spec — the 880 Hz count above is the timer's alone",
+      ).toBe(0);
     } finally {
       await hostBrowser.close();
       await guestBrowser.close();

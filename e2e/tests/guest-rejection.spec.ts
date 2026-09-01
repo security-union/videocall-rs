@@ -258,9 +258,15 @@ test.describe("Guest rejection flow", () => {
     // 6. A second join attempt by the same guest session must land back in
     //    "waiting" (the server resets their row) rather than bypassing
     //    rejection entirely.  This guards against a status-reset bypass.
+    //    The observer token is required: `resolve_guest_identity` (issue #2331)
+    //    only honours a client-supplied `guest_session_id` when a matching guest
+    //    token is presented, and mints a fresh identity otherwise.
     const rejoinRes = await fetch(`${API_URL}/api/v1/meetings/${meetingId}/join-guest`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${guestObserverToken}`,
+      },
       body: JSON.stringify({
         display_name: "APIRejectedGuest",
         guest_session_id: guestUserId,
@@ -268,8 +274,15 @@ test.describe("Guest rejection flow", () => {
     });
     expect(rejoinRes.ok, "re-join after rejection should succeed").toBe(true);
     const rejoinJson = await rejoinRes.json();
-    // After rejection, re-joining puts the guest back in "waiting" (not
-    // "admitted") — the host must explicitly re-admit them.
+    // The status assertion below only means anything if the server actually
+    // resumed the REJECTED identity.  A fresh `guest:<uuid>` is a brand-new row
+    // that is trivially "waiting", which would pass the status check while
+    // testing nothing.
+    expect(
+      rejoinJson.result.user_id,
+      `re-join must resume the same guest identity, not mint a fresh one; ` +
+        `expected '${guestUserId}', got '${rejoinJson.result.user_id}'`,
+    ).toBe(guestUserId);
     expect(
       ["waiting", "rejected"].includes(rejoinJson.result.status),
       `re-join after rejection must be 'waiting' or 'rejected', got '${rejoinJson.result.status}'`,

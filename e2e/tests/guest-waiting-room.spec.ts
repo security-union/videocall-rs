@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { patchMeetingSettings } from "../helpers/meeting-api";
 import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -38,32 +39,6 @@ async function createMeetingViaApi(
   }
   const json = await res.json();
   return json.result.meeting_id as string;
-}
-
-/** PATCH meeting settings (ownership check enforced by the API). */
-async function patchMeetingSettings(
-  hostEmail: string,
-  hostName: string,
-  meetingId: string,
-  settings: {
-    admitted_can_admit?: boolean;
-    waiting_room_enabled?: boolean;
-    end_on_host_leave?: boolean;
-  },
-): Promise<void> {
-  const token = generateSessionToken(hostEmail, hostName);
-  const res = await fetch(`${API_URL}/api/v1/meetings/${meetingId}`, {
-    method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-      Cookie: `${COOKIE_NAME}=${token}`,
-    },
-    body: JSON.stringify(settings),
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`PATCH /api/v1/meetings/${meetingId} failed (${res.status}): ${body}`);
-  }
 }
 
 /** Have the host join via the UI home-page flow, activating the meeting. */

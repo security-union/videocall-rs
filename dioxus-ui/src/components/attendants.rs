@@ -22,12 +22,12 @@ use crate::components::action_bar_layout::{
     DEFAULT_SLOTS,
 };
 use crate::components::decode_budget::{
-    build_decoded_bucket, build_unified_render_list, decide_step, effective_cap,
-    expand_decoded_for_requested, ios_decode_tile_ceiling, is_sole_real_tile, merge_pinned_decode,
-    merge_user_requested_decode, partition_camera_tiles, presenter_cap_ceiling,
-    presenter_extra_shed_pressure, promote_requested_into_decoded,
-    should_clear_force_decode_on_override_change, BudgetSample, BudgetState, BudgetStep,
-    TileRenderMode, MIN_CAP,
+    build_decoded_bucket, build_peer_tile_hints, build_unified_render_list, decide_step,
+    effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling, is_sole_real_tile,
+    merge_pinned_decode, merge_user_requested_decode, partition_camera_tiles, plan_decode_publish,
+    presenter_cap_ceiling, presenter_extra_shed_pressure, promote_requested_into_decoded,
+    should_clear_force_decode_on_override_change, viewport_roster, BudgetSample, BudgetState,
+    BudgetStep, TileRenderMode, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::decode_paused_pill::DecodePausedPill;
@@ -39,9 +39,11 @@ use crate::components::{
         next_pin_target, speak_style, transport_badge, transport_badge_from_str, PinnedTile,
         TileMode, TransportBadge,
     },
+    chat_sidebar::ChatSidebar,
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     emoji_picker::EmojiPicker,
+    grid_overflow_badge::GridOverflowBadge,
     host::Host,
     host_controls::HostControls,
     icons::raised_hand::RaisedHandIcon,
@@ -55,10 +57,10 @@ use crate::components::{
     reactions_overlay::ReactionsOverlay,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
-        js_state_to_record_button_state, CameraButton, DensityModeButton, DeviceSettingsButton,
-        DiagnosticsButton, HangUpButton, MeetingOptionsButton, MeetingTimerButton, MicButton,
-        MockPeersButton, PeerListButton, RaiseHandButton, ReactionsButton, RecordButton,
-        RecordButtonState, ScreenShareButton,
+        js_state_to_record_button_state, CameraButton, ChatButtonWithBadge, DensityModeButton,
+        DeviceSettingsButton, DiagnosticsButton, HangUpButton, MeetingOptionsButton,
+        MeetingTimerButton, MicButton, MockPeersButton, PeerListButton, RaiseHandButton,
+        ReactionsButton, RecordButton, RecordButtonState, ScreenShareButton,
     },
 };
 use crate::console_log_collector::{
@@ -95,10 +97,13 @@ use crate::components::reactions::{
     REACTION_FLOAT_LIFETIME_MS, REACTION_PALETTE_AUTOHIDE_MS, REACTION_SR_THROTTLE_MS,
 };
 // Issue 2135: the raised-hand roster store (ordering + copy) and its banner.
+// Issue 2329 adds the raise/lower chime policy to the same module — the decision
+// is pure and lives there; the tone pair it resolves to is played here.
 use crate::components::raised_hands::{
-    clear_raised_hand, clear_self_raised_hand, resync_self_session_id, set_raised_hand,
-    set_self_raised_hand, would_clear_raised_hand_change, would_set_raised_hand_change, RaisedHand,
-    RaisedHandsBanner, RaisedHandsLiveRegion, SELF_RAISED_HAND_BADGE_LABEL,
+    clear_raised_hand, clear_self_raised_hand, hand_sound_to_play, resync_self_session_id,
+    set_raised_hand, set_self_raised_hand, would_clear_raised_hand_change,
+    would_set_raised_hand_change, HandSound, HandSoundChannel, RaisedHand, RaisedHandsBanner,
+    RaisedHandsLiveRegion, SELF_RAISED_HAND_BADGE_LABEL,
 };
 // Issue 2136: the host-set meeting countdown. The chip and the live region are
 // the ONLY readers of `MeetingTimerCtx`; this module provides the context and
@@ -628,6 +633,103 @@ fn play_user_joined() {
 fn play_user_left() {
     // Descending two-tone: E5 -> A4 (subtle, muted)
     play_tone_pair(659.25, 440.0, 0.12, 0.25);
+}
+
+// ── Raised-hand chimes (issue 2329) ──────────────────────────────────────────
+//
+// Deliberately distinguishable from the join/leave chimes above on TWO
+// independent cues, because one is not enough to tell these events apart by ear:
+//
+//   * REGISTER. The hand chimes sit at B5-E6 (988-1319 Hz), clear of the
+//     join/leave band (A4-E5, 440-659 Hz). Pitch height is the most reliable of
+//     the cues available here — the tone pair's timbre and envelope are shared,
+//     so timbre cannot carry the distinction.
+//   * INTERVAL. A perfect FOURTH (B5->E6), against the join chime's major third
+//     (C5->E5) and the leave chime's perfect fifth (E5->A4). Register alone
+//     would have made "hand lowered" a transposed copy of "participant left",
+//     since that one is also a descending fifth.
+//
+// NONE of these four frequencies may be 880.0, and that is a HARD CONSTRAINT
+// rather than taste. `play_timer_expired_sound` emits 880, and
+// `e2e/tests/meeting-timer.spec.ts` fingerprints that cue by counting tones
+// exactly equal to 880 — so a hand chime at 880 would silently destroy that
+// spec's discriminator and falsify its doc comment. The band also stays ABOVE
+// 880 rather than straddling it: the count is an exact-equality test, but a hand
+// chime sitting perceptually next to the timer cue is the failure a user would
+// actually notice. For the same reason none of these equals 440.0 / 523.25 /
+// 659.25, the join and leave endpoints.
+//
+// Quieter and shorter than both existing chimes, per the issue's word "subtle":
+// peak gain 0.15 / 0.12 against 0.35 / 0.25, and 0.09s per tone (180ms total)
+// against 0.12s (240ms). The gain can come down this far BECAUSE of the
+// register, not in spite of it — the ear is markedly more sensitive around
+// 1 kHz than around 550 Hz, so 0.15 up here reads at roughly the loudness of
+// the join chime's 0.35 down there, and anything higher stops being subtle.
+//
+// Direction follows the established idiom: ascending for the "up" event,
+// descending for the "down" one, the lower chime being the exact retrograde of
+// the raise so the pair reads as one gesture and its reverse.
+
+/// A hand went up: ascending B5 -> E6.
+fn play_hand_raised() {
+    play_tone_pair(987.77, 1318.51, 0.09, 0.15);
+}
+
+/// A hand came down: the exact retrograde, E6 -> B5, quieter still.
+fn play_hand_lowered() {
+    play_tone_pair(1318.51, 987.77, 0.09, 0.12);
+}
+
+/// Decide-and-play for ONE raised-hand level transition (issue 2329).
+///
+/// The single place hand audio is emitted. Both call sites — the inbound
+/// `on_raise_hand` packet handler and the local `toggle_raise_hand` — go through
+/// here, so neither can acquire its own idea of the gates, and the departure
+/// cleanup (`OnPeerLeftAction::ClearRaisedHand`) is silent simply by not calling
+/// it. That structural omission is deliberate: a participant who disconnects
+/// with a hand up did not lower it, and their departure already has its own
+/// leave chime.
+///
+/// `channel` is a `Cell`, not a `Signal`: nothing renders from it, and a signal
+/// write would dirty `AttendantsComponent` on every chime for no rendered change
+/// (the #1296 / #2103 blast-radius hazard the roster comments describe).
+///
+/// The watermark advances ONLY when a chime actually plays. Advancing it on a
+/// suppressed event would let a stream of gated events hold the gate shut
+/// forever — the rate limiter would keep re-arming itself from traffic it never
+/// let through.
+/// `session_id` is `Some` for a REMOTE peer and `None` for the local user, and
+/// `raised_at_ms` is the sender's own stamp from the packet (`0` / ignored for a
+/// lower, and for the local path). One `Option` rather than a separate `is_self`
+/// flag on purpose: the two can then never disagree.
+fn maybe_play_hand_sound(
+    channel: &Rc<Cell<HandSoundChannel>>,
+    session_id: Option<u64>,
+    raised_at_ms: f64,
+    enabled: bool,
+    was_raised: bool,
+    now_raised: bool,
+) {
+    let now_ms = js_sys::Date::now();
+    let is_self = session_id.is_none();
+    let Some(sound) = hand_sound_to_play(
+        channel.get(),
+        raised_at_ms,
+        enabled,
+        is_self,
+        now_ms,
+        was_raised,
+        now_raised,
+    ) else {
+        return;
+    };
+    let mut next = channel.get();
+    next.last_played_ms = now_ms;
+    channel.set(next);
+    match sound {
+        HandSound::Raised => play_hand_raised(),
+        HandSound::Lowered => play_hand_lowered(),
+    }
 }
 
 // Deferred leave-sound debounce for the exit-notifications-OFF + exit-sound-ON
@@ -1270,7 +1372,7 @@ fn schedule_reconnect_no_jwt(
 
 use super::attendants_layout::{
     compute_effective_density, compute_layout, promote_speakers, screen_share_pinned_tile_size,
-    TILE_AR,
+    select_display_candidates, sort_camera_off_window, TILE_AR,
 };
 use super::density::{next_density_mode, DensityMode, DENSITY_MODES};
 
@@ -1996,6 +2098,19 @@ fn overflow_slot_icon(slot: ActionBarSlot) -> Element {
         ActionBarSlot::MeetingTimer => rsx! {
             MeetingTimerIcon { decorative: true }
         },
+        ActionBarSlot::Chat => rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" }
+            }
+        },
         // Issue #1884: Reactions (smiley), mirroring the ReactionsButton glyph.
         ActionBarSlot::Reactions => rsx! {
             svg {
@@ -2660,6 +2775,9 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    let mut chat_open = use_signal(|| false);
+    // True when a chat message has arrived while the sidebar is closed.
+    let mut chat_has_unread = use_signal(|| false);
     // Latch: set true the first time the Diagnostics drawer is opened, never
     // reset. Once the drawer has been opened at least once, CLOSING it keeps a
     // lightweight `#diagnostics-sidebar` placeholder in the DOM (without the
@@ -3255,6 +3373,13 @@ pub fn AttendantsComponent(
     // component drops and CANCELS it — a forgotten timer writing a signal on a
     // dropped scope panics in dioxus-signals 0.7.
     let raise_hand_timer: Signal<Option<Timeout>> = use_signal(|| None);
+    // Issue 2329: the raise/lower chime channel — when we last connected, and
+    // when the chime last sounded. `use_hook` + `Cell`, NOT a signal, for the
+    // same reason `raise_hand_announcer` is: nothing renders from it, so it must
+    // never dirty this ~9,000-line RSX. Starts MUTE (`connected_at_ms: None`)
+    // and is re-stamped by `on_connected` below, which is what makes the initial
+    // roster replay — and the identical replay after every reconnect — silent.
+    let hand_sound_channel = use_hook(|| Rc::new(Cell::new(HandSoundChannel::default())));
     // Screen-reader announcement channel + its throttle state. Peer reactions
     // are buffered in `reaction_sr_buffer` and flushed to `reaction_announcement`
     // at most once per REACTION_SR_THROTTLE_MS; `reaction_sr_flush_scheduled`
@@ -3915,13 +4040,6 @@ pub fn AttendantsComponent(
             enable_webtransport: effective_wt_enabled,
             max_received_layer: crate::constants::max_received_layer(),
             skip_canvas_paint: crate::constants::skip_canvas_paint(),
-            // Issue #2156: the deployment's CAMERA ladder, so this receiver's rung
-            // labels / {w}x{h} / ~kbps readouts describe the stream it actually
-            // decodes. Read here (not inside videocall-client) because only the UI
-            // can see `window.__APP_CONFIG`. ALL FOUR client-construction sites must
-            // pass this — see `dioxus-ui/tests/reduced_ladder_receive_labels.rs`,
-            // which pins the set.
-            camera_ladder_variant: crate::constants::camera_ladder_variant(),
             // Issue 1884: reaction receive callback. Fires ONLY for peers (the
             // relay self-skips the sender, so our own reaction never comes back
             // over the wire — the UI renders its own "You" echo on click). The
@@ -4008,9 +4126,21 @@ pub fn AttendantsComponent(
             // replacement for it — they share `is_peer_entry` with the mutators
             // precisely so the two answers cannot diverge.
             on_raise_hand: {
+                let hand_sound_channel = hand_sound_channel.clone();
                 Some(VcCallback::from(
                     move |(session_id, raised, raised_at_ms, name): (u64, bool, u64, String)| {
                         let mut hands = raised_hands;
+                        // Issue 2329: the level we held for this session BEFORE
+                        // this packet. `would_clear_raised_hand_change` is
+                        // exactly "is this peer's hand currently up" — reusing
+                        // the production predicate rather than re-deriving the
+                        // membership test is what keeps the chime's idea of the
+                        // peer keyspace from drifting from the mutators' (both
+                        // route through `is_peer_entry`).
+                        //
+                        // Read BEFORE any mutation, and it is a `peek` — no
+                        // subscription, no allocation.
+                        let was_raised = would_clear_raised_hand_change(&hands.peek(), session_id);
                         if raised {
                             let incoming = RaisedHand {
                                 session_id,
@@ -4018,22 +4148,44 @@ pub fn AttendantsComponent(
                                 name,
                                 is_self: false,
                             };
-                            if !would_set_raised_hand_change(&hands.peek(), &incoming) {
-                                return;
+                            if would_set_raised_hand_change(&hands.peek(), &incoming) {
+                                let mut next = hands.peek().clone();
+                                if set_raised_hand(&mut next, incoming) {
+                                    hands.set(next);
+                                }
                             }
-                            let mut next = hands.peek().clone();
-                            if set_raised_hand(&mut next, incoming) {
-                                hands.set(next);
-                            }
-                        } else {
-                            if !would_clear_raised_hand_change(&hands.peek(), session_id) {
-                                return;
-                            }
+                        } else if was_raised {
+                            // `was_raised` IS `would_clear_raised_hand_change`
+                            // for this session, so the redundant-packet guard is
+                            // the value we already computed — one fewer peek than
+                            // before, with identical semantics.
                             let mut next = hands.peek().clone();
                             if clear_raised_hand(&mut next, session_id) {
                                 hands.set(next);
                             }
                         }
+                        // Issue 2329. Reached UNCONDITIONALLY — the two early
+                        // `return`s this replaced were load-bearing perf guards,
+                        // but leaving them in front of the chime would have made
+                        // the audio depend on where they sat. It is gated on the
+                        // LEVEL transition, so the two cases the guards covered
+                        // (an identical re-announce, and a lower for a hand that
+                        // is already down) resolve to `None` here on their own.
+                        //
+                        // That level gating is also what makes a LATE DISPLAY
+                        // NAME silent: it slips past `would_set_raised_hand_change`
+                        // (the roster genuinely changes — the name updates in
+                        // place) but it is still `true -> true`, so it is not a
+                        // raise. A "did the roster change" gate would chime for a
+                        // name resolving.
+                        maybe_play_hand_sound(
+                            &hand_sound_channel,
+                            Some(session_id),
+                            raised_at_ms as f64,
+                            appearance_settings.peek().play_hand_raise_sound,
+                            was_raised,
+                            raised,
+                        );
                     },
                 ))
             },
@@ -4093,6 +4245,7 @@ pub fn AttendantsComponent(
                 let host_reconcile_meeting_id = id.clone();
                 let raise_hand_announcer = raise_hand_announcer.clone();
                 let client_cell_for_hand = client_for_reconnect.clone();
+                let hand_sound_channel_for_connect = hand_sound_channel.clone();
                 VcCallback::from(move |_| {
                     log::info!("DIOXUS-UI: Connection established");
                     let mut connection_error = connection_error;
@@ -4101,6 +4254,37 @@ pub fn AttendantsComponent(
                     connection_error.set(None);
                     call_start_time.set(Some(js_sys::Date::now()));
                     session_loaded.set(true);
+
+                    // Issue 2329 ANTI-STORM REFERENCE INSTANT. Stamp when WE
+                    // joined; `raise_happened_after_we_joined` compares each
+                    // inbound raise's own `raised_at_ms` against it. This is not
+                    // the start of a window — nothing expires — so how long the
+                    // replay takes to arrive is irrelevant, which is the whole
+                    // point (two window designs died on that timing, 5/5).
+                    //
+                    // Unconditional, and on EVERY connect rather than the first.
+                    // A reconnect's member-list replay drives every peer through
+                    // `on_peer_left` (whose `ClearRaisedHand` arm runs BEFORE the
+                    // reconnect early-return, tearing down every raised hand) and
+                    // then back through `on_peer_joined`, which makes each of
+                    // them re-announce. Re-stamping here means every one of those
+                    // replayed hands was raised before the NEW instant and is
+                    // therefore silent, while a genuine post-reconnect raise
+                    // still speaks — one rule, no special case.
+                    //
+                    // Placed at the TOP of this callback, ahead of the re-announce
+                    // self-heal below and ahead of any inbound media, so no
+                    // replayed packet can be compared against a stale instant. It
+                    // uses its OWN stamp rather than reading `call_start_time` so
+                    // a future change to that signal's lifecycle cannot silently
+                    // un-gate the chimes.
+                    //
+                    // `last_played_ms` is deliberately CARRIED OVER rather than
+                    // reset: the rate limiter is about what the user's ears just
+                    // heard, and a reconnect does not un-hear it.
+                    let mut channel = hand_sound_channel_for_connect.get();
+                    channel.connected_at_ms = Some(js_sys::Date::now());
+                    hand_sound_channel_for_connect.set(channel);
 
                     // Issue 2135 RECONNECT SELF-HEAL. A transport gap can desync
                     // the room's view of our hand in BOTH directions: a genuine
@@ -4722,6 +4906,12 @@ pub fn AttendantsComponent(
                         let mut rec_ids = recording_peer_ids;
                         let mut hands = raised_hands;
                         let departing_session_u64 = session_id.parse::<u64>().ok();
+                        // Issue 2329: drop this peer's replay deadline, and sweep
+                        // any other that has expired. Unconditional — it runs
+                        // ahead of the reconnect early-return below — because the
+                        // map must not accumulate one stale entry per session for
+                        // the life of a long, churning meeting. A rejoin writes a
+                        // fresh deadline via `on_peer_joined` anyway.
                         let departing_session_raised = departing_session_u64
                             .map(|sid| hands.peek().iter().any(|h| h.session_id == sid))
                             .unwrap_or(false);
@@ -4854,6 +5044,17 @@ pub fn AttendantsComponent(
                             user_id,
                             session_id
                         );
+
+                        // Issue 2329 note: this callback deliberately does NOT
+                        // feed the hand-chime gate any more. An earlier design
+                        // opened a per-peer replay window here, on the reasoning
+                        // that the relay introduces us and the peer to each other
+                        // simultaneously. Instrumentation disproved it — the
+                        // introductions landed 1.9 s BEFORE our own
+                        // `on_connected` and the re-announces 5.5 s after the
+                        // introductions, so the window was long expired. The gate
+                        // now compares the sender's own `raised_at_ms` against
+                        // our join instant and needs no event here at all.
 
                         // Issue 2135 RE-ANNOUNCE: the relay keeps no hand
                         // registry, so a hand raised BEFORE this peer joined only
@@ -6387,13 +6588,14 @@ pub fn AttendantsComponent(
         let task = spawn(async move {
             let client_for_budget = client_for_budget.clone();
             use crate::components::decode_budget::{
-                cascade_action, decide_step_with_median, in_distress, lower_layer_cap,
-                median_render_fps, next_layer_drop_ms, non_distress_growth_allowed,
-                non_distress_growth_qualifying, protective_emergency_cap,
-                protective_encoder_layer_ceiling, re_arm_cascade_after_recovery,
-                recovery_qualifying, settle_window_elapsed, severe_label, suppress_growth_step,
-                tick_protective_mode, CascadeAction, DistressSignals, ProtectiveModeState,
-                ProtectiveTransition, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
+                advance_observed_session, budget_reset_actions, cascade_action,
+                decide_step_with_median, in_distress, lower_layer_cap, median_render_fps,
+                next_layer_drop_ms, non_distress_growth_allowed, non_distress_growth_qualifying,
+                protective_emergency_cap, protective_encoder_layer_ceiling,
+                re_arm_cascade_after_recovery, recovery_qualifying, settle_window_elapsed,
+                severe_label, suppress_growth_step, tick_protective_mode, CascadeAction,
+                DistressSignals, ProtectiveModeState, ProtectiveTransition, STEP_UP_COOLDOWN_MS,
+                SUSTAIN_SAMPLES,
             };
             use crate::context::ProtectiveModeReport;
             use videocall_diagnostics::{now_ms, recv_loop_action, MetricValue, RecvLoopAction};
@@ -6460,28 +6662,15 @@ pub fn AttendantsComponent(
                 cap: *decode_budget_cap.peek(),
                 last_step_ms: 0.0,
                 direction_hold: 0,
-                // #1557: cascade state starts clean on loop init. NOTE: this loop is
-                // built ONCE (use_effect) and persists across reconnects — it is NOT
-                // rebuilt per call session, and an in-place `client.connect()` reconnect
-                // does not remount this component. So this initializer alone does NOT
-                // protect against settle/at-floor leaking across a reconnect; that is
-                // handled by the SESSION-RESET re-arm below (peer count collapsing to
-                // MIN_CAP on `clear_all_peers`), which fires on BOTH WT and WS.
+                // #1557: clean here; a reconnect is handled by the #2271 re-arm below.
                 last_layer_drop_ms: 0.0,
                 layers_at_floor: false,
             };
             // Tracks the last override we acted on so we can detect a transition
             // back to Auto and cleanly re-seed `state` from the live cap.
             let mut last_override = *decode_budget_override.peek();
-            // #1557: tracks the previous live tile count so the loop can detect a
-            // SESSION-RESET edge (peer count collapsing to the MIN_CAP floor). On a
-            // reconnect the client clears all peers (`clear_all_peers` runs on
-            // ConnectionState::Failed, transport-agnostic), so `decode_budget_natural`
-            // collapses to MIN_CAP and peers re-join FRESH at top layer; we re-arm the
-            // cascade on that edge so stale at-floor/settle timing cannot leak across
-            // the reconnect. Seeded from the live count so a session that starts with
-            // peers already present does not spuriously fire on the first tick.
             let mut prev_natural = *decode_budget_natural.peek();
+            let mut prev_session: Option<u64> = None;
 
             loop {
                 // Issue 2174: a bare `while let Ok(..)` here died permanently on
@@ -6693,31 +6882,14 @@ pub fn AttendantsComponent(
                 // ---- Auto path ----
                 let now = now_ms() as f64;
 
-                // #1557 reconnect re-arm: the budget loop is built ONCE (use_effect)
-                // and lives across reconnects — it is NOT rebuilt per call session, and
-                // the in-place `client.connect()` reconnect does NOT remount this
-                // component. So `state` (incl. `layers_at_floor` / `last_layer_drop_ms`)
-                // would otherwise PERSIST across a reconnect. On a reconnect the client
-                // clears all peers, so `natural` collapses to the MIN_CAP floor and the
-                // peers re-join fresh at top layer. Re-arm the cascade on that collapse
-                // edge — `re_arm_cascade_after_recovery` clears `layers_at_floor` and
-                // re-anchors `last_layer_drop_ms = now` (the SAME reset used by the Up
-                // recovery arm) — so the next Down edge after re-join re-enters at
-                // LowerLayer instead of routing straight to PauseTiles on stale at-floor
-                // state. This is transport-agnostic: `clear_all_peers` runs on
-                // ConnectionState::Failed for BOTH WebTransport and WebSocket. The same
-                // edge also fires when the LAST peer legitimately leaves — which is
-                // equally a correct moment to re-arm (no peers => nothing pressured =>
-                // the cascade should be clean for the next arrival).
-                if natural <= MIN_CAP && prev_natural > MIN_CAP {
+                // #2271: `clear_all_peers` runs ONLY on `ConnectionState::Failed`, which
+                // a reconnect does not emit, so a tile collapse is not a reconnect signal.
+                let session_now = client_for_budget.own_session_id_u64();
+                let resets = budget_reset_actions(natural, prev_natural, session_now, prev_session);
+                if resets.rearm_cascade {
                     re_arm_cascade_after_recovery(&mut state, now);
-                    // Issue #1558: reset protective mode on the SAME session-reset
-                    // edge as the #1557 cascade re-arm (transport-agnostic — fires
-                    // on both WT and WS reconnect, and when the last peer leaves).
-                    // Clear the latch, severity, and the carried audio reading so a
-                    // fresh session starts un-protected with no stale encoder shed,
-                    // and publish the cleared report so `Host` restores the user's
-                    // encoder ceiling immediately.
+                }
+                if resets.clear_protective {
                     protective = ProtectiveModeState::default();
                     protective_severity = 0;
                     last_audio_buffer_ms_max = None;
@@ -6727,6 +6899,7 @@ pub fn AttendantsComponent(
                         protective_mode_report.set(cleared);
                     }
                 }
+                prev_session = advance_observed_session(prev_session, session_now);
                 prev_natural = natural;
 
                 let pressured = *decode_budget_pressured.peek();
@@ -7611,17 +7784,10 @@ pub fn AttendantsComponent(
 
                 // ---- Issue #1558 stage 4: EMERGENCY non-speaker pause ----
                 //
-                // Applied LAST, after the cascade + presenter clamps, on the
-                // pressured path only (it is only reachable once the cascade has
-                // latched and reached floor — the cheaper stages run first). When
-                // protective mode is active AND audio is STILL growing past the
-                // EMERGENCY water mark, force the decode cap to MIN_CAP: exactly ONE
-                // decoded tile, which `promote_speakers` fills with the active
-                // speaker downstream. Every other non-speaker tile pauses, freeing
-                // decode CPU to protect audio. Returns `None` (no clamp) once audio
-                // drains, so the cap recovers via the normal cascade/growth path —
-                // the stage reverses on recovery. Audio decode is NEVER touched; this
-                // sheds VIDEO precisely to protect audio.
+                // Forces the decode cap to MIN_CAP while protective mode is active
+                // and audio sits past the EMERGENCY water mark; `promote_speakers`
+                // fills the one remaining slot downstream. Audio decode is never
+                // touched.
                 if let Some(emergency_cap) =
                     protective_emergency_cap(protective.active, last_audio_buffer_ms_max)
                 {
@@ -8190,23 +8356,32 @@ pub fn AttendantsComponent(
     //   real peer, video_enabled true → camera-ON
     //   real peer, video_enabled false→ camera-OFF
     // `is_video_enabled_for_peer` returns false for any non-numeric key (incl.
-    // mock-N), which is why mocks are handled by the `take(capped_real)` slice
+    // mock-N), which is why mocks are excluded from the `capped_real` selection
     // here (they are not in `display_peers`) and need no explicit OR.
-    let camera_candidates: Vec<(String, bool)> = display_peers
-        .iter()
-        .take(capped_real)
-        .map(|peer_id| (peer_id.clone(), client.is_video_enabled_for_peer(peer_id)))
-        .collect();
-    let (camera_on_real, mut camera_off_real) = partition_camera_tiles(&camera_candidates);
-    // Stable join-order sort for the camera-off group so its render order is
-    // deterministic and matches the rest of the grid's earliest-first ordering.
-    {
+    let camera_candidates: Vec<(String, bool)> = {
+        let speech_map = peer_speech_priority.read();
         let join_map = peer_join_time.read();
-        camera_off_real.sort_by(|a, b| {
-            let jt_a = join_map.get(a).copied().unwrap_or(0.0);
-            let jt_b = join_map.get(b).copied().unwrap_or(0.0);
-            jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        select_display_candidates(
+            &display_peers,
+            capped_real,
+            |peer_id| client.is_video_enabled_for_peer(peer_id),
+            &speech_map,
+            &join_map,
+            now_ms,
+            SPEAKER_ACTIVE_MS,
+        )
+    };
+    let (camera_on_real, mut camera_off_real) = partition_camera_tiles(&camera_candidates);
+    {
+        let speech_map = peer_speech_priority.read();
+        let join_map = peer_join_time.read();
+        sort_camera_off_window(
+            &mut camera_off_real,
+            &speech_map,
+            &join_map,
+            now_ms,
+            SPEAKER_ACTIVE_MS,
+        );
     }
 
     // `all_tiles` now holds ONLY the peers with video to decode: camera-ON real
@@ -8428,6 +8603,8 @@ pub fn AttendantsComponent(
     let mut screen_share_stack: Signal<Vec<String>> = use_signal(Vec::new);
     let previous_active_decode_set: Rc<RefCell<HashSet<u64>>> =
         use_hook(|| Rc::new(RefCell::new(HashSet::new())));
+    let previous_viewport_roster: Rc<RefCell<Vec<String>>> =
+        use_hook(|| Rc::new(RefCell::new(Vec::new())));
     // #1256 Phase 1: last pushed per-peer tile-size hints, so we only call
     // `set_peer_tile_hints` when the map actually changes (join/leave/pin/resize),
     // not on every render. Sibling of `previous_active_decode_set`.
@@ -8660,6 +8837,21 @@ pub fn AttendantsComponent(
             active_decode_set.insert(session_id);
         }
     }
+
+    // Screen share keeps its pre-fix source (the SS decode set + sharer) because the SS
+    // panel scrolls every participant, so its render list is not an on-screen set.
+    let ss_viewport_tiles: Vec<String> = if has_screen_share {
+        let mut v = ss_decoded_tiles.clone();
+        if let Some(sharer) = active_screen_sharer.as_ref() {
+            if !v.contains(sharer) {
+                v.push(sharer.clone());
+            }
+        }
+        v
+    } else {
+        Vec::new()
+    };
+    let viewport_roster_ids = viewport_roster(has_screen_share, &unified_tiles, &ss_viewport_tiles);
 
     // Tile count drives the `participants-N` class modifier on the grid
     // container AND the `compute_layout` cell sizing, which lets CSS branch
@@ -8932,6 +9124,7 @@ pub fn AttendantsComponent(
     let toggle_raise_hand: EventHandler<()> = use_callback({
         let client = client.clone();
         let raise_hand_announcer = raise_hand_announcer.clone();
+        let hand_sound_channel = hand_sound_channel.clone();
         move |_| {
             let now = js_sys::Date::now();
             let next = {
@@ -8988,6 +9181,33 @@ pub fn AttendantsComponent(
             if should_write_bool_signal(*self_raised.peek(), next) {
                 self_raised.set(next);
             }
+            // Issue 2329: our OWN toggle chimes too. The issue asks for a sound
+            // "any time someone raises their hand" and the local participant is a
+            // first-class roster entry (`is_self`), so narrowing it to peers
+            // would be a scope decision this change is not entitled to make.
+            //
+            // `is_self: true` exempts this from the settle window ONLY — a press
+            // is a user action that happened just now and can never be inbound
+            // replay. The rate gate still applies, so a press cannot smear over a
+            // remote chime that sounded moments earlier; a press has three
+            // simultaneous visual confirmations (this control's `data-raised`
+            // state, the self-tile badge, and the banner sentence) and can afford
+            // to lose the audio in that rare overlap.
+            //
+            // `!next` is the level we held a moment ago: `next` was computed as
+            // `!announcer.is_raised()` at the top of this callback, so every
+            // local toggle is a genuine transition by construction.
+            maybe_play_hand_sound(
+                &hand_sound_channel,
+                None,
+                // Ignored on the local path (`is_self` skips the storm gate), and
+                // the announcer's stamp is the honest value to pass rather than a
+                // sentinel that would read as "raised in 1970" if that ever changed.
+                raise_hand_announcer.borrow().raised_at_ms() as f64,
+                appearance_settings.peek().play_hand_raise_sound,
+                !next,
+                next,
+            );
             drive_raise_hand(
                 &client,
                 &raise_hand_announcer,
@@ -9441,26 +9661,40 @@ pub fn AttendantsComponent(
         &decoded_bucket,
     );
     {
-        // Dedup: only push to client when the set actually changed.
         let mut previous_active_decode_set = previous_active_decode_set.borrow_mut();
-        if *previous_active_decode_set != active_decode_set {
+        let mut previous_viewport_roster = previous_viewport_roster.borrow_mut();
+        let plan = plan_decode_publish(
+            &previous_active_decode_set,
+            &active_decode_set,
+            &previous_viewport_roster,
+            &viewport_roster_ids,
+        );
+        if let Some(decode) = plan.decode {
             // Render actuator: the effective decode-budget cap applied to the
             // visible tile set. Logged at debug to correlate with the info-level
             // cap-transition decisions above without spamming the steady state.
             log::debug!(
                 "DecodeBudget: active_decode_set size={} budget_cap={}",
-                active_decode_set.len(),
+                decode.len(),
                 budget_cap,
             );
-            client.set_active_decode_set(&active_decode_set);
-            *previous_active_decode_set = active_decode_set.clone();
+            client.set_active_decode_set(&decode);
+            *previous_active_decode_set = decode;
+        }
+        if let Some(roster) = plan.viewport {
+            // Record only on a delivered push: a swallowed one would otherwise be
+            // deduped away until the layout changes again, stranding a stale filter.
+            if client.set_viewport_session_ids(&roster) {
+                *previous_viewport_roster = roster;
+            }
         }
     }
 
     // #1256 Phase 1: push the per-peer rendered-tile-size hints so the receiver can
     // LID the requested simulcast layer to the size actually painted. The decode
-    // set is now fully settled (phases 1-4 above), so the hint map is keyed over the
-    // same `active_decode_set` the relay will receive layers for.
+    // set is now fully settled (phases 1-4 above). Keyed over the VIEWPORT roster, not
+    // the decode set: a peer the relay forwards but the budget is not decoding needs a
+    // lid too, and an absent entry means Uncapped.
     //
     // Tile device-pixel height: in the grid layout every decoded tile is the same
     // `compute_layout` cell (height = tile_w / TILE_AR), scaled by the device pixel
@@ -9485,15 +9719,19 @@ pub fn AttendantsComponent(
     };
 
     let peer_tile_hints: HashMap<u64, videocall_client::TileHint> = {
-        use videocall_client::TileHint;
-        // The pinned peer is held by USER_ID; resolve it to the session_id present
-        // in `active_decode_set` so the (Uncapped) pin exemption matches a real peer.
+        let viewport_sessions: Vec<u64> = viewport_roster_ids
+            .iter()
+            .filter_map(|id| id.parse::<u64>().ok())
+            .collect();
+        // The pin is held by USER_ID. Resolve it over the VIEWPORT set, not the decode
+        // set — an undecoded pin resolved over the decode set is `None`, so it misses the
+        // exemption and gets lidded to layer 0 while rendering large.
         let pinned_session: Option<u64> = pinned_peer_id
             .peek()
             .as_ref()
             .map(|p| p.user_id.as_str())
             .and_then(|pu| {
-                active_decode_set
+                viewport_sessions
                     .iter()
                     .copied()
                     .find(|sid| client.get_peer_user_id(&sid.to_string()).as_deref() == Some(pu))
@@ -9503,24 +9741,21 @@ pub fn AttendantsComponent(
         let screen_session: Option<u64> = active_screen_sharer
             .as_ref()
             .and_then(|s| s.parse::<u64>().ok());
-        active_decode_set
-            .iter()
-            .map(|&sid| {
-                // Pinned and screen-share peers are NEVER size-capped — they render
-                // large, so the receiver should pull the full downlink-sustainable
-                // layer for them.
-                let uncapped = Some(sid) == pinned_session || Some(sid) == screen_session;
-                let hint = match (uncapped, tile_device_px_h) {
-                    (true, _) => TileHint::Uncapped,
-                    (false, Some(h)) => TileHint::Capped { device_px_h: h },
-                    (false, None) => TileHint::Uncapped,
-                };
-                (sid, hint)
-            })
-            .collect()
+        let uncapped: Vec<u64> = [pinned_session, screen_session]
+            .into_iter()
+            .flatten()
+            .collect();
+        build_peer_tile_hints(
+            &viewport_sessions,
+            &active_decode_set,
+            &uncapped,
+            tile_device_px_h,
+        )
     };
     {
-        // Dedup: only push when the hint map actually changed (join/leave/pin/resize).
+        // Dedup: only push when the hint map actually changed (join/leave/pin/resize, and
+        // now any clamp entry/exit or layout change that moves a peer across the
+        // decoded/avatar boundary).
         // Only record the map as delivered when the push was actually APPLIED — if
         // set_peer_tile_hints dropped it on a transient `inner` borrow conflict (returns
         // false), leave `previous_peer_tile_hints` UNCHANGED so the next render re-attempts
@@ -9571,6 +9806,11 @@ pub fn AttendantsComponent(
                     // the peer list (issue #1790). The `else if` chain guarantees
                     // each Escape closes EXACTLY one surface. The dock menu keeps its
                     // own Esc handler (with stop_propagation).
+                    //
+                    // The chat drawer is DELIBERATELY excluded from this
+                    // light-dismiss: its message composer means a stray background
+                    // Escape must not risk discarding an in-progress draft. That is
+                    // out of issue-1790 scope.
                     let key = evt.key();
                     if key == Key::Escape {
                         if overflow_menu_open() {
@@ -10298,10 +10538,7 @@ pub fn AttendantsComponent(
                         }
 
                         if overflow_count > 0 {
-                            div { class: "grid-overflow-badge",
-                                "+{overflow_count}"
-                                span { "more in meeting" }
-                            }
+                            GridOverflowBadge { overflow_count }
                         }
 
                         // Invitation overlay when no peers (issue #1465).
@@ -10999,6 +11236,13 @@ pub fn AttendantsComponent(
                                                                     }
                                                                 }
                                                             }
+                                                            ActionBarSlot::Chat => rsx! {
+                                                                ChatButtonWithBadge {
+                                                                    chat_has_unread,
+                                                                    chat_open,
+                                                                    describedby: slot_describedby,
+                                                                }
+                                                            },
                                                             ActionBarSlot::ScreenShare => {
                                                                 let is_active = matches!(screen_share_state(), ScreenShareState::Active);
                                                                 let is_disabled = matches!(
@@ -11654,6 +11898,9 @@ pub fn AttendantsComponent(
                                                                                         dock_menu_open.set(false);
                                                                                         mock_peers_open.set(false);
                                                                                     }
+                                                                                }
+                                                                                ActionBarSlot::Chat => {
+                                                                                    chat_open.set(!chat_open());
                                                                                 }
                                                                                 // Issue #1884: open the reactions palette
                                                                                 // from the overflow menu (mirrors density).
@@ -12339,20 +12586,22 @@ pub fn AttendantsComponent(
                                                     let room_token = hangup_room_token.clone();
                                                     wasm_bindgen_futures::spawn_local(async move {
                                                         if hangup_is_guest {
-                                                            let _ = crate::meeting_api::leave_meeting_as_guest(
+                                                            crate::meeting_api::leave_within_deadline(
                                                                 &meeting_id,
-                                                                &room_token,
+                                                                crate::meeting_api::leave_meeting_as_guest(
+                                                                    &meeting_id,
+                                                                    &room_token,
+                                                                ),
                                                             )
                                                             .await;
-                                                        } else if let Err(e) =
-                                                            crate::meeting_api::leave_meeting(
+                                                        } else {
+                                                            crate::meeting_api::leave_within_deadline(
                                                                 &meeting_id,
+                                                                crate::meeting_api::leave_meeting(
+                                                                    &meeting_id,
+                                                                ),
                                                             )
-                                                            .await
-                                                        {
-                                                            log::error!(
-                                                                "Error leaving meeting: {e}"
-                                                            );
+                                                            .await;
                                                         }
                                                         let _ = window().location().set_href("/");
                                                     });
@@ -12396,6 +12645,7 @@ pub fn AttendantsComponent(
                                                             ActionBarSlot::Diagnostics => rsx! { DiagnosticsButton { open: diagnostics_open(), onclick: |_| {} } },
                                                             ActionBarSlot::DeviceSettings => rsx! { DeviceSettingsButton { open: device_settings_open(), onclick: |_| {} } },
                                                             ActionBarSlot::Recording => rsx! { RecordButton { state: record_state(), onclick: |_| {} } },
+                                                            ActionBarSlot::Chat => rsx! { ChatButtonWithBadge { chat_has_unread, chat_open } },
                                                             ActionBarSlot::MeetingOptions => rsx! { MeetingOptionsButton { open: meeting_options_open(), onclick: |_| {} } },
                                                             ActionBarSlot::MeetingTimer => rsx! { MeetingTimerButton { open: false, running: false, onclick: |_| {} } },
                                                         }
@@ -13628,6 +13878,28 @@ pub fn AttendantsComponent(
                     }
                 }
             }
+            // Chat sidebar
+                ChatSidebar {
+                    is_show: chat_open(),
+                    onclose: move |_| chat_open.set(false),
+                    conv_id: id.clone(),
+                    // View-only for non-hosts when the host has restricted chat:
+                    // everyone can READ, but only hosts may SEND unless
+                    // `chat_allowed_for_all` is on. Read the toggle reactively so
+                    // a mid-meeting flip enables/disables the composer live.
+                    can_send: crate::components::chat_sidebar::chat_send_allowed(
+                        is_owner,
+                        chat_allowed_for_all_toggle(),
+                    ),
+                    on_new_message: move |_| {
+                        // Event closure — not a reactive render-body read.
+                        // `peek()` keeps it explicitly non-subscribing so the
+                        // badge flip stays scoped to ChatButtonWithBadge.
+                        if !*chat_has_unread.peek() {
+                            chat_has_unread.set(true);
+                        }
+                    },
+                }
         }
     }
 }
@@ -13807,6 +14079,41 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    /// #2271 wiring pin: the budget loop is a spawned task, so no host test reaches
+    /// its call site. Needles are fragmented so they do not self-match.
+    #[test]
+    fn budget_loop_rearm_keys_off_the_session_edge() {
+        let src = include_str!("attendants.rs");
+        let adopted = concat!(
+            "budget_reset_actions(natural, prev_natural, ",
+            "session_now, prev_session)"
+        );
+        let live_read = concat!("client_for_budget.own_session_id", "_u64()");
+        let watermark = concat!("advance_observed_session(prev_session, ", "session_now)");
+        let scoped = concat!("if resets.clear", "_protective {");
+        let pre_fix_gate = concat!("natural <= MIN_CAP", " && prev_natural > MIN_CAP");
+        assert!(
+            src.contains(adopted),
+            "budget loop must gate its re-arm on session_reset_edge"
+        );
+        assert!(
+            src.contains(live_read),
+            "the session edge must read the LIVE relay session, not a constant"
+        );
+        assert!(
+            src.contains(watermark),
+            "a busy session read must HOLD the watermark, not overwrite it with None"
+        );
+        assert!(
+            src.contains(scoped),
+            "the protective clear must stay on its own peer-set-scoped branch"
+        );
+        assert!(
+            !src.contains(pre_fix_gate),
+            "the pre-fix tile-collapse-only gate must not be back in attendants.rs"
+        );
+    }
 
     // ───────────────────────────────────────────────────────────────────────
     // Issue 2053: the viewport `resize` listener must not outlive the
@@ -15338,6 +15645,7 @@ mod tests {
     fn overflow_test_secondary() -> Vec<ActionBarSlot> {
         vec![
             ActionBarSlot::Reactions,
+            ActionBarSlot::Chat,
             ActionBarSlot::ScreenShare,
             ActionBarSlot::PeerList,
             ActionBarSlot::DensityMode,

@@ -22,6 +22,32 @@ use std::sync::OnceLock;
 /// Environment variable prefix for feature flags
 const ENV_PREFIX: &str = "FEATURE_";
 
+/// Unprefixed name of the `meeting_management` flag; the env var is [`ENV_PREFIX`] + this.
+const MEETING_MANAGEMENT: &str = "MEETING_MANAGEMENT";
+
+/// Env var backing the `database` flag (legacy: carries no [`ENV_PREFIX`]).
+const DATABASE_ENABLED: &str = "DATABASE_ENABLED";
+
+/// [`ResolvedFlag::name`] of the meeting-management flag.
+pub const MEETING_MANAGEMENT_FLAG: &str = "meeting_management";
+
+/// [`ResolvedFlag::name`] of the database flag.
+pub const DATABASE_FLAG: &str = "database";
+
+/// A feature flag as resolved at process start: what the environment held, and the value
+/// callers of its accessor get back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFlag {
+    /// Field name of the flag on [`FeatureFlags`].
+    pub name: &'static str,
+    /// Fully-qualified environment variable that controls it.
+    pub env_var: String,
+    /// Raw string the environment variable held, or `None` when it was unset.
+    pub raw: Option<String>,
+    /// Value this flag's `*_enabled()` accessor returns.
+    pub enabled: bool,
+}
+
 /// Override states for testing
 const OVERRIDE_NONE: u8 = 0;
 const OVERRIDE_TRUE: u8 = 1;
@@ -46,8 +72,8 @@ impl FeatureFlags {
     /// Load feature flags from environment variables.
     fn from_env() -> Self {
         Self {
-            meeting_management: read_bool_env("MEETING_MANAGEMENT"),
-            database: read_bool_no_prefix("DATABASE_ENABLED"),
+            meeting_management: read_bool_env(MEETING_MANAGEMENT),
+            database: read_bool_no_prefix(DATABASE_ENABLED),
         }
     }
 
@@ -73,6 +99,26 @@ impl FeatureFlags {
     #[inline]
     pub fn database_enabled() -> bool {
         Self::global().database
+    }
+
+    /// Every flag, read through its `*_enabled()` accessor — the same call the lobby and
+    /// WebTransport connect paths make — paired with the raw environment string behind it.
+    pub fn resolved() -> Vec<ResolvedFlag> {
+        let meeting_management_env = format!("{ENV_PREFIX}{MEETING_MANAGEMENT}");
+        vec![
+            ResolvedFlag {
+                name: MEETING_MANAGEMENT_FLAG,
+                raw: std::env::var(&meeting_management_env).ok(),
+                env_var: meeting_management_env,
+                enabled: Self::meeting_management_enabled(),
+            },
+            ResolvedFlag {
+                name: DATABASE_FLAG,
+                env_var: DATABASE_ENABLED.to_string(),
+                raw: std::env::var(DATABASE_ENABLED).ok(),
+                enabled: Self::database_enabled(),
+            },
+        ]
     }
 
     /// Override meeting_management flag for testing.

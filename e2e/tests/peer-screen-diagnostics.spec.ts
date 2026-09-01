@@ -358,81 +358,36 @@ test.describe("Peer screen-share diagnostics", () => {
       await expect(helpText).toContainText(/Received/i);
       await expect(helpText).toContainText("pixel");
 
-      // ----- Cause line (HCL issue #903) -----
-      //
-      // The publisher's screen encoder publishes `encoder_target_bitrate_kbps`,
-      // `adaptive_tier`, and `cause_hint` on every `VideoMetadata` it emits.
-      // The receiver's `peer_decoder.rs` translates them into a
-      // `screen_encoder_state` diag event, `peer_tile.rs` records them on
-      // the `SignalSample`, and `signal_quality.rs::build_screen_cause_line`
-      // renders the compact `Cause: <hint> · <N>kbps · tier '<tier>'`
-      // line below the Screen row.
-      //
-      // IMPORTANT — cold-start behavior in this test environment:
-      // `videocall-client/src/encode/screen_encoder.rs` zeros ALL THREE
-      // Cause-line fields (bitrate, tier label, cause-hint) when the
-      // publisher is at the unconstrained top tier (`clamped_tier == 0`).
-      // In the cold-start Playwright env (no RTT signal, no real camera
-      // signal — `MOCK_GET_DISPLAY_MEDIA_SCRIPT` produces no real frames),
-      // AQ has nothing to classify by, so the publisher remains at tier 0
-      // and `build_screen_cause_line` correctly returns an empty string,
-      // omitting the Cause line from the tooltip entirely.
+      // NO Cause line for screen (issue #2343). The `Cause: <hint> · <N>kbps · tier
+      // '<tier>'` sub-line explained which ladder rung a constrained share fell to;
+      // its producer is gone (`transform_screen_chunk` no longer takes or stamps
+      // `adaptive_tier` / `cause_hint`). Asserted as an ABSENCE rather than dropped
+      // because the CONSUMER half is still wired (peer_decoder.rs → peer_tile.rs
+      // `screen_cause_hint`), so a stale hint could come back. The previous form of
+      // this block treated an absent line as "unconstrained tier, OK" and returned
+      // early — now the only reachable branch, i.e. a test that could not fail.
       const tooltipHtml2 = await tooltip.innerHTML();
-      const causeLine = tooltipHtml2.split(/<br\s*\/?>|\n/i).find((l) => /Cause:/.test(l));
-      // The Cause line is OPTIONAL — the renderer correctly OMITS it when
-      // the publisher is at the unconstrained top tier (tier 0), which is
-      // what the cold-start test environment hits when AQ has no
-      // RTT / camera signals to classify by. If the Cause line IS present,
-      // it must contain a bitrate value (NNNNkbps format) and must not use
-      // the wordy phrasing from the pre-tightening prototype.
-      if (causeLine) {
-        expect(causeLine).toMatch(/\d+kbps/);
-        expect(causeLine).not.toMatch(/encoder target/);
-        expect(causeLine).not.toMatch(/limited by/);
-      }
+      expect(
+        tooltipHtml2,
+        "screen share publishes one rung at the capture's own geometry, so there is " +
+          "no tier to attribute — a Cause line means a cause-hint producer came back",
+      ).not.toMatch(/Cause:/);
 
-      // HCL follow-up #939: when the Cause line IS rendered (publisher is at
-      // a constrained tier with a classified cause-hint), it must contain
-      // BOTH `tier '<name>'` AND a recognized cause-hint value. We poll for
-      // ~5s to allow the publisher's first AQ classification tick to land.
+      // The legend help text must state the #2343 contract, so the copy and the
+      // encoder cannot drift apart. Reverting the help text to the old ladder story
+      // ("the publisher's encoder downscaled … to a lower quality tier because the
+      // network couldn't sustain it") fails both assertions.
       //
-      // The Cause line is OMITTED at tier 0 (unconstrained top tier) per
-      // the publisher contract — `videocall-client/src/encode/screen_encoder.rs`
-      // zeros all three Cause-line fields (bitrate, tier label, cause-hint)
-      // when `clamped_tier == 0`, and the renderer's `build_screen_cause_line`
-      // returns an empty string in that case. The cold-start Playwright env
-      // (no RTT, mocked getDisplayMedia producing no frames) stays at tier 0
-      // indefinitely, so this poll naturally short-circuits when the
-      // publisher is unconstrained.
-      //
-      // The assertion still catches a regression where the publisher emits
-      // a Cause line with wrong shape (e.g. missing tier or hint). If the
-      // line is OMITTED entirely we treat that as "publisher is at
-      // unconstrained tier" and accept it — a separate test that drives a
-      // constrained tier would be the right place to enforce non-empty
-      // tier+hint emission deterministically.
-      //
-      // Cause-hint vocabulary (from
-      // `videocall-client/src/encode/screen_encoder.rs::cause_hint_from_trigger`):
-      //   - bitrate-limited (trigger=bitrate)
-      //   - cpu-pressure   (trigger=fps)
-      //   - network-rtt    (trigger=congestion)
-      //   - manual-cap     (trigger=coordination)
-      await expect(async () => {
-        const html = await tooltip.innerHTML();
-        const line = html.split(/<br\s*\/?>|\n/i).find((l) => /Cause:/.test(l));
-        if (line === undefined) {
-          return; // Cause line omitted ⇒ publisher at unconstrained tier 0. OK.
-        }
-        expect(line).toMatch(/tier '[^']+'/);
-        expect(line).toMatch(/(bitrate-limited|cpu-pressure|network-rtt|manual-cap)/);
-      }).toPass({ timeout: 5_000 });
-
-      // The legend help text must describe the Cause line shape so the
-      // wording stays in sync with the renderer. The previous placeholder
-      // string ("not yet instrumented" / "#903" reference) is gone.
-      await expect(helpText).toContainText(/cause/i);
-      await expect(helpText).toContainText(/adaptive-quality|tier/i);
+      // NOTE on why `/cause/i` is NOT used here, though it would pass: the help body
+      // contains the word "because", so a case-insensitive /cause/ matches it by
+      // accident and would stay green with every mention of the Cause line removed.
+      await expect(helpText).toContainText("Nothing downscales it to a lower quality tier");
+      // The ceiling clause must NAME a ceiling, but the NUMBER is deliberately not
+      // pinned: `SCREEN_MAX_ENCODE_*` moved 3840x2160 -> 2560x1440 once already
+      // (the 4K-keyframe / MAX_FRAME_SIZE cap), and a literal here just goes red on
+      // the next move without guarding anything. The shape is what matters — delete
+      // the clause and this fails; change the ceiling and it follows automatically.
+      await expect(helpText).toContainText(/up to \d{3,4}\s*[×x]\s*\d{3,4}/);
       await expect(helpText).not.toContainText("not yet instrumented");
     } finally {
       for (const m of members) {

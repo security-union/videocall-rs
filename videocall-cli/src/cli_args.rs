@@ -21,6 +21,7 @@ use std::str::FromStr;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use thiserror::Error;
 use url::Url;
+use videocall_meeting_types::mint::{self, LobbyAuth, MintError};
 use videocall_nokhwa::utils::FrameFormat;
 
 /// Video Call CLI
@@ -62,7 +63,7 @@ impl FromStr for IndexKind {
 #[derive(Subcommand, Debug)]
 pub enum Mode {
     /// Stream audio and video to the specified meeting.
-    Stream(Stream),
+    Stream(Box<Stream>),
 
     /// Information mode to list cameras, formats, and resolutions.
     Info(Info),
@@ -153,6 +154,47 @@ pub struct Stream {
     /// Warning: This makes connections insecure and should only be used for testing.
     #[clap(long = "insecure-skip-verify")]
     pub insecure_skip_verify: bool,
+
+    /// Pre-minted room access token. Takes precedence over --jwt-secret.
+    #[clap(long = "token", value_name = "JWT")]
+    pub token: Option<String>,
+
+    /// HMAC secret the relay validates room access tokens with. The CLI mints
+    /// its own token from it, joining as --user-id.
+    #[clap(
+        long = "jwt-secret",
+        value_name = "SECRET",
+        env = "JWT_SECRET",
+        hide_env_values = true
+    )]
+    pub jwt_secret: Option<String>,
+
+    /// Lifetime of a minted token, in seconds. A fresh token is minted on every
+    /// connection attempt, so this bounds handshake age, not meeting length.
+    #[clap(long = "token-ttl-secs", value_name = "N", default_value_t = 3600)]
+    pub token_ttl_secs: u64,
+
+    /// Join over the deprecated unauthenticated /lobby/<user_id>/<meeting_id>
+    /// path. Ignored when a token or secret is available, and rejected by any
+    /// relay running with FEATURE_MEETING_MANAGEMENT enabled.
+    #[clap(long = "deprecated-path")]
+    pub deprecated_path: bool,
+}
+
+impl Stream {
+    /// Pick the auth mode for this invocation (#2298).
+    ///
+    /// Token auth is the default; the deprecated unauthenticated path is
+    /// reachable only via `--deprecated-path`, and only when no credential was
+    /// supplied.
+    pub fn resolve_auth(&self) -> Result<LobbyAuth, MintError> {
+        mint::resolve_lobby_auth(
+            self.token.clone(),
+            self.jwt_secret.clone(),
+            self.token_ttl_secs,
+            self.deprecated_path,
+        )
+    }
 }
 
 fn parse_frame_format(s: &str) -> Result<FrameFormat, String> {

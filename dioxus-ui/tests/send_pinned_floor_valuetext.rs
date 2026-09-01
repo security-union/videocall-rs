@@ -19,9 +19,8 @@
 // 'Fixed' badge…` and `SEND ceiling thumb is grabbable…`) do cover it, but that spec is
 // UNTAGGED — `pr-check-e2e-smoke-hcl.yaml` runs `--project=bvt1`
 // (`grep: /@bvt[01]\b/`), so per-PR CI never executes it. Net effect before this file:
-// revert the production line and every CI job stays green. That is the same "guard
-// would not fail if the path were dead" seam `reduced_ladder_flag.rs` documents, and
-// the same untagged-spec drift that let issue #2158 sit for ~6 weeks. Those specs stay
+// revert the production line and every CI job stays green. That is the same
+// untagged-spec drift that let issue #2158 sit for ~6 weeks. Those specs stay
 // as the fuller-context check (real config.js chain, host.rs prop plumbing, CSS, real
 // pointer drag) — none of which this file can see; see the coverage split below.
 //
@@ -30,8 +29,7 @@
 // rendered `aria-valuetext` attribute off the DOM.
 //
 // It runs in a browser (`wasm_bindgen_test`) because the assertion is on rendered
-// DOM output, and because `send_layer_labels` resolves the camera top rung from
-// `window.__APP_CONFIG` via the memoized `app_config()`.
+// DOM output.
 //
 // COVERAGE SPLIT — what this file deliberately does NOT observe, so nobody reads it as
 // a replacement for the Playwright specs:
@@ -58,18 +56,11 @@
 // while never executing — precisely the failure mode it exists to fix. The step was
 // added in the same commit.
 //
-// ADDING A SECOND CASE TO THIS FILE? Two hazards, both of which produce a FALSE GREEN
-// rather than an error, so neither is self-announcing:
-//  1. `cleanup` only detaches the mount node. The panel's 250 ms `Interval` and the
-//     VU-meter rAF loop keep running afterwards, and they resolve their targets with a
-//     DOCUMENT-GLOBAL `get_element_by_id` — so two mounted panels fight over duplicate
-//     ids and can write each other's readouts.
-//  2. `active_camera_top_rung_label` memoizes in a `thread_local! OnceCell` that
-//     `reset_config_cache_for_test()` does NOT clear (it only resets the config cache).
-//     A case injecting `experimentalReducedLadder` here would therefore read the stale
-//     `"720p"` top label from this case and assert against the wrong ladder.
-// A reduced-ladder variant belongs in its own binary (see `reduced_ladder_flag.rs`),
-// not a second case here.
+// ADDING A SECOND CASE TO THIS FILE? `cleanup` only detaches the mount node. The
+// panel's 250 ms `Interval` and the VU-meter rAF loop keep running afterwards, and
+// they resolve their targets with a DOCUMENT-GLOBAL `get_element_by_id` — so two
+// mounted panels fight over duplicate ids and can write each other's readouts. That
+// produces a FALSE GREEN rather than an error, so it is not self-announcing.
 
 #![cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 
@@ -78,6 +69,7 @@ use dioxus_ui::components::performance_settings::receive::ReceivePreference;
 use dioxus_ui::components::performance_settings::{
     send_layer_labels_with_top, PerformancePreference, PerformanceSettingsPanel,
 };
+use dioxus_ui::constants::audio_published_layer_count;
 use videocall_client::PrefMediaKind;
 use wasm_bindgen_test::*;
 
@@ -86,28 +78,29 @@ use support::{cleanup, create_mount_point, inject_app_config, render_into, wait_
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
-/// Mount the panel with a THREE-rung ladder for all three SEND kinds.
+/// Mount the panel with a THREE-rung ladder for VIDEO, the only SEND kind that
+/// still has one. SCREEN is single-rung since issue #2343 and AUDIO since #2279;
+/// their `*_layer_max` props are the production depths.
 ///
 /// The `*_layer_max` props are plain `usize` and feed `send_layer_labels(kind,
 /// layer_max)` directly, so 3 rungs are forced with NO config flag, NO capability
 /// sniff, and NO encoders — unlike the e2e path, which needs
 /// `enableSimulcastFlag(ctx, 3, {capabilityMaxLayersOverride: 3})` to defeat the
-/// CPU clamp on video/screen.
+/// CPU clamp on video.
 ///
-/// THREE is load-bearing, not incidental: at depth 1 every ladder is single-element
-/// and `position_to_tier_index(0, 1) == 0`, so the buggy tier lookup and the fixed
-/// layer lookup return the SAME string and the assertions below would pass on
-/// broken code. At depth 3 they diverge (base `180p`/`12k`/`720p` vs top
-/// `720p`/`48k`/`1440p`). The depth is therefore asserted per kind before any
-/// valuetext assertion relies on it.
+/// THREE is load-bearing, not incidental: at depth 1 a ladder is single-element and
+/// `position_to_tier_index(0, 1) == 0`, so the buggy tier lookup and the fixed layer
+/// lookup return the SAME string and the assertions below would pass on broken code.
+/// At depth 3 they diverge (base `180p` vs top `720p`). The depth is therefore
+/// asserted before any valuetext assertion relies on it.
 ///
-/// Note video's TOP and screen's BASE are both `720p` since the issue #2179 review
-/// gave the screen ladder a numeric vocabulary. That collision is harmless — every
-/// assertion is per kind and compares that kind's own base against its own top,
-/// and screen still diverges (`720p` vs `1440p`).
-/// VIDEO's ceiling is seeded to 2-of-3 deliberately, while audio/screen stay at the
-/// full 3-of-3 (`None` = Auto). With every kind at a full ceiling, `active_count` and
-/// the ladder length are BOTH 3, so transposing
+/// SCREEN AND AUDIO CANNOT PARTICIPATE IN THAT DIVERGENCE. Both ladders are one
+/// rung, so base == top at every input and including them in the divergence loop
+/// would be a tautology — each is asserted separately, for the narrower property it
+/// can still carry.
+///
+/// VIDEO's ceiling is seeded to 2-of-3 deliberately. At a full ceiling `active_count`
+/// and the ladder length are BOTH 3, so transposing
 /// `send_layer_ceiling_valuetext(active_count, ladder_len)` at its call site renders a
 /// byte-identical `"3 of 3 layers"` and no assertion can see it. A lowered video
 /// ceiling makes the two arguments differ, so argument binding is pinned and not just
@@ -121,7 +114,7 @@ fn three_rung_panel() -> Element {
             on_receive_change: move |_| {},
             video_layer_max: 3,
             screen_layer_max: 3,
-            audio_layer_max: 3,
+            audio_layer_max: audio_published_layer_count() as usize,
         }
     }
 }
@@ -149,43 +142,21 @@ async fn send_slider_thumbs_announce_base_rung_and_layer_count() {
          assertions below would be vacuous"
     );
 
-    // SCREEN's rendered rung vocabulary is DERIVED, not spelled out. The issue
-    // #2179 review mapped the screen ladder's AQ rung names (`low` / `high` /
-    // `1440p`) onto one numeric vocabulary (`720p` / `1080p` / `1440p`) for display,
-    // and this file asserted the old literals — so it went red on the relabel even
-    // though the behaviour it guards (the floor announces the BASE rung) never
-    // changed. Reading the expectation out of the SAME production helper the panel
-    // renders from means the next relabel cannot rot it either.
+    // SCREEN (#2343) and AUDIO (#2279) are deliberately ABSENT from this loop: each
+    // ladder is one rung, so base == top and the buggy top-announcing lookup agrees
+    // with the fixed base-announcing one. Both are asserted after the loop, for what
+    // they can still prove.
     //
-    // Video and audio stay literal on purpose: their ladders carry no display
-    // mapping, so a literal there still fails loudly if the ladder itself moves,
-    // which is what this file wants to catch.
-    let screen_rungs = send_layer_labels_with_top(PrefMediaKind::Screen, 3, "720p");
-    assert_eq!(
-        screen_rungs.len(),
-        3,
-        "the screen ladder must render 3 rungs here, or the base/top indices below \
-         name the wrong rungs and the assertion is vacuous"
-    );
-    assert_ne!(
-        screen_rungs[0], screen_rungs[2],
-        "screen's base and top must DIFFER, otherwise the buggy top-announcing \
-         lookup and the fixed base-announcing one agree and prove nothing"
-    );
-
-    // The floor of each kind's lowest-first ladder. Unfixed, `position_label`'s tier
-    // inversion made each announce the TOP: 720p / 48k / and the screen ladder's top.
+    // The floor of video's lowest-first ladder. Unfixed, `position_label`'s tier
+    // inversion made it announce the TOP: 720p.
     //
-    // `expected_ceiling` differs for VIDEO because the fixture seeds its ceiling to
-    // 2-of-3 while audio/screen stay at Auto (full). That asymmetry is what makes the
-    // ceiling assertion sensitive to ARGUMENT ORDER at the
-    // `send_layer_ceiling_valuetext(active_count, ladder_len)` call site — with every
-    // kind full, both arguments are 3 and a transposition is invisible.
-    for (kind, expected_base, expected_top, expected_ceiling) in [
-        ("video", "180p", "720p", "2 of 3 layers"),
-        ("audio", "12k", "48k", "3 of 3 layers"),
-        ("screen", screen_rungs[0], screen_rungs[2], "3 of 3 layers"),
-    ] {
+    // The fixture seeds video's ceiling to 2-of-3, which is what makes the ceiling
+    // assertion sensitive to ARGUMENT ORDER at the
+    // `send_layer_ceiling_valuetext(active_count, ladder_len)` call site — at a full
+    // ceiling both arguments are 3 and a transposition is invisible.
+    for (kind, expected_base, expected_top, expected_ceiling) in
+        [("video", "180p", "720p", "2 of 3 layers")]
+    {
         let el = mount
             .query_selector(&format!("[data-testid='perf-{kind}-range-min']"))
             .unwrap()
@@ -195,11 +166,6 @@ async fn send_slider_thumbs_announce_base_rung_and_layer_count() {
         // `max` is `labels.len() - 1`, so "2" == a 3-rung ladder. Every assertion
         // below is vacuous at depth 1 (buggy == fixed), so if the panel ever stopped
         // honouring this kind's `*_layer_max` prop it must fail LOUDLY here.
-        //
-        // Per kind, not once for video: all three props are the literal `3` in this
-        // file's own `rsx!` today, but a future edit routing a different depth into
-        // just `audio_layer_max` would otherwise let the audio assertion pass
-        // vacuously with nothing to catch it.
         assert_eq!(
             el.get_attribute("max")
                 .unwrap_or_else(|| panic!("{kind} min thumb carries a max attribute")),
@@ -258,6 +224,105 @@ async fn send_slider_thumbs_announce_base_rung_and_layer_count() {
              empty string means AT falls back to the bare slider position"
         );
     }
+
+    // AUDIO: single-rung (#2279), so a NARROWER property. What it still proves is the
+    // one thing the panel must never render again — the floor announcing a LADDER
+    // BITRATE. `AUDIO_LAYER_KBPS[0]` is 12 kbps while a single-layer publisher runs at
+    // the AQ audio tier, so any digit in this attribute is a wrong number on screen.
+    let audio_rungs = send_layer_labels_with_top(
+        PrefMediaKind::Audio,
+        audio_published_layer_count() as usize,
+        "720p",
+    );
+    assert_eq!(
+        audio_rungs.len(),
+        1,
+        "issue 2279: audio publishes ONE layer, so its ladder is one label"
+    );
+
+    let audio_min = mount
+        .query_selector("[data-testid='perf-audio-range-min']")
+        .unwrap()
+        .expect("audio min thumb should render");
+    assert_eq!(
+        audio_min
+            .get_attribute("max")
+            .expect("audio min thumb carries a max attribute"),
+        "0",
+        "a single-layer audio ladder must render max=0; a higher value means the \
+         publisher's layer count and this control have drifted apart"
+    );
+    let audio_spoken = audio_min
+        .get_attribute("aria-valuetext")
+        .expect("audio min thumb should carry aria-valuetext");
+    assert_eq!(audio_spoken, audio_rungs[0]);
+    assert!(
+        !audio_spoken.chars().any(|c| c.is_ascii_digit()),
+        "the audio floor must announce no bitrate; got {audio_spoken:?}"
+    );
+
+    let audio_max = mount
+        .query_selector("[data-testid='perf-audio-range-max']")
+        .unwrap()
+        .expect("audio max thumb should render");
+    assert_eq!(
+        audio_max
+            .get_attribute("aria-valuetext")
+            .expect("audio max thumb should carry aria-valuetext"),
+        "1 layer",
+        "the audio ceiling must ANNOUNCE the published layer COUNT"
+    );
+
+    // SCREEN: single-rung, so a NARROWER property (issue #2343). It cannot carry the
+    // base-vs-top inversion guard above — that would be a tautology. It still proves
+    // the ladder is one rung (`max` == "0", failing if screen simulcast returns), that
+    // the label comes from `screen_display_label` (drop its `native` arm and the
+    // helper returns `"?"`), and that the ceiling announces a COUNT not a resolution.
+    // The label expectation is read from the production helper so a relabel moves both
+    // together; `max` and `"1 layer"` are literals on purpose — they pin the DEPTH.
+    let screen_rungs = send_layer_labels_with_top(PrefMediaKind::Screen, 3, "720p");
+    assert_eq!(
+        screen_rungs.len(),
+        1,
+        "issue 2343: screen publishes ONE rung; `send_layer_labels_with_top` must \
+         ignore its layer_max argument for Screen"
+    );
+
+    let screen_min = mount
+        .query_selector("[data-testid='perf-screen-range-min']")
+        .unwrap()
+        .expect("screen min thumb should render");
+    assert_eq!(
+        screen_min
+            .get_attribute("max")
+            .expect("screen min thumb carries a max attribute"),
+        "0",
+        "a single-rung screen ladder must render max=0; a higher value means the \
+         simulcast ladder came back"
+    );
+    assert_eq!(
+        screen_min
+            .get_attribute("aria-valuetext")
+            .expect("screen min thumb should carry aria-valuetext"),
+        screen_rungs[0],
+        "the screen floor must announce the rung `screen_display_label` produces \
+         (\"Native\"); \"?\" means the label helper lost its `native` arm"
+    );
+
+    let screen_max = mount
+        .query_selector("[data-testid='perf-screen-range-max']")
+        .unwrap()
+        .expect("screen max thumb should render");
+    assert_eq!(
+        screen_max
+            .get_attribute("aria-valuetext")
+            .expect("screen max thumb should carry aria-valuetext"),
+        // `send_layer_ceiling_valuetext` special-cases `ladder_len <= 1` to the
+        // ungrammatical-free "1 layer" rather than "1 of 1 layers".
+        "1 layer",
+        "the screen ceiling must ANNOUNCE the published layer COUNT — a resolution \
+         means it fell back onto the tier lookup"
+    );
 
     cleanup(&mount);
 }

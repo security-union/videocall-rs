@@ -147,31 +147,35 @@ const _: () =
 /// - It MUST sit ABOVE the publisher's periodic-keyframe recovery window so it fires ONLY when
 ///   periodic recovery has genuinely failed — never pre-empting the cheaper natural recovery. The
 ///   publisher emits an unconditional periodic GOP keyframe at most every
-///   `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` = 5s (camera) / `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`
+///   `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` = 5s (camera base) / `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`
 ///   = 3s (screen), exempt from the PLI coalescer (see `videocall-aq` / the encoders'
-///   `periodic_keyframe_due`). 6000ms sits ~1s above the *slower* (camera, 5s) of those two
-///   cadences — that publisher-measured cadence plus one-way transit (200ms+ RTT, loss) and decode
-///   is what the receiver actually waits, so the receiver-side margin is smaller than 1s but still
-///   positive in the common case: a stream merely waiting out its next periodic keyframe recovers
-///   naturally and this escalation does not fire. If a slow/lossy link does push the periodic
+///   `periodic_keyframe_due`). The camera cadence relaxes on the scarcest tiers, but never past
+///   `videocall_aq::constants::CAMERA_PERIODIC_KEYFRAME_ABSOLUTE_CEILING_MS` (5.5s), so 6000ms sits
+///   at least 500ms above the *slower* (camera) of those two cadences — that publisher-measured
+///   cadence plus one-way transit (200ms+ RTT, loss) and decode is what the receiver actually
+///   waits, so the receiver-side margin is smaller still but positive in the common case: a stream
+///   merely waiting out its next periodic keyframe recovers naturally and this escalation does not
+///   fire. If a slow/lossy link does push the periodic
 ///   keyframe just past 6s, the escalation is benign — it resets the decoder and the in-flight
 ///   keyframe then satisfies the clean CASE-3 (waiting-for-keyframe) path; it does not discard a
 ///   recovery that was about to land, it accelerates accepting it. It is genuinely load-bearing
 ///   only under sustained starvation (relay suppression, flapping publisher, a keyframe that keeps
 ///   failing to decode), exactly the 18-30s freezes the field showed.
-///   Issue #1531 note: the two lowest camera tiers (very_low/minimal) now emit periodic keyframes at
-///   7-8s — ABOVE this 6s ceiling. Still benign: this escalation fires ONLY in the keyframe-LESS
-///   starved branch (a healthy stream never ages its head past `MAX_PLAYOUT_AGE_MS` = 1800ms, the
-///   skip-to-live deadline), and on a genuinely starved receiver pre-empting a just-past-6s periodic
-///   keyframe only accelerates recovery (as above). #1531's 8s ABSOLUTE camera ceiling bounds the
-///   resulting post-reset wait to <=2s.
+///   Issue #2199 closed the inversion #1531 had opened here, so crossing 6s once again means the
+///   publisher's own periodic guarantee has already come and gone. A compile-time assert in
+///   `videocall_client::encode::camera_encoder` fails the build if the two ever re-invert.
 /// - It is far enough below the field-observed 28s tail that the worst-case freeze is cut from tens
 ///   of seconds to ~6s + one keyframe RTT, which a viewer perceives as "it reconnected" rather than
 ///   "it is broken."
 /// - It is independent of and additive to the #1479 proactive-PLI machinery above: that path keeps
 ///   asking the publisher for a keyframe (and backs off to avoid the storm); this ceiling is the
 ///   backstop for when those requests are not producing a *decodable* recovery in bounded time.
-const MAX_KEYFRAME_LESS_HOLD_MS: f64 = 6000.0;
+///
+/// Exported (issue #2328) so the receiver's simulcast layer chooser can bound a keyframe-less rung
+/// on the SAME ceiling this buffer uses to declare the hold unrecoverable, rather than inventing a
+/// second, silently-diverging threshold. See
+/// `videocall_client::decode::layer_chooser::SCREEN_KEYFRAME_STARVED_RETRACT_MS`.
+pub const MAX_KEYFRAME_LESS_HOLD_MS: f64 = 6000.0;
 
 /// Minimum wall-clock interval (ms) between keyframe-less-hold escalations (issue #1662).
 ///
@@ -199,7 +203,7 @@ const MAX_KEYFRAME_LESS_HOLD_MS: f64 = 6000.0;
 /// Set to 8000ms: comfortably above `MAX_KEYFRAME_LESS_HOLD_MS` (6000) so a *successful* escalation
 /// (which resets the pipeline → rebuilds the buffer via `new()` → the next keyframe re-bases
 /// playout) has a full keyframe-cadence window to take effect before another reset is even
-/// considered; and matched to the publisher's 5s periodic-keyframe cadence + margin so a second
+/// considered; and above the publisher's slowest camera periodic-keyframe cadence (5.5s) so a second
 /// escalation only fires if a *full* additional recovery window also failed. A reset is expensive
 /// (tears down the WebCodecs `VideoDecoder` and rebuilds on the next keyframe), so spacing them at
 /// the keyframe cadence avoids thrashing recovery while still bounding the freeze.
@@ -942,6 +946,15 @@ pub struct JitterBuffer<T> {
     /// closed. The next emitted diagnostic includes this pending dropped count.
     pending_freshness_skip: Option<FreshnessSkip>,
 
+    /// Lifetime freshness-deadline skips, counted at the DECISION point — upstream of the
+    /// ~1s throttle the forwarded diagnostic is subject to (#2524). Same contract as
+    /// `keyframe_arrivals`: survives `flush()`, reset by a pipeline rebuild.
+    freshness_evictions: u64,
+
+    /// Subset with no buffered keyframe to skip to — the held-last-good FREEZE, not a
+    /// routine skip-to-live. Counts evicting POLLS, not freeze episodes.
+    freshness_evictions_keyframeless: u64,
+
     /// Most recent keyframe ARRIVAL (issue #2201), set by `insert_frame` and drained by
     /// the worker via [`JitterBuffer::take_keyframe_arrival`]. `None` when no keyframe
     /// has arrived since the last drain.
@@ -1062,6 +1075,8 @@ impl<T> JitterBuffer<T> {
             last_freshness_skip: None,
             last_freshness_skip_emit_ms: None,
             pending_freshness_skip: None,
+            freshness_evictions: 0,
+            freshness_evictions_keyframeless: 0,
             last_keyframe_arrival: None,
             keyframe_arrivals: 0,
             governor_sustain_ticks: 0,
@@ -1102,6 +1117,12 @@ impl<T> JitterBuffer<T> {
     }
 
     fn record_freshness_skip(&mut self, current_time_ms: u128, skip: FreshnessSkip) {
+        // Not in the `should_emit` branch: that throttle coalesces and would undercount.
+        self.freshness_evictions = self.freshness_evictions.saturating_add(1);
+        if skip.keyframe_seq.is_none() {
+            self.freshness_evictions_keyframeless =
+                self.freshness_evictions_keyframeless.saturating_add(1);
+        }
         let should_emit = match self.last_freshness_skip_emit_ms {
             Some(last) => {
                 (current_time_ms.saturating_sub(last)) as f64
@@ -1178,6 +1199,13 @@ impl<T> JitterBuffer<T> {
     /// the counter's reset semantics (survives `flush()`, resets on a pipeline rebuild).
     pub fn keyframe_arrival_count(&self) -> u64 {
         self.keyframe_arrivals
+    }
+
+    pub fn freshness_eviction_counts(&self) -> (u64, u64) {
+        (
+            self.freshness_evictions,
+            self.freshness_evictions_keyframeless,
+        )
     }
 
     /// The main entry point for a new frame arriving from the network.
@@ -1747,7 +1775,7 @@ impl<T> JitterBuffer<T> {
             // NOT bound the *freeze*: with no buffered keyframe to skip to, playout stays frozen on
             // the last-good frame until a fresh keyframe arrives AND decodes. Field-observed
             // `head_age` reached ~28s. Once the held-last-good age crosses
-            // `MAX_KEYFRAME_LESS_HOLD_MS` — i.e. even the publisher's 5s periodic GOP keyframe has
+            // `MAX_KEYFRAME_LESS_HOLD_MS` — i.e. even the publisher's slowest periodic GOP keyframe has
             // failed to recover us — SIGNAL the escalation hook (the worker gates it on its own
             // cooldown and performs the decoder reset + diagnostic; see `signal_keyframe_less_ceiling`
             // for why those live in the worker, not here).
@@ -1979,7 +2007,7 @@ impl<T> JitterBuffer<T> {
     /// The escalation fires on the EFFECTIVE freeze-age = `head_age_ms.max(hold_duration_ms)` (issue
     /// #1903), where `hold_duration_ms` is how long this keyframe-less freeze has continuously
     /// persisted (`keyframe_less_hold_since_ms`). When that effective age `>= MAX_KEYFRAME_LESS_HOLD_MS`
-    /// — the held-last-good freeze has outlasted even the publisher's slowest (5s camera)
+    /// — the held-last-good freeze has outlasted even the publisher's slowest camera
     /// periodic-keyframe recovery window, so natural recovery has genuinely failed (relay suppression,
     /// flapping publisher, or the arriving keyframe not decoding) — it asks the injected
     /// `request_escalation` hook whether to escalate, passing the effective age. If the hook returns
@@ -2511,10 +2539,10 @@ pub fn paint_lag_ms(
 ///   this function's value climbs (a frozen stream IS getting more stale). ✓ NOTE: this describes
 ///   the value THIS function computes. On the wire it is additionally gated by `fps_received > 0`
 ///   in the health reporter, so a fully-stalled stream with NO inbound packets (fps→0 after ~1s)
-///   reports 0.0 ("at live") to Prometheus, same as the sibling #1252 ms-gauges. The #1631-M2
-///   target case (draining stale content while packets keep arriving) keeps `fps_received > 0`,
-///   so the wire value climbs there as intended; the no-arrivals stall is observed instead by the
-///   relay-side freeze signals (#1637).
+///   reports 0.0 ("at live") on `videocall_video_content_staleness_ms` (field 9) alone, same as
+///   the #1252 ms-gauges. The #1631-M2 target case (stale content draining while packets arrive)
+///   keeps `fps_received > 0`, so that gauge climbs; the no-arrivals stall is observed instead by
+///   the ungated `max_content_staleness_ms` (#2511) and the relay-side freeze signals (#1637).
 ///
 /// ## Caveats
 /// - Returns `0.0` when either anchor is `None` (cold start, or post-`flush()` re-baseline) — a
@@ -2591,7 +2619,7 @@ mod tests {
         type Frame = crate::decoder::DecodedFrame;
         fn new(
             _codec: crate::decoder::VideoCodec,
-            _on_decoded_frame: Box<dyn Fn(DecodedFrame)>,
+            _on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
         ) -> Self {
             panic!("Use `new_with_vec` for this mock.");
         }
@@ -3862,6 +3890,79 @@ mod tests {
         assert_eq!(
             coalesced.dropped, 3,
             "diagnostic should include skipped frames coalesced while throttled plus the current skip"
+        );
+    }
+
+    #[test]
+    fn freshness_skip_counters_are_not_undercounted_by_the_diagnostic_throttle() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+        assert_eq!(jb.freshness_eviction_counts(), (0, 0), "cold start");
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 300);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), 300);
+        jb.insert_frame(create_test_frame(4, FrameType::DeltaFrame), 300);
+
+        let mut forwarded = 0;
+        jb.find_and_move_continuous_frames(2150);
+        forwarded += usize::from(jb.take_freshness_skip().is_some());
+        jb.find_and_move_continuous_frames(2160);
+        forwarded += usize::from(jb.take_freshness_skip().is_some());
+        jb.find_and_move_continuous_frames(2170);
+        forwarded += usize::from(jb.take_freshness_skip().is_some());
+        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1400);
+        jb.find_and_move_continuous_frames(3200);
+        forwarded += usize::from(jb.take_freshness_skip().is_some());
+
+        assert_eq!(
+            forwarded, 2,
+            "premise: the throttle really did suppress two"
+        );
+        assert_eq!(
+            jb.freshness_eviction_counts(),
+            (4, 4),
+            "every decision is booked, and all four were keyframe-less"
+        );
+    }
+
+    #[test]
+    fn a_skip_to_a_buffered_keyframe_is_not_counted_as_keyframeless() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100);
+        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1200);
+        jb.insert_frame(create_test_frame(10, FrameType::KeyFrame), 1200);
+        jb.find_and_move_continuous_frames(1200 + MAX_PLAYOUT_AGE_MS as u128 + 50);
+        assert_eq!(
+            jb.take_freshness_skip()
+                .expect("a skip must surface")
+                .keyframe_seq,
+            Some(10),
+            "premise: this is the skip-to-live branch"
+        );
+        assert_eq!(jb.freshness_eviction_counts(), (1, 0));
+    }
+
+    #[test]
+    fn flush_preserves_the_freshness_eviction_counters() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100);
+        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1200);
+        jb.find_and_move_continuous_frames(1200 + MAX_PLAYOUT_AGE_MS as u128 + 50);
+        assert_eq!(
+            jb.freshness_eviction_counts(),
+            (1, 1),
+            "premise: one keyframe-less eviction was booked"
+        );
+
+        jb.flush();
+
+        assert_eq!(
+            jb.freshness_eviction_counts(),
+            (1, 1),
+            "a stream restart does not un-evict frames that were already lost"
         );
     }
 

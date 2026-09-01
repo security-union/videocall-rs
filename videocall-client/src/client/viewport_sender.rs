@@ -56,6 +56,24 @@ use std::collections::HashSet;
 /// settles. See module docs for the storm-avoidance rationale.
 pub(crate) const VIEWPORT_DEBOUNCE_MS: u32 = 300;
 
+/// Parse a layout roster into the wire set, skipping non-`u64` entries.
+///
+/// An EMPTY roster yields `Some(empty)` and must be published: the relay treats an empty
+/// viewport as fail-open, so withholding it leaves the relay filtering against a stale
+/// set. `None` means a non-empty roster parsed to nothing (an all-mock layout), where
+/// publishing empty would wrongly clear a real filter.
+pub(crate) fn parse_layout_session_ids(layout_session_ids: &[String]) -> Option<HashSet<u64>> {
+    let ids: HashSet<u64> = layout_session_ids
+        .iter()
+        .filter_map(|id| id.parse::<u64>().ok())
+        .collect();
+    if ids.is_empty() && !layout_session_ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
 /// Tracks the most recently *requested* viewport and the most recently *sent*
 /// viewport so we only emit a control packet when the set genuinely changes.
 ///
@@ -236,6 +254,25 @@ mod tests {
         // re-send it so filtering resumes.
         assert!(s.reset_for_reconnect());
         assert_eq!(s.take_if_changed(), Some(vec![7, 8]));
+    }
+
+    #[test]
+    fn parse_layout_session_ids_skips_unparseable_without_emptying() {
+        let roster = vec!["10".to_string(), "mock-1".to_string(), "30".to_string()];
+        assert_eq!(
+            parse_layout_session_ids(&roster),
+            Some(set(&[10, 30])),
+            "an unparseable entry must be skipped, not collapse the set"
+        );
+    }
+
+    #[test]
+    fn parse_layout_session_ids_publishes_empty_but_not_an_all_mock_layout() {
+        // Empty roster: publish it. Empty is FAIL-OPEN at the relay, so withholding it
+        // strands a stale filter.
+        assert_eq!(parse_layout_session_ids(&[]), Some(HashSet::new()));
+        // Non-empty but unparseable: publishing empty would clear a real filter.
+        assert_eq!(parse_layout_session_ids(&["mock-0".to_string()]), None);
     }
 
     #[test]

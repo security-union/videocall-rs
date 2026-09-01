@@ -32,6 +32,9 @@ fn test_state() -> AppState {
         db: sqlx::PgPool::connect_lazy("postgres://localhost/unused")
             .expect("connect_lazy should not connect"),
         jwt_secret: TEST_JWT_SECRET.to_string(),
+        session_jwt_secret: TEST_JWT_SECRET.to_string(),
+        session_jwt_secret_previous: None,
+        session_previous_secret_expires_at: 0,
         token_ttl_secs: 600,
         session_ttl_secs: SESSION_TTL,
         session_refresh_threshold_secs: REFRESH_THRESHOLD,
@@ -95,7 +98,7 @@ async fn near_expiry_cookie_slides_with_later_exp() {
     let auth_time = Utc::now().timestamp() - 60;
     let original_jwt =
         generate_session_token(TEST_JWT_SECRET, "alice@test.com", "Alice", 60, auth_time).unwrap();
-    let original_claims = decode_session_token(TEST_JWT_SECRET, &original_jwt).unwrap();
+    let original_claims = decode_session_token(TEST_JWT_SECRET, None, &original_jwt).unwrap();
     let app = build_app_from_state(state);
 
     let resp = app
@@ -105,7 +108,7 @@ async fn near_expiry_cookie_slides_with_later_exp() {
 
     let set_cookie = session_set_cookie(resp.headers()).expect("near-expiry cookie should slide");
     let refreshed_jwt = jwt_from_set_cookie(&set_cookie);
-    let refreshed_claims = decode_session_token(TEST_JWT_SECRET, refreshed_jwt).unwrap();
+    let refreshed_claims = decode_session_token(TEST_JWT_SECRET, None, refreshed_jwt).unwrap();
 
     assert_eq!(refreshed_claims.sub, "alice@test.com");
     assert_eq!(refreshed_claims.name, "Alice");
@@ -291,7 +294,7 @@ async fn legacy_cookie_without_auth_time_decodes_and_slides_from_iat() {
     let state = test_state();
     let iat = Utc::now().timestamp() - 60;
     let jwt = generate_legacy_session_token_without_auth_time("legacy@test.com", "Legacy", 60, iat);
-    let decoded = decode_session_token(TEST_JWT_SECRET, &jwt).unwrap();
+    let decoded = decode_session_token(TEST_JWT_SECRET, None, &jwt).unwrap();
     assert_eq!(decoded.auth_time, None);
     let app = build_app_from_state(state);
 
@@ -303,10 +306,50 @@ async fn legacy_cookie_without_auth_time_decodes_and_slides_from_iat() {
     let set_cookie =
         session_set_cookie(resp.headers()).expect("legacy near-expiry cookie should slide");
     let refreshed_jwt = jwt_from_set_cookie(&set_cookie);
-    let refreshed_claims = decode_session_token(TEST_JWT_SECRET, refreshed_jwt).unwrap();
+    let refreshed_claims = decode_session_token(TEST_JWT_SECRET, None, refreshed_jwt).unwrap();
 
     assert_eq!(refreshed_claims.sub, "legacy@test.com");
     assert_eq!(refreshed_claims.auth_time, Some(iat));
+    // #2411: a re-mint must upgrade a legacy cookie, not inherit its absent `typ`.
+    assert_eq!(
+        refreshed_claims.typ.as_deref(),
+        Some(SessionTokenClaims::TOKEN_TYPE),
+        "a refreshed session must carry typ, not inherit the legacy absence"
+    );
+    assert_eq!(decoded.typ, None, "the inbound cookie really was legacy");
+}
+
+#[tokio::test]
+async fn session_cookie_is_verified_with_the_session_secret_not_the_room_secret() {
+    // #2411: with SESSION_JWT_SECRET provisioned, the room secret must not mint a session.
+    const SESSION_SECRET: &str = "a-different-secret-for-session-cookies";
+    let mut state = test_state();
+    state.session_jwt_secret = SESSION_SECRET.to_string();
+    let now = Utc::now().timestamp();
+
+    let forged = generate_session_token(TEST_JWT_SECRET, "attacker@test.com", "A", 3600, now)
+        .expect("should sign");
+    let resp = build_app_from_state(state.clone())
+        .oneshot(request_with_cookie("/profile", &forged))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a session signed with the ROOM secret must not authenticate"
+    );
+
+    let legitimate = generate_session_token(SESSION_SECRET, "alice@test.com", "Alice", 3600, now)
+        .expect("should sign");
+    let resp = build_app_from_state(state)
+        .oneshot(request_with_cookie("/profile", &legitimate))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a session signed with the SESSION secret must authenticate"
+    );
 }
 
 #[tokio::test]

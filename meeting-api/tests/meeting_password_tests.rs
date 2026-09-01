@@ -902,3 +902,276 @@ async fn has_password_still_reflects_the_stored_hash() {
     cleanup_test_data(&pool, protected).await;
     cleanup_test_data(&pool, open).await;
 }
+
+// ── Setting and clearing the password over PATCH (issue #2207) ───────────
+//
+// These assert against the #1613 gate itself, not against `has_password`: that
+// flag is derived from the column, so a PATCH writing an unusable hash would
+// flip it and still lock everyone out.
+
+/// `PATCH /api/v1/meetings/{room_id}` as `user`, with an arbitrary body.
+async fn patch_meeting(
+    pool: &PgPool,
+    room_id: &str,
+    user: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("PATCH", &format!("/api/v1/meetings/{room_id}"), user)
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    app.oneshot(req).await.unwrap()
+}
+
+async fn assert_patched(
+    resp: axum::response::Response,
+) -> videocall_meeting_types::responses::MeetingInfoResponse {
+    let status = resp.status();
+    assert_eq!(status, StatusCode::OK, "expected the PATCH to succeed");
+    let body: APIResponse<videocall_meeting_types::responses::MeetingInfoResponse> =
+        response_json(resp).await;
+    assert!(body.success);
+    body.result
+}
+
+/// The stored hash, read straight from the column.
+async fn stored_hash(pool: &PgPool, room_id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT password_hash FROM meetings WHERE room_id = $1")
+        .bind(room_id)
+        .fetch_one(pool)
+        .await
+        .expect("reading password_hash")
+}
+
+#[tokio::test]
+#[serial]
+async fn patch_can_set_a_password_on_a_meeting_created_without_one() {
+    let pool = get_test_pool().await;
+    let room_id = "test-pw-patch-set";
+    create_meeting(&pool, room_id, None, false, false).await;
+    assert_eq!(host_join(&pool, room_id).await, StatusCode::OK);
+
+    assert!(stored_hash(&pool, room_id).await.is_none());
+    assert_joined(join(&pool, room_id, ATTENDEE, None).await).await;
+
+    let info = assert_patched(
+        patch_meeting(
+            &pool,
+            room_id,
+            HOST,
+            serde_json::json!({ "password": PASSWORD }),
+        )
+        .await,
+    )
+    .await;
+    assert!(info.has_password, "the PATCH must report the new state");
+
+    assert_denied(
+        join(&pool, room_id, VICTIM, None).await,
+        "MEETING_PASSWORD_REQUIRED",
+    )
+    .await;
+    assert_joined(join(&pool, room_id, VICTIM, Some(PASSWORD)).await).await;
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn patch_can_remove_a_password() {
+    let pool = get_test_pool().await;
+    let room_id = "test-pw-patch-clear";
+    create_meeting(&pool, room_id, Some(PASSWORD), false, false).await;
+    assert_eq!(host_join(&pool, room_id).await, StatusCode::OK);
+
+    assert_denied(
+        join(&pool, room_id, ATTENDEE, None).await,
+        "MEETING_PASSWORD_REQUIRED",
+    )
+    .await;
+
+    let info = assert_patched(
+        patch_meeting(
+            &pool,
+            room_id,
+            HOST,
+            serde_json::json!({ "remove_password": true }),
+        )
+        .await,
+    )
+    .await;
+    assert!(!info.has_password);
+    assert!(
+        stored_hash(&pool, room_id).await.is_none(),
+        "clearing must write NULL, not an empty string the gate would fail closed on"
+    );
+
+    assert_joined(join(&pool, room_id, ATTENDEE, None).await).await;
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn patch_can_rotate_the_password_and_the_old_one_stops_working() {
+    let pool = get_test_pool().await;
+    let room_id = "test-pw-patch-rotate";
+    create_meeting(&pool, room_id, Some(PASSWORD), false, false).await;
+    assert_eq!(host_join(&pool, room_id).await, StatusCode::OK);
+
+    assert_patched(
+        patch_meeting(
+            &pool,
+            room_id,
+            HOST,
+            serde_json::json!({ "password": "a different one" }),
+        )
+        .await,
+    )
+    .await;
+
+    assert_denied(
+        join(&pool, room_id, ATTENDEE, Some(PASSWORD)).await,
+        "INVALID_MEETING_PASSWORD",
+    )
+    .await;
+    assert_joined(join(&pool, room_id, ATTENDEE, Some("a different one")).await).await;
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_non_owner_cannot_set_or_remove_the_password() {
+    let pool = get_test_pool().await;
+    let room_id = "test-pw-patch-not-owner";
+    create_meeting(&pool, room_id, None, false, false).await;
+    assert_eq!(host_join(&pool, room_id).await, StatusCode::OK);
+
+    let resp = patch_meeting(
+        &pool,
+        room_id,
+        ATTENDEE,
+        serde_json::json!({ "password": "attacker-chosen" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: APIResponse<APIError> = response_json(resp).await;
+    assert_eq!(body.result.code, "NOT_OWNER");
+    assert!(
+        stored_hash(&pool, room_id).await.is_none(),
+        "a rejected PATCH must not have written a hash"
+    );
+    assert_joined(join(&pool, room_id, VICTIM, None).await).await;
+
+    let protected = "test-pw-patch-not-owner-clear";
+    create_meeting(&pool, protected, Some(PASSWORD), false, false).await;
+    let resp = patch_meeting(
+        &pool,
+        protected,
+        ATTENDEE,
+        serde_json::json!({ "remove_password": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        stored_hash(&pool, protected).await.is_some(),
+        "a non-owner must not be able to strip the password"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+    cleanup_test_data(&pool, protected).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn ambiguous_password_bodies_are_rejected_and_change_nothing() {
+    let pool = get_test_pool().await;
+    let room_id = "test-pw-patch-ambiguous";
+    create_meeting(&pool, room_id, Some(PASSWORD), false, false).await;
+    assert_eq!(host_join(&pool, room_id).await, StatusCode::OK);
+    let before = stored_hash(&pool, room_id).await.expect("a stored hash");
+
+    for body in [
+        serde_json::json!({ "password": "" }),
+        serde_json::json!({ "password": "new", "remove_password": true }),
+    ] {
+        let resp = patch_meeting(&pool, room_id, HOST, body.clone()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected a 400 for {body}"
+        );
+        assert_eq!(
+            stored_hash(&pool, room_id).await.as_deref(),
+            Some(before.as_str()),
+            "a rejected PATCH must leave the stored hash untouched: {body}"
+        );
+    }
+
+    assert_joined(join(&pool, room_id, ATTENDEE, Some(PASSWORD)).await).await;
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_toggle_only_patch_leaves_the_password_alone() {
+    let pool = get_test_pool().await;
+    let room_id = "test-pw-patch-toggle-only";
+    create_meeting(&pool, room_id, Some(PASSWORD), false, false).await;
+    assert_eq!(host_join(&pool, room_id).await, StatusCode::OK);
+    let before = stored_hash(&pool, room_id).await.expect("a stored hash");
+
+    let info = assert_patched(
+        patch_meeting(
+            &pool,
+            room_id,
+            HOST,
+            serde_json::json!({ "waiting_room_enabled": true, "allow_guests": true }),
+        )
+        .await,
+    )
+    .await;
+    assert!(info.waiting_room_enabled, "the toggle must still apply");
+    assert!(info.has_password, "the password must have survived");
+    assert_eq!(
+        stored_hash(&pool, room_id).await.as_deref(),
+        Some(before.as_str()),
+        "a toggle-only PATCH must not even re-hash the password"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn the_patch_response_never_echoes_the_password() {
+    let pool = get_test_pool().await;
+    let room_id = "test-pw-patch-no-echo";
+    create_meeting(&pool, room_id, None, false, false).await;
+
+    let resp = patch_meeting(
+        &pool,
+        room_id,
+        HOST,
+        serde_json::json!({ "password": PASSWORD }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("reading the response body")
+            .to_vec(),
+    )
+    .expect("a utf-8 body");
+    assert!(!raw.contains(PASSWORD), "the response echoed it: {raw}");
+    assert!(
+        !raw.contains("$argon2"),
+        "the response leaked the stored hash: {raw}"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}

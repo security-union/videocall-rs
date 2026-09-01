@@ -214,8 +214,6 @@ fn start_observer_connection(
         enable_webtransport: effective_wt_enabled,
         max_received_layer: crate::constants::max_received_layer(),
         skip_canvas_paint: crate::constants::skip_canvas_paint(),
-        // Issue #2156: deployment CAMERA ladder for receiver-side READOUTS.
-        camera_ladder_variant: crate::constants::camera_ladder_variant(),
         // Issue #1884: guest lobby OBSERVER client — no in-call reaction overlay,
         // so no reaction callback.
         on_reaction: None,
@@ -537,10 +535,13 @@ pub fn GuestJoinPage(id: String) -> Element {
         }
     };
 
-    let on_rejected = move |_| {
-        observer_token_signal.set(None);
-        crate::auth::clear_guest_session_id();
-        guest_status.set(GuestStatus::Rejected);
+    let on_rejected = {
+        let meeting_id = id.clone();
+        move |_| {
+            observer_token_signal.set(None);
+            crate::guest_session::clear(&meeting_id);
+            guest_status.set(GuestStatus::Rejected);
+        }
     };
 
     let on_cancel_waiting = {
@@ -549,7 +550,11 @@ pub fn GuestJoinPage(id: String) -> Element {
             let meeting_id = meeting_id.clone();
             let token = observer_token_signal().unwrap_or_default();
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = crate::meeting_api::leave_meeting_as_guest(&meeting_id, &token).await;
+                crate::meeting_api::leave_within_deadline(
+                    &meeting_id,
+                    crate::meeting_api::leave_meeting_as_guest(&meeting_id, &token),
+                )
+                .await;
                 if let Some(w) = web_sys::window() {
                     let _ = w.location().set_href("/");
                 }

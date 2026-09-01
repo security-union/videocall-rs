@@ -24,7 +24,7 @@ depends = "libvpx7 (>= 1.11.0), libvpx-dev (>= 1.11.0), libc6 (>= 2.34), libasou
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { version = "4.0.32", features = ["derive"] }
+clap = { version = "4.0.32", features = ["derive", "env"] }
 protobuf = "3.3.0"
 web-transport-quinn = { workspace = true }
 tokio = { version = "1.32.0", features = ["full"] }
@@ -42,4 +42,9 @@ videocall-nokhwa = { path = "nokhwa", version = "0.10.9", features = ["input-nat
 [dependencies.videocall-types]
 path = "../videocall-types"
 version = "5.0.0"
+
+[dependencies.videocall-meeting-types]
+path = "../videocall-meeting-types"
+version = "0.1.2"
+features = ["mint"]
 

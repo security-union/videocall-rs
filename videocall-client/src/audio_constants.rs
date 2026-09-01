@@ -45,10 +45,20 @@ pub const RMS_LOUD_SPEECH_CEILING: f32 = 0.10;
 /// Prevents excessive event emissions while maintaining smooth visual updates.
 pub const AUDIO_LEVEL_DELTA_THRESHOLD: f32 = 0.02;
 
-/// Minimum change in audio level before triggering a UI re-render.
-/// Tighter than `AUDIO_LEVEL_DELTA_THRESHOLD` (used codec-side) to ensure
-/// smooth visual transitions while still suppressing no-op updates.
-pub const UI_AUDIO_LEVEL_DELTA: f32 = 0.01;
+/// Minimum change in audio level before a UI signal write is worth making.
+pub const UI_AUDIO_LEVEL_DELTA: f32 = AUDIO_LEVEL_DELTA_THRESHOLD * 2.0;
+
+const _: () = assert!(
+    UI_AUDIO_LEVEL_DELTA > AUDIO_LEVEL_DELTA_THRESHOLD,
+    "issue 2289: the UI write gate must be STRICTLY wider than the producer's emit gate. \
+     Both compare the same delta with the same `>`, so at or below it the UI admits every \
+     event the producer emits and suppresses nothing."
+);
+
+/// Would a level move from `prev` to `next` be worth writing to a UI signal?
+pub fn ui_level_write_is_visible(next: f32, prev: f32) -> bool {
+    (next - prev).abs() > UI_AUDIO_LEVEL_DELTA
+}
 
 /// How often (in ms) the local microphone VAD analysis runs.
 ///

@@ -7407,10 +7407,13 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 
 /* ── Notifications: participant-announcement matrix (issue 1845) ─────────────
-   A compact 2×2 grid — rows are join/leave events, columns are the Message and
-   Sound channels — replacing four full-width toggle rows. All colors are tokens
-   the `.settings-modal` scope already remaps for light theme, so no separate
-   light-mode rules are needed. */
+   A compact grid — rows are the announceable events, columns are the Message
+   and Sound channels — replacing the full-width toggle rows it started as. All
+   colors are tokens the `.settings-modal` scope already remaps for light theme,
+   so no separate light-mode rules are needed.
+
+   Issue 2329 added a third row (a hand going up or down) that has a Sound cell
+   but no Message cell, so the grid is no longer fully populated. */
 .announce-matrix {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -7443,6 +7446,20 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .announce-matrix > .glow-switch {
   justify-self: center;
+}
+
+/* Placeholder for a channel a row does not offer (issue 2329: the hand row has
+   no Message cell). It occupies the grid slot so auto-placement cannot slide the
+   next switch into the wrong column, and reads as "nothing to configure here"
+   rather than as a control that failed to render. `aria-hidden` in the markup
+   keeps it out of the accessibility tree — it is a typographic dash, not a
+   state. */
+.announce-matrix__cell-empty {
+  justify-self: center;
+  color: var(--text-tertiary);
+  font-size: var(--fs-3);
+  line-height: 1;
+  user-select: none;
 }
 
 /* Keep the right-column tooltip inside the panel: the base tooltip grows
@@ -9735,7 +9752,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   overflow-x: hidden;
   overscroll-behavior: contain;
   /* issue 2173: the house thin-scrollbar treatment (cf. `.settings-panel`,
-     `.ss-peer-panel`), which this box needs now that it is the
+     `.ss-peer-panel`, `.chat-messages`), which this box needs now that it is the
      scroller — otherwise Windows/Linux paint the default light-grey bar on the
      glass. The thumb is the DARK `--scrollbar-thumb` value verbatim rather than
      the token: this surface is FIXED-DARK in both themes (issue 2091), but
@@ -10863,6 +10880,240 @@ html[data-theme="light"] .settings-divider {
   margin-right: var(--space-1);
   color: currentColor;
   flex-shrink: 0;
+}
+
+/* ==========================================================================
+   Chat Sidebar — Google Meet style
+   ========================================================================== */
+
+#chat-sidebar {
+  position: fixed;
+  top: 0;
+  right: -360px;
+  width: 360px;
+  height: 100%;
+  background-color: var(--chat-surface);
+  color: var(--chat-text-primary);
+  display: flex;
+  flex-direction: column;
+  visibility: hidden;
+  transition: right 0.25s ease, visibility 0.25s ease;
+  z-index: 200;
+  box-shadow: -2px 0 10px var(--chat-shadow);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  overflow: hidden;
+}
+
+#chat-sidebar.visible {
+  right: 0;
+  visibility: visible;
+}
+
+/* Notice bar */
+.chat-notice {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  background-color: var(--chat-surface-notice);
+  color: var(--chat-text-secondary);
+  font-size: var(--fs-3);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--chat-border);
+}
+
+/* Message list */
+.chat-messages-container {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  scrollbar-width: thin;
+  scrollbar-color: var(--chat-text-muted) transparent;
+}
+
+.chat-messages::-webkit-scrollbar {
+  width: 4px;
+}
+
+.chat-messages::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-messages::-webkit-scrollbar-thumb {
+  background-color: var(--chat-text-muted);
+  border-radius: 2px;
+}
+
+/* Individual message row */
+.chat-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.chat-message--self {
+  flex-direction: row-reverse;
+}
+
+/* Avatar circle */
+.chat-avatar {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background-color: var(--chat-accent);
+  color: var(--chat-on-accent);
+  font-size: var(--fs-3);
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-transform: uppercase;
+}
+
+/* Bubble wrapper */
+.chat-bubble-wrapper {
+  display: flex;
+  flex-direction: column;
+  max-width: 240px;
+}
+
+.chat-message--self .chat-bubble-wrapper {
+  align-items: flex-end;
+}
+
+/* Sender name */
+.chat-sender {
+  font-size: var(--fs-3);
+  font-weight: 600;
+  color: var(--chat-text-secondary);
+  margin-bottom: var(--space-1);
+}
+
+/* Bubble */
+.chat-bubble {
+  background-color: var(--chat-surface-raised);
+  color: var(--chat-text-primary);
+  padding: var(--space-2) var(--space-3);
+  border-radius: 18px;
+  font-size: var(--fs-5);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.chat-message--self .chat-bubble {
+  background-color: var(--chat-accent);
+  color: var(--chat-on-accent);
+  border-radius: 18px;
+}
+
+/* Timestamp */
+.chat-timestamp {
+  font-size: var(--fs-2);
+  color: var(--chat-text-muted);
+  margin-top: var(--space-1);
+  padding: 0 var(--space-1);
+}
+
+/* Input area */
+.chat-input-area {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--chat-border);
+  background-color: var(--chat-surface);
+}
+
+.chat-input-area--readonly {
+  color: var(--chat-text-secondary);
+  font-size: var(--fs-3);
+  justify-content: center;
+  cursor: default;
+}
+
+.chat-input {
+  flex: 1;
+  background-color: var(--chat-surface-raised);
+  border: none;
+  border-radius: var(--radius-outer);
+  color: var(--chat-text-primary);
+  font-size: var(--fs-5);
+  padding: 10px var(--space-4);
+  outline: none;
+  transition: background-color 0.2s;
+}
+
+.chat-input::placeholder {
+  color: var(--chat-text-secondary);
+}
+
+.chat-input:focus {
+  background-color: var(--chat-surface-input-focus);
+}
+
+.chat-send-button {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  background-color: var(--chat-accent);
+  color: var(--chat-on-accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 0.2s, opacity 0.2s;
+  padding: 0;
+}
+
+.chat-send-button:hover:not(:disabled) {
+  background-color: var(--chat-accent-hover);
+}
+
+.chat-send-button:disabled {
+  background-color: var(--chat-surface-raised);
+  color: var(--chat-text-muted);
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Responsive: full-width on small screens */
+@media (max-width: 600px) {
+  #chat-sidebar {
+    width: 100%;
+    right: -100%;
+  }
+}
+
+.chat-loading,
+.chat-empty {
+  color: var(--chat-text-secondary);
+  font-size: var(--fs-4);
+  text-align: center;
+  padding: 32px var(--space-4);
+}
+
+.chat-error {
+  color: var(--chat-error-text);
+  font-size: var(--fs-4);
+  background-color: var(--chat-error-bg);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  margin: var(--space-2) 0;
 }
 
 /* ──────────────────────────────────────────────────────────────────

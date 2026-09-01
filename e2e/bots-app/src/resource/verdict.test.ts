@@ -85,7 +85,7 @@ describe("evaluateVerdict — CPU rule", () => {
   });
 
   it("honors a custom threshold + window", () => {
-    const v = evaluateVerdict([mk(60), mk(60)], new Map(), {
+    const v = evaluateVerdict([mk(60), mk(60)], new Map(), null, {
       cpuThresholdPct: 50,
       cpuSustainSamples: 2,
     });
@@ -118,7 +118,7 @@ describe("evaluateVerdict — FPS rule", () => {
 
   it("fpsSustainMs override changes the threshold", () => {
     const map = new Map([["a", fps({ min: 2, maxSustainedBelowRungMs: 3000 })]]);
-    expect(evaluateVerdict([], map, { fpsSustainMs: 3000 }).fpsStarved).toBe(true);
+    expect(evaluateVerdict([], map, null, { fpsSustainMs: 3000 }).fpsStarved).toBe(true);
     expect(evaluateVerdict([], map).fpsStarved).toBe(false);
   });
 
@@ -136,6 +136,46 @@ describe("evaluateVerdict — FPS rule", () => {
     expect(v.starved).toBe(true);
     expect(v.cpuStarved).toBe(false);
     expect(v.fpsStarved).toBe(true);
+  });
+});
+
+describe("evaluateVerdict — no-evidence rule (#2358)", () => {
+  const healthy = [mk(10), mk(12), mk(9)];
+
+  it("refuses a clean verdict when no bot joined", () => {
+    const v = evaluateVerdict(healthy, new Map(), 0);
+    expect(v.noEvidence).toBe(true);
+    expect(v.starved).toBe(false);
+    expect(v.reasons.join(" ")).toContain("no bot was observed to join");
+  });
+
+  it("refuses a clean verdict when nothing was sampled", () => {
+    const v = evaluateVerdict([], new Map(), 2);
+    expect(v.noEvidence).toBe(true);
+    expect(v.reasons.join(" ")).toContain("no resource samples were derived");
+  });
+
+  it("stays clean for a sampled run with joins", () => {
+    const v = evaluateVerdict(healthy, new Map(), 1);
+    expect(v.noEvidence).toBe(false);
+    expect(v.starved).toBe(false);
+    expect(v.reasons).toHaveLength(0);
+  });
+
+  it("claims nothing when joins are not tracked", () => {
+    expect(evaluateVerdict(healthy, new Map(), null).noEvidence).toBe(false);
+  });
+
+  it("yields to a fired rule — starvation is evidence", () => {
+    const cpu = evaluateVerdict([mk(99), mk(99), mk(99)], new Map(), 0);
+    expect(cpu.starved).toBe(true);
+    expect(cpu.noEvidence).toBe(false);
+    const fpsStarving = new Map([
+      ["a", fps({ min: 1, maxSustainedBelowRungMs: RESOURCE_FPS_SUSTAIN_MS })],
+    ]);
+    const byFps = evaluateVerdict([], fpsStarving, 0);
+    expect(byFps.starved).toBe(true);
+    expect(byFps.noEvidence).toBe(false);
   });
 });
 

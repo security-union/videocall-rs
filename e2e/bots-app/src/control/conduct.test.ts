@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { BotTask } from "../orchestrator";
+import { SD_SOURCE } from "../posture";
 import { generateToken } from "./auth";
 import {
   type Clock,
@@ -15,6 +16,7 @@ import {
   httpConductorClientFactory,
   parseAtDuration,
   parseScenario,
+  READINESS_POLL_INTERVAL_MS,
   resolveBotHost,
   ScenarioValidationError,
 } from "./conduct";
@@ -103,6 +105,13 @@ describe("parseScenario (valid)", () => {
     expect(s.entries[0].netemBody).toEqual({ delayMs: 150, lossPct: 5 });
     expect(s.entries[0].netemLabel).toBe("custom");
   });
+
+  it("carries limitPkts through to the netem body", () => {
+    const s = parseScenario(
+      "timeline:\n  - { at: 30s, bot: 2, action: netem, rateKbit: 56, limitPkts: 10 }\n",
+    );
+    expect(s.entries[0].netemBody).toEqual({ rateKbit: 56, limitPkts: 10 });
+  });
 });
 
 // ── parseScenario: every error case ──────────────────────────────────────
@@ -165,6 +174,19 @@ describe("parseScenario (validation errors)", () => {
     expect(
       bad("timeline:\n  - { at: 0s, bot: 0, action: netem, profile: dialup, delayMs: 10 }\n"),
     ).toThrow(/either "profile" or raw params/);
+  });
+
+  it("rejects an out-of-range limitPkts at parse time", () => {
+    expect(
+      bad("timeline:\n  - { at: 0s, bot: 0, action: netem, rateKbit: 56, limitPkts: 0 }\n"),
+    ).toThrow(/timeline\[0\]: "limitPkts" must be an integer >= 1/);
+  });
+
+  it("rejects a scenario downlink rate rather than silently dropping it", () => {
+    // A dropped key would leave the operator believing the downlink was shaped.
+    expect(
+      bad("timeline:\n  - { at: 0s, bot: 0, action: netem, downlinkRateKbit: 4000 }\n"),
+    ).toThrow(/"downlinkRateKbit" is not accepted at runtime/);
   });
 
   it("rejects an unknown netem profile", () => {
@@ -290,8 +312,14 @@ function recordingClient(record: string[]): ConductorClient {
     setCameraOff: async (o) => void record.push(`camera:${o}`),
     setScreenShare: async (s) => void record.push(`share:${s}`),
     leave: async () => void record.push("leave"),
-    applyNetem: async (b) => void record.push(`netem:${JSON.stringify(b)}`),
-    clearNetem: async () => void record.push("netem-clear"),
+    applyNetem: async (b) => {
+      record.push(`netem:${JSON.stringify(b)}`);
+      return { mirrorRemoved: false };
+    },
+    clearNetem: async () => {
+      record.push("netem-clear");
+      return { mirrorRemoved: false };
+    },
   };
 }
 
@@ -349,14 +377,18 @@ describe("conductScenario (live run under injectable clock)", () => {
         void fired.push({ offset: fc.read() - 1000, host: config.host, label: `share:${s}` }),
       leave: async () =>
         void fired.push({ offset: fc.read() - 1000, host: config.host, label: "leave" }),
-      applyNetem: async (b) =>
-        void fired.push({
+      applyNetem: async (b) => {
+        fired.push({
           offset: fc.read() - 1000,
           host: config.host,
           label: `netem:${JSON.stringify(b)}`,
-        }),
-      clearNetem: async () =>
-        void fired.push({ offset: fc.read() - 1000, host: config.host, label: "netem-clear" }),
+        });
+        return { mirrorRemoved: false };
+      },
+      clearNetem: async () => {
+        fired.push({ offset: fc.read() - 1000, host: config.host, label: "netem-clear" });
+        return { mirrorRemoved: false };
+      },
     });
 
     const summary = await conductScenario({
@@ -422,6 +454,56 @@ describe("conductScenario (live run under injectable clock)", () => {
     expect(logs.join("\n")).not.toContain(SECRET);
   });
 
+  /** A pod started with BOT_NETEM_PROFILE: the action downgrades it to egress-only. */
+  const mirrorRemovingClient = (): ConductorClient => ({
+    ...recordingClient([]),
+    applyNetem: async () => ({ mirrorRemoved: true }),
+    clearNetem: async () => ({ mirrorRemoved: true }),
+  });
+
+  it("records that a netem action tore down a startup ingress mirror", async () => {
+    const logs: string[] = [];
+    const fc = fakeClock();
+    const summary = await conductScenario({
+      scenarioText: EXAMPLE_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "t",
+      deps: {
+        clientFactory: () => mirrorRemovingClient(),
+        clock: fc.clock,
+        sleep: fc.sleep,
+        log: (l) => logs.push(l),
+      },
+    });
+    expect(summary.failed).toBe(0);
+    const disclosed = logs.filter((l) => l.includes("downlink is now UNSHAPED"));
+    expect(
+      disclosed.length,
+      "a run whose record omits this credits the shaping change to the fix under test",
+    ).toBeGreaterThan(0);
+  });
+
+  it("stays silent when no mirror was there to remove", async () => {
+    const logs: string[] = [];
+    const fc = fakeClock();
+    await conductScenario({
+      scenarioText: EXAMPLE_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "t",
+      deps: {
+        clientFactory: () => recordingClient([]),
+        clock: fc.clock,
+        sleep: fc.sleep,
+        log: (l) => logs.push(l),
+      },
+    });
+    expect(logs.filter((l) => l.includes("UNSHAPED"))).toEqual([]);
+  });
+
   it("throws a ScenarioValidationError when a live run has no token", async () => {
     const fc = fakeClock();
     await expect(
@@ -439,6 +521,203 @@ describe("conductScenario (live run under injectable clock)", () => {
         },
       }),
     ).rejects.toBeInstanceOf(ScenarioValidationError);
+  });
+});
+
+// ── readiness gate (awaitFleetReady, via conductScenario) ────────────────
+
+const ONE_BOT_SCENARIO = "timeline:\n  - { at: 0s, bot: 0, action: unmute }\n";
+const BOT0 = "videocall-bots-0.videocall-bots.bot-load.svc.cluster.local";
+const BOT1 = "videocall-bots-1.videocall-bots.bot-load.svc.cluster.local";
+const TWO_BOT_SCENARIO =
+  "timeline:\n  - { at: 0s, bot: 0, action: unmute }\n  - { at: 0s, bot: 1, action: unmute }\n";
+
+describe("awaitFleetReady via conductScenario", () => {
+  it("runs the schedule once every pod answers /healthz on the first sweep", async () => {
+    const fc = fakeClock();
+    const record: string[] = [];
+    const probes: string[] = [];
+    const summary = await conductScenario({
+      scenarioText: TWO_BOT_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "T",
+      deps: {
+        clientFactory: () => recordingClient(record),
+        clock: fc.clock,
+        sleep: fc.sleep,
+        log: () => {},
+        fetchHealthz: async (host, port) => {
+          probes.push(`${host}:${port}`);
+          return true;
+        },
+      },
+    });
+    expect(summary).toEqual({ planned: 2, fired: 2, failed: 0, dryRun: false });
+    // Probed each unique pod exactly once, on the control port.
+    expect(probes).toEqual([`${BOT0}:8080`, `${BOT1}:8080`]);
+    expect(record).toEqual(["mute:false", "mute:false"]);
+  });
+
+  it("retries the slow pod and anchors t0 only after it answers", async () => {
+    const fc = fakeClock(1000);
+    const firedAt: number[] = [];
+    // Bot 1's control API has not bound yet on the first sweep.
+    let bot1Attempts = 0;
+    const summary = await conductScenario({
+      scenarioText: TWO_BOT_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "T",
+      deps: {
+        clientFactory: () => ({
+          ...recordingClient([]),
+          mute: async () => void firedAt.push(fc.read()),
+        }),
+        clock: fc.clock,
+        sleep: fc.sleep,
+        log: () => {},
+        fetchHealthz: async (host) => {
+          if (host !== BOT1) return true;
+          bot1Attempts += 1;
+          return bot1Attempts > 1;
+        },
+      },
+    });
+    expect(summary).toEqual({ planned: 2, fired: 2, failed: 0, dryRun: false });
+    expect(bot1Attempts).toBe(2);
+    // One poll interval elapsed before t0, so the t+0 actions fire late in
+    // wall-clock terms — that is the point of the gate.
+    expect(firedAt).toEqual([1000 + READINESS_POLL_INTERVAL_MS, 1000 + READINESS_POLL_INTERVAL_MS]);
+  });
+
+  it("throws naming the pods that never answered, and issues no control call", async () => {
+    const fc = fakeClock();
+    const record: string[] = [];
+    await expect(
+      conductScenario({
+        scenarioText: TWO_BOT_SCENARIO,
+        hostOpts: HOST_OPTS,
+        port: 8080,
+        dryRun: false,
+        token: "T",
+        readinessTimeoutMs: 10_000,
+        deps: {
+          clientFactory: () => recordingClient(record),
+          clock: fc.clock,
+          sleep: fc.sleep,
+          log: () => {},
+          fetchHealthz: async (host) => host === BOT0,
+        },
+      }),
+    ).rejects.toThrow(new RegExp(`1 pod\\(s\\) never answered /healthz within 10000ms: ${BOT1}`));
+    // A partially-bound set of scheduled pods must not produce a run at all.
+    expect(record).toEqual([]);
+  });
+
+  it("skips the gate when deps carry no fetchHealthz (no sleep, no error)", async () => {
+    const fc = fakeClock();
+    let sleeps = 0;
+    const summary = await conductScenario({
+      scenarioText: ONE_BOT_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "T",
+      deps: {
+        clientFactory: () => recordingClient([]),
+        clock: fc.clock,
+        sleep: async (ms) => {
+          sleeps += 1;
+          await fc.sleep(ms);
+        },
+        log: () => {},
+      },
+    });
+    expect(summary).toEqual({ planned: 1, fired: 1, failed: 0, dryRun: false });
+    expect(sleeps).toBe(0);
+  });
+
+  it("skips the gate at readinessTimeoutMs 0 without probing", async () => {
+    const fc = fakeClock();
+    let probes = 0;
+    const summary = await conductScenario({
+      scenarioText: ONE_BOT_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: false,
+      token: "T",
+      readinessTimeoutMs: 0,
+      deps: {
+        clientFactory: () => recordingClient([]),
+        clock: fc.clock,
+        sleep: fc.sleep,
+        log: () => {},
+        // Never ready — the run must still proceed because the gate is off.
+        fetchHealthz: async () => {
+          probes += 1;
+          return false;
+        },
+      },
+    });
+    expect(summary).toEqual({ planned: 1, fired: 1, failed: 0, dryRun: false });
+    expect(probes).toBe(0);
+  });
+
+  it("does not probe on a --dry-run (returns before the gate)", async () => {
+    let probes = 0;
+    const summary = await conductScenario({
+      scenarioText: ONE_BOT_SCENARIO,
+      hostOpts: HOST_OPTS,
+      port: 8080,
+      dryRun: true,
+      deps: {
+        clientFactory: () => recordingClient([]),
+        clock: {
+          now: () => {
+            throw new Error("dry-run must not read the clock");
+          },
+        },
+        sleep: async () => {},
+        log: () => {},
+        fetchHealthz: async () => {
+          probes += 1;
+          return true;
+        },
+      },
+    });
+    expect(summary.dryRun).toBe(true);
+    expect(probes).toBe(0);
+  });
+
+  it("gives up at the deadline instead of polling forever", async () => {
+    const fc = fakeClock(0);
+    let probes = 0;
+    await expect(
+      conductScenario({
+        scenarioText: ONE_BOT_SCENARIO,
+        hostOpts: HOST_OPTS,
+        port: 8080,
+        dryRun: false,
+        token: "T",
+        readinessTimeoutMs: 5 * READINESS_POLL_INTERVAL_MS,
+        deps: {
+          clientFactory: () => recordingClient([]),
+          clock: fc.clock,
+          sleep: fc.sleep,
+          log: () => {},
+          fetchHealthz: async () => {
+            probes += 1;
+            return false;
+          },
+        },
+      }),
+    ).rejects.toThrow(/never answered \/healthz/);
+    // Bounded: one probe per poll interval up to the deadline, not unbounded.
+    expect(probes).toBe(5);
+    expect(fc.read()).toBe(5 * READINESS_POLL_INTERVAL_MS);
   });
 });
 
@@ -490,6 +769,8 @@ function fakeTask(overrides: Partial<BotTask> = {}): BotTask {
     displayName: "Alice",
     headless: false,
     authBackend: "jwt",
+    sourceGeometry: SD_SOURCE,
+    cameraCycle: null,
     storageStateFile: null,
     ssoStateFile: null,
     manifest: null,
@@ -534,7 +815,12 @@ describe("httpConductorClientFactory (against a live control server)", () => {
         setScreenShare: async (id, s) => void calls.push(`share:${id}:${s}`),
         setNetem: async (action) => {
           calls.push(`netem:${action.op}:${action.label}`);
-          return { argv: ["tc", "qdisc"], label: action.label, op: action.op };
+          return {
+            commands: [["tc", "qdisc"]],
+            label: action.label,
+            op: action.op,
+            mirrorRemoved: false,
+          };
         },
         duplicateBot: async () => "x",
         launchOne: async () => "x",
@@ -586,7 +872,12 @@ describe("httpConductorClientFactory (against a live control server)", () => {
         setMicMuted: async () => {},
         setCameraOff: async () => {},
         setScreenShare: async () => {},
-        setNetem: async (action) => ({ argv: ["tc"], label: action.label, op: action.op }),
+        setNetem: async (action) => ({
+          commands: [["tc"]],
+          label: action.label,
+          op: action.op,
+          mirrorRemoved: true,
+        }),
         duplicateBot: async () => "x",
         launchOne: async () => "x",
       },
@@ -597,8 +888,9 @@ describe("httpConductorClientFactory (against a live control server)", () => {
         port: emptyHandle.port,
         token: emptyToken,
       });
-      // netem needs no bot id — succeeds against an empty registry.
-      await expect(client.clearNetem()).resolves.toBeUndefined();
+      // netem needs no bot id — succeeds against an empty registry. The outcome
+      // is asserted end to end: the server's mirrorRemoved must reach the caller.
+      await expect(client.clearNetem()).resolves.toEqual({ mirrorRemoved: true });
       // mute needs a bot id — surfaces a clear error.
       await expect(client.mute(true)).rejects.toThrow(/no bot registered/);
     } finally {
@@ -626,7 +918,12 @@ describe("httpConductorClientFactory (against a live control server)", () => {
         setMicMuted: async (id, m) => void retryCalls.push(`mic:${id}:${m}`),
         setCameraOff: async () => {},
         setScreenShare: async () => {},
-        setNetem: async (action) => ({ argv: ["tc"], label: action.label, op: action.op }),
+        setNetem: async (action) => ({
+          commands: [["tc"]],
+          label: action.label,
+          op: action.op,
+          mirrorRemoved: false,
+        }),
         duplicateBot: async () => "x",
         launchOne: async () => "x",
       },

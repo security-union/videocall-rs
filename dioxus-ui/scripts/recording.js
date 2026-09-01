@@ -289,6 +289,7 @@
   var TILE_RADIUS = 12;
   /** Tile border colour — --color-border-emphasis. */
   var TILE_BORDER_COLOR = "#48484A";
+  var PENDING_TILE_NAME = "Joining…";
 
   /**
    * Lazy-init a Path2D for the person-silhouette icon (viewBox 0 0 512 512).
@@ -430,60 +431,12 @@
    */
   function collectTileData(
     tileEl,
-    videoOverride,
+    videoSource,
     nameOverride,
     speakColorOverride,
     micMutedOverride,
-    decoderCanvasMap,
   ) {
-    // Video source
-    var videoEl = videoOverride !== undefined ? videoOverride : null;
-    if (videoEl === null && tileEl) {
-      // ── Priority 1: live decoder canvas (bypasses Dioxus DOM mounting) ──
-      // The decoder canvas is available even when `show_canvas = false` (budget
-      // pressure, force_avatar, or the 50 ms reactive throttle that delays the
-      // parent re-render after a camera-on event).  The tile div id is
-      // "peer-video-{sessionId}-div"; extract the session ID to look up the
-      // canvas that Rust registered via window.__vcGetPeerVideoCanvases().
-      if (decoderCanvasMap && tileEl.id) {
-        var m = tileEl.id.match(/^peer-video-(\d+)-div$/);
-        if (m) {
-          var dcCanvas = decoderCanvasMap[m[1]];
-          if (dcCanvas && dcCanvas.width > 0 && dcCanvas.height > 0) {
-            videoEl = dcCanvas;
-          }
-        }
-      }
-
-      // ── Priority 2: DOM canvas (fallback) ────────────────────────────────
-      // Used when the decoder canvas map is unavailable or has no entry for
-      // this peer (e.g. camera just turned on and decoder not yet attached).
-      if (videoEl === null) {
-        var c = tileEl.querySelector("canvas");
-        if (c && c.width > 0 && c.height > 0) {
-          videoEl = c;
-        } else if (
-          (_dbgFrameCount === 1 || _dbgFrameCount % 150 === 0) &&
-          tileEl.id
-        ) {
-          console.warn(
-            "[recording] tile",
-            tileEl.id,
-            "no videoEl —",
-            c
-              ? "canvas w=" +
-                  c.width +
-                  " h=" +
-                  c.height +
-                  " hidden=" +
-                  c.hidden +
-                  " hiddenAttr=" +
-                  c.hasAttribute("hidden")
-              : "no canvas found",
-          );
-        }
-      }
-    }
+    var videoEl = videoSource || null;
     if (videoEl && videoEl.tagName === "VIDEO") {
       // Basic readiness / dimension check.
       var videoReady = videoEl.readyState >= 2 && videoEl.videoWidth > 0;
@@ -1193,9 +1146,44 @@
     _offCtx.restore();
   }
 
+  /** Render the "+N more in meeting" cell, mirroring `.grid-overflow-badge`. */
+  function drawOverflowCell(count, tx, ty, tw, th) {
+    var r = Math.min(TILE_RADIUS, tw / 2, th / 2);
+    _offCtx.save();
+    roundRect(tx, ty, tw, th, r);
+    _offCtx.clip();
+    _offCtx.fillStyle = TILE_BG;
+    _offCtx.fillRect(tx, ty, tw, th);
+    _offCtx.restore();
+
+    _offCtx.save();
+    _offCtx.strokeStyle = TILE_BORDER_COLOR;
+    _offCtx.lineWidth = 2;
+    roundRect(tx + 1, ty + 1, tw - 2, th - 2, r);
+    _offCtx.stroke();
+    _offCtx.restore();
+
+    var countSz = Math.max(14, Math.min(34, Math.round(tw * 0.17)));
+    var captionSz = Math.max(9, Math.round(countSz * 0.42));
+    var cx = tx + tw / 2;
+    var cy = ty + th / 2;
+    _offCtx.save();
+    _offCtx.textAlign = "center";
+    _offCtx.textBaseline = "middle";
+    _offCtx.fillStyle = "#EBEBF5";
+    _offCtx.font =
+      "600 " + countSz + "px -apple-system, BlinkMacSystemFont, sans-serif";
+    _offCtx.fillText("+" + count, cx, cy - captionSz * 0.7);
+    _offCtx.fillStyle = "rgba(235, 235, 245, 0.7)";
+    _offCtx.font =
+      "400 " + captionSz + "px -apple-system, BlinkMacSystemFont, sans-serif";
+    _offCtx.fillText("more in meeting", cx, cy + countSz * 0.55);
+    _offCtx.restore();
+  }
+
   /**
-   * Render one participant tile at (tx, ty, tw × th) using the same visual
-   * language as the real meeting tiles:
+   * Render one tile at (tx, ty, tw × th): `tileData.overflowCount` routes to
+   * drawOverflowCell, else a participant tile in the meeting tiles' language:
    *   ① Rounded-corner background (#2C2C2E, --color-surface-elevated)
    *   ② 2 px border (#48484A, --color-border-emphasis)
    *   ③ Letterboxed video OR person-silhouette avatar (clipped to tile)
@@ -1205,6 +1193,10 @@
    *   ⑦ Speaking glow border (mirrors speak_style() inline border + glow)
    */
   function drawTile(tileData, tx, ty, tw, th) {
+    if (tileData.overflowCount) {
+      drawOverflowCell(tileData.overflowCount, tx, ty, tw, th);
+      return;
+    }
     var r = Math.min(TILE_RADIUS, tw / 2, th / 2);
     // ① Clip to tile shape
     _offCtx.save();
@@ -1241,24 +1233,27 @@
       var rx = tx + tw - iconPad; // right edge to lay out from
 
       // ── Mic indicator (rightmost, matches .audio-indicator circle) ──────
-      var micR = ICON_SZ / 2;
-      var micCX = rx - micR;
-      var micCY = icnOY + micR;
-      _offCtx.save();
-      _offCtx.beginPath();
-      _offCtx.arc(micCX, micCY, micR, 0, Math.PI * 2);
-      _offCtx.fillStyle = "rgba(0, 0, 0, 0.55)";
-      _offCtx.fill();
-      _offCtx.restore();
-      var micIconColor = tileData.micMuted ? "#FF6961" : "#ffffff";
-      drawControlIcon(
-        "mic",
-        micCX,
-        micCY,
-        Math.round(ICON_SZ * 0.65),
-        micIconColor,
-        !tileData.micMuted,
-      );
+      // `micMuted` defaults to false, so an unknown mic must not be drawn.
+      if (!tileData.micUnknown) {
+        var micR = ICON_SZ / 2;
+        var micCX = rx - micR;
+        var micCY = icnOY + micR;
+        _offCtx.save();
+        _offCtx.beginPath();
+        _offCtx.arc(micCX, micCY, micR, 0, Math.PI * 2);
+        _offCtx.fillStyle = "rgba(0, 0, 0, 0.55)";
+        _offCtx.fill();
+        _offCtx.restore();
+        var micIconColor = tileData.micMuted ? "#FF6961" : "#ffffff";
+        drawControlIcon(
+          "mic",
+          micCX,
+          micCY,
+          Math.round(ICON_SZ * 0.65),
+          micIconColor,
+          !tileData.micMuted,
+        );
+      }
       rx -= ICON_SZ + ICON_GAP;
 
       // ── Transport badge (WT = blue, WS = amber) — when available ─────────
@@ -1781,48 +1776,31 @@
     }
   }
 
+  /** Participants the live grid folded into its "+N more in meeting" badge. */
+  function readGridOverflowCount(grid) {
+    var badge = grid.querySelector(".grid-overflow-badge[data-overflow-count]");
+    if (!badge) return 0;
+    var n = parseInt(badge.getAttribute("data-overflow-count"), 10);
+    return n > 0 ? n : 0;
+  }
+
   /**
-   * Build the per-frame participant list.
-   *
-   * The DECODER CANVAS MAP is the authoritative source of remote peer
-   * identity — every peer with an attached video decoder canvas becomes a
-   * participant, regardless of whether their DOM tile has mounted yet.  DOM
-   * tiles are then merged in for metadata (name, mic state, signal, speaking)
-   * and to catch peers who are in the meeting but whose camera is off
-   * (avatar-only tiles have no decoder canvas registered).
+   * Build the per-frame participant list: one entry per DOM tile, plus the
+   * decoder peers pass 2 admits.
    *
    * Called once per frame from drawFrame() so every rendered tile reflects
    * the actual participant state at that instant.
-   *
-   * For each participant the video element is resolved in priority order:
-   *   1. Decoder canvas from window.__vcGetPeerVideoCanvases() — the source of
-   *      truth for what the local user's browser has decoded.  A canvas whose
-   *      dimensions differ from the browser default (300×150) has already
-   *      been painted; `canvasHasContent()` short-circuits to `true` in that
-   *      case, so post-first-frame content is never rejected.
-   *   2. DOM <canvas> element inside the tile (fallback when the decoder map
-   *      does not include this peer — e.g. before the recording started).
-   *   3. null → avatar silhouette rendered by drawTile().
-   *
-   * @param {Element}  grid             #grid-container DOM element.
-   * @param {Object}   decoderCanvasMap sid→HtmlCanvasElement map from __vcGetPeerVideoCanvases.
-   * @returns {Array<{domTile:Element|null, videoEl:Element|null, sid:string|null}>}
    */
-  function buildFrameParticipants(grid, decoderCanvasMap) {
+  function buildFrameParticipants(grid, decoderCanvasMap, overflowCount) {
     var participants = [];
     var seenSids = {};
 
-    // ── Build sid → DOM tile lookup once so both passes can enrich cheaply ─
-    var sidToDomTile = {};
     var domTiles = grid.querySelectorAll("[data-tile-root]");
     var domTileOrder = [];
     for (var di = 0; di < domTiles.length; di++) {
       var dt = domTiles[di];
       if (dt.classList.contains("split-screen-tile")) continue;
       var dm = dt.id.match(/^peer-video-(\d+)-div$/);
-      if (dm) {
-        sidToDomTile[dm[1]] = dt;
-      }
       domTileOrder.push({ tile: dt, sid: dm ? dm[1] : null });
     }
 
@@ -1863,6 +1841,7 @@
         domTile: t,
         videoEl: videoEl,
         sid: sid,
+        pending: false,
         _decHasContent: decHasContent,
         _decW: decW,
         _domHasContent: domHasContent,
@@ -1874,25 +1853,39 @@
     // These are peers whose Dioxus tile has not yet mounted (mid-recording
     // join, camera-on race, or a re-render that momentarily removed the
     // element) — trust the decoder canvas so their video appears immediately
-    // in the recording without waiting for the UI to catch up.
-    for (var dsid in decoderCanvasMap) {
-      if (seenSids[dsid]) continue;
-      var dc2 = decoderCanvasMap[dsid];
-      var dc2HasContent =
-        dc2 && dc2.width > 0 && dc2.height > 0 ? canvasHasContent(dc2) : false;
-      var videoEl2 = dc2HasContent ? dc2 : null;
-      participants.push({
-        domTile: sidToDomTile[dsid] || null,
-        videoEl: videoEl2,
-        sid: dsid,
-        _decHasContent: dc2HasContent,
-        _decW: dc2 ? dc2.width : null,
-        _domHasContent: false,
-        _domW: null,
-      });
+    // in the recording without waiting for the UI to catch up. Once the grid
+    // overflows, a peer missing from the DOM is one the +N badge already counts.
+    var gridIsOverflowing = overflowCount > 0;
+    if (!gridIsOverflowing) {
+      for (var dsid in decoderCanvasMap) {
+        if (seenSids[dsid]) continue;
+        var dc2 = decoderCanvasMap[dsid];
+        var dc2HasContent =
+          dc2 && dc2.width > 0 && dc2.height > 0
+            ? canvasHasContent(dc2)
+            : false;
+        participants.push({
+          domTile: null,
+          videoEl: dc2HasContent ? dc2 : null,
+          sid: dsid,
+          pending: true,
+          _decHasContent: dc2HasContent,
+          _decW: dc2 ? dc2.width : null,
+          _domHasContent: false,
+          _domW: null,
+        });
+      }
     }
 
     return participants;
+  }
+
+  /** Final tile order for one frame: peers, then local, then the "+N" cell. */
+  function composeTileOrder(peerTiles, localTd, overflowCount) {
+    var tiles = peerTiles.slice();
+    tiles.push(localTd);
+    if (overflowCount > 0) tiles.push({ overflowCount: overflowCount });
+    return tiles;
   }
 
   /**
@@ -2013,25 +2006,18 @@
     }
   }
 
-  /**
-   * Build a lightweight fingerprint of the current scene state.
-   *
-   * Covers all layout-affecting properties: screen share presence, local mic
-   * state, local speaking, and per-peer session ID, video presence, mic muted,
-   * speaking, and signal level.  Two frames with the same key produce identical
-   * canvas output (modulo live video pixels) — a key change forces a redraw.
-   *
-   * @param {Array<{sid:string|null, hasVideo:boolean, tileData:Object}>} tileDataList
-   * @param {boolean}     hasScreenShare  Whether a screen-share source is active.
-   * @param {boolean}     micOn           Whether the local mic is active.
-   * @param {string|null} localSpeakColor Speaking highlight colour for the local user.
-   * @returns {string}
-   */
-  function buildSceneKey(tileDataList, hasScreenShare, micOn, localSpeakColor) {
+  function buildSceneKey(
+    tileDataList,
+    hasScreenShare,
+    micOn,
+    localSpeakColor,
+    overflowCount,
+  ) {
     var parts = [
       "ss:" + (hasScreenShare ? "1" : "0"),
       "m:" + (micOn ? "1" : "0"),
       "ls:" + (localSpeakColor ? "1" : "0"),
+      "of:" + overflowCount,
     ];
     for (var i = 0; i < tileDataList.length; i++) {
       var e = tileDataList[i];
@@ -2233,14 +2219,6 @@
       micOn = !!(cBtns[0] && cBtns[0].classList.contains("active"));
     }
 
-    // ── Live decoder canvases (authoritative source) ──────────────────
-    // window.__vcGetPeerVideoCanvases() is installed by Rust before recording
-    // starts (prepare_recording_peer_canvases).  It returns an Array of
-    // {id: sessionId, canvas: HtmlCanvasElement} for every peer whose video
-    // decoder has an attached canvas — regardless of whether Dioxus has
-    // mounted the DOM <canvas> element (which it may not have when
-    // show_canvas=false due to force_avatar, budget pressure, or the 50 ms
-    // reactive throttle on camera-on events).
     var decoderCanvasMap = {};
     var decoderCanvasRaw = [];
     var decoderFnAvailable =
@@ -2267,9 +2245,14 @@
     // ── Camera participant tiles ─────────────────────────────────────
     // For each frame get the actual current participant list, apply A/V sync
     // gating per peer, and build the tile data list for change detection.
-    var participants = buildFrameParticipants(grid, decoderCanvasMap);
+    var overflowCount = readGridOverflowCount(grid);
+    var participants = buildFrameParticipants(
+      grid,
+      decoderCanvasMap,
+      overflowCount,
+    );
     var now = performance.now();
-    var tiles = [];
+    var peerTiles = [];
     var tileDataList = [];
     var frameHasLiveVideo = false;
 
@@ -2280,11 +2263,11 @@
       var td = collectTileData(
         p.domTile,
         p.videoEl,
+        p.pending ? PENDING_TILE_NAME : undefined,
         undefined,
         undefined,
-        undefined,
-        {},
       );
+      td.micUnknown = p.pending;
 
       // ── A/V sync gating ───────────────────────────────────────────────
       // When mic-unmute and first-video-frame arrive within AV_SYNC_WINDOW_MS
@@ -2298,7 +2281,7 @@
       }
 
       if (td.videoEl) frameHasLiveVideo = true;
-      tiles.push(td);
+      peerTiles.push(td);
       tileDataList.push({ sid: p.sid, hasVideo: !!td.videoEl, tileData: td });
     }
 
@@ -2329,12 +2312,13 @@
       !micOn,
     );
     if (localTd.videoEl) frameHasLiveVideo = true;
-    tiles.push(localTd);
     tileDataList.push({
       sid: "local",
       hasVideo: !!localTd.videoEl,
       tileData: localTd,
     });
+
+    var tiles = composeTileOrder(peerTiles, localTd, overflowCount);
 
     // ── Phase 3: Scene change detection ──────────────────────────────────
     var sceneKey = buildSceneKey(
@@ -2342,6 +2326,7 @@
       !!screenSource,
       micOn,
       localSpeakColor,
+      overflowCount,
     );
     var sceneChanged = sceneKey !== _prevSceneKey;
     _prevSceneKey = sceneKey;
@@ -3374,5 +3359,10 @@
      * behaviour, not a re-implementation.
      */
     _measureTextWidthCached: measureTextWidthCached,
+
+    /** Issue #2264 accessors: the production overflow/roster path, unwrapped. */
+    _readGridOverflowCount: readGridOverflowCount,
+    _buildFrameParticipants: buildFrameParticipants,
+    _composeTileOrder: composeTileOrder,
   };
 })();

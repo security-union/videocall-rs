@@ -222,3 +222,85 @@ export function distinctChecksumsInWindow(
       .map((s) => s.checksum),
   ).size;
 }
+
+/**
+ * Sample the RECEIVED SCREEN-SHARE `<canvas>` and return the same short
+ * pixel-checksum string {@link samplePeerVideoChecksum} produces, or `null` when
+ * no usable shared-content canvas is mounted yet.
+ *
+ * ## Why a second sampler instead of an `nth` index
+ *
+ * {@link samplePeerVideoChecksum} walks `#grid-container .canvas-container`,
+ * which in split (screen-share) layout holds BOTH the shared-content tile and
+ * every camera tile — the sharer's `.split-screen-tile` and their
+ * `.split-peer-tile` each render their own `.canvas-container`
+ * (`dioxus-ui/src/components/canvas_generator.rs`, split arm). An `nth` index
+ * into that list is a positional guess that silently re-points when a peer joins
+ * or leaves. The shared-content canvas has a stable, unique identity instead:
+ * `screen_share_zoom::screen_canvas_id(peer)` renders `id="screen-share-{peer}"`
+ * (`dioxus-ui/src/components/screen_share_zoom.rs`, pinned by its own
+ * `screen_canvas_id_is_stable` unit test), mounted inside `.split-screen-tile`.
+ * Selecting on that cannot drift onto a camera tile.
+ *
+ * Painting goes through a cached `CanvasRenderingContext2d`
+ * (`videocall-client/src/decode/peer_decoder.rs`) — the same context type the
+ * camera path uses — so `getImageData` reads real decoded pixels here too.
+ *
+ * @param page The VIEWER's page (the receiver of the share).
+ */
+export async function sampleScreenShareChecksum(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    const canvas = document.querySelector(
+      '.split-screen-tile canvas[id^="screen-share-"]',
+    ) as HTMLCanvasElement | null;
+    if (!canvas || canvas.width === 0 || canvas.height === 0) {
+      return null;
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return null;
+    }
+    const w = Math.min(32, canvas.width);
+    const h = Math.min(32, canvas.height);
+    const x = Math.max(0, Math.floor((canvas.width - w) / 2));
+    const y = Math.max(0, Math.floor((canvas.height - h) / 2));
+    try {
+      const data = ctx.getImageData(x, y, w, h).data;
+      // Same cheap checksum as the camera sampler: sum every 17th byte.
+      let sum = 0;
+      for (let i = 0; i < data.length; i += 17) {
+        sum = (sum + data[i]) >>> 0;
+      }
+      return `${canvas.width}x${canvas.height}:${sum}`;
+    } catch {
+      // SecurityError on a tainted canvas — should not happen for our own
+      // decoded media; treat as unsampleable.
+      return null;
+    }
+  });
+}
+
+/**
+ * Sample the shared-content canvas repeatedly at `intervalMs` cadence for
+ * `durationMs` and return the ordered series, ready for
+ * {@link longestFrozenRunMs} / {@link distinctChecksumsInWindow}.
+ *
+ * The screen-share twin of {@link sampleChecksumSeries}; identical loop shape
+ * (inclusive of t=0, bounded by the wall clock so CI jitter in `waitForTimeout`
+ * cannot run it long) so the two series are directly comparable.
+ */
+export async function sampleScreenShareChecksumSeries(
+  page: Page,
+  durationMs: number,
+  intervalMs: number,
+): Promise<ChecksumSample[]> {
+  const series: ChecksumSample[] = [];
+  const start = Date.now();
+  while (Date.now() - start <= durationMs) {
+    const atMs = Date.now() - start;
+    const checksum = await sampleScreenShareChecksum(page);
+    series.push({ atMs, checksum });
+    await page.waitForTimeout(intervalMs);
+  }
+  return series;
+}

@@ -242,6 +242,15 @@ impl APIError {
             engineering_error: None,
         }
     }
+
+    /// A create or password rotation shed at bounded Argon2 capacity (#2478).
+    pub fn password_hasher_overloaded() -> Self {
+        Self {
+            code: "PASSWORD_HASHER_OVERLOADED".to_string(),
+            message: "The server is busy setting meeting passwords. Please try again.".to_string(),
+            engineering_error: None,
+        }
+    }
 }
 
 impl std::fmt::Display for APIError {

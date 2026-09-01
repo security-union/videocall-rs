@@ -2,6 +2,7 @@ import { test, expect, chromium, BrowserContext, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { installMediaSocketRecorder, severMediaWebSocket } from "../helpers/media-socket-sever";
 
 /**
  * Regression coverage for HCL issue #828 — "same authed user multiple times not
@@ -49,6 +50,12 @@ const SAME_USER_EMAIL = "same-user-828@videocall.rs";
 const SAME_USER_NAME = "MultiSessionUser";
 
 const PEER_TILE_SELECTOR = ".split-peer-tile, #grid-container .canvas-container";
+
+const PEER_TILE_ID_SELECTOR = '[id^="peer-video-"][id$="-div"]';
+
+async function peerTileIdsOf(page: Page): Promise<string[]> {
+  return page.locator(PEER_TILE_ID_SELECTOR).evaluateAll((els) => els.map((el) => el.id));
+}
 
 /**
  * Navigate to the home page, fill in the meeting id + display name, and submit.
@@ -829,6 +836,113 @@ test.describe("Same authed user — multiple sessions in one meeting", () => {
         uniqueRowTexts.size,
         `all three rows must have distinct display names; got ${JSON.stringify(cleanedRowTexts)}`,
       ).toBe(3);
+    } finally {
+      await closeSameUserContext(sessionA.context);
+      await closeSameUserContext(sessionB.context);
+      await closeSameUserContext(sessionC.context);
+    }
+  });
+
+  test("a reconnecting tab's stale tile is retired without disturbing a sibling tab", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_same_user_resume_${Date.now()}`;
+
+    // Milliseconds, bracketed by the ~1s reconnect and the ~15s watchdog floor.
+    const RESUMED_TILE_BUDGET_MS = 8_000;
+
+    const sessionA = await openSameUserContext(uiURL);
+    const sessionB = await openSameUserContext(uiURL);
+    const sessionC = await openSameUserContext(uiURL);
+
+    try {
+      // Camera stays OFF, like the two tests above: three camera-on tabs starve tab C.
+      await installMediaSocketRecorder(sessionA.context);
+
+      for (const s of [sessionA, sessionB, sessionC]) {
+        await navigateToMeeting(s.page, meetingId, SAME_USER_NAME);
+        await joinMeetingFromPage(s.page);
+        await expect(s.page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+      }
+
+      const tilesB = sessionB.page.locator(PEER_TILE_ID_SELECTOR);
+      const tilesC = sessionC.page.locator(PEER_TILE_ID_SELECTOR);
+      await expect(tilesB, "tab B must see tabs A and C").toHaveCount(2, { timeout: 45_000 });
+      await expect(tilesC, "tab C must see tabs A and B").toHaveCount(2, { timeout: 45_000 });
+
+      // B sees {A, C} and C sees {A, B}, so the intersection is exactly {A}.
+      const idsB = await peerTileIdsOf(sessionB.page);
+      const idsC = await peerTileIdsOf(sessionC.page);
+      const sharedIds = idsC.filter((id) => idsB.includes(id));
+      expect(
+        sharedIds,
+        `tabs B and C must agree on exactly one common session (tab A). B=${JSON.stringify(idsB)} C=${JSON.stringify(idsC)}`,
+      ).toHaveLength(1);
+      const tabATileId = sharedIds[0];
+      const siblingTileId = idsC.filter((id) => id !== tabATileId)[0];
+      expect(siblingTileId, "tab C must also hold a tile for sibling tab B").toBeTruthy();
+
+      const siblingName = sessionC.page.locator(`#${siblingTileId} .floating-name-text`);
+      await expect(siblingName).toBeVisible({ timeout: 15_000 });
+      await expect(siblingName, "the sibling tile must start out named").toHaveText(SAME_USER_NAME);
+
+      const sever = await severMediaWebSocket(sessionA.page);
+      const severedAt = Date.now();
+      expect(
+        sever.severed,
+        `no live media socket was closed on tab A (recorder saw ${sever.recorded}) — ` +
+          `nothing below would be testing a reconnect`,
+      ).toBeGreaterThanOrEqual(1);
+
+      const staleTile = sessionC.page.locator(`#${tabATileId}`);
+      const deadline = severedAt + RESUMED_TILE_BUDGET_MS;
+      let staleGoneAfterMs: number | null = null;
+      while (Date.now() < deadline && staleGoneAfterMs === null) {
+        if ((await staleTile.count()) === 0) {
+          staleGoneAfterMs = Date.now() - severedAt;
+          break;
+        }
+        await sessionC.page.waitForTimeout(200);
+      }
+
+      await expect
+        .poll(
+          async () =>
+            (await peerTileIdsOf(sessionC.page)).filter(
+              (id) => id !== tabATileId && id !== siblingTileId,
+            ).length,
+          {
+            timeout: 45_000,
+            intervals: [500],
+            message: "tab A never re-registered under a new session id",
+          },
+        )
+        .toBeGreaterThanOrEqual(1);
+
+      await expect(
+        sessionC.page.locator(`#${siblingTileId}`),
+        "sibling tab B's tile must survive tab A's reconnect — only the session " +
+          "the relay named as superseded may be evicted",
+      ).toHaveCount(1);
+      await expect(
+        siblingName,
+        "sibling tab B must keep its name: a user_id-keyed eviction would drop " +
+          "its display_name_cache row and the tile would fall back to the email",
+      ).toHaveText(SAME_USER_NAME);
+
+      expect(
+        staleGoneAfterMs,
+        `tab A's superseded tile ${tabATileId} was still in tab C's grid ` +
+          `${RESUMED_TILE_BUDGET_MS}ms after the drop. Un-fixed, only the 3-miss / 5s ` +
+          `heartbeat watchdog reaps it (~15s); the fix retires it on ` +
+          `PARTICIPANT_SESSION_RESUMED.`,
+      ).not.toBeNull();
+
+      await expect(tilesC, "tab C settles back at two remote tiles").toHaveCount(2, {
+        timeout: 30_000,
+      });
     } finally {
       await closeSameUserContext(sessionA.context);
       await closeSameUserContext(sessionB.context);

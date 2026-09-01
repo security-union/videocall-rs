@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test test-scripts up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
+.PHONY: tests_up test test-scripts build-videocall-postgres test-videocall-postgres up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -11,7 +11,7 @@ tests_run:
 		cd /app && \
 		cargo clippy --all -- -D warnings && \
 		cargo fmt --all --check && \
-		cargo test -p videocall-meeting-types && \
+		cargo test -p videocall-meeting-types --all-features && \
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
 		cargo test -p meeting-api -- --nocapture --test-threads=1"
 
@@ -58,16 +58,40 @@ clippy-fix:
 # test, and nothing else in CI runs them, so a regression here would rot silently.
 test-scripts:
 		python3 scripts/test_parse_meeting_console_logs_census.py
+		python3 scripts/test_check_clippy_ci_sync.py
+		python3 scripts/test_check_protos_regen.py
+		python3 scripts/test_e2e_doctor_freshness.py
+		python3 scripts/test_e2e_up_stamp_clear.py
+		python3 scripts/test_check_native_test_coverage.py
+		python3 scripts/test_mutation_check.py
+
+build-videocall-postgres:
+		./scripts/build-videocall-postgres-dependencies.sh
+
+test-videocall-postgres:
+		./scripts/test-videocall-postgres-chart.sh
+		./scripts/test-digitalocean-preview-postgres.sh
 
 clippy-ci:
 		cargo clippy --all -- -D warnings
 		cargo clippy --target wasm32-unknown-unknown -p videocall-client --tests -- -D warnings
+		cargo clippy --target wasm32-unknown-unknown -p videocall-client --features netsim --tests -- -D warnings
 		cargo clippy -p videocall-aq --tests -- -D warnings
-		cargo clippy -p videocall-codecs --tests -- -D warnings
+		cargo clippy -p videocall-codecs --features wasm --tests -- -D warnings
 		cargo clippy -p videocall-ui --tests -- -D warnings
 		cargo clippy -p neteq --no-default-features --features web --tests -- -D warnings
 		cargo clippy -p videocall-diagnostics --tests -- -D warnings
 		cargo clippy -p bot --tests -- -D warnings
+		cargo clippy -p videocall-netsim --tests -- -D warnings
+		cargo clippy -p vcprobe --tests -- -D warnings
+		cargo clippy -p videocall-cli --tests -- -D warnings
+		cargo clippy -p videocall-api --tests -- -D warnings
+		cargo clippy -p meeting-api --tests -- -D warnings
+		cargo clippy -p videocall-meeting-client --tests -- -D warnings
+		cargo clippy -p videocall-meeting-types --tests -- -D warnings
+		cargo clippy -p videocall-transport --tests -- -D warnings
+		cargo clippy -p videocall-transport --features netsim --tests -- -D warnings
+		cargo clippy -p videocall-types --tests -- -D warnings
 
 fmt:
 		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo fmt --all"
@@ -133,7 +157,14 @@ e2e-build: e2e-cert
 # Start the E2E stack (postgres, nats, meeting-api, websocket-api,
 # webtransport-api, dioxus-ui). Re-runs the cert script first so a stale /
 # expired cert is regenerated automatically before bringing up the stack.
+# The stamps live in the /app bind mount, so `e2e-down -v` leaves them behind
+# at their last heartbeat. Clearing here keeps the freshness gate on its "no
+# stamp yet" path instead of the previous run's cold one (#2513). The leading
+# `-` is required: the container creates the dir as root, so on Linux the clear
+# can fail and must not take the stack up with it. See
+# scripts/test_e2e_up_stamp_clear.py.
 e2e-up: e2e-cert
+	-rm -rf e2e/.stack-stamps
 	$(COMPOSE_E2E) up -d
 
 # Start the E2E stack WITH the per-client downlink-impairment proxy (issue
@@ -143,6 +174,7 @@ e2e-up: e2e-cert
 # e2e/helpers/downlink-impair.ts). The proxy is OFF for every other target so
 # the standard suite is never slowed.
 e2e-up-impair: e2e-cert
+	-rm -rf e2e/.stack-stamps
 	COMPOSE_PROFILES=impair $(COMPOSE_E2E) up -d
 
 # Tear down the E2E stack and remove volumes. `--profile impair` ensures the
@@ -190,7 +222,7 @@ e2e-bvt1:
 # divergence test in tests/simulcast-per-receiver.spec.ts and
 # helpers/downlink-impair.ts.
 e2e-impair:
-	cd e2e && npx playwright test --project=impair
+	cd e2e && npx playwright test --project=impair --workers=1
 
 # Run e2e tests with visible browsers (assumes stack is already up; same
 # cert-rotation rule as `make e2e`)
@@ -216,4 +248,3 @@ e2e-lint:
 # Auto-fix lint and formatting issues
 e2e-fmt:
 	cd e2e && npm run lint:fix && npm run format:fix
-

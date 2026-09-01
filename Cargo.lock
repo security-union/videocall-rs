@@ -1083,10 +1083,8 @@ dependencies = [
  "hound",
  "hyper 0.14.32",
  "image 0.25.9",
- "jsonwebtoken",
  "memmap2",
  "opus",
- "percent-encoding",
  "prometheus",
  "protobuf 3.7.2",
  "rand 0.8.5",
@@ -1099,6 +1097,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "videocall-aq",
+ "videocall-meeting-types",
  "videocall-netsim",
  "videocall-types",
  "web-transport-quinn",
@@ -8437,6 +8436,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "url",
+ "videocall-meeting-types",
  "videocall-types",
  "web-transport-quinn",
 ]
@@ -8526,6 +8526,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "videocall-meeting-types",
  "videocall-nokhwa",
  "videocall-types",
  "web-transport-quinn",
@@ -8583,6 +8584,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde-wasm-bindgen 0.6.5",
+ "serde_bytes",
  "serde_json",
  "videocall-diagnostics",
  "wasm-bindgen",
@@ -8620,6 +8622,8 @@ dependencies = [
 name = "videocall-meeting-types"
 version = "0.1.2"
 dependencies = [
+ "jsonwebtoken",
+ "percent-encoding",
  "serde",
  "serde_json",
 ]
@@ -8733,7 +8737,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-transport"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures",

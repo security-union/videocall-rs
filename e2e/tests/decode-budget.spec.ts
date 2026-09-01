@@ -1,5 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
+import { BUDGET } from "../helpers/rust-mirrored-constants";
 import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -22,39 +23,14 @@ import { waitForServices } from "../helpers/wait-for-services";
  * `MOCK_PEERS_ENABLED=true`, see docker-compose.e2e.yaml) and asserts the cap
  * moves. Both rely on the mock-peers debug feature to synthesize tiles without
  * standing up N real browser contexts.
- *
- * THRESHOLD/TIMING CONSTANTS BELOW ARE COPIED FROM
- * `dioxus-ui/src/components/decode_budget.rs`. If 1a.7's performance-reviewer
- * retunes those consts, this spec must be updated in lockstep — see the
- * `BUDGET` block.
  */
 
-// --- Mirrors of dioxus-ui/src/components/decode_budget.rs (task 1a.7: keep in sync) ---
-const BUDGET = {
-  FPS_STEP_DOWN: 24, // FPS at/below which the loop considers stepping DOWN
-  FPS_STEP_UP: 30, // FPS at/above which the loop considers stepping UP (review FIX 3)
-  FPS_SEVERE: 12, // median FPS at/below which a down-step drops MULTIPLE tiles (review FIX 4)
-  LONGTASK_SEVERE_MS_PER_SEC: 700, // sustained long-task ms/s for a MULTI-tile drop (review FIX 4)
-  SUSTAIN_SAMPLES: 3, // consecutive 1 Hz samples required before a step
-  RECOVERY_HOLD: 5, // consecutive recovery-qualifying samples before a step UP
-  // min ms between two DOWN steps (review FIX 5). Issue #1557 REUSES this exact
-  // constant as the cascade SETTLE WINDOW: after received layers reach floor, the
-  // loop waits STEP_DOWN_COOLDOWN_MS since the last REAL layer drop before
-  // escalating from lowering layers to PAUSING (capping) tiles. One constant,
-  // two roles — `settle_window_elapsed(now, last_layer_drop_ms)` in
-  // decode_budget.rs compares against this same 2000 ms.
-  STEP_DOWN_COOLDOWN_MS: 2000,
-  STEP_UP_COOLDOWN_MS: 4000, // min ms between two UP steps (review FIX 5)
-  WINDOW: 5, // rolling sample window owned by the control loop (attendants.rs)
-} as const;
-
-// A synthetic FPS comfortably below FPS_STEP_DOWN and well above FPS_STEP_UP,
-// derived from the mirrored consts so a retune in 1a.7 keeps these valid.
 // LOW_FPS sits in the MILD band (above FPS_SEVERE, below FPS_STEP_DOWN) so the
 // DOWN phase exercises single-tile steps; severe multi-tile drops are covered by
-// the Rust unit tests, not this timing-sensitive E2E.
-const LOW_FPS = BUDGET.FPS_STEP_DOWN - 6; // 18: < FPS_STEP_DOWN, > FPS_SEVERE
-const HIGH_FPS = BUDGET.FPS_STEP_UP + 15; // 45: comfortably >= FPS_STEP_UP
+// the Rust unit tests, not this timing-sensitive E2E. A retune does NOT preserve
+// that band, so the `beforeAll` below pins it.
+const LOW_FPS = BUDGET.FPS_STEP_DOWN - 6;
+const HIGH_FPS = BUDGET.FPS_STEP_UP + 15;
 // Spacing between injected 1 Hz samples: slightly above the loop's 1 s bucket
 // cadence so each injection lands in a fresh bucket.
 const INJECT_INTERVAL_MS = 1200;
@@ -114,6 +90,11 @@ const firstLowerLayerLatchIndex = (lines: string[]): number =>
 
 test.describe("Adaptive decode budget (#987)", () => {
   test.beforeAll(async () => {
+    // A retune of the mirrored consts can flip LOW_FPS into the SEVERE band,
+    // where a down-step drops MULTIPLE tiles — a different path than these
+    // single-tile tests assert.
+    expect(LOW_FPS).toBeGreaterThan(BUDGET.FPS_SEVERE);
+    expect(LOW_FPS).toBeLessThan(BUDGET.FPS_STEP_DOWN);
     await waitForServices();
   });
 

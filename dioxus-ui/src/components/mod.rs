@@ -25,6 +25,8 @@ pub mod device_settings_modal;
 pub mod diagnostics;
 pub mod freshness_inject;
 pub mod google_sign_in_button;
+pub mod grid_overflow_badge;
+pub mod handler_cell;
 pub mod host;
 pub mod host_controls;
 pub mod icons;
@@ -86,6 +88,7 @@ pub mod video_control_buttons;
 pub mod waiting_room;
 
 pub mod canvas_generator;
+pub mod chat_sidebar;
 mod peer_list;
 pub mod peer_tile;
 pub mod pre_join_preview;

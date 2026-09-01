@@ -63,12 +63,19 @@
 # | Speaking changed: false -> true             | speaking_transitions (open-mic energy, NOT speech)    | videocall-client mic/VAD        |
 # | audio health (buffer: Nms) for peer: X      | audio_buffer_median_ms per peer   | videocall-client/src/health_reporter.rs |
 # | "level":"preamble"                          | cores / memory / platform / etc. | videocall-client console-logger initialization |
+# | ProtectiveMode: ENTERED                     | audio-starve cap (#1597) | dioxus-ui/src/components/attendants.rs            |
+# | ProtectiveMode: EMERGENCY cap N->M          | tile collapse       | dioxus-ui/src/components/attendants.rs               |
+# | ProtectiveMode: EXITED                      | recovery            | dioxus-ui/src/components/attendants.rs               |
+# | ProtectiveMode: audio-driven pressured latch | feeds max audio_buffer_ms only | dioxus-ui/src/components/attendants.rs    |
 #
 # | KEYFRAME_REQUEST                            | keyframe_req_count  | videocall-client/src/decode/peer_decode_manager.rs     |
 # | CameraEncoder: forcing keyframe             | pli_received_count  | videocall-client/src/encode/camera_encoder.rs          |
 # | AdaptiveQuality: video stepped DOWN         | aq_step_down_count  | videocall-aq/src/controller.rs                         |
 # | FPS: target=N received=N                    | pid_received_fps    | videocall-aq/src/controller.rs                         |
 # | Simulcast layer change: active N->M (reason=...) | simulcast_layer shed/restore counts + timeline | videocall-client/src/encode/camera_encoder.rs |
+# | [JITTER_BUFFER] freshness_skip              | freeze episodes (receiver from FILENAME; publisher is the 2nd id, often absent) | videocall-codecs/src/messages.rs (console_line) |
+# | [JITTER_BUFFER] keyframe_arrival            | keyframe arrivals per pair; carries NO simulcast-layer id, so cadence is not derivable | videocall-codecs/src/messages.rs (console_line) |
+# | LAYER_GATE_SKIPS                            | cumulative gate counters; session_id is the PUBLISHER being gated, take the max per pair | videocall-client/src/decode/peer_decode_manager.rs (layer_gate_skips_log_fields) |
 # | network=                                    | net_downlink, net_rtt | preamble (Navigator.connection API)                  |
 # | battery=                                    | battery_state       | preamble (Navigator.getBattery API)                    |
 #
@@ -191,6 +198,10 @@ fi
 # Use gawk explicitly — bare `awk` may resolve to BSD awk on macOS even
 # when gawk is installed separately.
 AWK=gawk
+
+# Two freshness skips on the same pair closer together than this are one freeze
+# episode. 3000 is the coalescing gap the meeting-analysis runbook specifies.
+FREEZE_EPISODE_GAP_MS=3000
 
 ts_to_human() { date -u -d "@$(( ${1} / 1000 ))" '+%H:%M:%S' 2>/dev/null || echo "?"; }
 epoch_to_prom() { echo "$(( ${1} / 1000 ))"; }
@@ -714,16 +725,18 @@ fi
 # Step 5: Output
 # ---------------------------------------------------------------------------
 
+# The report's own id (the date dir). The Prometheus label is `prom_meeting_id`.
 meeting_id=$(basename "$LOG_DIR")
+
+# Prometheus's meeting_id label is the ROOM NAME, not the date; a wrong value
+# returns an empty result set with HTTP 200, which reads as "no data".
+prom_room=$(basename "$(dirname "$(cd "$LOG_DIR" && pwd)")")
 
 # --verify mode: each PATTERN INVENTORY phrase is checked against the log dir.
 # "Required" patterns MUST match in any real meeting (meeting setup, elections,
 # preamble). "Optional" patterns may legitimately be absent in small/clean
 # meetings (no re-elections, no dropped datagrams). Required-with-zero-matches
 # is an error and exits 2 — almost certainly a renamed client log message.
-#
-# Use in CI / pre-deploy checks: run after a client build to catch when a PR
-# renames a log line and silently breaks extraction.
 if [[ "$OUTPUT_FORMAT" == "verify" ]]; then
   # Patterns always expected in a real meeting (client setup + preamble)
   declare -a VERIFY_REQUIRED=(
@@ -748,6 +761,15 @@ if [[ "$OUTPUT_FORMAT" == "verify" ]]; then
     "CameraEncoder: forcing keyframe"
     "stepped DOWN"
     "Simulcast layer change:"
+    # VISIBILITY ONLY: the optional loop never sets verify_failed, so a rename
+    # here prints [none] and still exits 0.
+    "[JITTER_BUFFER] freshness_skip"
+    "[JITTER_BUFFER] keyframe_arrival"
+    "LAYER_GATE_SKIPS"
+    "ProtectiveMode: ENTERED"
+    "ProtectiveMode: EXITED"
+    "ProtectiveMode: EMERGENCY cap"
+    "ProtectiveMode: audio-driven pressured latch"
   )
 
   verify_failed=0
@@ -811,8 +833,10 @@ if [[ "$OUTPUT_FORMAT" == "json" ]]; then
     --arg prom_start "$prom_start" \
     --arg prom_end "$prom_end" \
     --arg meeting_id "$meeting_id" \
+    --arg prom_meeting_id "$prom_room" \
     '{
       meeting_id: $meeting_id,
+      prom_meeting_id: $prom_meeting_id,
       meeting_start: $meeting_start,
       meeting_end: $meeting_end,
       prom_start_epoch: ($prom_start | tonumber),
@@ -1194,6 +1218,191 @@ if [[ -n "$RELAY_WS" ]]; then
   echo ""
 fi
 
+echo "### Video Freeze Episodes (client jitter buffer)"
+echo ""
+echo "_\`[JITTER_BUFFER] freshness_skip\` = a receive-side freeze onset. **Publisher** is the second id in the log line (the first is the logging peer); it renders \`-\` when that line carries no ids, in which case the receiver still attributes correctly because it comes from the filename. Consecutive skips on one (receiver, publisher) within ${FREEZE_EPISODE_GAP_MS}ms count as one episode._"
+echo ""
+
+freeze_tsv="$TMPDIR_WORK/freshness_skip.tsv"
+: > "$freeze_tsv"
+# Receiver from the FILENAME: most lines render `->:` with no ids, and pooling
+# those across files merges independent peers into one row.
+while read -r who; do
+  [[ -z "$who" ]] && continue
+  zcat "$LOG_DIR/${who}"_*.log.gz 2>/dev/null \
+    | jq -rc 'select(.msg? != null) | select(.msg | contains("freshness_skip")) | [.ts, .msg] | @tsv' 2>/dev/null \
+    | $AWK -F'\t' -v who="$who" '
+        { msg = $2
+          if (match(msg, /freshness_skip [0-9]*->([0-9]+)/, m)) pub = m[1]; else pub = "-"
+          head = 0; drop = 0; esc = "false"
+          if (match(msg, /head_age=([0-9]+)/, h)) head = h[1]
+          if (match(msg, /dropped=([0-9]+)/, d))  drop = d[1]
+          if (msg ~ /escalated=true/)             esc  = "true"
+          print $1 "\t" who "\t" pub "\t" head "\t" drop "\t" esc }' 2>/dev/null
+done < <(find "$LOG_DIR" -maxdepth 1 -name '*.log.gz' -exec basename {} \; \
+         | sed 's/_[0-9]*\.log\.gz$//' | sort -u) \
+  | sort -u > "$freeze_tsv"
+
+if [[ ! -s "$freeze_tsv" ]]; then
+  echo "_None — no \`freshness_skip\` in this window._"
+else
+  echo "| Receiver | Publisher | Episodes | Skips | Max head_age | Frames dropped | Escalations | First onset |"
+  echo "|----------|-----------|----------|-------|--------------|----------------|-------------|-------------|"
+  $AWK -F'\t' -v gapms="$FREEZE_EPISODE_GAP_MS" '
+      function epoch_ms(iso,   f, s) {
+        if (match(iso, /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})\.([0-9]{3})/, f) == 0) return -1
+        s = mktime(f[1] " " f[2] " " f[3] " " f[4] " " f[5] " " f[6] " 0", 1)
+        return (s * 1000) + (f[7] + 0)
+      }
+      { ms = epoch_ms($1)
+        # Cannot be placed in an episode; counting it would merge two.
+        if (ms < 0) { unparsed++; next }
+        key = $2 "\t" $3; head = $4 + 0
+        skips[key]++
+        if (head > maxhead[key]) maxhead[key] = head
+        drops[key] += $5 + 0
+        if ($6 == "true") esc[key]++
+        if (!(key in firstms) || ms < firstms[key]) { first[key] = $1; firstms[key] = ms }
+        # Requires ascending input; the feeding pipeline sorts.
+        if (!(key in lastms) || (ms - lastms[key]) > gapms) eps[key]++
+        lastms[key] = ms }
+      END {
+        for (k in skips) {
+          split(k, p, "\t")
+          printf "| %s | `%s` | %d | %d | %dms | %d | %d | %s |\n", \
+                 p[1], p[2], eps[k], skips[k], maxhead[k], drops[k], esc[k]+0, substr(first[k], 12, 12)
+        }
+        if (unparsed) printf "| ⚠ %d line(s) had an unparseable timestamp and are excluded | | | | | | | |\n", unparsed
+      }' "$freeze_tsv" | sort
+  echo ""
+  echo "_\`head_age\` is how stale the held picture was when the skip fired; compare it against \`MAX_PLAYOUT_AGE_MS\`. To tell a decoder-startup transient from a steady-state freeze, compare \`First onset\` against that receiver's join time in the Sessions table, and check \`videocall_video_seq_loss_per_sec\` / \`videocall_websocket_drops\` — both 0 alongside a nonzero \`videocall_video_freeze_episodes_total\` means the frames arrived undecodable rather than being lost in transit._"
+fi
+echo ""
+
+echo "### Keyframe Arrivals per Pair"
+echo ""
+echo "_Count of \`[JITTER_BUFFER] keyframe_arrival\` per (receiver, publisher). **Inter-arrival cadence is deliberately NOT reported: the log line carries no simulcast-layer id**, so arrivals from different layers of one publisher are indistinguishable and any median or off-cadence figure computed from them is an artifact. For the same reason a count that differs between publishers is a pointer, not a finding — it can mean extra keyframes OR a different number of layers passing the receiver's gate. \`stream_restart=true\` also resets \`seq\` mid-stream._"
+echo ""
+kf_tsv="$TMPDIR_WORK/keyframe_arrival.tsv"
+: > "$kf_tsv"
+# Same SetContext locals as freshness_skip, so id-less at the same rate.
+while read -r who; do
+  [[ -z "$who" ]] && continue
+  zcat "$LOG_DIR/${who}"_*.log.gz 2>/dev/null \
+    | jq -rc 'select(.msg? != null) | select(.msg | contains("keyframe_arrival")) | [.ts, .msg] | @tsv' 2>/dev/null \
+    | $AWK -F'\t' -v who="$who" '
+        { if (match($2, /keyframe_arrival [0-9]*->([0-9]+)/, m)) pub = m[1]; else pub = "-"
+          print $1 "\t" who "\t" pub }' 2>/dev/null
+done < <(find "$LOG_DIR" -maxdepth 1 -name '*.log.gz' -exec basename {} \; \
+         | sed 's/_[0-9]*\.log\.gz$//' | sort -u) \
+  | sort -u > "$kf_tsv"
+
+if [[ ! -s "$kf_tsv" ]]; then
+  echo "_None — no \`keyframe_arrival\` in this window._"
+else
+  echo "| Receiver | Publisher | Arrivals | First | Last |"
+  echo "|----------|-----------|----------|-------|------|"
+  $AWK -F'\t' '
+      { key = $2 "\t" $3; n[key]++
+        if (!(key in lo)) lo[key] = $1
+        hi[key] = $1 }
+      END { for (k in n) { split(k, p, "\t")
+              printf "| %s | `%s` | %d | %s | %s |\n", p[1], p[2], n[k], substr(lo[k],12,8), substr(hi[k],12,8) } }' \
+    "$kf_tsv" | sort
+fi
+echo ""
+
+
+echo "### Layer Gate Skips (cumulative — final value per pair)"
+echo ""
+echo "_Two traps. (1) The fields are **cumulative counters re-logged periodically**, so summing log lines over-counts by the number of lines — take the final value. (2) \`session_id=\` on this line is the **PUBLISHER being gated**, not the logging peer, so one receiver emits a separate running total per publisher; tailing a chunk file gives whichever publisher was logged last. Naming is **guard-relative**: \`*_above\` counts arriving frames BELOW the receiver's selection — it does NOT mean the frame was above it._"
+echo ""
+echo "| Receiver | Publisher | video_above | video_below | screen_above | screen_below | audio_above | audio_below |"
+echo "|----------|-----------|-------------|-------------|--------------|--------------|-------------|-------------|"
+lg_found=0
+lg_tsv="$TMPDIR_WORK/layer_gate.tsv"
+: > "$lg_tsv"
+while read -r who; do
+  [[ -z "$who" ]] && continue
+  zcat "$LOG_DIR/${who}"_*.log.gz 2>/dev/null \
+    | jq -rc 'select(.msg? != null) | select(.msg | contains("LAYER_GATE_SKIPS")) | .msg' 2>/dev/null \
+    | $AWK -v who="$who" '
+        # The emitter omits any field whose count is 0, so absent means 0 here.
+        { sid = ""
+          if (match($0, /session_id=([0-9]+)/, m)) sid = m[1]
+          if (sid == "") next
+          split("video_above video_below screen_above screen_below audio_above audio_below", f, " ")
+          for (i = 1; i <= 6; i++) {
+            v = 0
+            if (match($0, f[i] "=([0-9]+)", m)) v = m[1] + 0
+            # Max, not last: these only rise, so order of concatenation is moot.
+            if (v > mx[sid, i]) mx[sid, i] = v
+          }
+          seen[sid] = 1 }
+        END { for (k in seen) {
+                row = who "\t" k
+                for (i = 1; i <= 6; i++) row = row "\t" (mx[k, i] + 0)
+                print row } }'
+done < <(find "$LOG_DIR" -maxdepth 1 -name '*.log.gz' -exec basename {} \; \
+         | sed 's/_[0-9]*\.log\.gz$//' | sort -u) >> "$lg_tsv"
+
+if [[ -s "$lg_tsv" ]]; then
+  lg_found=1
+  sort "$lg_tsv" | $AWK -F'\t' \
+    '{ printf "| %s | `%s` | %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6, $7, $8 }'
+fi
+[[ $lg_found -eq 0 ]] && echo "| _none_ | | | | | | | |"
+echo ""
+
+echo "### ProtectiveMode Episodes (audio-driven tile-cap collapse)"
+echo ""
+echo "_\`ProtectiveMode: ENTERED\` fires when the client sacrifices VIDEO to rescue audio; \`EMERGENCY cap N->M (speaker-only)\` is the tile set collapsing, which users report as \"the video keeps resetting / repainting\". **The transitions themselves have no Prometheus series** (#1597). \`trigger=audio_buffer\` with a high \`median_fps\` and \`longtask_ms_per_sec=0\` means the renderer was HEALTHY and audio was starving — i.e. NOT a CPU-capacity problem. Compare \`audio_buffer_ms\` against the Sessions table's \`Buf med\` column: a 3-7x excursion is the signal._"
+echo ""
+echo "| Participant | Entered | Exited | Emergency caps | Worst cap | Max audio_buffer_ms | Renderer healthy at every onset? | First onset |"
+echo "|-------------|---------|--------|----------------|-----------|---------------------|----------------------------------|-------------|"
+
+pm_found=0
+while read -r who; do
+  [[ -z "$who" ]] && continue
+  zcat "$LOG_DIR/${who}"_*.log.gz 2>/dev/null \
+    | jq -rc 'select(.msg? != null) | select(.msg | contains("ProtectiveMode")) | [.ts, .msg] | @tsv' 2>/dev/null \
+    | $AWK -F'\t' -v who="$who" '
+        BEGIN { ent=0; ext=0; emg=0; worst=""; maxbuf=-1; fps=-1; lt=-1; fpsn=0; ltn=0; first="" }
+        { msg = $2
+          if (msg ~ /ENTERED/)   { ent++; if (first == "") first = $1 }
+          if (msg ~ /EXITED/)    ext++
+          if (msg ~ /EMERGENCY/) { emg++
+            if (match(msg, /cap ([0-9]+)->([0-9]+)/, c)) {
+              span = c[1] - c[2]
+              if (worst == "" || span > worstspan) { worst = c[1] "->" c[2]; worstspan = span }
+            }
+          }
+          if (match(msg, /audio_buffer_ms=([0-9]+)/, b) && b[1]+0 > maxbuf) maxbuf = b[1]+0
+          if (msg ~ /ENTERED/) {
+            if (match(msg, /median_fps=([0-9.]+)/, f)) { fpsn++; if (fps < 0 || f[1]+0 < fps) fps = f[1]+0 }
+            if (match(msg, /longtask_ms_per_sec=([0-9]+)/, l)) { ltn++; if (l[1]+0 > lt) lt = l[1]+0 }
+          }
+        }
+        END { if (ent > 0 || emg > 0) {
+                health = "unknown"
+                if (fps >= 0 && fps < 30) health = "no (min fps " fps ", max longtask " (lt < 0 ? "unknown" : lt) ")"
+                else if (lt > 0)          health = "no (min fps " (fps < 0 ? "unknown" : fps) ", max longtask " lt ")"
+                else if (fpsn == ent && ltn == ent && fps >= 30 && lt == 0) health = "YES (min fps " fps ", max longtask 0)"
+                printf "%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n", who, ent, ext, emg, (worst == "" ? "-" : worst), (maxbuf < 0 ? "-" : maxbuf), health, first
+              } }' 2>/dev/null
+done < <(find "$LOG_DIR" -maxdepth 1 -name '*.log.gz' -exec basename {} \; \
+         | sed 's/_[0-9]*\.log\.gz$//' | sort -u) \
+  | sort -t$'\t' -k4,4nr -k2,2nr > "$TMPDIR_WORK/protective.tsv"
+
+if [[ -s "$TMPDIR_WORK/protective.tsv" ]]; then
+  pm_found=1
+  $AWK -F'\t' '{ printf "| %s | %s | %s | %s | `%s` | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6, $7, $8 }' \
+    "$TMPDIR_WORK/protective.tsv"
+fi
+[[ $pm_found -eq 0 ]] && echo "| _none_ | | | | | | | |"
+echo ""
+echo "_An empty section means no client sacrificed video for audio — NOT that audio was healthy. Concealment can be elevated without ProtectiveMode firing (measured 2026-08-31: a receiver at 15.2% mean concealment logged zero ProtectiveMode events, while a receiver graded A peaked at 1040ms buffer). Read this alongside \`videocall_audio_concealment_pct\`, never instead of it._"
+echo ""
 echo "### Peer ID → Email Map (for Prometheus)"
 echo ""
 echo "| Session ID (uint64) | Email | Display Name |"
@@ -1211,9 +1420,39 @@ echo "### Prometheus Copy-Paste"
 echo ""
 echo "\`\`\`bash"
 echo "PROM=https://prometheus.videocall.fnxlabs.com"
-echo "MEETING_ID=${meeting_id}"
+echo "# meeting_id is the ROOM NAME, not the date. Guessed from the parent dir —"
+echo "# override if the local path does not mirror /console-logs/<room>/<date>/."
+echo "MEETING_ID=${prom_room}"
 echo "START=${prom_start}"
 echo "END=${prom_end}"
+echo ""
+echo "# Use query_range for everything below: the client-reported series stop being"
+echo "# scraped when the last participant leaves, so an instant query at END is empty"
+echo "# even for a counter. Read a counter's first vs last sample over the range."
+echo ""
+echo "# Enumerate exactly what this meeting exported (catches renamed metrics):"
+echo "curl -sk \"\$PROM/api/v1/series\" \\"
+echo "  --data-urlencode \"match[]={meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
+echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" | jq -r '.data[].__name__' | sort -u"
+echo ""
+echo "# Freeze ground truth (counters — compare first vs last sample):"
+echo "for q in videocall_video_freeze_episodes_total videocall_video_freeze_seconds_total \\"
+echo "         videocall_video_max_decode_gap_ms videocall_video_max_content_staleness_ms \\"
+echo "         videocall_video_freshness_evictions_keyframeless_total; do"
+echo "  curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "    --data-urlencode \"query=\$q{meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
+echo "    --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=30s\""
+echo "done"
+echo ""
+echo "# Was the freeze network loss, or undecodable-but-delivered frames?"
+echo "# Both 0 while freeze_episodes > 0 means the frames ARRIVED and could not be"
+echo "# decoded — look at the decoder/worker path, not the transport."
+echo "for q in videocall_video_seq_loss_per_sec videocall_video_seq_max_gap_frames \\"
+echo "         videocall_websocket_drops videocall_client_send_queue_bytes; do"
+echo "  curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "    --data-urlencode \"query=\$q{meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
+echo "    --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=30s\""
+echo "done"
 echo ""
 echo "# Call quality scores:"
 echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
@@ -1224,6 +1463,17 @@ echo "# Audio concealment:"
 echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
 echo "  --data-urlencode \"query=videocall_audio_concealment_pct{meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
 echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=15s\""
+echo ""
+echo "# Relay WS fragment reassembly. ⚠ These carry NO room or meeting label and are"
+echo "# process-lifetime totals for the whole relay pod, so the value is NOT"
+echo "# attributable to this meeting — read it as a rate over the meeting window and"
+echo "# check the pod's uptime and restart count before drawing any conclusion."
+echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "  --data-urlencode \"query=increase(relay_ws_fragmented_inbound_total[5m])\" \\"
+echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=1m\""
+echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "  --data-urlencode \"query=increase(relay_ws_fragment_discarded_total[5m])\" \\"
+echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=1m\""
 echo ""
 echo "# Relay mailbox-overflow drops (issue #1057) — room label is the meeting NAME:"
 echo "# Any nonzero increase here = the freeze-causing actor-mailbox overflow."

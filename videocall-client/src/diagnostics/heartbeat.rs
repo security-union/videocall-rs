@@ -95,7 +95,10 @@ type SharedOnTick = Rc<RefCell<Option<BoxedOnTick>>>;
 /// parent. Worker-scope timers are not throttled when the parent tab is hidden,
 /// so this keeps firing at the configured cadence even while the main thread
 /// is being clamped to 1Hz.
-#[cfg(target_arch = "wasm32")]
+///
+/// `test` is in the gate so the host libtest build can assert the message
+/// protocol against this literal (#2446).
+#[cfg(any(target_arch = "wasm32", test))]
 const HEARTBEAT_WORKER_JS: &str = r#"
 let intervalId = null;
 self.onmessage = (e) => {
@@ -396,12 +399,10 @@ impl std::fmt::Debug for HeartbeatTimer {
 mod tests {
     use super::*;
 
-    #[cfg(target_arch = "wasm32")]
     #[test]
     fn worker_js_has_expected_message_protocol() {
         // Smoke test: any future edit to the JS must keep the `start` / `stop`
-        // / `tick` contract used by the Rust side. The JS blob is only
-        // compiled on wasm targets, so this assertion is wasm-gated too.
+        // / `tick` contract used by the Rust side.
         assert!(HEARTBEAT_WORKER_JS.contains("'start'"));
         assert!(HEARTBEAT_WORKER_JS.contains("'stop'"));
         assert!(HEARTBEAT_WORKER_JS.contains("'tick'"));

@@ -9,6 +9,25 @@
 - **videocall-types** - Shared protobuf types
 - **videocall-codecs** - Audio/video codec wrappers
 
+## Media Terminology (use these terms exactly)
+
+Simulcast ladder positions are **layers**, indexed `0=base, 1=mid, 2=high/top`. **Always prefix the media kind** — "video layer 2", "audio layer 0". Never write a bare "layer" or "rung": `rung` is used interchangeably as a synonym in code (`RungKind::Audio`, `ProbeRung`, and `health_packet.proto` uses both words for the same concept), so an unqualified term is ambiguous across audio/video/screen. Existing code identifiers stay as they are — this governs prose, comments, PR bodies, and issue text.
+
+- **Video** publishes 3 layers, nominal `[0] 320x180 ~120kbps | [1] 640x360 ~350kbps | [2] 1280x720 ~1500kbps` (`SIMULCAST_VIDEO_LAYERS`), 1970 kbps total. These are INDEPENDENT simulcast encodes, NOT nested SVC (see `videocall-aq/src/constants.rs`), and the receiver's layer guard is EXACT-MATCH — a mismatched layer is dropped, not downgraded.
+- **A layer's dims are a bounding box and are NEVER upscaled**, so an observed resolution does not identify a layer without the source geometry. A 640x480 4:3 source fits to `240x180 / 480x360 / 640x480` (`camera_small_four_three_source_does_not_upscale`), so a 640-wide frame there is layer 2; a 16:9 720p source fits the nominal boxes exactly, so a 640-wide frame is layer 1. Bitrates are nominal per tier; resolutions are source-bounded — never read one as the other.
+- **Audio** publishes 3 layers: `[0] 12kbps | [1] 24kbps | [2] 48kbps` (`AUDIO_SIMULCAST_LAYER_KBPS`). Receivers typically settle on the top one, but the chooser starts at `[0]` and sheds downward under downlink constraint (`tick_audio_layer_chooser`, fed the video downlink as a health proxy).
+- **Qualify every bitrate and frame count the same way.** An unqualified "1970 kbps" or "1 frame/sec" has already been read as audio when it meant video.
+- **`fps` is video-only.** There is no audio fps. Audio's rate analogue is `videocall_neteq_packets_per_sec`; audio health is `videocall_audio_concealment_pct` plus `videocall_neteq_audio_buffer_ms`.
+- **"Frames" is NOT video-only** — `AudioFrame` is a real type (`neteq/src/neteq.rs`). Qualify it too.
+
+### Reading the diagnostics — three misleading names
+
+Verify direction and units against the source before concluding anything from these. The first two each produced a wrong conclusion that had to be retracted in a live investigation.
+
+- **`LAYER_GATE_SKIPS *_above/*_below` are guard-relative** (`guard_above = incoming < selected`), so `*_above` counts frames arriving BELOW the selection, and `*_below ≈ 0` means "pinned to the top layer". They cover audio and screen as well as video. (#2552)
+- **`[JITTER_BUFFER] freshness_skip {from}->{to}` renders receiver->publisher.** `set_stream_context(local_sid, peer.sid_str)` puts the LOCAL session first, despite the `from_peer` field name.
+- **`videocall_video_seq_loss_per_sec` is a packet COUNT per second, not a loss fraction** — the name reads as a rate; it is `record_seq_into_reorder_window`'s booked-lost packets over the window. The forward-gap component of one booking saturates at `MAX_PLAUSIBLE_FORWARD_GAP` (4096), so a very large burst under-reads. It is not a freeze predictor: loss and a frozen tile are different measurements. (#2524)
+
 ## Build Commands
 
 ```bash
@@ -44,6 +63,7 @@ Always delegate work to the specialized roster agents instead of making changes 
 - **deploy-sync-expert** — Update Docker/K8s configs when services or dependencies change
 - **e2e-test-sync** — Create/update E2E tests when user-facing behavior changes
 - **ux-ui-expert** — UI/UX design guidance, component design, visual polish, accessibility
+- **bot-fleet-tooling** — All `e2e/bots-app/` changes (the synthetic-participant load tool): the TypeScript CLI/orchestrator, the Playwright bot driver, injected browser sources, the control server, the operator dashboard, the resource sampler, `docker-entrypoint.sh`, and `k8s/` fleet manifests. Not for product code, and not for Playwright specs in `e2e/tests/` (those are `e2e-test-sync`).
 
 Run agents in parallel when tasks are independent. Always run `code-reviewer` after substantive code changes. Always run `e2e-test-sync` after any change that affects user-facing behavior — E2E tests must be updated to cover the change and must pass before the work is considered complete.
 
@@ -76,6 +96,7 @@ Every change must satisfy the applicable rules below. These are derived from rec
 | **Reuses a constant/threshold/interval across camera↔screen or WT↔WS** | Verify the existing values are the same across those contexts. If they DIFFER, the difference is deliberate (e.g., screen's 3s GOP for text readability vs camera's 5s). Unifying without justification is a regression. |
 | **Keys off a "congestion," "pressure," "full," or "backpressure" signal** | Trace the signal to the actual queue/buffer where real backpressure surfaces. Actix mailbox `Full` is a burst absorber, NOT a receiver's downlink. Verify both transports (WS + WT). |
 | **Adds recovery/exit hysteresis (consecutive-success counters, cooldown timers)** | Verify it cannot **wedge** under the condition that triggers it. Strictly-consecutive success counters reset under ongoing contention and can pin a healthy entity indefinitely. Prefer windowed/decaying/time-bounded exits. |
+| **Adds a counter, metric, or log for a condition** | **Prove the condition can occur BEFORE building the instrument.** Name the code path that produces it, then walk the guard chain in its CALLERS — if a caller gate excludes the state the condition requires, the counter is dead on arrival and every test of it passes vacuously. State either one observed non-zero reading, or explicitly that it is a canary for a case never yet seen. (Real miss: a WebSocket failed-send counter whose throw requires `readyState == CONNECTING`, which every send path's `Status::Connected` gate excludes — 9 proto fields with an expected magnitude of zero.) |
 | **Is a test-reliability or de-flake change** | Demonstrate the spec **actually runs green** after the fix (local docker or CI dispatch). A de-flake PR that hasn't been run proves nothing about reliability. |
 | **Has a merge conflict with the base branch** | Resolve by **merging** the base branch (`git merge github01/PR-staging`) — do NOT rebase. Force-push is blocked on this repository; rebasing rewrites history and requires a force-push, which will fail and force creation of a new PR. A plain `git merge` adds a merge commit without rewriting history and can be pushed normally. |
 
@@ -87,7 +108,7 @@ Every change must satisfy the applicable rules below. These are derived from rec
 
 **All code changes MUST pass project linters before being considered complete.** Agents must run the appropriate linter/formatter after editing any file:
 
-- **Rust code:** Run `cargo fmt` on changed crates. To catch clippy warnings the way CI does, run **`make clippy-ci`** — a plain `cargo clippy` (or `cargo clippy --all`) lints only library/binary targets and MISSES `#[test]`-target lints and crate-specific feature flags. CI therefore lints each test-bearing crate's `--tests` explicitly (`videocall-client` on wasm, `videocall-aq`, `videocall-codecs`, `videocall-ui`, and `neteq --no-default-features --features web`), and these lints fail CI on an already-pushed PR if missed locally. `make clippy-ci` mirrors that exact command set from `.github/workflows/pr-check-rust-hcl.yaml`; it is the only local command that reproduces the CI clippy job. **If you add a new crate with test code, add a `--tests` clippy step to BOTH the workflow and the `clippy-ci` target** — `scripts/check-clippy-ci-sync.sh` (run by the fmt job in CI, issue #1500) fails the build if the two lists drift, so editing one without the other turns CI red.
+- **Rust code:** Run `cargo fmt` on changed crates. To catch clippy warnings the way CI does, run **`make clippy-ci`** — a plain `cargo clippy` (or `cargo clippy --all`) lints only library/binary targets and MISSES `#[test]`-target lints and crate-specific feature flags. CI therefore lints each test-bearing crate's `--tests` explicitly — the authoritative list is the `clippy-ci` recipe itself, not this sentence — and these lints fail CI on an already-pushed PR if missed locally. `make clippy-ci` mirrors that exact command set from `.github/workflows/pr-check-rust-hcl.yaml`; it is the only local command that reproduces the CI clippy job. **If you add a new crate with test code, add a `--tests` clippy step to BOTH the workflow and the `clippy-ci` target** — `scripts/check-clippy-ci-sync.sh` (run by the fmt job in CI, issue #1500) fails the build if the two lists drift, so editing one without the other turns CI red — and fails separately if any workspace crate carrying test code has no `--tests` step at all (issue #2453).
 - **TypeScript / JS (e2e/):** Run `cd e2e && npx prettier --write <files> && npx eslint <files> && npx tsc --noEmit` to match the CI `ci:lint` check.
 - **General:** No unused imports, no unused variables, follow existing code style. Respect all project lint configs (`.eslintrc`, `rustfmt.toml`, `.prettierrc`, etc.).
 
@@ -97,7 +118,7 @@ This is mandatory for every agent making code changes — not optional. CI will 
 
 **Passing linters, `cargo check`, and CI does NOT mean a change is correct.** Lint/compile prove the code is well-formed; they do not prove it does what it claims. Before declaring any change complete — and before pushing or requesting review — run an explicit adversarial pass over the diff. Apply these three checks, by hand, to every new or changed piece:
 
-1. **Does this code path actually execute under real conditions?** Trace init order, guard conditions, lifetimes, and feature gates — not "it compiles." Ask: *under what runtime state does this line run, and is that state actually reached?* (Real miss: a `warn!` that could never fire because the level was read before the logger was installed, so the facade's `max_level()` was still `Off` and the record was dropped.)
+1. **Does this code path actually execute under real conditions?** Trace init order, guard conditions, lifetimes, and feature gates — not "it compiles." Ask: *under what runtime state does this line run, and is that state actually reached?* **For instrumentation, ask it of the CONDITION, not the code you added:** the increment runs fine, so the real question is whether the event it counts ever happens. That answer lives in the CALLERS' guard chain, not in the function under review. (Real miss: a `warn!` that could never fire because the level was read before the logger was installed, so the facade's `max_level()` was still `Off` and the record was dropped.)
 
 2. **Does each new test fail if you break the thing it names?** Mentally (or actually) mutate the source the test claims to protect; if the test would still pass, it is fake and must be rewritten to reference a real source of truth. A test asserting `X == X` (a literal against itself) pins nothing. (Real miss: a "lockstep pin" test that asserted `LevelFilter::Info == LevelFilter::Info`.)
 

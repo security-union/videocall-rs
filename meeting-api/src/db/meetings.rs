@@ -17,6 +17,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
+use crate::password::PasswordUpdate;
+
 /// The terminal `state` value. A meeting that has ended stays ended forever
 /// (until soft-deleted) — presence can never resurrect it.
 pub const STATE_ENDED: &str = "ended";
@@ -711,11 +713,32 @@ pub async fn set_host_display_name(
     Ok(())
 }
 
+/// Outcome of [`update_meeting_settings`]. `auto_admitted_user_ids` names the
+/// participants the same transaction moved from `waiting` to `admitted` — the
+/// caller's only handle for pushing that news to them (issue #2262).
+pub struct SettingsUpdate {
+    pub row: MeetingRow,
+    pub auto_admitted_user_ids: Vec<String>,
+}
+
+/// The `($9, $10)` pair the password `CASE` in [`update_meeting_settings`]
+/// consumes: `(clear it, the hash to write)`.
+fn password_binds(update: &PasswordUpdate) -> (bool, Option<&str>) {
+    match update {
+        PasswordUpdate::Unchanged => (false, None),
+        PasswordUpdate::Set(hash) => (false, Some(hash.as_str())),
+        PasswordUpdate::Clear => (true, None),
+    }
+}
+
 /// Atomically update the waiting_room_enabled, admitted_can_admit, end_on_host_leave,
-/// allow_guests, recording_allowed_for_all, and chat_allowed_for_all settings for a
-/// meeting.
+/// allow_guests, recording_allowed_for_all, chat_allowed_for_all, and password settings
+/// for a meeting.
 /// When disabling the waiting room, auto-admits all currently waiting participants
 /// within the same transaction to prevent race conditions.
+///
+/// `password` arrives already hashed (issue #2207); this layer never sees a
+/// plaintext.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_meeting_settings(
     pool: &PgPool,
@@ -727,7 +750,10 @@ pub async fn update_meeting_settings(
     allow_guests: Option<bool>,
     recording_allowed_for_all: Option<bool>,
     chat_allowed_for_all: Option<bool>,
-) -> Result<Option<MeetingRow>, sqlx::Error> {
+    password: &PasswordUpdate,
+) -> Result<Option<SettingsUpdate>, sqlx::Error> {
+    let (clear_password, new_password_hash) = password_binds(password);
+
     let mut tx = pool.begin().await?;
 
     let updated = sqlx::query_as::<_, MeetingRow>(
@@ -738,7 +764,8 @@ pub async fn update_meeting_settings(
             end_on_host_leave = COALESCE($5, end_on_host_leave),
             allow_guests = COALESCE($6, allow_guests),
             recording_allowed_for_all = COALESCE($7, recording_allowed_for_all),
-            chat_allowed_for_all = COALESCE($8, chat_allowed_for_all)
+            chat_allowed_for_all = COALESCE($8, chat_allowed_for_all),
+            password_hash = CASE WHEN $9 THEN NULL ELSE COALESCE($10, password_hash) END
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
@@ -753,29 +780,56 @@ pub async fn update_meeting_settings(
     .bind(allow_guests)
     .bind(recording_allowed_for_all)
     .bind(chat_allowed_for_all)
+    .bind(clear_password)
+    .bind(new_password_hash)
     .fetch_optional(&mut *tx)
     .await?;
 
     // When disabling the waiting room, admit everyone currently waiting.
+    let mut auto_admitted_user_ids = Vec::new();
     if let Some(ref row) = updated {
         if waiting_room_enabled == Some(false) {
-            sqlx::query(
+            auto_admitted_user_ids = sqlx::query_scalar::<_, String>(
                 "UPDATE meeting_participants SET status = 'admitted', admitted_at = NOW() \
-                 WHERE meeting_id = $1 AND status = 'waiting'",
+                 WHERE meeting_id = $1 AND status = 'waiting' RETURNING user_id",
             )
             .bind(row.id)
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await?;
         }
     }
 
     tx.commit().await?;
-    Ok(updated)
+    Ok(updated.map(|row| SettingsUpdate {
+        row,
+        auto_admitted_user_ids,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{display_state, escape_like};
+    use super::{display_state, escape_like, password_binds, PasswordUpdate};
+
+    // ── The password `CASE` binds (issue #2207) ──────────────────────────
+
+    #[test]
+    fn an_unchanged_password_binds_no_clear_and_no_hash() {
+        assert_eq!(password_binds(&PasswordUpdate::Unchanged), (false, None));
+    }
+
+    #[test]
+    fn clearing_binds_the_flag_and_no_hash() {
+        assert_eq!(password_binds(&PasswordUpdate::Clear), (true, None));
+    }
+
+    #[test]
+    fn setting_binds_the_hash_with_the_clear_flag_off() {
+        let update = PasswordUpdate::Set("$argon2id$v=19$fake".to_string());
+        assert_eq!(
+            password_binds(&update),
+            (false, Some("$argon2id$v=19$fake"))
+        );
+    }
 
     // ── display_state: the `idle ⟺ zero present` invariant (issue #1628) ──────
 

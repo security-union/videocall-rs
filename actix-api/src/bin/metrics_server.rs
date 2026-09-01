@@ -54,6 +54,13 @@ struct SessionInfo {
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
 
 const MAX_CAMERA_LAYER_GEOMETRY_PER_PACKET: usize = videocall_aq::constants::SIMULCAST_MAX_LAYERS;
+
+// In MediaStreamKey order; length pinned to the shared wire bound.
+const WS_STREAM_LABELS: [&str; 4] = ["1", "2", "3", "4"];
+const _: () =
+    assert!(WS_STREAM_LABELS.len() == videocall_types::limits::MAX_MEDIA_STREAM_KEY as usize);
+// In the order the two by-state fields are read.
+const WS_INACTIVE_STATE_LABELS: [&str; 2] = ["closing", "closed"];
 // Sanity ceiling for a client-reported fps, NOT any encoder's real maximum. The 4x is
 // a defensive round number: the single-stream path (`layer_fps == None`) follows capture
 // cadence, so the value it must not reject is capture-bounded, not ladder-bounded.
@@ -61,6 +68,9 @@ const MAX_PLAUSIBLE_CAMERA_LAYER_OUTPUT_FPS: u32 = videocall_aq::constants::SIMU
     [videocall_aq::constants::SIMULCAST_MAX_LAYERS - 1]
     .target_fps
     * 4;
+// The receiver already saturates here, so a value above it means a broken or hostile client
+// (issue 2524). ONE source with the client's saturation bound, not a second literal.
+const MAX_PLAUSIBLE_SEQ_GAP_FRAMES: u64 = videocall_aq::constants::MAX_PLAUSIBLE_FORWARD_GAP;
 
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
@@ -87,18 +97,26 @@ use sec_api::metrics::{
     NETEQ_TARGET_DELAY_MS, NON_FINITE_SAMPLES_DROPPED_TOTAL, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
     PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER,
     RTT_PROBE_DROPPED_TOTAL, RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_ENCODER_MAX_STALL_GAP_MS,
-    SCREEN_ENCODER_OUTPUT_FPS, SCREEN_ENCODER_STALL_EPISODES, SCREEN_SHARING_ACTIVE,
-    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS,
-    SCREEN_VIDEO_KEYFRAME_ARRIVALS_TOTAL, SCREEN_VIDEO_PLAYOUT_LATENCY_MS,
+    SCREEN_ENCODER_OUTPUT_FPS, SCREEN_ENCODER_STALL_EPISODES, SCREEN_KEYFRAME_REQUESTS_PER_SEC,
+    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_CONTENT_STALENESS_MS,
+    SCREEN_VIDEO_FPS, SCREEN_VIDEO_FREEZE_EPISODES_TOTAL, SCREEN_VIDEO_FREEZE_SECONDS_TOTAL,
+    SCREEN_VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL, SCREEN_VIDEO_FRESHNESS_EVICTIONS_TOTAL,
+    SCREEN_VIDEO_KEYFRAME_ARRIVALS_TOTAL, SCREEN_VIDEO_MAX_CONTENT_STALENESS_MS,
+    SCREEN_VIDEO_MAX_DECODE_GAP_MS, SCREEN_VIDEO_PLAYOUT_LATENCY_MS,
     SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS, SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS,
-    SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_DROPPED_TOTAL, TIER_TRANSITIONS_TOTAL, UNISTREAM_BYTES_DRAINED_TOTAL,
-    UNISTREAM_BYTES_OFFERED_TOTAL, UNISTREAM_STALE_DELTA_DROPS_TOTAL, VIDEOCALL_PEER_INFO,
-    VIDEO_BITRATE_KBPS, VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_KEYFRAME_ARRIVALS_TOTAL, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
-    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC,
-    VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS, WT_INCOMING_DATAGRAM_HIGH_WATER_MARK,
-    WT_INCOMING_DATAGRAM_MAX_AGE_MS,
+    SCREEN_VIDEO_SEQ_LOSS_PER_SEC, SCREEN_VIDEO_SEQ_MAX_GAP, SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL,
+    SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_DROPPED_TOTAL, TIER_TRANSITIONS_TOTAL,
+    UNISTREAM_BYTES_DRAINED_TOTAL, UNISTREAM_BYTES_OFFERED_TOTAL,
+    UNISTREAM_STALE_DELTA_DROPS_TOTAL, VIDEOCALL_PEER_INFO, VIDEO_BITRATE_KBPS,
+    VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_FREEZE_EPISODES_TOTAL,
+    VIDEO_FREEZE_SECONDS_TOTAL, VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL,
+    VIDEO_FRESHNESS_EVICTIONS_TOTAL, VIDEO_KEYFRAME_ARRIVALS_TOTAL, VIDEO_MAX_CONTENT_STALENESS_MS,
+    VIDEO_MAX_DECODE_GAP_MS, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
+    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SEQ_MAX_GAP,
+    VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPPED_BYTES_BY_STREAM, WEBSOCKET_DROPS,
+    WEBSOCKET_INACTIVE_DROPPED_BYTES_BY_STREAM, WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STATE,
+    WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STREAM, WEBSOCKET_OFFERED_BYTES_BY_STREAM,
+    WT_INCOMING_DATAGRAM_HIGH_WATER_MARK, WT_INCOMING_DATAGRAM_MAX_AGE_MS,
 };
 
 async fn metrics_handler(
@@ -118,12 +136,9 @@ async fn metrics_handler(
     let mut buffer = Vec::new();
 
     match encoder.encode(&metric_families, &mut buffer) {
-        Ok(_) => {
-            let output = String::from_utf8_lossy(&buffer);
-            Ok(HttpResponse::Ok()
-                .content_type("text/plain; version=0.0.4")
-                .body(output.to_string()))
-        }
+        Ok(_) => Ok(HttpResponse::Ok()
+            .content_type("text/plain; version=0.0.4")
+            .body(buffer)),
         Err(e) => {
             error!("Failed to encode metrics: {}", e);
             Ok(HttpResponse::InternalServerError().body("Failed to encode metrics"))
@@ -289,6 +304,26 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = UNISTREAM_BYTES_DRAINED_TOTAL.remove_label_values(&reporter_labels);
     let _ = UNISTREAM_STALE_DELTA_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
+    for label in WS_STREAM_LABELS {
+        let stream_labels = [
+            &session_info.meeting_id as &str,
+            &session_info.session_id,
+            &session_info.reporting_user_id,
+            label,
+        ];
+        let _ = WEBSOCKET_OFFERED_BYTES_BY_STREAM.remove_label_values(&stream_labels);
+        let _ = WEBSOCKET_DROPPED_BYTES_BY_STREAM.remove_label_values(&stream_labels);
+        let _ = WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STREAM.remove_label_values(&stream_labels);
+        let _ = WEBSOCKET_INACTIVE_DROPPED_BYTES_BY_STREAM.remove_label_values(&stream_labels);
+    }
+    for label in WS_INACTIVE_STATE_LABELS {
+        let _ = WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STATE.remove_label_values(&[
+            &session_info.meeting_id as &str,
+            &session_info.session_id,
+            &session_info.reporting_user_id,
+            label,
+        ]);
+    }
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
     // Issue 2031: per-client WT receive-health gauges.
     let _ = CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS.remove_label_values(&reporter_labels);
@@ -509,6 +544,18 @@ fn peers_to_prune(
         .collect()
 }
 
+/// Publish a presence-guarded per-pair gauge, or DROP the series when the client did not
+/// report it. A client that predates the field publishing 0 would read as "no burst" /
+/// "never froze" (issues 2524, 2541).
+fn publish_or_clear(gauge: &prometheus::GaugeVec, peer_labels: &[&str; 4], value: Option<f64>) {
+    match value {
+        Some(v) => gauge.with_label_values(peer_labels).set_finite(v),
+        None => {
+            let _ = gauge.remove_label_values(peer_labels);
+        }
+    }
+}
+
 /// Remove all per-peer Prometheus metrics for a specific reporter→peer pair.
 /// Used for session cleanup and for pruning a peer that has left a still-live
 /// reporter's view (issue #1092). Per-pair series are keyed only by the four
@@ -551,6 +598,15 @@ fn remove_per_peer_metrics(
     // #2201: GC the keyframe-arrival counter with its per-pair siblings, or a departed pair's
     // series would linger forever (it shares their exact label set).
     let _ = VIDEO_KEYFRAME_ARRIVALS_TOTAL.remove_label_values(&labels);
+    // #2511: same per-pair label set, so the same leak applies.
+    let _ = VIDEO_FREEZE_EPISODES_TOTAL.remove_label_values(&labels);
+    let _ = VIDEO_FREEZE_SECONDS_TOTAL.remove_label_values(&labels);
+    let _ = VIDEO_MAX_DECODE_GAP_MS.remove_label_values(&labels);
+    let _ = VIDEO_MAX_CONTENT_STALENESS_MS.remove_label_values(&labels);
+    // #2524: same per-pair label set, so the same leak applies.
+    let _ = VIDEO_SEQ_MAX_GAP.remove_label_values(&labels);
+    let _ = VIDEO_FRESHNESS_EVICTIONS_TOTAL.remove_label_values(&labels);
+    let _ = VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL.remove_label_values(&labels);
     let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
@@ -567,6 +623,16 @@ fn remove_per_peer_metrics(
     let _ = SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL.remove_label_values(&labels);
     // #2201: screen sibling of the arrival-counter GC above.
     let _ = SCREEN_VIDEO_KEYFRAME_ARRIVALS_TOTAL.remove_label_values(&labels);
+    // #2511: screen siblings of the freeze-family GC above.
+    let _ = SCREEN_VIDEO_FREEZE_EPISODES_TOTAL.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_FREEZE_SECONDS_TOTAL.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_MAX_DECODE_GAP_MS.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_MAX_CONTENT_STALENESS_MS.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_SEQ_MAX_GAP.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_FRESHNESS_EVICTIONS_TOTAL.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_SEQ_LOSS_PER_SEC.remove_label_values(&labels);
+    let _ = SCREEN_KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
 
     // NOTE: RECEIVED_LAYER is intentionally NOT reaped here. Its series are
     // reaped authoritatively from the #1561 tracked set
@@ -1234,6 +1300,77 @@ fn process_health_packet_to_metrics_pb(
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
         }
+
+        // An absent field leaves its series alone.
+        {
+            type WsStreamFields = (Option<u64>, Option<u64>, Option<u64>, Option<u64>);
+            let per_stream: [WsStreamFields; WS_STREAM_LABELS.len()] = [
+                (
+                    health_packet.ws_offered_bytes_audio,
+                    health_packet.ws_dropped_bytes_audio,
+                    health_packet.ws_inactive_dropped_frames_audio,
+                    health_packet.ws_inactive_dropped_bytes_audio,
+                ),
+                (
+                    health_packet.ws_offered_bytes_video,
+                    health_packet.ws_dropped_bytes_video,
+                    health_packet.ws_inactive_dropped_frames_video,
+                    health_packet.ws_inactive_dropped_bytes_video,
+                ),
+                (
+                    health_packet.ws_offered_bytes_screen,
+                    health_packet.ws_dropped_bytes_screen,
+                    health_packet.ws_inactive_dropped_frames_screen,
+                    health_packet.ws_inactive_dropped_bytes_screen,
+                ),
+                (
+                    health_packet.ws_offered_bytes_control,
+                    health_packet.ws_dropped_bytes_control,
+                    health_packet.ws_inactive_dropped_frames_control,
+                    health_packet.ws_inactive_dropped_bytes_control,
+                ),
+            ];
+            for (label, (offered, dropped, inactive_frames, inactive_bytes)) in
+                WS_STREAM_LABELS.iter().zip(per_stream)
+            {
+                let stream_labels = [meeting_id, session_id, reporting_user_id, label];
+                if let Some(offered) = offered {
+                    WEBSOCKET_OFFERED_BYTES_BY_STREAM
+                        .with_label_values(&stream_labels)
+                        .set(offered as f64);
+                }
+                if let Some(dropped) = dropped {
+                    WEBSOCKET_DROPPED_BYTES_BY_STREAM
+                        .with_label_values(&stream_labels)
+                        .set(dropped as f64);
+                }
+                if let Some(frames) = inactive_frames {
+                    WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STREAM
+                        .with_label_values(&stream_labels)
+                        .set(frames as f64);
+                }
+                if let Some(bytes) = inactive_bytes {
+                    WEBSOCKET_INACTIVE_DROPPED_BYTES_BY_STREAM
+                        .with_label_values(&stream_labels)
+                        .set(bytes as f64);
+                }
+            }
+
+            // Arity tied to the label list, so a third readyState bucket cannot be
+            // added on one side alone and be silently truncated by the zip.
+            let by_state: [Option<u64>; WS_INACTIVE_STATE_LABELS.len()] = [
+                health_packet.ws_inactive_dropped_frames_by_state_closing,
+                health_packet.ws_inactive_dropped_frames_by_state_closed,
+            ];
+            for (label, frames) in WS_INACTIVE_STATE_LABELS.iter().zip(by_state) {
+                if let Some(frames) = frames {
+                    WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STATE
+                        .with_label_values(&[meeting_id, session_id, reporting_user_id, label])
+                        .set(frames as f64);
+                }
+            }
+        }
+
         if let Some(kf_reqs) = health_packet.keyframe_requests_sent_total {
             KEYFRAME_REQUESTS_SENT_TOTAL
                 .with_label_values(&reporter_labels)
@@ -2000,6 +2137,55 @@ fn process_health_packet_to_metrics_pb(
                             .with_label_values(&peer_labels)
                             .set(arrivals as f64);
                     }
+                    // Freeze family (#2511): presence-guarded, NOT unconditional like the ms
+                    // gauges — a pre-#2511 client publishing 0 reads as "never froze".
+                    if let Some(episodes) = video_stats.freeze_episodes_total {
+                        VIDEO_FREEZE_EPISODES_TOTAL
+                            .with_label_values(&peer_labels)
+                            .set(episodes as f64);
+                    } else {
+                        let _ = VIDEO_FREEZE_EPISODES_TOTAL.remove_label_values(&peer_labels);
+                    }
+                    if let Some(freeze_ms) = video_stats.freeze_ms_total {
+                        VIDEO_FREEZE_SECONDS_TOTAL
+                            .with_label_values(&peer_labels)
+                            .set(freeze_ms as f64 / 1000.0);
+                    } else {
+                        let _ = VIDEO_FREEZE_SECONDS_TOTAL.remove_label_values(&peer_labels);
+                    }
+                    if let Some(gap_ms) = video_stats.max_decode_gap_ms {
+                        VIDEO_MAX_DECODE_GAP_MS
+                            .with_label_values(&peer_labels)
+                            .set(gap_ms as f64);
+                    } else {
+                        let _ = VIDEO_MAX_DECODE_GAP_MS.remove_label_values(&peer_labels);
+                    }
+                    if let Some(staleness_ms) = video_stats.max_content_staleness_ms {
+                        VIDEO_MAX_CONTENT_STALENESS_MS
+                            .with_label_values(&peer_labels)
+                            .set(staleness_ms as f64);
+                    } else {
+                        let _ = VIDEO_MAX_CONTENT_STALENESS_MS.remove_label_values(&peer_labels);
+                    }
+                    publish_or_clear(
+                        &VIDEO_SEQ_MAX_GAP,
+                        &peer_labels,
+                        video_stats
+                            .max_seq_gap_frames
+                            .map(|gap| gap.min(MAX_PLAUSIBLE_SEQ_GAP_FRAMES) as f64),
+                    );
+                    publish_or_clear(
+                        &VIDEO_FRESHNESS_EVICTIONS_TOTAL,
+                        &peer_labels,
+                        video_stats.freshness_evictions_total.map(|v| v as f64),
+                    );
+                    publish_or_clear(
+                        &VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL,
+                        &peer_labels,
+                        video_stats
+                            .freshness_evictions_keyframeless_total
+                            .map(|v| v as f64),
+                    );
                 }
 
                 // Screen video metrics (separate from camera)
@@ -2062,6 +2248,67 @@ fn process_health_packet_to_metrics_pb(
                             .with_label_values(&peer_labels)
                             .set(arrivals as f64);
                     }
+                    // #2511: presence-guarded, see the camera sibling.
+                    if let Some(episodes) = screen_stats.freeze_episodes_total {
+                        SCREEN_VIDEO_FREEZE_EPISODES_TOTAL
+                            .with_label_values(&peer_labels)
+                            .set(episodes as f64);
+                    } else {
+                        let _ =
+                            SCREEN_VIDEO_FREEZE_EPISODES_TOTAL.remove_label_values(&peer_labels);
+                    }
+                    if let Some(freeze_ms) = screen_stats.freeze_ms_total {
+                        SCREEN_VIDEO_FREEZE_SECONDS_TOTAL
+                            .with_label_values(&peer_labels)
+                            .set(freeze_ms as f64 / 1000.0);
+                    } else {
+                        let _ = SCREEN_VIDEO_FREEZE_SECONDS_TOTAL.remove_label_values(&peer_labels);
+                    }
+                    if let Some(gap_ms) = screen_stats.max_decode_gap_ms {
+                        SCREEN_VIDEO_MAX_DECODE_GAP_MS
+                            .with_label_values(&peer_labels)
+                            .set(gap_ms as f64);
+                    } else {
+                        let _ = SCREEN_VIDEO_MAX_DECODE_GAP_MS.remove_label_values(&peer_labels);
+                    }
+                    if let Some(staleness_ms) = screen_stats.max_content_staleness_ms {
+                        SCREEN_VIDEO_MAX_CONTENT_STALENESS_MS
+                            .with_label_values(&peer_labels)
+                            .set(staleness_ms as f64);
+                    } else {
+                        let _ =
+                            SCREEN_VIDEO_MAX_CONTENT_STALENESS_MS.remove_label_values(&peer_labels);
+                    }
+                    publish_or_clear(
+                        &SCREEN_VIDEO_SEQ_MAX_GAP,
+                        &peer_labels,
+                        screen_stats
+                            .max_seq_gap_frames
+                            .map(|gap| gap.min(MAX_PLAUSIBLE_SEQ_GAP_FRAMES) as f64),
+                    );
+                    publish_or_clear(
+                        &SCREEN_VIDEO_FRESHNESS_EVICTIONS_TOTAL,
+                        &peer_labels,
+                        screen_stats.freshness_evictions_total.map(|v| v as f64),
+                    );
+                    publish_or_clear(
+                        &SCREEN_VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL,
+                        &peer_labels,
+                        screen_stats
+                            .freshness_evictions_keyframeless_total
+                            .map(|v| v as f64),
+                    );
+                    // #2524: camera keeps its PeerStats source; no existing series moves.
+                    publish_or_clear(
+                        &SCREEN_VIDEO_SEQ_LOSS_PER_SEC,
+                        &peer_labels,
+                        screen_stats.video_seq_loss_per_sec,
+                    );
+                    publish_or_clear(
+                        &SCREEN_KEYFRAME_REQUESTS_PER_SEC,
+                        &peer_labels,
+                        screen_stats.keyframe_requests_per_sec,
+                    );
                 }
 
                 // Decode errors
@@ -2339,6 +2586,184 @@ mod tests {
         // Detailed Prometheus gather assertions can be added if needed.
     }
 
+    #[test]
+    #[serial(ws_stream_bytes)]
+    fn an_unset_field_leaves_its_series_alone() {
+        let session = "unset-session";
+        let mut hp = PbHealthPacket::new();
+        hp.session_id = session.to_string();
+        hp.meeting_id = "m-unset".to_string();
+        hp.reporting_user_id = "alice@example.com".as_bytes().to_vec();
+        hp.timestamp_ms = 1;
+        hp.ws_offered_bytes_video = Some(4_000);
+
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let base = [
+            ("meeting_id", "m-unset"),
+            ("session_id", session),
+            ("peer_id", "alice@example.com"),
+        ];
+        let with_key = |k: &'static str| {
+            let mut v = base.to_vec();
+            v.push(("stream_key", k));
+            v
+        };
+        assert_eq!(
+            series_value(
+                "videocall_websocket_offered_bytes_by_stream",
+                &with_key("2")
+            ),
+            Some(4_000.0),
+            "the reported stream must publish its absolute value"
+        );
+
+        // The client reports a cumulative absolute, so re-processing the same packet
+        // must be idempotent. An accumulating publish would read 8_000 here.
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+        assert_eq!(
+            series_value(
+                "videocall_websocket_offered_bytes_by_stream",
+                &with_key("2")
+            ),
+            Some(4_000.0),
+            "publishing an absolute must not accumulate"
+        );
+        for absent in ["1", "3", "4"] {
+            assert!(
+                !series_exists(
+                    "videocall_websocket_offered_bytes_by_stream",
+                    &with_key(absent)
+                ),
+                "stream_key {absent} was never reported and must not publish"
+            );
+        }
+        assert!(
+            !series_exists(
+                "videocall_websocket_dropped_bytes_by_stream",
+                &with_key("2")
+            ),
+            "an unset dropped field must not publish a zero"
+        );
+    }
+
+    #[test]
+    #[serial(ws_stream_bytes)]
+    fn ws_stream_series_are_swept_on_session_removal() {
+        let session = "sweep-session";
+        let mut hp = PbHealthPacket::new();
+        hp.session_id = session.to_string();
+        hp.meeting_id = "m-sweep".to_string();
+        hp.reporting_user_id = "alice@example.com".as_bytes().to_vec();
+        hp.timestamp_ms = 1;
+        hp.ws_offered_bytes_audio = Some(11);
+        hp.ws_offered_bytes_video = Some(22);
+        hp.ws_offered_bytes_screen = Some(33);
+        hp.ws_offered_bytes_control = Some(44);
+        hp.ws_dropped_bytes_audio = Some(1);
+        hp.ws_dropped_bytes_video = Some(2);
+        hp.ws_dropped_bytes_screen = Some(3);
+        hp.ws_dropped_bytes_control = Some(4);
+        hp.ws_inactive_dropped_frames_audio = Some(101);
+        hp.ws_inactive_dropped_frames_video = Some(102);
+        hp.ws_inactive_dropped_frames_screen = Some(103);
+        hp.ws_inactive_dropped_frames_control = Some(104);
+        hp.ws_inactive_dropped_bytes_audio = Some(201);
+        hp.ws_inactive_dropped_bytes_video = Some(202);
+        hp.ws_inactive_dropped_bytes_screen = Some(203);
+        hp.ws_inactive_dropped_bytes_control = Some(204);
+        hp.ws_inactive_dropped_frames_by_state_closing = Some(7);
+        hp.ws_inactive_dropped_frames_by_state_closed = Some(9);
+
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels_for = |k: &'static str| {
+            vec![
+                ("meeting_id", "m-sweep"),
+                ("session_id", session),
+                ("peer_id", "alice@example.com"),
+                ("stream_key", k),
+            ]
+        };
+        let state_labels_for = |s: &'static str| {
+            vec![
+                ("meeting_id", "m-sweep"),
+                ("session_id", session),
+                ("peer_id", "alice@example.com"),
+                ("state", s),
+            ]
+        };
+        // Label strings are LITERAL here on purpose: deriving them from
+        // WS_STREAM_LABELS / WS_INACTIVE_STATE_LABELS would let the production
+        // constants permute on both sides of the assertion and pin nothing.
+        const PER_STREAM_FAMILIES: [(&str, [(&str, f64); 4]); 4] = [
+            (
+                "videocall_websocket_offered_bytes_by_stream",
+                [("1", 11.0), ("2", 22.0), ("3", 33.0), ("4", 44.0)],
+            ),
+            (
+                "videocall_websocket_dropped_bytes_by_stream",
+                [("1", 1.0), ("2", 2.0), ("3", 3.0), ("4", 4.0)],
+            ),
+            (
+                "videocall_websocket_inactive_dropped_frames_by_stream",
+                [("1", 101.0), ("2", 102.0), ("3", 103.0), ("4", 104.0)],
+            ),
+            (
+                "videocall_websocket_inactive_dropped_bytes_by_stream",
+                [("1", 201.0), ("2", 202.0), ("3", 203.0), ("4", 204.0)],
+            ),
+        ];
+        for (family, expected) in PER_STREAM_FAMILIES {
+            for (k, want) in expected {
+                assert_eq!(
+                    series_value(family, &labels_for(k)),
+                    Some(want),
+                    "{family} for stream_key {k}"
+                );
+            }
+        }
+        for (state, want) in [("closing", 7.0), ("closed", 9.0)] {
+            assert_eq!(
+                series_value(
+                    "videocall_websocket_inactive_dropped_frames_by_state",
+                    &state_labels_for(state)
+                ),
+                Some(want),
+                "inactive drops for state {state}"
+            );
+        }
+
+        let info = tracker
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+            .expect("session recorded");
+        remove_session_metrics(&info);
+
+        for (family, expected) in PER_STREAM_FAMILIES {
+            for (k, _) in expected {
+                assert!(
+                    !series_exists(family, &labels_for(k)),
+                    "{family} stream_key {k} leaked after session removal"
+                );
+            }
+        }
+        for state in ["closing", "closed"] {
+            assert!(
+                !series_exists(
+                    "videocall_websocket_inactive_dropped_frames_by_state",
+                    &state_labels_for(state)
+                ),
+                "inactive-drops state {state} leaked after session removal"
+            );
+        }
+    }
+
     /// Helper function to create a test health packet (protobuf)
     fn create_test_health_packet(
         session_id: &str,
@@ -2398,6 +2823,28 @@ mod tests {
             }
         }
         false
+    }
+
+    /// Gauge VALUE for a label set, or None if the series is absent. `series_exists`
+    /// compares labels only, so on its own it cannot tell `.set(v)` from `.add(v)`.
+    fn series_value(metric_name: &str, expected_labels: &[(&str, &str)]) -> Option<f64> {
+        prometheus::gather().into_iter().find_map(|family| {
+            if family.get_name() != metric_name {
+                return None;
+            }
+            family
+                .get_metric()
+                .iter()
+                .find(|metric| {
+                    expected_labels.iter().all(|(lname, lval)| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|l| l.get_name() == *lname && l.get_value() == *lval)
+                    })
+                })
+                .map(|metric| metric.get_gauge().get_value())
+        })
     }
 
     fn matching_series_count(metric_name: &str, expected_labels: &[(&str, &str)]) -> usize {
@@ -3932,7 +4379,7 @@ mod tests {
         let mut ps = PbPeerStats::new();
         ps.can_listen = true;
         ps.audio_enabled = true;
-        // A heavy burst: capped saturates at ~64, raw reads the true 210 magnitude.
+        // A heavy burst mid-drain: the settled count still trails the raw 210.
         ps.audio_datagram_loss_per_sec = Some(63.0);
         ps.audio_datagram_raw_loss_per_sec = Some(210.0);
 
@@ -4187,6 +4634,263 @@ mod tests {
         );
     }
 
+    /// Issues 2524 / 2541: every new receive-side loss/PLI/freshness series must be EXPORTED
+    /// from its own bucket, per reason where labelled, and swept by the per-pair GC.
+    ///
+    /// Camera and screen carry deliberately different values so a bucket transposition (the
+    /// #1641 defect class) fails rather than silently passing.
+    #[test]
+    fn loss_pli_and_freshness_series_export_per_bucket_and_are_gc_d() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut camera_vs = PbVideoStats::new();
+        camera_vs.fps_received = 8.0;
+        camera_vs.max_seq_gap_frames = Some(437);
+        camera_vs.freshness_evictions_total = Some(31);
+        camera_vs.freshness_evictions_keyframeless_total = Some(29);
+        camera_vs.video_seq_loss_per_sec = Some(12.5);
+        camera_vs.keyframe_requests_per_sec = Some(2.5);
+
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 10.0;
+        screen_vs.max_seq_gap_frames = Some(88);
+        screen_vs.freshness_evictions_total = Some(6);
+        screen_vs.freshness_evictions_keyframeless_total = Some(4);
+        screen_vs.video_seq_loss_per_sec = Some(3.25);
+        screen_vs.keyframe_requests_per_sec = Some(0.75);
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_loss_2524".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_loss_2524",
+            "meet_loss_2524",
+            "alice_loss_2524",
+            peer_stats,
+        );
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_loss_2524"),
+            ("session_id", "sess_loss_2524"),
+            ("from_peer", "alice_loss_2524"),
+            ("to_peer", "bob_loss_2524"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_video_seq_max_gap_frames", &labels),
+            Some(437.0),
+            "None => the .set(video_stats.seq_max_gap) line was dropped"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_seq_max_gap_frames", &labels),
+            Some(88.0),
+            "the SCREEN gap (88, NOT the camera's 437)"
+        );
+        assert_eq!(
+            gauge_value("videocall_video_freshness_evictions_total", &labels),
+            Some(31.0)
+        );
+        assert_eq!(
+            gauge_value(
+                "videocall_video_freshness_evictions_keyframeless_total",
+                &labels
+            ),
+            Some(29.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_freshness_evictions_total", &labels),
+            Some(6.0)
+        );
+        assert_eq!(
+            gauge_value(
+                "videocall_screen_video_freshness_evictions_keyframeless_total",
+                &labels
+            ),
+            Some(4.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_seq_loss_per_sec", &labels),
+            Some(3.25),
+            "the SCREEN rate (3.25, NOT the camera bucket's 12.5)"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_keyframe_requests_per_sec", &labels),
+            Some(0.75),
+            "the SCREEN PLI rate (0.75, NOT the camera bucket's 2.5)"
+        );
+        // Provenance pin: PeerStats 15/16 are unset in this fixture, so a Some() below means
+        // the camera export silently re-sourced itself from VideoStats.
+        assert_eq!(
+            gauge_value("videocall_video_seq_loss_per_sec", &labels),
+            None,
+            "camera loss must stay PeerStats-sourced; VideoStats 18 must not feed it"
+        );
+        assert_eq!(
+            gauge_value("videocall_keyframe_requests_per_sec", &labels),
+            None,
+            "camera PLI must stay PeerStats-sourced; VideoStats 19 must not feed it"
+        );
+        remove_per_peer_metrics(
+            "meet_loss_2524",
+            "sess_loss_2524",
+            "alice_loss_2524",
+            "bob_loss_2524",
+        );
+        for name in [
+            "videocall_video_seq_max_gap_frames",
+            "videocall_screen_video_seq_max_gap_frames",
+            "videocall_video_freshness_evictions_total",
+            "videocall_video_freshness_evictions_keyframeless_total",
+            "videocall_screen_video_freshness_evictions_total",
+            "videocall_screen_video_freshness_evictions_keyframeless_total",
+            "videocall_screen_video_seq_loss_per_sec",
+            "videocall_screen_keyframe_requests_per_sec",
+        ] {
+            assert_eq!(
+                gauge_value(name, &labels),
+                None,
+                "{name} must be swept with its per-pair siblings, or it leaks per departed pair"
+            );
+        }
+    }
+
+    /// Issues 2524 / 2541: a client that predates these fields must be ABSENT from every new
+    /// series, never published as 0.
+    ///
+    /// Sequenced AFTER a populated report on the SAME labels, so this also proves absence
+    /// CLEARS a previously-published series rather than merely never creating one.
+    #[test]
+    fn absent_loss_pli_and_freshness_fields_clear_rather_than_publish_zero() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let labels = [
+            ("meeting_id", "meet_abs_2524"),
+            ("session_id", "sess_abs_2524"),
+            ("from_peer", "alice_abs_2524"),
+            ("to_peer", "bob_abs_2524"),
+        ];
+        let report = |gap: Option<u64>, evictions: Option<u64>, screen_loss: Option<f64>| {
+            let mut camera_vs = PbVideoStats::new();
+            camera_vs.fps_received = 8.0;
+            camera_vs.max_seq_gap_frames = gap;
+            camera_vs.freshness_evictions_total = evictions;
+            // Always PRESENT: the omission under test is the FIELD, not the whole message,
+            // which would skip the export block wholesale and prove nothing.
+            let mut screen_vs = PbVideoStats::new();
+            screen_vs.fps_received = 10.0;
+            screen_vs.video_seq_loss_per_sec = screen_loss;
+            screen_vs.keyframe_requests_per_sec = screen_loss.map(|v| v / 2.0);
+            let mut ps = PbPeerStats::new();
+            ps.can_see = true;
+            ps.video_enabled = true;
+            ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+            ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+            let mut peer_stats = std::collections::HashMap::new();
+            peer_stats.insert("bob_abs_2524".to_string(), ps);
+            let hp = create_test_health_packet(
+                "sess_abs_2524",
+                "meet_abs_2524",
+                "alice_abs_2524",
+                peer_stats,
+            );
+            assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+        };
+
+        report(Some(500), Some(12), Some(9.5));
+        assert_eq!(
+            gauge_value("videocall_video_seq_max_gap_frames", &labels),
+            Some(500.0),
+            "premise: the series was published"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_seq_loss_per_sec", &labels),
+            Some(9.5),
+            "premise: the screen loss series was published"
+        );
+
+        // Now the same pair reports without the fields (a downgrade, or a peer whose decoder
+        // never produced them).
+        report(None, None, None);
+        assert_eq!(
+            gauge_value("videocall_video_seq_max_gap_frames", &labels),
+            None,
+            "absence must clear, not latch 500 and not publish 0"
+        );
+        assert_eq!(
+            gauge_value("videocall_video_freshness_evictions_total", &labels),
+            None
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_seq_loss_per_sec", &labels),
+            None,
+            "a rate that already recovered must clear, not latch 9.5 and not publish 0"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_keyframe_requests_per_sec", &labels),
+            None
+        );
+    }
+
+    #[test]
+    fn implausible_seq_gap_saturates_at_the_ingest_ceiling_on_both_buckets() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut camera_vs = PbVideoStats::new();
+        camera_vs.fps_received = 8.0;
+        camera_vs.max_seq_gap_frames = Some(MAX_PLAUSIBLE_SEQ_GAP_FRAMES + 1);
+
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 10.0;
+        screen_vs.max_seq_gap_frames = Some(u64::MAX);
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_clamp_2524".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_clamp_2524",
+            "meet_clamp_2524",
+            "alice_clamp_2524",
+            peer_stats,
+        );
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_clamp_2524"),
+            ("session_id", "sess_clamp_2524"),
+            ("from_peer", "alice_clamp_2524"),
+            ("to_peer", "bob_clamp_2524"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_video_seq_max_gap_frames", &labels),
+            Some(MAX_PLAUSIBLE_SEQ_GAP_FRAMES as f64),
+            "an implausible CAMERA value must saturate at the ceiling, not publish"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_seq_max_gap_frames", &labels),
+            Some(MAX_PLAUSIBLE_SEQ_GAP_FRAMES as f64),
+            "the SCREEN site is a separate .min()"
+        );
+
+        remove_per_peer_metrics(
+            "meet_clamp_2524",
+            "sess_clamp_2524",
+            "alice_clamp_2524",
+            "bob_clamp_2524",
+        );
+    }
+
     /// #2201: an OLD client that does not report keyframe arrivals must be ABSENT from the
     /// gauge, not published as 0.
     ///
@@ -4254,6 +4958,296 @@ mod tests {
             Some(8.0),
             "the rest of the bucket must still export; otherwise this test proves nothing"
         );
+    }
+
+    const FREEZE_SERIES_2511: [&str; 8] = [
+        "videocall_video_freeze_episodes_total",
+        "videocall_video_freeze_seconds_total",
+        "videocall_video_max_decode_gap_ms",
+        "videocall_video_max_content_staleness_ms",
+        "videocall_screen_video_freeze_episodes_total",
+        "videocall_screen_video_freeze_seconds_total",
+        "videocall_screen_video_max_decode_gap_ms",
+        "videocall_screen_video_max_content_staleness_ms",
+    ];
+
+    /// #2511: every value distinct, so a bucket or field transposition fails rather than passes.
+    fn freeze_peer_stats(peer_id: &str) -> std::collections::HashMap<String, PbPeerStats> {
+        let mut camera_vs = PbVideoStats::new();
+        camera_vs.fps_received = 0.0;
+        camera_vs.freeze_episodes_total = Some(3);
+        camera_vs.freeze_ms_total = Some(7_400);
+        camera_vs.max_decode_gap_ms = Some(5_100);
+        camera_vs.max_content_staleness_ms = Some(4_800);
+
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 0.0;
+        screen_vs.freeze_episodes_total = Some(2);
+        screen_vs.freeze_ms_total = Some(61_000);
+        screen_vs.max_decode_gap_ms = Some(58_000);
+        screen_vs.max_content_staleness_ms = Some(240_000);
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert(peer_id.to_string(), ps);
+        peer_stats
+    }
+
+    /// #2511: the eight freeze series export from their own bucket, and re-processing the same
+    /// packet does not change the value.
+    #[test]
+    fn freeze_family_exports_per_bucket_and_does_not_accumulate() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let hp = create_test_health_packet(
+            "sess_fz_2511",
+            "meet_fz_2511",
+            "alice_fz_2511",
+            freeze_peer_stats("bob_fz_2511"),
+        );
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_fz_2511"),
+            ("session_id", "sess_fz_2511"),
+            ("from_peer", "alice_fz_2511"),
+            ("to_peer", "bob_fz_2511"),
+        ];
+        let expected = [
+            ("videocall_video_freeze_episodes_total", 3.0),
+            ("videocall_video_freeze_seconds_total", 7.4),
+            ("videocall_video_max_decode_gap_ms", 5_100.0),
+            ("videocall_video_max_content_staleness_ms", 4_800.0),
+            ("videocall_screen_video_freeze_episodes_total", 2.0),
+            ("videocall_screen_video_freeze_seconds_total", 61.0),
+            ("videocall_screen_video_max_decode_gap_ms", 58_000.0),
+            ("videocall_screen_video_max_content_staleness_ms", 240_000.0),
+        ];
+        for (metric, value) in expected {
+            assert_eq!(
+                gauge_value(metric, &labels),
+                Some(value),
+                "{metric} must export {value} from its own bucket; a different number means the \
+                 camera/screen zip or the field order is transposed"
+            );
+        }
+
+        assert_eq!(
+            gauge_value("videocall_video_fps", &labels),
+            Some(0.0),
+            "fixture: the whole family exported above at fps 0, the state it exists to describe"
+        );
+
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+        for (metric, value) in expected {
+            assert_eq!(
+                gauge_value(metric, &labels),
+                Some(value),
+                "{metric} must publish an absolute; a doubled value means .set became .add"
+            );
+        }
+    }
+
+    #[test]
+    fn freeze_family_absence_clears_the_previous_series() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let labels = [
+            ("meeting_id", "meet_clear_2511"),
+            ("session_id", "sess_clear_2511"),
+            ("from_peer", "alice_clear_2511"),
+            ("to_peer", "bob_clear_2511"),
+        ];
+
+        let first = create_test_health_packet(
+            "sess_clear_2511",
+            "meet_clear_2511",
+            "alice_clear_2511",
+            freeze_peer_stats("bob_clear_2511"),
+        );
+        assert!(process_health_packet_to_metrics_pb(&first, &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_video_max_content_staleness_ms", &labels),
+            Some(4_800.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_max_content_staleness_ms", &labels),
+            Some(240_000.0)
+        );
+
+        let mut peer_stats = freeze_peer_stats("bob_clear_2511");
+        let peer = peer_stats.get_mut("bob_clear_2511").expect("peer fixture");
+        {
+            let video = peer.video_stats.as_mut().expect("camera stats");
+            video.freeze_episodes_total = None;
+            video.freeze_ms_total = None;
+            video.max_decode_gap_ms = None;
+            video.max_content_staleness_ms = None;
+        }
+        {
+            let screen = peer.screen_video_stats.as_mut().expect("screen stats");
+            screen.freeze_episodes_total = None;
+            screen.freeze_ms_total = None;
+            screen.max_decode_gap_ms = None;
+            screen.max_content_staleness_ms = None;
+        }
+        let second = create_test_health_packet(
+            "sess_clear_2511",
+            "meet_clear_2511",
+            "alice_clear_2511",
+            peer_stats,
+        );
+        assert!(process_health_packet_to_metrics_pb(&second, &tracker).is_ok());
+
+        for metric in FREEZE_SERIES_2511 {
+            assert!(
+                !series_exists(metric, &labels),
+                "an omitted optional freeze-family field must clear the prior {metric} series"
+            );
+        }
+    }
+
+    /// #2511: `freeze_ms_total` is milliseconds on the wire and seconds on the exported
+    /// `_seconds_total` series. 1500ms must read 1.5, not 1500.
+    #[test]
+    fn freeze_ms_total_exports_as_seconds() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut camera_vs = PbVideoStats::new();
+        camera_vs.freeze_ms_total = Some(1_500);
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.freeze_ms_total = Some(1_500);
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_sec_2511".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_sec_2511",
+            "meet_sec_2511",
+            "alice_sec_2511",
+            peer_stats,
+        );
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_sec_2511"),
+            ("session_id", "sess_sec_2511"),
+            ("from_peer", "alice_sec_2511"),
+            ("to_peer", "bob_sec_2511"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_video_freeze_seconds_total", &labels),
+            Some(1.5),
+            "1500ms must export as 1.5s; 1500.0 means the /1000.0 conversion was dropped and the \
+             series contradicts its own unit suffix"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_freeze_seconds_total", &labels),
+            Some(1.5),
+            "the screen sibling converts too"
+        );
+    }
+
+    /// #2511: a pre-#2511 client leaves all four fields unset and must publish NO freeze series.
+    #[test]
+    fn absent_freeze_fields_publish_no_series() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut camera_vs = PbVideoStats::new();
+        camera_vs.fps_received = 8.0;
+        assert_eq!(
+            camera_vs.freeze_episodes_total, None,
+            "fixture: field unset"
+        );
+        assert_eq!(camera_vs.max_content_staleness_ms, None, "fixture: unset");
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 10.0;
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_oldfz_2511".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_oldfz_2511",
+            "meet_oldfz_2511",
+            "alice_oldfz_2511",
+            peer_stats,
+        );
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_oldfz_2511"),
+            ("session_id", "sess_oldfz_2511"),
+            ("from_peer", "alice_oldfz_2511"),
+            ("to_peer", "bob_oldfz_2511"),
+        ];
+        for metric in FREEZE_SERIES_2511 {
+            assert!(
+                !series_exists(metric, &labels),
+                "{metric} must be ABSENT for a client that never reported it; a 0 here reads as \
+                 'this receiver never froze'"
+            );
+        }
+        assert_eq!(
+            gauge_value("videocall_video_fps", &labels),
+            Some(8.0),
+            "the rest of the bucket must still export; otherwise this test proves nothing"
+        );
+    }
+
+    /// #2511: each freeze series needs its own `remove_label_values` line; asserted per specific
+    /// label set, since a family-wide count passes when the WRONG series is swept.
+    #[test]
+    fn freeze_family_series_are_swept_per_pair() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let hp = create_test_health_packet(
+            "sess_sw_2511",
+            "meet_sw_2511",
+            "alice_sw_2511",
+            freeze_peer_stats("bob_sw_2511"),
+        );
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_sw_2511"),
+            ("session_id", "sess_sw_2511"),
+            ("from_peer", "alice_sw_2511"),
+            ("to_peer", "bob_sw_2511"),
+        ];
+        for metric in FREEZE_SERIES_2511 {
+            assert!(
+                series_exists(metric, &labels),
+                "fixture: {metric} must be published before the sweep, or the sweep assertion \
+                 below passes vacuously"
+            );
+        }
+
+        remove_per_peer_metrics(
+            "meet_sw_2511",
+            "sess_sw_2511",
+            "alice_sw_2511",
+            "bob_sw_2511",
+        );
+
+        for metric in FREEZE_SERIES_2511 {
+            assert!(
+                !series_exists(metric, &labels),
+                "{metric} survived the per-pair sweep — its remove_label_values line is missing \
+                 and it leaks one stale series per departed peer"
+            );
+        }
     }
 
     #[test]
@@ -6007,6 +7001,37 @@ mod tests {
         assert!(
             !series_exists("videocall_peer_connections_total", &conn_labels_a),
             "PEER_CONNECTIONS_TOTAL{{meeting, peer_a}} must be removed on whole-session reap"
+        );
+    }
+    /// FORWARD guard on the exposition Content-Type. Not a regression test for
+    /// the single-copy change: it passes on both the fixed and un-fixed handler.
+    #[actix_web::test]
+    async fn metrics_endpoint_serves_prometheus_content_type() {
+        let health_store: HealthDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(health_store))
+                .app_data(web::Data::new(tracker))
+                .route("/metrics", web::get().to(metrics_handler)),
+        )
+        .await;
+
+        let resp = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/metrics")
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(
+            resp.headers()
+                .get(actix_web::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; version=0.0.4"),
+            "Prometheus rejects a scrape that is not text/plain"
         );
     }
 }

@@ -41,15 +41,9 @@ spec:
     runAsGroup: 1000
   containers:
     - name: bot
-      # Harbor (hclcr.io/hcllabs) — pulled via the pod-level `hclcr-io`
-      # imagePullSecret. `:latest` is what build.sh pushes for the iteration
-      # loop; for a reproducible/pinned run replace it with the dated tag
-      # build.sh also emits (0.1.0-YYYYMMDD-<sha7>).
-      image: hclcr.io/hcllabs/videocall-bots-app:latest
-      # Pinned placeholder tag; build.sh emits a dated immutable tag
-      # (0.1.0-YYYYMMDD-<sha7>). Replace on each build. Always-pull so a
-      # re-pushed dev tag is re-fetched during the iteration loop.
-      imagePullPolicy: Always
+      # Must match statefulset.yaml: prepull-image.sh warms one reference only.
+      image: hclcr.io/hcllabs/videocall-bots-app:0.1.0-20260822-3a95d0f@sha256:26de7a79fbd0f148557b179d8787d2abaadad36b9628c0efe85ea99c7a11df13
+      imagePullPolicy: IfNotPresent
       # No container securityContext: Chromium needs the setuid chrome-sandbox,
       # so allowPrivilegeEscalation must stay at its default (NOT false, or
       # no_new_privs breaks launch). NET_ADMIN is deliberately NOT granted here
@@ -89,23 +83,18 @@ spec:
       resources:
         requests:
           cpu: "1500m"
-          memory: "1.5Gi"
-        limits:
-          # CPU limit set high (not 2) so CFS throttling of the bursty headless-
-          # Chrome encoder can't self-induce a false RESOURCE_STARVED fps verdict
-          # — the signal this tool exists to measure. The namespace ResourceQuota
-          # requires a limit, so it's set generous rather than omitted.
-          cpu: "4"
           memory: "2Gi"
+        limits:
+          # Generous on purpose: a throttled encoder depresses the fps this tool
+          # measures. In lockstep with statefulset.yaml, pinned by the drift lock.
+          cpu: "8"
+          memory: "3Gi"
       volumeMounts:
         # Headless Chrome shared memory. Default container /dev/shm is 64Mi,
         # a classic crash/OOM gotcha. Note: src/bot.ts also passes
         # --disable-dev-shm-usage (so Chrome prefers /tmp), making this mount
         # defense-in-depth. sizeLimit counts against the pod memory limit, so it
-        # is kept at 256Mi — well under the burst band (limit 2Gi − request
-        # 1.5Gi = 512Mi) to preserve OOM margin, matching statefulset.yaml.
-        # --disable-dev-shm-usage already diverts Chrome to /tmp, so 256Mi is
-        # ample.
+        # stays inside the burst band (limit − request); the drift lock pins it.
         - name: dshm
           mountPath: /dev/shm
   volumes:

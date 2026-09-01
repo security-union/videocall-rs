@@ -272,6 +272,7 @@ async fn main() -> std::io::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     info!("start");
+    sec_api::startup::log_feature_flags();
 
     let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
     let nats_client = async_nats::ConnectOptions::new()

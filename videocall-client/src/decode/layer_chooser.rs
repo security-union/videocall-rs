@@ -86,11 +86,6 @@
 //! is per-(peer, [`PrefMediaKind`]), so a user can cap screen and camera
 //! independently.
 
-/// Which CAMERA simulcast ladder a rung index resolves against (issue #1768).
-/// Re-exported through the crate's AQ shim; imported here so the selection-vs-display
-/// resolver split below can name it (issue #2156).
-use crate::adaptive_quality_constants::LadderVariant;
-
 /// Media kind a layer preference / chooser applies to (issue #989, Phase 3).
 ///
 /// Camera VIDEO, SCREEN-share, and AUDIO of the same peer are independent
@@ -224,6 +219,174 @@ pub const STICKY_RECOVERY_CLEAN_TICKS: u32 = 12;
 /// re-probes on the time-bounded recovery path.
 pub const SCREEN_LAYER_OSCILLATION_LATCH_MS: u64 = 15_000;
 
+// --- Keyframe-starved screen rung retraction (issue #2328) -------------------
+//
+// `LayerAvailability` learns which rungs a source offers purely from PACKET
+// ARRIVAL, and its doc calls out that "a keyframe-only lull does not retract a
+// layer". The INVERSE case is the blind spot #2328 hit: a rung that keeps
+// delivering DELTAS but no decodable KEYFRAME looks perfectly healthy to
+// availability (packets keep landing, `last_seen_ms` keeps refreshing) while the
+// receiver sitting on it is frozen with nothing to decode from. The chooser
+// therefore never downshifts off it, and — because the relay ALWAYS forwards
+// layer 0 regardless of preference (`chat_server.rs`'s `simulcast_layer_id != 0`
+// guard) — the base rung's keyframes are on the wire the whole time, unused.
+//
+// The fix is a TIME-BOUNDED quarantine, deliberately not a success counter: the
+// repo's recovery-hysteresis rule forbids strictly-consecutive counters because
+// they reset under ongoing contention and can pin an entity indefinitely. Here a
+// counter would be worse than merely fragile — it would be unsatisfiable. Once
+// the receiver leaves the rung, that rung MAY stop arriving entirely (if the
+// chooser is `constrained` it publishes a LAYER_PREFERENCE and the relay stops
+// forwarding it), so "re-admit once it demonstrably delivers a keyframe" could
+// never be met. Expiry is therefore purely wall-clock: the rung becomes eligible
+// again after the window whatever happened in between, and if it is still
+// starved the next hold re-quarantines it. That is the only shape that cannot
+// wedge.
+
+/// How long a SCREEN rung must be BOTH decoder-starved and keyframe-less before
+/// this receiver retracts it from its own availability view (issue #2328).
+///
+/// Tied to [`videocall_codecs::jitter_buffer::MAX_KEYFRAME_LESS_HOLD_MS`] — the
+/// ceiling the decoder's own jitter buffer uses to declare a keyframe-less hold
+/// unrecoverable and escalate to a pipeline reset — so the two cannot silently
+/// diverge. Semantics match: by the time the buffer has been starved that long,
+/// the publisher has missed at least two `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`
+/// (3s) GOP cadences on this rung, which is no longer a lull.
+pub const SCREEN_KEYFRAME_STARVED_RETRACT_MS: u64 =
+    videocall_codecs::jitter_buffer::MAX_KEYFRAME_LESS_HOLD_MS as u64;
+
+/// How long a retracted SCREEN rung stays excluded from this receiver's
+/// availability view before it is re-admitted and may be climbed back to
+/// (issue #2328).
+///
+/// Sized against the two cadences it has to clear:
+/// * the chooser only re-evaluates on the **5s monitor tick**, so the window
+///   must span several ticks or the rung would be re-admitted before the
+///   downshift it caused had even been applied;
+/// * [`STICKY_RECOVERY_CLEAN_TICKS`] (12 ticks ≈ 60s) is the existing "cautious
+///   re-climb" cadence, so a shorter window here re-probes strictly more eagerly
+///   than the chooser's own recovery path and cannot be the limiting factor.
+///
+/// 30s ⇒ a still-broken rung costs at most ~6s of freeze per ~36s cycle (~17%)
+/// instead of a permanent one, while a rung broken only transiently is back
+/// within half a minute. Deliberately NOT reused from
+/// [`SCREEN_LAYER_OSCILLATION_LATCH_MS`] (15s): that is a *detection* window for
+/// the #1899 yo-yo, not a *recovery* dwell, and 15s here would only leave ~2
+/// monitor ticks on the base rung before re-probing.
+pub const SCREEN_KEYFRAME_STARVED_QUARANTINE_MS: u64 = 30_000;
+
+/// The window a keyframe-starvation observation stays actionable (issue #2328).
+///
+/// The starvation clock is stamped from `now_ms()`, a WALL clock, so a
+/// backgrounded tab (or an NTP step) can resume with an arbitrarily old
+/// timestamp and make the retract test trip instantly on the first packet after
+/// resume — a rung retracted for a freeze that has already ended. Past this
+/// bound the observation is treated as stale and simply RE-ARMED to `now`, which
+/// costs one fresh hold window and cannot wedge (it never latches anything).
+pub const SCREEN_KEYFRAME_STARVED_STALE_MS: u64 = SCREEN_KEYFRAME_STARVED_QUARANTINE_MS;
+
+/// The retraction bound must sit strictly below the staleness bound, or every
+/// observation would be classified stale before it could ever retract and the
+/// whole path would be dead code.
+const _: () = assert!(SCREEN_KEYFRAME_STARVED_RETRACT_MS < SCREEN_KEYFRAME_STARVED_STALE_MS);
+/// The quarantine must outlast the retraction bound, or a rung could be
+/// re-admitted before the receiver had spent even one hold window off it.
+const _: () = assert!(SCREEN_KEYFRAME_STARVED_QUARANTINE_MS > SCREEN_KEYFRAME_STARVED_RETRACT_MS);
+
+/// What the receiver should do about the current SCREEN keyframe-starvation
+/// observation. Returned by [`screen_starvation_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenStarvationAction {
+    /// Nothing to do: no starvation recorded, the hold has not reached the
+    /// bound yet, or the receiver is already on the base rung (which the relay
+    /// always forwards — there is no lower rung to fall back to, so this is the
+    /// decoder-escalation path's problem, not the chooser's).
+    None,
+    /// The selected rung has been starved past the bound WHILE the base rung was
+    /// still arriving: quarantine it so the chooser downshifts to a rung that is
+    /// actually being delivered.
+    Retract,
+    /// The observation is older than [`SCREEN_KEYFRAME_STARVED_STALE_MS`] and
+    /// cannot be trusted (suspended tab / clock step). Re-arm the clock to
+    /// `now_ms` and require a fresh hold window.
+    Rearm,
+}
+
+/// Decide what to do about a SCREEN rung that the decoder reports as
+/// keyframe-starved (issue #2328). Pure, so the encode-loop-free host tests pin
+/// it; `peer_decode_manager` supplies the live inputs.
+///
+/// * `selected_layer` — the rung this receiver currently decodes for this
+///   source. `0` always yields [`ScreenStarvationAction::None`]: the base rung
+///   is unconditionally forwarded by the relay and there is nothing below it, so
+///   retracting it could only make things worse.
+/// * `starved_since_ms` — when the CURRENT unbroken keyframe-less hold began
+///   (`None` ⇒ not starved). Cleared by the caller on any keyframe arrival, so a
+///   rung that is delivering keyframes can never reach the bound.
+/// * `base_rung_arriving` — whether layer 0 is still being delivered to this
+///   receiver. This is the ASYMMETRY test, and it is what separates the defect
+///   from a symmetric pressure episode; see below.
+///
+/// ## Why the asymmetry test is required
+/// A starved selected rung is only actionable if there is a HEALTHIER rung to
+/// fall back to. `actix-api/src/actors/priority_drop.rs` drops SCREEN media once
+/// the outbound channel is at `PRIORITY_DROP_SCREEN_FILL_RATIO` (0.90) and that
+/// drop is LAYER-AGNOSTIC — it never inspects `simulcast_layer_id`, so under
+/// severe outbound pressure the base rung's keyframes are dropped right along
+/// with everything else (that is #1977's design, a symmetric pressure path, and
+/// it is NOT the per-layer asymmetry #2328 fixes). Retracting a rung during such
+/// an episode buys nothing — every rung is equally starved — and only adds
+/// LAYER_SWITCH churn to a link that is already saturated. Requiring layer 0 to
+/// still be arriving confines the retraction to the case it was built for: THIS
+/// rung is starved while another one is being delivered.
+///
+/// ## What `base_rung_arriving` can and cannot prove
+/// The caller sources it from packet ARRIVAL
+/// ([`LayerAvailability::layer_available_peek`] on layer 0), which is sound
+/// because the relay forwards `simulcast_layer_id == 0` unconditionally,
+/// whatever LAYER_PREFERENCE this receiver published — so base packets are on
+/// the wire and `observe`d even while the receiver decodes rung 2. It proves
+/// "the stream has not stopped wholesale"; it does NOT prove layer 0 is
+/// delivering KEYFRAMES specifically. It cannot: `frame_type` lives inside the
+/// AEAD seal and the #1066 cleartext gate returns `SKIPPED` before decrypt for
+/// every non-selected layer, so a receiver on rung 2 never parses a layer-0
+/// packet. Proving base-keyframe delivery would mean decrypting and parsing every
+/// layer-0 SCREEN packet — reinstating exactly the per-layer receiver CPU cost
+/// #1066 removed. The residual failure mode is bounded and benign: during a
+/// PARTIAL priority-drop episode (base packets still trickling) this can still
+/// retract once, and the receiver lands on the base rung — which is also the
+/// bandwidth-safe response to a 90%-fill condition.
+///
+/// Note the converse case — base NOT arriving while the selected rung is —
+/// yields `None`. That would mean the publisher stopped producing its base rung
+/// entirely, which the relay's unconditional layer-0 forwarding makes a
+/// publisher-side bug; there is nothing better for this receiver to switch to,
+/// and the decoder's own keyframe-less escalation still runs.
+///
+/// A backwards clock step (`now_ms < starved_since_ms`) saturates to a 0-age
+/// hold and yields `None` rather than tripping either bound.
+pub fn screen_starvation_action(
+    selected_layer: u32,
+    starved_since_ms: Option<u64>,
+    base_rung_arriving: bool,
+    now_ms: u64,
+    retract_after_ms: u64,
+    stale_after_ms: u64,
+) -> ScreenStarvationAction {
+    let Some(since) = starved_since_ms else {
+        return ScreenStarvationAction::None;
+    };
+    let age_ms = now_ms.saturating_sub(since);
+    if age_ms > stale_after_ms {
+        return ScreenStarvationAction::Rearm;
+    }
+    if selected_layer > 0 && base_rung_arriving && age_ms >= retract_after_ms {
+        ScreenStarvationAction::Retract
+    } else {
+        ScreenStarvationAction::None
+    }
+}
+
 /// A single window's receive-health sample for one source (THIS receiver's
 /// downlink), as produced by the receive-side sequence tracker on ~1s rollover.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,6 +425,13 @@ pub struct LayerAvailability {
     last_seen_ms: std::collections::HashMap<u32, u64>,
     /// How long (ms) an unobserved layer remains considered available.
     window_ms: u64,
+    /// Layers this receiver has RETRACTED until the given wall-clock ms, despite
+    /// their packets still arriving (issue #2328). Arrival-based availability
+    /// cannot see a rung that delivers deltas but no decodable keyframe; this is
+    /// the override that lets the receiver stop targeting one. Expiry is purely
+    /// time-based, so a quarantine can never become permanent — see
+    /// [`SCREEN_KEYFRAME_STARVED_QUARANTINE_MS`].
+    quarantined_until_ms: std::collections::HashMap<u32, u64>,
 }
 
 impl LayerAvailability {
@@ -279,6 +449,7 @@ impl LayerAvailability {
         Self {
             last_seen_ms: std::collections::HashMap::new(),
             window_ms,
+            quarantined_until_ms: std::collections::HashMap::new(),
         }
     }
 
@@ -287,23 +458,63 @@ impl LayerAvailability {
         self.last_seen_ms.insert(layer_id, now_ms);
     }
 
-    /// Highest layer id observed within the window as of `now`. Returns 0 when
-    /// nothing has been observed recently (base-only / un-upgraded publisher),
-    /// which is the bandwidth-safe default. Expired entries are pruned lazily.
+    /// Retract `layer_id` from this receiver's view until `until_ms`, even while
+    /// its packets keep arriving (issue #2328).
+    ///
+    /// Used when the rung is delivering DELTAS but no decodable keyframe, which
+    /// arrival-based availability cannot distinguish from health. Extends (never
+    /// shortens) an existing quarantine, so a rung that is still starved when the
+    /// receiver re-probes it simply serves another full window rather than
+    /// flapping. Layer 0 is deliberately still accepted here — it is the caller
+    /// (`screen_starvation_action`) that refuses to retract the base rung, and
+    /// keeping this primitive unconditional keeps it honest for future callers.
+    pub fn quarantine(&mut self, layer_id: u32, until_ms: u64) {
+        let entry = self
+            .quarantined_until_ms
+            .entry(layer_id)
+            .or_insert(until_ms);
+        *entry = (*entry).max(until_ms);
+    }
+
+    /// Whether `layer_id` is currently retracted as of `now_ms`.
+    pub fn is_quarantined(&self, layer_id: u32, now_ms: u64) -> bool {
+        self.quarantined_until_ms
+            .get(&layer_id)
+            .is_some_and(|&until| now_ms < until)
+    }
+
+    /// Highest layer id observed within the window as of `now`, EXCLUDING any
+    /// currently-quarantined rung. Returns 0 when nothing qualifies (base-only /
+    /// un-upgraded publisher), which is the bandwidth-safe default. Expired
+    /// observations and expired quarantines are both pruned lazily.
+    ///
+    /// The quarantine is applied HERE, at the single choke point every consumer
+    /// already reads (the chooser tick, the #1179 early seed, the
+    /// LAYER_PREFERENCE publisher and the diagnostics snapshots), so a retraction
+    /// cannot be seen by some of them and missed by others.
     pub fn highest_available(&mut self, now_ms: u64) -> u32 {
         let window = self.window_ms;
         self.last_seen_ms
             .retain(|_, &mut seen| now_ms.saturating_sub(seen) <= window);
-        self.last_seen_ms.keys().copied().max().unwrap_or(0)
+        self.quarantined_until_ms
+            .retain(|_, &mut until| now_ms < until);
+        self.last_seen_ms
+            .keys()
+            .copied()
+            .filter(|layer| !self.quarantined_until_ms.contains_key(layer))
+            .max()
+            .unwrap_or(0)
     }
 
-    /// Whether `layer_id` is within the availability window as of `now_ms`,
-    /// without pruning. Read-only so `&self` diagnostic paths can ask; the
-    /// pruning variant above stays the one selection uses.
+    /// Whether `layer_id` is within the availability window as of `now_ms` and
+    /// not quarantined, without pruning. Read-only so `&self` diagnostic paths
+    /// can ask; the pruning variant above stays the one selection uses.
     pub fn layer_available_peek(&self, layer_id: u32, now_ms: u64) -> bool {
-        self.last_seen_ms
-            .get(&layer_id)
-            .is_some_and(|&seen| now_ms.saturating_sub(seen) <= self.window_ms)
+        !self.is_quarantined(layer_id, now_ms)
+            && self
+                .last_seen_ms
+                .get(&layer_id)
+                .is_some_and(|&seen| now_ms.saturating_sub(seen) <= self.window_ms)
     }
 }
 
@@ -795,7 +1006,7 @@ pub fn clamp_to_user_range(desired: u32, user_min: u32, user_max: u32) -> u32 {
 /// SEND index convention (where tier 0 is the *best*). Per kind:
 ///   * video  — layers `0..=2` (low / standard / hd)
 ///   * screen — layers `0..=2` (low / medium / high)
-///   * audio  — layers `0..=1` (low / high)
+///   * audio  — layers `0..=2`; the receive UI offers only `0` (#2279)
 ///
 /// ## Semantics
 /// `min`/`max` are inclusive bounds applied to EVERY incoming peer of this kind
@@ -1052,21 +1263,11 @@ pub const fn audio_layer_kbps_len() -> usize {
 }
 
 /// Nominal kbps of the BASE received-audio layer (layer 0, the rung the relay's
-/// #989 layer filter never drops). Audio simulcast defaults ON with three rungs
-/// since issue #1082 (`clamp_audio_layer_count` still maps `0`/`1` to one layer),
-/// so this value is not necessarily the nominal bitrate of the layer a receiver
-/// selected.
+/// #989 layer filter never drops).
 ///
-/// This cheap const remains deliberate for the #1769 media-overlay path (a plain
-/// `const fn` — no borrow, no clock read).
-///
-/// A consumer needing the SELECTED-layer bitrate must pick the right accessor, and
-/// the similarly-named one is a trap: `received_layer_snapshot` (both here and its
-/// `VideoCallClient` wrapper) is a per-KIND AGGREGATE — one needle per kind, the
-/// active talker for audio with a highest-layer fallback — so it cannot drive a
-/// per-peer readout without showing every peer the same value. For per-peer use
-/// `VideoCallClient::per_peer_received_snapshots` (#1095), one `PeerReceiveDiag`
-/// per peer. Issue #2132 tracks the overlay correction that needs this.
+/// This is a LADDER nominal, not an observed bitrate: a publisher emitting one
+/// audio layer runs at its own AQ audio tier, so layer 0's arrival says nothing
+/// about the rate. No UI readout may derive a remote peer's audio bitrate from it.
 pub const fn base_audio_layer_kbps() -> u32 {
     AUDIO_LAYER_KBPS[0]
 }
@@ -1092,7 +1293,7 @@ const AUDIO_LAYER_CAP: u32 = AUDIO_LAYER_KBPS.len() as u32;
 /// per-kind decoupling + cross-crate tie in issues #1082 / #1077): video/screen
 /// = `SIMULCAST_MAX_LAYERS`/`SCREEN_SIMULCAST_MAX_LAYERS`, audio =
 /// `AUDIO_LAYER_KBPS.len()`. Single source of truth for the per-kind ladder size
-/// used by the snapshot resolver and the availability-id clamp.
+/// used by the snapshot resolver and the decode path's off-ladder rejection.
 pub fn max_layers_for_kind(kind: PrefMediaKind) -> u32 {
     match kind {
         // Video and Screen share the same value today but are independent arms
@@ -1101,18 +1302,6 @@ pub fn max_layers_for_kind(kind: PrefMediaKind) -> u32 {
         PrefMediaKind::Screen => SCREEN_LAYER_CAP,
         PrefMediaKind::Audio => AUDIO_LAYER_CAP,
     }
-}
-
-/// Clamp a raw incoming `simulcast_layer_id` to the highest valid layer index
-/// for `kind` (issue #989, security follow-up). The layer id rides OUTSIDE the
-/// AEAD seal, so a malicious publisher could cycle arbitrary/unbounded ids; if
-/// fed straight into [`LayerAvailability::observe`] each unique id would add a
-/// distinct map entry, inflating availability cardinality between prunes.
-/// Clamping to `[0, max_layers_for_kind - 1]` bounds the map to the ladder size
-/// regardless of what arrives on the wire, with no effect on honest publishers
-/// (whose ids are already in range).
-pub fn clamp_observed_layer_id(kind: PrefMediaKind, raw_layer_id: u32) -> u32 {
-    raw_layer_id.min(max_layers_for_kind(kind).saturating_sub(1))
 }
 
 /// A per-peer rendered-tile-size hint pushed by the UI (issue #1256 Phase 1).
@@ -1136,16 +1325,10 @@ pub const SIZE_CAP_MARGIN: f64 = 0.10;
 /// Map a rendered device-pixel tile height to the smallest simulcast layer index
 /// that "covers" it (issue #1256 Phase 1). Pure + host-tested.
 ///
-/// **This is the layer SELECTION path** and is deliberately pinned to
-/// [`LadderVariant::Default`] via [`size_cap_layer_in`]. Simulcast in this codebase
-/// is EXACT-MATCH — a guard/relay layer-id mismatch DROPS packets and freezes video
-/// — so the lid must never become variant-dependent. It provably need not be:
-/// #1768 moved only the top rung, and reaching that rung means every lower rung
-/// already failed. The function therefore returns `highest_available` whether the
-/// top rung covers the tile or the loop falls through, so the top rung's height
-/// cannot change the result. See
-/// `size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung`, which proves the
-/// two variants agree exhaustively by calling [`size_cap_layer_in`] on both arms.
+/// **This is the layer SELECTION path.** Simulcast in this codebase is EXACT-MATCH
+/// — a guard/relay layer-id mismatch DROPS packets and freezes video — so the lid
+/// resolves rung heights from the one camera ladder, never from anything a
+/// deployment can vary.
 ///
 /// Returns the smallest layer `i` in `0..=highest_available` whose native height
 /// (from [`received_layer_snapshot`]) times `(1.0 + SIZE_CAP_MARGIN)` is >=
@@ -1155,41 +1338,20 @@ pub const SIZE_CAP_MARGIN: f64 = 0.10;
 /// - AUDIO is never size-capped: returns `highest_available` unconditionally
 ///   (defensive; the caller never invokes this for audio).
 /// - `tile_h_px == 0` (unknown size) returns `highest_available` (don't cap).
+///
+/// Re-exported at the crate root so `dioxus-ui` can verify its lid values against this
+/// function rather than restating the layer heights.
 pub fn size_cap_layer(
     tile_h_px: u32,
     highest_available: u32,
     layer_count: u32,
     kind: PrefMediaKind,
 ) -> u32 {
-    size_cap_layer_in(
-        tile_h_px,
-        highest_available,
-        layer_count,
-        kind,
-        LadderVariant::Default,
-    )
-}
-
-/// [`size_cap_layer`] with the camera [`LadderVariant`] supplied explicitly.
-///
-/// **Deliberately PRIVATE**, so no production caller can pass
-/// [`LadderVariant::Reduced`] into layer selection (see [`size_cap_layer`] for why
-/// that must stay impossible). Its only reason to exist is that the equivalence
-/// test can then assert `size_cap_layer_in(.., Reduced) == size_cap_layer_in(..,
-/// Default)` using the REAL production rule on BOTH arms, instead of re-implementing
-/// the lid inside the test and grading its own copy.
-fn size_cap_layer_in(
-    tile_h_px: u32,
-    highest_available: u32,
-    layer_count: u32,
-    kind: PrefMediaKind,
-    variant: LadderVariant,
-) -> u32 {
     if matches!(kind, PrefMediaKind::Audio) || tile_h_px == 0 {
         return highest_available;
     }
     for i in 0..=highest_available {
-        let native_h = received_layer_snapshot_in(kind, i, layer_count, variant).height;
+        let native_h = received_layer_snapshot(kind, i, layer_count).height;
         if native_h as f64 * (1.0 + SIZE_CAP_MARGIN) >= tile_h_px as f64 {
             return i;
         }
@@ -1204,61 +1366,13 @@ fn size_cap_layer_in(
 /// `layer_count` are clamped into range, so an explicit 1-layer (flag-off) input
 /// always yields a valid layer-0 snapshot.
 ///
-/// **This is the layer SELECTION entry point** — pinned to
-/// [`LadderVariant::Default`]. Use it for anything that feeds a DECISION (notably
-/// [`size_cap_layer`]'s #1256 tile-size lid), because simulcast here is EXACT-MATCH
-/// and a variant-dependent selection would risk a freeze.
-///
-/// For anything the USER READS (a rung label, a `{w}x{h}` readout, a `~kbps`
-/// metric) call [`received_layer_snapshot_for_display`] instead and hand it the
-/// deployment's real variant — otherwise a `Reduced` deployment labels a 960×540 @
-/// ~900 kbps stream "720p · ~1.5M" (issue #2156).
+/// Used for both layer SELECTION (notably [`size_cap_layer`]'s #1256 tile-size lid)
+/// and the readouts the user sees, because there is one camera ladder:
+/// `videocall_aq::constants::simulcast_layers` is the single source of ladder truth.
 pub fn received_layer_snapshot(
     kind: PrefMediaKind,
     layer_index: u32,
     layer_count: u32,
-) -> ReceivedLayerSnapshot {
-    received_layer_snapshot_in(kind, layer_index, layer_count, LadderVariant::Default)
-}
-
-/// Resolve a [`ReceivedLayerSnapshot`] for **DISPLAY**, honouring the deployment's
-/// camera [`LadderVariant`] (issue #2156).
-///
-/// Identical to [`received_layer_snapshot`] except that the Video arm resolves its
-/// rung geometry/bitrate from `variant`'s ladder, so a `Reduced` deployment's
-/// receiver readouts say `540p · ~900k` rather than the shipped ladder's `720p ·
-/// ~1.5M`. `Screen` and `Audio` are variant-INVARIANT (#1768 touched only the camera
-/// ladder), so they are unaffected by `variant` — but the parameter is still taken
-/// for all kinds so a caller never has to branch on kind to pick a resolver.
-///
-/// This must NOT be used for layer selection — see [`received_layer_snapshot`].
-///
-/// Note for #2156's purpose (unblocking a measurement run): this changes **no
-/// metric**. `health_reporter`'s `received_{video,screen,audio}_layer` maps carry
-/// layer INDICES only (`populate_received_layers`), with no geometry or bitrate, so
-/// Prometheus was never wrong here — only the UI was.
-pub fn received_layer_snapshot_for_display(
-    kind: PrefMediaKind,
-    layer_index: u32,
-    layer_count: u32,
-    variant: LadderVariant,
-) -> ReceivedLayerSnapshot {
-    received_layer_snapshot_in(kind, layer_index, layer_count, variant)
-}
-
-/// The shared clamp + ladder-map body behind [`received_layer_snapshot`] (selection,
-/// pinned `Default`) and [`received_layer_snapshot_for_display`] (display,
-/// variant-explicit).
-///
-/// Private and variant-explicit so the two public wrappers' NAMES carry the
-/// selection-vs-display invariant while the logic itself exists exactly once —
-/// `videocall_aq::constants::simulcast_layers_for` remains the single source of
-/// ladder truth.
-fn received_layer_snapshot_in(
-    kind: PrefMediaKind,
-    layer_index: u32,
-    layer_count: u32,
-    variant: LadderVariant,
 ) -> ReceivedLayerSnapshot {
     // Clamp the ladder size to the supported range for this kind, and the index
     // into [0, count-1], so a degenerate input can never panic the resolver.
@@ -1267,33 +1381,23 @@ fn received_layer_snapshot_in(
     let count = layer_count.clamp(1, max_layers);
     let idx = layer_index.min(count.saturating_sub(1));
 
-    if audio {
-        let kbps = AUDIO_LAYER_KBPS
-            .get(idx as usize)
-            .copied()
-            .unwrap_or(AUDIO_LAYER_KBPS[0]);
+    // AUDIO and SCREEN carry no ladder geometry OR bitrate. Screen's is enriched from
+    // the publisher's own reported target (`enrich_screen_snapshot`); audio has no
+    // such report, and its rate is set by the publisher's AQ audio tier rather than
+    // by the layer a receiver decodes.
+    if audio || matches!(kind, PrefMediaKind::Screen) {
         return ReceivedLayerSnapshot {
             kind,
             layer_index: idx,
             layer_count: count,
             width: 0,
             height: 0,
-            kbps,
-            // The bare resolver doesn't know the user bound / chooser state, so it
-            // leaves the reason unset; the snapshot producers fill it in.
+            kbps: 0,
             reason: None,
         };
     }
 
-    // Video / screen: resolve from the AQ ladder (lowest-first, index == layer).
-    // The SCREEN ladder has no variant (#1768 changed only the camera ladder), so
-    // `variant` is deliberately consulted on the camera arm only.
-    let tiers = match kind {
-        PrefMediaKind::Screen => {
-            crate::adaptive_quality_constants::simulcast_screen_layers(count as usize)
-        }
-        _ => crate::adaptive_quality_constants::simulcast_layers_for(count as usize, variant),
-    };
+    let tiers = crate::adaptive_quality_constants::simulcast_layers(count as usize);
     let tier = tiers
         .get(idx as usize)
         .or_else(|| tiers.first())
@@ -1327,22 +1431,15 @@ fn received_layer_snapshot_in(
 /// **DISPLAY-ONLY** — every caller is inside
 /// `PeerDecodeManager::per_peer_received_snapshots`, whose output drives readouts
 /// (the perf panel's per-peer rows, the diagnostics drawer, the signal popup) and no
-/// selection decision. It therefore takes the deployment's camera
-/// [`LadderVariant`] and resolves geometry through
-/// [`received_layer_snapshot_for_display`] (issue #2156). The `reason`/quality
-/// derivation is variant-INVARIANT: it is computed from layer INDICES
-/// (`layer_index`, `avail_top`, `full_ladder_top`, `user_max`), and both variants are
-/// the same depth (compile-time asserted in `videocall-aq`), so only the rendered
-/// pixels/bitrate move.
+/// selection decision.
 pub fn received_layer_snapshot_with_reason(
     kind: PrefMediaKind,
     raw_selected: u32,
     avail_top: u32,
     user_max: Option<u32>,
     constrained: bool,
-    variant: LadderVariant,
 ) -> ReceivedLayerSnapshot {
-    let mut snap = received_layer_snapshot_for_display(kind, raw_selected, avail_top + 1, variant);
+    let mut snap = received_layer_snapshot(kind, raw_selected, avail_top + 1);
     let full_ladder_top = max_layers_for_kind(kind).saturating_sub(1);
     // Derive from the CLAMPED layer the snapshot actually carries, never the raw
     // selected layer — see the fn doc.
@@ -2324,35 +2421,37 @@ mod tests {
         assert!(base.kbps < s.kbps, "base bitrate < top bitrate");
     }
 
-    /// The SCREEN receive ladder's top rung is 1440p since issue #2179 (it was
-    /// 1080p, which capped how sharp a simulcast receiver could ever get). The
-    /// middle rung is the 1080p `high` rung and the base is the 720p `low` rung,
-    /// so the ladder is spaced by RESOLUTION rather than repeating 720p twice.
-    ///
-    /// Mutation guard: reverting `simulcast_screen_layers(3)` to
-    /// `[low, medium, high]` makes rung 2 read 1920x1080 and rung 1 read
-    /// 1280x720, failing both asserts.
+    /// MUTATION: resolve this arm from `simulcast_screen_layers` again.
     #[test]
-    fn snapshot_screen_ladder_is_spaced_by_resolution() {
-        let base = received_layer_snapshot(PrefMediaKind::Screen, 0, 3);
-        let mid = received_layer_snapshot(PrefMediaKind::Screen, 1, 3);
-        let top = received_layer_snapshot(PrefMediaKind::Screen, 2, 3);
-        assert_eq!((base.width, base.height), (1280, 720));
-        assert_eq!((mid.width, mid.height), (1920, 1080));
-        assert_eq!((top.width, top.height), (2560, 1440));
+    fn snapshot_screen_carries_no_ladder_geometry() {
+        for raw_count in [1u32, 3] {
+            let s = received_layer_snapshot(PrefMediaKind::Screen, 0, raw_count);
+            assert_eq!((s.width, s.height), (0, 0));
+            assert_eq!(s.kbps, 0);
+            assert_eq!(s.layer_count, 1);
+            assert_eq!(s.layer_index, 0);
+        }
     }
 
+    /// MUTATION: resolve this arm from `AUDIO_LAYER_KBPS` again.
     #[test]
-    fn snapshot_audio_has_no_resolution_and_kbps_by_layer() {
-        // Audio 3-rung ladder retuned lighter (issue #1768): low 12 / mid 24 / high 48.
-        let low = received_layer_snapshot(PrefMediaKind::Audio, 0, 3);
-        assert_eq!((low.width, low.height), (0, 0));
-        assert_eq!(low.kbps, 12);
-        let mid = received_layer_snapshot(PrefMediaKind::Audio, 1, 3);
-        assert_eq!(mid.kbps, 24);
-        let high = received_layer_snapshot(PrefMediaKind::Audio, 2, 3);
-        assert_eq!(high.kbps, 48);
-        assert_eq!(high.layer_count, 3);
+    fn snapshot_audio_carries_no_ladder_geometry_or_bitrate() {
+        // The decoded layer id does not determine a publisher's audio bitrate, so no
+        // layer may resolve to its ladder nominal. Nominals read from the production
+        // table so a retune moves with it.
+        for layer in 0..AUDIO_LAYER_KBPS.len() as u32 {
+            let s = received_layer_snapshot(PrefMediaKind::Audio, layer, 3);
+            assert_eq!((s.width, s.height), (0, 0));
+            assert_eq!(s.kbps, 0, "layer {layer} must report no bitrate");
+            assert_ne!(
+                s.kbps, AUDIO_LAYER_KBPS[layer as usize],
+                "layer {layer} resolved to its ladder nominal again"
+            );
+        }
+        assert_eq!(
+            received_layer_snapshot(PrefMediaKind::Audio, 2, 3).layer_count,
+            3
+        );
     }
 
     #[test]
@@ -2555,7 +2654,6 @@ mod tests {
             0, // avail_top (base-only sender)
             None,
             false,
-            LadderVariant::Default,
         );
         // Clamped to base — the dot will be Low, and the reason explains it.
         assert_eq!(
@@ -2569,200 +2667,15 @@ mod tests {
         );
 
         // A healthy full-quality stream: top of the full ladder, no reason.
-        let top = received_layer_snapshot_with_reason(
-            PrefMediaKind::Video,
-            2,
-            2,
-            None,
-            false,
-            LadderVariant::Default,
-        );
+        let top = received_layer_snapshot_with_reason(PrefMediaKind::Video, 2, 2, None, false);
         assert_eq!(top.layer_index, 2);
         assert_eq!(top.reason, None, "optimal reception carries no reason chip");
 
         // A user cap at the decoded layer below the full top → Setting.
-        let capped = received_layer_snapshot_with_reason(
-            PrefMediaKind::Video,
-            1,
-            2,
-            Some(1),
-            false,
-            LadderVariant::Default,
-        );
+        let capped =
+            received_layer_snapshot_with_reason(PrefMediaKind::Video, 1, 2, Some(1), false);
         assert_eq!(capped.layer_index, 1);
         assert_eq!(capped.reason, Some(DegradeReason::Setting));
-    }
-
-    // -----------------------------------------------------------------
-    // Issue #2156: the DISPLAY resolver honours the deployment's camera
-    // LadderVariant, while the SELECTION resolver stays pinned to Default.
-    // -----------------------------------------------------------------
-
-    /// The display resolver must report the REDUCED ladder's top rung
-    /// (960×540 @ 900 kbps) under `LadderVariant::Reduced`, and the shipped
-    /// 1280×720 @ 1500 kbps under `Default`. This is the whole of #2156's
-    /// videocall-client half: the peer-row `720p · ~1.5M` was wrong by 67% on the
-    /// bitrate for a 900 kbps stream.
-    ///
-    /// The expectations are read from the AQ tables (`simulcast_layers_for`, the
-    /// single source of ladder truth) rather than hardcoded, so a future retune of
-    /// either ladder cannot leave this test asserting stale geometry — but the two
-    /// arms are also asserted DIFFERENT, so a resolver that ignored `variant` (both
-    /// arms equal) fails regardless.
-    ///
-    /// MUTATION: make `received_layer_snapshot_for_display` delegate to
-    /// `received_layer_snapshot` (dropping `variant`) and the `assert_ne!` plus the
-    /// Reduced-arm equality both fail.
-    #[test]
-    fn display_resolver_reports_the_reduced_top_rung_under_the_reduced_variant() {
-        use crate::adaptive_quality_constants::{simulcast_layers_for, SIMULCAST_MAX_LAYERS};
-
-        let d_top = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Default)
-            .last()
-            .expect("the default camera ladder is non-empty");
-        let r_top = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Reduced)
-            .last()
-            .expect("the reduced camera ladder is non-empty");
-
-        let shipped =
-            received_layer_snapshot_for_display(PrefMediaKind::Video, 2, 3, LadderVariant::Default);
-        let reduced =
-            received_layer_snapshot_for_display(PrefMediaKind::Video, 2, 3, LadderVariant::Reduced);
-
-        assert_eq!(
-            (shipped.width, shipped.height, shipped.kbps),
-            (d_top.max_width, d_top.max_height, d_top.ideal_bitrate_kbps),
-            "the Default arm must resolve the SHIPPED top rung"
-        );
-        assert_eq!(
-            (reduced.width, reduced.height, reduced.kbps),
-            (r_top.max_width, r_top.max_height, r_top.ideal_bitrate_kbps),
-            "the Reduced arm must resolve the REDUCED top rung (#2156)"
-        );
-        assert_ne!(
-            (shipped.width, shipped.height, shipped.kbps),
-            (reduced.width, reduced.height, reduced.kbps),
-            "a resolver that ignored `variant` would make both arms identical — that is \
-             exactly the #2156 bug"
-        );
-
-        // Non-top rungs are byte-identical across variants (#1768 moved only the top),
-        // so the display resolver must agree there. This is the same invariant the
-        // #1256 lid's insensitivity argument rests on.
-        for idx in 0..2u32 {
-            let a = received_layer_snapshot_for_display(
-                PrefMediaKind::Video,
-                idx,
-                3,
-                LadderVariant::Default,
-            );
-            let b = received_layer_snapshot_for_display(
-                PrefMediaKind::Video,
-                idx,
-                3,
-                LadderVariant::Reduced,
-            );
-            assert_eq!(
-                (a.width, a.height, a.kbps),
-                (b.width, b.height, b.kbps),
-                "rung {idx} (below the top) must be variant-invariant"
-            );
-        }
-    }
-
-    /// SCREEN and AUDIO are variant-INVARIANT — #1768 changed only the camera
-    /// ladder, and `simulcast_screen_layers` has no variant at all. Passing
-    /// `Reduced` must therefore be a no-op for them, so an over-eager fix that
-    /// re-pointed the screen/audio arms at the camera table is caught here.
-    ///
-    /// MUTATION: route the Screen arm of `received_layer_snapshot_in` through
-    /// `simulcast_layers_for(.., variant)` and this fails.
-    #[test]
-    fn display_resolver_leaves_screen_and_audio_variant_invariant() {
-        for kind in [PrefMediaKind::Screen, PrefMediaKind::Audio] {
-            for idx in 0..3u32 {
-                let d = received_layer_snapshot_for_display(kind, idx, 3, LadderVariant::Default);
-                let r = received_layer_snapshot_for_display(kind, idx, 3, LadderVariant::Reduced);
-                assert_eq!(
-                    d, r,
-                    "{kind:?} rung {idx} must be identical across camera ladder variants"
-                );
-            }
-        }
-    }
-
-    /// The SELECTION entry point must stay pinned to the shipped ladder: the whole
-    /// safety argument for option (B) is that `received_layer_snapshot` (and hence
-    /// `size_cap_layer`) is physically incapable of reporting the reduced ladder.
-    ///
-    /// MUTATION: change `received_layer_snapshot`'s pinned variant to `Reduced` and
-    /// this fails.
-    #[test]
-    fn selection_resolver_stays_pinned_to_the_default_ladder() {
-        for idx in 0..3u32 {
-            assert_eq!(
-                received_layer_snapshot(PrefMediaKind::Video, idx, 3),
-                received_layer_snapshot_for_display(
-                    PrefMediaKind::Video,
-                    idx,
-                    3,
-                    LadderVariant::Default
-                ),
-                "the selection resolver must equal the DEFAULT display arm at rung {idx}"
-            );
-        }
-        // And it must NOT equal the reduced arm at the top rung, or the pin is dead.
-        assert_ne!(
-            received_layer_snapshot(PrefMediaKind::Video, 2, 3).height,
-            received_layer_snapshot_for_display(PrefMediaKind::Video, 2, 3, LadderVariant::Reduced)
-                .height,
-            "if these agree the Default pin is meaningless (or the variants no longer differ)"
-        );
-    }
-
-    /// The reason/quality attribution must be VARIANT-INVARIANT: it is derived from
-    /// layer INDICES only, and both ladders are the same depth. Only the rendered
-    /// pixels/bitrate may move. Guards against a #2156 regression where threading the
-    /// variant accidentally changed a peer row's quality dot or reason chip.
-    ///
-    /// MUTATION: derive `full_ladder_top` from the variant's ladder rather than
-    /// `max_layers_for_kind` in a way that differs per variant, and this fails.
-    #[test]
-    fn with_reason_attribution_is_variant_invariant() {
-        // (raw_selected, avail_top, user_max, constrained) covering every branch of
-        // `degrade_reason`: Sender, optimal/None, Setting, Network.
-        let cases: &[(u32, u32, Option<u32>, bool)] = &[
-            (2, 0, None, false),
-            (2, 2, None, false),
-            (1, 2, Some(1), false),
-            (1, 2, None, true),
-            (0, 0, None, false),
-        ];
-        for &(sel, avail_top, user_max, constrained) in cases {
-            let d = received_layer_snapshot_with_reason(
-                PrefMediaKind::Video,
-                sel,
-                avail_top,
-                user_max,
-                constrained,
-                LadderVariant::Default,
-            );
-            let r = received_layer_snapshot_with_reason(
-                PrefMediaKind::Video,
-                sel,
-                avail_top,
-                user_max,
-                constrained,
-                LadderVariant::Reduced,
-            );
-            assert_eq!(
-                (d.layer_index, d.layer_count, d.reason),
-                (r.layer_index, r.layer_count, r.reason),
-                "index/count/reason must not move with the ladder variant \
-                 (sel={sel} avail_top={avail_top} user_max={user_max:?} \
-                 constrained={constrained})"
-            );
-        }
     }
 
     #[test]
@@ -2851,10 +2764,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Security follow-up: clamp_observed_layer_id bounds availability cardinality
-    // -----------------------------------------------------------------
-
     #[test]
     fn max_layers_for_kind_matches_ladders() {
         // Tied to the publisher-side ladder sizes at compile time (issues #1082 /
@@ -2873,7 +2782,7 @@ mod tests {
         );
         // Concrete values for the current ladders.
         assert_eq!(max_layers_for_kind(PrefMediaKind::Video), 3);
-        assert_eq!(max_layers_for_kind(PrefMediaKind::Screen), 3);
+        assert_eq!(max_layers_for_kind(PrefMediaKind::Screen), 1);
         assert_eq!(max_layers_for_kind(PrefMediaKind::Audio), 3);
     }
 
@@ -2907,55 +2816,16 @@ mod tests {
     #[test]
     fn audio_observed_layer_id_climb_to_top_rung() {
         // The receiver learns availability from observed layer ids; a publisher
-        // emitting all 3 audio rungs must let the chooser reach index 2. The
-        // clamp keeps an out-of-range id from inflating availability beyond the
-        // ladder, but in-range ids 0/1/2 must all be learnable (issue #1082).
+        // emitting all 3 audio rungs must let the chooser reach index 2 (#1082).
         let mut avail = LayerAvailability::new();
         let now = 1_000u64;
         for raw in 0u32..=2 {
-            avail.observe(clamp_observed_layer_id(PrefMediaKind::Audio, raw), now);
+            avail.observe(raw, now);
         }
         assert_eq!(
             avail.highest_available(now),
             2,
             "all three audio rungs must be learnable"
-        );
-        // A bogus higher id is clamped down to the top audio index, not learned
-        // as a 4th rung.
-        avail.observe(clamp_observed_layer_id(PrefMediaKind::Audio, 99), now);
-        assert_eq!(avail.highest_available(now), 2);
-    }
-
-    #[test]
-    fn clamp_observed_layer_id_caps_to_ladder() {
-        // In-range ids pass through; out-of-range ids clamp to the top index.
-        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, 0), 0);
-        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, 2), 2);
-        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, 3), 2);
-        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, u32::MAX), 2);
-        // Audio now caps at index 2 (3-rung ladder, issue #1082).
-        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Audio, 2), 2);
-        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Audio, 5), 2);
-    }
-
-    #[test]
-    fn clamped_observe_bounds_availability_cardinality() {
-        // Simulate an attacker cycling many UNIQUE out-of-range layer ids: with
-        // the clamp, availability can never hold more than the ladder size, and
-        // highest_available never exceeds the top index — no inflation between
-        // prunes. (Without the clamp this map would grow to ~1000 entries.)
-        let mut avail = LayerAvailability::new();
-        let now = 1_000u64;
-        for raw in 0u32..1000 {
-            let clamped = clamp_observed_layer_id(PrefMediaKind::Video, raw);
-            avail.observe(clamped, now);
-        }
-        // highest_available also prunes; with all observations at `now` it is the
-        // top ladder index, not some giant attacker value.
-        assert_eq!(
-            avail.highest_available(now),
-            2,
-            "clamped observe keeps availability within the 3-layer video ladder"
         );
     }
 
@@ -3054,117 +2924,286 @@ mod tests {
         }
     }
 
-    /// Issue #1768 — **why the receiver-side size lid does NOT need the ladder
-    /// variant threaded into it.**
-    ///
-    /// The publisher-side gate (`LadderVariant::Reduced`) lowers the TOP camera
-    /// rung 720p → 540p. `size_cap_layer` resolves rung heights from the
-    /// receiver's own compiled ladder, so the natural worry is that a receiver
-    /// still believing "L2 == 720p" picks the wrong lid index against a reduced
-    /// publisher.
-    ///
-    /// It cannot. `size_cap_layer` returns the FIRST index `i` in
-    /// `0..=highest_available` whose height covers the tile, and it falls through
-    /// to `highest_available` when none does. #1768 changed ONLY the top rung (the
-    /// 180p/360p rungs are byte-identical between variants, deliberately: the floor
-    /// is ~1.3% of the encode cost). Whatever height the top rung has, reaching it
-    /// means every lower rung already failed, so the answer is
-    /// `highest_available` whether the top covers or the loop falls through.
-    ///
-    /// This test proves that exhaustively over every tile height in
-    /// `0..=2200` device px (past 1080p tiles) × every `highest_available`, by
-    /// running the REAL `size_cap_layer_in` against BOTH ladders. If a future retune
-    /// moves a NON-top rung, this test turns red and the lid then genuinely does need
-    /// the variant plumbed through.
-    ///
-    /// MUTATION: change `SIMULCAST_VIDEO_LAYERS_REDUCED`'s `standard` rung to a
-    /// different height and this fails, correctly reporting that the lid has
-    /// become variant-sensitive.
-    #[test]
-    fn size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung() {
-        use crate::adaptive_quality_constants::{simulcast_layers_for, SIMULCAST_MAX_LAYERS};
+    // --- Issue #2328: keyframe-starved SCREEN rung retraction ------------------
 
-        // Precondition this test's whole argument rests on: the two ladders differ
-        // ONLY in the top rung. Asserted, not assumed.
-        let d_full = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Default);
-        let r_full = simulcast_layers_for(SIMULCAST_MAX_LAYERS, LadderVariant::Reduced);
-        assert_eq!(d_full.len(), r_full.len(), "same ladder depth");
-        for i in 0..d_full.len() - 1 {
-            assert_eq!(
-                (d_full[i].max_width, d_full[i].max_height),
-                (r_full[i].max_width, r_full[i].max_height),
-                "rung {i} (below the top) must be identical across variants — if this \
-                 fails, `size_cap_layer` HAS become variant-sensitive and the receiver \
-                 lid needs the LadderVariant threaded into it (issue #1768)"
-            );
-        }
-        assert_ne!(
-            d_full[d_full.len() - 1].max_height,
-            r_full[r_full.len() - 1].max_height,
-            "the top rung must differ, or the variant is a no-op"
+    /// A rung that keeps DELIVERING PACKETS but no decodable keyframe past the bound must be
+    /// retracted, and the chooser must downshift off it.
+    ///
+    /// This is the exact #2328 shape: the relay always forwards layer 0 (`chat_server.rs` drops
+    /// only `simulcast_layer_id != 0`), so BOTH rung 0 and the selected rung 2 keep arriving and
+    /// keep refreshing `last_seen_ms`. Arrival-based availability therefore reports 2 as healthy
+    /// forever while the receiver on it is frozen. Every step below calls the production path —
+    /// `screen_starvation_action` for the decision, `LayerAvailability::quarantine` for the
+    /// retraction, `highest_available` for the ceiling, `LayerChooser::choose` for the downshift.
+    ///
+    /// MUTATION CHECKS:
+    /// * make `highest_available` ignore `quarantined_until_ms` (i.e. revert the retraction to a
+    ///   no-op) → `highest_available` stays 2 and BOTH the ceiling and the chooser assertions fail;
+    /// * make `screen_starvation_action` return `None` at the boundary → the `Retract` assertion
+    ///   fails (the exact `>=`/`>` boundary is pinned by the bounds test below);
+    /// * the pre-quarantine `highest_available == 2` assertion pins that the rung really is still
+    ///   arriving, so the test cannot pass for the wrong reason (a rung that simply went silent).
+    #[test]
+    fn keyframe_starved_screen_rung_is_retracted_and_the_chooser_downshifts() {
+        let start = 100_000u64;
+        let mut avail = LayerAvailability::new();
+        // Rungs 0 and 2 are BOTH on the wire (relay fail-open on base + the receiver's selection).
+        avail.observe(0, start);
+        avail.observe(2, start);
+        assert_eq!(
+            avail.highest_available(start),
+            2,
+            "precondition: packets are arriving on rung 2, so arrival-based availability offers it"
         );
 
-        // Exhaustive equivalence, on REAL PRODUCTION CODE on BOTH arms.
-        //
-        // Issue #2156 gave the lid the same private core/wrapper split as the snapshot
-        // resolver (`size_cap_layer_in`), specifically so this test can ASK production
-        // for the reduced-ladder answer. Before that it could not, and an earlier
-        // revision recomputed the rule in a `lid_of` closure — a test grading its own
-        // copy, which CLAUDE.md forbids. That closure is now gone: `chosen_default` and
-        // `chosen_reduced` are both the real `size_cap_layer_in`.
-        //
-        // What still carries the weight:
-        //   1. the PRECONDITION loop above (non-top rungs byte-identical across
-        //      variants) — the actual invariant the argument rests on, and the thing a
-        //      future retune breaks; and
-        //   2. `chosen_default == size_cap_layer(..)` below, which proves the public
-        //      selection entry point remains behaviorally equivalent to the shipped
-        //      core. `selection_resolver_stays_pinned_to_the_default_ladder` separately
-        //      pins the wrapper's explicit `LadderVariant::Default` choice.
-        for layer_count in 1..=SIMULCAST_MAX_LAYERS as u32 {
-            // Kept (though the heights are no longer recomputed against) as a per-count
-            // restatement that the two ladders are the same depth at EVERY `n`, not just
-            // at the full ladder the precondition loop above checked.
-            let d = simulcast_layers_for(layer_count as usize, LadderVariant::Default);
-            let r = simulcast_layers_for(layer_count as usize, LadderVariant::Reduced);
-            assert_eq!(
-                d.len(),
-                r.len(),
-                "same ladder depth at layer_count={layer_count}"
-            );
-            for highest in 0..layer_count {
-                for tile in 0u32..=2200 {
-                    let chosen_default = size_cap_layer_in(
-                        tile,
-                        highest,
-                        layer_count,
-                        PrefMediaKind::Video,
-                        LadderVariant::Default,
-                    );
-                    let chosen_reduced = size_cap_layer_in(
-                        tile,
-                        highest,
-                        layer_count,
-                        PrefMediaKind::Video,
-                        LadderVariant::Reduced,
-                    );
-                    assert_eq!(
-                        chosen_default, chosen_reduced,
-                        "the #1256 lid diverges between ladders at tile={tile}px \
-                         highest={highest} layer_count={layer_count} — the lid HAS become \
-                         variant-sensitive and needs the LadderVariant threaded into it"
-                    );
-                    // The shipped public entry point must be exactly the `Default` core:
-                    // this is the assertion that the #2156 split changed no selection
-                    // behaviour.
-                    assert_eq!(
-                        size_cap_layer(tile, highest, layer_count, PrefMediaKind::Video),
-                        chosen_default,
-                        "`size_cap_layer` must equal `size_cap_layer_in(.., Default)` \
-                         at tile={tile}px highest={highest} layer_count={layer_count}"
-                    );
-                }
-            }
-        }
+        // The receiver picked rung 2 and has been in an unbroken keyframe-less hold since `start`.
+        // Both rungs keep arriving throughout the hold — the relay forwards layer 0 unconditionally
+        // and the receiver's selection keeps rung 2 coming, so packet arrival alone cannot tell the
+        // two apart. That is precisely the blind spot #2328 closes.
+        let selected = 2u32;
+        let now = start + SCREEN_KEYFRAME_STARVED_RETRACT_MS;
+        avail.observe(0, now);
+        avail.observe(2, now);
+        assert_eq!(
+            screen_starvation_action(
+                selected,
+                Some(start),
+                // The base rung IS still arriving — this is the asymmetry that makes the
+                // retraction actionable, and it is read from the same `LayerAvailability` the
+                // production caller reads.
+                avail.layer_available_peek(0, now),
+                now,
+                SCREEN_KEYFRAME_STARVED_RETRACT_MS,
+                SCREEN_KEYFRAME_STARVED_STALE_MS,
+            ),
+            ScreenStarvationAction::Retract,
+            "an unbroken hold at the bound, while the base rung is still being delivered, must \
+             retract the rung"
+        );
+
+        avail.quarantine(selected, now + SCREEN_KEYFRAME_STARVED_QUARANTINE_MS);
+        // Rung 2's packets keep arriving throughout — the quarantine, not silence, removes it.
+        avail.observe(0, now);
+        avail.observe(2, now);
+        assert_eq!(
+            avail.highest_available(now),
+            0,
+            "a quarantined rung is excluded from the ceiling even while its packets keep arriving"
+        );
+        assert!(
+            !avail.layer_available_peek(2, now),
+            "the read-only peek must agree with the pruning read"
+        );
+
+        // The chooser, fed the retracted ceiling, drops to the base rung — which the relay
+        // forwards unconditionally and which the publisher's floor always re-keys.
+        let mut c = LayerChooser::new_screen(start);
+        c.choose(clean(), 2, start);
+        assert_eq!(
+            c.current(),
+            2,
+            "precondition: chooser was sitting on rung 2"
+        );
+        let chosen = c.choose(clean(), avail.highest_available(now), now);
+        assert_eq!(
+            chosen, 0,
+            "with rung 2 retracted the chooser must downshift to a rung that delivers keyframes"
+        );
+    }
+
+    /// The retraction CANNOT WEDGE: the quarantine expires on wall-clock alone and the rung is
+    /// re-admitted, after which the chooser climbs back.
+    ///
+    /// This is the property the repo's recovery-hysteresis rule demands, and here it is stronger
+    /// than "prefer time-bounded": a success-counter exit would be UNSATISFIABLE, because once the
+    /// receiver leaves the rung the rung may stop arriving at all and could never demonstrate a
+    /// keyframe. Re-admission is therefore unconditional at expiry.
+    ///
+    /// MUTATION CHECKS: dropping the `retain` prune in `highest_available`, or making
+    /// `is_quarantined` ignore `until`, leaves the ceiling at 0 and the re-admission assertion
+    /// fails; flipping `now_ms < until` to `<=` fails the exclusive-expiry assertion.
+    #[test]
+    fn a_quarantined_screen_rung_is_readmitted_when_the_window_expires() {
+        let start = 100_000u64;
+        let mut avail = LayerAvailability::new();
+        let until = start + SCREEN_KEYFRAME_STARVED_QUARANTINE_MS;
+        avail.quarantine(2, until);
+
+        // Still quarantined one ms before expiry, even with a fresh observation.
+        avail.observe(0, until - 1);
+        avail.observe(2, until - 1);
+        assert!(avail.is_quarantined(2, until - 1));
+        assert_eq!(
+            avail.highest_available(until - 1),
+            0,
+            "the rung is held out for the full window"
+        );
+
+        // At `until` the quarantine is over (exclusive upper bound).
+        avail.observe(0, until);
+        avail.observe(2, until);
+        assert!(
+            !avail.is_quarantined(2, until),
+            "expiry is exclusive: at `until` the rung is eligible again"
+        );
+        assert_eq!(
+            avail.highest_available(until),
+            2,
+            "an expired quarantine must re-admit the rung — otherwise the receiver is pinned to \
+             base forever, which is the wedge this design forbids"
+        );
+
+        // And the chooser actually climbs back onto it.
+        let mut c = LayerChooser::new_screen(start);
+        c.choose(clean(), 0, start);
+        assert_eq!(
+            c.current(),
+            0,
+            "precondition: parked on base while retracted"
+        );
+        assert_eq!(
+            c.choose(clean(), avail.highest_available(until), until),
+            2,
+            "an unconstrained chooser follows the re-admitted ceiling straight back up"
+        );
+
+        // Re-quarantining EXTENDS but never shortens, so a still-broken rung serves a full new
+        // window instead of flapping on a shorter one.
+        avail.quarantine(2, until + 10_000);
+        avail.quarantine(2, until + 1);
+        assert!(
+            avail.is_quarantined(2, until + 5_000),
+            "a shorter re-quarantine must not shorten the standing window"
+        );
+    }
+
+    /// Boundary + guard semantics of the production decision function (issue #2328).
+    ///
+    /// MUTATION CHECKS, per assertion: `>= retract_after_ms` → `>` fails the exact-boundary case;
+    /// dropping the `selected_layer > 0` guard fails the base-rung case (and would let the
+    /// receiver retract the one rung the relay guarantees); dropping the staleness bound fails the
+    /// suspended-tab case; dropping `saturating_sub` fails the backwards-clock case.
+    #[test]
+    fn screen_starvation_action_bounds_and_guards() {
+        let retract = SCREEN_KEYFRAME_STARVED_RETRACT_MS;
+        let stale = SCREEN_KEYFRAME_STARVED_STALE_MS;
+        let t0 = 1_000_000u64;
+
+        assert_eq!(
+            screen_starvation_action(2, None, true, t0, retract, stale),
+            ScreenStarvationAction::None,
+            "no recorded starvation → nothing to do"
+        );
+        assert_eq!(
+            screen_starvation_action(2, Some(t0), true, t0 + retract - 1, retract, stale),
+            ScreenStarvationAction::None,
+            "one ms short of the bound must not retract"
+        );
+        assert_eq!(
+            screen_starvation_action(2, Some(t0), true, t0 + retract, retract, stale),
+            ScreenStarvationAction::Retract,
+            "the bound is inclusive (`>=`)"
+        );
+        assert_eq!(
+            screen_starvation_action(0, Some(t0), true, t0 + retract, retract, stale),
+            ScreenStarvationAction::None,
+            "the BASE rung is never retracted — the relay always forwards it and there is nothing \
+             below it to fall back to"
+        );
+        assert_eq!(
+            screen_starvation_action(2, Some(t0), true, t0 + stale, retract, stale),
+            ScreenStarvationAction::Retract,
+            "the staleness bound is exclusive: exactly at it the observation is still actionable"
+        );
+        assert_eq!(
+            screen_starvation_action(2, Some(t0), true, t0 + stale + 1, retract, stale),
+            ScreenStarvationAction::Rearm,
+            "past the staleness bound (suspended tab / clock step) the observation is re-armed, \
+             not acted on"
+        );
+        assert_eq!(
+            screen_starvation_action(2, Some(t0), true, t0 - 5_000, retract, stale),
+            ScreenStarvationAction::None,
+            "a backwards clock step saturates to a zero-age hold rather than tripping either bound"
+        );
+    }
+
+    /// Issue #2328 + #1977: a SYMMETRIC screen stall must NOT retract a rung.
+    ///
+    /// `actix-api/src/actors/priority_drop.rs` sheds SCREEN media at
+    /// `PRIORITY_DROP_SCREEN_FILL_RATIO` (0.90) channel fill, and that shed is LAYER-AGNOSTIC — it
+    /// never inspects `simulcast_layer_id`, so base-rung keyframes go down with everything else.
+    /// That is a different (and deliberate) pressure path, not the per-layer asymmetry #2328 fixes.
+    /// Retracting during such an episode buys nothing — every rung is equally starved — and only
+    /// adds LAYER_SWITCH churn to an already-saturated link.
+    ///
+    /// The two calls below are IDENTICAL except for `base_rung_arriving`, so the assertion isolates
+    /// exactly that input.
+    ///
+    /// MUTATION CHECK: dropping `base_rung_arriving` from the `Retract` condition makes the second
+    /// call return `Retract` and fails this test.
+    #[test]
+    fn a_symmetric_screen_stall_does_not_retract_a_rung() {
+        let retract = SCREEN_KEYFRAME_STARVED_RETRACT_MS;
+        let stale = SCREEN_KEYFRAME_STARVED_STALE_MS;
+        let t0 = 1_000_000u64;
+        let past_bound = t0 + retract;
+
+        assert_eq!(
+            screen_starvation_action(2, Some(t0), true, past_bound, retract, stale),
+            ScreenStarvationAction::Retract,
+            "control: with the base rung arriving, the same hold DOES retract — so the only \
+             difference driving the next assertion is the asymmetry input"
+        );
+        assert_eq!(
+            screen_starvation_action(2, Some(t0), false, past_bound, retract, stale),
+            ScreenStarvationAction::None,
+            "with the base rung ALSO not arriving the stall is room-wide (the layer-agnostic 90% \
+             fill shed), there is no healthier rung to fall back to, and a retraction would be \
+             pure churn"
+        );
+
+        // The staleness guard still wins over the asymmetry guard: an un-actionable observation is
+        // re-armed rather than left to accumulate, whatever the base rung is doing.
+        assert_eq!(
+            screen_starvation_action(2, Some(t0), false, t0 + stale + 1, retract, stale),
+            ScreenStarvationAction::Rearm,
+            "a stale stamp re-arms even when the base rung is down, so it cannot latch"
+        );
+    }
+
+    /// Issue #2328: `layer_available_peek(0, ..)` — the production source of `base_rung_arriving` —
+    /// tracks real base-rung arrival and is NOT perturbed by quarantining a higher rung.
+    ///
+    /// This is the seam between the two halves of the receiver fix: if retracting rung 2 also made
+    /// layer 0 read as unavailable, the very next evaluation would see a "symmetric stall" and the
+    /// asymmetry guard would suppress every subsequent retraction.
+    ///
+    /// MUTATION CHECK: making `quarantine` apply to all layers, or `layer_available_peek` ignore
+    /// the observation window, fails one of these.
+    #[test]
+    fn base_rung_arrival_is_independent_of_a_higher_rung_quarantine() {
+        let t = 500_000u64;
+        let mut avail = LayerAvailability::new();
+        avail.observe(0, t);
+        avail.observe(2, t);
+        avail.quarantine(2, t + SCREEN_KEYFRAME_STARVED_QUARANTINE_MS);
+
+        assert!(
+            avail.layer_available_peek(0, t),
+            "quarantining rung 2 must not make the base rung read as gone"
+        );
+        assert!(
+            !avail.layer_available_peek(2, t),
+            "the quarantined rung itself reads as unavailable"
+        );
+
+        // Base arrival still decays normally once packets genuinely stop — which is what makes the
+        // asymmetry guard able to detect a room-wide stall at all.
+        let after_window = t + LayerAvailability::DEFAULT_WINDOW_MS + 1;
+        assert!(
+            !avail.layer_available_peek(0, after_window),
+            "a base rung that has stopped arriving must eventually read as gone"
+        );
     }
 }

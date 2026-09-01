@@ -21,10 +21,10 @@
 use jsonwebtoken::{DecodingKey, Validation};
 use regex::Regex;
 use std::fmt;
-use videocall_meeting_types::token::RoomAccessTokenClaims;
+use videocall_meeting_types::token::{check_token_type, RoomAccessTokenClaims, TokenTypeCheck};
 
 use crate::constants::VALID_ID_PATTERN;
-use crate::metrics::AUTH_REJECTIONS_TOTAL;
+use crate::metrics::{AUTH_REJECTIONS_TOTAL, LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL};
 
 lazy_static::lazy_static! {
     /// Compiled regex for validating room identifiers against NATS-safe characters.
@@ -69,6 +69,9 @@ pub enum TokenError {
     /// (dots, wildcards `*` / `>`, spaces, etc.). This indicates either a tampered
     /// JWT or a bug in the token-issuing service.
     UnsafeIdentifier { field: String, value: String },
+    /// The `typ` claim names a different token type (#2411): signature and
+    /// issuer verified, so it is a credential minted for another purpose.
+    TokenTypeMismatch { found: String },
 }
 
 impl fmt::Display for TokenError {
@@ -103,6 +106,11 @@ impl fmt::Display for TokenError {
                 f,
                 "token {field} '{value}' contains characters unsafe for NATS subjects"
             ),
+            TokenError::TokenTypeMismatch { found } => write!(
+                f,
+                "token type '{found}' is not '{}'",
+                RoomAccessTokenClaims::TOKEN_TYPE
+            ),
         }
     }
 }
@@ -119,6 +127,7 @@ impl TokenError {
                 | TokenError::Malformed(_)
                 | TokenError::Invalid(_)
                 | TokenError::UnsafeIdentifier { .. }
+                | TokenError::TokenTypeMismatch { .. }
         )
     }
 
@@ -156,6 +165,7 @@ impl TokenError {
             TokenError::InvalidSignature => "invalid_signature",
             TokenError::MissingClaim(_) => "missing_claim",
             TokenError::Malformed(_) => "malformed",
+            TokenError::TokenTypeMismatch { .. } => "token_type_mismatch",
             // `Missing`, `Invalid`, `RoomJoinDenied`, `RoomMismatch`,
             // `IdentityMismatch`, `UnsafeIdentifier` all roll up to `other`.
             // Splitting them further would inflate cardinality with little
@@ -238,6 +248,12 @@ fn decode_room_token_inner(secret: &str, token: &str) -> Result<RoomAccessTokenC
         )?;
 
     let claims = token_data.claims;
+
+    match check_token_type(claims.typ.as_deref(), RoomAccessTokenClaims::TOKEN_TYPE) {
+        TokenTypeCheck::Match => {}
+        TokenTypeCheck::Legacy => LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL.inc(),
+        TokenTypeCheck::Mismatch { found } => return Err(TokenError::TokenTypeMismatch { found }),
+    }
 
     // Reject room names containing NATS-unsafe characters (dots, wildcards,
     // spaces, etc.). A room like "foo.>" would let an attacker subscribe to
@@ -345,6 +361,7 @@ mod tests {
             end_on_host_leave: false,
             exp: now + exp_offset_secs,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
+            typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
         };
         jsonwebtoken::encode(
             &Header::default(),
@@ -410,6 +427,7 @@ mod tests {
             end_on_host_leave: false,
             exp: now + 600,
             iss: RoomAccessTokenClaims::ISSUER.to_string(),
+            typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
         };
         let token = jsonwebtoken::encode(
             &Header::default(),
@@ -804,6 +822,7 @@ mod tests {
             "invalid_signature",
             "missing_claim",
             "malformed",
+            "token_type_mismatch",
             "other",
         ];
         let before: f64 = reasons.iter().map(|r| auth_counter(r)).sum();
@@ -839,6 +858,99 @@ mod tests {
         assert_eq!(
             after_signature, before_signature,
             "RoomMismatch must not bump `invalid_signature`"
+        );
+    }
+
+    fn make_token_with_typ(typ: Option<&str>) -> String {
+        let now = Utc::now().timestamp();
+        let claims = RoomAccessTokenClaims {
+            sub: "alice@test.com".to_string(),
+            room: "room-1".to_string(),
+            room_join: true,
+            is_host: false,
+            display_name: "Alice".to_string(),
+            observer: false,
+            is_guest: false,
+            end_on_host_leave: false,
+            exp: now + 600,
+            iss: RoomAccessTokenClaims::ISSUER.to_string(),
+            typ: typ.map(str::to_string),
+        };
+        jsonwebtoken::encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn session_typed_token_is_rejected_by_the_room_verifier() {
+        let result = decode_room_token(TEST_SECRET, &make_token_with_typ(Some("session")));
+
+        match result {
+            Err(TokenError::TokenTypeMismatch { found }) => assert_eq!(found, "session"),
+            other => panic!("expected TokenTypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn the_same_payload_with_the_room_typ_is_accepted() {
+        // Control: identical claims apart from `typ`.
+        let token = make_token_with_typ(Some(RoomAccessTokenClaims::TOKEN_TYPE));
+        assert!(decode_room_token(TEST_SECRET, &token).is_ok());
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn room_token_without_typ_is_accepted_as_legacy_and_counted() {
+        let before = LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL.get();
+
+        let claims = decode_room_token(TEST_SECRET, &make_token_with_typ(None))
+            .expect("pre-#2411 room tokens must keep working");
+
+        assert_eq!(claims.typ, None);
+        assert_eq!(
+            LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL.get() - before,
+            1.0,
+            "legacy acceptance must be counted — it is the signal that says when `typ` can be required"
+        );
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn a_typed_token_does_not_touch_the_legacy_counter() {
+        let before = LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL.get();
+        let _ = decode_room_token(
+            TEST_SECRET,
+            &make_token_with_typ(Some(RoomAccessTokenClaims::TOKEN_TYPE)),
+        );
+        assert_eq!(LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL.get(), before);
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn type_mismatch_is_suspicious_and_not_retryable() {
+        let err = TokenError::TokenTypeMismatch {
+            found: "session".to_string(),
+        };
+        assert!(err.is_suspicious());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn type_mismatch_gets_its_own_counter_label() {
+        let before = auth_counter("token_type_mismatch");
+        let before_malformed = auth_counter("malformed");
+        let _ = decode_room_token(TEST_SECRET, &make_token_with_typ(Some("session")));
+        assert_eq!(auth_counter("token_type_mismatch") - before, 1.0);
+        assert_eq!(
+            auth_counter("malformed"),
+            before_malformed,
+            "a cross-type presentation must be distinguishable from a garbage token"
         );
     }
 }

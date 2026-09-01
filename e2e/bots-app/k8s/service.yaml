@@ -17,7 +17,7 @@
 # is inherent to the per-pod DNS. This is INTERNAL cluster traffic only — no
 # Ingress/LoadBalancer fronts it, and every request needs the bot-ctl-token
 # bearer token. `publishNotReadyAddresses: true` keeps the DNS records
-# resolvable even while a pod is still coming up / has no readiness probe, so
+# resolvable even while a pod is still coming up or NotReady, so
 # the conductor can address a pod without racing pod readiness.
 apiVersion: v1
 kind: Service

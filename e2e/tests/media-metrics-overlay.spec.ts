@@ -35,8 +35,8 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  * video (mock peers are video-OFF placeholders that never decode). Cameras AND
  * mics both default OFF, so `vc_prejoin_camera_on` and `vc_prejoin_mic_on` are
  * seeded to `"true"` for both users — camera-on drives the RECEIVED-video
- * metrics, mic-on drives the RECEIVED-audio kbps (issue #1769), which the overlay
- * asserts is a real number ("· {n}k"), not the em-dash placeholder ("· —k").
+ * metrics, and mic-on makes the peer's audio field visible for the #2279
+ * assertion that it renders the em-dash ("· —k").
  * Untagged (no @bvt): runs in the dioxus full suite, not per-PR CI.
  *
  * ⚠ THIS SPEC CANNOT CURRENTLY RUN GREEN LOCALLY — issue #2193, and it is NOT the
@@ -46,8 +46,7 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  * reverting this file to its PR-staging baseline fails identically, and the
  * untouched `crop-toggle.spec.ts` fails on the SAME locator (4 of 5 tests). A
  * from-scratch stack rebuild (`make e2e-down` with volumes + `make e2e-up`) did not
- * fix it, and single-peer specs on the same stack are green
- * (`performance-settings.spec.ts`: 29 passed).
+ * fix it, and single-peer specs on the same stack are green.
  *
  * So the #2170 self-overlay assertion added here is WRITTEN AND LINTED BUT NOT YET
  * DEMONSTRATED GREEN. It is NOT the only guard on that consumer, and the others ARE
@@ -83,7 +82,6 @@ const BROWSER_ARGS = [
   "--origin-to-force-quic-on=127.0.0.1:4433",
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
-  "--disable-gpu",
   "--disable-dev-shm-usage",
   "--renderer-process-limit=1",
   "--auto-select-desktop-capture-source=Entire screen",
@@ -243,11 +241,9 @@ async function setupTwoUserMeeting(
   }
 
   // Seed camera-on AND mic-on BEFORE page creation so the initial prejoin read
-  // is true for both. Camera-on gives the RECEIVED-video overlay metrics; mic-on
-  // gives the RECEIVED-audio kbps (issue #1769). BOTH default OFF
-  // (`load_preferred_camera_on` / `load_preferred_mic_on` → false), so without
-  // the mic seed the peer publishes no audio and the overlay's audio field would
-  // legitimately read the em-dash "—k".
+  // is true for both. Camera-on gives the RECEIVED-video overlay metrics, and
+  // mic-on puts the peer audio field in scope. BOTH default OFF
+  // (`load_preferred_camera_on` / `load_preferred_mic_on` → false).
   await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
   await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_mic_on", "true");`);
   await guestCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
@@ -354,18 +350,14 @@ test.describe("Per-tile media-metrics overlay (issue 1768)", () => {
         })
         .toMatch(/·\s*\d+fps\s*·/);
 
-      // Issue #1769: the RECEIVED-audio field is the trailing "· {n}k" segment and
-      // must be a REAL number, not the em-dash placeholder "—k". With the guest's
-      // mic seeded on (above), the host observes audio flowing from the peer and
-      // the overlay sources the kbps from the per-tile `audio_bitrate` signal
-      // (driven off the peer_status audio-on flag) instead of scanning the receive
-      // snapshots. Poll because audio may take a moment to start flowing after the
-      // tile appears; the em-dash form "· —k" never matches the numeric pattern.
+      // Issue #2279: the RECEIVED-audio field is the trailing "· —k" segment.
+      // Pre-#2279 this read `· 12k`/`· 48k`, so the assertion is discriminating;
+      // the fps segment above proves the overlay is otherwise live.
       await expect
         .poll(async () => (await peerOverlay.first().textContent()) ?? "", {
           timeout: 30_000,
         })
-        .toMatch(/·\s*\d+k\s*$/);
+        .toMatch(/·\s*—k\s*$/);
 
       // RELOAD PERSISTENCE — guards the `load_bool` read-back the spec would
       // otherwise leave unverified. After a reload the "true" preference must be
@@ -564,56 +556,6 @@ test.describe("Per-tile media-metrics overlay (issue 1768)", () => {
       // as well as any future upscaling regression.
       expect(w, "fitting never upscales beyond the capture width").toBeLessThanOrEqual(640);
       expect(h, "fitting never upscales beyond the capture height").toBeLessThanOrEqual(480);
-    } finally {
-      await browser1.close().catch(() => undefined);
-      await browser2.close().catch(() => undefined);
-    }
-  });
-
-  /**
-   * #2132: the RECEIVED-audio segment must report the rung the receiver is actually
-   * decoding, not the layer-0 nominal.
-   *
-   * The pre-existing assertion in the toggle test (`/·\s*\d+k\s*$/`) cannot see this
-   * fix — it matches `12k` (the bug) and `48k` (the fix) equally, so it passed before
-   * and after. This asserts the readout is NOT the base nominal, which is the only
-   * form that discriminates.
-   *
-   * Uses the proven `threeRungLadder` path so the publisher offers rungs above the
-   * base for the receiver to climb to. Unlike the fitted-geometry test above there is
-   * no aspect-ratio-style invariant available here: reporting the base is
-   * indistinguishable from the bug, so this necessarily depends on the audio chooser
-   * leaving rung 0 — which it does by availability, not by the video AQ's timed ramp.
-   */
-  test("received-audio readout reports the decoded rung, not the 12k base", async ({ baseURL }) => {
-    test.setTimeout(180_000);
-    const uiURL = baseURL || "http://localhost:80";
-    const meetingId = `media_metrics_audio_rung_${Date.now()}`;
-
-    const { hostPage, browser1, browser2 } = await setupTwoUserMeeting(uiURL, meetingId, {
-      threeRungLadder: true,
-    });
-
-    try {
-      await openDiagnosticsPanel(hostPage);
-      const toggle = hostPage.locator('[data-testid="media-metrics-overlay-toggle"]');
-      await expect(toggle).toBeVisible({ timeout: 10_000 });
-      await toggle.check();
-
-      const peerOverlay = hostPage.locator('[data-testid="media-metrics-overlay-peer"]');
-      await expect(peerOverlay.first()).toBeVisible({ timeout: 30_000 });
-
-      // First wait for a real number at all — the mount seed is now `—k` until the
-      // first peer_status carries the rung (up to one ~5s heartbeat).
-      await expect
-        .poll(async () => (await peerOverlay.first().textContent()) ?? "", { timeout: 60_000 })
-        .toMatch(/·\s*\d+k\s*$/);
-
-      // Then the discriminating assertion. Pre-fix this segment was hardcoded to
-      // `base_audio_layer_kbps()` and read `· 12k` regardless of the decoded rung.
-      await expect
-        .poll(async () => (await peerOverlay.first().textContent()) ?? "", { timeout: 60_000 })
-        .toMatch(/·\s*(24|48)k\s*$/);
     } finally {
       await browser1.close().catch(() => undefined);
       await browser2.close().catch(() => undefined);

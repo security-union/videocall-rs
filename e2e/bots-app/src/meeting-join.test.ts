@@ -8,6 +8,7 @@ import {
   MeetingNavigatedAwayError,
   WaitingRoomError,
   classifyJoinModeText,
+  closePeerList,
   detectJoinMode,
   ensureDisplayNameInMeeting,
   ensureWaitingRoomOff,
@@ -16,6 +17,12 @@ import {
   logPostClickDiagnostics,
   waitForJoinButton,
 } from "./meeting-join";
+import {
+  CAMERA_TOOLTIP,
+  MIC_UNMUTE_SELECTOR,
+  cameraButtonSelector,
+  peerListControlSelector,
+} from "./control-buttons";
 
 // #865 regression lock (the deterministic one). The end-to-end Playwright
 // spec (bot-join-flow.spec.ts) is smoke coverage of the real join flow but is
@@ -326,7 +333,7 @@ function makeJoinHarness(initialState: JoinHarnessState): {
   const button = locator("button");
   const page = {
     locator: vi.fn((selector: string) =>
-      selector === "button.video-control-button" ? openPeers : (locators.get(selector) ?? other),
+      selector === peerListControlSelector("off") ? openPeers : (locators.get(selector) ?? other),
     ),
     getByRole: vi.fn(() => button),
     on: vi.fn(),
@@ -371,6 +378,47 @@ describe("joinMeetingAndEnableMedia state machine", () => {
       timeout: 5_000,
     });
     expect(joinClick).not.toHaveBeenCalled();
+  });
+
+  // Call-site guards: revert the consumer to an unscoped/tooltip locator and
+  // these fail, which the builders' own drift locks cannot see.
+  it("drives the mic, camera and peer-list controls by their scoped selectors", async () => {
+    const { page } = makeJoinHarness("prompt");
+    const boundedJoin = Promise.race([
+      joinMeetingAndEnableMedia({ page, ...args, displayName: "Alice" }),
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("auto-join did not resolve")), 500);
+      }),
+    ]);
+    await expect(boundedJoin).resolves.toBeUndefined();
+
+    const requested = (page.locator as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(
+      (c) => c[0],
+    );
+    expect(requested).toContain(MIC_UNMUTE_SELECTOR);
+    expect(requested).toContain(cameraButtonSelector(CAMERA_TOOLTIP.off));
+    expect(requested).toContain(peerListControlSelector("off"));
+  });
+
+  it("closePeerList targets the open-state peer-list selector", async () => {
+    const seen: string[] = [];
+    const btn = {
+      isVisible: vi.fn(async () => true),
+      click: vi.fn(async () => undefined),
+      waitFor: vi.fn(async () => undefined),
+    };
+    const page = {
+      locator: vi.fn((selector: string) => {
+        seen.push(selector);
+        return btn;
+      }),
+      mouse: { move: vi.fn(async () => undefined) },
+      waitForTimeout: vi.fn(async () => undefined),
+    };
+    await closePeerList(page as unknown as Parameters<typeof closePeerList>[0], "alice");
+    expect([...new Set(seen)]).toEqual([peerListControlSelector("on")]);
+    expect(btn.click).toHaveBeenCalledTimes(1);
+    expect(btn.waitFor).toHaveBeenCalledWith({ state: "hidden", timeout: 5_000 });
   });
 
   it("propagates WaitingRoomError from the real join path", async () => {

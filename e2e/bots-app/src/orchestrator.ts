@@ -1,6 +1,13 @@
 import { existsSync } from "node:fs";
 
 import { type BotExitReason, launchBot, type BotRunOptions } from "./bot";
+import { type CameraCycleConfig } from "./camera-cycle";
+import {
+  cameraControlSelector,
+  micControlSelector,
+  resolveControlSelector,
+  screenShareCandidates,
+} from "./control-buttons";
 import { defaultSsoStatePath } from "./auth/storage-state";
 import type { PrimeProgress } from "./auto-prime";
 import {
@@ -28,6 +35,7 @@ import { getHost, type SshHost } from "./control/ssh-hosts";
 import { spawnRemoteBot, type SshBotHandle, type SshLaunchSpec } from "./control/ssh-launcher";
 import { loadManifest, type Manifest } from "./manifest";
 import { JoinRejectedError, MeetingNavigatedAwayError, WaitingRoomError } from "./meeting-join";
+import { SD_SOURCE } from "./posture";
 import { type RemoteResourceManager } from "./resource/session";
 import { formatDuration, parseDuration, type Ttl } from "./ttl";
 
@@ -40,6 +48,8 @@ export interface BotTask extends BotRunOptions {
    */
   botId: string;
   ttl: Ttl;
+  /** Required here, optional on BotRunOptions: every task builder must decide (#2362). */
+  cameraCycle: CameraCycleConfig | null;
 }
 
 /**
@@ -114,6 +124,8 @@ export interface RunOptions {
    * this process.
    */
   onEncoderFps?: (botId: string, fps: number | null) => void;
+  /** Local bots only; a ctl rejoin re-fires it with the FIRST join instant (#2294). */
+  onJoin?: (botId: string, joinedAt: number) => void;
   /**
    * Optional remote-resource manager (issue 2032). When set, each SSH-hosted
    * bot triggers `ensureForHost(host)` so the box that actually runs the bot is
@@ -163,6 +175,9 @@ export async function registerSshTask(
     audioOverride: null,
     ttl,
     network: spec.network === "none" ? null : spec.network,
+    // Unused on this path: an SSH bot launches via the remote CLI, not launchBot.
+    sourceGeometry: SD_SOURCE,
+    cameraCycle: null,
   };
   const hostKind: BotHostKind = { kind: "ssh", hostLabel: host.label };
   const entry = newRegistryEntry(task, hostKind);
@@ -481,7 +496,10 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
     const exec = opts.control.netem.exec ?? defaultNetemExec();
     surface.setNetem = async (action) => {
       const result = await applyNetemAction(action, { iface, exec });
-      console.log(`[orchestrator] netem ${result.op} (${result.label}): ${result.argv.join(" ")}`);
+      const ran = result.commands.map((c) => c.join(" ")).join("; ");
+      console.log(
+        `[orchestrator] netem ${result.op} (${result.label}) mirror_removed=${result.mirrorRemoved}: ${ran}`,
+      );
       return result;
     };
   }
@@ -519,6 +537,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
           ctlSignals.delete(botId);
         },
         onEncoderFps: opts.onEncoderFps,
+        onJoin: opts.onJoin,
       }),
     );
     // Wake the wait loop if it was parked waiting for new work
@@ -616,6 +635,8 @@ interface SingleBotDeps {
   clearMaps: (botId: string) => void;
   /** Per-bot FPS sink threaded from {@link RunOptions.onEncoderFps} (issue 2032). */
   onEncoderFps?: (botId: string, fps: number | null) => void;
+  /** Join sink threaded from {@link RunOptions.onJoin} (#2294). */
+  onJoin?: (botId: string, joinedAt: number) => void;
 }
 
 async function runSingleBotTask(
@@ -725,8 +746,10 @@ async function runSingleBotTask(
     }
     entry.handle = bot;
     entry.status = "in-meeting";
+    entry.joinedAt ??= Date.now();
     entry.ttl = ttl;
     entry.ttlDeadline = ttl === "infinite" ? null : Date.now() + ttl;
+    deps.onJoin?.(task.botId, entry.joinedAt);
     console.log(`[${label}] joined; ttl=${formatDuration(ttl)}`);
 
     // Build the rearmable TTL timer. The control server's `applyTtl`
@@ -871,7 +894,7 @@ function createRearmableTtl(initialTtl: Ttl): {
   };
 }
 
-async function toggleMicrophone(entry: BotRegistryEntry, mute: boolean): Promise<void> {
+export async function toggleMicrophone(entry: BotRegistryEntry, mute: boolean): Promise<void> {
   if (entry.handle === null) return;
   const { page } = entry.handle;
   // The Dioxus action bar auto-hides; hover so the buttons render.
@@ -880,13 +903,14 @@ async function toggleMicrophone(entry: BotRegistryEntry, mute: boolean): Promise
     .first()
     .hover()
     .catch(() => {});
-  const tooltips = mute
-    ? ["Mute", "Mute Microphone", "Stop microphone"]
-    : ["Unmute", "Unmute Microphone", "Start microphone"];
-  await clickFirstMatchingTooltip(entry, tooltips, mute ? "mute" : "unmute");
+  await clickControlButton(
+    entry,
+    [micControlSelector(mute ? "on" : "off")],
+    mute ? "mute" : "unmute",
+  );
 }
 
-async function toggleCamera(entry: BotRegistryEntry, cameraOff: boolean): Promise<void> {
+export async function toggleCamera(entry: BotRegistryEntry, cameraOff: boolean): Promise<void> {
   if (entry.handle === null) return;
   const { page } = entry.handle;
   await page
@@ -894,26 +918,18 @@ async function toggleCamera(entry: BotRegistryEntry, cameraOff: boolean): Promis
     .first()
     .hover()
     .catch(() => {});
-  const tooltips = cameraOff
-    ? ["Stop Video", "Stop Camera", "Stop camera"]
-    : ["Start Video", "Start Camera", "Start camera"];
-  await clickFirstMatchingTooltip(entry, tooltips, cameraOff ? "camera-off" : "camera-on");
+  await clickControlButton(
+    entry,
+    [cameraControlSelector(cameraOff ? "on" : "off")],
+    cameraOff ? "camera-off" : "camera-on",
+  );
 }
 
 /**
- * Click the in-meeting screen-share toggle. Same pattern as mic/cam:
- * hover the action bar so the auto-hide doesn't get in the way, then
- * click the button matching the tooltip text. The matching tooltips
- * live in `dioxus-ui/src/components/video_control_buttons.rs` —
- * `"Share Screen"` (idle) and `"Stop Screen Share"` (active).
- *
- * Note: the browser's `getDisplayMedia()` prompt cannot be auto-confirmed
- * by a Playwright click. The bot relies on `--use-fake-ui-for-media-stream`
- * (already in `CHROME_ARGS`) to bypass the prompt entirely — Chrome
- * picks the first available source. This is acceptable for bots; for
- * the human-operator case the operator wouldn't be using a bot.
+ * `getDisplayMedia()` cannot be confirmed by a Playwright click; the bot relies
+ * on `--use-fake-ui-for-media-stream` in `CHROME_ARGS` to bypass the prompt.
  */
-async function toggleScreenShare(entry: BotRegistryEntry, share: boolean): Promise<void> {
+export async function toggleScreenShare(entry: BotRegistryEntry, share: boolean): Promise<void> {
   if (entry.handle === null) return;
   const { page } = entry.handle;
   await page
@@ -921,35 +937,36 @@ async function toggleScreenShare(entry: BotRegistryEntry, share: boolean): Promi
     .first()
     .hover()
     .catch(() => {});
-  const tooltips = share ? ["Share Screen"] : ["Stop Screen Share"];
-  await clickFirstMatchingTooltip(entry, tooltips, share ? "share-start" : "share-stop");
+  await clickControlButton(
+    entry,
+    screenShareCandidates(share ? "off" : "on"),
+    share ? "share-start" : "share-stop",
+  );
 }
 
-async function clickFirstMatchingTooltip(
+async function clickControlButton(
   entry: BotRegistryEntry,
-  tooltips: readonly string[],
+  candidates: readonly string[],
   action: string,
 ): Promise<void> {
   if (entry.handle === null) return;
   const { page } = entry.handle;
   const label = `${entry.task.participant}@${shortBotId(entry.botId)}`;
-  for (const tooltip of tooltips) {
-    const btn = page.locator(
-      `button.video-control-button:has(span.tooltip:has-text("${tooltip}"))`,
-    );
-    if (await btn.isVisible({ timeout: 1_000 }).catch(() => false)) {
-      try {
-        await btn.click({ timeout: 2_000 });
-        console.log(`[${label}] ctl ${action} → clicked '${tooltip}'`);
-        return;
-      } catch (e) {
-        console.warn(`[${label}] ctl ${action} click failed: ${(e as Error).message}`);
-      }
-    }
-  }
-  console.warn(
-    `[${label}] ctl ${action}: no matching control button visible (tried: ${tooltips.join(", ")}) — the bot may not be in-meeting yet`,
+  const selector = await resolveControlSelector(page, candidates, `ctl ${action}`, (m) =>
+    console.warn(`[${label}] ${m}`),
   );
+  if (selector === null) {
+    console.warn(
+      `[${label}] ctl ${action}: no visible button matching ${candidates.join(" | ")} — action bar autohidden, control unavailable, or the bot is not in-meeting yet`,
+    );
+    return;
+  }
+  try {
+    await page.locator(selector).click({ timeout: 2_000 });
+    console.log(`[${label}] ctl ${action} → clicked ${selector}`);
+  } catch (e) {
+    console.warn(`[${label}] ctl ${action} click failed: ${(e as Error).message}`);
+  }
 }
 
 function defaultDisplayName(participant: string): string {
@@ -1028,6 +1045,10 @@ export function buildLaunchedBotTask(
     audioOverride,
     ttl: spec.ttl,
     network: spec.network === "none" ? null : spec.network,
+    // `LaunchSpec` carries no fleet index, so `/launch` bots publish SD (README).
+    sourceGeometry: SD_SOURCE,
+    // `LaunchSpec` carries no cycle, so a /launch bot keeps its camera on.
+    cameraCycle: null,
   };
 }
 

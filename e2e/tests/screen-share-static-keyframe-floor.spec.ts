@@ -1,7 +1,14 @@
-import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
+import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
-import { wakeControls } from "../helpers/controls";
+import {
+  MeetingMember,
+  MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT,
+  admitGuestIfNeeded,
+  clickJoinAndEnterGrid,
+  joinMeetingAs,
+  startScreenShare,
+} from "../helpers/screen-share-meeting";
 
 /**
  * Static-share keyframe FLOOR — sharer side (issue #1903, umbrella of #1832/#1841).
@@ -69,155 +76,14 @@ import { wakeControls } from "../helpers/controls";
  * `MAX_KEYFRAME_LESS_HOLD_MS` ceiling, "Test 1" the below-ceiling control). This
  * spec deliberately does NOT duplicate it and covers only the new sharer-side floor.
  *
- * Mirrors the auth + mock harness of `peer-screen-static-fps.spec.ts`.
+ * The auth + mock + join harness lives in `helpers/screen-share-meeting.ts`.
  */
 
 const DEFAULT_UI_URL = "http://localhost:3001";
 
-interface MeetingMember {
-  page: Page;
-  context: BrowserContext;
-  email: string;
-  name: string;
-}
-
 // The substring that identifies the FLOOR/on-demand synthetic re-encode INFO
 // line. With a happy static viewer (no PLI) it is the floor (see doc comment).
 const FLOOR_LOG_SUBSTRING = "wall-clock floor #1903";
-
-// Toggleable canvas-backed `getDisplayMedia` mock (copied from
-// `peer-screen-static-fps.spec.ts`'s MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT; the
-// const there is module-scoped, not exported). `captureStream(0)` emits frames
-// ONLY when `requestFrame()` is called, so flipping `__e2e1903_emit_frames` to
-// false stops emission and the encoder's read() parks — the faithful model of a
-// real screen-share track whose content stopped changing (NOT a repainting mock,
-// which would keep the real-frame branch alive and never exercise the floor).
-const MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT = `
-  (() => {
-    const mediaDevices = navigator.mediaDevices;
-    if (!mediaDevices) return;
-    window.__e2e1903_emit_frames = true;
-    const createStream = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = 1280; canvas.height = 720;
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, 0, 1280, 720);
-      ctx.fillStyle = '#fff'; ctx.font = '32px sans-serif';
-      ctx.fillText('Mock Screen Share (e2e-1903)', 320, 360);
-      const stream = canvas.captureStream(0);
-      const track = stream.getVideoTracks()[0];
-      let frame = 0;
-      const tick = () => {
-        if (window.__e2e1903_emit_frames) {
-          frame++;
-          ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, 0, 1280, 720);
-          ctx.fillStyle = '#fff'; ctx.font = '32px sans-serif';
-          ctx.fillText('Mock Screen Share (e2e-1903)', 320, 360);
-          ctx.fillStyle = '#ff0';
-          const x = 100 + (frame * 10) % 1000;
-          ctx.fillRect(x, 600, 20, 20);
-          if (typeof track.requestFrame === 'function') {
-            try { track.requestFrame(); } catch (_) { /* ignore */ }
-          }
-        }
-        setTimeout(tick, 80); // ~12fps when emitting (< the 150ms static poll)
-      };
-      tick();
-      return stream;
-    };
-    Object.defineProperty(mediaDevices, 'getDisplayMedia', {
-      configurable: true, value: async () => createStream(),
-    });
-  })();
-`;
-
-async function joinMeetingAs(
-  context: BrowserContext,
-  meetingId: string,
-  username: string,
-): Promise<Page> {
-  const page = await context.newPage();
-  await page.goto("/");
-  await page.waitForTimeout(1500);
-
-  await page.locator("#meeting-id").click();
-  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
-  await page.locator("#username").click();
-  await page.locator("#username").fill("");
-  await page.locator("#username").pressSequentially(username, { delay: 50 });
-  await page.waitForTimeout(500);
-  await page.locator("#username").press("Enter");
-
-  await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
-  await page.waitForTimeout(1500);
-
-  return page;
-}
-
-async function clickJoinAndEnterGrid(page: Page): Promise<void> {
-  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-  const grid = page.locator("#grid-container");
-
-  const result = await Promise.race([
-    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
-    grid.waitFor({ timeout: 30_000 }).then(() => "auto-joined" as const),
-  ]);
-
-  if (result === "join") {
-    await page.waitForTimeout(1000);
-    await joinButton.click();
-    await page.waitForTimeout(3000);
-  }
-
-  await expect(grid).toBeVisible({ timeout: 15_000 });
-}
-
-async function admitGuestIfNeeded(hostPage: Page, guestPage: Page): Promise<void> {
-  const joinButton = guestPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-  const waitingRoom = guestPage.getByText("Waiting to be admitted");
-  const guestGrid = guestPage.locator("#grid-container");
-
-  const result = await Promise.race([
-    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
-    waitingRoom.waitFor({ timeout: 30_000 }).then(() => "waiting" as const),
-    guestGrid.waitFor({ timeout: 30_000 }).then(() => "auto-joined" as const),
-  ]);
-
-  if (result === "waiting") {
-    const admitButton = hostPage.getByTitle("Admit").first();
-    await expect(admitButton).toBeVisible({ timeout: 20_000 });
-    await hostPage.waitForTimeout(1000);
-    await admitButton.dispatchEvent("click");
-    await hostPage.waitForTimeout(3000);
-  }
-
-  if (result !== "auto-joined") {
-    await clickJoinAndEnterGrid(guestPage);
-  } else {
-    await expect(guestGrid).toBeVisible({ timeout: 15_000 });
-  }
-}
-
-// Sharer clicks "Share Screen"; returns true once the VIEWER transitions to the
-// split layout — which confirms encoded screen frames actually reached the guest
-// (so the encoder produced a retained frame + replenished the floor budget).
-async function startScreenShare(sharerPage: Page, viewerPage: Page): Promise<boolean> {
-  await wakeControls(sharerPage);
-  await sharerPage.waitForTimeout(300);
-  const shareButton = sharerPage.locator("button.video-control-button", {
-    has: sharerPage.locator(".tooltip", { hasText: "Share Screen" }),
-  });
-
-  await expect(shareButton).toBeVisible({ timeout: 10_000 });
-  await shareButton.click();
-
-  try {
-    await expect(viewerPage.locator(".split-screen-tile")).toBeVisible({ timeout: 15_000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 test.describe("Static screen-share keyframe FLOOR — sharer side (issue #1903)", () => {
   test.beforeAll(async () => {

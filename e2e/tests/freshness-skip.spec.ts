@@ -1,6 +1,7 @@
 import { test, expect, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
+import { MAX_KEYFRAME_LESS_HOLD_MS, MAX_PLAYOUT_AGE_MS } from "../helpers/rust-mirrored-constants";
 import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -37,10 +38,7 @@ import { waitForServices } from "../helpers/wait-for-services";
  *     arrival time is back-dated by `ageMs`. With no buffered keyframe the worker
  *     holds; once the back-dated head ages past `MAX_PLAYOUT_AGE_MS` (1800ms) the
  *     ~10ms tick trips the keyframe-less eviction and posts a `freshness_skip`.
- *   - `__videocall_freshness_skips` — an array a diagnostics-bus subscriber
- *     appends each captured `freshness_skip` to (`{ head_age_ms, keyframe_seq,
- *     dropped, ts_ms, escalated, tick_gap_ms }`; `escalated` is the #1662
- *     hold-ceiling flag, `tick_gap_ms` the #1851 gap since the previous worker poll).
+ *   - `__videocall_freshness_skips` — captured `freshness_skip` events; shape in `FreshnessSkip` below.
  *
  * ## Fails if the feature regresses (genuine fail-when-broken)
  *
@@ -49,10 +47,9 @@ import { waitForServices } from "../helpers/wait-for-services";
  * worker stops `take_freshness_skip()`-ing, or `handle_worker_diag_message`
  * stops re-broadcasting (the #1045 surfacing path) — NO event lands in
  * `__videocall_freshness_skips`, the array stays empty, and the
- * wait-for-non-empty assertion times out and FAILS. Verified by a control case:
- * injecting a FRESH backlog (age well below the deadline) produces ZERO events
- * within the same window, proving the assertion is keyed to the deadline tripping
- * and not merely to the injection occurring. See the "does NOT fire" test below.
+ * wait-for-non-empty assertion times out and FAILS. The positive-control test
+ * keys this to the deadline rather than to the injection: a FRESH backlog must
+ * stay silent below the deadline AND must fire once aged past it.
  *
  * ## #1662 — keyframe-less hold-CEILING escalation (`escalated: bool`)
  *
@@ -82,16 +79,6 @@ import { waitForServices } from "../helpers/wait-for-services";
  *     below the ceiling and FAIL ("Test 1", extended).
  */
 
-// Mirror of MAX_PLAYOUT_AGE_MS in videocall-codecs/src/jitter_buffer.rs.
-// If that const is retuned, update this in lockstep.
-const MAX_PLAYOUT_AGE_MS = 1800;
-
-// Mirror of MAX_KEYFRAME_LESS_HOLD_MS in videocall-codecs/src/jitter_buffer.rs
-// (issue #1662): the keyframe-less held-last-good freeze ceiling. Crossing it
-// triggers the cooldown-gated decoder-reset escalation (`escalated: true`). If
-// that const is retuned, update this in lockstep.
-const MAX_KEYFRAME_LESS_HOLD_MS = 6000;
-
 // Back-date the ESCALATION backlog comfortably ABOVE the ceiling so the head is
 // already past MAX_KEYFRAME_LESS_HOLD_MS on the first eviction tick (head_age
 // only grows from injection to the tick, never shrinks), and on a cold stream
@@ -106,9 +93,13 @@ const ABOVE_CEILING_AGE_MS = MAX_KEYFRAME_LESS_HOLD_MS + 1000; // 7000ms
 // below-ceiling control: every skip it produces must carry `escalated === false`.
 const STALE_AGE_MS = MAX_PLAYOUT_AGE_MS + 3200; // 5000ms (< MAX_KEYFRAME_LESS_HOLD_MS)
 
-// A "fresh" backlog age for the control (must-NOT-fire) case: well under the
-// deadline so the head never ages past it during the observation window.
+// A "fresh" backlog age for the must-NOT-fire case: starts under the deadline, so
+// nothing fires until the head has aged past it.
 const FRESH_AGE_MS = 0;
+
+// Test 2 phase 1's silence window. Must stay below MAX_PLAYOUT_AGE_MS with enough margin
+// to absorb waitForTimeout overshoot.
+const FRESH_SILENT_WINDOW_MS = MAX_PLAYOUT_AGE_MS / 2; // 900ms
 
 // How many delta frames to inject. >1 so `dropped` is unambiguously >= 1 and the
 // eviction has a real backlog to clear.
@@ -125,6 +116,18 @@ const ESCALATION_INJECT_FRAMES = 100;
 // Keyframe-less eviction encodes keyframe_seq as -1 (the #1045 sentinel for "no
 // buffered keyframe; held last-good frame").
 const KEYFRAME_LESS_SENTINEL = -1;
+
+// Mirrors the same-named consts in videocall-client/src/freshness_inject.rs.
+const INJECT_FROM_PEER = "inject-local";
+const INJECT_TO_PEER = "inject-peer";
+const COLD_FROM_PEER = "cold-local";
+const COLD_TO_PEER = "cold-peer";
+
+// The replay is re-stamped with the worker's own clock, so the skip trails it by MAX_PLAYOUT_AGE_MS.
+const COLD_SKIP_TIMEOUT_MS = 8_000;
+// Must stay under COLD_HARNESS_BOOT_REPLAY_TTL_MS (30s, freshness_inject.rs): above it a slow
+// boot trips the TTL and queue_dropped fails as a replay failure.
+const COLD_BOOT_TIMEOUT_MS = 15_000;
 
 // ── Issue 1899 / discussion 1960: stream-open immediate keyframe request ──
 //
@@ -161,6 +164,8 @@ interface FreshnessSkip {
   // (videocall-client/src/freshness_inject.rs) as a real JS number (f64). Absent (undefined) on
   // the pre-#1851 build, which is what makes the Test 1 assertions below fail-when-unfixed.
   tick_gap_ms: number;
+  from_peer: string;
+  to_peer: string;
 }
 
 // Issue 1899 / discussion 1960: a captured proactive keyframe request, appended to
@@ -177,8 +182,7 @@ interface KeyframeRequest {
 }
 
 // The injection + capture hooks are attached only when MOCK_PEERS_ENABLED=true
-// (see docker-compose.e2e.yaml). The whole feature this spec covers cannot run
-// without them, so the tests skip (rather than fail) if they are absent.
+// (see docker-compose.e2e.yaml).
 const hasInjectHook = (page: Page) =>
   page.evaluate(
     () =>
@@ -195,6 +199,32 @@ const injectStaleBacklog = (page: Page, numFrames: number, ageMs: number) =>
         }
       ).__videocall_inject_stale_video_backlog(n, age),
     [numFrames, ageMs] as const,
+  );
+
+const injectStaleBacklogCold = (page: Page, numFrames: number) =>
+  page.evaluate(
+    (n) =>
+      (
+        window as unknown as {
+          __videocall_inject_stale_video_backlog_cold: (n: number) => void;
+        }
+      ).__videocall_inject_stale_video_backlog_cold(n),
+    numFrames,
+  );
+
+interface ColdBootState {
+  handshake_seen: boolean;
+  queue_dropped: boolean;
+}
+
+const coldBootState = (page: Page): Promise<ColdBootState | null> =>
+  page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __videocall_cold_worker_boot_state?: () => ColdBootState | null;
+        }
+      ).__videocall_cold_worker_boot_state?.() ?? null,
   );
 
 const readSkips = (page: Page): Promise<FreshnessSkip[]> =>
@@ -215,16 +245,31 @@ const skipCount = (page: Page): Promise<number> =>
       ).length,
   );
 
+// The bus is GLOBAL, so a poll and the assertions after it must select the same decoder's entries.
+const skipsFor = (page: Page, toPeer: string): Promise<FreshnessSkip[]> =>
+  page.evaluate(
+    (tp) =>
+      (
+        (window as unknown as { __videocall_freshness_skips?: FreshnessSkip[] })
+          .__videocall_freshness_skips ?? []
+      ).filter((s) => s.to_peer === tp) as FreshnessSkip[],
+    toPeer,
+  );
+
 // Count captured skips whose #1662 `escalated` flag is strictly === true. Read in
 // the page so we observe the real JS booleans the collector wrote (not a stale
 // snapshot), letting `expect.poll` wait for the throttle-bypassed escalation event.
-const escalatedSkipCount = (page: Page): Promise<number> =>
+const escalatedSkipCount = (page: Page, toPeer: string): Promise<number> =>
   page.evaluate(
-    () =>
+    (tp) =>
       (
-        (window as unknown as { __videocall_freshness_skips?: { escalated?: boolean }[] })
-          .__videocall_freshness_skips ?? []
-      ).filter((s) => s.escalated === true).length,
+        (
+          window as unknown as {
+            __videocall_freshness_skips?: { escalated?: boolean; to_peer?: string }[];
+          }
+        ).__videocall_freshness_skips ?? []
+      ).filter((s) => s.escalated === true && s.to_peer === tp).length,
+    toPeer,
   );
 
 // Issue 1899 / discussion 1960: read/count captured proactive keyframe requests. Evaluated in the
@@ -326,31 +371,35 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
   // registers `onmessage` are dropped — so after the hook appears we give the
   // worker a short settle to finish booting before the first injection. (The
   // pre-warm starts the boot at mount, so this is margin, not the full boot.)
-  async function waitForHook(page: Page): Promise<boolean> {
+  async function assertInjectHook(page: Page): Promise<void> {
     const deadline = Date.now() + 15_000;
+    let attached = false;
     while (Date.now() < deadline) {
       if (await hasInjectHook(page)) {
+        attached = true;
         // Worker-boot settle margin (see above).
         await page.waitForTimeout(1500);
-        return true;
+        break;
       }
       await page.waitForTimeout(250);
     }
-    return false;
+    expect(
+      attached,
+      "__videocall_inject_stale_video_backlog is not attached. The e2e stack must run with " +
+        "MOCK_PEERS_ENABLED=true (docker/docker-compose.e2e.yaml) so the freshness inject hook " +
+        "is registered (dioxus-ui freshness_inject.rs).",
+    ).toBe(true);
   }
 
   // ──────────────────────────────────────────────────────────────────────
   // Test 1 — a STALE backlog trips the deadline → freshness_skip fires.
   // ──────────────────────────────────────────────────────────────────────
-  test("a stale buffered-video backlog trips the freshness deadline and surfaces a skip", async ({
+  test("@bvt1 a stale buffered-video backlog trips the freshness deadline and surfaces a skip", async ({
     page,
   }) => {
     await joinMeeting(page, "stale_fires");
 
-    if (!(await waitForHook(page))) {
-      test.skip(true, "MOCK_PEERS_ENABLED is off; freshness injection hooks are not attached");
-      return;
-    }
+    await assertInjectHook(page);
 
     // #1851: capture the main-thread console so we can assert the re-emitted freshness_skip
     // FIELD-LOG line carries the new `tick_gap=` token. That console.warn is the load-bearing
@@ -369,14 +418,13 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
     // back-dated head is already older than MAX_PLAYOUT_AGE_MS (it is, by
     // STALE_AGE_MS). Poll the capture array until at least one event lands.
     await expect
-      .poll(() => skipCount(page), {
+      .poll(() => skipsFor(page, INJECT_TO_PEER).then((s) => s.length), {
         timeout: 30_000,
         message: "expected a freshness_skip DiagEvent after injecting a stale backlog",
       })
       .toBeGreaterThanOrEqual(1);
 
-    const skips = await readSkips(page);
-    const skip = skips[0];
+    const skip = (await skipsFor(page, INJECT_TO_PEER))[0];
 
     // Shape assertions (mirrors the #1045 event contract for the keyframe-less
     // held case):
@@ -386,6 +434,9 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
     expect(skip.dropped).toBeGreaterThanOrEqual(1);
     //   - no buffered keyframe to skip to → the -1 sentinel.
     expect(skip.keyframe_seq).toBe(KEYFRAME_LESS_SENTINEL);
+
+    expect(skip.from_peer).toBe(INJECT_FROM_PEER);
+    expect(skip.to_peer).toBe(INJECT_TO_PEER);
 
     // #1851 (a) — the collector entry now carries a numeric tick_gap_ms. On the PRE-#1851 build the
     // collector never sets this field, so `skip.tick_gap_ms` is `undefined`: `typeof` is
@@ -448,8 +499,8 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
     // ages at wall-clock rate, so it cannot reach the 6000ms ceiling within this
     // window — keeping the control unambiguously below-ceiling.
     await page.waitForTimeout(1000);
-    expect(await escalatedSkipCount(page)).toBe(0);
-    const allBelow = await readSkips(page);
+    expect(await escalatedSkipCount(page, INJECT_TO_PEER)).toBe(0);
+    const allBelow = await skipsFor(page, INJECT_TO_PEER);
     expect(allBelow.length).toBeGreaterThanOrEqual(1);
     for (const s of allBelow) {
       expect(s.escalated).toBe(false);
@@ -457,37 +508,33 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // Test 2 — CONTROL: a FRESH backlog must NOT fire the deadline.
-  //
-  // This is the genuine-fail-when-broken guard. It proves Test 1's assertion is
-  // keyed to the deadline TRIPPING, not merely to the injection running: the same
-  // injection path with a non-stale arrival time produces ZERO events in the same
-  // observation window. If the deadline fired regardless of head age (the bug
-  // this whole feature prevents), THIS test would see events and fail.
+  // Test 2 — CONTROL: a FRESH backlog must NOT fire the deadline before it ages.
   // ──────────────────────────────────────────────────────────────────────
-  test("a fresh (non-stale) backlog does NOT trip the freshness deadline", async ({ page }) => {
+  test("@bvt1 a fresh backlog stays silent until aged, then fires (positive control)", async ({
+    page,
+  }) => {
     await joinMeeting(page, "fresh_silent");
 
-    if (!(await waitForHook(page))) {
-      test.skip(true, "MOCK_PEERS_ENABLED is off; freshness injection hooks are not attached");
-      return;
-    }
+    await assertInjectHook(page);
 
     const before = await skipCount(page);
 
-    // Inject a FRESH backlog (arrival ~= now). The head never ages past the
-    // deadline during the window below, so no skip should occur.
     await injectStaleBacklog(page, INJECT_FRAMES, FRESH_AGE_MS);
 
-    // Give the worker well over a deadline's worth of ticks. A fresh head needs
-    // MAX_PLAYOUT_AGE_MS (1800ms) to even become stale; we wait less than that so
-    // a correct deadline stays silent. (If we waited > 1800ms the fresh frames
-    // would themselves age out and legitimately fire — that is NOT a bug, just
-    // the deadline doing its job, so the window is intentionally sub-deadline.)
-    await page.waitForTimeout(1200);
+    // Phase 1: below the deadline, a correct deadline stays silent.
+    await page.waitForTimeout(FRESH_SILENT_WINDOW_MS);
 
     const after = await skipCount(page);
     expect(after).toBe(before);
+
+    // Phase 2: hold the same backlog and let it age.
+    await expect
+      .poll(() => skipCount(page), {
+        timeout: 15_000,
+        message:
+          "positive control: this backlog must eventually fire a freshness_skip; zero means the DiagEvent path delivers nothing, so phase 1's silence proves nothing",
+      })
+      .toBeGreaterThan(before);
   });
 
   // ──────────────────────────────────────────────────────────────────────
@@ -510,10 +557,7 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
   }) => {
     await joinMeeting(page, "ceiling_escalates");
 
-    if (!(await waitForHook(page))) {
-      test.skip(true, "MOCK_PEERS_ENABLED is off; freshness injection hooks are not attached");
-      return;
-    }
+    await assertInjectHook(page);
 
     // Inject a stale keyframe-less backlog back-dated ABOVE the ceiling. The head
     // is already > MAX_KEYFRAME_LESS_HOLD_MS old, so the next eviction tick both
@@ -528,7 +572,7 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
     // so it lands within the worker's first deadline tick after injection; 30s is
     // generous headroom for worker-boot settle + poll latency.
     await expect
-      .poll(() => escalatedSkipCount(page), {
+      .poll(() => escalatedSkipCount(page, INJECT_TO_PEER), {
         timeout: 30_000,
         message:
           "expected at least one freshness_skip with escalated === true after injecting a backlog past MAX_KEYFRAME_LESS_HOLD_MS (#1662)",
@@ -575,20 +619,15 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
   // postMessage round-trip (tens of ms), and the poll passes. Reverting fix (a)
   // breaks this test.
   //
-  // Contrast with Test 2: a FRESH backlog produces NO freshness_skip in the same
-  // window (the eviction deadline hasn't tripped) — yet DOES produce a stream-open
-  // keyframe request here. Same fresh injection, different observable: the request
-  // is the insert-time signal, the skip is the deadline signal.
+  // Contrast with Test 2: the same fresh injection yields a different observable —
+  // the request is the insert-time signal, the skip is the deadline signal.
   // ──────────────────────────────────────────────────────────────────────
   test("a fresh delta-only backlog on a never-decoded stream fires an immediate keyframe request before the freshness deadline (#1899 / disc. 1960)", async ({
     page,
   }) => {
     await joinMeeting(page, "stream_open_pli");
 
-    if (!(await waitForHook(page))) {
-      test.skip(true, "MOCK_PEERS_ENABLED is off; freshness injection hooks are not attached");
-      return;
-    }
+    await assertInjectHook(page);
 
     const before = await keyframeRequestCount(page);
 
@@ -631,5 +670,44 @@ test.describe("Jitter-buffer freshness deadline (#1022 / #1020)", () => {
     await injectStaleBacklog(page, 1, FRESH_AGE_MS);
     await page.waitForTimeout(ONE_SHOT_SETTLE_MS);
     expect(await keyframeRequestCount(page)).toBe(afterFirst);
+  });
+
+  // Test 5 — issue 1741: a NEVER-PRE-WARMED worker still gets its attribution.
+  test("@bvt1 a cold decoder worker is attributed despite the boot race (#1741)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "cold_attribution");
+
+    await injectStaleBacklogCold(page, INJECT_FRAMES);
+
+    await expect
+      .poll(() => coldBootState(page).then((s) => s?.handshake_seen ?? false), {
+        timeout: COLD_BOOT_TIMEOUT_MS,
+        message:
+          "the cold decoder worker never handed over: this is a worker BOOT failure, not a " +
+          "replay failure",
+      })
+      .toBe(true);
+
+    expect(
+      (await coldBootState(page))?.queue_dropped,
+      "the worker's boot outran the replay queue's TTL, so the burst was dropped by design: " +
+        "a boot-latency failure, not a replay failure",
+    ).toBe(false);
+
+    await expect
+      .poll(() => skipsFor(page, COLD_TO_PEER).then((s) => s.length), {
+        timeout: COLD_SKIP_TIMEOUT_MS,
+        message:
+          "the worker booted inside the TTL and the queue was not dropped, yet no ATTRIBUTED " +
+          "freshness_skip appeared: the replay did not deliver the cold burst",
+      })
+      .toBeGreaterThan(0);
+
+    const skip = (await skipsFor(page, COLD_TO_PEER))[0];
+    expect(skip.from_peer).toBe(COLD_FROM_PEER);
+    expect(skip.to_peer).toBe(COLD_TO_PEER);
+    expect(skip.head_age_ms).toBeGreaterThanOrEqual(MAX_PLAYOUT_AGE_MS);
+    expect(skip.keyframe_seq).toBe(KEYFRAME_LESS_SENTINEL);
   });
 });

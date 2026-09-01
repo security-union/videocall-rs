@@ -13,6 +13,7 @@ import type { SshHost } from "./control/ssh-hosts";
 import { buildSshCommand, type SshBotHandle, type SshLaunchSpec } from "./control/ssh-launcher";
 import { parseManifestText } from "./manifest";
 import type { BotTask } from "./orchestrator";
+import { SD_SOURCE } from "./posture";
 
 function task(participant: string): BotTask {
   return {
@@ -22,6 +23,8 @@ function task(participant: string): BotTask {
     displayName: participant,
     headless: true,
     authBackend: "jwt",
+    sourceGeometry: SD_SOURCE,
+    cameraCycle: null,
     ttl: 60_000,
   };
 }
@@ -189,6 +192,7 @@ lines:
     expect(task.audioOverride).toBeNull();
     expect(task.participant).toBe("alice");
     expect(task.displayName).toBe("Alice");
+    expect(task.sourceGeometry).toEqual(SD_SOURCE);
   });
 
   it("forwards explicit costume + audio overrides as basenames", () => {
@@ -307,6 +311,8 @@ describe("orchestrator.registerSshTask", () => {
     });
 
     expect(registry.get(botId)?.task.videoMode).toBe("clock");
+    // An SSH bot joins in the REMOTE process: the ssh spawn is not a join.
+    expect(registry.get(botId)?.joinedAt).toBeUndefined();
     expect(captured).not.toBeNull();
     expect(captured!.videoMode).toBe("clock");
     expect(buildSshCommand(captured!.host, captured!).remoteCommand).toContain(
@@ -332,6 +338,8 @@ describe("registry priming lifecycle", () => {
       displayName: "Alice",
       headless: true,
       authBackend: "jwt",
+      sourceGeometry: SD_SOURCE,
+      cameraCycle: null,
       ttl: 60_000,
     });
     expect(e.recentLog).toEqual([]);
@@ -354,6 +362,8 @@ describe("registry priming lifecycle", () => {
       displayName: "Alice",
       headless: true,
       authBackend: "jwt",
+      sourceGeometry: SD_SOURCE,
+      cameraCycle: null,
       ttl: 60_000,
     });
     // newRegistryEntry stays in 'launching'; the orchestrator's
@@ -372,6 +382,8 @@ describe("registry priming lifecycle", () => {
       displayName: "Alice",
       headless: true,
       authBackend: "jwt",
+      sourceGeometry: SD_SOURCE,
+      cameraCycle: null,
       ttl: 60_000,
     });
     const sequence: BotStatus[] = [

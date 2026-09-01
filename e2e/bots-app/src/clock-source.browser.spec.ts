@@ -1,14 +1,20 @@
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-test("clock getUserMedia track publishes advancing frames", async ({ page }) => {
+import { SD_SOURCE, sourceGeometryForIndex } from "./posture";
+
+const CLOCK_SOURCE = readFileSync(resolve(process.cwd(), "bots-app/src/clock-source.js"), "utf8");
+
+async function installClockSource(page: Page, injected?: string): Promise<void> {
+  // One registration, the shape bot.ts uses: globals then the source that reads them.
   await page.addInitScript(
-    `globalThis.__CLOCK_PARTICIPANT = ${JSON.stringify("Clock Browser Test")};`,
+    `globalThis.__CLOCK_PARTICIPANT = ${JSON.stringify("Clock Browser Test")};\n` +
+      (injected ?? "") +
+      "\n" +
+      CLOCK_SOURCE,
   );
-  await page.addInitScript({
-    path: resolve(process.cwd(), "bots-app/src/clock-source.js"),
-  });
   await page.route("https://clock.test/", async (route) => {
     await route.fulfill({
       contentType: "text/html",
@@ -16,6 +22,38 @@ test("clock getUserMedia track publishes advancing frames", async ({ page }) => 
     });
   });
   await page.goto("https://clock.test/");
+}
+
+/** Settings of the track `getUserMedia` hands the client — what reaches the wire. */
+async function capturedTrackSettings(page: Page): Promise<{ width?: number; height?: number }> {
+  return page.evaluate(async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+    try {
+      const settings = stream.getVideoTracks()[0].getSettings();
+      return { width: settings.width, height: settings.height };
+    } finally {
+      for (const track of stream.getTracks()) track.stop();
+    }
+  });
+}
+
+test("captured track reports the injected geometry (#2236)", async ({ page }) => {
+  const hd = sourceGeometryForIndex(1);
+  expect([hd.width, hd.height]).toEqual([1280, 720]);
+  await installClockSource(
+    page,
+    `globalThis.__CLOCK_WIDTH = ${hd.width};globalThis.__CLOCK_HEIGHT = ${hd.height};`,
+  );
+  expect(await capturedTrackSettings(page)).toEqual({ width: 1280, height: 720 });
+});
+
+test("captured track falls back to SD_SOURCE with no injection (#2236)", async ({ page }) => {
+  await installClockSource(page);
+  expect(await capturedTrackSettings(page)).toEqual({ ...SD_SOURCE });
+});
+
+test("clock getUserMedia track publishes advancing frames", async ({ page }) => {
+  await installClockSource(page);
 
   const result = await page.evaluate(async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ video: true });

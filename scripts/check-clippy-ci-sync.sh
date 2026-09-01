@@ -12,10 +12,12 @@
 # self-enforcing instead of comment-enforced.
 #
 # It extracts the ordered list of `cargo clippy` invocations from each source,
-# normalizes whitespace, and fails with a diff if they differ.
+# normalizes whitespace, and fails with a diff if they differ. It then fails,
+# independently, if a workspace crate carrying test code has no `--tests` step.
 #
 # Usage: bash scripts/check-clippy-ci-sync.sh
 set -euo pipefail
+export LC_ALL=C
 
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 MAKEFILE="$ROOT_DIR/Makefile"
@@ -96,5 +98,91 @@ if [[ "$makefile_cmds" != "$workflow_cmds" ]]; then
   exit 1
 fi
 
+# A crate in neither list is invisible to the compare above, so the expected set is derived from the workspace.
+covered="$(printf '%s\n' "$makefile_cmds" | awk '
+  /(^| )--tests( |$)/ {
+    for (i = 1; i <= NF; i++) {
+      if (($i == "-p" || $i == "--package") && i < NF) { print $(i + 1) }
+      else if ($i ~ /^(-p|--package)=./) { sub(/^[^=]*=/, "", $i); print $i }
+    }
+  }
+' | sort -u)"
+if [[ -z "$covered" ]]; then
+  echo "ERROR: no '-p <crate>' argument found on any '--tests' clippy-ci invocation." >&2
+  echo "       The extractor likely broke — refusing to pass vacuously." >&2
+  exit 2
+fi
+
+expected="$(cd "$ROOT_DIR" && python3 - <<'PY'
+import json, os, re, subprocess, sys
+
+r = subprocess.run(
+    ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+    capture_output=True, text=True,
+)
+if r.returncode != 0:
+    sys.stderr.write(r.stderr)
+    sys.exit(2)
+md = json.loads(r.stdout)
+root = md["workspace_root"]
+members = set(md["workspace_members"])
+# Longest-prefix owner over EVERY manifest, so a nested/excluded crate's tests are not attributed to its parent.
+owners = {
+    os.path.relpath(os.path.dirname(p["manifest_path"]), root): (p["name"], p["id"] in members)
+    for p in md["packages"]
+}
+
+# Comments and string literals are blanked, so a `#[test]` in a doc comment and
+# #[clap(long = "send-test-pattern")] are not test attributes.
+COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
+ATTR = re.compile(r"#\[[^]]*\]")
+STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
+TEST_TOKEN = re.compile(r"(?:^|[^\w-])\w*test\w*")
+
+
+def has_test_attr(src):
+    src = COMMENT.sub("", src)
+    return any(TEST_TOKEN.search(STRING.sub('""', m.group(0))) for m in ATTR.finditer(src))
+
+need = set()
+for path in subprocess.run(
+    ["git", "ls-files", "-z", "*.rs"], capture_output=True, text=True, check=True
+).stdout.split("\0"):
+    if not path:
+        continue
+    owner = max(
+        (d for d in owners if d != "." and (path == d or path.startswith(d + "/"))),
+        key=len, default=None,
+    )
+    if owner is None:
+        continue
+    name, is_member = owners[owner]
+    if not is_member or name in need:
+        continue
+    with open(path, encoding="utf-8", errors="ignore") as fh:
+        src = fh.read()
+    if path[len(owner) + 1:].startswith("tests/") or has_test_attr(src):
+        need.add(name)
+print("\n".join(sorted(need)))
+PY
+)"
+if [[ -z "$expected" ]]; then
+  echo "ERROR: workspace enumeration produced no crates carrying test code." >&2
+  echo "       cargo metadata or the source scan likely broke — refusing to pass vacuously." >&2
+  exit 2
+fi
+
+uncovered="$(comm -13 <(printf '%s\n' "$covered") <(printf '%s\n' "$expected" | sort -u))"
+if [[ -n "$uncovered" ]]; then
+  echo "ERROR: these workspace crates carry test code but have no '--tests' clippy step:" >&2
+  printf '%s\n' "$uncovered" | sed 's/^/         /' >&2
+  echo "       'cargo clippy --all' does not lint test targets, so their #[test] code is" >&2
+  echo "       unlinted. Add 'cargo clippy -p <crate> --tests -- -D warnings' to BOTH" >&2
+  echo "       the 'clippy-ci' target in Makefile and the 'clippy' job in" >&2
+  echo "       .github/workflows/pr-check-rust-hcl.yaml, keeping the two byte-identical." >&2
+  exit 1
+fi
+
 count="$(printf '%s\n' "$makefile_cmds" | wc -l | tr -d ' ')"
 echo "OK: clippy-ci Makefile target and workflow clippy job are in sync ($count invocations)."
+echo "OK: every workspace crate carrying test code has a --tests clippy step."

@@ -1290,11 +1290,21 @@ async function share(
 }
 
 /**
- * Render a netem apply result as the JSON the client sees. `argv` is
- * echoed so a conductor (and `ctl`) can log exactly what `tc` ran.
+ * Render a netem apply result as the JSON the client sees. Every command
+ * is echoed so a conductor (and `ctl`) can log exactly what ran, and
+ * `mirrorRemoved` discloses that this action tore down a startup ingress
+ * mirror it cannot reinstall.
  */
 function netemResult(result: NetemApplyResult): RouteResult {
-  return { status: 200, body: { op: result.op, label: result.label, argv: result.argv } };
+  return {
+    status: 200,
+    body: {
+      op: result.op,
+      label: result.label,
+      commands: result.commands,
+      mirrorRemoved: result.mirrorRemoved,
+    },
+  };
 }
 
 async function netemApplyRoute(

@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { COSTUME_HEIGHT, COSTUME_WIDTH, y4mMatchesTargetGeometry } from "./costumes";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,8 +10,18 @@ import { performFormLogin, resolveFormLoginCredentials } from "./auth/form-login
 import { type AuthBackend, requireStorageState } from "./auth/storage-state";
 import { resolveAssetsForParticipant } from "./assets";
 import { ensureAssetsPrimed, type PrimeProgress } from "./auto-prime";
+import {
+  type CameraCycleConfig,
+  type CameraCycleRunner,
+  CAMERA_CYCLE_DEGRADED_BANNER,
+  formatCameraCycleConfig,
+  startCameraCycle,
+} from "./camera-cycle";
+import { HANG_UP_CANDIDATES, resolveControlSelector } from "./control-buttons";
 import { isDevServerNoise } from "./dev-noise";
+import { taggedLine } from "./log-line";
 import { type Manifest } from "./manifest";
+import { captureGeometryToken, type SourceGeometry } from "./posture";
 import { buildReceiverConfigInitScript, buildReceiverConfigOverrides } from "./receiver-caps";
 import { coerceEncoderFps } from "./resource/fps";
 import {
@@ -20,6 +30,9 @@ import {
   MeetingNavigatedAwayError,
   WaitingRoomError,
 } from "./meeting-join";
+
+const CLOCK_SOURCE_PATH = fileURLToPath(new URL("./clock-source.js", import.meta.url));
+const CLOCK_SOURCE_SCRIPT = `${readFileSync(CLOCK_SOURCE_PATH, "utf8")}\n//# sourceURL=${CLOCK_SOURCE_PATH}`;
 
 const CHROME_ARGS = [
   "--ignore-certificate-errors",
@@ -92,6 +105,9 @@ export function browserEnvWithoutFleetCreds(
  * so polls can never pile up in flight.
  */
 export const ENCODER_FPS_POLL_MS = 2000;
+
+/** Per-action budget for one camera toggle (hover, click, post-condition). */
+export const CAMERA_TOGGLE_TIMEOUT_MS = 5000;
 
 const ALREADY_CLOSED_MESSAGES = [
   "Target page, context or browser has been closed",
@@ -290,6 +306,14 @@ export interface BotRunOptions {
    * {@link maxReceivedLayer}.
    */
   skipCanvasPaint?: boolean | null;
+  /** Override `FORM_LOGIN_TIMEOUT_MS`; the login runs over startup shaping (#2354). */
+  formLoginTimeoutMs?: number | null;
+  /** Override `FORM_LOGIN_ACTION_TIMEOUT_MS` for the per-step fill/click actions. */
+  formLoginActionTimeoutMs?: number | null;
+  /** Clock-mode capture geometry (#2236). */
+  sourceGeometry: SourceGeometry;
+  /** Opt-in duty cycle (#2362); unset = camera on the whole run. Set = less publish. */
+  cameraCycle?: CameraCycleConfig | null;
 }
 
 /**
@@ -359,8 +383,37 @@ function logLabel(opts: Pick<BotRunOptions, "participant" | "botIdShort">): stri
   return opts.botIdShort ? `${opts.participant}@${opts.botIdShort}` : opts.participant;
 }
 
+export interface HangUpPage {
+  locator(selector: string): {
+    isVisible(options?: { timeout?: number }): Promise<boolean>;
+    click(options?: { timeout?: number }): Promise<void>;
+  };
+  waitForURL(predicate: (url: URL) => boolean, options?: { timeout?: number }): Promise<void>;
+}
+
+/**
+ * The post-click `waitForURL` gives the client-side `meeting_api::leave_meeting`
+ * request time to reach the server before the caller tears the context down;
+ * not reaching `/` is not an error.
+ */
+export async function clickHangUp(
+  page: HangUpPage,
+  error: (message: string, e: unknown) => void,
+  warn: (message: string) => void = (m) => console.warn(m),
+): Promise<void> {
+  try {
+    const selector = await resolveControlSelector(page, HANG_UP_CANDIDATES, "leaveMeeting", warn);
+    if (selector === null) return;
+    await page.locator(selector).click({ timeout: 2_000 });
+    await page.waitForURL((url) => url.pathname === "/", { timeout: 2_000 }).catch(() => {});
+  } catch (e) {
+    error("leaveMeeting failed:", e);
+  }
+}
+
 export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   const label = logLabel(opts);
+  const at = (msg: string): string => taggedLine(label, msg);
   const videoMode = opts.videoMode ?? "costume";
   // `baseURL` is derived from the *original* URL (no query) so the
   // JWT session cookie's scope doesn't drift if a `?netsim=` param is
@@ -373,7 +426,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   const target = new URL(opts.meetingURL);
   if (opts.network && opts.network !== "") {
     target.searchParams.set("netsim", opts.network);
-    console.log(`[${label}] netsim: applying profile '${opts.network}' via ?netsim=<profile>`);
+    console.log(at(`netsim: applying profile '${opts.network}' via ?netsim=<profile>`));
   }
 
   const launchArgs = [...CHROME_ARGS];
@@ -421,7 +474,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
         // overrides this via `opts.onPrimeProgress` to append into
         // the per-bot rolling log buffer instead (with the same
         // formatted line).
-        const line = `[${label}] auto-prime: ${p.step} — ${p.message}`;
+        const line = at(`auto-prime: ${p.step} — ${p.message}`);
         if (opts.onPrimeProgress) {
           opts.onPrimeProgress(p);
         } else {
@@ -457,18 +510,22 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     });
     if (audioPath !== null) {
       launchArgs.push(`--use-file-for-fake-audio-capture=${audioPath}`);
-      console.log(`[${label}] fake mic → ${audioPath}`);
+      console.log(at(`fake mic → ${audioPath}`));
     } else if (opts.manifest != null) {
       console.warn(
-        `[${label}] no stitched WAV found under ${opts.runDir}/audio — using Chrome's default fake mic. Run \`npm run bot -- prep-assets\` to fix.`,
+        at(
+          `no stitched WAV found under ${opts.runDir}/audio — using Chrome's default fake mic. Run \`npm run bot -- prep-assets\` to fix.`,
+        ),
       );
     }
     if (videoPath !== null) {
       launchArgs.push(`--use-file-for-fake-video-capture=${videoPath}`);
-      console.log(`[${label}] fake camera → ${videoPath}`);
+      console.log(at(`fake camera → ${videoPath}`));
     } else if (opts.manifest != null) {
       console.warn(
-        `[${label}] no costume y4m found under ${opts.runDir}/costumes — using Chrome's default fake camera. Run \`npm run bot -- prep-assets\` to fix (or the participant has no costume_dir).`,
+        at(
+          `no costume y4m found under ${opts.runDir}/costumes — using Chrome's default fake camera. Run \`npm run bot -- prep-assets\` to fix (or the participant has no costume_dir).`,
+        ),
       );
     }
   }
@@ -529,7 +586,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   browser.on("disconnected", () => {
     if (!intentionalCloseStarted) {
       browserDiedUnexpectedly = true;
-      console.error(`[${label}] browser disconnected unexpectedly (crash or external kill)`);
+      console.error(at(`browser disconnected unexpectedly (crash or external kill)`));
     }
   });
   /**
@@ -576,34 +633,34 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     });
     if (ssoStateLoaded) {
       console.log(
-        `[${label}] auth: jwt + SSO state from ${opts.ssoStateFile} (injected session cookie for ${email})`,
+        at(
+          `auth: jwt + SSO state from ${opts.ssoStateFile} (injected session cookie for ${email})`,
+        ),
       );
     } else {
-      console.log(`[${label}] auth: jwt (injected session cookie for ${email})`);
+      console.log(at(`auth: jwt (injected session cookie for ${email})`));
       if (opts.ssoStateFile && opts.ssoStateFile !== "" && !existsSync(opts.ssoStateFile)) {
         console.warn(
-          `[${label}] no SSO state at ${opts.ssoStateFile} — if the target sits behind HCL SSO, the page-load will redirect to the SSO portal. Run \`bots-app sso-login\` once to capture it.`,
+          at(
+            `no SSO state at ${opts.ssoStateFile} — if the target sits behind HCL SSO, the page-load will redirect to the SSO portal. Run \`bots-app sso-login\` once to capture it.`,
+          ),
         );
       }
     }
   } else if (opts.authBackend === "storage-state") {
-    console.log(
-      `[${label}] auth: storage-state (reused captured session from ${opts.storageStateFile})`,
-    );
+    console.log(at(`auth: storage-state (reused captured session from ${opts.storageStateFile})`));
   } else if (opts.authBackend === "form-login") {
     // The context launches with a clean cookie jar (like `"none"`); the
     // session is established later by driving the identity provider's
     // login form after the first navigation (see the form-login step
     // below, after `page.goto`).
-    console.log(
-      `[${label}] auth: form-login (will drive the identity login form after navigation)`,
-    );
+    console.log(at(`auth: form-login (will drive the identity login form after navigation)`));
   } else {
     // `authBackend === "none"` — guest join. No cookie injection, no
     // storage-state replay. The browser context launches with a clean
     // cookie jar; the meeting page must allow guest landing for this
     // to work.
-    console.log(`[${label}] auth: guest (no session cookie injected)`);
+    console.log(at(`auth: guest (no session cookie injected)`));
   }
 
   const page = await context.newPage();
@@ -628,7 +685,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     await page.addInitScript(
       `Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => ${cores}, configurable: true });`,
     );
-    console.log(`[${label}] navigator.hardwareConcurrency spoofed → ${cores} (issue #2035)`);
+    console.log(at(`navigator.hardwareConcurrency spoofed → ${cores} (issue #2035)`));
   }
 
   // Issues #2068/#2069 (increment 5): optionally cap the RECEIVED simulcast
@@ -645,18 +702,19 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   if (receiverOverrides !== null) {
     await page.addInitScript(buildReceiverConfigInitScript(receiverOverrides));
     console.log(
-      `[${label}] receiver caps → __APP_CONFIG ${JSON.stringify(receiverOverrides)} (issues #2068/#2069)`,
+      at(`receiver caps → __APP_CONFIG ${JSON.stringify(receiverOverrides)} (issues #2068/#2069)`),
     );
   }
 
   if (videoMode === "clock") {
+    // ONE registration: clock-source.js reads these globals at module scope.
     await page.addInitScript(
-      `globalThis.__CLOCK_PARTICIPANT = ${JSON.stringify(opts.displayName)};`,
+      `globalThis.__CLOCK_PARTICIPANT = ${JSON.stringify(opts.displayName)};\n` +
+        `globalThis.__CLOCK_WIDTH = ${opts.sourceGeometry.width};\n` +
+        `globalThis.__CLOCK_HEIGHT = ${opts.sourceGeometry.height};\n` +
+        CLOCK_SOURCE_SCRIPT,
     );
-    await page.addInitScript({
-      path: fileURLToPath(new URL("./clock-source.js", import.meta.url)),
-    });
-    console.log(`[${label}] fake camera: synchronized wall clock`);
+    console.log(at(`fake camera: synchronized wall clock`));
   }
 
   // Dioxus 0.7's `trunk serve` workflow injects noisy diagnostics on
@@ -671,7 +729,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       suppressedNoise++;
       return;
     }
-    console.error(`[${label}] pageerror:`, err.message);
+    console.error(at(`pageerror:`), err.message);
   });
   page.on("console", (msg) => {
     const text = msg.text();
@@ -680,11 +738,11 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       suppressedNoise++;
       return;
     }
-    console.error(`[${label}] console.error:`, text);
+    console.error(at(`console.error:`), text);
   });
 
   const navigateUrl = target.toString();
-  console.log(`[${label}] navigating to ${navigateUrl}`);
+  console.log(at(`navigating to ${navigateUrl}`));
   await page.goto(navigateUrl, { waitUntil: "domcontentloaded" });
 
   // `meetingIdFromUrl` operates on the raw `opts.meetingURL` because
@@ -711,7 +769,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       // mis-configured launch doesn't leak a Chrome process.
       await closeBrowserIntentionally();
       throw new Error(
-        `[${label}] auth: form-login requires BOT_EMAIL and BOT_PASSWORD environment variables to be set`,
+        at(`auth: form-login requires BOT_EMAIL and BOT_PASSWORD environment variables to be set`),
       );
     }
     try {
@@ -722,6 +780,8 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
         appBaseUrl: baseURL,
         meetingId,
         label,
+        timeoutMs: opts.formLoginTimeoutMs ?? undefined,
+        actionTimeoutMs: opts.formLoginActionTimeoutMs ?? undefined,
       });
     } catch (e) {
       await closeBrowserIntentionally();
@@ -750,7 +810,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     }
     if (!pathname.startsWith(meetingPathPrefix) && !userHangupFired) {
       userHangupFired = true;
-      console.log(`[${label}] page navigated away from meeting (likely manual hang-up)`);
+      console.log(at(`page navigated away from meeting (likely manual hang-up)`));
       resolveUserHangup();
     }
   });
@@ -815,18 +875,18 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
         (k) => applied[k] !== receiverOverrides[k],
       );
       if (mismatched.length === 0) {
-        console.log(
-          `[${label}] receiver caps verified in __APP_CONFIG: ${JSON.stringify(applied)}`,
-        );
+        console.log(at(`receiver caps verified in __APP_CONFIG: ${JSON.stringify(applied)}`));
       } else {
         console.error(
-          `[${label}] WARNING: receiver caps did NOT land in __APP_CONFIG (expected ${JSON.stringify(
-            receiverOverrides,
-          )}, got ${JSON.stringify(applied)}); the bot may not be capped (issues #2068/#2069)`,
+          at(
+            `WARNING: receiver caps did NOT land in __APP_CONFIG (expected ${JSON.stringify(
+              receiverOverrides,
+            )}, got ${JSON.stringify(applied)}); the bot may not be capped (issues #2068/#2069)`,
+          ),
         );
       }
     } catch (e) {
-      console.error(`[${label}] receiver-caps __APP_CONFIG assertion check failed:`, e);
+      console.error(at(`receiver-caps __APP_CONFIG assertion check failed:`), e);
     }
   }
 
@@ -835,21 +895,14 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // dropping signal).
   if (suppressedNoise > 0) {
     console.log(
-      `[${label}] suppressing ${suppressedNoise} Dioxus dev-server noise events; this is normal under \`trunk serve\``,
+      at(
+        `suppressing ${suppressedNoise} Dioxus dev-server noise events; this is normal under \`trunk serve\``,
+      ),
     );
   }
 
   // #2062/#2057: poll the client's window global for encoder output fps and
-  // feed the per-bot FpsTracker. Once the publisher ships (#2057, not yet
-  // merged), videocall-client `health_reporter` sets `window.__videocall_encoder_fps`
-  // (a positive number when the camera encoder is active + has produced a real
-  // sample; cleared to `undefined` when the camera is off / warming up / on
-  // teardown) roughly once per ~5s health tick; until then the global is absent
-  // and every read is coerced to "no data" (the fps rule stays dormant). This
-  // replaces the earlier console-line parse: a global (not a log line) makes
-  // capture independent of the runtime log level and off the console-log-upload
-  // path. `undefined`/absent (and a non-positive `0`) is "no data" (skipped) —
-  // never recorded — so an idle/cold-start bot is not mis-flagged as starved.
+  // feed the per-bot FpsTracker (contract: resource/fps.ts `coerceEncoderFps`).
   //
   // Scheduling: a SELF-THROTTLING setTimeout chain (next poll scheduled only
   // AFTER the previous `page.evaluate` settles), NOT a fixed-rate setInterval.
@@ -860,6 +913,8 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // is most stressed. The chain applies at most one evaluate at a time.
   let fpsPollStopped = false;
   let fpsPollTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingCaptureToken =
+    videoMode === "clock" ? captureGeometryToken(label, opts.sourceGeometry) : null;
   if (opts.onEncoderFps) {
     const onFps = opts.onEncoderFps;
     const scheduleNextFpsPoll = (): void => {
@@ -877,6 +932,10 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
         .then((raw) => {
           const fps = coerceEncoderFps(raw);
           onFps(fps);
+          if (fps !== null && pendingCaptureToken !== null) {
+            console.log(pendingCaptureToken);
+            pendingCaptureToken = null;
+          }
           scheduleNextFpsPoll();
         })
         .catch(() => {
@@ -894,26 +953,26 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     scheduleNextFpsPoll();
   }
 
-  const leaveMeeting = async (): Promise<void> => {
-    const hangUp = page.locator("button.video-control-button", {
-      has: page.locator("span.tooltip", { hasText: "Hang Up" }),
+  // `shutdown()` is the authoritative stop and emits the receipt (#2362).
+  let cameraCycleRunner: CameraCycleRunner | null = null;
+  if (opts.cameraCycle != null) {
+    console.log(
+      at(
+        `camera cycle configured — ${formatCameraCycleConfig(opts.cameraCycle)}; ` +
+          `cameras-off time is published load this run will NOT represent (#2362)`,
+      ),
+    );
+    cameraCycleRunner = startCameraCycle({
+      page,
+      config: opts.cameraCycle,
+      timeoutMs: CAMERA_TOGGLE_TIMEOUT_MS,
+      log: (m) => console.log(at(m)),
+      error: (m) => console.error(at(m)),
     });
-    try {
-      if (await hangUp.isVisible({ timeout: 1_000 }).catch(() => false)) {
-        await hangUp.click({ timeout: 2_000 });
-        // After hang-up the page navigates to `/`. Wait briefly so the
-        // client-side `meeting_api::leave_meeting` request has time to
-        // reach the server before we tear the context down.
-        await page
-          .waitForURL((url) => url.pathname === "/", { timeout: 2_000 })
-          .catch(() => {
-            // Falling through is fine — the API call may still complete
-            // after we close, and the relay handles the disconnect anyway.
-          });
-      }
-    } catch (e) {
-      console.error(`[${label}] leaveMeeting failed:`, e);
-    }
+  }
+
+  const leaveMeeting = async (): Promise<void> => {
+    await clickHangUp(page, (m, e) => console.error(at(m), e));
   };
 
   const shutdown = async (): Promise<void> => {
@@ -925,13 +984,18 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       clearTimeout(fpsPollTimer);
       fpsPollTimer = undefined;
     }
+    if (cameraCycleRunner !== null) {
+      const receipt = cameraCycleRunner.stop();
+      if (receipt.banner === CAMERA_CYCLE_DEGRADED_BANNER) console.error(at(receipt.line));
+      else console.log(at(receipt.line));
+    }
     try {
       await context.close();
     } catch (e) {
       if (isBenignTeardownError(e, browserDiedUnexpectedly)) {
-        console.debug(`[${label}] context was already closed during teardown:`, e);
+        console.debug(at(`context was already closed during teardown:`), e);
       } else {
-        console.error(`[${label}] context.close failed:`, e);
+        console.error(at(`context.close failed:`), e);
       }
     }
     // Raised HERE, not before `context.close()` above: closing a context does not
@@ -943,9 +1007,9 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       await browser.close();
     } catch (e) {
       if (isBenignTeardownError(e, browserDiedUnexpectedly)) {
-        console.debug(`[${label}] browser was already closed during teardown:`, e);
+        console.debug(at(`browser was already closed during teardown:`), e);
       } else {
-        console.error(`[${label}] browser.close failed:`, e);
+        console.error(at(`browser.close failed:`), e);
       }
     }
   };
@@ -980,16 +1044,22 @@ function resolveOverrideOrAuto(args: {
       // silently publishing 3x a real user's pixel load.
       if (args.kind === "video" && !y4mMatchesTargetGeometry(overridePath)) {
         console.warn(
-          `[${args.label}] video override "${args.override}" was built at a different geometry ` +
-            `(expected ${COSTUME_WIDTH}x${COSTUME_HEIGHT}) — ignoring it and falling back to ` +
-            `manifest auto-match. Re-run prep-assets to rebuild it.`,
+          taggedLine(
+            args.label,
+            `video override "${args.override}" was built at a different geometry ` +
+              `(expected ${COSTUME_WIDTH}x${COSTUME_HEIGHT}) — ignoring it and falling back to ` +
+              `manifest auto-match. Re-run prep-assets to rebuild it.`,
+          ),
         );
       } else {
         return overridePath;
       }
     } else {
       console.warn(
-        `[${args.label}] ${args.kind} override "${args.override}" missing at ${overridePath} — falling back to manifest auto-match.`,
+        taggedLine(
+          args.label,
+          `${args.kind} override "${args.override}" missing at ${overridePath} — falling back to manifest auto-match.`,
+        ),
       );
     }
   }

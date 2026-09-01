@@ -162,6 +162,9 @@ export interface BotRegistryEntry {
    *     and render a "X minutes ago" relative timestamp.
    */
   finishedAt?: number;
+  /** Local bots only: an SSH bot joins in the remote process, so the ssh spawn
+   * must not be stamped here (#2294). */
+  joinedAt?: number;
   /**
    * Rolling log buffer for **local** bots, mirrored over
    * `GET /bots/:id/log`. Populated by the orchestrator's
@@ -200,6 +203,8 @@ export interface BotSnapshot {
    * render a "X minutes ago" relative timestamp.
    */
   finishedAt: number | null;
+  /** Mirrors {@link BotRegistryEntry.joinedAt}; `null` when unobserved. */
+  joinedAt: number | null;
   /**
    * Where the bot is running. Mirrors `BotRegistryEntry.host` 1:1 —
    * the dashboard's bots-table renders a small chip ("local" or
@@ -328,6 +333,7 @@ export function snapshotEntry(entry: BotRegistryEntry, now: number = Date.now())
     ttlRemainingMs,
     host: entry.host,
     finishedAt: entry.finishedAt ?? null,
+    joinedAt: entry.joinedAt ?? null,
   };
   if (entry.finishReason !== undefined) snap.finishReason = entry.finishReason;
   if (entry.lastError !== undefined) snap.lastError = entry.lastError;

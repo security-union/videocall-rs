@@ -100,7 +100,9 @@ impl std::fmt::Debug for CreateMeetingRequest {
 }
 
 /// Request body for `PATCH /api/v1/meetings/{meeting_id}`.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// `Debug` is implemented manually to redact [`Self::password`]; see [`REDACTED`].
+#[derive(Serialize, Deserialize, Clone)]
 pub struct UpdateMeetingRequest {
     /// Toggle the waiting room on or off.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +127,32 @@ pub struct UpdateMeetingRequest {
     /// Toggle whether every admitted participant may send chat messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_allowed_for_all: Option<bool>,
+
+    /// Set the meeting password to this plaintext value, Argon2-hashed
+    /// server-side. `None` leaves it untouched; `""` is rejected. Mutually
+    /// exclusive with [`Self::remove_password`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+
+    /// Remove the meeting's password. `Some(false)` and `None` both mean
+    /// "leave it alone".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_password: Option<bool>,
+}
+
+impl std::fmt::Debug for UpdateMeetingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateMeetingRequest")
+            .field("waiting_room_enabled", &self.waiting_room_enabled)
+            .field("admitted_can_admit", &self.admitted_can_admit)
+            .field("end_on_host_leave", &self.end_on_host_leave)
+            .field("allow_guests", &self.allow_guests)
+            .field("recording_allowed_for_all", &self.recording_allowed_for_all)
+            .field("chat_allowed_for_all", &self.chat_allowed_for_all)
+            .field("password", &self.password.as_ref().map(|_| REDACTED))
+            .field("remove_password", &self.remove_password)
+            .finish()
+    }
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/join`.
@@ -352,6 +380,16 @@ mod tests {
             guest_session_id: Some("guest:abc".into()),
             password: Some(SECRET.into()),
         };
+        let update = UpdateMeetingRequest {
+            waiting_room_enabled: None,
+            admitted_can_admit: None,
+            end_on_host_leave: None,
+            allow_guests: None,
+            recording_allowed_for_all: None,
+            chat_allowed_for_all: None,
+            password: Some(SECRET.into()),
+            remove_password: None,
+        };
 
         for rendered in [
             format!("{create:?}"),
@@ -360,6 +398,8 @@ mod tests {
             format!("{join:#?}"),
             format!("{guest:?}"),
             format!("{guest:#?}"),
+            format!("{update:?}"),
+            format!("{update:#?}"),
         ] {
             assert!(
                 !rendered.contains(SECRET),
@@ -446,5 +486,43 @@ mod tests {
         let raw = r#"{"display_name":"Alice","password":"  Mixed CASE ☂ "}"#;
         let join: JoinMeetingRequest = serde_json::from_str(raw).expect("join body with password");
         assert_eq!(join.password.as_deref(), Some("  Mixed CASE ☂ "));
+    }
+
+    #[test]
+    fn update_body_carries_set_and_clear() {
+        let set: UpdateMeetingRequest =
+            serde_json::from_str(r#"{"password":"s3cret"}"#).expect("update body setting one");
+        assert_eq!(set.password.as_deref(), Some("s3cret"));
+        assert_eq!(set.remove_password, None);
+
+        let clear: UpdateMeetingRequest =
+            serde_json::from_str(r#"{"remove_password":true}"#).expect("update body clearing one");
+        assert_eq!(clear.password, None);
+        assert_eq!(clear.remove_password, Some(true));
+    }
+
+    #[test]
+    fn update_body_omits_the_password_keys_when_unused() {
+        let toggle_only = UpdateMeetingRequest {
+            waiting_room_enabled: Some(false),
+            admitted_can_admit: None,
+            end_on_host_leave: None,
+            allow_guests: None,
+            recording_allowed_for_all: None,
+            chat_allowed_for_all: None,
+            password: None,
+            remove_password: None,
+        };
+        let wire = serde_json::to_string(&toggle_only).expect("serializing an update request");
+        assert_eq!(wire, r#"{"waiting_room_enabled":false}"#);
+    }
+
+    #[test]
+    fn legacy_update_bodies_still_deserialize() {
+        let legacy: UpdateMeetingRequest =
+            serde_json::from_str(r#"{"allow_guests":true}"#).expect("legacy update body");
+        assert_eq!(legacy.allow_guests, Some(true));
+        assert!(legacy.password.is_none());
+        assert!(legacy.remove_password.is_none());
     }
 }

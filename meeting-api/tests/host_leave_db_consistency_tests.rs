@@ -48,6 +48,9 @@ fn build_app_with_nats(pool: sqlx::PgPool, nats: async_nats::Client) -> axum::Ro
     let state = AppState {
         db: pool,
         jwt_secret: TEST_JWT_SECRET.to_string(),
+        session_jwt_secret: TEST_JWT_SECRET.to_string(),
+        session_jwt_secret_previous: None,
+        session_previous_secret_expires_at: 0,
         token_ttl_secs: 600,
         session_ttl_secs: 3600,
         session_refresh_threshold_secs: 7200,

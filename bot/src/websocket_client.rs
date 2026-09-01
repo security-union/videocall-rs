@@ -33,13 +33,14 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::url_log::strip_query_for_log;
 
 use crate::inbound_stats::InboundStats;
 
 use crate::config::ClientConfig;
 #[cfg(feature = "metrics")]
 use crate::metrics_server::BotMetrics;
-use crate::transport::{InboundHook, MediaTypeLabel, OutboundFrame};
+use crate::transport::{InboundHook, MediaTypeLabel, OutboundFrame, OutboundFrameSender};
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -93,7 +94,11 @@ impl WebSocketClient {
         stats: Arc<Mutex<InboundStats>>,
         inbound_hook: Option<InboundHook>,
     ) -> anyhow::Result<()> {
-        info!("Connecting client {} to {}", self.config.user_id, lobby_url);
+        info!(
+            "Connecting client {} to {}",
+            self.config.user_id,
+            strip_query_for_log(lobby_url.as_str())
+        );
 
         let (ws_stream, _response) = tokio_tungstenite::connect_async(lobby_url.as_str()).await?;
         info!(
@@ -347,7 +352,7 @@ pub fn spawn_heartbeat_producer(
     user_id: String,
     audio_enabled: bool,
     video_enabled: bool,
-    packet_sender: tokio::sync::mpsc::Sender<OutboundFrame>,
+    packet_sender: OutboundFrameSender,
     quit: Arc<AtomicBool>,
     is_speaking: Arc<AtomicBool>,
 ) {

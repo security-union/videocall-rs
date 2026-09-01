@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { test, expect, chromium, Locator, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { continuousToneWavPath } from "../helpers/audio-fixtures";
@@ -57,10 +60,7 @@ import { wakeControls } from "../helpers/controls";
  * The tile's inline `style` attribute is EXACTLY `speak_style(...)`
  * (`canvas_generator.rs`: `style: "{grid_tile_style}"`), and Dioxus writes it
  * only when the rendered string changes, so each style mutation implies at least
- * one level change — which, since `UI_AUDIO_LEVEL_DELTA` (0.01) is TIGHTER than
- * the codec-side 0.02, implies at least one qualifying deadman event. On the
- * un-fixed build `arms >= styleWrites`, so `styleWrites >= 3 * arms` cannot hold
- * however slowly the events happen to arrive.
+ * one level change.
  *
  * THE SAFETY HALF
  * ---------------
@@ -92,9 +92,15 @@ import { wakeControls } from "../helpers/controls";
  * `decode_reinstalls_a_screen_only_route_drop` in `peer_decode_manager.rs`,
  * which drives the real `decode()` with a screen-only route drop.
  *
- * TAGGING: deliberately UNTAGGED (no `@bvt0` / `@bvt1`), for the same reason as
+ * ISSUE 2289 — THE TILE'S AUDIO-LEVEL WRITE GATE (second describe block)
+ * WHAT CHANGED: `UI_AUDIO_LEVEL_DELTA` (`videocall-client/src/audio_constants.rs`)
+ * became `AUDIO_LEVEL_DELTA_THRESHOLD * 2.0`, 0.01 → 0.04. Each assertion is labelled
+ * DISCRIMINATOR / CORROBORATING / SANITY FLOOR at its call site and states in its own
+ * `expect()` message why it fails on un-fixed code, over the [`RENDER_CHAIN`] trace.
+ *
+ * TAGGING: both tests are deliberately UNTAGGED (no `@bvt0` / `@bvt1`), same reason as
  * `speaking-glow-mute-veto.spec.ts`: two real browsers, a full join dance with a
- * fake microphone, and a 15 s observation window — ~90 s. It therefore does NOT
+ * fake microphone, and a 15 s observation window — ~90 s each. They therefore do NOT
  * run in per-PR CI and must be validated by a full `--project=dioxus` run (local
  * `make e2e`, or a scoped `/run-e2e dioxus` dispatch).
  */
@@ -151,6 +157,98 @@ const ARM_BUDGET = Math.ceil(OBSERVE_MS / GLOW_DEADMAN_REARM_THROTTLE_MS) + 2;
  */
 const MIN_STYLE_WRITES = Math.round((2 * OBSERVE_MS) / 1_000);
 
+const REPO_ROOT = path.resolve(__dirname, "..", "..");
+const AUDIO_CONSTANTS_RS = "videocall-client/src/audio_constants.rs";
+const CANVAS_GENERATOR_RS = "dioxus-ui/src/components/canvas_generator.rs";
+
+function rustSource(rel: string): string {
+  const abs = path.resolve(REPO_ROOT, rel);
+  try {
+    return readFileSync(abs, "utf8");
+  } catch (err) {
+    throw new Error(
+      `cannot read ${rel} (resolved ${abs}); this spec reads its blur-step floor out of ` +
+        `that file at load time rather than mirroring it`,
+      { cause: err },
+    );
+  }
+}
+
+function rustF32Literal(rel: string, name: string): number {
+  const re = new RegExp(`^(?:pub )?const ${name}\\s*:\\s*f32\\s*=\\s*([^;]+);`, "gm");
+  const hits = [...rustSource(rel).matchAll(re)];
+  if (hits.length !== 1) {
+    throw new Error(
+      `expected exactly 1 top-level \`const ${name}: f32\` in ${rel}, found ${hits.length} — ` +
+        `renamed, moved or redefined; re-point this derivation at the new source`,
+    );
+  }
+  const raw = hits[0][1].trim().replace(/_/g, "");
+  if (!/^-?\d+(\.\d+)?$/.test(raw)) {
+    throw new Error(
+      `\`const ${name}\` in ${rel} is \`${raw}\`, not a plain number literal; this reader ` +
+        `only resolves literals, so ${name} must be derived explicitly here`,
+    );
+  }
+  return Number(raw);
+}
+
+function uiAudioLevelDeltaFromRust(): number {
+  const multiplier = rustSource(AUDIO_CONSTANTS_RS).match(
+    /^pub const UI_AUDIO_LEVEL_DELTA\s*:\s*f32\s*=\s*AUDIO_LEVEL_DELTA_THRESHOLD\s*\*\s*([\d.]+)\s*;/m,
+  );
+  if (!multiplier) {
+    throw new Error(
+      `UI_AUDIO_LEVEL_DELTA in ${AUDIO_CONSTANTS_RS} is no longer ` +
+        `\`AUDIO_LEVEL_DELTA_THRESHOLD * <literal>\`; re-derive it before trusting ` +
+        `MIN_RENDERED_BLUR_STEP_PX, which is only a discriminator while it exceeds ` +
+        `the blur a single admitted level move produces`,
+    );
+  }
+  return rustF32Literal(AUDIO_CONSTANTS_RS, "AUDIO_LEVEL_DELTA_THRESHOLD") * Number(multiplier[1]);
+}
+
+const UI_AUDIO_LEVEL_DELTA = uiAudioLevelDeltaFromRust();
+
+const SEEDED_GLOW_BLEED = rustF32Literal(CANVAS_GENERATOR_RS, "GLOW_BLEED_OLD_MAX");
+const BLUR_PX_PER_LEVEL =
+  rustF32Literal(CANVAS_GENERATOR_RS, "OUTER_BLUR_INTENSITY") * SEEDED_GLOW_BLEED;
+
+const MIN_RENDERED_BLUR_STEP_PX = Math.floor(UI_AUDIO_LEVEL_DELTA * BLUR_PX_PER_LEVEL - 1) + 1;
+const ONE_PX_STEP_BUDGET = 2;
+const FIXTURE_LEVEL_TRAVEL_PER_ENVELOPE = 2 * (1.0 - 0.708);
+const FIXTURE_ENVELOPE_MS = 2_000;
+
+const RENDER_CHAIN = [
+  "level -> tile style, traced in production source:",
+  "  peer_tile.rs:1487         if glow_write_reaches_signal(lvl, prev) { audio_level.set(lvl) }",
+  "  peer_tile.rs:1021         (lvl == 0.0 && prev != 0.0) || ui_level_write_is_visible(lvl, prev)",
+  "  canvas_generator.rs:961   speak_style(visible_audio_level, is_speaking, appearance)",
+  '  canvas_generator.rs:1708  style: "{grid_tile_style}" on the tile ROOT div',
+  "  canvas_generator.rs:196   glowing branch emits box-shadow: 0 0 {outer_blur:.0}px ...",
+  "  canvas_generator.rs:144   outer_blur = OUTER_BLUR_BASE + i * OUTER_BLUR_INTENSITY * glow_bleed",
+  "  context.rs:500-501 + canvas_generator.rs:293/:57/:59 at the seeded appearance make that",
+  `  14 + ${BLUR_PX_PER_LEVEL.toFixed(1)} * level, quantised to whole px by {:.0}`,
+].join("\n");
+
+const MAX_STYLE_WRITES = Math.ceil(
+  (FIXTURE_LEVEL_TRAVEL_PER_ENVELOPE * (OBSERVE_MS / FIXTURE_ENVELOPE_MS)) / UI_AUDIO_LEVEL_DELTA,
+);
+
+const MIN_RENDERED_STYLES = 30;
+const MIN_NONZERO_STEPS = 20;
+const MIN_PEAK_BLUR_PX = 45;
+
+// PLAIN text, not JSON: `context.rs::load_appearance_settings_from_storage` reads
+// these keys once, at `attendants.rs`'s mount, via bare `f32::to_string()` / `"true"`.
+const APPEARANCE_SEED_INIT_SCRIPT = `(() => {
+  try {
+    localStorage.setItem("vc_appearance_glow_enabled", "true");
+    localStorage.setItem("vc_appearance_inner_glow_strength", "0.5");
+    localStorage.setItem("vc_appearance_glow_brightness", "0.5");
+  } catch (_) {}
+})();`;
+
 // ---------------------------------------------------------------------------
 // In-page probe types (no runtime values cross the evaluate boundary)
 // ---------------------------------------------------------------------------
@@ -171,6 +269,9 @@ interface GlowSample {
 interface ChurnRecorder {
   samples: GlowSample[];
   styleWrites: number;
+  /** Rendered `style` values IN ORDER: `oldValue`s closed by the value held at stop, so
+   * two writes in one microtask batch — which a DOM re-read collapses — both survive. */
+  styleTrack: string[];
   stop: () => void;
 }
 
@@ -284,7 +385,7 @@ async function startChurnObservation(page: Page, tileId: string): Promise<number
   return page.evaluate((id) => {
     const w = window as unknown as ChurnWindow;
     const samples: GlowSample[] = [];
-    const recorder: ChurnRecorder = { samples, styleWrites: 0, stop: () => {} };
+    const recorder: ChurnRecorder = { samples, styleWrites: 0, styleTrack: [], stop: () => {} };
     w.__vcGlowChurn = recorder;
 
     const sample = () => {
@@ -310,6 +411,7 @@ async function startChurnObservation(page: Page, tileId: string): Promise<number
       for (const record of records) {
         if (record.attributeName === "style" && (record.target as Element).id === id) {
           recorder.styleWrites += 1;
+          recorder.styleTrack.push(record.oldValue || "");
           // The value the tile held BEFORE this mutation. Re-reading the DOM in
           // the callback (as `sample()` does) sees only the value at the end of
           // the batch, so a glow driven dark and re-lit inside one microtask
@@ -333,6 +435,12 @@ async function startChurnObservation(page: Page, tileId: string): Promise<number
     recorder.stop = () => {
       observer.disconnect();
       window.clearInterval(timer);
+      // Closes the `oldValue` chain, or the LAST rendered style is missing. No
+      // `takeRecords` flush: callbacks are microtasks, this is a fresh task.
+      const el = document.getElementById(id);
+      if (el !== null) {
+        recorder.styleTrack.push(el.getAttribute("style") || "");
+      }
     };
 
     return Date.now();
@@ -343,6 +451,7 @@ interface ChurnResult {
   at: number;
   samples: GlowSample[];
   styleWrites: number;
+  styleTrack: string[] | null;
   probeInstalled: boolean;
   totalTimers: number;
   arms: number[];
@@ -357,11 +466,28 @@ async function stopChurnObservation(page: Page): Promise<ChurnResult> {
       at: Date.now(),
       samples: w.__vcGlowChurn?.samples ?? [],
       styleWrites: w.__vcGlowChurn?.styleWrites ?? 0,
+      styleTrack: w.__vcGlowChurn ? w.__vcGlowChurn.styleTrack : null,
       probeInstalled: probe !== undefined,
       totalTimers: probe?.total ?? 0,
       arms: probe?.deadmanArms ?? [],
     };
   });
+}
+
+function parseOuterBlurPx(style: string): number | null {
+  const match = /box-shadow:\s*0\s+0\s+(\d+(?:\.\d+)?)px/.exec(style);
+  return match === null ? null : Number.parseFloat(match[1]);
+}
+
+function renderedBlurSteps(blurs: number[]): number[] {
+  const steps: number[] = [];
+  for (let i = 1; i < blurs.length; i += 1) {
+    const step = Math.abs(blurs[i] - blurs[i - 1]);
+    if (step > 0) {
+      steps.push(step);
+    }
+  }
+  return steps;
 }
 
 /** Smallest interval between consecutive arms, for the failure message. */
@@ -525,20 +651,196 @@ test.describe("Speaking-glow deadman re-arm throttle", () => {
           `per event, and this peer produced ${result.styleWrites} level updates in the window`,
       ).toBeLessThanOrEqual(ARM_BUDGET);
 
-      // The same verdict stated as a ratio, which needs no assumption about the
-      // event rate a given machine achieves: every style write implies at least
-      // one qualifying event (UI_AUDIO_LEVEL_DELTA 0.01 is tighter than the
-      // codec-side 0.02), and the un-fixed build arms once per event — so
-      // `arms >= styleWrites` there, and this can never hold.
       expect(
         result.styleWrites,
         `${result.styleWrites} level updates produced ${arms.length} deadman rebuilds — barely ` +
           `throttled at all. A build that re-arms per event would show roughly one rebuild per ` +
-          `update`,
+          `update. The same verdict as the budget above but as a ratio, so it assumes nothing ` +
+          `about the event rate a machine achieves: the signal is only ever fed values the ` +
+          `decoder emitted (peer_tile.rs::apply_resolved_level), and 2289's UI gate (0.04) is ` +
+          `WIDER than the codec-side AUDIO_LEVEL_DELTA_THRESHOLD (0.02), so writes are a subset ` +
+          `of qualifying events and the un-fixed build has arms >= styleWrites. Margin note: a ` +
+          `correct build is PREDICTED (never yet measured) at ~71 writes, against a ` +
+          `3 * ARM_BUDGET ceiling of ${3 * ARM_BUDGET}`,
       ).toBeGreaterThanOrEqual(3 * arms.length);
 
-      // Final state, read straight from the DOM rather than the recording.
-      expect(classifyGlow((await tile.getAttribute("style")) || "")).toBe("lit");
+      expect(
+        classifyGlow((await tile.getAttribute("style")) || ""),
+        "final state, read straight from the DOM rather than the recording",
+      ).toBe("lit");
+    } finally {
+      await hostBrowser.close();
+      await guestBrowser.close();
+    }
+  });
+});
+
+function stepHistogram(steps: number[]): string {
+  const counts = new Map<number, number>();
+  for (const step of steps) {
+    counts.set(step, (counts.get(step) ?? 0) + 1);
+  }
+  return `{${[...counts.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([px, n]) => `${px}px: ${n}`)
+    .join(", ")}}`;
+}
+
+test.describe("Tile audio-level write gate", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test("a continuously speaking peer never re-renders its tile on a sub-threshold level move", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_glow_gate_${Date.now()}`;
+
+    const hostBrowser = await chromium.launch({ args: [...BROWSER_ARGS] });
+    const guestBrowser = await chromium.launch({
+      args: [...BROWSER_ARGS, `--use-file-for-fake-audio-capture=${continuousToneWavPath()}`],
+    });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        hostBrowser,
+        "glowgatehost@videocall.rs",
+        "GlowGateHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        guestBrowser,
+        "glowgateguest@videocall.rs",
+        "GlowGateGuest",
+        uiURL,
+      );
+
+      // HOST context, before its first page: appearance is the VIEWER's local
+      // preference, and the host is the viewer that renders the guest's `PeerTile`.
+      await hostCtx.addInitScript(APPEARANCE_SEED_INIT_SCRIPT);
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // NODE-side: an in-page array would be wiped by a reload. Quoted into the
+      // messages rather than asserted on, so an unrelated warning cannot turn this red.
+      const hostPageErrors: string[] = [];
+      hostPage.on("pageerror", (err) => hostPageErrors.push(err.message));
+
+      // No camera seed, deliberately: the glow path is audio-only, `.grid-item`
+      // exists for a camera-off peer, and `enterTwoUserMeeting` settles on
+      // `.canvas-container` — a div. That is why issue 2193 does not block this.
+      await enterTwoUserMeeting(hostPage, guestPage, meetingId);
+      await enableMic(guestPage);
+
+      const { tileId, tile } = await settledGlowingTile(hostPage);
+      await startChurnObservation(hostPage, tileId);
+      await hostPage.waitForTimeout(OBSERVE_MS);
+      const result = await stopChurnObservation(hostPage);
+
+      const errNote = hostPageErrors.length
+        ? ` (host page error during the window: "${hostPageErrors[0]}")`
+        : "";
+
+      // === SANITY FLOOR — presence before measurement ======================
+      expect(
+        result.styleTrack,
+        `the ordered style track is null: the recorder never installed on the host page, so ` +
+          `"no undersized steps" would be a statement about an empty list${errNote}`,
+      ).not.toBeNull();
+      const track = result.styleTrack as string[];
+
+      expect(
+        result.samples.filter((s) => s.missing).length,
+        `the tracked tile disappeared mid-window — the recording is not meaningful${errNote}`,
+      ).toBe(0);
+
+      expect(
+        track.length,
+        `only ${track.length} rendered style(s) in ${OBSERVE_MS}ms. The guest was not driving ` +
+          `level updates (dead fake mic, stalled audio path), so a clean step histogram would ` +
+          `prove nothing${errNote}`,
+      ).toBeGreaterThanOrEqual(MIN_RENDERED_STYLES);
+
+      const misclassified = track.filter((s) => classifyGlow(s) !== "lit");
+      expect(
+        misclassified.length,
+        `${misclassified.length}/${track.length} rendered styles were not speak_style's GLOWING ` +
+          `branch — first: "${misclassified[0]}". The guest speaks continuously for the whole ` +
+          `window, so a dark or unclassifiable tile means this run measured something else`,
+      ).toBe(0);
+
+      const parsed = track.map(parseOuterBlurPx);
+      const unparsed = parsed.filter((b) => b === null).length;
+      expect(
+        unparsed,
+        `${unparsed}/${track.length} rendered styles carried no outer box-shadow. parseOuterBlurPx ` +
+          `is anchored on speak_style's glowing format string (canvas_generator.rs ` +
+          `"box-shadow: 0 0 {:.0}px {:.0}px rgba(...)"), so it reads the outer blur and skips the ` +
+          `inset shadow that follows, and yields null rather than a 0 that would silently join the ` +
+          `measurement as a real reading. speak_style emits "box-shadow: none" when ` +
+          `inner_glow_strength <= f32::EPSILON, and in that branch border_alpha clamps to 1.00 at ` +
+          `EVERY level — the style string would be constant and every step assertion vacuous. The ` +
+          `appearance seed did not take${errNote}`,
+      ).toBe(0);
+      const blurs = parsed as number[];
+
+      const peak = Math.max(...blurs);
+      expect(
+        peak,
+        `peak rendered blur was ${peak}px. At the seeded sliders the formula is ` +
+          `14 + ${BLUR_PX_PER_LEVEL.toFixed(1)} * level, and this fixture saturates level at ` +
+          `1.0, so a correct run peaks near 67px. A lower peak means the appearance seed did ` +
+          `not take: a weaker inner_glow_strength shrinks BLUR_PX_PER_LEVEL and the step floor ` +
+          `with it, so the glow geometry is not the one MIN_RENDERED_BLUR_STEP_PX ` +
+          `(${MIN_RENDERED_BLUR_STEP_PX}px) was derived from${errNote}`,
+      ).toBeGreaterThanOrEqual(MIN_PEAK_BLUR_PX);
+
+      const steps = renderedBlurSteps(blurs);
+      expect(
+        steps.length,
+        `${steps.length} non-zero blur step(s) across ${track.length} rendered styles: the tile ` +
+          `re-rendered without the level moving, so there is nothing to measure${errNote}`,
+      ).toBeGreaterThanOrEqual(MIN_NONZERO_STEPS);
+
+      // === THE DISCRIMINATOR ===============================================
+      const undersized = steps.filter((s) => s < MIN_RENDERED_BLUR_STEP_PX);
+      expect(
+        undersized.length,
+        `${undersized.length} consecutive rendered blur values differed by less than ` +
+          `${MIN_RENDERED_BLUR_STEP_PX}px (histogram ${stepHistogram(steps)} over ` +
+          `${result.styleWrites} style writes). Issue 2289: a tile write requires ` +
+          `|Δlevel| > UI_AUDIO_LEVEL_DELTA (${UI_AUDIO_LEVEL_DELTA}), which is ` +
+          `${(UI_AUDIO_LEVEL_DELTA * BLUR_PX_PER_LEVEL).toFixed(3)}px of blur before rounding — ` +
+          `and rounding moves each endpoint by at most 0.5px, so the rounded difference still ` +
+          `exceeds 1.128 and is therefore >= 2. A 1px step is arithmetically impossible, which ` +
+          `is what makes this assertion machine- and rate-independent. Zero steps (a re-render ` +
+          `that wrote an unchanged blur) are dropped from the histogram, which cannot hide a 1px ` +
+          `step. Seeing them means the gate is back at or below the producer's own 0.02 ` +
+          `(neteq_audio_decoder.rs:194 VadState::observe, re-anchored at :200 on every emit), ` +
+          `where every emitted event reaches the signal and re-renders the whole PeerTile.\n` +
+          `${RENDER_CHAIN}${errNote}`,
+      ).toBeLessThanOrEqual(ONE_PX_STEP_BUDGET);
+
+      // === CORROBORATING — agrees with the verdict, does not set it =========
+      expect(
+        result.styleWrites,
+        `${result.styleWrites} tile style writes in ${OBSERVE_MS}ms, over a ceiling of ` +
+          `${MAX_STYLE_WRITES}. Each write costs more than ${UI_AUDIO_LEVEL_DELTA} of level ` +
+          `movement and this fixture supplies only ${FIXTURE_LEVEL_TRAVEL_PER_ENVELOPE.toFixed(3)} ` +
+          `per ${FIXTURE_ENVELOPE_MS}ms envelope (audio-fixtures.ts: ENVELOPE_PERIOD_SECONDS = 2, ` +
+          `amplitude 0.6 -> 0.085 -> 0.6, which rms_to_intensity maps to level 1.0 -> 0.708), ` +
+          `so a correct build cannot reach it; the un-fixed gate is predicted at ~141. Read it as ` +
+          `corroboration of the step histogram above, not as the verdict — it leans on the ` +
+          `fixture's travel, which the capture path can perturb${errNote}`,
+      ).toBeLessThanOrEqual(MAX_STYLE_WRITES);
+
+      expect(
+        classifyGlow((await tile.getAttribute("style")) || ""),
+        `final state, read straight from the DOM rather than the recording${errNote}`,
+      ).toBe("lit");
     } finally {
       await hostBrowser.close();
       await guestBrowser.close();

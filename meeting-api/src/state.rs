@@ -26,8 +26,14 @@ use sqlx::PgPool;
 pub struct AppState {
     /// PostgreSQL connection pool.
     pub db: PgPool,
-    /// JWT signing secret (shared with the Media Server).
+    /// JWT signing secret for room access tokens (shared with the Media Server).
     pub jwt_secret: String,
+    /// JWT signing secret for session cookies; see [`crate::config::Config::session_jwt_secret`].
+    pub session_jwt_secret: String,
+    /// Verify-only predecessor key (#2455); read via [`Self::previous_session_secret`].
+    pub session_jwt_secret_previous: Option<String>,
+    /// Unix instant after which [`Self::session_jwt_secret_previous`] is ignored.
+    pub session_previous_secret_expires_at: i64,
     /// Room access token time-to-live in seconds.
     pub token_ttl_secs: i64,
     /// Session JWT time-to-live in seconds.
@@ -113,6 +119,11 @@ impl AppState {
         Self {
             db,
             jwt_secret: config.jwt_secret.clone(),
+            session_jwt_secret: config.session_jwt_secret.clone(),
+            session_jwt_secret_previous: config.session_jwt_secret_previous.clone(),
+            session_previous_secret_expires_at: chrono::Utc::now()
+                .timestamp()
+                .saturating_add(config.session_ttl_secs),
             token_ttl_secs: config.token_ttl_secs,
             session_ttl_secs: config.session_ttl_secs,
             session_refresh_threshold_secs: config.session_refresh_threshold_secs,
@@ -136,5 +147,12 @@ impl AppState {
             dev_user: config.dev_user.clone(),
             password_gate: Arc::new(crate::password::MeetingPasswordGate::new()),
         }
+    }
+
+    /// The verify-only previous session key (#2455), or `None` past its window.
+    pub fn previous_session_secret(&self, now: i64) -> Option<&str> {
+        self.session_jwt_secret_previous
+            .as_deref()
+            .filter(|_| now < self.session_previous_secret_expires_at)
     }
 }

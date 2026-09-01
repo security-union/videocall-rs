@@ -18,6 +18,7 @@
 
 use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
+use crate::components::handler_cell::use_handler_cell;
 use crate::components::media_metrics_overlay::{
     media_metrics_overlay, MediaMetricsOverlay, MediaMetricsOverlayCtx,
 };
@@ -42,7 +43,7 @@ use videocall_client::adaptive_quality_constants::{
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{
-    initial_screen_tier, CameraEncoder, MediaDeviceList, PrefMediaKind, ScreenEncoder,
+    AqControlLoopCancel, CameraEncoder, MediaDeviceList, PrefMediaKind, ScreenEncoder,
     ScreenShareEvent,
 };
 
@@ -141,25 +142,19 @@ pub fn Host(
 
     use_hook(videocall_client::capability_probe::spawn_capability_probe);
 
-    // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
-    let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
-        use_hook(|| Rc::new(RefCell::new(None)));
-    let mic_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
-        use_hook(|| Rc::new(RefCell::new(None)));
-    let screen_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
-        use_hook(|| Rc::new(RefCell::new(None)));
-    let camera_error_handler: Rc<RefCell<Option<EventHandler<String>>>> =
-        use_hook(|| Rc::new(RefCell::new(None)));
-    let mic_error_handler: Rc<RefCell<Option<EventHandler<String>>>> =
-        use_hook(|| Rc::new(RefCell::new(None)));
-    let camera_permission_error_handler: Rc<
-        RefCell<Option<EventHandler<videocall_client::MediaPermissionsErrorState>>>,
-    > = use_hook(|| Rc::new(RefCell::new(None)));
-    let mic_permission_error_handler: Rc<
-        RefCell<Option<EventHandler<videocall_client::MediaPermissionsErrorState>>>,
-    > = use_hook(|| Rc::new(RefCell::new(None)));
-    let screen_state_handler: Rc<RefCell<Option<EventHandler<ScreenShareEvent>>>> =
-        use_hook(|| Rc::new(RefCell::new(None)));
+    // Indirection cells for callbacks: updated each render, closed over by encoder
+    // callbacks, and emptied on unmount so a late encoder event can no longer reach
+    // a handler whose scope is gone (issue #2282).
+    let camera_settings_handler = use_handler_cell::<String>();
+    let mic_settings_handler = use_handler_cell::<String>();
+    let screen_settings_handler = use_handler_cell::<String>();
+    let camera_error_handler = use_handler_cell::<String>();
+    let mic_error_handler = use_handler_cell::<String>();
+    let camera_permission_error_handler =
+        use_handler_cell::<videocall_client::MediaPermissionsErrorState>();
+    let mic_permission_error_handler =
+        use_handler_cell::<videocall_client::MediaPermissionsErrorState>();
+    let screen_state_handler = use_handler_cell::<ScreenShareEvent>();
 
     // Use Rc<RefCell<>> to hold mutable encoder state that persists across renders
     let state = use_hook(|| {
@@ -182,19 +177,6 @@ pub fn Host(
             .min(crate::components::capability_check::capability_max_simulcast_layers());
         log::info!("CameraEncoder: effective simulcast layers = {effective_max_layers}");
 
-        // AUDIO is decoupled from the VIDEO capability ceiling (issue #1082):
-        // Opus encoders run on the AudioWorklet thread (off the main thread) and
-        // cost ~1-3% of call bandwidth, so a device that is correctly capped to
-        // 1 VIDEO layer can still run the full audio ladder. Audio's ceiling is
-        // the audio ladder size itself (`max_layers_for_kind(Audio)`), still
-        // gated by the SAME runtime flag — so setting the flag to 1 disables
-        // audio simulcast too (it now defaults to 3 = ON).
-        let audio_capability_ceiling = videocall_client::max_layers_for_kind(PrefMediaKind::Audio);
-        let audio_effective_max_layers = flag_max_layers.min(audio_capability_ceiling);
-        log::info!(
-            "MicrophoneEncoder: effective audio simulcast layers = {audio_effective_max_layers} \
-             (flag={flag_max_layers}, audio_ceiling={audio_capability_ceiling})"
-        );
         if effective_max_layers > 1 {
             log::info!(
                 "SIMULCAST: publishing {effective_max_layers} video layers (default ON). \
@@ -207,26 +189,8 @@ pub fn Host(
             );
         }
 
-        let cam_settings_cell = camera_settings_handler.clone();
-        let camera_settings_cb = VcCallback::from(move |settings: String| {
-            if let Some(handler) = cam_settings_cell.borrow().as_ref() {
-                handler.call(settings);
-            }
-        });
-        let cam_error_cell = camera_error_handler.clone();
-        let camera_error_cb = VcCallback::from(move |err: String| {
-            if let Some(handler) = cam_error_cell.borrow().as_ref() {
-                handler.call(err);
-            }
-        });
-        // Camera simulcast ladder variant (issue #1768). ONE read of the
-        // `experimentalReducedLadder` runtime flag per Host mount, threaded into
-        // the encoder — which forwards this same value into its AQ controller, so
-        // the geometry the encoder emits and the uplink budget the controller
-        // sums are always the SAME rungs. Defaults to the shipped ladder when the
-        // key is absent/falsy, so this is inert unless an operator opts in.
-        let ladder_variant = camera_ladder_variant();
-        log::info!("CameraEncoder: camera simulcast ladder = {ladder_variant:?}");
+        let camera_settings_cb = camera_settings_handler.callback();
+        let camera_error_cb = camera_error_handler.callback();
         let mut camera = CameraEncoder::new(
             client.clone(),
             VIDEO_ELEMENT_ID,
@@ -234,29 +198,11 @@ pub fn Host(
             camera_settings_cb,
             camera_error_cb,
             effective_max_layers,
-            ladder_variant,
         );
-        let cam_perm_error_cell = camera_permission_error_handler.clone();
-        let camera_permission_error_cb =
-            VcCallback::from(move |err: videocall_client::MediaPermissionsErrorState| {
-                if let Some(handler) = cam_perm_error_cell.borrow().as_ref() {
-                    handler.call(err);
-                }
-            });
-        camera.set_permission_error_callback(camera_permission_error_cb);
+        camera.set_permission_error_callback(camera_permission_error_handler.callback());
 
-        let mic_settings_cell = mic_settings_handler.clone();
-        let mic_settings_cb = VcCallback::from(move |settings: String| {
-            if let Some(handler) = mic_settings_cell.borrow().as_ref() {
-                handler.call(settings);
-            }
-        });
-        let mic_error_cell = mic_error_handler.clone();
-        let mic_error_cb = VcCallback::from(move |err: String| {
-            if let Some(handler) = mic_error_cell.borrow().as_ref() {
-                handler.call(err);
-            }
-        });
+        let mic_settings_cb = mic_settings_handler.callback();
+        let mic_error_cb = mic_error_handler.callback();
         // Microphone encoder is created after camera so it can share the
         // camera's audio tier atomics (avoiding a duplicate quality manager).
         let mut microphone = create_microphone_encoder(
@@ -271,29 +217,12 @@ pub fn Host(
             // ctl-reconfig so inband FEC actually engages on a mid-call AQ
             // audio-tier drop (and disengages on recovery).
             Some(camera.shared_audio_tier_index()),
-            // Audio simulcast layer ceiling (issue #989, Phase 3c → #1082):
-            // decoupled from the VIDEO CPU ceiling (audio encodes off-main-thread
-            // and is cheap), but still gated by the SAME runtime flag. The flag
-            // defaults to 3 (audio simulcast ON); setting it to 1 collapses audio
-            // to a single layer too.
-            audio_effective_max_layers,
+            audio_published_layer_count(),
         );
-        let mic_perm_error_cell = mic_permission_error_handler.clone();
-        let mic_permission_error_cb =
-            VcCallback::from(move |err: videocall_client::MediaPermissionsErrorState| {
-                if let Some(handler) = mic_perm_error_cell.borrow().as_ref() {
-                    handler.call(err);
-                }
-            });
-        microphone.set_permission_error_callback(mic_permission_error_cb);
+        microphone.set_permission_error_callback(mic_permission_error_handler.callback());
 
-        let screen_settings_cell = screen_settings_handler.clone();
-        let screen_settings_cb = VcCallback::from(move |settings: String| {
-            if let Some(handler) = screen_settings_cell.borrow().as_ref() {
-                handler.call(settings);
-            }
-        });
-        let screen_state_cell = screen_state_handler.clone();
+        let screen_settings_cb = screen_settings_handler.callback();
+        let screen_state_forward = screen_state_handler.callback();
         let screen_state_cb = VcCallback::from(move |event: ScreenShareEvent| {
             match &event {
                 ScreenShareEvent::Started(stream) => {
@@ -303,9 +232,7 @@ pub fn Host(
                     detach_screen_preview();
                 }
             }
-            if let Some(handler) = screen_state_cell.borrow().as_ref() {
-                handler.call(event);
-            }
+            screen_state_forward.emit(event);
         });
         let mut screen = ScreenEncoder::new(
             client.clone(),
@@ -503,16 +430,31 @@ pub fn Host(
         }))
     });
 
+    // Issue #2458: `state` is self-referential (`media_devices.on_loaded` is an
+    // `Rc<dyn Fn>` stored in `HostState` capturing `state`), so the #1108
+    // encoder-drop exit never fires. Cancel the AQ loops explicitly instead.
+    let aq_cancel = use_hook({
+        let state = state.clone();
+        move || {
+            let s = state.borrow();
+            AqLoopCancelTokens {
+                camera: s.camera.control_loop_cancel_token(),
+                screen: s.screen.control_loop_cancel_token(),
+            }
+        }
+    });
+    use_aq_loop_teardown(aq_cancel);
+
     // Update the indirection cells so encoder callbacks route to the current EventHandlers.
     // This runs on every render to keep them in sync with the latest prop values.
-    *camera_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
-    *mic_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
-    *screen_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
-    *camera_error_handler.borrow_mut() = Some(on_camera_error);
-    *mic_error_handler.borrow_mut() = Some(on_microphone_error);
-    *camera_permission_error_handler.borrow_mut() = Some(on_camera_permission_error);
-    *mic_permission_error_handler.borrow_mut() = Some(on_microphone_permission_error);
-    *screen_state_handler.borrow_mut() = Some(on_screen_share_state);
+    camera_settings_handler.set(on_encoder_settings_update);
+    mic_settings_handler.set(on_encoder_settings_update);
+    screen_settings_handler.set(on_encoder_settings_update);
+    camera_error_handler.set(on_camera_error);
+    mic_error_handler.set(on_microphone_error);
+    camera_permission_error_handler.set(on_camera_permission_error);
+    mic_permission_error_handler.set(on_microphone_permission_error);
+    screen_state_handler.set(on_screen_share_state);
 
     // Initialize devices once
     {
@@ -748,36 +690,13 @@ pub fn Host(
             if share_screen {
                 s.screen.set_enabled(true);
 
-                // Adaptive initial tier selection: inspect network signals at
-                // the moment screen sharing starts to choose a conservative
-                // starting tier that gives a readable first frame on constrained
-                // uplinks without waiting for the PID loop to ramp down.
-                //
-                // Issue #2179: this is only the network-imposed FLOOR. The
-                // encoder composes it with the capture's real resolution once
-                // getDisplayMedia resolves (`resolve_initial_screen_tier`), so a
-                // share on a healthy link starts at the resolution actually
-                // being shared instead of a flat 1080p ceiling. The capture size
-                // is not knowable here — the browser picker has not run yet —
-                // which is why the composition lives in the encoder.
-                let rtt_ms = client.average_rtt_ms();
-                let camera_tier_index = client.camera_tier_index();
-                let network_tier = initial_screen_tier(rtt_ms, camera_tier_index);
-
-                log::info!(
-                    "Start screen share encoder: rtt={:?}ms, camera_tier={:?}, network_floor_tier={}",
-                    rtt_ms,
-                    camera_tier_index,
-                    network_tier
-                );
-
                 // Check if the onclick handler already acquired a MediaStream
                 // (required for Safari which mandates getDisplayMedia be called
                 // synchronously within a user gesture handler).
                 let maybe_stream = pre_acquired_stream.borrow_mut().take();
                 if let Some(stream) = maybe_stream {
                     log::info!("Start screen share encoder with pre-acquired stream");
-                    s.screen.start_with_stream(stream, network_tier);
+                    s.screen.start_with_stream(stream);
                 } else {
                     // Fallback: let the encoder call getDisplayMedia itself.
                     // This path works on Chrome/Firefox where the gesture
@@ -785,7 +704,7 @@ pub fn Host(
                     log::info!("Start screen share encoder (encoder-acquired stream)");
                     let state_clone = state.clone();
                     Timeout::new(1000, move || {
-                        state_clone.borrow_mut().screen.start(network_tier);
+                        state_clone.borrow_mut().screen.start();
                     })
                     .forget();
                 }
@@ -1104,13 +1023,13 @@ pub fn Host(
             let flag = experimental_simulcast_max_layers();
             let video_capability =
                 crate::components::capability_check::capability_max_simulcast_layers();
-            let audio_capability = videocall_client::max_layers_for_kind(PrefMediaKind::Audio);
+            let audio_published = state.borrow().microphone.effective_audio_layers();
             let summary = SimulcastSummary {
                 flag,
                 video_capability,
-                audio_capability,
+                audio_capability: audio_published,
                 effective_video: flag.min(video_capability),
-                effective_audio: flag.min(audio_capability),
+                effective_audio: audio_published,
             };
             let state_v = state.clone();
             let state_s = state.clone();
@@ -1178,16 +1097,12 @@ pub fn Host(
             as usize
     });
 
-    // Effective AUDIO ladder depth for the SEND audio layer-count slider. UNLIKE
-    // video/screen this is NOT CPU-clamped: audio Opus encode runs off the main
-    // thread and is cheap, so the ceiling is just `min(flag, audio ladder size)`
-    // (`max_layers_for_kind(Audio)` == 3). So audio typically shows the full
-    // 3-layer ladder even on weak runners that clamp video to 1. Same formula as
-    // the mic encoder setup (host.rs ~L146). Computed once per mount.
-    let audio_layer_max: usize = use_hook(|| {
-        experimental_simulcast_max_layers()
-            .min(videocall_client::max_layers_for_kind(PrefMediaKind::Audio)) as usize
-    });
+    // AUDIO ladder depth for the SEND audio layer-count slider, read back from the
+    // mic encoder so the control can never offer positions the publisher does not
+    // emit.
+    let mic_state = state.clone();
+    let audio_layer_max =
+        use_hook(move || mic_state.borrow().microphone.effective_audio_layers() as usize);
 
     // Bundle the Performance controls into ONE handle and publish it to the parent
     // (attendants) so the Diagnostics drawer — a sibling of `Host` that can't
@@ -1212,9 +1127,8 @@ pub fn Host(
             read_screen_snapshot: read_screen_snap,
             received_reader: recv_reader,
             diagnostics_reader: diag_reader,
-            // Video/screen share the CPU-derived effective ceiling; audio uses its
-            // own (non-CPU-clamped) ladder depth. Same values the modal used to
-            // forward before the panel moved into the drawer.
+            // Video/screen share the CPU-derived effective ceiling; audio is the mic
+            // encoder's published count.
             video_layer_max: send_layer_max,
             screen_layer_max: send_layer_max,
             audio_layer_max,
@@ -1367,6 +1281,24 @@ pub fn Host(
     }
 }
 
+/// The AQ control-loop cancellation handles `Host` trips on unmount (issue #2458).
+#[derive(Clone)]
+struct AqLoopCancelTokens {
+    camera: AqControlLoopCancel,
+    screen: AqControlLoopCancel,
+}
+
+impl AqLoopCancelTokens {
+    fn cancel_all(&self) {
+        self.camera.cancel();
+        self.screen.cancel();
+    }
+}
+
+fn use_aq_loop_teardown(tokens: AqLoopCancelTokens) {
+    use_drop(move || tokens.cancel_all());
+}
+
 struct HostState {
     camera: CameraEncoder,
     microphone: Box<dyn MicrophoneEncoderTrait>,
@@ -1432,6 +1364,88 @@ mod tests {
                 microphone_kbps: AUDIO_QUALITY_TIERS[0].bitrate_kbps,
                 screen_kbps: SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].ideal_bitrate_kbps,
             }
+        );
+    }
+
+    /// #2458. MUTATION: drop either `cancel()` from `cancel_all` and this fails.
+    #[test]
+    fn cancel_all_trips_both_camera_and_screen_tokens() {
+        let tokens = AqLoopCancelTokens {
+            camera: AqControlLoopCancel::new(),
+            screen: AqControlLoopCancel::new(),
+        };
+        let camera_seen_by_loop = tokens.camera.clone();
+        let screen_seen_by_loop = tokens.screen.clone();
+        assert!(!camera_seen_by_loop.is_cancelled());
+        assert!(!screen_seen_by_loop.is_cancelled());
+
+        tokens.cancel_all();
+
+        assert!(
+            camera_seen_by_loop.is_cancelled(),
+            "camera AQ loop not cancelled"
+        );
+        assert!(
+            screen_seen_by_loop.is_cancelled(),
+            "screen AQ loop not cancelled"
+        );
+    }
+
+    /// #2458. MUTATION: delete the `use_drop` from `use_aq_loop_teardown` and
+    /// this fails — the tokens outlive the scope uncancelled.
+    #[test]
+    fn unmount_teardown_cancels_both_camera_and_screen_aq_loops() {
+        thread_local! {
+            static PROBE_TOKENS: RefCell<Option<AqLoopCancelTokens>> =
+                const { RefCell::new(None) };
+        }
+
+        #[allow(non_snake_case)]
+        fn TeardownProbe() -> Element {
+            use_aq_loop_teardown(
+                PROBE_TOKENS.with(|t| t.borrow_mut().take().expect("seeded before mount")),
+            );
+            rsx! { div {} }
+        }
+
+        let tokens = AqLoopCancelTokens {
+            camera: AqControlLoopCancel::new(),
+            screen: AqControlLoopCancel::new(),
+        };
+        let camera_seen_by_loop = tokens.camera.clone();
+        let screen_seen_by_loop = tokens.screen.clone();
+        PROBE_TOKENS.with(|t| *t.borrow_mut() = Some(tokens));
+
+        let mut vdom = VirtualDom::new(TeardownProbe);
+        vdom.rebuild_in_place();
+        assert!(
+            !camera_seen_by_loop.is_cancelled(),
+            "a mounted scope must leave the camera AQ loop running"
+        );
+        assert!(
+            !screen_seen_by_loop.is_cancelled(),
+            "a mounted scope must leave the screen AQ loop running"
+        );
+
+        drop(vdom);
+
+        assert!(
+            camera_seen_by_loop.is_cancelled(),
+            "issue 2458: unmount must cancel the camera AQ loop"
+        );
+        assert!(
+            screen_seen_by_loop.is_cancelled(),
+            "issue 2458: unmount must cancel the screen AQ loop"
+        );
+    }
+
+    /// #2458. MUTATION: delete the call from `Host` and this fails; no unit test
+    /// can mount `Host` itself (it builds three real encoders).
+    #[test]
+    fn host_installs_the_aq_loop_teardown_on_its_own_scope() {
+        assert!(
+            include_str!("host.rs").contains(concat!("use_aq_loop_teardown", "(aq_cancel);")),
+            "issue 2458: Host must install the scope-owned AQ teardown"
         );
     }
 }

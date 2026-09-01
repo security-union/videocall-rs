@@ -20,7 +20,8 @@ import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
  * `--auto-select-desktop-capture-source` flag to auto-accept the picker
  * in CI-compatible headless mode.  If the flag is unavailable the screen
  * share button click will not produce a stream and the split layout will
- * not activate — the tests document this and skip gracefully.
+ * not activate. UNTAGGED tests skip on that; the `@bvt1`-tagged ones must
+ * assert instead, because a skip counts as a pass in the per-PR gate.
  *
  * Mock peers are used to verify many-participant rendering and scroll
  * behavior.  Mock peers require the Dioxus UI to be built with
@@ -34,7 +35,6 @@ const BROWSER_ARGS = [
   "--origin-to-force-quic-on=127.0.0.1:4433",
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
-  "--disable-gpu",
   "--disable-dev-shm-usage",
   "--renderer-process-limit=1",
   // Auto-accept getDisplayMedia() system picker for screen sharing.
@@ -313,17 +313,11 @@ test.describe("Screen share right panel layout", () => {
       // Guest starts screen sharing
       const shareActivated = await startScreenShare(guestPage, hostPage);
 
-      if (!shareActivated) {
-        // getDisplayMedia() could not be auto-accepted in this environment.
-        // Skip the test gracefully with a descriptive message.
-        test.skip(
-          true,
-          "Screen share could not be auto-accepted. " +
-            "The --auto-select-desktop-capture-source flag may not be supported " +
-            "in this Chromium build or display environment.",
-        );
-        return;
-      }
+      expect(
+        shareActivated,
+        "guest screen share must reach the host's split layout (.split-screen-tile); " +
+          "mockDisplayMedia is injected for this test, so a false here is a regression",
+      ).toBe(true);
 
       // ---- ASSERT: split layout is active ----
       // The #grid-container should now be a flex container with two children:
@@ -683,10 +677,10 @@ test.describe("Screen share right panel layout", () => {
       await hostPage.waitForTimeout(3000);
 
       const shareActivated = await startScreenShare(guestPage, hostPage);
-      if (!shareActivated) {
-        test.skip(true, "Screen share could not be auto-accepted; mockDisplayMedia not effective.");
-        return;
-      }
+      expect(
+        shareActivated,
+        "guest screen share must reach the host's split layout; mockDisplayMedia is injected here",
+      ).toBe(true);
 
       // Let the split layout settle.
       await hostPage.waitForTimeout(2000);
@@ -1186,6 +1180,7 @@ test.describe("Screen share right panel layout", () => {
       meetingId,
       "SSPinVarHost",
       "SSPinVarGuest",
+      { mockDisplayMedia: true },
     );
 
     // Read the `--tile-h` custom property (px) set inline on `#grid-container`.
@@ -1204,10 +1199,10 @@ test.describe("Screen share right panel layout", () => {
         has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
       });
       const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
-      if (!mockPeersAvailable) {
-        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
-        return;
-      }
+      expect(
+        mockPeersAvailable,
+        'Mock Peers control must be present. docker/docker-compose.e2e.yaml sets MOCK_PEERS_ENABLED=true, so its absence in CI is a regression; locally set mockPeersEnabled: "true" in config.js.',
+      ).toBe(true);
 
       // Inflate the host's grid to many tiles (1 real guest + 10 mocks = 11),
       // so the grid `--tile-h` collapses below the maximized value.
@@ -1234,10 +1229,10 @@ test.describe("Screen share right panel layout", () => {
 
       // Guest starts screen share → host viewer switches to the split layout.
       const shareActivated = await startScreenShare(guestPage, hostPage);
-      if (!shareActivated) {
-        test.skip(true, "Screen share could not be auto-accepted.");
-        return;
-      }
+      expect(
+        shareActivated,
+        "guest screen share must reach the host's split layout (.split-screen-tile)",
+      ).toBe(true);
       await expect(hostPage.locator(".split-peer-tile").first()).toBeVisible({ timeout: 15_000 });
       await hostPage.waitForTimeout(1500);
 

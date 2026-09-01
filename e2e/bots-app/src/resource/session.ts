@@ -24,14 +24,19 @@ import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { taggedLine } from "../log-line";
 import { reapChild, type ReapHandle } from "../control/reap-child";
 import { buildBaseSshArgs, shellEscape, type SshHost } from "../control/ssh-hosts";
+import type { ArrivalSpread } from "./arrival";
 import { formatDerivedCsv } from "./csv";
 import { deriveSamples } from "./derive";
 import { type FpsStats } from "./fps";
 import { parseRawCsv } from "./proc";
 import { formatResourceReport, type ReportInput } from "./report";
 import { evaluateVerdict, summarize, type ResourceSummary, type ResourceVerdict } from "./verdict";
+
+/** Binds `taggedLine`'s label for this module's single `[resource]` marker. */
+const resourceLine = (msg: string): string => taggedLine("resource", msg);
 
 /** Absolute path to the shell sampler shipped alongside this package. */
 export function resolveSamplerScriptPath(): string {
@@ -172,17 +177,19 @@ export class ResourceCaptureSession {
       });
       child.on("error", (e: Error) => {
         this.startError = e.message;
-        console.warn(`[resource] sampler spawn error: ${e.message} — capture disabled`);
+        console.warn(resourceLine(`sampler spawn error: ${e.message} — capture disabled`));
       });
       child.unref();
       this.child = child;
       console.log(
-        `[resource] sampling host every ${this.intervalSec}s → ${this.rawCsvPath} (pid ${child.pid ?? "?"})`,
+        resourceLine(
+          `sampling host every ${this.intervalSec}s → ${this.rawCsvPath} (pid ${child.pid ?? "?"})`,
+        ),
       );
     } catch (e) {
       this.startError = (e as Error).message;
       console.warn(
-        `[resource] could not start sampler: ${(e as Error).message} — capture disabled`,
+        resourceLine(`could not start sampler: ${(e as Error).message} — capture disabled`),
       );
     }
   }
@@ -193,14 +200,18 @@ export class ResourceCaptureSession {
    * (spawn failed, or non-Linux box with no rows) — the caller treats that as
    * "no verdict available", not an error.
    */
-  async finalize(fpsByBot: ReadonlyMap<string, FpsStats>): Promise<ResourceCaptureResult | null> {
+  async finalize(
+    fpsByBot: ReadonlyMap<string, FpsStats>,
+    arrival: ArrivalSpread | null,
+    joinedBots: number | null,
+  ): Promise<ResourceCaptureResult | null> {
     await this.stopChild();
     let raw: string;
     try {
       raw = await readFile(this.rawCsvPath, "utf8");
     } catch {
       if (this.startError === null) {
-        console.warn(`[resource] no raw CSV at ${this.rawCsvPath} — capture produced nothing`);
+        console.warn(resourceLine(`no raw CSV at ${this.rawCsvPath} — capture produced nothing`));
       }
       return null;
     }
@@ -210,6 +221,8 @@ export class ResourceCaptureSession {
       derivedCsvPath: this.derivedCsvPath,
       reportPath: this.reportPath,
       fpsByBot,
+      arrival,
+      joinedBots,
     });
   }
 
@@ -239,15 +252,19 @@ export async function deriveReport(args: {
   derivedCsvPath: string;
   reportPath: string;
   fpsByBot: ReadonlyMap<string, FpsStats>;
+  arrival: ArrivalSpread | null;
+  /** Bots seen to join; `null` when this process does not observe joins. */
+  joinedBots: number | null;
 }): Promise<ResourceCaptureResult> {
   const parsed = parseRawCsv(args.rawCsvText);
   const derived = deriveSamples(parsed);
   const summary = summarize(derived);
-  const verdict = evaluateVerdict(derived, args.fpsByBot);
+  const verdict = evaluateVerdict(derived, args.fpsByBot, args.joinedBots);
   const reportInput: ReportInput = {
     summary,
     verdict,
     fpsByBot: args.fpsByBot,
+    arrival: args.arrival,
     supported: !parsed.unsupported,
     sysstatMissing: parsed.meta ? !(parsed.meta.haveMpstat && parsed.meta.havePidstat) : false,
     rawCsvPath: args.rawCsvPath,
@@ -328,7 +345,7 @@ export function startRemoteSampler(
   child.stdin?.end();
   child.stderr?.on("data", (b: Buffer) => {
     const msg = b.toString("utf8").trim();
-    if (msg !== "") console.warn(`[resource] remote sampler (${opts.host.label}): ${msg}`);
+    if (msg !== "") console.warn(resourceLine(`remote sampler (${opts.host.label}): ${msg}`));
   });
 
   return {
@@ -363,7 +380,7 @@ export function startRemoteSampler(
         try {
           child2 = spawnImpl("ssh", catArgs, { stdio: ["ignore", "pipe", "pipe"] });
         } catch (e) {
-          console.warn(`[resource] remote CSV retrieve spawn failed: ${(e as Error).message}`);
+          console.warn(resourceLine(`remote CSV retrieve spawn failed: ${(e as Error).message}`));
           resolve(0);
           return;
         }
@@ -469,8 +486,10 @@ export function startRemoteSampler(
           closeOut((err) => {
             if (err) {
               console.warn(
-                `[resource] remote CSV write to ${localPath} failed while flushing: ` +
-                  `${err.message} — reporting 0 bytes rather than a truncated CSV`,
+                resourceLine(
+                  `remote CSV write to ${localPath} failed while flushing: ` +
+                    `${err.message} — reporting 0 bytes rather than a truncated CSV`,
+                ),
               );
               resolve(0);
               return;
@@ -486,9 +505,11 @@ export function startRemoteSampler(
           if (stallTimer !== undefined) clearTimeout(stallTimer);
           stallTimer = setTimeout(() => {
             console.warn(
-              `[resource] remote CSV retrieve from ${opts.host.label} stalled — no data for ` +
-                `${stallMs}ms (${bytesSeen} bytes received); killing the ssh session. The transport ` +
-                `was alive (ServerAlive kept answering), so the remote \`cat\` itself wedged.`,
+              resourceLine(
+                `remote CSV retrieve from ${opts.host.label} stalled — no data for ` +
+                  `${stallMs}ms (${bytesSeen} bytes received); killing the ssh session. The transport ` +
+                  `was alive (ServerAlive kept answering), so the remote \`cat\` itself wedged.`,
+              ),
             );
             // Resolve FIRST, then reap: `settle` runs `clearTimers`, so
             // arming the reaper before it would cancel the escalation.
@@ -513,7 +534,7 @@ export function startRemoteSampler(
         // guard has already fired.
         out.on("error", (e: Error) => {
           if (writeError === null) writeError = e;
-          console.warn(`[resource] remote CSV write to ${localPath} failed: ${e.message}`);
+          console.warn(resourceLine(`remote CSV write to ${localPath} failed: ${e.message}`));
           if (settled) return;
           settled = true;
           clearTimers();
@@ -523,7 +544,7 @@ export function startRemoteSampler(
           startReap();
         });
         child2.on("error", (e: Error) => {
-          console.warn(`[resource] remote CSV retrieve failed: ${e.message}`);
+          console.warn(resourceLine(`remote CSV retrieve failed: ${e.message}`));
           settle(0);
         });
         // `close`, NOT `exit` — this is the ROOT-CAUSE fix for a whole class of
@@ -561,8 +582,10 @@ export function startRemoteSampler(
             // Name the actual ssh failure rather than a bare exit code — this is
             // why stderr is captured above and not just drained.
             console.warn(
-              `[resource] remote CSV retrieve from ${opts.host.label} exited ${code}` +
-                (stderrTail.trim() ? `: ${stderrTail.trim()}` : ""),
+              resourceLine(
+                `remote CSV retrieve from ${opts.host.label} exited ${code}` +
+                  (stderrTail.trim() ? `: ${stderrTail.trim()}` : ""),
+              ),
             );
           }
           settle(code === 0 ? bytesSeen : 0);
@@ -641,10 +664,12 @@ export class RemoteResourceManager {
         retrieveKillGraceMs: this.opts.retrieveKillGraceMs,
       });
       this.byHost.set(host.label, handle);
-      console.log(`[resource] remote sampling ${host.label} (${host.user}@${host.host})`);
+      console.log(resourceLine(`remote sampling ${host.label} (${host.user}@${host.host})`));
     } catch (e) {
       this.byHost.delete(host.label);
-      console.warn(`[resource] remote sampler for ${host.label} failed: ${(e as Error).message}`);
+      console.warn(
+        resourceLine(`remote sampler for ${host.label} failed: ${(e as Error).message}`),
+      );
     }
   }
 
@@ -668,7 +693,7 @@ export class RemoteResourceManager {
         mkdirSync(join(this.opts.runDir, "resource"), { recursive: true });
         const bytes = await handle.retrieve(rawCsvPath);
         if (bytes === 0) {
-          console.warn(`[resource] no remote CSV retrieved from ${hostLabel}`);
+          console.warn(resourceLine(`no remote CSV retrieved from ${hostLabel}`));
           continue;
         }
         const rawText = await readFile(rawCsvPath, "utf8");
@@ -686,12 +711,17 @@ export class RemoteResourceManager {
             `${this.opts.label}-${hostLabel}-summary.txt`,
           ),
           fpsByBot: new Map(),
+          // A remote box's bots join out of this process, like its fps.
+          arrival: null,
+          joinedBots: null,
         });
-        console.log(`[resource] remote host ${hostLabel}:`);
+        console.log(resourceLine(`remote host ${hostLabel}:`));
         console.log(result.reportText);
         results.push(result);
       } catch (e) {
-        console.warn(`[resource] remote finalize for ${hostLabel} failed: ${(e as Error).message}`);
+        console.warn(
+          resourceLine(`remote finalize for ${hostLabel} failed: ${(e as Error).message}`),
+        );
       }
     }
     return results;
@@ -747,7 +777,7 @@ export async function readSamplerScript(): Promise<string> {
   try {
     return await readFile(resolveSamplerScriptPath(), "utf8");
   } catch (e) {
-    console.warn(`[resource] could not read sampler script: ${(e as Error).message}`);
+    console.warn(resourceLine(`could not read sampler script: ${(e as Error).message}`));
     return "";
   }
 }

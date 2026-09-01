@@ -81,6 +81,10 @@ thread_local! {
     /// gated off).
     static INJECT_DECODER: RefCell<Option<videocall_codecs::decoder::WasmDecoder>> =
         const { RefCell::new(None) };
+    static COLD_INJECT_DECODER: RefCell<Option<videocall_codecs::decoder::WasmDecoder>> =
+        const { RefCell::new(None) };
+    /// Sequence high-water mark across the COLD path's repeated bursts.
+    static COLD_SEQ_BASE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// JS global the spec polls for captured `freshness_skip` events.
@@ -100,6 +104,24 @@ const KEYFRAME_REQUESTS_GLOBAL: &str = "__videocall_keyframe_requests";
 /// JS global the spec calls to inject a stale backlog.
 #[cfg(target_arch = "wasm32")]
 const INJECT_GLOBAL: &str = "__videocall_inject_stale_video_backlog";
+
+#[cfg(target_arch = "wasm32")]
+const INJECT_FROM_PEER: &str = "inject-local";
+#[cfg(target_arch = "wasm32")]
+const INJECT_TO_PEER: &str = "inject-peer";
+
+#[cfg(target_arch = "wasm32")]
+const COLD_INJECT_GLOBAL: &str = "__videocall_inject_stale_video_backlog_cold";
+
+/// Issue 2572: separates a boot failure from a replay failure for the spec.
+#[cfg(target_arch = "wasm32")]
+const COLD_BOOT_STATE_GLOBAL: &str = "__videocall_cold_worker_boot_state";
+
+/// Distinct from the warm pair because the collector reads one global bus.
+#[cfg(target_arch = "wasm32")]
+const COLD_FROM_PEER: &str = "cold-local";
+#[cfg(target_arch = "wasm32")]
+const COLD_TO_PEER: &str = "cold-peer";
 
 /// Register the test-only freshness injection + observation hooks on `window`.
 ///
@@ -147,14 +169,6 @@ pub fn register_freshness_inject_hooks() {
     // Subscriber: append every freshness_skip DiagEvent to the capture array.
     spawn_freshness_skip_collector();
 
-    // Pre-warm the test decoder NOW (at registration, well before the spec calls
-    // the inject hook) so its Web Worker has finished its async wasm boot and
-    // registered its `onmessage` handler by injection time. The trunk worker
-    // loader (`worker_decoder_loader.js`) instantiates the wasm asynchronously,
-    // and messages posted to the worker before its `main()` runs `set_onmessage`
-    // are dropped (verified empirically — a cold-worker injection lost all 5
-    // frames; a warm-worker injection tripped the deadline cleanly). Pre-warming
-    // eliminates that race so a single injection from the spec is deterministic.
     ensure_test_decoder();
 
     // window.__videocall_inject_stale_video_backlog(num_frames, age_ms):
@@ -170,6 +184,49 @@ pub fn register_freshness_inject_hooks() {
     );
     // Leak the closure so the JS reference stays valid for the page lifetime.
     inject_cb.forget();
+
+    // window.__videocall_inject_stale_video_backlog_cold(num_frames, age_ms) — issue 1741.
+    let cold_cb = Closure::<dyn Fn(f64)>::new(|num_frames: f64| {
+        inject_stale_video_backlog_cold(num_frames as u32);
+    });
+    let _ = js_sys::Reflect::set(
+        &window,
+        &JsValue::from_str(COLD_INJECT_GLOBAL),
+        cold_cb.as_ref().unchecked_ref(),
+    );
+    cold_cb.forget();
+
+    let boot_state_cb = Closure::<dyn Fn() -> JsValue>::new(cold_worker_boot_state);
+    let _ = js_sys::Reflect::set(
+        &window,
+        &JsValue::from_str(COLD_BOOT_STATE_GLOBAL),
+        boot_state_cb.as_ref().unchecked_ref(),
+    );
+    boot_state_cb.forget();
+}
+
+/// `null` until the first cold injection has constructed the decoder.
+#[cfg(target_arch = "wasm32")]
+fn cold_worker_boot_state() -> wasm_bindgen::JsValue {
+    use wasm_bindgen::JsValue;
+    COLD_INJECT_DECODER.with(|cell| {
+        let slot = cell.borrow();
+        let Some(decoder) = slot.as_ref() else {
+            return JsValue::NULL;
+        };
+        let obj = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("handshake_seen"),
+            &JsValue::from_bool(decoder.worker_handshake_seen()),
+        );
+        let _ = js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("queue_dropped"),
+            &JsValue::from_bool(decoder.boot_queue_dropped()),
+        );
+        obj.into()
+    })
 }
 
 /// Native stub: no `window`/worker, nothing to register. Keeps the call site
@@ -223,9 +280,13 @@ fn spawn_freshness_skip_collector() {
             // head_age_ms. Absent on pre-#1851 events → stays NaN, which the e2e `>= 0` assertion
             // rejects, so a missing metric surfaces as a failure rather than a spurious 0.
             let mut tick_gap_ms = f64::NAN;
+            let mut from_peer = String::new();
+            let mut to_peer = String::new();
             for m in &evt.metrics {
                 match (m.name, &m.value) {
                     ("head_age_ms", MetricValue::F64(v)) => head_age_ms = *v,
+                    ("from_peer", MetricValue::Text(v)) => from_peer = v.to_string(),
+                    ("to_peer", MetricValue::Text(v)) => to_peer = v.to_string(),
                     // #1045 encodes keyframe_seq as i64 with -1 for the keyframe-less case.
                     ("keyframe_seq", MetricValue::I64(v)) => keyframe_seq = *v,
                     ("dropped", MetricValue::U64(v)) => dropped = *v,
@@ -272,6 +333,16 @@ fn spawn_freshness_skip_collector() {
                 &obj,
                 &JsValue::from_str("tick_gap_ms"),
                 &JsValue::from_f64(tick_gap_ms),
+            );
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("from_peer"),
+                &JsValue::from_str(&from_peer),
+            );
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("to_peer"),
+                &JsValue::from_str(&to_peer),
             );
 
             if let Some(window) = web_sys::window() {
@@ -330,75 +401,136 @@ fn record_keyframe_request(head_age_ms: f64) {
 /// posts a `freshness_skip` (issue #1045) — captured by the collector above.
 #[cfg(target_arch = "wasm32")]
 fn inject_stale_video_backlog(num_frames: u32, age_ms: f64) {
-    use videocall_codecs::frame::{FrameBuffer, FrameCodec, FrameType, VideoFrame};
-
-    // At least one frame, default to a small backlog if the spec passes 0.
-    let num_frames = num_frames.max(1);
+    use videocall_codecs::messages::StreamContext;
 
     ensure_test_decoder();
 
     INJECT_DECODER.with(|cell| {
         let slot = cell.borrow();
-        let Some(decoder) = slot.as_ref() else {
-            return;
-        };
-
-        let now_ms = js_sys::Date::now() as u128;
-        let arrival_time_ms = now_ms.saturating_sub(age_ms.max(0.0) as u128);
-
-        // Inject ONLY delta frames (no keyframe): the buffer waits for a keyframe and
-        // never releases/decodes the deltas. Once the back-dated head ages past the
-        // deadline, the keyframe-less eviction path fires (keyframe_seq → -1).
-        // Sequence numbers start at 1 (0 can collide with the "never decoded" sentinel
-        // logic in some buffers); contiguous so they form a single backlog.
-        for i in 0..num_frames {
-            let frame = FrameBuffer::new(
-                VideoFrame {
-                    sequence_number: (i + 1) as u64,
-                    frame_type: FrameType::DeltaFrame,
-                    codec: FrameCodec::Vp9Profile0Level10Bit8,
-                    data: Vec::new(),
-                    timestamp: 0.0,
+        if let Some(decoder) = slot.as_ref() {
+            inject_backlog(
+                decoder,
+                num_frames,
+                age_ms,
+                0,
+                &StreamContext {
+                    from_peer: INJECT_FROM_PEER.to_string(),
+                    to_peer: INJECT_TO_PEER.to_string(),
                 },
-                arrival_time_ms,
             );
-            decoder.inject_stale_frame(frame);
         }
     });
 }
 
-/// Construct the self-contained test decoder (spawning its Web Worker) once and
-/// cache it in [`INJECT_DECODER`]. Idempotent. Called at hook registration to
-/// PRE-WARM the worker — the trunk worker loader instantiates the wasm
-/// asynchronously and messages posted before the worker's `main()` runs
-/// `set_onmessage` are dropped, so the worker must be booted before the first
-/// injection (see the call site in `register_freshness_inject_hooks`).
+/// Must exceed the spec's `COLD_BOOT_TIMEOUT_MS`.
+#[cfg(target_arch = "wasm32")]
+const COLD_HARNESS_BOOT_REPLAY_TTL_MS: f64 = 30_000.0;
+
+/// Issue 1741 harness: constructs the `WasmDecoder` and injects into it in ONE synchronous block,
+/// so `main()` cannot have run `set_onmessage`.
+#[cfg(target_arch = "wasm32")]
+fn inject_stale_video_backlog_cold(num_frames: u32) {
+    use videocall_codecs::messages::StreamContext;
+
+    COLD_INJECT_DECODER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(build_test_decoder(false));
+        }
+        if let Some(decoder) = slot.as_ref() {
+            let context = StreamContext {
+                from_peer: COLD_FROM_PEER.to_string(),
+                to_peer: COLD_TO_PEER.to_string(),
+            };
+            let base = COLD_SEQ_BASE.with(|c| {
+                let base = c.get();
+                c.set(base + u64::from(num_frames.max(1)));
+                base
+            });
+            // `push_frame`, not `inject_stale_frame`: this must drive the PRODUCTION method, so
+            // deleting its `SetContext` re-emit fails this test. The worker stamps arrival with
+            // its own clock, so the delta-only head ages past MAX_PLAYOUT_AGE_MS unaided.
+            let now_ms = js_sys::Date::now() as u128;
+            for i in 0..num_frames.max(1) {
+                decoder.push_frame(
+                    delta_frame(base + u64::from(i) + 1, now_ms),
+                    Some(context.clone()),
+                );
+            }
+        }
+    });
+}
+
+/// Contiguous back-dated deltas, so the keyframe-less eviction is what fires.
+#[cfg(target_arch = "wasm32")]
+fn inject_backlog(
+    decoder: &videocall_codecs::decoder::WasmDecoder,
+    num_frames: u32,
+    age_ms: f64,
+    seq_base: u64,
+    context: &videocall_codecs::messages::StreamContext,
+) {
+    let now_ms = js_sys::Date::now() as u128;
+    let arrival_time_ms = now_ms.saturating_sub(age_ms.max(0.0) as u128);
+
+    for i in 0..num_frames.max(1) {
+        decoder.inject_stale_frame(
+            delta_frame(seq_base + u64::from(i) + 1, arrival_time_ms),
+            Some(context.clone()),
+        );
+    }
+}
+
+/// A delta frame with no payload. Delta-only means the buffer never releases, so the
+/// keyframe-less eviction is what eventually fires.
+#[cfg(target_arch = "wasm32")]
+fn delta_frame(
+    sequence_number: u64,
+    arrival_time_ms: u128,
+) -> videocall_codecs::frame::FrameBuffer {
+    use videocall_codecs::frame::{FrameBuffer, FrameCodec, FrameType, VideoFrame};
+
+    FrameBuffer::new(
+        VideoFrame {
+            sequence_number,
+            frame_type: FrameType::DeltaFrame,
+            codec: FrameCodec::Vp9Profile0Level10Bit8,
+            data: Vec::new(),
+            timestamp: 0.0,
+        },
+        arrival_time_ms,
+    )
+}
+
 #[cfg(target_arch = "wasm32")]
 fn ensure_test_decoder() {
-    use videocall_codecs::decoder::{VideoCodec, WasmDecoder};
-
     INJECT_DECODER.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.is_some() {
-            return;
+        if slot.is_none() {
+            *slot = Some(build_test_decoder(true));
         }
-        // Mirror the production peer-decode constructor (peer_decoder.rs): same
-        // codec, same `new_with_video_frame_callback` path that wires
-        // `handle_worker_diag_message` (which re-broadcasts the freshness_skip).
-        // The frame callback is a no-op: injected frames are never decoded (the
-        // keyframe-less deadline evicts them first). The proactive keyframe-request
-        // callback records each request onto KEYFRAME_REQUESTS_GLOBAL (issue 1899 /
-        // discussion 1960) so an e2e spec can observe the stream-open one-shot PLI
-        // (fix (a)) firing at insert time, well before the freshness deadline.
-        let decoder = WasmDecoder::new_with_video_frame_callback(
-            VideoCodec::Vp9Profile0Level10Bit8,
-            Box::new(|_frame| {}),
-            Box::new(record_keyframe_request),
-            // Issue #1641: this #1022/#1045 inject harness exercises the camera freshness path,
-            // so tag it as camera ("VIDEO" / MEDIA_TYPE_CAMERA) — the value health_reporter
-            // treats as non-screen.
-            crate::decode::peer_decoder::MEDIA_TYPE_CAMERA,
-        );
-        *slot = Some(decoder);
     });
+}
+
+/// Mirrors the production peer-decode constructor (peer_decoder.rs). The issue-1741 cold decoder
+/// passes `record_requests: false` because it shares one page, and one array, with the warm one.
+#[cfg(target_arch = "wasm32")]
+fn build_test_decoder(record_requests: bool) -> videocall_codecs::decoder::WasmDecoder {
+    use videocall_codecs::decoder::{VideoCodec, WasmDecoder};
+
+    let on_request: Box<dyn Fn(f64)> = if record_requests {
+        Box::new(record_keyframe_request)
+    } else {
+        Box::new(|_head_age_ms| {})
+    };
+    WasmDecoder::new_with_video_frame_callback(
+        VideoCodec::Vp9Profile0Level10Bit8,
+        Box::new(|_frame| {}),
+        on_request,
+        // Issue #1641: the harness exercises the CAMERA freshness path, so tag it as such.
+        crate::decode::peer_decoder::MEDIA_TYPE_CAMERA,
+        // NOT the production TTL: this harness measures boot latency directly, so a short TTL
+        // makes a slow boot read as a replay failure.
+        COLD_HARNESS_BOOT_REPLAY_TTL_MS,
+    )
 }

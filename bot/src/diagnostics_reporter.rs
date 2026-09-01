@@ -41,13 +41,12 @@ use protobuf::{Message, MessageField};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::Sender;
 use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::config::ClientConfig;
 use crate::inbound_stats::{InboundStats, SenderHealthCounters};
-use crate::transport::{MediaTypeLabel, OutboundFrame};
+use crate::transport::{MediaTypeLabel, OutboundFrame, OutboundFrameSender};
 use videocall_types::protos::diagnostics_packet::{AudioMetrics, DiagnosticsPacket, VideoMetrics};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -75,7 +74,7 @@ pub struct DiagnosticsReporterConfig {
 pub fn spawn_diagnostics_reporter(
     config: DiagnosticsReporterConfig,
     stats: Arc<Mutex<InboundStats>>,
-    packet_sender: Sender<OutboundFrame>,
+    packet_sender: OutboundFrameSender,
     quit: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
@@ -146,7 +145,7 @@ pub fn spawn_diagnostics_reporter(
                     }
                 }
 
-                if counters.audio_packets > 0 {
+                if should_emit_audio(counters) {
                     let bytes = match build_wrapper(
                         user_id,
                         &user_id_bytes,
@@ -187,18 +186,20 @@ pub fn spawn_diagnostics_reporter(
 
 /// Whether a sender has any observable traffic worth a DIAGNOSTICS packet.
 ///
-/// Liveness reads ARRIVAL (bytes), not the rung-filtered frame count: `video_packets`
-/// is filtered (#2206) and sits at zero for the whole availability window after a
-/// ladder shed, which would stop emitting this packet's UNFILTERED bitrate payload
-/// while frames are still arriving on the base rung.
+/// Liveness reads ARRIVAL (bytes): both frame counts are rung-filtered (#2206 video,
+/// #2244 audio) and sit at zero for a whole availability window after a shed.
 pub(crate) fn should_emit_any(counters: &SenderHealthCounters) -> bool {
-    should_emit_video(counters) || counters.audio_packets > 0
+    should_emit_video(counters) || should_emit_audio(counters)
 }
 
 /// Whether to emit the VIDEO half. Same arrival-not-decode rule as
 /// [`should_emit_any`]; see there for why.
 pub(crate) fn should_emit_video(counters: &SenderHealthCounters) -> bool {
     counters.video_bytes > 0
+}
+
+pub(crate) fn should_emit_audio(counters: &SenderHealthCounters) -> bool {
+    counters.audio_bytes > 0
 }
 
 /// Build a serialized `PacketWrapper { packet_type = DIAGNOSTICS, ... }`
@@ -252,7 +253,7 @@ fn build_wrapper(
 /// `try_send` the serialized wrapper and log-throttle drops, mirroring the
 /// health reporter's dropped-send pattern.
 fn try_emit(
-    packet_sender: &Sender<OutboundFrame>,
+    packet_sender: &OutboundFrameSender,
     bytes: Vec<u8>,
     transport_drops: &AtomicU64,
 ) -> bool {
@@ -302,6 +303,7 @@ mod tests {
             video_packets: 30,
             audio_bytes: 4_000,
             video_bytes: 125_000,
+            ..Default::default()
         };
         let user_id = "bot-1";
         let sender_id = "alice";
@@ -339,6 +341,7 @@ mod tests {
             video_packets: 0,
             audio_bytes: 5_000,
             video_bytes: 0,
+            ..Default::default()
         };
         let bytes = build_wrapper("bot-1", b"bot-1", "alice", 1, MediaType::AUDIO, &counters)
             .expect("build");
@@ -366,12 +369,18 @@ mod tests {
         video_packets: 0,
         audio_bytes: 0,
         video_bytes: 2000,
+        audio_seq_gaps: 0,
+        video_seq_gaps: 0,
     };
 
     #[test]
     fn a_shed_ladder_still_emits_because_liveness_reads_arrival() {
         assert!(should_emit_any(&POST_SHED));
         assert!(should_emit_video(&POST_SHED));
+        assert!(
+            !should_emit_audio(&POST_SHED),
+            "POST_SHED carries no audio bytes"
+        );
     }
 
     #[test]
@@ -388,11 +397,29 @@ mod tests {
             video_packets: 0,
             audio_bytes: 4000,
             video_bytes: 0,
+            ..Default::default()
         };
         assert!(should_emit_any(&audio_only));
         assert!(
             !should_emit_video(&audio_only),
             "no video bytes means no VIDEO packet, even though the sender is live"
         );
+    }
+
+    #[test]
+    fn an_audio_only_sender_past_a_rung_shed_still_emits() {
+        let shed = SenderHealthCounters {
+            audio_packets: 0,
+            video_packets: 0,
+            audio_bytes: 5000,
+            video_bytes: 0,
+            ..Default::default()
+        };
+        assert!(should_emit_audio(&shed));
+        assert!(
+            should_emit_any(&shed),
+            "an audio-only peer must still get a DIAGNOSTICS packet"
+        );
+        assert!(!should_emit_audio(&SenderHealthCounters::default()));
     }
 }

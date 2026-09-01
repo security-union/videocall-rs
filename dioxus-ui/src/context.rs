@@ -481,6 +481,15 @@ pub struct AppearanceSettings {
     pub show_exit_notifications: bool,
     pub play_entry_sound: bool,
     pub play_exit_sound: bool,
+    /// Issue 2329: chime when ANY participant's hand goes up or comes down.
+    ///
+    /// Defaults ON, like the two chimes above. A notification feature that ships
+    /// default-off is invisible — the issue asks for the sound, not for the
+    /// option — and the hazards that would justify hiding it (the issue 2276
+    /// replay storm, re-announce echo, and wave mush) are gated in code by
+    /// `raised_hands::hand_sound_to_play` rather than by leaving the feature
+    /// switched off.
+    pub play_hand_raise_sound: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -495,6 +504,7 @@ impl Default for AppearanceSettings {
             show_exit_notifications: true,
             play_entry_sound: true,
             play_exit_sound: true,
+            play_hand_raise_sound: true,
         }
     }
 }
@@ -512,6 +522,7 @@ const APPEARANCE_ENTRY_NOTIFICATIONS_KEY: &str = "vc_appearance_entry_notificati
 const APPEARANCE_EXIT_NOTIFICATIONS_KEY: &str = "vc_appearance_exit_notifications";
 const APPEARANCE_ENTRY_SOUND_KEY: &str = "vc_appearance_entry_sound";
 const APPEARANCE_EXIT_SOUND_KEY: &str = "vc_appearance_exit_sound";
+const APPEARANCE_HAND_RAISE_SOUND_KEY: &str = "vc_appearance_hand_raise_sound";
 const CUSTOM_COLORS_STORAGE_KEY: &str = "vc_appearance_custom_colors";
 
 pub const MAX_CUSTOM_COLORS: usize = 10;
@@ -556,6 +567,7 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
         read_local_storage(APPEARANCE_EXIT_NOTIFICATIONS_KEY).as_deref(),
         read_local_storage(APPEARANCE_ENTRY_SOUND_KEY).as_deref(),
         read_local_storage(APPEARANCE_EXIT_SOUND_KEY).as_deref(),
+        read_local_storage(APPEARANCE_HAND_RAISE_SOUND_KEY).as_deref(),
     );
 
     settings
@@ -568,20 +580,23 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
 ///
 /// A value equal to `"false"` disables; any other present value enables
 /// (mirrors the `!= "false"` read used elsewhere for boolean prefs). Each of
-/// the four toggles is applied independently.
+/// the five toggles is applied independently.
 ///
 /// Extracted as a pure function so the per-direction gating is unit testable
 /// without a DOM — the E2E harness cannot observe the exit (leave) direction
 /// because the "left the meeting" toast is currently suppressed there (see the
-/// skipped leave-toast tests in `toast-notifications.spec.ts`). Tested via
-/// `#[wasm_bindgen_test]` in `tests/context_unit.rs` (the lib's plain `#[test]`
-/// block is not executed by the wasm test runner).
+/// skipped leave-toast tests in `toast-notifications.spec.ts`). Covered from
+/// BOTH gates: `#[wasm_bindgen_test]` in `tests/context_unit.rs` (run by
+/// `pr-check-dioxus-ui-hcl.yaml`'s `--test context_unit` step) and plain
+/// `#[test]` below (run natively by `pr-check-rust-hcl.yaml`'s
+/// `cargo test -p videocall-ui --lib` step).
 pub fn apply_notification_prefs(
     settings: &mut AppearanceSettings,
     entry_notifications: Option<&str>,
     exit_notifications: Option<&str>,
     entry_sound: Option<&str>,
     exit_sound: Option<&str>,
+    hand_raise_sound: Option<&str>,
 ) {
     if let Some(value) = entry_notifications {
         settings.show_entry_notifications = value != "false";
@@ -594,6 +609,9 @@ pub fn apply_notification_prefs(
     }
     if let Some(value) = exit_sound {
         settings.play_exit_sound = value != "false";
+    }
+    if let Some(value) = hand_raise_sound {
+        settings.play_hand_raise_sound = value != "false";
     }
 }
 
@@ -634,6 +652,10 @@ pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
     write_local_storage(
         APPEARANCE_EXIT_SOUND_KEY,
         &settings.play_exit_sound.to_string(),
+    );
+    write_local_storage(
+        APPEARANCE_HAND_RAISE_SOUND_KEY,
+        &settings.play_hand_raise_sound.to_string(),
     );
 }
 
@@ -2251,6 +2273,76 @@ mod tests {
         assert_eq!(
             GlowColor::from_storage("mint-green"),
             Some(GlowColor::MintGreen)
+        );
+    }
+
+    /// Issue 2329: the hand-raise chime preference resolves independently of the
+    /// four announcement toggles it sits beside, and defaults ON.
+    ///
+    /// Lives HERE, as a plain `#[test]`, rather than only in
+    /// `tests/context_unit.rs`: the native `cargo test -p videocall-ui --lib`
+    /// step in `pr-check-rust-hcl.yaml` executes this, and it is the gate that
+    /// runs without a browser.
+    ///
+    /// `apply_notification_prefs` now takes FIVE positional `Option<&str>`
+    /// arguments, so the failure this really guards against is a cross-wired
+    /// read — the new key landing on `play_exit_sound`, or the exit key landing
+    /// on the new field. Every assertion below therefore checks the whole tuple,
+    /// not just the field under test.
+    ///
+    /// ADVERSARIAL (mutation): point the `hand_raise_sound` arm at
+    /// `settings.play_exit_sound` → the second case's exit assertion goes red.
+    /// Delete the arm entirely → the second case's hand assertion goes red.
+    /// Flip the struct default to `false` → the first case goes red.
+    #[test]
+    fn hand_raise_sound_pref_is_independent_and_defaults_on() {
+        fn resolve(
+            entry_notifications: Option<&str>,
+            exit_notifications: Option<&str>,
+            entry_sound: Option<&str>,
+            exit_sound: Option<&str>,
+            hand_raise_sound: Option<&str>,
+        ) -> (bool, bool, bool, bool, bool) {
+            let mut settings = AppearanceSettings::default();
+            apply_notification_prefs(
+                &mut settings,
+                entry_notifications,
+                exit_notifications,
+                entry_sound,
+                exit_sound,
+                hand_raise_sound,
+            );
+            (
+                settings.show_entry_notifications,
+                settings.show_exit_notifications,
+                settings.play_entry_sound,
+                settings.play_exit_sound,
+                settings.play_hand_raise_sound,
+            )
+        }
+
+        // No stored keys: every channel, the new one included, stays enabled.
+        assert_eq!(
+            resolve(None, None, None, None, None),
+            (true, true, true, true, true)
+        );
+        // Disabling ONLY the hand chime must leave the other four alone.
+        assert_eq!(
+            resolve(None, None, None, None, Some("false")),
+            (true, true, true, true, false)
+        );
+        // ...and the symmetric direction: disabling the LEAVE chime must not
+        // silence the hand chime. This is the cross-wiring a same-typed
+        // positional argument list makes easy to ship.
+        assert_eq!(
+            resolve(None, None, None, Some("false"), None),
+            (true, true, true, false, true)
+        );
+        // Any other present value enables, matching the `!= "false"` convention
+        // the other four keys use.
+        assert_eq!(
+            resolve(None, None, None, None, Some("true")),
+            (true, true, true, true, true)
         );
     }
 }

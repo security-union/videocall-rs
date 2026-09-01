@@ -24,8 +24,8 @@ mod microphone_encoder;
 mod screen_encoder;
 mod transform;
 
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::VideoCallClient;
@@ -88,6 +88,34 @@ pub(crate) fn fps_after_idle_decay(
 
 pub(crate) fn reset_output_fps(fps: &AtomicU32) {
     fps.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Scope-owned cancellation handle for an encoder's 1 Hz AQ control loop, read
+/// each tick via [`aq_control_loop_should_exit`]. Set-only: no reset.
+#[derive(Clone, Default)]
+pub struct AqControlLoopCancel(Rc<AtomicBool>);
+
+impl AqControlLoopCancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Exit predicate for the camera and screen AQ control loops: the owning encoder
+/// was dropped, OR the owning scope cancelled the loop (issue #2458).
+pub(crate) fn aq_control_loop_should_exit(
+    liveness: &Weak<()>,
+    cancel: &AqControlLoopCancel,
+) -> bool {
+    liveness.upgrade().is_none() || cancel.is_cancelled()
 }
 
 /// Trait to abstract over different microphone encoder implementations
@@ -263,7 +291,10 @@ pub fn create_microphone_encoder(
 
 #[cfg(test)]
 mod tests {
-    use super::{fps_after_idle_decay, reset_output_fps};
+    use super::{
+        aq_control_loop_should_exit, fps_after_idle_decay, reset_output_fps, AqControlLoopCancel,
+    };
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
@@ -279,5 +310,47 @@ mod tests {
         let fps = AtomicU32::new(30);
         reset_output_fps(&fps);
         assert_eq!(fps.load(Ordering::Relaxed), 0);
+    }
+
+    /// #2458: cancellation must exit the loop while the encoder is STILL alive.
+    #[test]
+    fn aq_control_loop_exits_on_cancel_while_encoder_alive_2458() {
+        let liveness = Rc::new(());
+        let weak = Rc::downgrade(&liveness);
+        let cancel = AqControlLoopCancel::new();
+
+        assert!(!aq_control_loop_should_exit(&weak, &cancel));
+
+        cancel.cancel();
+        assert_eq!(
+            Rc::strong_count(&liveness),
+            1,
+            "fixture must assert the exit while the encoder token is still held"
+        );
+        assert!(aq_control_loop_should_exit(&weak, &cancel));
+    }
+
+    /// #1108 must survive #2458: encoder drop alone still exits the loop.
+    #[test]
+    fn aq_control_loop_still_exits_on_encoder_drop_1108() {
+        let liveness = Rc::new(());
+        let weak = Rc::downgrade(&liveness);
+        let cancel = AqControlLoopCancel::new();
+
+        assert!(!aq_control_loop_should_exit(&weak, &cancel));
+
+        drop(liveness);
+        assert!(!cancel.is_cancelled());
+        assert!(aq_control_loop_should_exit(&weak, &cancel));
+    }
+
+    #[test]
+    fn aq_cancel_handle_clones_share_one_flag() {
+        let held_by_loop = AqControlLoopCancel::new();
+        let held_by_scope = held_by_loop.clone();
+
+        assert!(!held_by_loop.is_cancelled());
+        held_by_scope.cancel();
+        assert!(held_by_loop.is_cancelled());
     }
 }

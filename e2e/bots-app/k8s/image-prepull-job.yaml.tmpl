@@ -1,0 +1,70 @@
+# TEMPLATE, not appliable: every `__…__` token is substituted by
+# k8s/prepull-image.sh from k8s/statefulset.yaml.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: videocall-bots-image-prepull
+  namespace: bot-load
+  labels:
+    app.kubernetes.io/name: videocall-bots-image-prepull
+    app.kubernetes.io/component: image-prepull
+    app.kubernetes.io/part-of: videocall
+spec:
+  completions: __PREPULL_COMPLETIONS__
+  parallelism: __PREPULL_COMPLETIONS__
+  backoffLimit: 0
+  activeDeadlineSeconds: __PREPULL_DEADLINE__
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: videocall-bots-image-prepull
+        app.kubernetes.io/component: image-prepull
+        app.kubernetes.io/part-of: videocall
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: hclcr-io
+      # Deliberately no tolerations: NoSchedule control-plane nodes stay cold.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: videocall-bots-image-prepull
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: prepull
+          image: __BOT_IMAGE__
+          imagePullPolicy: __BOT_IMAGE_PULL_POLICY__
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "prepull: node=${NODE_NAME:-unknown} image=__BOT_IMAGE__"
+              echo "prepull: clock node=${NODE_NAME:-unknown} epoch=$(date -u +%s.%N)"
+              echo "prepull: resident node=${NODE_NAME:-unknown}"
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # The bot-load ResourceQuota requires requests AND limits.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"

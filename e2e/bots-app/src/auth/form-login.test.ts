@@ -3,9 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "@playwright/test";
 
 import {
+  FORM_LOGIN_ACTION_TIMEOUT_MS,
   FORM_LOGIN_EMAIL_SELECTOR,
   FORM_LOGIN_PASSWORD_SELECTOR,
   FORM_LOGIN_SUBMIT_SELECTOR,
+  FORM_LOGIN_TIMEOUT_MS,
   FORM_LOGIN_TRIGGER_SELECTOR,
   isKnownPublicIdpHost,
   performFormLogin,
@@ -147,6 +149,46 @@ describe("performFormLogin", () => {
 
     // Waited for the app to consume the callback.
     expect(waitForURL).toHaveBeenCalledTimes(1);
+  });
+
+  it("applies the timeout overrides to the waits and the per-step actions (#2356)", async () => {
+    const { page, email, password, submit, waitForURL } = makePage({});
+
+    await performFormLogin({
+      page,
+      email: EMAIL,
+      password: SECRET_PASSWORD,
+      appBaseUrl: APP_BASE,
+      meetingId: "bottest",
+      label: "bot",
+      timeoutMs: 90_000,
+      actionTimeoutMs: 45_000,
+    });
+
+    expect(email.waitFor).toHaveBeenCalledWith({ state: "visible", timeout: 90_000 });
+    expect(waitForURL).toHaveBeenCalledWith(expect.anything(), { timeout: 90_000 });
+    expect(email.fill).toHaveBeenCalledWith(EMAIL, { timeout: 45_000 });
+    expect(password.fill).toHaveBeenCalledWith(SECRET_PASSWORD, { timeout: 45_000 });
+    expect(submit.click).toHaveBeenCalledWith({ timeout: 45_000 });
+  });
+
+  it("falls back to the module defaults when no override is passed (#2356)", async () => {
+    const { page, email, submit } = makePage({});
+
+    await performFormLogin({
+      page,
+      email: EMAIL,
+      password: SECRET_PASSWORD,
+      appBaseUrl: APP_BASE,
+      meetingId: "bottest",
+      label: "bot",
+    });
+
+    expect(email.waitFor).toHaveBeenCalledWith({
+      state: "visible",
+      timeout: FORM_LOGIN_TIMEOUT_MS,
+    });
+    expect(submit.click).toHaveBeenCalledWith({ timeout: FORM_LOGIN_ACTION_TIMEOUT_MS });
   });
 
   it("NEVER logs the password (neither the value nor via a logged URL)", async () => {

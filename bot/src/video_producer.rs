@@ -20,7 +20,7 @@ use crate::aq_controller::BotAq;
 use crate::costume_renderer::CostumeRenderer;
 use crate::ekg_renderer::EkgRenderer;
 use crate::i420_scale::scale_i420;
-use crate::transport::{MediaTypeLabel, OutboundFrame};
+use crate::transport::{MediaTypeLabel, OutboundFrame, OutboundFrameSender};
 use crate::video_encoder::{VideoEncoder, VideoEncoderBuilder};
 use image::{ImageBuffer, Rgb};
 use protobuf::Message;
@@ -28,7 +28,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::Sender;
 use tracing::{error, info, trace, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetadata};
@@ -61,7 +60,7 @@ impl VideoProducer {
         rms: Vec<f32>,
         max_rms: f32,
         rms_fps: u32,
-        packet_sender: Sender<OutboundFrame>,
+        packet_sender: OutboundFrameSender,
         media_start: Instant,
         loop_duration: Duration,
         aq: Arc<BotAq>,
@@ -111,7 +110,7 @@ impl VideoProducer {
     pub fn from_costume(
         user_id: String,
         renderer: CostumeRenderer,
-        packet_sender: Sender<OutboundFrame>,
+        packet_sender: OutboundFrameSender,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
@@ -160,7 +159,7 @@ impl VideoProducer {
         rms: Vec<f32>,
         max_rms: f32,
         rms_fps: u32,
-        packet_sender: Sender<OutboundFrame>,
+        packet_sender: OutboundFrameSender,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
@@ -485,7 +484,7 @@ impl VideoProducer {
     fn costume_video_loop(
         user_id: String,
         renderer: CostumeRenderer,
-        packet_sender: Sender<OutboundFrame>,
+        packet_sender: OutboundFrameSender,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
@@ -892,7 +891,7 @@ impl VideoProducer {
         rms: Vec<f32>,
         max_rms: f32,
         rms_fps: u32,
-        packet_sender: Sender<OutboundFrame>,
+        packet_sender: OutboundFrameSender,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
@@ -1190,7 +1189,7 @@ impl VideoProducer {
     fn costume_video_loop_simulcast(
         user_id: String,
         renderer: CostumeRenderer,
-        packet_sender: Sender<OutboundFrame>,
+        packet_sender: OutboundFrameSender,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
@@ -1500,7 +1499,7 @@ fn get_timestamp_ms() -> f64 {
 /// `Result` from `write_to_bytes`.
 #[allow(clippy::too_many_arguments)]
 fn build_and_send_layer(
-    packet_sender: &Sender<OutboundFrame>,
+    packet_sender: &OutboundFrameSender,
     user_id_bytes: &[u8],
     frame_data: &[u8],
     is_key: bool,
@@ -1810,8 +1809,9 @@ mod tests {
     /// never awaits) so no tokio runtime is needed.
     fn send_one(layer_id: u32, sequence: u64, framerate: u32) -> PacketWrapper {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let sender = OutboundFrameSender::new(tx);
         let sent = build_and_send_layer(
-            &tx,
+            &sender,
             b"alice",
             &[0xAA, 0xBB, 0xCC],
             true,

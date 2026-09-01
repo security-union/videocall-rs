@@ -58,7 +58,7 @@ Every code change must be evaluated in the context of a real-time conferencing a
 
 ## Runtime Config Files
 
-- `dioxus-ui/scripts/config.js` is a committed fallback and is also rewritten by the E2E/dev container from environment variables. Do not casually stage it while the E2E stack is running; check whether changes are intentional source edits or generated env noise.
+- `dioxus-ui/scripts/config.js` is a committed fallback. The E2E/dev container does not write it — `docker/start-dioxus.sh` generates the gitignored `config.local.js` override instead. A modification to `config.js` is therefore a real source edit, not generated env noise.
 - When adding a field to the wasm `RuntimeConfig`, either give `dioxus-ui/scripts/config.js` a value that works against a vanilla `make e2e-up` stack or make the field optional with `#[serde(default)]`.
 
 ## Linter And Formatter Rules
@@ -66,7 +66,7 @@ Every code change must be evaluated in the context of a real-time conferencing a
 All code changes must pass the project linters before the work is considered complete.
 
 - Rust: run `cargo fmt` on changed crates. To match CI clippy behavior, run `make clippy-ci`; plain `cargo clippy` or `cargo clippy --all` misses test targets and crate-specific feature flags that CI checks.
-- If adding a new crate with test code, add a `--tests` clippy step to both `.github/workflows/pr-check-rust-hcl.yaml` and the `clippy-ci` Makefile target. `scripts/check-clippy-ci-sync.sh` fails CI if the lists drift.
+- If adding a new crate with test code, add a `--tests` clippy step to both `.github/workflows/pr-check-rust-hcl.yaml` and the `clippy-ci` Makefile target. `scripts/check-clippy-ci-sync.sh` fails CI if the lists drift, and separately if a workspace crate carrying test code has no `--tests` step in either.
 - TypeScript/JS in `e2e/`: run `cd e2e && npx prettier --write <files> && npx eslint <files> && npx tsc --noEmit`.
 - Do not leave unused imports or variables.
 - Respect local lint and formatter configuration.

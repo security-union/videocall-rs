@@ -13,7 +13,11 @@
 #   BOT_EMAIL          login email  — REQUIRED for form-login (single mode; from the bot-creds Secret)
 #   BOT_PASSWORD       login password — REQUIRED for form-login (single mode; from the bot-creds Secret)
 #   BOT_HW_CONCURRENCY navigator.hardwareConcurrency cap → simulcast layer cap (default: 10 → 3 layers; "" omits)
+#   BOT_HW_CONCURRENCY_<N> / BOT_NETEM_PROFILE[_<N>] / BOT_NETEM_IFACE / BOT_MAX_JOIN_STAGGER_SECS  see README
+#   BOT_CAMERA_{ON,OFF}_SECS_{MIN,MAX}  camera duty cycle (#2362); all four unset ⇒ camera always on
 #   BOT_IDENTITY_MODE  single | ordinal | auto (default: auto — see "Identity resolution" below)
+#   BOT_INDEX          fleet index → clock capture geometry (#2236); ordinal mode OVERWRITES it
+#                      with the pod ordinal. Unset ⇒ flag omitted ⇒ index 0 ⇒ 640x480.
 #   BOT_EMAIL_<N> /    per-ordinal creds for ordinal mode, injected via `envFrom` from the
 #   BOT_PASSWORD_<N>     `bot-accounts` Secret (see k8s/bot-accounts.example.yaml)
 #   BOT_CTL_PORT       control-API port (Increment 3 #2072; UNSET ⇒ control server disabled — see "Control server" below)
@@ -59,6 +63,9 @@
 
 set -euo pipefail
 
+# CR/LF become a space, so a value cannot forge a second, unprefixed line. $2 = stream.
+say() { printf '%s\n' "${1//[$'\r\n']/ }" >&"${2:-1}"; }
+
 MEETING_URL="${MEETING_URL:-https://app.videocall.labsworkspace.fnxlabs.com/meeting/bottest}"
 BOT_PARTICIPANT="${BOT_PARTICIPANT:-k8s-bot-1}"
 TTL="${TTL:-infinite}"
@@ -78,6 +85,23 @@ BOT_RUN_DIR="${BOT_RUN_DIR:-/tmp/bots-run}"
 # core count — the per-pod escape hatch.
 BOT_HW_CONCURRENCY="${BOT_HW_CONCURRENCY-10}"
 BOT_IDENTITY_MODE="${BOT_IDENTITY_MODE:-auto}"
+BOT_INDEX="${BOT_INDEX:-}"
+BOT_NETEM_PROFILE="${BOT_NETEM_PROFILE:-}"
+BOT_NETEM_IFACE="${BOT_NETEM_IFACE:-eth0}"
+# Mirrors netem.ts's NETEM_IFB_DEV / NETEM_INGRESS_QDISC_MARKER; not operator config.
+NETEM_IFB_DEV="ifb0"
+# iproute2 clears its own caps unless CAP_NET_ADMIN is INHERITABLE, which a file
+# cap does not populate — so every `ip` here goes through netem_ip (#2428).
+NETEM_SETPRIV="${NETEM_SETPRIV:-/usr/local/bin/netem-setpriv}"
+NETEM_INGRESS_MARKER="qdisc ingress"
+# A fresh ifb comes up at 32, which would bind ahead of every profile's netem limit.
+NETEM_IFB_TXQUEUELEN="1000"
+BOT_MAX_JOIN_STAGGER_SECS="${BOT_MAX_JOIN_STAGGER_SECS:-}"
+# Validated (not consumed) here; src/camera-cycle.ts reads them from the env.
+BOT_CAMERA_ON_SECS_MIN="${BOT_CAMERA_ON_SECS_MIN:-}"
+BOT_CAMERA_ON_SECS_MAX="${BOT_CAMERA_ON_SECS_MAX:-}"
+BOT_CAMERA_OFF_SECS_MIN="${BOT_CAMERA_OFF_SECS_MIN:-}"
+BOT_CAMERA_OFF_SECS_MAX="${BOT_CAMERA_OFF_SECS_MAX:-}"
 
 # ── Control server (Increment 3, #2072) ──────────────────────────────────────
 # In-cluster remote control. When BOT_CTL_PORT is set, this entrypoint starts
@@ -143,7 +167,7 @@ if [ "${BOT_IDENTITY_MODE}" = "ordinal" ]; then
   POD_NAME="${HOSTNAME:-$(hostname 2>/dev/null || true)}"
   ORDINAL="${POD_NAME##*-}"
   if ! [[ "${ORDINAL}" =~ ^[0-9]+$ ]]; then
-    echo "docker-entrypoint: FATAL — BOT_IDENTITY_MODE=ordinal but could not derive a numeric ordinal from hostname '${POD_NAME:-<unset>}' (expected 'videocall-bots-<N>'). Refusing to start." >&2
+    say "docker-entrypoint: FATAL — BOT_IDENTITY_MODE=ordinal but could not derive a numeric ordinal from hostname '${POD_NAME:-<unset>}' (expected 'videocall-bots-<N>'). Refusing to start." 2
     exit 1
   fi
   # Indirect expansion selects THIS pod's account from the fleet-wide Secret.
@@ -164,8 +188,67 @@ if [ "${BOT_IDENTITY_MODE}" = "ordinal" ]; then
   # never inherited from the shared pod template (all pods share one env, so a
   # template BOT_PARTICIPANT would collide across the fleet).
   BOT_PARTICIPANT="bot-${ORDINAL}"
+  # Same reason for the fleet index: the ordinal wins over a template BOT_INDEX.
+  BOT_INDEX="${ORDINAL}"
+  # `-`, not `:-`: an explicitly EMPTY value opts this pod out, not the fleet.
+  hw_var="BOT_HW_CONCURRENCY_${ORDINAL}"
+  BOT_HW_CONCURRENCY="${!hw_var-${BOT_HW_CONCURRENCY}}"
+  netem_var="BOT_NETEM_PROFILE_${ORDINAL}"
+  BOT_NETEM_PROFILE="${!netem_var-${BOT_NETEM_PROFILE}}"
   echo "docker-entrypoint: ordinal identity — ordinal=${ORDINAL} participant=${BOT_PARTICIPANT} (account selected from bot-accounts Secret)"
+  # A per-ordinal var reaches a pod only when its suffix SPELLS that pod's
+  # ${ORDINAL} (so `_01` never reaches pod 1), and only provisioned ordinals
+  # start. `_<digits>` on a misspelt stem is left to the stem sweep below.
+  unreachable=""
+  for env_name in ${!BOT_NETEM_PROFILE_@} ${!BOT_HW_CONCURRENCY_@}; do
+    [[ "${env_name}" =~ ^(BOT_NETEM_PROFILE|BOT_HW_CONCURRENCY)_(.*)$ ]] || continue
+    suffix="${BASH_REMATCH[2]}"
+    [ "${suffix}" = "${ORDINAL}" ] && continue
+    if [[ "${suffix}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+      email_var_n="BOT_EMAIL_${suffix}"
+      password_var_n="BOT_PASSWORD_${suffix}"
+      [ -n "${!email_var_n:-}" ] && [ -n "${!password_var_n:-}" ] && continue
+    elif [[ "${suffix}" =~ _[0-9]+$ ]]; then
+      continue
+    fi
+    unreachable="${unreachable}${env_name} "
+  done
+  if [ -n "${unreachable}" ]; then
+    say "docker-entrypoint: WARNING — ignoring (${unreachable% }): no pod reads them — a per-ordinal suffix must be a plain integer naming an ordinal with a provisioned BOT_EMAIL_<N>/BOT_PASSWORD_<N>; this pod is ordinal ${ORDINAL}." 2
+  fi
+else
+  per_pod="$(printf '%s ' "${!BOT_NETEM_PROFILE_@}" "${!BOT_HW_CONCURRENCY_@}")"
+  if [ -n "${per_pod% }" ]; then
+    say "docker-entrypoint: WARNING — ignoring per-ordinal overrides (${per_pod% }): they are read only when BOT_IDENTITY_MODE=ordinal (resolved to '${BOT_IDENTITY_MODE}')." 2
+  fi
 fi
+
+# Stem, not prefix: BOT_NETEM_PROFILE_TYPO_1 is read by nothing too, in either mode.
+inert_suffixed=""
+for env_name in ${!BOT_@}; do
+  [[ "${env_name}" =~ ^(.*)_[0-9]+$ ]] || continue
+  case "${BASH_REMATCH[1]}" in
+    BOT_EMAIL | BOT_PASSWORD | BOT_NETEM_PROFILE | BOT_HW_CONCURRENCY) continue ;;
+  esac
+  inert_suffixed="${inert_suffixed}${env_name} "
+done
+if [ -n "${inert_suffixed}" ]; then
+  say "docker-entrypoint: WARNING — ignoring (${inert_suffixed% }): only BOT_EMAIL_<N>, BOT_PASSWORD_<N>, BOT_NETEM_PROFILE_<N> and BOT_HW_CONCURRENCY_<N> take a per-ordinal suffix; the rest of this pod's config is fleet-wide." 2
+fi
+
+# Every operator string this script puts on the launch line or exports to the bot
+# process. Downstream TypeScript composes `[label] …` lines from these without
+# collapsing CR/LF, so the value is refused here rather than at each writer.
+for raw_var in MEETING_URL BOT_PARTICIPANT TTL BOT_AUTH BOT_RUN_DIR \
+  BOT_HW_CONCURRENCY BOT_INDEX BOT_CTL_PORT BOT_CTL_BIND BOT_CTL_STATE_DIR \
+  BOT_EMAIL BOT_EXTRA_ARGS; do
+  case "${!raw_var-}" in
+    *$'\r'* | *$'\n'*)
+      say "docker-entrypoint: FATAL — ${raw_var} contains a carriage return or newline, which a downstream log line would emit verbatim. A Secret created with 'kubectl create secret --from-file' carries a trailing newline; use --from-literal or stringData. Refusing to start." 2
+      exit 1
+      ;;
+  esac
+done
 
 # form-login (added by the separate frontend task) reads BOT_EMAIL/BOT_PASSWORD
 # straight from the environment and drives the identity-service login form.
@@ -191,8 +274,8 @@ fi
 ctl_args=()
 if [ -n "${BOT_CTL_PORT}" ]; then
   if [ -z "${BOT_CTL_TOKEN}" ]; then
-    echo "docker-entrypoint: FATAL — BOT_CTL_PORT=${BOT_CTL_PORT} enables the remote control server but BOT_CTL_TOKEN is empty." >&2
-    echo "docker-entrypoint: refusing to bind an UNAUTHENTICATED control/netem API on ${BOT_CTL_BIND}. Provide the token via the 'bot-ctl-token' Secret (see k8s/bot-ctl-token.example.yaml). Refusing to start." >&2
+    say "docker-entrypoint: FATAL — BOT_CTL_PORT=${BOT_CTL_PORT} enables the remote control server but BOT_CTL_TOKEN is empty." 2
+    say "docker-entrypoint: refusing to bind an UNAUTHENTICATED control/netem API on ${BOT_CTL_BIND}. Provide the token via the 'bot-ctl-token' Secret (see k8s/bot-ctl-token.example.yaml). Refusing to start." 2
     exit 1
   fi
   # Token is NOT passed on argv (it would show in /proc/<pid>/cmdline / ps).
@@ -258,11 +341,11 @@ sweep_tokens() {
   # $1 = directory to sweep, $2 = human label for the warning.
   [ -n "$1" ] || return 0
   if ! rm -f "$1"/ctl-*.token 2>/dev/null; then
-    echo "docker-entrypoint: WARNING — could not sweep stale ctl-*.token from $1 ($2)." >&2
-    echo "docker-entrypoint: a pre-#2157 cleartext control-API token may STILL be present there." >&2
-    echo "docker-entrypoint: rotating the bot-ctl-token Secret will NOT retire that copy — delete the" >&2
-    echo "docker-entrypoint: PVC (kubectl -n bot-load delete pvc …) or fix the directory permissions." >&2
-    echo "docker-entrypoint: continuing startup anyway — the sweep is best-effort and must not crashloop." >&2
+    say "docker-entrypoint: WARNING — could not sweep stale ctl-*.token from $1 ($2)." 2
+    say "docker-entrypoint: a pre-#2157 cleartext control-API token may STILL be present there." 2
+    say "docker-entrypoint: rotating the bot-ctl-token Secret will NOT retire that copy — delete the" 2
+    say "docker-entrypoint: PVC (kubectl -n bot-load delete pvc …) or fix the directory permissions." 2
+    say "docker-entrypoint: continuing startup anyway — the sweep is best-effort and must not crashloop." 2
   fi
 }
 sweep_tokens "${BOT_RUN_DIR}" "run dir / retained PVC"
@@ -302,17 +385,255 @@ if [ -n "${BOT_CTL_STATE_DIR}" ] && [ "${BOT_CTL_STATE_DIR}" != "${BOT_RUN_DIR}"
   export BOT_CTL_STATE_DIR
 fi
 
-# NO SIGTERM TRAP HERE — DELIBERATE, and NOT an oversight. This script `exec`s
-# tsx below (see the exec NOTE), which REPLACES this shell with the Node process:
-# the shell is gone, so any `trap … TERM` it had installed can never fire. A trap
-# added here would be pure dead code — exactly the "looks right, does nothing"
-# shell defect the repo's adversarial-review rule calls out. Removal on shutdown
-# would have to live in the Node process's own SIGTERM path
-# (orchestrator.ts requestShutdown). We deliberately do NOT add it there either:
-# with the token on an emptyDir it is already destroyed with the pod, so an
-# in-process unlink would buy nothing on the K8s path and would DELETE a local
-# dev's token file out from under a `ctl` session on the fallback path. The
-# startup sweep above is what retires the pre-existing PVC copies.
+# Nothing unlinks the ctl token: on K8s the pod-lifetime `ctl-state` emptyDir
+# takes it.
+
+netem_fatal() {
+  say "docker-entrypoint: FATAL — BOT_NETEM_PROFILE=${BOT_NETEM_PROFILE}: $1 failed. Refusing to start on a link that does not match the profile." 2
+  echo "docker-entrypoint: check the netem-preload DaemonSet is Ready on this node and that cap_net_admin reached tc and ${NETEM_SETPRIV} (k8s/netem-preload-daemonset.yaml, #2428)." >&2
+  exit 1
+}
+
+netem_ip() {
+  "${NETEM_SETPRIV}" --inh-caps +net_admin --ambient-caps +net_admin -- ip "$@"
+}
+
+# Failure is expected when the object is absent; only rc>=126 is fatal.
+netem_try() {
+  local rc=0
+  "$@" >/dev/null 2>&1 || rc=$?
+  [ "${rc}" -lt 126 ] || netem_fatal "$* did not execute, rc=${rc}"
+  return "${rc}"
+}
+
+# Mirrors buildNetemMirrorInstallArgs: probe before `ip link add` (the netns
+# outlives the container), delete the hook before adding, `protocol all` for IPv6.
+netem_mirror_install() {
+  netem_ip link show "${NETEM_IFB_DEV}" >/dev/null 2>&1 ||
+    netem_ip link add "${NETEM_IFB_DEV}" type ifb ||
+    netem_fatal "ip link add ${NETEM_IFB_DEV} type ifb"
+  netem_ip link set "${NETEM_IFB_DEV}" up || netem_fatal "ip link set ${NETEM_IFB_DEV} up"
+  netem_ip link set "${NETEM_IFB_DEV}" txqueuelen "${NETEM_IFB_TXQUEUELEN}" ||
+    netem_fatal "ip link set ${NETEM_IFB_DEV} txqueuelen ${NETEM_IFB_TXQUEUELEN}"
+  netem_try tc qdisc del dev "${BOT_NETEM_IFACE}" ingress || true
+  tc qdisc add dev "${BOT_NETEM_IFACE}" handle ffff: ingress ||
+    netem_fatal "tc qdisc add dev ${BOT_NETEM_IFACE} handle ffff: ingress"
+  tc filter add dev "${BOT_NETEM_IFACE}" parent ffff: protocol all u32 match u32 0 0 \
+    action mirred egress redirect dev "${NETEM_IFB_DEV}" ||
+    netem_fatal "tc filter add dev ${BOT_NETEM_IFACE} parent ffff: (ingress redirect to ${NETEM_IFB_DEV})"
+  tc qdisc replace dev "${NETEM_IFB_DEV}" root netem "$@" ||
+    netem_fatal "tc qdisc replace dev ${NETEM_IFB_DEV} root netem"
+}
+
+# Hook first: no filter may outlive its target; its status is the only proof.
+netem_mirror_clear() {
+  netem_try tc qdisc del dev "${BOT_NETEM_IFACE}" ingress || return 0
+  netem_try tc qdisc del dev "${NETEM_IFB_DEV}" root || true
+  netem_try netem_ip link del "${NETEM_IFB_DEV}" || true
+}
+
+netem_apply() {
+  local netem_rc=0 netem_err="" netem_err_lc=""
+  if [ "$1" = "clear" ]; then
+    netem_err="$(tc qdisc del dev "${BOT_NETEM_IFACE}" root 2>&1)" || netem_rc=$?
+    if [ "${netem_rc}" -ne 0 ]; then
+      # >=126 is the shell's own "tc never ran": judge status before wording.
+      if [ "${netem_rc}" -ge 126 ]; then
+        netem_fatal "tc did not execute, rc=${netem_rc} (${netem_err})"
+      fi
+      netem_err_lc="$(printf '%s' "${netem_err}" | tr '[:upper:]' '[:lower:]')"
+      case "${netem_err_lc}" in
+        *"cannot delete"* | *"no such file"*) ;;
+        *) netem_fatal "tc qdisc del dev ${BOT_NETEM_IFACE} root (${netem_err})" ;;
+      esac
+    fi
+    netem_mirror_clear
+    return 0
+  fi
+  shift
+  tc qdisc replace dev "${BOT_NETEM_IFACE}" root netem "$@" ||
+    netem_fatal "tc qdisc replace dev ${BOT_NETEM_IFACE} root netem"
+  netem_mirror_install ${netem_ingress_params[@]+"${netem_ingress_params[@]}"}
+}
+
+# Sets netem_read_rc/_root/_netem/_ingress; reads ifb too when a hook is present.
+netem_read() {
+  local out="" line
+  netem_read_rc=0
+  netem_read_root=""
+  netem_read_netem=""
+  netem_read_ingress=""
+  # No pipeline: the status must be captured before anything matches the output.
+  out="$(tc qdisc show dev "${BOT_NETEM_IFACE}" 2>&1)" || netem_read_rc=$?
+  if [ "${netem_read_rc}" -ne 0 ]; then
+    netem_read_root="${out%%$'\n'*}"
+    return 0
+  fi
+  netem_read_root="${out%%$'\n'*}"
+  case "${out}" in
+    *"qdisc netem"*)
+      line="qdisc netem${out#*qdisc netem}"
+      netem_read_netem="${line%%$'\n'*}"
+      ;;
+  esac
+  case "${out}" in
+    *"${NETEM_INGRESS_MARKER}"*)
+      out="$(tc qdisc show dev "${NETEM_IFB_DEV}" 2>&1)" || true
+      [ -n "${out}" ] || out="unread"
+      netem_read_ingress="${out%%$'\n'*}"
+      ;;
+  esac
+}
+
+# Validated before the first interface mutation: a reject must not leave it shaped.
+stagger_max=0
+if [ -n "${BOT_MAX_JOIN_STAGGER_SECS}" ]; then
+  if ! [[ "${BOT_MAX_JOIN_STAGGER_SECS}" =~ ^[0-9]{1,5}$ ]]; then
+    say "docker-entrypoint: FATAL — BOT_MAX_JOIN_STAGGER_SECS must be a non-negative integer of at most 5 digits (got '${BOT_MAX_JOIN_STAGGER_SECS}')." 2
+    exit 1
+  fi
+  # 10#: "08" is a valid stagger, not an octal literal.
+  stagger_max=$((10#${BOT_MAX_JOIN_STAGGER_SECS}))
+  if [ "${stagger_max}" -gt 32767 ]; then
+    say "docker-entrypoint: FATAL — BOT_MAX_JOIN_STAGGER_SECS=${stagger_max} exceeds the 32767s the stagger can draw." 2
+    exit 1
+  fi
+fi
+
+# Before the first interface mutation. A PARTIAL set is a hard error (#2362).
+CAMERA_CYCLE_VARS=(BOT_CAMERA_ON_SECS_MIN BOT_CAMERA_ON_SECS_MAX BOT_CAMERA_OFF_SECS_MIN BOT_CAMERA_OFF_SECS_MAX)
+CAMERA_CYCLE_SECS_CEILING=86400
+camera_cycle_state="off"
+camera_set=""
+camera_unset=""
+for camera_var in "${CAMERA_CYCLE_VARS[@]}"; do
+  if [ -n "${!camera_var}" ]; then
+    camera_set="${camera_set}${camera_var} "
+  else
+    camera_unset="${camera_unset}${camera_var} "
+  fi
+done
+if [ -n "${camera_set}" ]; then
+  if [ -n "${camera_unset}" ]; then
+    say "docker-entrypoint: FATAL — camera cycling needs all four of ${CAMERA_CYCLE_VARS[*]}; missing: ${camera_unset% }. Set them all, or none (none = camera on for the whole run)." 2
+    exit 1
+  fi
+  for camera_var in "${CAMERA_CYCLE_VARS[@]}"; do
+    if ! [[ "${!camera_var}" =~ ^[0-9]{1,5}$ ]]; then
+      say "docker-entrypoint: FATAL — ${camera_var} must be a positive integer of at most 5 digits (seconds), got '${!camera_var}'." 2
+      exit 1
+    fi
+    if [ "$((10#${!camera_var}))" -lt 1 ]; then
+      say "docker-entrypoint: FATAL — ${camera_var} must be >= 1 second, got '${!camera_var}'." 2
+      exit 1
+    fi
+    if [ "$((10#${!camera_var}))" -gt "${CAMERA_CYCLE_SECS_CEILING}" ]; then
+      say "docker-entrypoint: FATAL — ${camera_var} must be <= ${CAMERA_CYCLE_SECS_CEILING} seconds, got '${!camera_var}'." 2
+      exit 1
+    fi
+  done
+  camera_on_min=$((10#${BOT_CAMERA_ON_SECS_MIN}))
+  camera_on_max=$((10#${BOT_CAMERA_ON_SECS_MAX}))
+  camera_off_min=$((10#${BOT_CAMERA_OFF_SECS_MIN}))
+  camera_off_max=$((10#${BOT_CAMERA_OFF_SECS_MAX}))
+  if [ "${camera_on_min}" -gt "${camera_on_max}" ]; then
+    say "docker-entrypoint: FATAL — BOT_CAMERA_ON_SECS_MIN=${camera_on_min} must be <= BOT_CAMERA_ON_SECS_MAX=${camera_on_max}." 2
+    exit 1
+  fi
+  if [ "${camera_off_min}" -gt "${camera_off_max}" ]; then
+    say "docker-entrypoint: FATAL — BOT_CAMERA_OFF_SECS_MIN=${camera_off_min} must be <= BOT_CAMERA_OFF_SECS_MAX=${camera_off_max}." 2
+    exit 1
+  fi
+  camera_duty=$((
+    (camera_on_min + camera_on_max) * 100 / (camera_on_min + camera_on_max + camera_off_min + camera_off_max)
+  ))
+  # "configured", not "applied" — only the bot's CAMERA_CYCLE_* receipt knows.
+  camera_cycle_state="configured on=[${camera_on_min}-${camera_on_max}]s off=[${camera_off_min}-${camera_off_max}]s target_duty=${camera_duty}%"
+fi
+
+# Same grammar assertIface() enforces; also blocks a newline in the launch line.
+if ! [[ "${BOT_NETEM_IFACE}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$ ]]; then
+  say "docker-entrypoint: FATAL — BOT_NETEM_IFACE '${BOT_NETEM_IFACE}' is not a valid device name (netem.ts IFACE_PATTERN)." 2
+  exit 1
+fi
+
+netem_state="unknown"
+if [ -n "${BOT_NETEM_PROFILE}" ]; then
+  # Mirrors NETEM_PROFILES / ingressNetemParams; the two differ only in `rate`.
+  netem_params=()
+  netem_ingress_params=()
+  netem_op="shape"
+  netem_verb="applied"
+  case "${BOT_NETEM_PROFILE}" in
+    clean | none)
+      netem_op="clear"
+      netem_verb="cleared"
+      ;;
+    good_wifi)
+      netem_params=(delay 20ms 5ms loss 0.1% rate 20000kbit limit 100)
+      netem_ingress_params=(delay 20ms 5ms loss 0.1% rate 50000kbit limit 100)
+      ;;
+    good_4g)
+      netem_params=(delay 50ms 15ms loss 0.5% rate 10000kbit limit 100)
+      netem_ingress_params=(delay 50ms 15ms loss 0.5% rate 30000kbit limit 100)
+      ;;
+    congested_wifi)
+      netem_params=(delay 80ms 30ms loss 2% rate 2000kbit limit 55)
+      netem_ingress_params=(delay 80ms 30ms loss 2% rate 4000kbit limit 55)
+      ;;
+    lossy_mobile)
+      netem_params=(delay 150ms 50ms loss 5% rate 800kbit limit 40)
+      netem_ingress_params=(delay 150ms 50ms loss 5% rate 2000kbit limit 40)
+      ;;
+    satellite)
+      netem_params=(delay 600ms 50ms loss 1% rate 1500kbit limit 300)
+      netem_ingress_params=(delay 600ms 50ms loss 1% rate 10000kbit limit 300)
+      ;;
+    dialup)
+      netem_params=(delay 200ms 40ms loss 3% rate 56kbit limit 10)
+      netem_ingress_params=(delay 200ms 40ms loss 3% rate 56kbit limit 10)
+      ;;
+    *)
+      say "docker-entrypoint: FATAL — unknown BOT_NETEM_PROFILE '${BOT_NETEM_PROFILE}'. Known: clean none good_wifi good_4g congested_wifi lossy_mobile satellite dialup (src/control/netem.ts)." 2
+      exit 1
+      ;;
+  esac
+  netem_apply "${netem_op}" ${netem_params[@]+"${netem_params[@]}"}
+  netem_read
+  if [ "${netem_read_rc}" -ne 0 ]; then
+    netem_fatal "tc qdisc show dev ${BOT_NETEM_IFACE} after ${netem_op}, rc=${netem_read_rc} (${netem_read_root})"
+  fi
+  if [ "${netem_op}" = "shape" ]; then
+    [ -n "${netem_read_netem}" ] || netem_fatal "post-read found no netem on ${BOT_NETEM_IFACE}"
+    case "${netem_read_ingress}" in
+      *"qdisc netem"*) ;;
+      *) netem_fatal "post-read found no ingress netem on ${NETEM_IFB_DEV} (${netem_read_ingress:-no mirror})" ;;
+    esac
+    netem_state="shape profile=${BOT_NETEM_PROFILE} iface=${BOT_NETEM_IFACE} direction=both egress=[${netem_params[*]-}] ingress=[dev ${NETEM_IFB_DEV} ${netem_ingress_params[*]-}]"
+  else
+    [ -z "${netem_read_netem}" ] || netem_fatal "post-read still shows netem on ${BOT_NETEM_IFACE} (${netem_read_netem})"
+    [ -z "${netem_read_ingress}" ] || netem_fatal "post-read still shows an ingress mirror on ${BOT_NETEM_IFACE} (${netem_read_ingress})"
+    netem_state="clear profile=${BOT_NETEM_PROFILE} iface=${BOT_NETEM_IFACE} direction=both tc=[${netem_read_root}] ingress=none"
+  fi
+  say "docker-entrypoint: netem ${netem_verb} — ${netem_state}"
+else
+  netem_read
+  netem_ingress_state="none"
+  [ -z "${netem_read_ingress}" ] || netem_ingress_state="[${netem_read_ingress}]"
+  if [ "${netem_read_rc}" -ne 0 ]; then
+    netem_state="unread iface=${BOT_NETEM_IFACE} probe-failed rc=${netem_read_rc}"
+    say "docker-entrypoint: WARNING — could not read the qdisc, so this pod's link posture is UNKNOWN — ${netem_state}: ${netem_read_root}" 2
+  elif [ -n "${netem_read_netem}" ] || [ -n "${netem_read_ingress}" ]; then
+    qdisc_line="${netem_read_netem:-${netem_read_root}}"
+    # A root that shapes (e.g. tbf) outranks a netem nested under it.
+    [ "${netem_read_root}" = "${qdisc_line}" ] || qdisc_line="${netem_read_root}; ${qdisc_line}"
+    netem_state="inherited iface=${BOT_NETEM_IFACE} tc=[${qdisc_line}] ingress=${netem_ingress_state}"
+    say "docker-entrypoint: WARNING — shaping was already installed and this run neither applied nor cleared it — ${netem_state}" 2
+  else
+    # "No netem" is not "no shaping", so report the evidence, never a bare claim.
+    netem_state="no-netem iface=${BOT_NETEM_IFACE} tc=[${netem_read_root}] ingress=none"
+  fi
+fi
 
 # Non-sensitive startup line only — password is never logged; email is reported
 # as present/absent to minimize PII in logs.
@@ -325,7 +646,24 @@ ctl_state="disabled"
 # operator can confirm from the pod log that the credential is NOT going to the
 # retained PVC.
 [ -n "${BOT_CTL_PORT}" ] && ctl_state="port=${BOT_CTL_PORT} bind=${BOT_CTL_BIND} token=present token_dir=${BOT_CTL_STATE_DIR:-${BOT_RUN_DIR}}"
-echo "docker-entrypoint: launching bot — url=${MEETING_URL} participant=${BOT_PARTICIPANT} auth=${BOT_AUTH} ttl=${TTL} identity_mode=${BOT_IDENTITY_MODE} hw_concurrency=${BOT_HW_CONCURRENCY:-<omitted>} credentials=${cred_state} control=[${ctl_state}]"
+
+stagger_state="off"
+stagger_note=""
+if [ "${stagger_max}" -gt 0 ]; then
+  stagger_secs=$((RANDOM % (stagger_max + 1)))
+  stagger_state="${stagger_secs}s"
+  # TERM and INT both: an operator stop must not be swallowed by this sleep.
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  say "docker-entrypoint: join stagger — sleeping ${stagger_secs}s (max ${stagger_max}s) before joining"
+  sleep "${stagger_secs}" &
+  if ! wait $!; then
+    stagger_note="(INCOMPLETE)"
+    say "docker-entrypoint: WARNING — stagger sleep failed; joining without the full ${stagger_secs}s" 2
+  fi
+fi
+
+say "docker-entrypoint: launching bot — url=${MEETING_URL} participant=${BOT_PARTICIPANT} auth=${BOT_AUTH} ttl=${TTL} identity_mode=${BOT_IDENTITY_MODE} hw_concurrency=${BOT_HW_CONCURRENCY:-<omitted>} credentials=${cred_state} control=[${ctl_state}] netem=[${netem_state}] join_stagger=${stagger_state}${stagger_note} camera_cycle=[${camera_cycle_state}]"
 
 # Capability cap. `--hardware-concurrency <N>` (added by the parallel frontend
 # task on the `run` command) sets the fake navigator.hardwareConcurrency the bot
@@ -336,6 +674,11 @@ echo "docker-entrypoint: launching bot — url=${MEETING_URL} participant=${BOT_
 hw_args=()
 if [ -n "${BOT_HW_CONCURRENCY}" ]; then
   hw_args=(--hardware-concurrency "${BOT_HW_CONCURRENCY}")
+fi
+
+posture_args=()
+if [ -n "${BOT_INDEX}" ]; then
+  posture_args=(--bot-index "${BOT_INDEX}")
 fi
 
 # exec the tsx binary DIRECTLY (not `npm run`, which would make npm PID 1 and
@@ -363,5 +706,6 @@ exec node_modules/.bin/tsx bots-app/src/cli.ts run \
   --manifest "" \
   --assets-dir "${BOT_RUN_DIR}" \
   ${hw_args[@]+"${hw_args[@]}"} \
+  ${posture_args[@]+"${posture_args[@]}"} \
   ${ctl_args[@]+"${ctl_args[@]}"} \
   ${BOT_EXTRA_ARGS:-}

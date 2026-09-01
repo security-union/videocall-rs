@@ -19,11 +19,9 @@ import { execFile } from "node:child_process";
  * against {@link IFACE_PATTERN}. There is no code path that interpolates
  * untrusted text into a shell string.
  *
- * NOTE — direction: `tc qdisc ... dev <iface> root netem` shapes the
- * interface's EGRESS (outbound) queue. That is the bot's uplink — the
- * direction that carries its published camera/screen media — which is
- * what a load test wants to impair. Inbound shaping would require an
- * `ifb` mirror and is intentionally out of scope here.
+ * NOTE — direction: root netem shapes EGRESS only. Ingress needs the `ifb`
+ * mirror that ONLY `docker-entrypoint.sh` installs; a runtime action cannot,
+ * so it REMOVES any mirror rather than mislabel a downlink it did not shape.
  */
 
 /** Default interface shaped when the deploy config does not override it. */
@@ -36,7 +34,10 @@ export const NETEM_IFACE_DEFAULT = "eth0";
  * interface is operator/deploy configuration — NEVER taken from an HTTP
  * request body — but we validate defensively regardless.
  */
-export const IFACE_PATTERN = /^[A-Za-z0-9._-]{1,15}$/;
+export const IFACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$/;
+
+/** Loopback names refused as shaping targets — the readinessProbe rides loopback. */
+export const LOOPBACK_IFACES = new Set(["lo", "lo0"]);
 
 /**
  * Concrete netem parameters. All optional so a profile / raw request can
@@ -53,6 +54,10 @@ export interface NetemParams {
   lossPct?: number;
   /** Egress rate cap, kilobit/s. */
   rateKbit?: number;
+  /** Ingress rate cap, kilobit/s — for the `ifb` mirror, never the root qdisc. */
+  downlinkRateKbit?: number;
+  /** Netem queue depth, packets. Unset ⇒ netem's own default backlog. */
+  limitPkts?: number;
 }
 
 /**
@@ -67,7 +72,7 @@ export type NetemAction =
 
 /**
  * Named profiles. Values MIRROR `videocall-netsim/src/profiles.rs`
- * (uplink direction, since root netem shapes egress) so operators use
+ * (both directions, locked by netem-profile-drift.test.ts) so operators use
  * ONE impairment vocabulary across the client `?netsim=` shim and the
  * OS-level tc path. `null` means "no shaping" ⇒ clear the qdisc.
  *
@@ -77,16 +82,63 @@ export type NetemAction =
 export const NETEM_PROFILES: Readonly<Record<string, NetemParams | null>> = {
   clean: null,
   none: null,
-  good_wifi: { delayMs: 20, jitterMs: 5, lossPct: 0.1, rateKbit: 20_000 },
-  good_4g: { delayMs: 50, jitterMs: 15, lossPct: 0.5, rateKbit: 10_000 },
-  congested_wifi: { delayMs: 80, jitterMs: 30, lossPct: 2, rateKbit: 2_000 },
-  lossy_mobile: { delayMs: 150, jitterMs: 50, lossPct: 5, rateKbit: 800 },
-  satellite: { delayMs: 600, jitterMs: 50, lossPct: 1, rateKbit: 1_500 },
-  dialup: { delayMs: 200, jitterMs: 40, lossPct: 3, rateKbit: 56 },
+  good_wifi: {
+    delayMs: 20,
+    jitterMs: 5,
+    lossPct: 0.1,
+    rateKbit: 20_000,
+    downlinkRateKbit: 50_000,
+    limitPkts: 100,
+  },
+  good_4g: {
+    delayMs: 50,
+    jitterMs: 15,
+    lossPct: 0.5,
+    rateKbit: 10_000,
+    downlinkRateKbit: 30_000,
+    limitPkts: 100,
+  },
+  congested_wifi: {
+    delayMs: 80,
+    jitterMs: 30,
+    lossPct: 2,
+    rateKbit: 2_000,
+    downlinkRateKbit: 4_000,
+    limitPkts: 55,
+  },
+  lossy_mobile: {
+    delayMs: 150,
+    jitterMs: 50,
+    lossPct: 5,
+    rateKbit: 800,
+    downlinkRateKbit: 2_000,
+    limitPkts: 40,
+  },
+  satellite: {
+    delayMs: 600,
+    jitterMs: 50,
+    lossPct: 1,
+    rateKbit: 1_500,
+    downlinkRateKbit: 10_000,
+    limitPkts: 300,
+  },
+  dialup: {
+    delayMs: 200,
+    jitterMs: 40,
+    lossPct: 3,
+    rateKbit: 56,
+    downlinkRateKbit: 56,
+    limitPkts: 10,
+  },
 };
 
 /** Stable list of profile names for CLI help / error messages. */
 export const NETEM_PROFILE_NAMES: readonly string[] = Object.keys(NETEM_PROFILES);
+
+/** Own-property only: `in` would accept `toString`/`constructor` as profiles. */
+export function isNetemProfileName(name: string): boolean {
+  return NETEM_PROFILE_NAMES.includes(name);
+}
 
 /**
  * Thrown by {@link resolveNetemRequest} on any invalid request body. The
@@ -99,22 +151,40 @@ export class NetemValidationError extends Error {
   }
 }
 
-/**
- * Result of running a netem action: the exact argv handed to `tc` (for
- * logging / the API response) and the resolved label.
- */
 export interface NetemApplyResult {
-  /** Full argv including the `tc` program name at index 0. */
-  argv: string[];
+  commands: string[][];
   label: string;
   op: "shape" | "clear";
+  mirrorRemoved: boolean;
+}
+
+/** `exitStatus` is the status the child exited with, or null when none is available. */
+export class NetemExecError extends Error {
+  readonly exitStatus: number | null;
+
+  constructor(message: string, exitStatus: number | null) {
+    super(message);
+    this.name = "NetemExecError";
+    this.exitStatus = exitStatus;
+  }
+}
+
+export const NETEM_EXEC_NOT_RUN_STATUS_MIN = 126;
+
+export function netemExecExitedNonZero(e: unknown): e is NetemExecError {
+  return (
+    e instanceof NetemExecError &&
+    e.exitStatus !== null &&
+    e.exitStatus < NETEM_EXEC_NOT_RUN_STATUS_MIN
+  );
 }
 
 /**
  * Injectable process runner. Production uses {@link defaultNetemExec}
  * (a thin `execFile` wrapper); tests inject a recorder so no real `tc`
  * ever runs. Mirrors the `vpnFetch` / `ssoCaptureFactory` seam pattern
- * already used by the control server.
+ * already used by the control server. Implementations MUST reject with
+ * {@link NetemExecError}.
  */
 export type NetemExec = (
   file: string,
@@ -134,7 +204,8 @@ export function defaultNetemExec(): NetemExec {
       execFile(file, args, { timeout: NETEM_EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
         if (err) {
           const detail = stderr.trim().length > 0 ? stderr.trim() : err.message;
-          reject(new Error(`tc ${args.join(" ")} failed: ${detail}`));
+          const exitStatus = typeof err.code === "number" ? err.code : null;
+          reject(new NetemExecError(`tc ${args.join(" ")} failed: ${detail}`, exitStatus));
           return;
         }
         resolve({ stdout, stderr });
@@ -187,6 +258,18 @@ export function validateNetemParams(raw: Record<string, unknown>): NetemParams {
     }
     params.rateKbit = rate;
   }
+  if (raw.downlinkRateKbit !== undefined && raw.downlinkRateKbit !== null) {
+    throw new NetemValidationError(
+      '"downlinkRateKbit" is not accepted at runtime — ingress is shaped only at pod start, via BOT_NETEM_PROFILE',
+    );
+  }
+  if (raw.limitPkts !== undefined && raw.limitPkts !== null) {
+    const limit = assertFiniteNonNegative(raw.limitPkts as number, "limitPkts", 100_000);
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new NetemValidationError('"limitPkts" must be an integer >= 1');
+    }
+    params.limitPkts = limit;
+  }
   if (params.jitterMs !== undefined && params.delayMs === undefined) {
     throw new NetemValidationError('"jitterMs" requires "delayMs" (netem puts jitter after delay)');
   }
@@ -207,7 +290,7 @@ export function validateNetemParams(raw: Record<string, unknown>): NetemParams {
  *
  * Accepts EITHER:
  *   - `{ profile: "<name>" }` — a named profile ("clean"/"none" ⇒ clear)
- *   - `{ delayMs?, jitterMs?, lossPct?, rateKbit? }` — raw params
+ *   - `{ delayMs?, jitterMs?, lossPct?, rateKbit?, limitPkts? }` — raw params
  *
  * Supplying both a profile AND raw params is rejected as ambiguous. An
  * explicit `{ clear: true }` (or the DELETE verb, handled by the caller)
@@ -224,7 +307,9 @@ export function resolveNetemRequest(body: unknown): NetemAction {
     o.delayMs !== undefined ||
     o.jitterMs !== undefined ||
     o.lossPct !== undefined ||
-    o.rateKbit !== undefined;
+    o.rateKbit !== undefined ||
+    o.downlinkRateKbit !== undefined ||
+    o.limitPkts !== undefined;
 
   if (o.clear === true) {
     if (hasProfile || hasRawParam) {
@@ -241,7 +326,7 @@ export function resolveNetemRequest(body: unknown): NetemAction {
     if (typeof o.profile !== "string") {
       throw new NetemValidationError('"profile" must be a string');
     }
-    if (!(o.profile in NETEM_PROFILES)) {
+    if (!isNetemProfileName(o.profile)) {
       throw new NetemValidationError(
         `unknown profile "${o.profile}" (known: ${NETEM_PROFILE_NAMES.join(", ")})`,
       );
@@ -269,11 +354,16 @@ function assertIface(iface: string): void {
       `interface "${iface}" is not a valid device name (${IFACE_PATTERN.source})`,
     );
   }
+  if (LOOPBACK_IFACES.has(iface)) {
+    throw new NetemValidationError(
+      `interface "${iface}" is loopback — shaping it would break the pod's readinessProbe`,
+    );
+  }
 }
 
 /**
  * Build the argv (excluding the `tc` program name) for a shape command:
- *   qdisc replace dev <iface> root netem [delay <d>ms [<j>ms]] [loss <l>%] [rate <r>kbit]
+ *   qdisc replace dev <iface> root netem [delay <d>ms [<j>ms]] [loss <l>%] [rate <r>kbit] [limit <n>]
  *
  * `replace` (not `add`) makes the call idempotent — re-applying a
  * profile overwrites the existing qdisc instead of erroring.
@@ -293,6 +383,9 @@ export function buildNetemShapeArgs(iface: string, params: NetemParams): string[
   if (params.rateKbit !== undefined) {
     args.push("rate", `${params.rateKbit}kbit`);
   }
+  if (params.limitPkts !== undefined) {
+    args.push("limit", `${params.limitPkts}`);
+  }
   return args;
 }
 
@@ -305,34 +398,155 @@ export function buildNetemClearArgs(iface: string): string[] {
   return ["qdisc", "del", "dev", iface, "root"];
 }
 
+export const NETEM_IFB_DEV = "ifb0";
+
+/**
+ * Device queue depth for the mirror, packets. A fresh `ifb` comes up at 32,
+ * which sits AHEAD of the netem qdisc and would bind before its `limit`.
+ */
+export const NETEM_IFB_TXQUEUELEN = 1000;
+
+export interface NetemCommand {
+  file: "tc" | "ip";
+  args: string[];
+}
+
+/**
+ * The ingress half of a profile: downlink rate in place of uplink, the rest
+ * symmetric. `rateKbit` here would tighten the downlink 2–6.7x. Throws without
+ * a downlink rate: a mirror at the wrong rate mislabels the receipt.
+ */
+export function ingressNetemParams(params: NetemParams): NetemParams {
+  if (params.downlinkRateKbit === undefined) {
+    throw new NetemValidationError(
+      "cannot shape ingress without a downlinkRateKbit (see NETEM_PROFILES)",
+    );
+  }
+  const { downlinkRateKbit, ...rest } = params;
+  return { ...rest, rateKbit: downlinkRateKbit };
+}
+
+/**
+ * Install commands in order. `ip link add` runs ONLY when the `ip link show`
+ * before it fails; the hook is deleted then re-added, never replaced.
+ */
+export function buildNetemMirrorInstallArgs(iface: string, params: NetemParams): NetemCommand[] {
+  assertIface(iface);
+  const ingress = ingressNetemParams(params);
+  return [
+    { file: "ip", args: ["link", "show", NETEM_IFB_DEV] },
+    { file: "ip", args: ["link", "add", NETEM_IFB_DEV, "type", "ifb"] },
+    { file: "ip", args: ["link", "set", NETEM_IFB_DEV, "up"] },
+    {
+      file: "ip",
+      args: ["link", "set", NETEM_IFB_DEV, "txqueuelen", `${NETEM_IFB_TXQUEUELEN}`],
+    },
+    { file: "tc", args: ["qdisc", "del", "dev", iface, "ingress"] },
+    { file: "tc", args: ["qdisc", "add", "dev", iface, "handle", "ffff:", "ingress"] },
+    {
+      file: "tc",
+      args: [
+        ...["filter", "add", "dev", iface, "parent", "ffff:", "protocol", "all"],
+        ...["u32", "match", "u32", "0", "0"],
+        ...["action", "mirred", "egress", "redirect", "dev", NETEM_IFB_DEV],
+      ],
+    },
+    { file: "tc", args: buildNetemShapeArgs(NETEM_IFB_DEV, ingress) },
+  ];
+}
+
+export const NETEM_MIRROR_ADD_STEP = 1;
+
+/** Teardown order: hook first, and its exit status gates the `ifb` steps. */
+export function buildNetemMirrorClearArgs(iface: string): NetemCommand[] {
+  assertIface(iface);
+  return [
+    { file: "tc", args: ["qdisc", "del", "dev", iface, "ingress"] },
+    { file: "tc", args: buildNetemClearArgs(NETEM_IFB_DEV) },
+    { file: "ip", args: ["link", "del", NETEM_IFB_DEV] },
+  ];
+}
+
+export function buildNetemProbeArgs(iface: string): string[] {
+  assertIface(iface);
+  return ["qdisc", "show", "dev", iface];
+}
+
+export const NETEM_INGRESS_QDISC_MARKER = "qdisc ingress";
+
+/** Lowercased `tc qdisc del` stderr meaning "already clean". Wording only. */
+export const NETEM_BENIGN_CLEAR_ERRORS = ["cannot delete", "no such file"] as const;
+
+export function isBenignClearError(message: string): boolean {
+  const msg = message.toLowerCase();
+  return NETEM_BENIGN_CLEAR_ERRORS.some((needle) => msg.includes(needle));
+}
+
+export class NetemStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NetemStateError";
+  }
+}
+
 /**
  * Run a resolved {@link NetemAction} against `iface` using the injected
  * `exec`. A `clear` on an interface that has no qdisc makes `tc` exit
- * non-zero ("Cannot delete qdisc with handle of zero" / "No such file");
- * we swallow that specific idempotency case so repeated clears succeed.
+ * non-zero; that idempotency case is swallowed so repeated clears
+ * succeed.
+ *
+ * BOTH ops then remove any startup ingress mirror and re-read the qdisc.
+ * Teardown is best-effort per step; the post-read is the gate.
  */
 export async function applyNetemAction(
   action: NetemAction,
   deps: { iface: string; exec: NetemExec },
 ): Promise<NetemApplyResult> {
   const { iface, exec } = deps;
+  const commands: string[][] = [];
+
+  const attempt = async (cmd: NetemCommand): Promise<boolean> => {
+    commands.push([cmd.file, ...cmd.args]);
+    try {
+      await exec(cmd.file, cmd.args);
+      return true;
+    } catch (e) {
+      if (!netemExecExitedNonZero(e)) throw e;
+      return false;
+    }
+  };
+
   if (action.op === "shape") {
     const args = buildNetemShapeArgs(iface, action.params);
+    commands.push(["tc", ...args]);
     await exec("tc", args);
-    return { argv: ["tc", ...args], label: action.label, op: "shape" };
+  } else {
+    const args = buildNetemClearArgs(iface);
+    commands.push(["tc", ...args]);
+    try {
+      await exec("tc", args);
+    } catch (e) {
+      if (!netemExecExitedNonZero(e) || !isBenignClearError(e.message)) throw e;
+    }
   }
-  const args = buildNetemClearArgs(iface);
-  try {
-    await exec("tc", args);
-  } catch (e) {
-    // Clearing an already-clean interface is not an error we surface —
-    // the desired end state (no shaping) is achieved either way.
-    const msg = (e as Error).message.toLowerCase();
-    const benign =
-      msg.includes("cannot delete") ||
-      msg.includes("no such file") ||
-      msg.includes("rtnetlink answers: no such file");
-    if (!benign) throw e;
+
+  const [hook, ...ifbSteps] = buildNetemMirrorClearArgs(iface);
+  const mirrorRemoved = await attempt(hook);
+  if (mirrorRemoved) {
+    for (const step of ifbSteps) await attempt(step);
   }
-  return { argv: ["tc", ...args], label: action.label, op: "clear" };
+
+  const probe = buildNetemProbeArgs(iface);
+  commands.push(["tc", ...probe]);
+  const { stdout } = await exec("tc", probe);
+  const left = [
+    stdout.includes(NETEM_INGRESS_QDISC_MARKER) ? "an ingress mirror" : "",
+    action.op === "clear" && stdout.includes("qdisc netem") ? "a netem qdisc" : "",
+  ].filter(Boolean);
+  if (left.length > 0) {
+    throw new NetemStateError(
+      `netem ${action.op} (${action.label}) left ${left.join(" and ")} on ${iface}: ${stdout.trim()}`,
+    );
+  }
+  return { commands, label: action.label, op: action.op, mirrorRemoved };
 }

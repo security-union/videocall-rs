@@ -24,6 +24,8 @@ use tokio::{
     time::{self, Duration},
 };
 use tracing::info;
+use url::Url;
+use videocall_meeting_types::mint::{self, LobbyAuth};
 use videocall_types::protos::{
     connection_packet::ConnectionPacket,
     media_packet::{media_packet::MediaType, HeartbeatMetadata, MediaPacket},
@@ -118,16 +120,26 @@ impl WebTransportClient {
     }
 }
 
+/// Build the lobby URL for one connection attempt.
+pub fn lobby_url_for_attempt(options: &Stream, auth: &LobbyAuth) -> anyhow::Result<Url> {
+    let mut base = options.url.clone();
+    base.set_path("");
+    base.set_query(None);
+    base.set_fragment(None);
+
+    let url = mint::build_lobby_url(base.as_str(), auth, &options.user_id, &options.meeting_id)?;
+    Ok(Url::parse(&url)?)
+}
+
 async fn connect_to_server(options: &Stream) -> anyhow::Result<web_transport_quinn::Session> {
+    // Resolved once so a missing credential fails immediately instead of
+    // retrying forever (#2298).
+    let auth = options.resolve_auth()?;
+
     loop {
         info!("Attempting to connect to {}", options.url);
 
-        // Construct WebTransport URL
-        let mut url = options.url.clone();
-        url.set_path(&format!(
-            "/lobby/{}/{}",
-            options.user_id, options.meeting_id
-        ));
+        let url = lobby_url_for_attempt(options, &auth)?;
 
         // Create WebTransport client using 0.7.3 API (same pattern as bot)
         let client = if options.insecure_skip_verify {
@@ -183,5 +195,70 @@ impl CameraSynk for WebTransportClient {
 
     async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
         self.queue_message(data).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lobby_url_for_attempt;
+    use crate::cli_args::{Mode, Opt, Stream};
+    use clap::Parser;
+    use videocall_meeting_types::mint::LobbyAuth;
+
+    /// `--jwt-secret ""` neutralises the `JWT_SECRET` env fallback so these
+    /// assertions hold on a developer machine that has the relay secret set.
+    fn stream_from(extra: &[&str]) -> Stream {
+        let mut argv = vec![
+            "videocall-cli",
+            "stream",
+            "--url",
+            "https://relay.example.com",
+            "--user-id",
+            "cli-1",
+            "--meeting-id",
+            "room-1",
+        ];
+        argv.extend_from_slice(extra);
+        match Opt::parse_from(argv).mode {
+            Mode::Stream(s) => *s,
+            other => panic!("expected the stream subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stream_without_a_credential_refuses_to_join() {
+        let err = stream_from(&["--jwt-secret", ""])
+            .resolve_auth()
+            .expect_err("a credential-less invocation must not resolve to a joinable auth mode");
+        assert!(
+            err.to_string().contains("no room access token"),
+            "expected a missing-credential error — got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_secret_defaults_to_a_token_authenticated_url() {
+        let options = stream_from(&["--jwt-secret", "secret"]);
+        let url = lobby_url_for_attempt(&options, &options.resolve_auth().unwrap()).unwrap();
+
+        assert_eq!(url.path(), "/lobby");
+        assert!(url.query().unwrap_or_default().starts_with("token="));
+    }
+
+    #[test]
+    fn a_secret_wins_over_an_explicit_deprecated_path_request() {
+        let options = stream_from(&["--jwt-secret", "secret", "--deprecated-path"]);
+        assert!(matches!(
+            options.resolve_auth().unwrap(),
+            LobbyAuth::Secret { .. }
+        ));
+    }
+
+    #[test]
+    fn the_deprecated_path_is_still_reachable_on_request() {
+        let options = stream_from(&["--jwt-secret", "", "--deprecated-path"]);
+        let url = lobby_url_for_attempt(&options, &options.resolve_auth().unwrap()).unwrap();
+
+        assert_eq!(url.as_str(), "https://relay.example.com/lobby/cli-1/room-1");
     }
 }

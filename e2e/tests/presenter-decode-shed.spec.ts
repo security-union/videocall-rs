@@ -1,5 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
+import { BUDGET } from "../helpers/rust-mirrored-constants";
 import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
@@ -42,19 +43,7 @@ import { wakeControls } from "../helpers/controls";
  * MUTATION SENSITIVITY: if the presenter bias were removed, the SHARING phase
  * would also Hold at BAND_FPS (no off-budget tiles), so the "off-budget tiles
  * appear only while sharing" assertion fails.
- *
- * THRESHOLD/TIMING CONSTANTS below mirror
- * `dioxus-ui/src/components/decode_budget.rs`; keep in lockstep with a retune.
  */
-
-// --- Mirrors of dioxus-ui/src/components/decode_budget.rs (keep in sync) ---
-const BUDGET = {
-  FPS_STEP_DOWN: 24, // normal step-down threshold
-  FPS_STEP_UP: 30, // step-up threshold == presenter step-down while sharing
-  SUSTAIN_SAMPLES: 3,
-  STEP_DOWN_COOLDOWN_MS: 2000,
-  STEP_UP_COOLDOWN_MS: 4000,
-} as const;
 
 // An injected FPS strictly INSIDE the 24-30 hysteresis band: above the normal
 // step-down floor (so a non-presenter Holds) but below the presenter step-down

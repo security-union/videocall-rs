@@ -747,7 +747,7 @@
               "mode": "none"
             }
           },
-          "max": 256,
+          "max": 1024,
           "min": 0,
           "thresholds": {
             "mode": "absolute",
@@ -792,7 +792,8 @@
         }
       ],
       "title": "Outbound Queue Depth",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Room-level relay outbound channel depth (slots occupied). Every session in the room writes this one series from its own heartbeat, so each scrape shows whichever session sampled last and a single backed-up receiver can be erased by an idle peer (#2593). Use it for a room-shape overview only; for attribution see 'Relay Outbound Queue Depth by Session' and 'Relay Outbound Queue Bytes by Session'. On WebTransport this is the unistream+datagram sum."
     },
     {
       "datasource": {
@@ -2431,7 +2432,7 @@
         }
       ],
       "title": "Reference Loss, Decode Errors & FPS (Receiver)",
-      "description": "Per-peer receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series, left axis) is the always-on signal and returns to 0 when healthy — sustained > 0 while FPS still reads ~30 is the classic frozen-but-decoding case. FPS (videocall_video_fps) is plotted on the right axis so it does not flatten the loss series or trip the loss threshold. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update when a hard WebCodecs decode fault occurs) — read these two as 'has a fault occurred', not 'is one occurring right now'. All three loss/error gauges are registered + emitted server-side and conditionally populated.",
+      "description": "Per-peer receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series, left axis) is the always-on signal and returns to 0 when healthy — sustained > 0 while FPS still reads ~30 is the classic frozen-but-decoding case. Published by browser receivers and, since #2424, by the Rust synthetic-client bot (the docker-compose 'synthetic-clients' service; NOT the e2e/bots-app Chromium fleet, which does not report per-peer loss). On the bot it counts only discontinuity inside the receiver's rung availability window (4s): a stream silent longer than that re-baselines on return and books 0, because frames the relay deliberately shed were never sent to this receiver. So a bot pair's 0 means 'no in-window discontinuity', NOT 'no freeze' — a #2363-class 15-60s freeze reads 0 here. Browser pairs carry videocall_video_content_staleness_ms / videocall_video_freeze_seconds_total for freeze severity; bot pairs do NOT populate those, so for a bot read the RX STATS log line in the bot's own output, whose rung_expiries figure is nonzero whenever that bound bit during the run. (See also #2524 — this is a packet count per second, not a loss fraction, and not a freeze predictor.) FPS (videocall_video_fps) is plotted on the right axis so it does not flatten the loss series or trip the loss threshold. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update when a hard WebCodecs decode fault occurs) — read these two as 'has a fault occurred', not 'is one occurring right now'. All three loss/error gauges are registered + emitted server-side and conditionally populated.",
       "type": "timeseries"
     },
     {
@@ -3480,7 +3481,7 @@
             }
           ],
           "title": "Reference Loss & Decode Errors (per receiver)",
-          "description": "Per-receiver-pair receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series) is the always-on signal and returns to 0 when healthy. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update on a real WebCodecs decode fault) — read these two as 'has a fault occurred', not 'is one occurring right now'. Correlate with tier changes and encoder queue depth (videocall_encoder_queue_depth, sender-side backpressure) to find whether degradation is isolated or widespread. All three are registered + emitted server-side and conditionally populated.",
+          "description": "Per-receiver-pair receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series) is the always-on signal and returns to 0 when healthy. Published by browser receivers and, since #2424, by the Rust synthetic-client bot (the docker-compose 'synthetic-clients' service; NOT the e2e/bots-app Chromium fleet, which does not report per-peer loss). On the bot it counts only discontinuity inside the receiver's rung availability window (4s): a stream silent longer than that re-baselines on return and books 0, because frames the relay deliberately shed were never sent to this receiver. So a bot pair's 0 means 'no in-window discontinuity', NOT 'no freeze' — a #2363-class 15-60s freeze reads 0 here. Browser pairs carry videocall_video_content_staleness_ms / videocall_video_freeze_seconds_total for freeze severity; bot pairs do NOT populate those, so for a bot read the RX STATS log line in the bot's own output, whose rung_expiries figure is nonzero whenever that bound bit during the run. (See also #2524 — this is a packet count per second, not a loss fraction, and not a freeze predictor.) videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update on a real WebCodecs decode fault) — read these two as 'has a fault occurred', not 'is one occurring right now'. Correlate with tier changes and encoder queue depth (videocall_encoder_queue_depth, sender-side backpressure) to find whether degradation is isolated or widespread. All three are registered + emitted server-side and conditionally populated.",
           "type": "timeseries"
         }
       ]
@@ -5058,7 +5059,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Per-pair receive-side audio datagram loss rate (lost audio packets/sec) observed by a WebTransport receiver (#1878). Sustained nonzero => plaintext-datagram audio being dropped (e.g. incoming-datagram queue overflow on a main-thread stall) — burst loss NetEQ cannot conceal. Reads 0 on WebSocket (audio rides ordered TCP) and ~0 on E2EE-WT (audio on the reliable unistream). Filtered to > 0 so only lossy pairs plot.",
+      "description": "Per-pair receive-side audio datagram loss rate (lost audio packets/sec) observed by a WebTransport receiver (#1878). Sustained nonzero => plaintext-datagram audio being dropped (e.g. incoming-datagram queue overflow on a main-thread stall) — burst loss NetEQ cannot conceal. Reads 0 on WebSocket (audio rides ordered TCP) and ~0 on E2EE-WT (audio on the reliable unistream). Filtered to > 0 so only lossy pairs plot. The Rust synthetic-client bot publishes this too (#2424), on the same WebTransport gate and with the same 4s rung-availability bound as the video sibling: a stream silent longer than the window re-baselines and books 0, so 0 is not proof of a healthy stretch. The bot also has no 64-slot reorder window, so it books a gap immediately and never retracts it — on a reordering path a bot pair reads above what a browser pair would, closer to the raw sibling (field 18) than to this one. The e2e/bots-app Chromium fleet does not report per-peer loss at all.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -5120,7 +5121,7 @@
       "datasource": {
         "type": "prometheus"
       },
-      "description": "Per-receiver relay outbound channel depth (slots occupied), keyed by session and split by channel (#1737). Labeled by room (== meeting name), transport, session_id, channel. The per-rx mpsc capacity is 512 with shedding at ~80% (#979); sustained high depth means the receiver's downlink cannot drain as fast as the relay fans in. Wrapped in topk(25, ...) to bound rendered series because $meeting defaults to All and this is a high-cardinality {room,transport,session_id,channel} metric.",
+      "description": "Per-receiver relay outbound channel depth (slots occupied), keyed by session and split by channel (#1737). Labeled by room (== meeting name), transport, session_id, channel. The per-rx bound on WS is 1024 slots plus a per-kind byte budget (#2261): camera VIDEO sheds at 80% of 384,000 B, SCREEN at 90% of 7,076,736 B, audio on slots only. See relay_outbound_queue_bytes_by_session{kind=video|screen|other} for the byte dimension this slot gauge cannot show; each kind is judged against its own budget. WT is 512 slots per channel by default, shedding at ~80% (#979). Sustained high depth means the receiver's downlink cannot drain as fast as the relay fans in. Wrapped in topk(25, ...) to bound rendered series because $meeting defaults to All and this is a high-cardinality {room,transport,session_id,channel} metric.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -5372,6 +5373,68 @@
         "x": 0,
         "y": 262
       }
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "description": "Per-receiver relay outbound queue occupancy in BYTES, keyed by session and split by media kind (#2593). WebSocket only. Labeled by room (== meeting name), transport, session_id, kind (video|screen|other). The #2261 shed points are per kind: camera VIDEO at 80% of 384,000 B (307,200), SCREEN at 90% of 7,076,736 B (6,369,062); kind=other (audio, control) is counted here but never shed on bytes. The attributable form of relay_outbound_queue_bytes, which is room-level last-writer-wins and can read ~0 while one receiver sits at its shed point. Wrapped in topk(25, ...) to bound rendered series because $meeting defaults to All and this is a high-cardinality {room,transport,session_id,kind} metric.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 262
+      },
+      "id": 114,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(25, relay_outbound_queue_bytes_by_session{room=~\"$meeting\"})",
+          "legendFormat": "{{session_id}} {{kind}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Relay Outbound Queue Bytes by Session (#2593)",
+      "type": "timeseries"
     },
     {
       "datasource": {

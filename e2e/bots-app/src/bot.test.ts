@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -53,6 +56,10 @@ import {
   launchBot,
 } from "./bot";
 import { openSsoCaptureBrowser } from "./auth/sso-capture";
+import { CAMERA_CYCLE_NEVER_FIRED_BANNER } from "./camera-cycle";
+import { SD_SOURCE } from "./posture";
+
+const CLOCK_SOURCE_PATH = fileURLToPath(new URL("./clock-source.js", import.meta.url));
 
 describe("isBenignTeardownError", () => {
   it.each([
@@ -134,6 +141,7 @@ describe("launchBot clock mode", () => {
       headless: true,
       videoMode: "clock",
       authBackend: "none",
+      sourceGeometry: SD_SOURCE,
       manifest: {
         participants: [{ name: "clock-bot" }],
         lines: [],
@@ -145,16 +153,13 @@ describe("launchBot clock mode", () => {
       audioOverride: "clock.wav",
     });
 
-    expect(mocks.addInitScript).toHaveBeenCalledTimes(2);
-    expect(mocks.addInitScript).toHaveBeenNthCalledWith(
-      1,
-      'globalThis.__CLOCK_PARTICIPANT = "Clock Bot";',
-    );
-    expect(mocks.addInitScript).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        path: expect.stringMatching(/clock-source\.js$/),
-      }),
+    expect(mocks.addInitScript).toHaveBeenCalledTimes(1);
+    expect(mocks.addInitScript).toHaveBeenCalledWith(
+      'globalThis.__CLOCK_PARTICIPANT = "Clock Bot";\n' +
+        "globalThis.__CLOCK_WIDTH = 640;\n" +
+        "globalThis.__CLOCK_HEIGHT = 480;\n" +
+        readFileSync(CLOCK_SOURCE_PATH, "utf8") +
+        `\n//# sourceURL=${CLOCK_SOURCE_PATH}`,
     );
 
     expect(mocks.ensureAssetsPrimed).not.toHaveBeenCalled();
@@ -165,6 +170,121 @@ describe("launchBot clock mode", () => {
         expect.stringMatching(/^--use-file-for-fake-(?:audio|video)-capture=/),
       ]),
     );
+  });
+
+  it("injects the task's source geometry in the label's own init script (#2236)", async () => {
+    await launchBot({
+      meetingURL: "https://example.test/meeting/ClockTest",
+      participant: "clock-bot",
+      displayName: "Clock Bot",
+      headless: true,
+      videoMode: "clock",
+      authBackend: "none",
+      sourceGeometry: { width: 1280, height: 720 },
+    });
+
+    expect(mocks.addInitScript).toHaveBeenCalledTimes(1);
+    expect(mocks.addInitScript.mock.calls[0][0]).toContain(
+      "globalThis.__CLOCK_WIDTH = 1280;\nglobalThis.__CLOCK_HEIGHT = 720;\n",
+    );
+  });
+
+  it("prints the greppable capture token only past a join AND a positive encoder fps (#2236)", async () => {
+    vi.useFakeTimers();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const { WaitingRoomError } = await import("./meeting-join");
+      const opts = {
+        meetingURL: "https://example.test/meeting/ClockTest",
+        participant: "clock-bot",
+        displayName: "Clock Bot",
+        headless: true,
+        videoMode: "clock" as const,
+        authBackend: "none" as const,
+        sourceGeometry: { width: 1280, height: 720 },
+        onEncoderFps: (): void => {},
+      };
+      const token = "[clock-bot] captures 1280x720 (issue #2236)";
+      const tokenCount = (): number => logSpy.mock.calls.flat().filter((l) => l === token).length;
+      mocks.pageEvaluate.mockReset();
+      mocks.pageEvaluate.mockResolvedValue(9);
+
+      // A bot the meeting never admitted never reaches the poll, so it cannot
+      // be counted.
+      mocks.joinMeetingAndEnableMedia.mockRejectedValueOnce(
+        new WaitingRoomError("waiting-for-host", "still waiting for the host"),
+      );
+      await expect(launchBot(opts)).rejects.toThrow(WaitingRoomError);
+      await vi.advanceTimersByTimeAsync(ENCODER_FPS_POLL_MS * 2);
+      expect(tokenCount()).toBe(0);
+
+      const handle = await launchBot(opts);
+      // Joined, but no reading has landed yet.
+      expect(tokenCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(ENCODER_FPS_POLL_MS);
+      expect(tokenCount()).toBe(1);
+
+      // Once per join, though the chain keeps reading positives.
+      await vi.advanceTimersByTimeAsync(ENCODER_FPS_POLL_MS * 3);
+      expect(tokenCount()).toBe(1);
+      await handle.shutdown();
+    } finally {
+      logSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("prints no capture token when the encoder never reports fps (#2236)", async () => {
+    vi.useFakeTimers();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      // The camera enable is best-effort — `clickWhenVisible` warns and returns
+      // when no control matches — so a join can succeed with no encoder at all.
+      mocks.pageEvaluate.mockReset();
+      mocks.pageEvaluate.mockResolvedValue(undefined);
+      const handle = await launchBot({
+        meetingURL: "https://example.test/meeting/ClockTest",
+        participant: "clock-bot",
+        displayName: "Clock Bot",
+        headless: true,
+        videoMode: "clock",
+        authBackend: "none",
+        sourceGeometry: { width: 1280, height: 720 },
+        onEncoderFps: (): void => {},
+      });
+      await vi.advanceTimersByTimeAsync(ENCODER_FPS_POLL_MS * 5);
+      expect(mocks.pageEvaluate.mock.calls.length).toBeGreaterThan(1);
+      expect(logSpy.mock.calls.flat().join("\n")).not.toContain("captures");
+      await handle.shutdown();
+    } finally {
+      logSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("prints no capture token in costume mode (#2236)", async () => {
+    vi.useFakeTimers();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      mocks.pageEvaluate.mockReset();
+      mocks.pageEvaluate.mockResolvedValue(9);
+      const handle = await launchBot({
+        meetingURL: "https://example.test/meeting/ClockTest",
+        participant: "clock-bot",
+        displayName: "Clock Bot",
+        headless: true,
+        videoMode: "costume",
+        authBackend: "none",
+        sourceGeometry: { width: 1280, height: 720 },
+        onEncoderFps: (): void => {},
+      });
+      await vi.advanceTimersByTimeAsync(ENCODER_FPS_POLL_MS * 3);
+      expect(logSpy.mock.calls.flat().join("\n")).not.toContain("captures");
+      await handle.shutdown();
+    } finally {
+      logSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("logs an already-closed context as expected teardown rather than an error", async () => {
@@ -180,6 +300,7 @@ describe("launchBot clock mode", () => {
         headless: true,
         videoMode: "clock",
         authBackend: "none",
+        sourceGeometry: SD_SOURCE,
       });
 
       await handle.shutdown();
@@ -208,6 +329,7 @@ describe("launchBot clock mode", () => {
         headless: true,
         videoMode: "clock",
         authBackend: "none",
+        sourceGeometry: SD_SOURCE,
       });
 
       await handle.shutdown();
@@ -246,6 +368,7 @@ describe("launchBot clock mode", () => {
         headless: true,
         videoMode: "clock",
         authBackend: "none",
+        sourceGeometry: SD_SOURCE,
       };
       if (kind === "waiting-room") {
         mocks.joinMeetingAndEnableMedia.mockRejectedValueOnce(
@@ -320,6 +443,7 @@ describe("launchBot clock mode", () => {
           headless: true,
           videoMode: "clock",
           authBackend: "none",
+          sourceGeometry: SD_SOURCE,
         });
 
         await handle.shutdown();
@@ -363,6 +487,7 @@ describe("launchBot clock mode", () => {
         headless: true,
         videoMode: "clock",
         authBackend: "none",
+        sourceGeometry: SD_SOURCE,
       });
 
       await handle.shutdown();
@@ -389,6 +514,7 @@ describe("launchBot clock mode", () => {
       headless: true,
       videoMode: "clock",
       authBackend: "none",
+      sourceGeometry: SD_SOURCE,
     });
 
     expect(mocks.launch).toHaveBeenCalledWith(
@@ -404,6 +530,7 @@ describe("launchBot clock mode", () => {
       headless: true,
       videoMode: "clock",
       authBackend: "none",
+      sourceGeometry: SD_SOURCE,
     });
 
     const capturePage = {
@@ -457,6 +584,7 @@ describe("launchBot clock mode", () => {
         headless: true,
         videoMode: "clock",
         authBackend: "none",
+        sourceGeometry: SD_SOURCE,
       });
 
       // context.close() runs first and reports that the target was already closed.
@@ -508,6 +636,7 @@ describe("launchBot clock mode", () => {
         headless: true,
         videoMode: "clock",
         authBackend: "none",
+        sourceGeometry: SD_SOURCE,
       });
 
       await handle.shutdown();
@@ -538,6 +667,7 @@ describe("launchBot clock mode", () => {
         headless: true,
         videoMode: "clock",
         authBackend: "none",
+        sourceGeometry: SD_SOURCE,
       });
 
       // Fire the `disconnected` listener launchBot registered, simulating a crash
@@ -586,6 +716,7 @@ describe("launchBot clock mode", () => {
         headless: true,
         videoMode: "clock",
         authBackend: "none",
+        sourceGeometry: SD_SOURCE,
         manifest: { participants: [{ name: "clock-bot" }], lines: [], pauseMs: 0 },
         manifestDir: "/tmp/manifest",
         runDir: "/tmp/run",
@@ -652,6 +783,7 @@ describe("launchBot clock mode", () => {
         headless: true,
         videoMode: "clock",
         authBackend: "none",
+        sourceGeometry: SD_SOURCE,
         manifest: { participants: [{ name: "clock-bot" }], lines: [], pauseMs: 0 },
         manifestDir: "/tmp/manifest",
         runDir: "/tmp/run",
@@ -724,6 +856,7 @@ describe("launchBot form-login mode (#2035)", () => {
     headless: true,
     videoMode: "clock" as const,
     authBackend: "form-login" as const,
+    sourceGeometry: SD_SOURCE,
   };
 
   it("drives the login form BEFORE the join flow, using the app origin as appBaseUrl", async () => {
@@ -752,6 +885,33 @@ describe("launchBot form-login mode (#2035)", () => {
     expect(mocks.performFormLogin.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.joinMeetingAndEnableMedia.mock.invocationCallOrder[0],
     );
+  });
+
+  it("forwards the login timeout overrides to performFormLogin (#2356)", async () => {
+    mocks.resolveFormLoginCredentials.mockReturnValue({
+      email: "bot@example.test",
+      password: "secret-pw",
+    });
+
+    await launchBot({ ...baseOpts, formLoginTimeoutMs: 90_000, formLoginActionTimeoutMs: 45_000 });
+
+    expect(mocks.performFormLogin.mock.calls[0][0]).toMatchObject({
+      timeoutMs: 90_000,
+      actionTimeoutMs: 45_000,
+    });
+  });
+
+  it("passes no timeout override when unset, leaving the form-login defaults (#2356)", async () => {
+    mocks.resolveFormLoginCredentials.mockReturnValue({
+      email: "bot@example.test",
+      password: "secret-pw",
+    });
+
+    await launchBot(baseOpts);
+
+    const call = mocks.performFormLogin.mock.calls[0][0];
+    expect(call.timeoutMs).toBeUndefined();
+    expect(call.actionTimeoutMs).toBeUndefined();
   });
 
   it("throws and tears the browser down when BOT_EMAIL / BOT_PASSWORD are absent", async () => {
@@ -823,6 +983,7 @@ describe("launchBot hardwareConcurrency spoof (#2035)", () => {
     headless: true,
     videoMode: "clock" as const,
     authBackend: "none" as const,
+    sourceGeometry: SD_SOURCE,
   };
 
   // The exact init script the injection is required to emit. This mirrors the
@@ -858,8 +1019,8 @@ describe("launchBot hardwareConcurrency spoof (#2035)", () => {
   it("does NOT inject any hardwareConcurrency script when the value is unset (default behavior)", async () => {
     await launchBot(baseOpts);
 
-    // Clock mode still adds its own two init scripts; assert specifically that
-    // none of the registered scripts touch navigator.hardwareConcurrency.
+    // Clock mode still adds its own init script; assert specifically that none
+    // of the registered scripts touch navigator.hardwareConcurrency.
     const touchedHwc = mocks.addInitScript.mock.calls.some(
       (c) => typeof c[0] === "string" && c[0].includes("hardwareConcurrency"),
     );
@@ -915,6 +1076,7 @@ describe("launchBot receive posture (#2235)", () => {
       headless: true,
       videoMode: "clock",
       authBackend: "none",
+      sourceGeometry: SD_SOURCE,
       manifest: { participants: [{ name: "posture-bot" }], lines: [], pauseMs: 0 },
       manifestDir: "/tmp/manifest",
       runDir: "/tmp/run",
@@ -1026,5 +1188,148 @@ describe("browserEnvWithoutFleetCreds (#2035)", () => {
   it("drops undefined values", () => {
     const filtered = browserEnvWithoutFleetCreds({ PATH: "/usr/bin", MAYBE: undefined });
     expect(filtered).toEqual({ PATH: "/usr/bin" });
+  });
+});
+
+describe("launchBot log-line forgery (#2375)", () => {
+  /** A complete, correctly-prefixed bot line an operator value must not be able to start. */
+  const FORGED = "[bot-0] FORGED-BY-BOT";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const page = {
+      addInitScript: mocks.addInitScript.mockResolvedValue(undefined),
+      evaluate: mocks.pageEvaluate,
+      goto: vi.fn().mockResolvedValue(undefined),
+      locator: vi.fn(),
+      off: vi.fn(),
+      on: vi.fn(),
+      url: vi.fn(() => "https://example.test/meeting/ClockTest"),
+    };
+    mocks.launch.mockResolvedValue({
+      close: vi.fn().mockResolvedValue(undefined),
+      newContext: vi.fn().mockResolvedValue({
+        close: vi.fn().mockResolvedValue(undefined),
+        newPage: vi.fn().mockResolvedValue(page),
+      }),
+      on: vi.fn(),
+    });
+    mocks.joinMeetingAndEnableMedia.mockResolvedValue(undefined);
+  });
+
+  /** Every line the run wrote to stdout/stderr, split on either terminator. */
+  async function linesFrom(overrides: Record<string, unknown>): Promise<string[]> {
+    const written: string[] = [];
+    const sink = (...args: unknown[]): void => {
+      written.push(args.map((a) => (typeof a === "string" ? a : String(a))).join(" "));
+    };
+    const spies = (["log", "warn", "error", "debug"] as const).map((m) =>
+      vi.spyOn(console, m).mockImplementation(sink),
+    );
+    try {
+      const handle = await launchBot({
+        meetingURL: "https://example.test/meeting/ClockTest",
+        participant: "bot-0",
+        displayName: "Bot 0",
+        headless: true,
+        videoMode: "clock",
+        authBackend: "none",
+        sourceGeometry: SD_SOURCE,
+        ...overrides,
+      } as Parameters<typeof launchBot>[0]);
+      await handle.shutdown();
+    } finally {
+      for (const s of spies) s.mockRestore();
+    }
+    return written.join("\n").split(/[\r\n]/);
+  }
+
+  const CASES: Array<[string, Record<string, unknown>]> = [
+    ["participant (LF)", { participant: `bot-0\n${FORGED}` }],
+    ["participant (CR)", { participant: `bot-0\r${FORGED}` }],
+    ["botIdShort (LF)", { participant: "bot-0", botIdShort: `abc123\n${FORGED}` }],
+    ["network (LF)", { network: `congested_wifi\n${FORGED}` }],
+    ["ssoStateFile (CR)", { authBackend: "jwt", ssoStateFile: `/nope/sso-state.json\r${FORGED}` }],
+  ];
+
+  it.each(CASES)("keeps %s from starting a second bot-prefixed line", async (_label, overrides) => {
+    const lines = await linesFrom(overrides);
+    expect(lines.filter((l) => l.startsWith(FORGED))).toEqual([]);
+    // Truncated instead ⇒ the sanitiser dropped the tail rather than collapsing it.
+    expect(lines.filter((l) => l.includes(FORGED)).length).toBeGreaterThan(0);
+  });
+});
+
+describe("launchBot camera cycle wiring (#2362)", () => {
+  const BASE = {
+    meetingURL: "https://example.test/meeting/ClockTest",
+    participant: "clock-bot",
+    displayName: "Clock Bot",
+    headless: true,
+    videoMode: "clock" as const,
+    authBackend: "none" as const,
+    sourceGeometry: SD_SOURCE,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.browserClose.mockResolvedValue(undefined);
+    mocks.contextClose.mockResolvedValue(undefined);
+    const page = {
+      addInitScript: mocks.addInitScript,
+      evaluate: mocks.pageEvaluate,
+      goto: vi.fn().mockResolvedValue(undefined),
+      locator: vi.fn(),
+      off: vi.fn(),
+      on: vi.fn(),
+      url: vi.fn(() => BASE.meetingURL),
+    };
+    const context = { close: mocks.contextClose, newPage: vi.fn().mockResolvedValue(page) };
+    mocks.launch.mockResolvedValue({
+      close: mocks.browserClose,
+      newContext: vi.fn().mockResolvedValue(context),
+      on: vi.fn(),
+    });
+    mocks.addInitScript.mockResolvedValue(undefined);
+    mocks.joinMeetingAndEnableMedia.mockResolvedValue(undefined);
+  });
+
+  const runAndCollect = async (
+    cameraCycle: { onMinMs: number; onMaxMs: number; offMinMs: number; offMaxMs: number } | null,
+  ): Promise<string[]> => {
+    const lines: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...a) => void lines.push(a.join(" ")));
+    const err = vi
+      .spyOn(console, "error")
+      .mockImplementation((...a) => void lines.push(a.join(" ")));
+    try {
+      const bot = await launchBot({ ...BASE, cameraCycle });
+      await bot.shutdown();
+    } finally {
+      log.mockRestore();
+      err.mockRestore();
+    }
+    return lines;
+  };
+
+  it("stays silent and starts no loop when cameraCycle is null — the default", async () => {
+    const lines = await runAndCollect(null);
+    expect(lines.filter((l) => l.includes("camera cycle"))).toEqual([]);
+    expect(lines.filter((l) => l.includes("CAMERA_CYCLE_"))).toEqual([]);
+  });
+
+  it("announces the configured cycle and emits the receipt from shutdown()", async () => {
+    const lines = await runAndCollect({
+      onMinMs: 5_000,
+      onMaxMs: 15_000,
+      offMinMs: 20_000,
+      offMaxMs: 60_000,
+    });
+    expect(lines.some((l) => l.includes("camera cycle configured — on=[5-15]s off=[20-60]s"))).toBe(
+      true,
+    );
+    // No timer advanced, so no toggle fired — and the receipt must say so
+    // rather than being absent.
+    expect(lines.some((l) => l.includes(CAMERA_CYCLE_NEVER_FIRED_BANNER))).toBe(true);
   });
 });

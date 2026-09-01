@@ -1374,6 +1374,7 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_constants::{ui_level_write_is_visible, UI_AUDIO_LEVEL_DELTA};
     use wasm_bindgen_test::*;
 
     // === Issue 2174: terminal `speaking: 0` on teardown ===
@@ -1566,6 +1567,54 @@ mod tests {
         assert!(
             vad.observe(true, 0.50 + AUDIO_LEVEL_DELTA_THRESHOLD * 2.0),
             "a level move past the threshold must emit without a speaking flip"
+        );
+    }
+
+    #[test]
+    fn the_ui_write_gate_drops_a_level_move_the_producer_emits() {
+        let inside_the_band = (AUDIO_LEVEL_DELTA_THRESHOLD + UI_AUDIO_LEVEL_DELTA) / 2.0;
+        let mut vad = VadState::new();
+        assert!(vad.observe(true, 0.50), "the rising edge must emit");
+        assert!(
+            vad.observe(true, 0.50 + inside_the_band),
+            "a move of {inside_the_band} must clear the producer's emit gate"
+        );
+        assert!(
+            !ui_level_write_is_visible(0.50 + inside_the_band, 0.50),
+            "a move of {inside_the_band} must not be worth a UI signal write: \
+             the write gate must be strictly wider than the emit gate, not equal to it"
+        );
+    }
+
+    #[test]
+    fn a_speaking_peer_does_not_reach_the_ui_signal_on_every_emitted_event() {
+        const STEPS: u32 = 60;
+        let mut vad = VadState::new();
+        let mut signal = 0.0_f32;
+        let (mut emitted, mut written) = (0_u32, 0_u32);
+
+        for step in 0..STEPS {
+            let envelope = 0.20 + step as f32 * 0.007;
+            let jitter = if step % 2 == 0 { 0.017 } else { -0.017 };
+            let intensity = envelope + jitter;
+            if !vad.observe(true, intensity) {
+                continue;
+            }
+            emitted += 1;
+            if ui_level_write_is_visible(intensity, signal) {
+                written += 1;
+                signal = intensity;
+            }
+        }
+
+        assert_eq!(
+            emitted, STEPS,
+            "the stimulus must exercise the defect: every frame has to be emitted"
+        );
+        assert!(
+            written * 4 <= emitted,
+            "{written} of {emitted} emitted events reached the UI signal; a speaking \
+             peer must not re-render its tile on every VAD event"
         );
     }
 

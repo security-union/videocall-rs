@@ -34,6 +34,7 @@ mod test_helpers;
 use axum::body::Body;
 use axum::http::StatusCode;
 use meeting_api::db::meetings as db_meetings;
+use meeting_api::password::PasswordUpdate;
 use serde_json::json;
 use serial_test::serial;
 use test_helpers::*;
@@ -171,10 +172,12 @@ async fn chat_allowed_for_all_round_trips_through_db() {
         None,
         None,
         Some(true),
+        &PasswordUpdate::Unchanged,
     )
     .await
     .unwrap()
-    .expect("owned row must update");
+    .expect("owned row must update")
+    .row;
     assert!(
         updated.chat_allowed_for_all,
         "update to Some(true) must return the new value"
@@ -190,11 +193,21 @@ async fn chat_allowed_for_all_round_trips_through_db() {
 
     // update_meeting_settings(chat=None) is a COALESCE no-op — the value stays true.
     let unchanged = db_meetings::update_meeting_settings(
-        &pool, room_id, owner, None, None, None, None, None, None,
+        &pool,
+        room_id,
+        owner,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &PasswordUpdate::Unchanged,
     )
     .await
     .unwrap()
-    .expect("owned row must update");
+    .expect("owned row must update")
+    .row;
     assert!(
         unchanged.chat_allowed_for_all,
         "omitting chat_allowed_for_all (None) must not change the stored value"
@@ -211,10 +224,12 @@ async fn chat_allowed_for_all_round_trips_through_db() {
         None,
         None,
         Some(false),
+        &PasswordUpdate::Unchanged,
     )
     .await
     .unwrap()
-    .expect("owned row must update");
+    .expect("owned row must update")
+    .row;
     assert!(
         !back_to_false.chat_allowed_for_all,
         "update to Some(false) must persist false"

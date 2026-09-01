@@ -43,12 +43,12 @@ services:
   # loss_per_sec >= LOSS_STEP_DOWN_PER_SEC || kf_per_sec >= PLI_STEP_DOWN_PER_SEC).
   #
   # MECHANISM (WS path, verified by code trace — see helpers/downlink-impair.ts):
-  # the relay's WsChatSession holds a BOUNDED 128-slot outbound channel
-  # (WS_OUTBOUND_CHANNEL_CAPACITY) drained straight to the TCP socket via
+  # the relay's WsChatSession holds an outbound channel bounded by slots AND
+  # bytes (WS_OUTBOUND_VIDEO_BYTE_BUDGET, #2261) drained to the TCP socket via
   # `ctx.binary` with NO app-level retransmit. Severely bandwidth-limiting ONE
   # receiver's WS TCP connection makes that receiver's kernel send buffer fill →
-  # the drain stalls on TCP backpressure → the outbound channel fills →
-  # `try_send` returns Full → VIDEO frames are shed (priority-drop policy,
+  # the drain stalls on TCP backpressure → queued bytes pass the video budget →
+  # VIDEO frames are shed before enqueue (priority-drop policy,
   # videocall_outbound_channel_drops_total, issue #1057). A shed frame never
   # reaches that receiver, so the receive-side SequenceTracker sees a gap →
   # loss_per_sec rises → the chooser steps that receiver DOWN. The sender and
@@ -88,7 +88,7 @@ services:
     working_dir: /app/meeting-api
     command: >
       nix develop /app#backend-dev --command bash -c
-      "/app/dbmate/startup.sh && cargo run --bin meeting-api"
+      "/app/dbmate/startup.sh && /app/docker/e2e-backend.sh supervise meeting-api"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
       - LISTEN_ADDR=0.0.0.0:8081
@@ -160,7 +160,7 @@ services:
     working_dir: /app/actix-api
     command: >
       nix develop /app#backend-dev --command bash -c
-      "cargo run --bin websocket_server"
+      "/app/docker/e2e-backend.sh supervise websocket_server"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
       - ACTIX_PORT=8080
@@ -206,9 +206,11 @@ services:
     working_dir: /app/actix-api
     command: >
       nix develop /app#backend-dev --command bash -c
-      "cargo run -r --bin webtransport_server"
+      "/app/docker/e2e-backend.sh supervise webtransport_server"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
+      # The one backend built in release mode; e2e-backend.sh maps this to -r.
+      - E2E_CARGO_RELEASE=1
       - RUST_LOG=info
       - NATS_URL=nats:4222
       - REGION=us-east

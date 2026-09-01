@@ -90,7 +90,12 @@ fn build_refresh_cookie(state: &AppState, jwt: &str) -> Option<String> {
     let now = Utc::now().timestamp();
     let claims =
         decode_claims_for_refresh(jwt, now, state.session_refresh_threshold_secs, |jwt| {
-            token::decode_session_token(&state.jwt_secret, jwt).ok()
+            token::decode_session_token(
+                &state.session_jwt_secret,
+                state.previous_session_secret(now),
+                jwt,
+            )
+            .ok()
         })?;
 
     // Absolute cap: never mint past `baseline + SESSION_ABSOLUTE_MAX_SECS`.
@@ -109,9 +114,14 @@ fn build_refresh_cookie(state: &AppState, jwt: &str) -> Option<String> {
         return None;
     }
 
-    let refreshed_jwt =
-        token::generate_session_token(&state.jwt_secret, &claims.sub, &claims.name, ttl, baseline)
-            .ok()?;
+    let refreshed_jwt = token::generate_session_token(
+        &state.session_jwt_secret,
+        &claims.sub,
+        &claims.name,
+        ttl,
+        baseline,
+    )
+    .ok()?;
 
     Some(build_session_cookie(
         &state.cookie_name,
@@ -146,6 +156,102 @@ mod tests {
     use super::*;
 
     const TEST_SECRET: &str = "session-refresh-test-secret";
+    const PREVIOUS_SECRET: &str = "session-refresh-outgoing-secret";
+
+    fn state_with_window(previous: Option<&str>, expires_at: i64) -> AppState {
+        // connect_lazy yields a pool handle without contacting Postgres; the
+        // refresh path runs no queries.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost/unused")
+            .expect("lazy pool creation should not fail");
+        AppState {
+            db,
+            jwt_secret: "room-secret".to_string(),
+            session_jwt_secret: TEST_SECRET.to_string(),
+            session_jwt_secret_previous: previous.map(str::to_string),
+            session_previous_secret_expires_at: expires_at,
+            token_ttl_secs: 600,
+            session_ttl_secs: 3600,
+            session_refresh_threshold_secs: 300,
+            session_absolute_max_secs: 604_800,
+            oauth: None,
+            jwks_cache: None,
+            cookie_domain: None,
+            cookie_name: "session".to_string(),
+            cookie_secure: false,
+            nats: None,
+            feed_tx: crate::feed_events::new_feed_channel().0,
+            service_version_urls: Vec::new(),
+            http_client: reqwest::Client::new(),
+            display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
+            search: None,
+            display_name_rate_limit_disabled: false,
+            dev_user: None,
+            password_gate: std::sync::Arc::new(crate::password::MeetingPasswordGate::new()),
+        }
+    }
+
+    fn jwt_from_set_cookie(set_cookie: &str) -> &str {
+        set_cookie
+            .strip_prefix("session=")
+            .and_then(|rest| rest.split(';').next())
+            .expect("refresh cookie must carry a JWT")
+    }
+
+    #[tokio::test]
+    async fn a_previous_key_cookie_is_re_minted_under_the_current_key() {
+        let now = Utc::now().timestamp();
+        let state = state_with_window(Some(PREVIOUS_SECRET), now + 600);
+        // TTL 60 < threshold 300, so the cookie is inside the refresh window.
+        let jwt = token::generate_session_token(PREVIOUS_SECRET, "user@test.com", "User", 60, now)
+            .expect("session token should encode");
+
+        let cookie =
+            build_refresh_cookie(&state, &jwt).expect("an open window must re-mint an old cookie");
+        let refreshed = jwt_from_set_cookie(&cookie);
+
+        token::decode_session_token(TEST_SECRET, None, refreshed)
+            .expect("the re-mint must verify under the CURRENT key with no window configured");
+        assert!(
+            token::decode_session_token(PREVIOUS_SECRET, None, refreshed).is_err(),
+            "signing must never use the previous key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_previous_key_cookie_is_not_re_minted_once_the_window_has_closed() {
+        let now = Utc::now().timestamp();
+        let jwt = token::generate_session_token(PREVIOUS_SECRET, "user@test.com", "User", 60, now)
+            .expect("session token should encode");
+
+        assert!(
+            build_refresh_cookie(&state_with_window(Some(PREVIOUS_SECRET), now), &jwt).is_none(),
+            "an expired window must not verify the previous key"
+        );
+        assert!(
+            build_refresh_cookie(&state_with_window(None, now + 600), &jwt).is_none(),
+            "an unconfigured window must not verify the previous key"
+        );
+    }
+
+    #[tokio::test]
+    async fn previous_session_secret_is_gated_on_the_window_deadline() {
+        let state = state_with_window(Some(PREVIOUS_SECRET), 1_000);
+
+        assert_eq!(state.previous_session_secret(999), Some(PREVIOUS_SECRET));
+        assert_eq!(state.previous_session_secret(1_000), None);
+        assert_eq!(state.previous_session_secret(1_001), None);
+        assert_eq!(
+            state_with_window(None, 1_000).previous_session_secret(0),
+            None
+        );
+    }
 
     #[test]
     fn fresh_cookie_early_out_skips_verified_decode() {
@@ -156,7 +262,7 @@ mod tests {
 
         let claims = decode_claims_for_refresh(&jwt, now, 300, |jwt| {
             verify_calls.set(verify_calls.get() + 1);
-            token::decode_session_token(TEST_SECRET, jwt).ok()
+            token::decode_session_token(TEST_SECRET, None, jwt).ok()
         });
 
         assert!(claims.is_none(), "fresh cookie must not enter refresh path");
@@ -176,7 +282,7 @@ mod tests {
 
         let claims = decode_claims_for_refresh(&jwt, now, 300, |jwt| {
             verify_calls.set(verify_calls.get() + 1);
-            token::decode_session_token(TEST_SECRET, jwt).ok()
+            token::decode_session_token(TEST_SECRET, None, jwt).ok()
         });
 
         assert!(

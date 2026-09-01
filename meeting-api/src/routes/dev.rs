@@ -47,12 +47,17 @@ pub async fn auto_login(State(state): State<AppState>) -> Result<Response, Statu
         now,
     )
     .max(1);
-    let session_jwt =
-        token::generate_session_token(&state.jwt_secret, &dev_user.email, &dev_user.name, ttl, now)
-            .map_err(|e| {
-                tracing::error!("DEV_USER auto-login: failed to generate session JWT: {e:?}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    let session_jwt = token::generate_session_token(
+        &state.session_jwt_secret,
+        &dev_user.email,
+        &dev_user.name,
+        ttl,
+        now,
+    )
+    .map_err(|e| {
+        tracing::error!("DEV_USER auto-login: failed to generate session JWT: {e:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let session_cookie = build_session_cookie(
         &state.cookie_name,
@@ -95,6 +100,9 @@ mod tests {
         AppState {
             db,
             jwt_secret: TEST_SECRET.to_string(),
+            session_jwt_secret: TEST_SECRET.to_string(),
+            session_jwt_secret_previous: None,
+            session_previous_secret_expires_at: 0,
             token_ttl_secs: 600,
             session_ttl_secs: 3600,
             session_refresh_threshold_secs: 7200,
@@ -190,7 +198,7 @@ mod tests {
             .and_then(|rest| rest.split(';').next())
             .expect("cookie should start with session=<jwt>; ...");
 
-        let claims = token::decode_session_token(TEST_SECRET, jwt)
+        let claims = token::decode_session_token(TEST_SECRET, None, jwt)
             .expect("session JWT issued by handler should decode with the configured secret");
         assert_eq!(claims.sub, "alice@example.test");
         assert_eq!(claims.name, "Alice Example");

@@ -1,9 +1,0 @@
-apiVersion: v2
-name: videocall-ui-ascend
-version: 0.1.0
-description: Videocall UI for Ascend region
-
-dependencies:
-  - name: videocall-ui
-    version: 0.1.0
-    repository: file://../../../videocall-ui

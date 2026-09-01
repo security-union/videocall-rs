@@ -285,6 +285,95 @@ pub async fn start(
     Ok(())
 }
 
+/// Identity and room resolved for an inbound WebTransport connection.
+#[derive(Debug)]
+struct WtConnectIdentity {
+    username: String,
+    lobby_id: String,
+    observer: bool,
+    display_name: String,
+    is_guest: bool,
+    is_host: bool,
+    end_on_host_leave: bool,
+}
+
+/// Resolve who is connecting, from the JWT when one is presented and otherwise
+/// from the deprecated `/lobby/{user_id}/{room}` path parameters.
+///
+/// The deprecated arm is reachable ONLY while `FEATURE_MEETING_MANAGEMENT` is
+/// off; with the flag on, a tokenless connect is refused (issue #2298). This
+/// mirrors the 410 the WebSocket `ws_connect` handler returns.
+fn resolve_wt_connect_identity(
+    parts: &[&str],
+    token: Option<&str>,
+) -> anyhow::Result<WtConnectIdentity> {
+    if let Some(tok) = token {
+        let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+        if jwt_secret.is_empty() {
+            return Err(anyhow!("JWT_SECRET not set"));
+        }
+        let claims = token_validator::decode_room_token(&jwt_secret, tok).map_err(|e| {
+            e.log("WT");
+            anyhow!("token validation failed: {}", e.client_message())
+        })?;
+        info!(
+            "WT token-based connection: user_id={}, room={}, display_name={}, is_guest={}, observer={}, is_host={}",
+            claims.sub, claims.room, claims.display_name, claims.is_guest, claims.observer, claims.is_host
+        );
+        return Ok(WtConnectIdentity {
+            username: claims.sub,
+            lobby_id: claims.room,
+            observer: claims.observer,
+            display_name: claims.display_name,
+            is_guest: claims.is_guest,
+            is_host: claims.is_host,
+            end_on_host_leave: claims.end_on_host_leave,
+        });
+    }
+
+    if videocall_types::FeatureFlags::meeting_management_enabled() {
+        info!("WT connection rejected: no token provided and meeting management is enabled");
+        return Err(anyhow!(
+            "room access token is required. Use /lobby?token=<JWT>"
+        ));
+    }
+
+    if parts.len() != 3 {
+        return Err(anyhow!(
+            "Invalid path: expected /lobby/{{user_id}}/{{room}} (deprecated) or /lobby?token=<JWT>"
+        ));
+    }
+    let username = parts[1].replace(' ', "_");
+    let lobby_id = parts[2].replace(' ', "_");
+    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
+    if !re.is_match(&username) || !re.is_match(&lobby_id) {
+        return Err(anyhow!("Invalid path input chars"));
+    }
+    info!(
+        "WT deprecated path-based connection: user_id={}, room={}",
+        username, lobby_id
+    );
+    let display_name = username.clone();
+    Ok(WtConnectIdentity {
+        username,
+        lobby_id,
+        observer: false,
+        display_name,
+        is_guest: false,
+        is_host: false,
+        end_on_host_leave: true,
+    })
+}
+
+/// Format the "received WebTransport request" line with the URL's query string
+/// stripped — it carries `?token=<JWT>` since issue #2298.
+fn wt_request_log_line(url: &str) -> String {
+    format!(
+        "received WebTransport request: {}",
+        videocall_types::url_log::strip_query_for_log(url)
+    )
+}
+
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
     chat_server: Addr<ChatServer>,
@@ -292,17 +381,15 @@ async fn run_webtransport_connection_from_request(
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
 ) -> anyhow::Result<()> {
-    warn!("received WebTransport request: {}", request.url);
+    warn!("{}", wt_request_log_line(request.url.as_str()));
     let uri = &request.url;
     let path = urlencoding::decode(uri.path()).unwrap().into_owned();
 
-    let parts = path.split('/').collect::<Vec<&str>>();
-    // filter out the empty strings
-    let parts: Vec<_> = parts.iter().filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     info!("Parts {:?}", parts);
 
     // First part must be "lobby"
-    if parts.is_empty() || parts[0] != &"lobby" {
+    if parts.is_empty() || parts[0] != "lobby" {
         return Err(anyhow!("Invalid path: must start with /lobby"));
     }
 
@@ -317,59 +404,19 @@ async fn run_webtransport_connection_from_request(
         .find(|(key, _)| key == "instance_id")
         .map(|(_, val)| val.into_owned());
 
-    // Determine username, room, and observer flag from either the JWT or URL path params.
-    let (username, lobby_id, observer, display_name, is_guest, is_host, end_on_host_leave) =
-        if let Some(ref tok) = token {
-            // Token-based flow: identity and room come from the JWT claims.
-            let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
-            if jwt_secret.is_empty() {
-                return Err(anyhow!("JWT_SECRET not set"));
-            }
-            let claims = token_validator::decode_room_token(&jwt_secret, tok).map_err(|e| {
-                e.log("WT");
-                anyhow!("token validation failed: {}", e.client_message())
-            })?;
-            info!(
-            "WT token-based connection: user_id={}, room={}, display_name={}, is_guest={}, observer={}, is_host={}",
-            claims.sub, claims.room, claims.display_name, claims.is_guest, claims.observer, claims.is_host
-        );
-            (
-                claims.sub,
-                claims.room,
-                claims.observer,
-                claims.display_name,
-                claims.is_guest,
-                claims.is_host,
-                claims.end_on_host_leave,
-            )
-        } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
-            // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
-            if parts.len() != 3 {
-                return Err(anyhow!(
-                "Invalid path: expected /lobby/{{user_id}}/{{room}} (deprecated) or /lobby?token=<JWT>"
-            ));
-            }
-            let username = parts[1].replace(' ', "_");
-            let lobby_id = parts[2].replace(' ', "_");
-            let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-            if !re.is_match(&username) || !re.is_match(&lobby_id) {
-                return Err(anyhow!("Invalid path input chars"));
-            }
-            info!(
-                "WT deprecated path-based connection: user_id={}, room={}",
-                username, lobby_id
-            );
-            // display_name fallback: use user_id for deprecated path
-            let display = username.clone();
-            // deprecated path-based endpoint: no JWT claim, treat as non-guest & non-observer, not host
-            (username, lobby_id, false, display, false, false, true)
-        } else {
-            // FF=on but no token provided
-            info!("WT connection rejected: no token provided and meeting management is enabled");
-            return Err(anyhow!(
-                "room access token is required. Use /lobby?token=<JWT>"
-            ));
-        };
+    let identity = resolve_wt_connect_identity(&parts, token.as_deref())?;
+    let WtConnectIdentity {
+        username,
+        lobby_id,
+        observer,
+        display_name,
+        is_guest,
+        is_host,
+        end_on_host_leave,
+    } = identity;
+
+    // `instance_id` binds reconnect adoption to identity; this path has no verified one.
+    let instance_id = if token.is_some() { instance_id } else { None };
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
@@ -2092,6 +2139,158 @@ mod tests {
         videocall_types::FeatureFlags::clear_meeting_management_override();
     }
 
+    /// Deprecated path-based endpoint, claiming an `instance_id`.
+    async fn connect_client_with_instance_id(
+        user: &str,
+        meeting: &str,
+        instance_id: &str,
+    ) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
+        let base = std::env::var("WEBTRANSPORT_URL")
+            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+        let url_str = format!(
+            "{}/lobby/{}/{}?instance_id={}",
+            base.trim_end_matches('/'),
+            user,
+            meeting,
+            urlencoding::encode(instance_id)
+        );
+        let url = url::Url::parse(&url_str)?;
+
+        let client = web_transport_quinn::ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()?;
+
+        Ok(client.connect(url).await?)
+    }
+
+    /// Count MEETING packets of `event_type` arriving on `session` within `window`.
+    async fn count_meeting_events(
+        session: &web_transport_quinn::Session,
+        persistent: Option<web_transport_quinn::RecvStream>,
+        window: Duration,
+        event_type: videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType,
+    ) -> usize {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let wanted: ::protobuf::EnumOrUnknown<_> = event_type.into();
+        let meeting_type: ::protobuf::EnumOrUnknown<VcPacketType> = VcPacketType::MEETING.into();
+
+        // The server picks either channel per packet, so both must be watched.
+        // Frames go via a channel because `read_exact` is not cancel-safe: losing
+        // a `select!` race mid-frame would desync the stream for every later read.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let forwarder = persistent.map(|mut stream| {
+            tokio::spawn(async move {
+                while let Some(frame) = read_length_prefixed_frame(&mut stream).await {
+                    if tx.send(frame).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+
+        let mut count = 0usize;
+        let _ = tokio::time::timeout(window, async {
+            loop {
+                let data = tokio::select! {
+                    Some(frame) = rx.recv() => frame,
+                    Ok(dg) = session.read_datagram() => dg.to_vec(),
+                    else => break,
+                };
+                if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&data) {
+                    if wrapper.packet_type == meeting_type {
+                        if let Ok(meeting) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                            if meeting.event_type == wanted {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        if let Some(handle) = forwarder {
+            handle.abort();
+        }
+        count
+    }
+
+    /// #2270: the deprecated path must ignore a client-supplied `instance_id`.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn test_wt_deprecated_endpoint_ignores_client_instance_id() {
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+
+        setup_jwt_wt().await;
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
+        let room = "wt-2270-deprecated-instance-id";
+        let stolen_iid = "iid-2270-shared";
+
+        let watcher = connect_client("watcher", room)
+            .await
+            .expect("watcher should connect");
+        let watcher_stream = wait_for_session_ready(&watcher, "watcher")
+            .await
+            .expect("watcher should receive MEETING_STARTED");
+        // PARTICIPANT_JOINED/LEFT fire only for Active sessions; a session
+        // activates on its first non-RTT packet.
+        send_packet(
+            &watcher,
+            create_test_packet("watcher", VcMediaType::AUDIO, "activate".to_string()),
+        )
+        .await;
+
+        let first = connect_client_with_instance_id("victim", room, stolen_iid)
+            .await
+            .expect("first victim session should connect");
+        wait_for_session_ready(&first, "victim-1")
+            .await
+            .expect("first victim session should receive MEETING_STARTED");
+        send_packet(
+            &first,
+            create_test_packet("victim", VcMediaType::AUDIO, "activate".to_string()),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        first.close(0u32, b"transport drop");
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let second = connect_client_with_instance_id("victim", room, stolen_iid)
+            .await
+            .expect("second session should connect");
+        wait_for_session_ready(&second, "victim-2")
+            .await
+            .expect("second session should receive MEETING_STARTED");
+        send_packet(
+            &second,
+            create_test_packet("victim", VcMediaType::AUDIO, "activate".to_string()),
+        )
+        .await;
+
+        // Watch past RECONNECT_GRACE_PERIOD (3s).
+        let left = count_meeting_events(
+            &watcher,
+            watcher_stream,
+            Duration::from_secs(5),
+            MeetingEventType::PARTICIPANT_LEFT,
+        )
+        .await;
+
+        second.close(0u32, b"done");
+        watcher.close(0u32, b"done");
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+
+        assert_eq!(
+            left, 1,
+            "the dropped session's PARTICIPANT_LEFT must still fire; 0 means the \
+             second connect adopted its pending departure via the claimed instance_id"
+        );
+    }
+
     #[actix_rt::test]
     async fn test_wt_deprecated_endpoint_rejected_ff_on() {
         setup_jwt_wt().await;
@@ -2541,5 +2740,126 @@ mod tests {
             Ok(Err(e)) => panic!("loopback test failed: {e}"),
             Err(_) => panic!("loopback test timed out after 15s"),
         }
+    }
+
+    // =====================================================================
+    // Tokenless-join guard for the deprecated WT path (issue #2298)
+    // =====================================================================
+
+    const TOKENLESS_JWT_SECRET: &str = "test-secret-for-wt-identity-tests";
+
+    #[test]
+    #[serial_test::serial]
+    fn wt_rejects_a_tokenless_connect_when_meeting_management_is_enabled() {
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+
+        let err = resolve_wt_connect_identity(&["lobby", "alice", "room-1"], None)
+            .expect_err("FF=on must refuse a tokenless WT connect");
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+        assert!(
+            err.to_string().contains("room access token is required"),
+            "expected a token-required rejection — got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wt_accepts_the_deprecated_path_when_meeting_management_is_disabled() {
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
+        let identity = resolve_wt_connect_identity(&["lobby", "alice", "room-1"], None);
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+        let identity = identity.expect("FF=off must keep the deprecated WT path working");
+        assert_eq!(identity.username, "alice");
+        assert_eq!(identity.lobby_id, "room-1");
+        assert_eq!(identity.display_name, "alice");
+        assert!(!identity.is_host);
+        assert!(!identity.is_guest);
+        assert!(!identity.observer);
+        assert!(identity.end_on_host_leave);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wt_rejects_nats_unsafe_identifiers_on_the_deprecated_path() {
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
+        let err = resolve_wt_connect_identity(&["lobby", "alice.evil", "room-1"], None);
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+        assert!(
+            err.is_err(),
+            "a dot in the identity must not reach the deprecated WT path"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wt_takes_identity_from_the_token_not_the_path() {
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+        std::env::set_var("JWT_SECRET", TOKENLESS_JWT_SECRET);
+
+        let token = meeting_api::token::generate_room_token(
+            TOKENLESS_JWT_SECRET,
+            60,
+            "carol",
+            "claimed-room",
+            false,
+            "Carol",
+            true,
+            false,
+        )
+        .expect("should generate a room token");
+
+        let identity =
+            resolve_wt_connect_identity(&["lobby", "spoofed", "spoofed-room"], Some(&token));
+
+        std::env::remove_var("JWT_SECRET");
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+
+        let identity = identity.expect("a valid token must be accepted with FF=on");
+        assert_eq!(identity.username, "carol");
+        assert_eq!(identity.lobby_id, "claimed-room");
+    }
+
+    #[test]
+    fn wt_request_log_line_never_prints_the_room_token() {
+        let token = meeting_api::token::generate_room_token(
+            TOKENLESS_JWT_SECRET,
+            86_400,
+            "dave",
+            "room-1",
+            false,
+            "Dave",
+            true,
+            false,
+        )
+        .expect("should generate a room token");
+        let url = format!("https://relay.example.com/lobby?token={token}&instance_id=abc");
+
+        let line = wt_request_log_line(&url);
+
+        assert!(
+            !line.contains(&token),
+            "the room token must not reach the log line — got: {line}"
+        );
+        assert!(
+            !line.contains("token="),
+            "no query parameter may survive into the log line — got: {line}"
+        );
+        assert_eq!(
+            line,
+            "received WebTransport request: https://relay.example.com/lobby"
+        );
+    }
+
+    #[test]
+    fn wt_request_log_line_keeps_a_tokenless_url_intact() {
+        assert_eq!(
+            wt_request_log_line("https://relay.example.com/lobby/alice/room-1"),
+            "received WebTransport request: https://relay.example.com/lobby/alice/room-1"
+        );
     }
 }

@@ -120,7 +120,6 @@ test.use({
       "--origin-to-force-quic-on=127.0.0.1:4433",
       "--use-fake-device-for-media-stream=device-count=3",
       "--use-fake-ui-for-media-stream",
-      "--disable-gpu",
       "--disable-dev-shm-usage",
       "--renderer-process-limit=1",
     ],

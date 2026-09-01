@@ -13,8 +13,17 @@ keywords = ["videocall", "meeting", "api", "types"]
 categories = ["network-programming"]
 description = "Shared API types for the videocall.rs meeting backend"
 
+[features]
+default = []
+# Room-access-token minting for the headless tools (`bot`, `vcprobe`,
+# `videocall-cli`). Off by default so the wasm consumers (`dioxus-ui`,
+# `videocall-meeting-client`) never pull `jsonwebtoken` into their builds.
+mint = ["dep:jsonwebtoken", "dep:percent-encoding"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+jsonwebtoken = { version = "9", optional = true }
+percent-encoding = { version = "2", optional = true }
 
 [dev-dependencies]
 # The `#[cfg(test)]` module in `src/responses.rs` has always called

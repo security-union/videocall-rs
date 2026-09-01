@@ -26,8 +26,8 @@ use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::{
     classify_packet, keyframe_per_pair_budget, outbound_keyframe_observation,
     stamp_raise_hand_for_broadcast, stamp_reaction_for_broadcast, InboundFrameKind,
-    KeyframeRequestLimiter, KeyframeTarget, MeetingTimerRateLimiter, PacketKind,
-    RaiseHandRateLimiter, ReactionRateLimiter,
+    KeyframeMediaKind, KeyframeRequestLimiter, KeyframeRequestOutcome, KeyframeTarget,
+    MeetingTimerRateLimiter, PacketKind, RaiseHandRateLimiter, ReactionRateLimiter,
 };
 use crate::client_diagnostics::health_processor::{self, AuthenticatedReporter};
 use crate::constants::{
@@ -38,7 +38,8 @@ use crate::constants::{
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{
-    RELAY_ACTIVE_SESSIONS_PER_ROOM, RELAY_PUBLISHER_INBOUND_FRAME_GAP_MS, RELAY_ROOM_BYTES_TOTAL,
+    RELAY_ACTIVE_SESSIONS_PER_ROOM, RELAY_KEYFRAME_REQUESTS_TOTAL,
+    RELAY_PUBLISHER_INBOUND_FRAME_GAP_MS, RELAY_ROOM_BYTES_TOTAL,
 };
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
@@ -774,6 +775,11 @@ impl SessionLogic {
             &self.transport,
             &session_id,
         );
+        crate::metrics::forget_outbound_queue_bytes_by_session(
+            &self.room,
+            &self.transport,
+            &session_id,
+        );
         send_connection_ended(&self.tracker_sender, self.id);
         self.addr.do_send(Disconnect {
             session: self.id,
@@ -795,6 +801,23 @@ impl SessionLogic {
     /// RTT probes (Echo) do not activate; any other packet does.
     pub fn should_activate_on_action(action: &InboundAction) -> bool {
         !matches!(action, InboundAction::Echo(_))
+    }
+
+    /// Run one KEYFRAME_REQUEST through `limiter` and record the decision on
+    /// `relay_keyframe_requests_total{room, kind, outcome}` (#2394).
+    fn admit_keyframe_request(
+        limiter: &mut KeyframeRequestLimiter,
+        room: &str,
+        target: KeyframeTarget,
+        kind: KeyframeMediaKind,
+        layer: u32,
+        congested: bool,
+    ) -> KeyframeRequestOutcome {
+        let outcome = limiter.classify_with_congestion(target, kind, layer, congested);
+        RELAY_KEYFRAME_REQUESTS_TOTAL
+            .with_label_values(&[room, kind.metric_label(), outcome.metric_label()])
+            .inc();
+        outcome
     }
 
     /// Handle an inbound packet from the client.
@@ -955,12 +978,16 @@ impl SessionLogic {
                 // inside `allow_with_congestion` lets a still-frozen receiver on
                 // a lossless WS path re-request even when the strict budget is
                 // exhausted (the `congested` path cannot fire on a lossless
-                // link); `handle_outbound` clears that waiting flag when the
-                // matching media is actually delivered.
-                if !self
-                    .keyframe_limiter
-                    .allow_with_congestion(target, kind, layer, congested)
-                {
+                // link); `observe_outbound_delivery` clears it on delivery.
+                let outcome = Self::admit_keyframe_request(
+                    &mut self.keyframe_limiter,
+                    &self.room,
+                    target,
+                    kind,
+                    layer,
+                    congested,
+                );
+                if !outcome.admitted() {
                     // #1899: log the media kind, congestion state, and the
                     // per-pair budget that applied (via the SAME
                     // `keyframe_per_pair_budget` the limiter enforced, so the log
@@ -969,7 +996,7 @@ impl SessionLogic {
                     // being throttled at the camera budget — surfacing kind +
                     // budget here makes the next diagnosis a single grep.
                     warn!(
-                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting user {} session {} kind={:?} congested={} per_pair_budget={}",
+                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting user {} session {} kind={:?} congested={} per_pair_budget={} outcome={:?}",
                         self.id,
                         self.user_id,
                         String::from_utf8_lossy(&target_user_id),
@@ -977,6 +1004,7 @@ impl SessionLogic {
                         kind,
                         congested,
                         keyframe_per_pair_budget(kind, congested),
+                        outcome,
                     );
                     return InboundAction::Processed;
                 }
@@ -1255,48 +1283,12 @@ impl SessionLogic {
     /// Handle an outbound message from ChatServer (to be sent to client).
     ///
     /// Returns the bytes to send and tracks metrics.
-    ///
-    /// #1297: this is also the DELIVERY-OBSERVATION point for the keyframe
-    /// limiter. Every forwarded frame this receiver is about to be sent is the
-    /// delivery side of the keyframe-request/keyframe-delivery loop. When the
-    /// frame is a MEDIA VIDEO/SCREEN packet, we clear THIS receiver's
-    /// still-waiting flag for that `(publisher, kind)` bucket so the strict
-    /// per-pair budget re-engages on its next request (a receiver that keeps
-    /// requesting after recovery is throttled again). This runs for BOTH
-    /// transports because both `WsChatSession` and `WtChatSession` route every
-    /// outbound frame through here. It is `&mut self` purely so the observation
-    /// can mutate `self.keyframe_limiter` — the SAME limiter instance the
-    /// inbound KEYFRAME_REQUEST arm reads, so request-set and delivery-clear act
-    /// on one map.
-    ///
-    /// DELIVERY semantics (honest contract): like the `RELAY_ROOM_BYTES_TOTAL`
-    /// "outbound" accounting above, this hook runs when a frame is HANDED to the
-    /// transport — BEFORE the per-transport priority-drop / channel-full check
-    /// (both callers invoke `handle_outbound` first). So a keyframe that is
-    /// subsequently priority-dropped under outbound-channel saturation still
-    /// clears the wait. That imprecision is benign: a drop here means the
-    /// receiver's outbound channel is SATURATED, which fires `on_outbound_drop`
-    /// → the receiver is then flagged congested, so the #979 congested
-    /// relaxation (not the delivery-aware path) covers its next recovery
-    /// request. On the healthy, unsaturated path #1297 targets — the common
-    /// all-WS deployment — the frame IS delivered and clearing the wait is
-    /// correct.
     pub fn handle_outbound(&mut self, msg: &Message) -> Vec<u8> {
         RELAY_ROOM_BYTES_TOTAL
             .with_label_values(&[&self.room, "outbound"])
             .inc_by(msg.msg.len() as f64);
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_sent(self.id, msg.msg.len() as u64);
-
-        // #1297 delivery observation: cheap partial decode (no `data` copy —
-        // see `outbound_keyframe_observation`). Only MEDIA VIDEO/SCREEN frames
-        // return Some; everything else (the bulk of traffic) is a no-op here.
-        // Observers never request keyframes, so skip the work for them.
-        if !self.observer {
-            if let Some((target, kind)) = outbound_keyframe_observation(&msg.msg) {
-                self.keyframe_limiter.observe_delivery(target, kind);
-            }
-        }
 
         // `msg.msg` is a shared `bytes::Bytes` (#1063): the single NATS payload
         // allocation is refcounted across all fan-out receivers. The
@@ -1305,6 +1297,18 @@ impl SessionLogic {
         // materialize ONCE here per receiver — the same single copy that used
         // to live at the fan-out `Message` construction, just moved downstream.
         msg.msg.to_vec()
+    }
+
+    /// Clear this receiver's keyframe wait (#1297) for a frame the transport
+    /// ACCEPTED for the socket: both transports call this only after the
+    /// priority-drop pre-check and a successful enqueue on the outbound channel.
+    pub fn observe_outbound_delivery(&mut self, msg: &Message) {
+        if self.observer {
+            return;
+        }
+        if let Some((target, kind)) = outbound_keyframe_observation(&msg.msg) {
+            self.keyframe_limiter.observe_delivery(target, kind);
+        }
     }
 
     // =========================================================================
@@ -2094,6 +2098,82 @@ mod tests {
         );
     }
 
+    /// #2394 CALL-SITE proof. Requires NATS (constructing `SessionLogic` needs a
+    /// live client); SKIPS when the broker is unreachable, like its neighbours.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn handle_inbound_keyframe_request_records_outcome_metric() {
+        use protobuf::Message as _;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        let inner = MediaPacket {
+            media_type: MediaType::KEYFRAME_REQUEST.into(),
+            user_id: b"target-user-2394".to_vec(),
+            target_session_id: 909_090,
+            data: b"VIDEO".to_vec(),
+            ..Default::default()
+        };
+        let request = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: inner.write_to_bytes().expect("inner encode"),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .expect("wrapper encode");
+
+        let room = "room-2394-keyframe-outcome";
+        let admitted = [room, "video", "admitted_strict"];
+        let denied = [room, "video", "denied_still_waiting"];
+        let before_admitted = RELAY_KEYFRAME_REQUESTS_TOTAL
+            .with_label_values(&admitted)
+            .get();
+        let before_denied = RELAY_KEYFRAME_REQUESTS_TOTAL
+            .with_label_values(&denied)
+            .get();
+
+        let mut logic = build_test_receiver_logic(nats_client, room).await;
+
+        assert!(
+            matches!(logic.handle_inbound(&request), InboundAction::Forward(_)),
+            "the first KEYFRAME_REQUEST must be forwarded"
+        );
+        assert!(
+            matches!(logic.handle_inbound(&request), InboundAction::Processed),
+            "the immediate retry must be rate-limited, not forwarded"
+        );
+
+        assert_eq!(
+            RELAY_KEYFRAME_REQUESTS_TOTAL
+                .with_label_values(&admitted)
+                .get()
+                - before_admitted,
+            1.0,
+            "handle_inbound must record the admitted request on \
+             relay_keyframe_requests_total{{room, kind=video, outcome=admitted_strict}} (#2394)"
+        );
+        assert_eq!(
+            RELAY_KEYFRAME_REQUESTS_TOTAL
+                .with_label_values(&denied)
+                .get()
+                - before_denied,
+            1.0,
+            "the frozen-receiver denial must be recorded as denied_still_waiting, the outcome \
+             that distinguishes it from a correct denied_budget (#2394)"
+        );
+    }
+
     // =====================================================================
     // #1219 — receiver-downlink overflow must NOT emit sender-keyed CONGESTION
     // =====================================================================
@@ -2146,6 +2226,118 @@ mod tests {
             false,
             false,
         )
+    }
+
+    const KEYFRAME_2393_PUBLISHER: u64 = 555;
+
+    async fn connect_test_nats() -> Option<async_nats::client::Client> {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        match async_nats::connect(&nats_url).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                None
+            }
+        }
+    }
+
+    /// The sleep lets `ChatServer::started` run inside the runtime — its
+    /// `tokio::spawn` panics without a reactor.
+    async fn build_receiver(nats_client: async_nats::client::Client, room: &str) -> SessionLogic {
+        let logic = build_test_receiver_logic(nats_client, room).await;
+        actix_rt::time::sleep(Duration::from_millis(20)).await;
+        logic
+    }
+
+    fn keyframe_delivery_message() -> Message {
+        use bytes::Bytes;
+        use protobuf::Message as _;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let inner = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            frame_type: "key".to_string(),
+            data: vec![0xABu8; 256],
+            ..Default::default()
+        };
+        let raw = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id: KEYFRAME_2393_PUBLISHER,
+            media_kind: MediaKind::VIDEO.into(),
+            data: inner
+                .write_to_bytes()
+                .expect("inner MediaPacket serializes"),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .expect("PacketWrapper serializes");
+        Message {
+            session: 1,
+            msg: Bytes::from(raw),
+        }
+    }
+
+    fn classify_request(logic: &mut SessionLogic) -> KeyframeRequestOutcome {
+        logic.keyframe_limiter.classify_with_congestion(
+            KeyframeTarget::Session(KEYFRAME_2393_PUBLISHER),
+            KeyframeMediaKind::Video,
+            0,
+            false,
+        )
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn test_handle_outbound_alone_does_not_clear_the_keyframe_wait() {
+        let nats_client = match connect_test_nats().await {
+            Some(c) => c,
+            None => return,
+        };
+        let mut logic = build_receiver(nats_client, "keyframe_2393_handoff").await;
+
+        assert_eq!(
+            classify_request(&mut logic),
+            KeyframeRequestOutcome::AdmittedStrict,
+            "the first request must be admitted by the strict budget and arm the wait"
+        );
+
+        let _bytes = logic.handle_outbound(&keyframe_delivery_message());
+
+        assert_eq!(
+            classify_request(&mut logic),
+            KeyframeRequestOutcome::DeniedStillWaiting,
+            "hand-off alone must leave the wait armed — clearing it here strands a \
+             receiver whose keyframe was dropped before the socket"
+        );
+    }
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn test_observe_outbound_delivery_clears_the_keyframe_wait() {
+        let nats_client = match connect_test_nats().await {
+            Some(c) => c,
+            None => return,
+        };
+        let mut logic = build_receiver(nats_client, "keyframe_2393_delivered").await;
+
+        assert_eq!(
+            classify_request(&mut logic),
+            KeyframeRequestOutcome::AdmittedStrict,
+            "the first request must be admitted by the strict budget and arm the wait"
+        );
+
+        let msg = keyframe_delivery_message();
+        let _bytes = logic.handle_outbound(&msg);
+        logic.observe_outbound_delivery(&msg);
+
+        assert_eq!(
+            classify_request(&mut logic),
+            KeyframeRequestOutcome::DeniedBudget,
+            "an accepted keyframe must disarm the wait so the strict budget re-engages"
+        );
     }
 
     /// #1219 (Half 1): when the relay drops outbound packets to ONE receiver

@@ -223,6 +223,32 @@ pub fn fit_within_tier_box(src_w: u32, src_h: u32, box_w: u32, box_h: u32) -> (u
     fit_within_preserving_aspect(src_w, src_h, box_w, box_h)
 }
 
+/// The geometry a screen encoder is configured at for a captured surface: its
+/// OWN size, aspect-fitted into the encode ceiling only when larger. Shared by
+/// the sender and the receiver so the two cannot describe one stream
+/// differently. `(0, 0)` in yields `(0, 0)` out = "not known yet".
+pub fn screen_encode_box_for_capture(capture_w: u32, capture_h: u32) -> (u32, u32) {
+    if capture_w == 0 || capture_h == 0 {
+        return (0, 0);
+    }
+    let (box_w, box_h) = orient_box_to_source(
+        crate::constants::SCREEN_MAX_ENCODE_WIDTH,
+        crate::constants::SCREEN_MAX_ENCODE_HEIGHT,
+        capture_w,
+        capture_h,
+    );
+    fit_within_tier_box(capture_w, capture_h, box_w, box_h)
+}
+
+/// Is the encode geometry the ceiling rather than the surface's own size?
+/// Unknown dims are not evidence of capping.
+pub fn capture_exceeds_encode_ceiling(capture_w: u32, capture_h: u32) -> bool {
+    if capture_w == 0 || capture_h == 0 {
+        return false;
+    }
+    screen_encode_box_for_capture(capture_w, capture_h) != (capture_w, capture_h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +615,36 @@ mod tests {
             d.needs_reconfigure,
             "a mid-share aspect change must reconfigure the screen rung"
         );
+    }
+    /// MUTATION: re-introduce a tier box smaller than the ceiling and the
+    /// 1400x700 / 2496x1440 cases collapse onto it.
+    #[test]
+    fn the_encode_box_is_the_captured_surface_up_to_the_ceiling() {
+        let ceiling = (
+            crate::constants::SCREEN_MAX_ENCODE_WIDTH,
+            crate::constants::SCREEN_MAX_ENCODE_HEIGHT,
+        );
+
+        assert_eq!(screen_encode_box_for_capture(1400, 700), (1400, 700));
+        assert_eq!(screen_encode_box_for_capture(1920, 1080), (1920, 1080));
+        assert_eq!(screen_encode_box_for_capture(2496, 1440), (2496, 1440));
+        assert_eq!(screen_encode_box_for_capture(ceiling.0, ceiling.1), ceiling);
+        assert!(!capture_exceeds_encode_ceiling(1400, 700));
+        assert!(!capture_exceeds_encode_ceiling(ceiling.0, ceiling.1));
+
+        assert_eq!(screen_encode_box_for_capture(1440, 2560), (1440, 2560));
+
+        for (cw, ch) in [(3840u32, 2160u32), (3840, 1600), (5120, 2880)] {
+            let (w, h) = screen_encode_box_for_capture(cw, ch);
+            assert!(w <= ceiling.0.max(ceiling.1) && h <= ceiling.0.max(ceiling.1));
+            assert!((w as u64) * (ch as u64) == (h as u64) * (cw as u64) || w < cw);
+            assert!(
+                capture_exceeds_encode_ceiling(cw, ch),
+                "{cw}x{ch} must read capped"
+            );
+        }
+
+        assert_eq!(screen_encode_box_for_capture(0, 0), (0, 0));
+        assert!(!capture_exceeds_encode_ceiling(0, 1080));
     }
 }

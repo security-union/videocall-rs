@@ -132,7 +132,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 400,
         min_bitrate_kbps: 200,
         max_bitrate_kbps: 600,
-        keyframe_interval_frames: 100, // ~5s at 20fps; wall-clock cap guarantees ≤5s
+        keyframe_interval_frames: 100, // ~5s at 20fps; wall-clock cap ≤5s on WT, ≤5.5s on WS
     },
     VideoQualityTier {
         label: "very_low",
@@ -142,7 +142,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 250,
         min_bitrate_kbps: 100,
         max_bitrate_kbps: 400,
-        keyframe_interval_frames: 75, // ~5s at 15fps; wall-clock cap guarantees ≤5s
+        keyframe_interval_frames: 75, // ~5s at 15fps; wall-clock cap guarantees ≤5.5s
     },
     VideoQualityTier {
         label: "minimal",
@@ -152,7 +152,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 150,
         min_bitrate_kbps: 50,
         max_bitrate_kbps: 250,
-        keyframe_interval_frames: 50, // ~5s at 10fps; wall-clock cap guarantees ≤5s
+        keyframe_interval_frames: 50, // ~5s at 10fps; wall-clock cap guarantees ≤5.5s
     },
 ];
 
@@ -276,122 +276,6 @@ pub const SIMULCAST_VIDEO_LAYERS: &[VideoQualityTier] = &[
     },
 ];
 
-/// REDUCED-top camera simulcast ladder, selected by [`LadderVariant::Reduced`]
-/// (issue #1768).
-///
-/// Identical to [`SIMULCAST_VIDEO_LAYERS`] except the top rung is **540p instead
-/// of 720p**. Same length (so the layer-id space and every count clamp are
-/// unchanged) and same lowest-first ordering.
-///
-/// # Why the TOP rung and not the floor
-///
-/// At each rung's own target fps the encode cost is wildly lopsided —
-/// `low` 320×180@7 = 0.40 Mpx/s (1.3% of a 3-layer encode), `standard`
-/// 640×360@15 = 3.46 (11.0%), `hd` 1280×720@30 = **27.65 (87.8%)**. Lowering the
-/// floor saves essentially nothing; lowering the top is the entire win. Swapping
-/// 720p→540p takes the top rung to 15.55 Mpx/s, cutting the 3-layer total from
-/// ~31.5 to ~19.4 Mpx/s (≈38%).
-///
-/// # Why 540p specifically
-///
-/// It matches Google Meet's 540p rung (their documented ladder is
-/// 180p/360p/540p/720p, and their documented typical group-meeting inbound of
-/// ~1.3 Mbps shows their receivers sit low in the grid, which is why our video
-/// looks sharper in the same tile). It also keeps us **above** the 180p floor
-/// where a full-screen or 2-person view would go soft — going below 180p was
-/// explicitly rejected. And 960×540 is already validated geometry in this
-/// codebase: it is the `standard` rung of [`VIDEO_QUALITY_TIERS`], whose
-/// 900/500/1500 kbps band is reused here rather than inventing values.
-///
-/// # The `n == 2` case
-///
-/// [`spaced_ladder_positions`] anchors base+top and skips the interior, so a
-/// 2-layer publisher (any device sniffing 6–9 cores) gets `[low, top]` — `[180p,
-/// 720p]` by default, `[180p, 540p]` here. The gap between the two rungs narrows on
-/// both measures: **pixel area 16× → 9×**, and **throughput 68.6× → 38.6× Mpx/s**
-/// (the throughput figure folds in the 7 vs 30 fps difference; it is the "69×"
-/// number quoted in the #2143 analysis, and it is NOT the pixel ratio — the two are
-/// easily conflated).
-///
-/// **This does NOT give the #1256 tile-size lid a new target**, and an earlier
-/// revision of this doc claiming it did was wrong. `size_cap_layer` returns the
-/// FIRST rung whose height covers the tile and otherwise falls through to
-/// `highest_available`, so reaching the top index means every lower rung already
-/// failed — the top rung's height never enters the decision. A 2-layer publisher's
-/// receiver therefore selects the SAME index under either ladder;
-/// `size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung` (videocall-client)
-/// proves that exhaustively. The benefit of the narrower gap is that a receiver
-/// forced to the top rung now pays 540p instead of 720p — cheaper DECODE and less
-/// downlink for the SAME selection, not a better selection.
-///
-/// # The receiver-side saving, quantified
-///
-/// This is the headline result for the low-power devices this project targets (no
-/// hardware VP8/VP9 decode, where software decode is the binding constraint), so it
-/// is stated in numbers rather than as "cheaper": 960×540 is **0.5625×** the pixels
-/// of 1280×720, so a receiver on the top rung does **~43.8% less** decode work per
-/// frame — **15.55 vs 27.65 Mpx/s** at the rung's 30 fps. Downlink for that rung
-/// falls with it (ideal 900 vs 1500 kbps, −40%). Pinned by
-/// `reduced_ladder_cuts_top_rung_decode_cost` so the receiver claim is tied to the
-/// tables exactly as the publisher-side encode claim is.
-pub const SIMULCAST_VIDEO_LAYERS_REDUCED: &[VideoQualityTier] = &[
-    VideoQualityTier {
-        label: "low",
-        max_width: 320,
-        max_height: 180,
-        target_fps: 7,
-        ideal_bitrate_kbps: 120,
-        min_bitrate_kbps: 60, // achievable on ~100-200 kbps constrained links
-        max_bitrate_kbps: 200,
-        keyframe_interval_frames: 35, // ~5s at 7fps; wall-clock cap guarantees ≤5s
-    },
-    VideoQualityTier {
-        label: "standard",
-        max_width: 640,
-        max_height: 360,
-        target_fps: 15,
-        ideal_bitrate_kbps: 350,
-        min_bitrate_kbps: 150,
-        max_bitrate_kbps: 600,
-        keyframe_interval_frames: 75, // ~5s at 15fps; wall-clock cap guarantees ≤5s
-    },
-    VideoQualityTier {
-        // Named distinctly from the default ladder's `hd` so a log/diagnostic
-        // line naming the rung is unambiguous about which ladder produced it.
-        label: "hd540",
-        max_width: 960,
-        max_height: 540,
-        target_fps: 30,
-        // Band reused from the `standard` rung of VIDEO_QUALITY_TIERS (960×540@30),
-        // which is already the tuned 540p operating point in this codebase.
-        ideal_bitrate_kbps: 900,
-        min_bitrate_kbps: 500,
-        max_bitrate_kbps: 1500,
-        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
-    },
-];
-
-/// Compile-time guard: both camera ladders must be the SAME DEPTH.
-///
-/// The wire `simulcast_layer_id` space, `spaced_ladder_positions` selection, and
-/// every layer-count clamp (`SIMULCAST_MAX_LAYERS`, the client's
-/// `clamp_layer_count`, the relay's id bucketing) are shared across variants. A
-/// variant of a different length would silently change the meaning of a layer id
-/// between publishers, so this is asserted at build time rather than trusted.
-const _: () = assert!(
-    SIMULCAST_VIDEO_LAYERS_REDUCED.len() == SIMULCAST_VIDEO_LAYERS.len(),
-    "the reduced camera ladder must have the same rung count as the default ladder"
-);
-
-/// Compile-time guard: the reduced ladder's top rung must actually be SMALLER
-/// than the default's, or the variant is pointless and a future retune that
-/// inverts them would silently make `Reduced` the heavier option.
-const _: () = assert!(
-    SIMULCAST_VIDEO_LAYERS_REDUCED[SIMULCAST_VIDEO_LAYERS_REDUCED.len() - 1].max_height
-        < SIMULCAST_VIDEO_LAYERS[SIMULCAST_VIDEO_LAYERS.len() - 1].max_height,
-    "the reduced ladder's top rung must be lower-resolution than the default top rung"
-);
-
 /// Per-layer framerate-cap slack for the simulcast encode throttle (issue
 /// #1768), as a fraction of the rung's nominal frame interval.
 ///
@@ -412,6 +296,20 @@ pub const SIMULCAST_LAYER_FPS_THROTTLE_SLACK: f64 = 0.15;
 /// (kept in sync deliberately — the client clamps requested layers, the AQ
 /// crate owns the tier mapping).
 pub const SIMULCAST_MAX_LAYERS: usize = 3;
+
+/// Maximum AUDIO simulcast layers — independent counterpart to [`SIMULCAST_MAX_LAYERS`].
+pub const AUDIO_SIMULCAST_MAX_LAYERS: usize = 3;
+
+/// Audio-source activity gate in packets/sec; below it a sender is likely DTX-silent.
+pub const AUDIO_ACTIVE_PPS_GATE: f64 = 2.0;
+
+/// Backward per-rung sequence jump treated as a publisher RESTART, not reorder; the
+/// blind region it leaves is `GAP / packet-rate` seconds.
+pub const SEQ_RESET_REANCHOR_GAP: u64 = 1024;
+
+/// Ceiling on one booked FORWARD sequence gap, in frames. `sequence` is publisher-controlled,
+/// so both the receiver's saturation and the metrics server's clamp read this one bound.
+pub const MAX_PLAUSIBLE_FORWARD_GAP: u64 = 4096;
 
 /// How long a simulcast rung stays "arriving" after its last packet, for receivers
 /// deciding which rungs a source is currently offering.
@@ -494,136 +392,19 @@ fn spaced_ladder_positions(n: usize, len: usize) -> Vec<usize> {
 /// crashing a live call — issue #1082). Callers should still clamp upstream
 /// (the client's `clamp_layer_count`).
 pub fn simulcast_layers(n: usize) -> &'static [VideoQualityTier] {
-    simulcast_layers_for(n, LadderVariant::Default)
-}
-
-/// Which camera simulcast ladder a publisher is encoding against (issue #1768).
-///
-/// The rung RESOLUTIONS differ; the rung COUNT does not — both variants are
-/// [`SIMULCAST_MAX_LAYERS`] deep, so `spaced_ladder_positions` selection, the
-/// wire `simulcast_layer_id` space, and every layer-count clamp are unchanged.
-/// Only the pixels/bitrate behind a given index move.
-///
-/// # Why a runtime variant rather than an edit or a cargo feature
-///
-/// Re-cutting the ladder needs a wasm rebuild + full deploy to evaluate, which
-/// makes each experiment a multi-day cycle. A runtime variant, delivered through
-/// the same `runtimeConfig` → `config.js` → `window.__APP_CONFIG` path as
-/// `experimentalSimulcastMaxLayers`, lets an operator flip the ladder with a
-/// `helm upgrade`. A cargo feature would be compile-time and defeat that.
-///
-/// # This is a DEPLOYMENT-WIDE switch, not a per-user A/B
-///
-/// The wire carries only a layer INDEX and no geometry, so a receiver resolves a
-/// rung's dimensions/bitrate from its OWN copy of the ladder. Which copy depends on
-/// what the answer is FOR (the #2156 split): `layer_chooser::received_layer_snapshot`
-/// — the SELECTION resolver — stays pinned to [`LadderVariant::Default`], while
-/// `received_layer_snapshot_for_display` takes the deployment's variant. Two
-/// consequences, and they differ in severity:
-///
-/// * **DECODE and layer SELECTION are unaffected.** The decoder sizes from the
-///   decoded frame itself (`peer_decoder.rs`, `video_frame.display_width()`), never
-///   from this table. And the #1256 tile-size lid is *provably* insensitive to a
-///   TOP-rung change: `size_cap_layer` returns the first rung covering the tile and
-///   otherwise falls through to `highest_available`. Reaching the top means every
-///   lower rung already failed, so the result is the top index whether that rung
-///   covers or the loop falls through. Pinned
-///   exhaustively by `size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung`
-///   (videocall-client), which turns red if a future retune moves a non-top rung
-///   and the lid therefore DOES need the variant plumbed.
-/// * **Receiver-side DISPLAY follows the variant (fixed in issue #2156).** The
-///   receiver's READOUTS — the performance panel's `{w}x{h}` line, the peer-row
-///   `540p · ~900k` metric, the receive slider's rung labels and their
-///   `aria-valuetext`, the diagnostics drawer's per-kind line, and the signal-quality
-///   popup — resolve rung geometry through
-///   `layer_chooser::received_layer_snapshot_for_display`, which is handed the
-///   deployment's variant via `VideoCallClientOptions::camera_ladder_variant` →
-///   `PeerDecodeManager::set_camera_ladder_variant`. Before #2156 they were pinned to
-///   the shipped ladder, so a `Reduced` deployment labelled a 960×540 @ ~900 kbps
-///   stream "720p · ~1.5M" — wrong by 67% on the bitrate operators judge a run by.
-///   Receiver rung labels are therefore ground truth when every publisher uses the
-///   deployment's variant. In a mixed room containing native `bot/` publishers,
-///   which remain [`LadderVariant::Default`]-pinned, use each publisher's
-///   `AQ_STATUS ladder=` field to interpret its rung. For browser publishers,
-///   `videocall_encoder_active_layers` remains authoritative for SEND-side layer
-///   counts; native bots expose that count through `AQ_STATUS active_layers=`.
-///
-///   This changed **no metric**: `health_reporter`'s `received_*_layer` maps carry
-///   layer INDICES only, with no geometry or bitrate, so Prometheus was never wrong.
-///
-/// So a mixed-variant room is not a correctness break; keep the variant uniform
-/// across a deployment anyway so rung labels and selection stay interpretable.
-///
-/// # The publisher-side halves MUST agree
-///
-/// The encoder derives per-layer GEOMETRY from these rungs; the AQ controller
-/// derives the per-layer BITRATE TARGETS from them (and hands those to the encoder
-/// via `shared_layer_bitrates_bps` → `set_bitrate`). Gating only one half would
-/// therefore encode one ladder's resolutions at the OTHER ladder's bitrates — e.g.
-/// 960×540 configured for 1500 kbps — so the variant is threaded to both from a
-/// single read of the flag.
-///
-/// It would **not** cause a spurious layer shed. [`uplink_budget_kbps`] sums the
-/// same tiers whose ideals become the targets, so `sum == budget` by construction
-/// and [`cap_layers_to_budget`] no-ops under either variant; shed decisions read
-/// encoder-queue backpressure, the union/user caps and tier movement, none of which
-/// consults this table. (An earlier revision of this doc claimed a "phantom
-/// ceiling" shed — that mechanism does not exist in the code.)
-///
-/// # The native `bot` crate cannot see this
-///
-/// `bot/` links this crate but has no `window.__APP_CONFIG`, so it always
-/// encodes against [`LadderVariant::Default`]. A Rust bot sharing a room with
-/// gated-on browsers publishes a different top rung — harmless per the decode
-/// note above, but it makes a measurement run non-uniform. The browser bots-app
-/// (`e2e/bots-app`) is unaffected: it drives the real client, so it inherits
-/// whatever the deployment serves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LadderVariant {
-    /// The shipped ladder: `[low 320×180@7, standard 640×360@15, hd 1280×720@30]`.
-    #[default]
-    Default,
-    /// Reduced-top ladder: `[low 320×180@7, standard 640×360@15, 540p 960×540@30]`.
-    ///
-    /// Drops the 720p top to 540p. Rationale (issue #1768 + the #2143 run):
-    /// the top rung is ~87.8% of the whole 3-layer encode cost (27.65 of 31.5
-    /// Mpx/s), so lowering it — not touching the near-free 180p floor — is where
-    /// the CPU is. It also narrows the `n == 2` gap on BOTH measures:
-    /// **pixel area 16× → 9×** and **throughput 68.6× → 38.6× Mpx/s**
-    /// (`[180p, 720p]` → `[180p, 540p]`), so a 6–9-core publisher's receivers pay
-    /// 540p rather than 720p when they land on the top rung. It does NOT change
-    /// WHICH rung the #1256 lid selects — see the `n == 2` section on
-    /// [`SIMULCAST_VIDEO_LAYERS_REDUCED`].
-    ///
-    /// The "**69×**" figure quoted in the #2143 analysis is the THROUGHPUT ratio
-    /// (it folds in 30 vs 7 fps), **not** pixel area — the two are easily
-    /// conflated, and both are pinned by
-    /// `reduced_ladder_n2_keeps_the_middle_skip_but_shrinks_the_cliff`.
-    Reduced,
-}
-
-/// Resolve the simulcast layer tiers for an `n`-layer ladder in a specific
-/// [`LadderVariant`] (issue #1768).
-///
-/// [`simulcast_layers`] is this function pinned to [`LadderVariant::Default`];
-/// see that function for the `n`-selection contract, which is identical here
-/// (same [`spaced_ladder_positions`] rule, same clamping, same never-panics
-/// guarantee).
-pub fn simulcast_layers_for(n: usize, variant: LadderVariant) -> &'static [VideoQualityTier] {
     // Static, build-once tables so the function can return `&'static`. We build
-    // one cached `Vec<VideoQualityTier>` per (variant, ladder size) lazily via
-    // `OnceLock`.
+    // one cached `Vec<VideoQualityTier>` per ladder size lazily via `OnceLock`.
     use std::sync::OnceLock;
 
-    fn ladder(n: usize, source: &[VideoQualityTier]) -> Vec<VideoQualityTier> {
+    fn ladder(n: usize) -> Vec<VideoQualityTier> {
         // Derive the lowest-`n` well-spaced rungs generically from the ladder
         // definition (issue #1082): no per-`n` `match` arm, so raising
         // SIMULCAST_MAX_LAYERS requires no change here. The ladder is already
         // lowest-first, so a selected position IS the layer id (issue #1768).
-        spaced_ladder_positions(n, source.len())
+        spaced_ladder_positions(n, SIMULCAST_VIDEO_LAYERS.len())
             .into_iter()
             .map(|pos| {
-                let t = &source[pos];
+                let t = &SIMULCAST_VIDEO_LAYERS[pos];
                 // VideoQualityTier is Copy-able plain data; clone field-by-field
                 // so the returned vec owns 'static-compatible values.
                 VideoQualityTier {
@@ -640,21 +421,13 @@ pub fn simulcast_layers_for(n: usize, variant: LadderVariant) -> &'static [Video
             .collect()
     }
 
-    // One OnceLock cache cell per supported ladder size, PER VARIANT. Indexed by
-    // clamped n. Separate arrays (not one keyed array) so a cache cell can never
-    // be filled by the wrong variant.
-    static LADDERS_DEFAULT: [OnceLock<Vec<VideoQualityTier>>; SIMULCAST_MAX_LAYERS] =
-        [const { OnceLock::new() }; SIMULCAST_MAX_LAYERS];
-    static LADDERS_REDUCED: [OnceLock<Vec<VideoQualityTier>>; SIMULCAST_MAX_LAYERS] =
+    // One OnceLock cache cell per supported ladder size, indexed by clamped n.
+    static LADDERS: [OnceLock<Vec<VideoQualityTier>>; SIMULCAST_MAX_LAYERS] =
         [const { OnceLock::new() }; SIMULCAST_MAX_LAYERS];
 
     let clamped = n.clamp(1, SIMULCAST_MAX_LAYERS);
-    let (cache, source) = match variant {
-        LadderVariant::Default => (&LADDERS_DEFAULT, SIMULCAST_VIDEO_LAYERS),
-        LadderVariant::Reduced => (&LADDERS_REDUCED, SIMULCAST_VIDEO_LAYERS_REDUCED),
-    };
-    cache[clamped - 1]
-        .get_or_init(|| ladder(clamped, source))
+    LADDERS[clamped - 1]
+        .get_or_init(|| ladder(clamped))
         .as_slice()
 }
 
@@ -786,366 +559,96 @@ pub fn screen_share_camera_ceiling_index() -> usize {
         .unwrap_or_else(|| VIDEO_QUALITY_TIERS.len().saturating_sub(2))
 }
 
-/// Compile-time `&str` equality, so the label↔index invariants below can be
-/// asserted at build time instead of only in a `#[test]`.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+/// Bits per pixel per frame budgeted for SCREEN content, in THOUSANDTHS.
+pub const SCREEN_BITS_PER_PIXEL_MILLI: u64 = 120;
+
+/// Floor on a screen encode budget, in kbps.
+pub const SCREEN_MIN_BITRATE_KBPS: u32 = 500;
+
+/// Ceiling on a screen encode, in pixels; also the `getDisplayMedia` `max`.
 ///
-/// `str::eq` is not `const`, so this compares the UTF-8 bytes directly.
-const fn const_str_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
+/// Bounded by the relay's `MAX_FRAME_SIZE`, which `actix-api` asserts at compile
+/// time against [`SCREEN_KEYFRAME_BYTES_PER_PIXEL`].
+pub const SCREEN_MAX_ENCODE_WIDTH: u32 = 2560;
+/// See [`SCREEN_MAX_ENCODE_WIDTH`].
+pub const SCREEN_MAX_ENCODE_HEIGHT: u32 = 1440;
+
+/// Worst-case VP9 keyframe size per encoded pixel, in bytes: a measured 1080p
+/// screen keyframe runs 1-2 MB over 2_073_600 px. Bounds the encode ceiling
+/// against the relay frame cap.
+///
+/// That measurement predates the issue #1832 framerate hint, which inflates
+/// keyframes on a starved static share, so re-measure before RAISING the
+/// ceiling. The assert this feeds guards the ceiling, not the model.
+pub const SCREEN_KEYFRAME_BYTES_PER_PIXEL: usize = 1;
+
+/// Frames per second the screen encoder is configured at.
+pub const SCREEN_TARGET_FPS: u32 = 10;
+
+/// The encode bitrate budget for a screen share of `width` x `height` at `fps`.
+pub const fn screen_bitrate_kbps_for(width: u32, height: u32, fps: u32) -> u32 {
+    let bits_per_second =
+        (width as u64) * (height as u64) * (fps as u64) * SCREEN_BITS_PER_PIXEL_MILLI / 1000;
+    let kbps = (bits_per_second / 1000) as u32;
+    if kbps < SCREEN_MIN_BITRATE_KBPS {
+        SCREEN_MIN_BITRATE_KBPS
+    } else {
+        kbps
     }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
 }
 
-// ---------------------------------------------------------------------------
-// Screen tier LABELS (the stable contract; indices shift when rungs are added)
-// ---------------------------------------------------------------------------
-//
-// Issue #2179 extended `SCREEN_QUALITY_TIERS` upward with a 1440p and a native
-// 2160p rung, which SHIFTED every pre-existing index by two. Everything that
-// used to hard-code `0 = high / 1 = medium / 2 = low` therefore resolves its
-// rung by LABEL through the helpers below, so a future rung insertion can never
-// silently repoint a decision at the wrong resolution/bitrate.
+/// The budget at the encode ceiling.
+const SCREEN_CEILING_KBPS: u32 = screen_bitrate_kbps_for(
+    SCREEN_MAX_ENCODE_WIDTH,
+    SCREEN_MAX_ENCODE_HEIGHT,
+    SCREEN_TARGET_FPS,
+);
 
-/// Label of the screen rung used as the "bandwidth-conservative baseline"
-/// (720p / 8 fps / 1200 kbps).
-pub const SCREEN_TIER_LABEL_BASELINE: &str = "medium";
+/// The one and only SCREEN encode rung. `max_width`/`max_height` are a CEILING,
+/// not a target; a share's real budget is [`screen_bitrate_kbps_for`].
+pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[VideoQualityTier {
+    label: "native",
+    max_width: SCREEN_MAX_ENCODE_WIDTH,
+    max_height: SCREEN_MAX_ENCODE_HEIGHT,
+    target_fps: SCREEN_TARGET_FPS,
+    ideal_bitrate_kbps: SCREEN_CEILING_KBPS,
+    min_bitrate_kbps: SCREEN_CEILING_KBPS / 2,
+    max_bitrate_kbps: SCREEN_CEILING_KBPS * 7 / 4,
+    keyframe_interval_frames: 30,
+}];
 
-/// Label of the WORST screen rung (720p / 5 fps / 500 kbps) — the floor the AQ
-/// ladder and the simulcast base rung both use.
-pub const SCREEN_TIER_LABEL_FLOOR: &str = "low";
+const _: () = assert!(
+    SCREEN_QUALITY_TIERS.len() == 1,
+    "the screen path publishes exactly one rung (issue 2343); adding a rung \
+     reintroduces the resolution ladder that issue removed"
+);
 
-/// Label of the 1080p screen rung.
-pub const SCREEN_TIER_LABEL_1080P: &str = "high";
+/// Index into [`SCREEN_QUALITY_TIERS`]. There is exactly one rung.
+pub const DEFAULT_SCREEN_TIER_INDEX: usize = 0;
 
-/// Label of the 1440p screen rung (issue #2179).
-pub const SCREEN_TIER_LABEL_1440P: &str = "1440p";
+/// Number of SCREEN simulcast layers (issue 2343).
+pub const SCREEN_SIMULCAST_MAX_LAYERS: usize = 1;
 
-/// Resolve a `SCREEN_QUALITY_TIERS` index by tier label.
-///
-/// Falls back to the WORST (last) rung when the label is absent, which is the
-/// conservative direction: a mis-resolved rung must never spend MORE bandwidth
-/// than the ladder's floor.
-pub fn screen_tier_index_by_label(label: &str) -> usize {
+/// Screen layers active from frame one (issue 2343).
+pub const SCREEN_INITIAL_ACTIVE_LAYERS: usize = 1;
+
+const _: () = assert!(
+    SCREEN_INITIAL_ACTIVE_LAYERS == SCREEN_SIMULCAST_MAX_LAYERS,
+    "every screen layer is active from frame one — there is only one"
+);
+
+/// The SCREEN rung LABELS, lowest layer first (index == `layer_id`). One rung
+/// whatever `n` asks for; clamps rather than panics (browser encode task).
+pub fn simulcast_screen_layer_labels(_n: usize) -> &'static [&'static str] {
+    &["native"]
+}
+
+/// The SCREEN layer tiers. One element; indexing callers must bounds-check.
+pub fn simulcast_screen_layers(_n: usize) -> &'static [VideoQualityTier] {
     SCREEN_QUALITY_TIERS
-        .iter()
-        .position(|t| t.label == label)
-        .unwrap_or_else(|| SCREEN_QUALITY_TIERS.len().saturating_sub(1))
-}
-
-/// Index into `SCREEN_QUALITY_TIERS` for the default starting tier.
-///
-/// Points at the [`SCREEN_TIER_LABEL_BASELINE`] rung ("medium", 720p/8fps/
-/// 1200kbps) — a bandwidth-conservative baseline that is used ONLY as a
-/// fallback: it is what the AQ manager/controller construct at, and what the
-/// screen encoder seeds its shared atomics with before any capture exists.
-///
-/// The value a real share actually starts at is resolved at RUNTIME from the
-/// captured source resolution by [`resolve_initial_screen_tier`] (issue #2179),
-/// because a compile-time constant cannot express "match whatever the user
-/// chose to share". This constant remains the answer when the source dimensions
-/// are unknown (a track that has not reported `getSettings()` yet).
-///
-/// Pinned to the label (not a hand-counted index) by the compile-time assert
-/// below, so adding a rung to the ladder cannot silently repoint the default.
-pub const DEFAULT_SCREEN_TIER_INDEX: usize = 3; // "medium"
-
-const _: () = assert!(
-    DEFAULT_SCREEN_TIER_INDEX < SCREEN_QUALITY_TIERS.len(),
-    "DEFAULT_SCREEN_TIER_INDEX out of bounds for SCREEN_QUALITY_TIERS"
-);
-const _: () = assert!(
-    const_str_eq(
-        SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX].label,
-        SCREEN_TIER_LABEL_BASELINE
-    ),
-    "DEFAULT_SCREEN_TIER_INDEX must point at the 'medium' rung — a rung was \
-     added/removed without updating the index"
-);
-
-// ---------------------------------------------------------------------------
-// Screen Share Quality Tiers
-// ---------------------------------------------------------------------------
-
-/// Screen share quality tiers, ordered from highest (index 0) to lowest.
-///
-/// Screen content (text, code, diagrams) needs significantly higher bitrates
-/// than camera video to remain readable during scrolling and motion. The
-/// encoder is configured with `contentHint = 'detail'` and variable bitrate
-/// mode to accommodate burst demand during scroll events.
-///
-/// # The two top rungs (issue #2179)
-/// The ladder used to top out at 1080p, which silently destroyed text on any
-/// HiDPI display: a browser window measuring 1248x720 CSS px on a DPR-2 panel
-/// is 2496x1440 REAL pixels, and `fit_within_preserving_aspect` downscaled that
-/// into the 1920x1080 rung and then (once AQ stepped to "medium") into
-/// 1280x720 — a quarter of the source pixels through two fractional resamples,
-/// which is exactly what shreds glyph stems and antialiasing.
-///
-/// `1440p` (2560x1440) holds a DPR-2 Retina laptop window 1:1, and `native`
-/// (3840x2160) holds a 4K panel and the 21:9 ultra-wides (3840x1600) 1:1.
-/// Because `fit_within_preserving_aspect` NEVER upscales, a small source on a
-/// big rung is still encoded at its own size — the rungs only remove a ceiling,
-/// they never inflate a stream.
-///
-/// # Bitrates
-/// Tuned for text at ~10 fps under VBR with `contentHint = 'detail'`: static
-/// text is highly temporally redundant so the `ideal` is a modest steady-state
-/// figure, while `max` is generous so a scroll burst is not smeared. These are
-/// SETPOINTS for the PID, not a reservation — a static share converges far
-/// below `ideal`.
-///
-/// # Cost control
-/// Reaching the top rungs is gated, not automatic:
-/// - a PERSISTENT ceiling ([`resolve_screen_tier_ceiling`]) is installed on the
-///   AQ controller for the life of every share, composing the captured source
-///   size, the sender's CPU class and the stream count. Because it is a
-///   persistent bound rather than a start value, the PID cannot climb a 720p
-///   window up to the `native` rung's 8000 kbps setpoint after the fact — which
-///   is exactly what the start-only gate allowed before the #2179 review;
-/// - the single-stream path only reaches them when the CAPTURED SOURCE is
-///   actually that large ([`resolve_initial_screen_tier`]) and the network
-///   signals do not veto it, and never past `1440p` at all
-///   ([`screen_tier_single_stream_floor`]) because its receivers have no
-///   lower rung to fall back to;
-/// - the simulcast path keeps its 2-rung cold-start seed at
-///   `[low, high]` (unchanged from #1553, ≈3000 kbps), and the 1440p rung is
-///   only ever the THIRD rung, earned by the existing 6 s clear-queue headroom
-///   probe (see [`simulcast_screen_layers`]).
-pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
-    VideoQualityTier {
-        label: "native",
-        max_width: 3840,
-        max_height: 2160,
-        target_fps: 10,
-        ideal_bitrate_kbps: 8000,
-        min_bitrate_kbps: 4000,
-        max_bitrate_kbps: 14000,
-        keyframe_interval_frames: 30, // ~3s at 10fps (text readability); wall-clock cap ≤3s
-    },
-    VideoQualityTier {
-        label: "1440p",
-        max_width: 2560,
-        max_height: 1440,
-        target_fps: 10,
-        ideal_bitrate_kbps: 5000,
-        min_bitrate_kbps: 2500,
-        max_bitrate_kbps: 8000,
-        keyframe_interval_frames: 30, // ~3s at 10fps (text readability); wall-clock cap ≤3s
-    },
-    VideoQualityTier {
-        label: "high",
-        max_width: 1920,
-        max_height: 1080,
-        target_fps: 10,
-        ideal_bitrate_kbps: 2500,
-        min_bitrate_kbps: 1500,
-        max_bitrate_kbps: 4000,
-        keyframe_interval_frames: 30, // ~3s at 10fps (text readability); wall-clock cap ≤3s
-    },
-    VideoQualityTier {
-        label: "medium",
-        max_width: 1280,
-        max_height: 720,
-        target_fps: 8,
-        ideal_bitrate_kbps: 1200,
-        min_bitrate_kbps: 700,
-        max_bitrate_kbps: 2000,
-        keyframe_interval_frames: 24, // ~3s at 8fps (text readability); wall-clock cap ≤3s
-    },
-    VideoQualityTier {
-        label: "low",
-        max_width: 1280,
-        max_height: 720,
-        target_fps: 5,
-        ideal_bitrate_kbps: 500,
-        min_bitrate_kbps: 250,
-        max_bitrate_kbps: 1000,
-        keyframe_interval_frames: 15, // ~3s at 5fps (text readability); wall-clock cap ≤3s
-    },
-];
-
-/// Maximum number of SCREEN simulcast layers (issue #989, Phase 3).
-pub const SCREEN_SIMULCAST_MAX_LAYERS: usize = 3;
-
-/// Initial number of ACTIVE screen simulcast layers seeded at (re)share start
-/// (issue #1553).
-///
-/// # Why this exists (issue #1553)
-/// The screen path used to seed `active_layer_count == 1` (base rung only) and
-/// relied on the headroom-probe ramp ([`LAYER_PROBE_CLEAR_WINDOW_MS`]) to earn
-/// every upper rung. That ramp demands the encoder queue be **uninterruptedly**
-/// clear for 6 s per rung; on a busy share in a large (~15-peer) meeting the
-/// queue never stays clear that long, so the share stalled permanently on the
-/// base rung — `low` (720p / 500 kbps / 5 fps) — and looked FUZZY forever.
-///
-/// # Decision: start OPTIMISTIC, shed DOWN on real backpressure (Option B)
-/// Seed the screen ladder at this many active rungs instead of 1, so a clear
-/// share gets a solid baseline from frame one without waiting on the 6 s ramp.
-/// At the `2`-rung seed the ladder is `[low, high]` (see
-/// [`simulcast_screen_layers`] just below: `n == 2 => [low, high]`), so the
-/// publisher emits the base `low` (720p / 500 kbps) AND the top `high`
-/// (1080p / 2500 kbps) rung — ≈ 3000 kbps across TWO simultaneous encodes (one
-/// of them the full 1080p) immediately. The EXISTING shed-down machinery
-/// (`drop_top_layer` under sustained encoder backpressure / congestion) still
-/// reduces active toward the floor (1) under genuine congestion, and the ramp
-/// can still earn the deferred MIDDLE rung up to the full 3-rung ceiling when
-/// uplink allows.
-///
-/// # Why `2` and not the full ladder (the #1200 tradeoff)
-/// Issue #1200 deliberately removed the "all rungs hot from frame one" cold
-/// start (active == n == 3, every rung encoding the instant a share begins)
-/// because that slam was too aggressive. Seeding at `2` is the middle ground
-/// that honors BOTH issues:
-/// - **#1553**: publishing the sharp `high` (1080p) rung immediately is exactly
-///   what de-fuzzes the shared content for a healthy receiver — the whole point
-///   of the issue — instead of stalling at the base rung waiting on the 6 s ramp.
-/// - **#1200**: 2 is strictly fewer than the 3-rung ladder, so it does NOT
-///   reintroduce the all-rungs-hot slam. What the seed leaves OFF is the THIRD
-///   simultaneous encode — the TOP rung, which since issue #2179 is `1440p`
-///   (2560x1440 / 5000 kbps) rather than the old middle `medium` rung. The
-///   honest comparison is "2 encodes (incl. the 1080p `high`) / ≈ 3000 kbps" at
-///   the seed vs "3 encodes / ≈ 8000 kbps" for the full ladder; the deferred top
-///   rung is earned by the ramp (or restored after a shed).
-///
-/// Issue #2179 note: because the ladder is now a strict prefix chain
-/// (`[low, high]` ⊂ `[low, high, 1440p]`), this seed publishes EXACTLY the same
-/// two rungs at exactly the same bitrates as before the ladder was extended —
-/// the cold-start cost of a share is unchanged.
-///
-/// Clamped against the actual ladder size by the seed method (a `1`-layer /
-/// single-stream session stays at active 1), so this never exceeds the ceiling.
-pub const SCREEN_INITIAL_ACTIVE_LAYERS: usize = 2;
-
-// The optimistic seed must be ≥ 1 (the base rung is always published) and must
-// not exceed the screen ladder ceiling (otherwise the "middle ground vs #1200"
-// intent collapses into the full all-rungs-hot slam #1200 removed). Asserting at
-// COMPILE time so a future retune that violates either bound fails the build.
-const _: () = assert!(
-    SCREEN_INITIAL_ACTIVE_LAYERS >= 1,
-    "screen initial-active seed must include at least the base rung"
-);
-const _: () = assert!(
-    SCREEN_INITIAL_ACTIVE_LAYERS <= SCREEN_SIMULCAST_MAX_LAYERS,
-    "screen initial-active seed must not exceed the screen ladder ceiling"
-);
-const _: () = assert!(
-    SCREEN_INITIAL_ACTIVE_LAYERS < SCREEN_SIMULCAST_MAX_LAYERS,
-    "screen initial-active seed must be strictly below the ceiling — seeding the \
-     full ladder reintroduces the all-rungs-hot cold-start slam removed by #1200"
-);
-
-/// The SCREEN simulcast rung LABELS for an `n`-layer ladder, lowest layer first
-/// (index == `layer_id`). Split out from [`simulcast_screen_layers`] so the
-/// selection is pinned by label — the rung a layer publishes must not move when
-/// a tier is inserted into [`SCREEN_QUALITY_TIERS`] (issue #2179 added two).
-///
-/// # The n == 3 RECEIVE points moved (issue #2179 — deliberate)
-/// The 3-rung ladder used to publish `[low, medium, high]` = **500 / 1200 /
-/// 2500 kbps**; it now publishes `[low, high, 1440p]` = **500 / 2500 /
-/// 5000 kbps**. The consequence for RECEIVERS is explicit and accepted:
-///
-/// - a receiver on ~0.5–2.5 Mbps that used to land on the 1200 kbps `medium`
-///   rung now falls back to the 500 kbps `low` base rung — a real downgrade for
-///   that band;
-/// - a receiver with headroom gains a 1440p rung that did not exist before,
-///   which is the sharpness issue #2179 was filed for.
-///
-/// This is the tradeoff the issue asks for: restoring `medium` would re-cap
-/// every simulcast receiver at 1080p no matter how sharp the source is. The
-/// cost is bounded on the SEND side — the third rung is never seeded, only
-/// earned by the headroom probe, and it is shed first under backpressure.
-///
-/// # Panics
-/// Panics if `n` is not in `{1, 2, 3}`; callers must clamp first.
-pub fn simulcast_screen_layer_labels(n: usize) -> &'static [&'static str] {
-    match n {
-        1 => &[SCREEN_TIER_LABEL_FLOOR],
-        2 => &[SCREEN_TIER_LABEL_FLOOR, SCREEN_TIER_LABEL_1080P],
-        3 => &[
-            SCREEN_TIER_LABEL_FLOOR,
-            SCREEN_TIER_LABEL_1080P,
-            SCREEN_TIER_LABEL_1440P,
-        ],
-        other => panic!("simulcast_screen_layers: n must be in {{1,2,3}}, got {other}"),
-    }
-}
-
-/// Resolve the SCREEN simulcast layer tiers for an `n`-layer ladder
-/// (issue #989, Phase 3), **lowest layer first** (index == `layer_id`).
-///
-/// Derived from [`SCREEN_QUALITY_TIERS`] by LABEL (see
-/// [`simulcast_screen_layer_labels`]):
-/// - `n == 1` → `[low]` (single base; screen single-stream path is unchanged
-///   and does not consult this).
-/// - `n == 2` → `[low, high]` (720p/500 base + 1080p/2500 top — well separated).
-///   UNCHANGED by issue #2179: this is the ladder the `SCREEN_INITIAL_ACTIVE_LAYERS`
-///   cold-start seed publishes, so a fresh share still costs ≈3000 kbps across
-///   two encodes exactly as it did before the ladder was extended.
-/// - `n == 3` → `[low, high, 1440p]` (full ladder).
-///
-/// # Why the third rung moved (issue #2179)
-/// It used to be `[low, medium, high]` — `low` and `medium` are BOTH 1280x720
-/// (they differ only in fps/bitrate), so the ladder spent its middle rung on a
-/// resolution the base rung already carried and topped out at 1080p. That
-/// capped simulcast receivers at 1080p no matter how sharp the source was,
-/// which is the defect issue #2179 reports. The ladder is now spaced by
-/// RESOLUTION — 720p → 1080p → 1440p — so the top rung can carry a DPR-2
-/// Retina window at its native size.
-///
-/// Two properties make this affordable rather than a bandwidth slam:
-/// - **Prefix stability.** `n == 3` is now `n == 2` plus one rung on top, so
-///   earning the third rung ADDS 1440p instead of also re-pointing layer 1 from
-///   `high` to `medium` (which is what the old `[low, medium, high]` did, and
-///   which forced a mid-share reconfigure of an already-published rung).
-/// - **Earned, not seeded.** The cold-start seed is `SCREEN_INITIAL_ACTIVE_LAYERS`
-///   (= 2) active rungs, so the 1440p rung is published ONLY after the
-///   headroom probe sees the encoder queue uninterruptedly clear for
-///   `LAYER_PROBE_CLEAR_WINDOW_MS`, and it is shed first under backpressure by
-///   the existing top-down `drop_top_layer` machinery.
-///
-/// # Panics
-/// Panics if `n` is not in `{1, 2, 3}`; callers must clamp first.
-pub fn simulcast_screen_layers(n: usize) -> &'static [VideoQualityTier] {
-    use std::sync::OnceLock;
-
-    fn ladder(n: usize) -> Vec<VideoQualityTier> {
-        simulcast_screen_layer_labels(n)
-            .iter()
-            .map(|&label| {
-                let t = &SCREEN_QUALITY_TIERS[screen_tier_index_by_label(label)];
-                VideoQualityTier {
-                    label: t.label,
-                    max_width: t.max_width,
-                    max_height: t.max_height,
-                    target_fps: t.target_fps,
-                    ideal_bitrate_kbps: t.ideal_bitrate_kbps,
-                    min_bitrate_kbps: t.min_bitrate_kbps,
-                    max_bitrate_kbps: t.max_bitrate_kbps,
-                    keyframe_interval_frames: t.keyframe_interval_frames,
-                }
-            })
-            .collect()
-    }
-
-    static SCREEN_LADDER_1: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
-    static SCREEN_LADDER_2: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
-    static SCREEN_LADDER_3: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
-
-    match n {
-        1 => SCREEN_LADDER_1.get_or_init(|| ladder(1)).as_slice(),
-        2 => SCREEN_LADDER_2.get_or_init(|| ladder(2)).as_slice(),
-        3 => SCREEN_LADDER_3.get_or_init(|| ladder(3)).as_slice(),
-        other => panic!("simulcast_screen_layers: n must be in {{1,2,3}}, got {other}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,17 +950,12 @@ pub const LAYER_PROBE_CLEAR_WINDOW_MS: f64 = 6_000.0;
 ///
 /// The shipped ratios `next_ideal / budget_now` are:
 ///
-/// | ladder                     | 1→2  | 2→3  |
-/// |----------------------------|------|------|
-/// | camera default `120/350/1500` | 2.92 | 3.19 |
-/// | camera reduced `120/350/900`  | 2.92 | 1.91 |
-/// | screen `500/2500/5000`        | 5.00 | 1.67 |
+/// | ladder                        | 1→2  | 2→3  |
+/// |-------------------------------|------|------|
+/// | camera `120/350/1500`         | 2.92 | 3.19 |
 ///
-/// So every `FRAC < 1.67` is provably inert, and the FIRST value that rejects
-/// anything (1.67) rejects exactly the screen ladder's third rung — the 1440p
-/// rung issue #2179 exists to earn — permanently, on every device. Raising this
-/// number is therefore either a no-op or a silent removal of the 1440p rung; it
-/// is deliberately left at `0.0` rather than dressed up as a tuned safety gate.
+/// So every `FRAC < 2.92` is provably inert on the shipped ladder; the constant
+/// is left at `0.0` rather than dressed up as a tuned safety gate.
 ///
 /// **What actually guards the +5000 kbps marginal rung** is the tier-QUIET
 /// precondition added alongside this note: the probe refuses to add a rung
@@ -1710,25 +1208,43 @@ pub const SCREEN_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 /// so the #1510 ≤5s guarantee is preserved unchanged on full_hd … low over WebTransport.
 pub const PERIODIC_KEYFRAME_MAX_INTERVAL_MS: f64 = 5000.0;
 
+/// Receiver-side keyframe-less-hold escalation ceiling (ms), mirrored from
+/// `videocall_codecs::jitter_buffer::MAX_KEYFRAME_LESS_HOLD_MS` (issue #1662) because
+/// this crate deliberately depends only on `videocall-types`. `videocall-client` sees
+/// both and carries the compile-time equality assert that keeps the mirror honest.
+pub const RECEIVER_MAX_KEYFRAME_LESS_HOLD_MS: f64 = 6000.0;
+
+/// Margin (ms) reserved between the publisher's slowest camera periodic keyframe and
+/// [`RECEIVER_MAX_KEYFRAME_LESS_HOLD_MS`] (issue #2199). The publisher's ceiling is
+/// enforced at the ENCODER while the receiver's clock runs on what it has received, so
+/// this must cover publisher → relay → receiver transit plus the per-captured-frame
+/// granularity of `periodic_keyframe_due` (100ms at the lowest tier's 10fps).
+pub const CAMERA_KEYFRAME_CEILING_RECEIVER_MARGIN_MS: f64 = 500.0;
+
+/// Absolute camera periodic-keyframe wall-clock ceiling (ms) across every tier and
+/// transport (issue #2199): no arm of [`camera_periodic_keyframe_max_interval_ms`] may
+/// exceed it, so a receiver never gives up on a keyframe the publisher still owes it.
+pub const CAMERA_PERIODIC_KEYFRAME_ABSOLUTE_CEILING_MS: f64 =
+    RECEIVER_MAX_KEYFRAME_LESS_HOLD_MS - CAMERA_KEYFRAME_CEILING_RECEIVER_MARGIN_MS;
+
 /// Relaxed camera periodic-keyframe ceiling (ms) for the second-lowest AQ tier
 /// (`very_low`, 480×270 / 15 fps / ~250 kbps) — and, on a lossless transport, also
 /// for the `low` tier (issue #1531).
 ///
 /// At the very lowest tiers bandwidth is scarcest, so a forced I-frame every 5s is a
-/// disproportionate share of the tier budget. Relaxing to ~7s cuts that overhead
-/// while keeping freeze recovery bounded. See [`camera_periodic_keyframe_max_interval_ms`].
-pub const PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS: f64 = 7000.0;
+/// disproportionate share of the tier budget. The relief available is whatever
+/// [`CAMERA_PERIODIC_KEYFRAME_ABSOLUTE_CEILING_MS`] leaves, which this tier and
+/// `minimal` therefore share. See [`camera_periodic_keyframe_max_interval_ms`].
+pub const PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS: f64 = 5500.0;
 
 /// Relaxed camera periodic-keyframe ceiling (ms) for the lowest AQ tier
 /// (`minimal`, 426×240 / 10 fps / ~150 kbps) — the scarcest link (issue #1531).
 ///
-/// Bounded at 8s: this is the **absolute** camera periodic-keyframe ceiling across
-/// all tiers/transports. It is deliberately kept close to the receiver-side
-/// keyframe-less-hold escalation (`MAX_KEYFRAME_LESS_HOLD_MS` = 6s, issue #1662 in
-/// `videocall-codecs`). Relaxing past ~8s would widen the window in which a desynced
-/// receiver resets its decoder (#1662) and then still waits for the periodic keyframe;
-/// 8s keeps that post-reset wait ≤2s. See [`camera_periodic_keyframe_max_interval_ms`].
-pub const PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS: f64 = 8000.0;
+/// Pinned to [`CAMERA_PERIODIC_KEYFRAME_ABSOLUTE_CEILING_MS`] (issue #2199): the
+/// deepest tier takes every millisecond of relief the receiver's keyframe-less-hold
+/// escalation leaves available, and not one more.
+/// See [`camera_periodic_keyframe_max_interval_ms`].
+pub const PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS: f64 = 5500.0;
 
 /// Effective camera periodic-keyframe wall-clock ceiling (ms) for the current AQ
 /// tier and transport (issue #1531). Pure so a host test pins the per-tier /
@@ -1742,13 +1258,14 @@ pub const PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS: f64 = 8000.0;
 /// extends one tier higher than on lossy WebTransport.
 ///
 /// Selection (for the current 8-tier ladder):
-/// - lowest tier (`minimal`, idx 7) → [`PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS`] (8s)
-/// - second-lowest (`very_low`, idx 6) → [`PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS`] (7s)
-/// - third-lowest (`low`, idx 5) → 7s **only on a lossless transport**, else the base 5s
+/// - lowest tier (`minimal`, idx 7) → [`PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS`] (5.5s)
+/// - second-lowest (`very_low`, idx 6) → [`PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS`] (5.5s)
+/// - third-lowest (`low`, idx 5) → 5.5s **only on a lossless transport**, else the base 5s
 /// - every higher tier (full_hd … standard) → [`PERIODIC_KEYFRAME_MAX_INTERVAL_MS`] (5s)
 ///
-/// No combination exceeds 8s, bounding the #1662 receiver-side interaction (see
-/// [`PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS`]). Screen shares are deliberately
+/// No combination reaches [`RECEIVER_MAX_KEYFRAME_LESS_HOLD_MS`] (issue #2199), so a
+/// receiver never escalates to a decoder-pipeline reset while the publisher's own
+/// periodic guarantee is still in flight. Screen shares are deliberately
 /// NOT relaxed this way — screen keeps the flat 3s
 /// [`SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`] recovery guarantee on every tier
 /// (static screen content = keyframes are the only paintable data), and its tier
@@ -1801,11 +1318,13 @@ const _: () = assert!(
         <= PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS,
     "minimal ceiling must not be tighter than very_low (relief deepens toward the floor)"
 );
-// The absolute ceiling stays bounded so the #1662 (MAX_KEYFRAME_LESS_HOLD_MS = 6s)
-// receiver interaction cannot be widened past ~2s by a retune.
 const _: () = assert!(
-    PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS <= 8000.0,
-    "the lowest-tier camera keyframe ceiling must stay <= 8s to bound the #1662 receiver interaction"
+    PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS <= CAMERA_PERIODIC_KEYFRAME_ABSOLUTE_CEILING_MS,
+    "the lowest-tier camera keyframe ceiling must stay within the receiver's keyframe-less-hold window (#2199)"
+);
+const _: () = assert!(
+    CAMERA_PERIODIC_KEYFRAME_ABSOLUTE_CEILING_MS < RECEIVER_MAX_KEYFRAME_LESS_HOLD_MS,
+    "the camera keyframe ceiling must be strictly tighter than the receiver's give-up ceiling (#2199)"
 );
 
 /// Max time to wait for a keyframe before requesting one (milliseconds).
@@ -1844,472 +1363,6 @@ pub const KEYFRAME_BACKOFF_DECAY_MS: u64 = 30_000;
 /// keyframes during a request storm. Periodic (tier-controlled) keyframes
 /// are NOT subject to this cooldown.
 pub const ENCODER_PLI_COOLDOWN_MS: f64 = 2000.0;
-
-// ---------------------------------------------------------------------------
-// Screen Share Initial Tier Selection
-// ---------------------------------------------------------------------------
-
-/// Select the NETWORK-imposed floor on the starting screen-share quality tier.
-///
-/// # Signals
-/// - `rtt_ms`: Most-recent average server RTT, or `None` if unknown (e.g. first meeting
-///   before any RTT probes have completed, or WebSocket-only deployment).
-/// - `camera_tier_index`: Current camera AQ tier index (0 = full-HD, higher = degraded).
-///   Pass `None` if camera is not started (screen-only share).
-///
-/// # Returns
-/// An index into [`SCREEN_QUALITY_TIERS`]: the WORST (highest-index) tier the
-/// share is allowed to start better than. `0` means "the network imposes no
-/// constraint" — it does NOT mean "start at the 2160p rung"; the resolution the
-/// share actually starts at is chosen by [`resolve_initial_screen_tier`], which
-/// composes this answer with the captured source size.
-///
-/// The constrained answers are resolved by LABEL (`medium` / `low`), so they
-/// keep pointing at 720p/8fps and 720p/5fps exactly as they did before issue
-/// #2179 inserted the 1440p and 2160p rungs above them. Hard-coding `1` / `2`
-/// here would have silently promoted a poor-RTT client from 720p to 1080p and a
-/// fair-RTT client from 720p to 1440p.
-///
-/// # Failure mode — cold start
-/// When `rtt_ms` is `None` (first meeting, no prior probes) and the camera has not yet
-/// been degraded, this returns `0` — no network floor — so the source-resolution
-/// term decides. The PID loop and the five self-congestion axes ramp down within
-/// a few seconds if the uplink cannot sustain the chosen tier. In practice this
-/// branch is rare: a user reaches the share button after being connected long
-/// enough for RTT probes to have reported.
-pub fn initial_screen_tier(rtt_ms: Option<f64>, camera_tier_index: Option<usize>) -> usize {
-    // Cold start: no signals available → no network-imposed floor.
-    if rtt_ms.is_none() && camera_tier_index.is_none() {
-        return 0;
-    }
-
-    // RTT-based thresholds
-    let rtt_poor = rtt_ms.map(|rtt| rtt >= RTT_POOR_MS).unwrap_or(false);
-    let rtt_fair = rtt_ms.map(|rtt| rtt >= RTT_FAIR_MS).unwrap_or(false);
-
-    // Camera tier degradation indicators
-    // Camera tiers: 0=full_hd, 1=hd_plus, 2=hd, 3=standard, 4=medium, 5=low, 6=very_low, 7=minimal
-    // Threshold: ≥3 (sd/low) means camera is already degraded
-    let camera_degraded = camera_tier_index.map(|idx| idx >= 3).unwrap_or(false);
-
-    // Decision table:
-    // RTT >= POOR (400ms)     → "low"     (720p/5fps)
-    // RTT >= FAIR (200ms)     → "medium"  (720p/8fps)
-    // RTT < FAIR, camera ≥ sd → "medium"  (camera already degraded)
-    // RTT < FAIR, camera < sd → 0         (no network floor; source decides)
-    // RTT None, camera ≥ sd   → "medium"  (camera signal only)
-    // RTT None, camera < sd   → 0         (camera signal only, optimistic)
-
-    if rtt_poor {
-        return screen_tier_index_by_label(SCREEN_TIER_LABEL_FLOOR);
-    }
-
-    if rtt_fair || camera_degraded {
-        return screen_tier_index_by_label(SCREEN_TIER_LABEL_BASELINE);
-    }
-
-    0
-}
-
-/// The WORST (cheapest) [`SCREEN_QUALITY_TIERS`] rung that still contains
-/// `src_w x src_h` without downscaling it (issue #2179).
-///
-/// # Semantics
-/// Walks the ladder from worst to best and returns the first rung whose box
-/// covers the source, comparing LONG edge to long edge and SHORT edge to short
-/// edge. Paired with [`crate::orient_box_to_source`] — which the screen encoder
-/// uses at every fit site — a covering rung encodes the source at its native
-/// size, so this is precisely "the least expensive tier that costs the source
-/// zero resolution".
-///
-/// - A source LARGER than even the top rung returns `0`; the top rung's box
-///   still binds and the source is downscaled into it (unavoidable).
-/// - A source with an unknown dimension (`0` on either axis — a capture track
-///   that has not reported `getSettings()` yet) returns
-///   [`DEFAULT_SCREEN_TIER_INDEX`], the pre-#2179 conservative baseline, because
-///   guessing a rung from a fabricated size is worse than the old default.
-///
-/// # Why the match is ORIENTATION-AGNOSTIC (issue #2179 review)
-/// Every rung's box is authored landscape. A per-axis comparison therefore
-/// matched no rung at all for a rotated 1440x2560 panel (`2160 >= 2560` fails
-/// even on the top rung), so it fell through to `0` — handing a portrait share
-/// the 2160p rung's 8000 kbps setpoint for a stream that still got downscaled
-/// to 1215x2160 by the landscape box. Comparing sorted `(long, short)` pairs
-/// selects the `1440p` rung instead, and the oriented box then holds the panel
-/// 1:1 at that rung's honest 5000 kbps budget.
-///
-/// # Known limitation (NOT fixed here)
-/// The `getDisplayMedia` capture ceiling is still a per-axis
-/// `max 3840 x max 2160`, so a surface TALLER than 2160 px arrives already
-/// downscaled by the browser. This function only decides the ENCODE rung; it
-/// cannot recover pixels the capture pipeline never delivered.
-///
-/// # Why "worst that fits" rather than "best available"
-/// Requirement: start at the resolution actually being shared. Choosing the
-/// BEST rung would hand a 720p window the 2160p rung's 8000 kbps setpoint for a
-/// stream that the fit still encodes at 1280x720 — pure waste. Choosing the
-/// worst rung that fits pins resolution to the source while keeping the
-/// bitrate/fps budget proportionate to it.
-pub fn screen_tier_for_source(src_w: u32, src_h: u32) -> usize {
-    if src_w == 0 || src_h == 0 {
-        return DEFAULT_SCREEN_TIER_INDEX;
-    }
-    let (src_long, src_short) = (src_w.max(src_h), src_w.min(src_h));
-    for (i, tier) in SCREEN_QUALITY_TIERS.iter().enumerate().rev() {
-        let (box_long, box_short) = (
-            tier.max_width.max(tier.max_height),
-            tier.max_width.min(tier.max_height),
-        );
-        if box_long >= src_long && box_short >= src_short {
-            return i;
-        }
-    }
-    0
-}
-
-/// Resolve the tier a screen share should START at (issue #2179).
-///
-/// Composes the two independent inputs:
-/// - `network_tier` — the floor from [`initial_screen_tier`] (RTT / camera
-///   degradation). Higher index = worse = more conservative.
-/// - `(src_w, src_h)` — the capture track's real `getSettings()` size, i.e. the
-///   resolution the user actually chose to share.
-///
-/// # Rule
-/// ```text
-/// resolved = max( min( screen_tier_for_source(src), index_of("high") ),
-///                 network_tier )
-/// ```
-/// read as two clamps in quality terms:
-/// 1. `min(..., index_of("high"))` — never start WORSE than the pre-#2179
-///    optimistic answer, which was always the 1080p `high` rung. A 1280x720
-///    window is *contained* by the `low` rung (720p/5fps/500kbps), but starting
-///    a share there would be a bitrate/fps regression, so it is pulled back up
-///    to `high`; `fit_within_preserving_aspect` still encodes it at 1280x720,
-///    identical to today, just with `high`'s 2500 kbps / 10 fps budget. This
-///    clamp is ALSO what handles an unknown capture size: `screen_tier_for_source`
-///    returns [`DEFAULT_SCREEN_TIER_INDEX`] there, which this pulls up to `high`
-///    — exactly the pre-#2179 behaviour.
-/// 2. `max(..., network_tier)` — never start BETTER than the network signals
-///    allow. A poor-RTT client sharing a 4K panel still starts at `low`, exactly
-///    as it did before this change.
-///
-/// Composed, the result is **never worse than the pre-#2179 start in any case,
-/// and better only when the source genuinely carries more pixels than the 1080p
-/// rung can hold on a link with no network-imposed floor.** The case issue #2179
-/// reports — a DPR-2 Retina window at 2496x1440 on a healthy link — resolves to
-/// the `1440p` rung and is encoded at 2496x1440, its own pixels, with no
-/// resample at all, instead of being fitted into 1920x1080 and then into
-/// 1280x720.
-pub fn resolve_initial_screen_tier(src_w: u32, src_h: u32, network_tier: usize) -> usize {
-    let optimistic_floor = screen_tier_index_by_label(SCREEN_TIER_LABEL_1080P);
-    let source_tier = screen_tier_for_source(src_w, src_h).min(optimistic_floor);
-    source_tier
-        .max(network_tier)
-        .min(SCREEN_QUALITY_TIERS.len().saturating_sub(1))
-}
-
-// ---------------------------------------------------------------------------
-// Screen share PERSISTENT quality ceiling (issue #2179 review round)
-// ---------------------------------------------------------------------------
-//
-// `resolve_initial_screen_tier` only decides where a share STARTS. Once the AQ
-// loop is running, nothing stopped it from climbing a small/weak share all the
-// way to the `native` rung's 8000 kbps setpoint — a 720p window billed at 4K
-// money, multiplied by SFU fan-out. These helpers produce a PERSISTENT index
-// floor (quality is the inverse of index) that the controller installs for the
-// life of the share, composed with — never replacing — the user's own bounds.
-
-// --- Device-class bars: TWO SEPARATE calibrations (issue #2179 review r2) ---
-//
-// They currently share their numbers, and they are deliberately NOT expressed in
-// terms of each other. One governs how many CONCURRENT encodes a device is
-// trusted with; the other how many PIXELS PER SECOND a single screen stream may
-// cost it. Collapsing the two is exactly what produced the first cut's defect:
-// the `1440p` tier was gated behind the 3-LAYER bar (>= 10 cores), so a 6–9-core
-// Retina laptop — the machine class issue #2179 was actually reported from — was
-// capped at 1080p and stayed fuzzy, i.e. the fix missed its own bug report on
-// most consumer hardware. Either bar may be retuned without touching the other.
-
-/// LAYER bar: logical cores at/above which a sender is trusted with more than
-/// ONE concurrent encode.
-///
-/// Mirrors `dioxus-ui::components::capability_check::MIN_CORES_FOR_MULTILAYER`.
-/// Duplicated rather than imported because the dependency runs the other way
-/// (`dioxus-ui` → `videocall-aq`) and the UI constant is private; the two are
-/// kept in lockstep by naming the same cc7tp post-mortem rule ("2-core /
-/// low-core Intel MacBooks stall the main thread under multi-layer encode").
-pub const SCREEN_LAYER_BAR_MULTILAYER_CORES: u32 = 6;
-
-/// LAYER bar: logical cores at/above which a sender is trusted with the FULL
-/// 3-rung ladder. Mirrors
-/// `dioxus-ui::components::capability_check::CORES_FOR_3_LAYERS`.
-pub const SCREEN_LAYER_BAR_FULL_LADDER_CORES: u32 = 10;
-
-/// TIER ceiling: logical cores at/above which a share may reach the `1440p`
-/// rung.
-///
-/// # Pixel-rate arithmetic (computed from the shipped table, not asserted)
-/// | configuration                       | Mpx/s |
-/// |-------------------------------------|-------|
-/// | single `high`  1920x1080 @ 10 fps    | 20.74 |
-/// | 2-layer ladder `[low, high]`         | 25.34 |
-/// | single `1440p` 2560x1440 @ 10 fps    | 36.86 |
-/// | 3-layer ladder `[low, high, 1440p]`  | 62.21 |
-/// | single `native` 3840x2160 @ 10 fps   | 82.94 |
-///
-/// A single 1440p stream is **1.45x** the 2-layer ladder this bar already
-/// authorises and **0.59x** the 3-layer ladder the upper bar authorises — it
-/// falls BETWEEN the two bars rather than neatly under either. It is placed at
-/// the LOWER bar deliberately:
-/// - it is ONE encode, not two: a single WebCodecs instance, one rate
-///   controller, one keyframe cadence, none of the per-stream fixed overhead
-///   that makes concurrent encodes cost more than their pixel sum;
-/// - the alternative fails the issue on most consumer hardware. Apple-Silicon
-///   M-series report 8–12 logical cores, so gating `1440p` at the >= 10 bar
-///   leaves a large share of exactly the DPR-2 Retina machines #2179 was
-///   reported from capped at 1080p — still fuzzy, which is the entire bug;
-/// - it is a CEILING, not an operating point. A device that cannot sustain it
-///   is stepped down within seconds by the encoder-queue backpressure axis —
-///   the same "erring generous is safe because the shed catches it" argument
-///   `capability_check` makes for its own layer bar.
-///
-/// **Known interaction, not fixed here:** in simulcast the BASE encoder takes
-/// its dimensions from the AQ tier while the upper rungs use their own ladder
-/// boxes, so a 6-core sender at this ceiling with 2 active rungs costs
-/// 36.86 + 20.74 = 57.60 Mpx/s rather than 36.86. That base-layer geometry
-/// mismatch is a separate, pre-existing defect (the base layer is also budgeted
-/// at rung 0's bitrate); it is being tracked on its own follow-up.
-pub const SCREEN_TIER_1440P_MIN_CORES: u32 = 6;
-
-/// TIER ceiling: logical cores at/above which a share may reach the `native`
-/// (2160p) rung.
-///
-/// Stays at the upper bar. A single `native` stream is **82.94 Mpx/s** — see the
-/// table on [`SCREEN_TIER_1440P_MIN_CORES`] — which is **1.33x** the entire
-/// 3-layer ladder the >= 10-core class is trusted with, so unlike the 1440p case
-/// there is no argument for lowering it: it is the most expensive single encode
-/// the ladder can ask for, by a wide margin.
-pub const SCREEN_TIER_NATIVE_MIN_CORES: u32 = 10;
-
-// Ordering sanity: a better rung may never require FEWER cores than a worse one.
-const _: () = assert!(
-    SCREEN_TIER_NATIVE_MIN_CORES >= SCREEN_TIER_1440P_MIN_CORES,
-    "the `native` tier bar must be at least as demanding as the `1440p` bar"
-);
-
-/// Device-class term on a screen share's quality ceiling: the BEST (lowest)
-/// [`SCREEN_QUALITY_TIERS`] index a sender with `cores` logical CPUs may reach.
-///
-/// Three classes, calibrated by pixel rate rather than by concurrent-encode
-/// count — see [`SCREEN_TIER_1440P_MIN_CORES`]:
-/// - `>= SCREEN_TIER_NATIVE_MIN_CORES` → index `0`, i.e. this term imposes no
-///   restriction at all;
-/// - `>= SCREEN_TIER_1440P_MIN_CORES`  → no better than `1440p`;
-/// - below that                        → no better than `1080p`.
-///
-/// **The top class does NOT mean a 2160p encode is reachable.** This is one term
-/// of a composition, and [`resolve_screen_tier_ceiling`] also applies
-/// [`screen_ladder_top_index`], which caps EVERY path at `1440p` (issue #2179
-/// review r3). No composed ceiling returns `0`; the `native` rung's only
-/// remaining job is to donate the `getDisplayMedia` capture ceiling. Returning
-/// `0` here means "the CPU is not what is holding this share back", nothing more.
-///
-/// `cores == 0` means `navigator.hardwareConcurrency` was unavailable and is
-/// treated as the most conservative class, exactly like the UI capability sniff.
-pub fn screen_tier_device_floor(cores: u32) -> usize {
-    if cores >= SCREEN_TIER_NATIVE_MIN_CORES {
-        0
-    } else if cores >= SCREEN_TIER_1440P_MIN_CORES {
-        screen_tier_index_by_label(SCREEN_TIER_LABEL_1440P)
-    } else {
-        screen_tier_index_by_label(SCREEN_TIER_LABEL_1080P)
-    }
-}
-
-/// SINGLE-STREAM term on a screen share's quality ceiling: the BEST (lowest)
-/// index a share publishing exactly ONE rung may reach.
-///
-/// # Why single-stream needs its own, tighter cap
-/// On the simulcast path a receiver that cannot afford the top rung simply
-/// decodes a lower one. On the single-stream path there is no lower rung: one
-/// encode, `TileHint::Uncapped`, no receiver→sender tier feedback, and the
-/// receiver's decode budget caps the NUMBER of streams, not their resolution.
-/// Every receiver is therefore pinned to whatever the sender chose, so the
-/// sender must be the conservative party: never better than `1440p`, and never
-/// better than its own device class allows either (composed here rather than
-/// left to the caller, so a standalone call is correct on its own).
-///
-/// # Currently SUBSUMED (issue #2179 review r3)
-/// [`screen_ladder_top_index`] now caps every path at the same `1440p` rung, so
-/// this term never binds on its own today — a single-stream share and a
-/// simulcast share reach the same ceiling. It is kept rather than deleted
-/// because the two caps are independent policies that merely coincide: the
-/// moment the publish ladder gains a rung above `1440p`, this one starts binding
-/// again and the single-stream path stays conservative without anyone having to
-/// remember why. `screen_ceiling_cause_reports_the_uniquely_responsible_term`
-/// pins the coincidence so a ladder change surfaces it.
-pub fn screen_tier_single_stream_floor(cores: u32) -> usize {
-    screen_tier_index_by_label(SCREEN_TIER_LABEL_1440P).max(screen_tier_device_floor(cores))
-}
-
-// --- Cause vocabulary for a ceiling-constrained share (issue #2179 review r2) -
-
-/// Cause hint for a share held below its source's rung by the DEVICE term.
-///
-/// Reuses the EXISTING receive-side vocabulary rather than inventing a synonym:
-/// `cpu-pressure` is already what `cause_hint_from_trigger` emits for the
-/// CPU/fps axis and is already enumerated in the diagnostics panel's Cause
-/// legend, so no receiver copy has to change. Its meaning widens slightly —
-/// from "the AQ stepped down on CPU pressure" to "this machine's class is what
-/// is holding the share back" — but both readings are "your CPU is the limit",
-/// which is what the line has to tell the user.
-pub const SCREEN_CAUSE_CPU: &str = "cpu-pressure";
-
-/// The BEST (lowest) [`SCREEN_QUALITY_TIERS`] index any SCREEN simulcast rung
-/// can carry — derived from the ladder itself, never hard-coded.
-///
-/// This is the ceiling on EVERY encode path (issue #2179 review r3, security).
-/// The simulcast base rung takes its geometry from the AQ tier while its budget
-/// comes from ladder rung 0, so an AQ tier better than the ladder's top made the
-/// base rung encode 3840x2160 on `low`'s 500 kbps — and the base rung is exactly
-/// what a struggling receiver falls back to, which inverts the whole "receivers
-/// can choose a lower rung" mitigation. Capping the ceiling here means the base
-/// rung can never exceed what some published rung actually carries.
-///
-/// The base-rung GEOMETRY fix (bounding it by `simulcast_screen_layers(n)[0]`)
-/// is the real repair and is tracked separately; this cap is the bound that
-/// makes the current geometry safe in the meantime.
-pub fn screen_ladder_top_index() -> usize {
-    simulcast_screen_layer_labels(SCREEN_SIMULCAST_MAX_LAYERS)
-        .iter()
-        .map(|&label| screen_tier_index_by_label(label))
-        .min()
-        .unwrap_or(0)
-}
-
-/// Cause hint for a share held below its source's rung by the PUBLISH LADDER's
-/// top rung ([`screen_ladder_top_index`]).
-///
-/// Distinct from the CPU and single-stream causes because it is a property of
-/// the product, not of the user's machine or their stream count: no amount of
-/// CPU or extra rungs will lift it. Telling a 4K sharer "cpu-pressure" when the
-/// ladder would cap them at 1440p regardless would send them optimising the
-/// wrong thing.
-pub const SCREEN_CAUSE_LADDER: &str = "ladder-limited";
-
-/// Cause hint for a share held below its source's rung by the SINGLE-STREAM cap.
-///
-/// A genuinely new string: no existing hint expresses "you are publishing one
-/// rung, so every receiver is pinned to it and the sender must stay
-/// conservative". The receive-side renderer prints the hint verbatim, so this
-/// renders correctly today; the diagnostics panel's Cause LEGEND enumerates the
-/// vocabulary and must gain this entry.
-pub const SCREEN_CAUSE_SINGLE_STREAM: &str = "single-stream-limited";
-
-/// Cause hint for a share held below its source's rung by the network floor or
-/// by live AQ congestion — the pre-existing default.
-pub const SCREEN_CAUSE_BITRATE: &str = "bitrate-limited";
-
-/// WHICH term of the composed ceiling holds this share below the rung its own
-/// captured source needs — `""` when none does (issue #2179 review r2).
-///
-/// # Why this exists
-/// Publishing a single composed ceiling traded a false POSITIVE for a false
-/// NEGATIVE: a 4K sharer capped by their CPU class sits exactly at their
-/// ceiling, so the "at or better than the ceiling → say nothing" rule stamped
-/// no cause at all, while their viewers saw a red "3840x2160 → 2560x1440 ↓44%"
-/// downscale badge with nothing to explain it. That is a real, nameable
-/// constraint and it must be named.
-///
-/// The reference point for "is anything being withheld?" is therefore the
-/// SOURCE-only rung ([`resolve_initial_screen_tier`] with no network floor), and
-/// this function says which of the OTHER terms pushed the ceiling above it.
-///
-/// Precedence when several terms bind: the single-stream cap only wins when it
-/// is strictly tighter than the device term, because on a low-core machine the
-/// device class is the ROOT cause and "your CPU" is the more actionable thing to
-/// tell the user than "you are publishing one rung" (which is itself a
-/// consequence of the core count).
-pub fn screen_ceiling_cause(
-    src_w: u32,
-    src_h: u32,
-    cores: u32,
-    effective_layers: u32,
-) -> &'static str {
-    let source = resolve_initial_screen_tier(src_w, src_h, 0);
-    let device = screen_tier_device_floor(cores);
-    let single = if effective_layers <= 1 {
-        screen_tier_single_stream_floor(cores)
-    } else {
-        0
-    };
-    // Terms that apply to EVERY share, layered outward. A term is named only
-    // when removing it would actually raise the ceiling — otherwise we would
-    // blame the user's CPU for a cap the product ladder imposes anyway.
-    let always = source.max(screen_ladder_top_index());
-    let with_device = always.max(device);
-    let ceiling = with_device.max(single);
-    if ceiling <= source {
-        ""
-    } else if single > with_device {
-        SCREEN_CAUSE_SINGLE_STREAM
-    } else if device > always {
-        SCREEN_CAUSE_CPU
-    } else {
-        SCREEN_CAUSE_LADDER
-    }
-}
-
-/// The PERSISTENT quality ceiling for a screen share: the BEST (lowest)
-/// [`SCREEN_QUALITY_TIERS`] index this share may ever reach, for its whole life.
-///
-/// Composes three independent terms, most restrictive (highest index) wins:
-/// 1. **Source** — [`resolve_initial_screen_tier`] with no network floor, i.e.
-///    the cheapest rung that still costs the source zero resolution (pulled up
-///    to `high` so a small window is never billed WORSE than the pre-#2179
-///    start).
-/// 2. **Device** — [`screen_tier_device_floor`].
-/// 3. **Stream count** — [`screen_tier_single_stream_floor`], applied only when
-///    `effective_layers <= 1`.
-/// 4. **Publish ladder** — [`screen_ladder_top_index`], on every path.
-///
-/// [`screen_ceiling_cause`] reports WHICH of terms 2–4 raised the result above
-/// term 1, which is what the publisher stamps as its Cause hint.
-///
-/// # Consequence: the `native` rung is UNREACHABLE as an ENCODE tier
-/// Term 4 caps every path at the ladder's top (`1440p`), so this function can
-/// never return `0`. That is deliberate: the `native` rung's remaining job is to
-/// donate the CAPTURE ceiling (`SCREEN_QUALITY_TIERS[0]`'s dims are what
-/// `getDisplayMedia` requests as `max`), so a 4K surface still arrives at 4K and
-/// is downscaled ONCE, by the compositor, into the encode rung — rather than
-/// being pre-shrunk at capture and then re-fitted. Nothing encodes at 2160p.
-/// Any doc or test claiming a 2160p ENCODE is wrong.
-///
-/// The result is a FLOOR on the index, so the AQ PID may still step DOWN from
-/// it freely under congestion; it can simply never climb past it. It is
-/// composed with (never substituted for) the user's own `best`/`worst` bounds.
-///
-/// The screen encoder publishes this value to the UI as
-/// `ScreenQualitySnapshot::best_source_tier_index`, where "live tier index
-/// equals it" means "as good as this share can get" and "live index greater
-/// than it" means "genuinely constrained below what the source needs".
-pub fn resolve_screen_tier_ceiling(
-    src_w: u32,
-    src_h: u32,
-    cores: u32,
-    effective_layers: u32,
-) -> usize {
-    let mut floor = resolve_initial_screen_tier(src_w, src_h, 0)
-        .max(screen_tier_device_floor(cores))
-        // Issue #2179 review r3 (security): no path may reach a rung better than
-        // the publish ladder's own top — see `screen_ladder_top_index`.
-        .max(screen_ladder_top_index());
-    if effective_layers <= 1 {
-        floor = floor.max(screen_tier_single_stream_floor(cores));
-    }
-    floor.min(SCREEN_QUALITY_TIERS.len().saturating_sub(1))
-}
 
 // ---------------------------------------------------------------------------
 // Reconnection
@@ -3624,46 +2677,12 @@ mod tests {
     }
 
     #[test]
-    fn reduced_ladder_exact_values_through_the_resolver() {
-        // Issue #1768: pin the REDUCED ladder through the PRODUCTION resolver
-        // (`simulcast_layers_for`), so changing a rung — or wiring the variant to
-        // the wrong source table — FAILS here. Values are (w, h, fps, ideal_kbps).
-        let l = simulcast_layers_for(3, LadderVariant::Reduced);
-        let got: Vec<(u32, u32, u32, u32)> = l
-            .iter()
-            .map(|t| {
-                (
-                    t.max_width,
-                    t.max_height,
-                    t.target_fps,
-                    t.ideal_bitrate_kbps,
-                )
-            })
-            .collect();
-        assert_eq!(
-            got,
-            vec![(320, 180, 7, 120), (640, 360, 15, 350), (960, 540, 30, 900),],
-            "reduced camera ladder must be 180p/360p/540p with the 540p band"
-        );
-        // Keyframe intervals track ~5s wall-clock at each rung's fps (unchanged
-        // fps ⇒ unchanged intervals; the top rung stays 30fps at 540p).
-        assert_eq!(l[0].keyframe_interval_frames, 35); // 5s × 7fps
-        assert_eq!(l[1].keyframe_interval_frames, 75); // 5s × 15fps
-        assert_eq!(l[2].keyframe_interval_frames, 150); // 5s × 30fps
-                                                        // The min/max band comes from VIDEO_QUALITY_TIERS' 540p rung, not invented.
-        assert_eq!((l[2].min_bitrate_kbps, l[2].max_bitrate_kbps), (500, 1500));
-    }
-
-    #[test]
-    fn default_variant_is_byte_identical_to_the_plain_resolver() {
-        // The gate must be INERT when off. NOTE the assertion shape: comparing
-        // `simulcast_layers(n)` against `simulcast_layers_for(n, Default)` would be a
-        // TAUTOLOGY — the former is *defined* as the latter, so both sides move
-        // together under any mutation and the comparison can never fail. (An earlier
-        // revision of this test did exactly that, and claimed mutation power it did
-        // not have.) So resolve against `SIMULCAST_VIDEO_LAYERS` — the independent
-        // source of truth — via `spaced_ladder_positions`, which is what actually
-        // fails if the Default arm is pointed at the reduced table.
+    fn simulcast_layers_resolves_rungs_from_the_shipped_table() {
+        // Resolve against `SIMULCAST_VIDEO_LAYERS` — the independent source of truth
+        // — via `spaced_ladder_positions`, so a resolver pointed at any other table
+        // fails here. Asserting `simulcast_layers(n)` against itself, or against a
+        // second resolver defined as it, would be a TAUTOLOGY that no mutation can
+        // break (an earlier revision of this test did exactly that).
         for n in 1..=SIMULCAST_MAX_LAYERS {
             let resolved = simulcast_layers(n);
             let expected_positions = spaced_ladder_positions(n, SIMULCAST_VIDEO_LAYERS.len());
@@ -3689,153 +2708,54 @@ mod tests {
                         src.target_fps,
                         src.ideal_bitrate_kbps
                     ),
-                    "flag-off must resolve rungs from SIMULCAST_VIDEO_LAYERS at n={n}"
+                    "rungs must resolve from SIMULCAST_VIDEO_LAYERS at n={n}"
                 );
             }
         }
-        // And the DEFAULT top rung must still be 720p — i.e. the gate did not
-        // quietly re-cut the shipped ladder while adding the variant.
         let top = simulcast_layers(3).last().expect("3-rung ladder");
         assert_eq!(
             (top.max_width, top.max_height),
             (1280, 720),
-            "flag-off must still publish the 720p top rung"
+            "the shipped camera ladder publishes a 720p top rung"
         );
     }
 
-    #[test]
-    fn reduced_ladder_n2_keeps_the_middle_skip_but_shrinks_the_cliff() {
-        // With `spaced_ladder_positions` anchoring base+top, n=2 skips the interior
-        // on BOTH ladders; what changes is the SIZE of the resulting gap. NOTE the
-        // units: the pixel-AREA ratio is 16x -> 9x, while 68.6x -> 38.6x is
-        // THROUGHPUT (Mpx/s, folding in 30 vs 7 fps) — the "69x" quoted in the #2143
-        // analysis is the latter. Both are asserted below.
-        //
-        // This narrows what a top-rung receiver PAYS (540p instead of 720p); it does
-        // NOT change which rung the #1256 lid selects — `size_cap_layer` never
-        // consults the top rung's height (proved exhaustively by
-        // `size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung`).
-        let d = simulcast_layers_for(2, LadderVariant::Default);
-        let r = simulcast_layers_for(2, LadderVariant::Reduced);
-        assert_eq!(d.len(), 2, "n=2 must yield exactly 2 rungs");
-        assert_eq!(r.len(), 2, "n=2 must yield exactly 2 rungs");
-        // Same base on both.
-        assert_eq!((d[0].max_width, d[0].max_height), (320, 180));
-        assert_eq!((r[0].max_width, r[0].max_height), (320, 180));
-        // Different tops: 720p vs 540p.
-        assert_eq!((d[1].max_width, d[1].max_height), (1280, 720));
-        assert_eq!((r[1].max_width, r[1].max_height), (960, 540));
-        // Cliff-size claims, checked rather than asserted in prose. NOTE the two
-        // ratios are different numbers and are routinely confused: the widely
-        // quoted "69x" for `[180p, 720p]` is the DECODE/ENCODE THROUGHPUT ratio
-        // (Mpx/s, which folds in fps 7 vs 30), while the PIXEL-AREA ratio is 16x.
-        // Both are pinned so neither figure can drift unnoticed.
-        let px = |t: &VideoQualityTier| (t.max_width as f64) * (t.max_height as f64);
-        let mpx = |t: &VideoQualityTier| px(t) * (t.target_fps as f64) / 1e6;
-
-        // Pixel area: 921_600/57_600 = 16.0x  vs  518_400/57_600 = 9.0x
-        let d_px_ratio = px(&d[1]) / px(&d[0]);
-        let r_px_ratio = px(&r[1]) / px(&r[0]);
-        assert!(
-            (d_px_ratio - 16.0).abs() < 0.1,
-            "default n=2 pixel-area cliff should be 16.0x, got {d_px_ratio:.1}x"
-        );
-        assert!(
-            (r_px_ratio - 9.0).abs() < 0.1,
-            "reduced n=2 pixel-area cliff should be 9.0x, got {r_px_ratio:.1}x"
-        );
-
-        // Throughput (the "69x" figure): 27.65/0.40 = 68.6x  vs  15.55/0.40 = 38.6x
-        let d_mpx_ratio = mpx(&d[1]) / mpx(&d[0]);
-        let r_mpx_ratio = mpx(&r[1]) / mpx(&r[0]);
-        assert!(
-            d_mpx_ratio > 60.0,
-            "default n=2 throughput cliff should be ~69x, got {d_mpx_ratio:.1}x"
-        );
-        assert!(
-            r_mpx_ratio < 45.0,
-            "reduced n=2 throughput cliff should be ~39x, got {r_mpx_ratio:.1}x"
-        );
-        assert!(
-            r_mpx_ratio < d_mpx_ratio * 0.6,
-            "reduced variant must materially shrink the n=2 throughput cliff"
-        );
-    }
-
-    #[test]
-    fn reduced_ladder_cuts_the_dominant_encode_cost() {
-        // The justification for touching the TOP rung rather than the floor: the
-        // top is ~88% of the 3-layer encode cost. Compute Mpx/s from the
-        // production tables so a future retune that moves the cost elsewhere (or
-        // that "reduces" the ladder without reducing cost) fails here.
-        let mpx = |t: &VideoQualityTier| {
-            (t.max_width as f64) * (t.max_height as f64) * (t.target_fps as f64) / 1e6
-        };
-        let d: f64 = simulcast_layers(3).iter().map(mpx).sum();
-        let r: f64 = simulcast_layers_for(3, LadderVariant::Reduced)
-            .iter()
-            .map(mpx)
-            .sum();
-        assert!(
-            r < d * 0.7,
-            "reduced ladder must cut total encode Mpx/s by >30% (default {d:.1}, reduced {r:.1})"
-        );
-        // And the top rung must still dominate its own ladder (it is the lever).
-        let top_share = mpx(simulcast_layers(3).last().unwrap()) / d;
-        assert!(
-            top_share > 0.8,
-            "default top rung should be >80% of encode cost, got {:.1}%",
-            top_share * 100.0
-        );
-    }
-
-    /// The RECEIVER-side saving, pinned to the tables the same way the publisher's
-    /// encode saving is (issue #1768).
+    /// Issue #2208: this file must keep exactly ONE camera ladder.
     ///
-    /// A receiver's cost is set by the rung it actually decodes, and the reduced
-    /// ladder's whole receiver-side benefit is that a peer forced to the TOP rung
-    /// decodes 540p instead of 720p. On the low-power devices this project targets
-    /// (no hardware VP8/VP9 decode) software decode is the binding constraint, so
-    /// this is the headline receiver result — and it was previously asserted in prose
-    /// with no number behind it.
+    /// A second table, plus the enum that threads it through the encoder, the AQ
+    /// controller, the display resolvers and every client-options construction
+    /// site, is the carrying cost #2208 removed — and while a re-added arm is
+    /// unreferenced NO behavioural assertion can see it, so this scans the source.
     ///
-    /// MUTATION: raise the reduced top rung back toward 720p (or drop its fps) and
-    /// the ratio assertion fails.
+    /// Both needles are ASSEMBLED AT RUNTIME so the test cannot match its own
+    /// source text; inlining either literal makes it match itself.
     #[test]
-    fn reduced_ladder_cuts_top_rung_decode_cost() {
-        let px = |t: &VideoQualityTier| (t.max_width as f64) * (t.max_height as f64);
-        let mpx = |t: &VideoQualityTier| px(t) * (t.target_fps as f64) / 1e6;
+    fn no_second_camera_ladder_survives_the_1768_backout() {
+        let src = include_str!("constants.rs");
 
-        let d_top = simulcast_layers(3).last().expect("default top rung");
-        let r_top = simulcast_layers_for(3, LadderVariant::Reduced)
+        let sibling_table = format!("SIMULCAST_VIDEO_LAYERS{}", "_REDUCED");
+        assert!(
+            !src.contains(&sibling_table),
+            "{sibling_table} is back — SIMULCAST_VIDEO_LAYERS must stay the only \
+             camera ladder (issue #2208)"
+        );
+
+        let variant_enum = format!("Ladder{}", "Variant");
+        assert!(
+            !src.contains(&variant_enum),
+            "{variant_enum} is back — a rung is a bounding box fitted to the native \
+             capture, so a second ladder cannot change what a sub-rung camera encodes \
+             (issue #2208)"
+        );
+
+        // Tie the text scan to the runtime fact it stands for.
+        let top = simulcast_layers(SIMULCAST_MAX_LAYERS)
             .last()
-            .expect("reduced top rung");
-
-        // Per-frame decode work: 960x540 is 0.5625x the pixels of 1280x720, i.e.
-        // ~43.8% less. Allow a small band so a future retune to another sane 540p-ish
-        // geometry still passes, while a regression toward 720p fails.
-        let ratio = px(r_top) / px(d_top);
-        assert!(
-            ratio < 0.60,
-            "the reduced top rung must cut per-frame decode work by >40% (ratio {ratio:.4})"
-        );
-
-        // Sustained decode throughput at each rung's own fps.
-        assert!(
-            mpx(r_top) < mpx(d_top) * 0.60,
-            "reduced top rung decode throughput must be <60% of default (default \
-             {:.2} Mpx/s, reduced {:.2} Mpx/s)",
-            mpx(d_top),
-            mpx(r_top)
-        );
-
-        // Downlink for that rung falls too, which is the other half of the
-        // receiver-side win on a constrained link.
-        assert!(
-            r_top.ideal_bitrate_kbps < d_top.ideal_bitrate_kbps,
-            "the reduced top rung must also cost less downlink ({} vs {} kbps)",
-            r_top.ideal_bitrate_kbps,
-            d_top.ideal_bitrate_kbps
+            .expect("the camera ladder is non-empty");
+        assert_eq!(
+            (top.max_width, top.max_height),
+            (1280, 720),
+            "the one camera ladder tops out at 720p"
         );
     }
 
@@ -4105,122 +3025,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // SCREEN simulcast ladder + budget (issue #989, Phase 3)
     // -----------------------------------------------------------------
 
-    /// Pins the SCREEN simulcast rung selection (issue #989, retargeted by
-    /// #2179) against LITERAL labels AND LITERAL resolutions, so the ladder
-    /// cannot silently repoint when a tier is inserted into
-    /// `SCREEN_QUALITY_TIERS`.
-    ///
-    /// Mutation guards:
-    /// - reverting `simulcast_screen_layer_labels(3)` to the pre-#2179
-    ///   `[low, medium, high]` makes the `l3` label assert AND the 2560x1440
-    ///   resolution assert fail;
-    /// - dropping the label indirection back to hard-coded indices `[2,1,0]`
-    ///   (which now name `high`/`1440p`/`native`) fails every assert here.
+    /// MUTATION: restore a multi-rung ladder, or re-point the rung at a smaller tier.
     #[test]
-    fn test_simulcast_screen_layers_labels_and_ordering() {
-        // n=1 → [low]; n=2 → [low, high]; n=3 → [low, high, 1440p].
-        let l1 = simulcast_screen_layers(1);
-        assert_eq!(l1.len(), 1);
-        assert_eq!(l1[0].label, "low");
-        assert_eq!((l1[0].max_width, l1[0].max_height), (1280, 720));
+    fn screen_ladder_is_exactly_one_native_rung() {
+        assert_eq!(SCREEN_QUALITY_TIERS.len(), 1);
+        assert_eq!(SCREEN_SIMULCAST_MAX_LAYERS, 1);
+        assert_eq!(SCREEN_INITIAL_ACTIVE_LAYERS, 1);
 
-        let l2 = simulcast_screen_layers(2);
-        assert_eq!(l2.len(), 2);
-        assert_eq!([l2[0].label, l2[1].label], ["low", "high"]);
-        // The #1553 cold-start seed rides this ladder: base 720p/500 + top
-        // 1080p/2500. #2179 must not have changed it.
-        assert_eq!((l2[0].max_width, l2[0].max_height), (1280, 720));
-        assert_eq!((l2[1].max_width, l2[1].max_height), (1920, 1080));
+        let ladder = simulcast_screen_layers(1);
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(ladder[0].label, "native");
         assert_eq!(
-            l2[0].ideal_bitrate_kbps + l2[1].ideal_bitrate_kbps,
-            3000,
-            "the 2-rung seed's cost must stay at the pre-#2179 ≈3000 kbps"
+            (ladder[0].max_width, ladder[0].max_height),
+            (SCREEN_MAX_ENCODE_WIDTH, SCREEN_MAX_ENCODE_HEIGHT),
+            "the single rung's box must be the encode ceiling so a smaller \
+             capture is encoded at its own size"
         );
-
-        let l3 = simulcast_screen_layers(3);
-        assert_eq!(l3.len(), 3);
-        assert_eq!(
-            [l3[0].label, l3[1].label, l3[2].label],
-            ["low", "high", "1440p"]
-        );
-        // The top rung must actually be able to carry a DPR-2 Retina window
-        // (2496x1440) without downscaling it — the whole point of #2179.
-        assert_eq!((l3[2].max_width, l3[2].max_height), (2560, 1440));
-        // Prefix property: the 3-rung ladder is the 2-rung ladder plus one on
-        // top, so earning the third rung never re-points an already-published
-        // one. (The old [low, medium, high] moved layer 1 from high → medium.)
-        assert_eq!([l3[0].label, l3[1].label], [l2[0].label, l2[1].label]);
-        // Bitrate ideals must be non-decreasing lowest→highest.
-        assert!(l3[0].ideal_bitrate_kbps <= l3[1].ideal_bitrate_kbps);
-        assert!(l3[1].ideal_bitrate_kbps <= l3[2].ideal_bitrate_kbps);
-        // Resolutions must be strictly increasing lowest→highest, which the old
-        // ladder violated (low and medium were both 1280x720).
-        assert!(
-            (l3[0].max_width as u64 * l3[0].max_height as u64)
-                < (l3[1].max_width as u64 * l3[1].max_height as u64)
-        );
-        assert!(
-            (l3[1].max_width as u64 * l3[1].max_height as u64)
-                < (l3[2].max_width as u64 * l3[2].max_height as u64)
-        );
+        assert_eq!(simulcast_screen_layer_labels(1), &["native"]);
     }
 
-    /// The rungs the simulcast ladder names must all EXIST in
-    /// `SCREEN_QUALITY_TIERS`. `screen_tier_index_by_label` falls back to the
-    /// worst rung on a miss (deliberately conservative), so a typo'd or removed
-    /// label would otherwise degrade silently to a triple-`low` ladder instead
-    /// of failing.
+    /// MUTATION: restore the `n != 1` panic and every assertion here aborts.
     #[test]
-    fn simulcast_screen_layer_labels_all_resolve_to_real_tiers() {
-        for n in 1..=3 {
-            for label in simulcast_screen_layer_labels(n) {
-                assert!(
-                    SCREEN_QUALITY_TIERS.iter().any(|t| t.label == *label),
-                    "simulcast_screen_layer_labels({n}) names '{label}', which is \
-                     not a SCREEN_QUALITY_TIERS label"
-                );
-            }
+    fn simulcast_screen_layers_clamps_any_requested_depth() {
+        for n in [0usize, 1, 2, 3, 99] {
+            assert_eq!(simulcast_screen_layers(n).len(), 1);
+            assert_eq!(simulcast_screen_layers(n)[0].label, "native");
+            assert_eq!(simulcast_screen_layer_labels(n), &["native"]);
         }
     }
 
+    /// MUTATION: pin the budget to a tier constant, or drop the floor.
     #[test]
-    #[should_panic(expected = "n must be in")]
-    fn test_simulcast_screen_layers_rejects_zero() {
-        let _ = simulcast_screen_layers(0);
-    }
-
-    #[test]
-    fn test_screen_budget_caps_active_sum() {
-        // The budget cap is ladder-agnostic; verify it works over the SCREEN
-        // ladder. 3-layer ideals (#2179): low 500 + high 2500 + 1440p 5000 = 8000.
-        let tiers = simulcast_screen_layers(3);
-        let budget = uplink_budget_kbps(tiers, 3);
-        assert_eq!(budget, 8000.0);
-        // Push each layer to its max → sum exceeds budget → scaled down.
-        let mut targets = [
-            tiers[0].max_bitrate_kbps as f64,
-            tiers[1].max_bitrate_kbps as f64,
-            tiers[2].max_bitrate_kbps as f64,
-        ];
-        cap_layers_to_budget(&mut targets, tiers, 3, budget);
-        let sum: f64 = targets.iter().sum();
+    fn screen_bitrate_is_proportional_to_pixels() {
+        let small = screen_bitrate_kbps_for(1280, 720, SCREEN_TARGET_FPS);
+        let double = screen_bitrate_kbps_for(2560, 720, SCREEN_TARGET_FPS);
         assert!(
-            sum <= budget + 1e-6,
-            "screen active sum {sum} within {budget}"
+            double >= small * 2 && double <= small * 2 + 1,
+            "{double} must be twice {small}"
         );
-        for (i, &t) in targets.iter().enumerate() {
-            assert!(t >= tiers[i].min_bitrate_kbps as f64 - 1e-6, "floor held");
-        }
-    }
 
-    #[test]
-    fn test_screen_budget_shrinks_with_active_layers() {
-        let tiers = simulcast_screen_layers(3);
-        assert!(uplink_budget_kbps(tiers, 3) > uplink_budget_kbps(tiers, 2));
-        assert!(uplink_budget_kbps(tiers, 2) > uplink_budget_kbps(tiers, 1));
+        assert_eq!(screen_bitrate_kbps_for(1400, 700, SCREEN_TARGET_FPS), 1176);
+
+        assert_eq!(
+            screen_bitrate_kbps_for(160, 90, SCREEN_TARGET_FPS),
+            SCREEN_MIN_BITRATE_KBPS
+        );
+
+        assert_eq!(
+            SCREEN_QUALITY_TIERS[0].ideal_bitrate_kbps,
+            screen_bitrate_kbps_for(
+                SCREEN_MAX_ENCODE_WIDTH,
+                SCREEN_MAX_ENCODE_HEIGHT,
+                SCREEN_TARGET_FPS
+            )
+        );
     }
 
     #[test]
@@ -4436,641 +3296,16 @@ mod tests {
     }
 
     // =====================================================================
-    // initial_screen_tier decision function
     // =====================================================================
-
-    /// Resolve the expected constrained answers by LABEL, so this test asserts
-    /// "poor RTT ⇒ the 720p/5fps rung" rather than "poor RTT ⇒ index 2". If
-    /// `initial_screen_tier` regressed to the pre-#2179 hard-coded `1`/`2`, it
-    /// would return the `1440p`/`high` rungs and these asserts would fail.
-    fn medium_idx() -> usize {
-        screen_tier_index_by_label(SCREEN_TIER_LABEL_BASELINE)
-    }
-    fn low_idx() -> usize {
-        screen_tier_index_by_label(SCREEN_TIER_LABEL_FLOOR)
-    }
-
-    #[test]
-    fn initial_screen_tier_cold_start_imposes_no_floor() {
-        // No signals at all → no network-imposed floor; the source term decides.
-        assert_eq!(initial_screen_tier(None, None), 0);
-    }
-
-    #[test]
-    fn initial_screen_tier_good_rtt_good_camera_imposes_no_floor() {
-        // RTT well below FAIR threshold, camera not degraded → no floor.
-        assert_eq!(initial_screen_tier(Some(50.0), Some(1)), 0);
-        assert_eq!(initial_screen_tier(Some(RTT_GOOD_MS), Some(2)), 0);
-    }
-
-    #[test]
-    fn initial_screen_tier_fair_rtt_returns_medium() {
-        // RTT exactly at FAIR threshold → medium tier, regardless of camera.
-        assert_eq!(
-            initial_screen_tier(Some(RTT_FAIR_MS), Some(0)),
-            medium_idx()
-        );
-        assert_eq!(initial_screen_tier(Some(RTT_FAIR_MS), None), medium_idx());
-        // Above FAIR but below POOR → still medium.
-        assert_eq!(initial_screen_tier(Some(300.0), Some(1)), medium_idx());
-        // …and "medium" must still be the 720p/8fps rung it always was.
-        assert_eq!(
-            (
-                SCREEN_QUALITY_TIERS[medium_idx()].max_width,
-                SCREEN_QUALITY_TIERS[medium_idx()].max_height,
-                SCREEN_QUALITY_TIERS[medium_idx()].target_fps,
-            ),
-            (1280, 720, 8),
-            "a fair-RTT client must not be promoted above 720p/8fps by #2179"
-        );
-    }
-
-    #[test]
-    fn initial_screen_tier_poor_rtt_returns_low() {
-        // RTT at or above POOR threshold → low tier regardless of camera.
-        assert_eq!(initial_screen_tier(Some(RTT_POOR_MS), Some(0)), low_idx());
-        assert_eq!(initial_screen_tier(Some(RTT_POOR_MS), None), low_idx());
-        assert_eq!(initial_screen_tier(Some(1000.0), Some(2)), low_idx());
-        // …and "low" must still be the 720p/5fps/500kbps floor.
-        assert_eq!(
-            (
-                SCREEN_QUALITY_TIERS[low_idx()].max_width,
-                SCREEN_QUALITY_TIERS[low_idx()].max_height,
-                SCREEN_QUALITY_TIERS[low_idx()].target_fps,
-                SCREEN_QUALITY_TIERS[low_idx()].ideal_bitrate_kbps,
-            ),
-            (1280, 720, 5, 500),
-            "a poor-RTT client must not be promoted above 720p/5fps by #2179"
-        );
-        assert_eq!(
-            low_idx(),
-            SCREEN_QUALITY_TIERS.len() - 1,
-            "the poor-RTT answer must be the worst rung on the ladder"
-        );
-    }
-
-    #[test]
-    fn initial_screen_tier_degraded_camera_no_rtt_returns_medium() {
-        // Camera already at sd (3) or low (4) tier, RTT unknown → medium.
-        assert_eq!(initial_screen_tier(None, Some(3)), medium_idx());
-        assert_eq!(initial_screen_tier(None, Some(4)), medium_idx());
-    }
-
-    #[test]
-    fn initial_screen_tier_good_rtt_degraded_camera_returns_medium() {
-        // Good RTT but camera already degraded → conservative medium tier.
-        assert_eq!(initial_screen_tier(Some(50.0), Some(3)), medium_idx());
-        assert_eq!(
-            initial_screen_tier(Some(RTT_GOOD_MS), Some(4)),
-            medium_idx()
-        );
-    }
-
-    #[test]
-    fn initial_screen_tier_camera_only_not_degraded_imposes_no_floor() {
-        // Camera not degraded (tier ≤ 2), no RTT → no floor.
-        assert_eq!(initial_screen_tier(None, Some(0)), 0);
-        assert_eq!(initial_screen_tier(None, Some(2)), 0);
-    }
 
     // =====================================================================
     // Issue #2179: source-resolution-driven initial screen tier
     // =====================================================================
 
-    /// `DEFAULT_SCREEN_TIER_INDEX` must keep naming the `medium` rung after the
-    /// ladder was extended. The `const _: () = assert!(...)` next to the
-    /// constant already fails the BUILD on a drift, so this test additionally
-    /// pins the rung's actual numbers — a rename of the label alone (say
-    /// `medium` → `720p8`) would keep the const assert honest only if the
-    /// constant is updated in lockstep, and this catches a retune of the rung
-    /// itself.
-    #[test]
-    fn default_screen_tier_index_is_the_medium_720p_rung() {
-        let t = &SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX];
-        assert_eq!(t.label, SCREEN_TIER_LABEL_BASELINE);
-        assert_eq!((t.max_width, t.max_height, t.target_fps), (1280, 720, 8));
-    }
-
-    /// `screen_tier_for_source` must return the WORST rung that still contains
-    /// the source, i.e. the cheapest tier that costs the source ZERO
-    /// resolution. Every case below is a literal (source → rung label) pair, so
-    /// a mutation of the search direction (`.rev()` dropped → returns the best
-    /// rung instead of the worst) or of the containment test (`>=` → `>`)
-    /// changes at least one answer.
-    #[test]
-    fn screen_tier_for_source_picks_cheapest_rung_that_fits() {
-        let label_for = |w, h| SCREEN_QUALITY_TIERS[screen_tier_for_source(w, h)].label;
-
-        // The issue #2179 case: a DPR-2 Retina window (1248x720 CSS px).
-        // MUST NOT land on a 720p rung — that is the reported defect.
-        assert_eq!(label_for(2496, 1440), "1440p");
-        let idx = screen_tier_for_source(2496, 1440);
-        assert!(
-            SCREEN_QUALITY_TIERS[idx].max_width >= 2496
-                && SCREEN_QUALITY_TIERS[idx].max_height >= 1440,
-            "the chosen rung must contain the Retina source without downscaling"
-        );
-        assert_ne!(
-            (
-                SCREEN_QUALITY_TIERS[idx].max_width,
-                SCREEN_QUALITY_TIERS[idx].max_height
-            ),
-            (1280, 720),
-            "2496x1440 must never resolve to a 720p rung"
-        );
-
-        // Exactly equal to a rung cap → that rung (guards `>=` → `>`).
-        assert_eq!(label_for(2560, 1440), "1440p");
-        assert_eq!(label_for(1920, 1080), "high");
-        assert_eq!(label_for(3840, 2160), "native");
-
-        // One pixel over a rung cap → the next rung up (guards an off-by-one).
-        assert_eq!(label_for(2561, 1440), "native");
-        assert_eq!(label_for(2560, 1441), "native");
-        assert_eq!(label_for(1921, 1080), "1440p");
-
-        // 21:9 ultra-wide (the issue #1973 M3 Pro source): height fits every
-        // rung, width only fits `native`.
-        assert_eq!(label_for(3840, 1600), "native");
-
-        // Beyond the top rung (a 5K Retina panel) → clamp to the best rung; the
-        // downscale there is unavoidable.
-        assert_eq!(screen_tier_for_source(5120, 2880), 0);
-
-        // A small source picks the CHEAPEST containing rung, which for 720p is
-        // the ladder floor. (`resolve_initial_screen_tier` is what stops a
-        // share from actually STARTING there — see the test below.)
-        assert_eq!(label_for(1280, 720), "low");
-        assert_eq!(
-            screen_tier_for_source(1280, 720),
-            SCREEN_QUALITY_TIERS.len() - 1
-        );
-    }
-
-    /// Unknown source dimensions must fall back to the pre-#2179 baseline, not
-    /// to a fabricated rung.
-    /// Issue #2179 review: a PORTRAIT surface must select a rung by its LONG and
-    /// SHORT edges, not per-axis.
-    ///
-    /// Mutation guard: restore the per-axis compare
-    /// (`tier.max_width >= src_w && tier.max_height >= src_h`) and a 1440x2560
-    /// panel matches NO rung, falling through to index 0 (`native`) — a 720p-class
-    /// stream billed at 8000 kbps. Both assertions below fail.
-    #[test]
-    fn screen_tier_for_source_is_orientation_agnostic() {
-        let label_for = |w, h| SCREEN_QUALITY_TIERS[screen_tier_for_source(w, h)].label;
-
-        // A rotated 1440p panel is the `1440p` rung's box with the axes swapped.
-        assert_eq!(label_for(1440, 2560), "1440p");
-        // …and it must pick the SAME rung as its landscape twin.
-        assert_eq!(
-            screen_tier_for_source(1440, 2560),
-            screen_tier_for_source(2560, 1440)
-        );
-
-        // Portrait 1080p / 720p likewise.
-        assert_eq!(label_for(1080, 1920), "high");
-        assert_eq!(label_for(720, 1280), "low");
-
-        // A portrait surface larger than the top rung on its long edge still
-        // returns the top rung (index 0) — that box genuinely binds.
-        assert_eq!(screen_tier_for_source(2160, 4320), 0);
-    }
-
-    #[test]
-    fn screen_tier_for_source_unknown_dims_fall_back_to_default() {
-        assert_eq!(screen_tier_for_source(0, 0), DEFAULT_SCREEN_TIER_INDEX);
-        assert_eq!(screen_tier_for_source(1920, 0), DEFAULT_SCREEN_TIER_INDEX);
-        assert_eq!(screen_tier_for_source(0, 1080), DEFAULT_SCREEN_TIER_INDEX);
-    }
-
-    /// `resolve_initial_screen_tier` composes the source term with the network
-    /// floor. Each assertion below breaks under a specific mutation:
-    /// - dropping `min(..., index_of("high"))` starts a 720p share on the `low`
-    ///   rung (a bitrate/fps regression) — caught by the 1280x720 case;
-    /// - dropping `max(..., network_tier)` lets a poor-RTT client start at the
-    ///   source resolution — caught by the constrained-network cases;
-    /// - dropping the source term entirely pins everything at `high` — caught by
-    ///   the Retina and 4K cases;
-    /// - swapping `min`/`max` breaks all of them.
-    #[test]
-    fn resolve_initial_screen_tier_composes_source_and_network() {
-        let label_at = |idx: usize| SCREEN_QUALITY_TIERS[idx].label;
-        let medium = medium_idx();
-        let low = low_idx();
-
-        // Healthy network (no floor) + Retina source → the source's own rung.
-        assert_eq!(
-            label_at(resolve_initial_screen_tier(2496, 1440, 0)),
-            "1440p",
-            "a healthy link sharing a Retina window must start at its own resolution"
-        );
-        // Healthy network + 4K panel / 21:9 ultra-wide → the native rung.
-        assert_eq!(
-            label_at(resolve_initial_screen_tier(3840, 2160, 0)),
-            "native"
-        );
-        assert_eq!(
-            label_at(resolve_initial_screen_tier(3840, 1600, 0)),
-            "native"
-        );
-        // Healthy network + 1080p source → the 1080p rung (no downscale).
-        assert_eq!(label_at(resolve_initial_screen_tier(1920, 1080, 0)), "high");
-
-        // Healthy network + SMALL source → clamped UP to the 1080p rung, which
-        // is exactly the pre-#2179 answer: the encoder still emits 1280x720 (the
-        // fit never upscales) but with `high`'s 2500 kbps / 10 fps budget rather
-        // than the `low` rung's 500 kbps / 5 fps.
-        assert_eq!(label_at(resolve_initial_screen_tier(1280, 720, 0)), "high");
-        assert_eq!(label_at(resolve_initial_screen_tier(800, 600, 0)), "high");
-
-        // Constrained network vetoes the source term — a 4K sharer on a poor
-        // link still starts at `low`, exactly as before #2179.
-        assert_eq!(resolve_initial_screen_tier(3840, 2160, low), low);
-        assert_eq!(resolve_initial_screen_tier(2496, 1440, medium), medium);
-        assert_eq!(resolve_initial_screen_tier(1280, 720, low), low);
-
-        // Unknown source dims → the pre-#2179 optimistic answer (`high`), NOT a
-        // fabricated rung and not the conservative floor.
-        assert_eq!(label_at(resolve_initial_screen_tier(0, 0, 0)), "high");
-        assert_eq!(label_at(resolve_initial_screen_tier(1920, 0, 0)), "high");
-        assert_eq!(resolve_initial_screen_tier(0, 0, low), low);
-
-        // Result is always a valid index, even for a nonsense network floor.
-        assert_eq!(
-            resolve_initial_screen_tier(2496, 1440, 999),
-            SCREEN_QUALITY_TIERS.len() - 1
-        );
-    }
-
-    /// THE ISSUE-REPORTER CASE (issue #2179, review round 2).
-    ///
-    /// A DPR-2 Retina laptop shares a 1248x720 CSS window = 2496x1440 real
-    /// pixels. Apple-Silicon M-series report 8–12 logical cores, so an 8-core
-    /// machine is the modal reporter. It MUST reach the `1440p` rung — anything
-    /// less re-introduces the double-downscale (2496x1440 → 1920x1080 → 1280x720)
-    /// that is the entire bug.
-    ///
-    /// Mutation guard: gate `1440p` behind `SCREEN_TIER_NATIVE_MIN_CORES` again
-    /// (the first cut's calibration, which tied the tier ceiling to the 3-LAYER
-    /// bar) and this resolves to `high` — i.e. the fix silently misses its own
-    /// bug report on most consumer hardware.
-    #[test]
-    fn retina_laptop_reaches_the_1440p_rung_on_consumer_core_counts() {
-        let label_at = |i: usize| SCREEN_QUALITY_TIERS[i].label;
-        for cores in [SCREEN_TIER_1440P_MIN_CORES, 7, 8, 9] {
-            assert_eq!(
-                label_at(resolve_screen_tier_ceiling(2496, 1440, cores, 3)),
-                "1440p",
-                "a {cores}-core Retina sender must reach the 1440p rung"
-            );
-        }
-        // One core below the bar it is still held at 1080p.
-        assert_eq!(
-            label_at(resolve_screen_tier_ceiling(
-                2496,
-                1440,
-                SCREEN_TIER_1440P_MIN_CORES - 1,
-                3
-            )),
-            "high"
-        );
-    }
-
-    /// The TIER ceiling bars must not be silently re-derived from the LAYER
-    /// bars: they are separate calibrations that happen to share numbers today.
-    /// This pins the CURRENT mapping so a retune of either is a deliberate edit.
-    #[test]
-    fn tier_ceiling_bars_are_calibrated_per_pixel_rate_not_per_layer_count() {
-        assert_eq!(screen_tier_device_floor(SCREEN_TIER_NATIVE_MIN_CORES), 0);
-        assert_eq!(
-            SCREEN_QUALITY_TIERS[screen_tier_device_floor(SCREEN_TIER_1440P_MIN_CORES)].label,
-            "1440p"
-        );
-        assert_eq!(
-            SCREEN_QUALITY_TIERS[screen_tier_device_floor(SCREEN_TIER_1440P_MIN_CORES - 1)].label,
-            "high"
-        );
-        assert_eq!(
-            SCREEN_QUALITY_TIERS[screen_tier_device_floor(0)].label,
-            "high"
-        );
-        // Monotone in cores: more CPU may never mean a WORSE ceiling.
-        let mut prev = usize::MAX;
-        for cores in 0..24u32 {
-            let f = screen_tier_device_floor(cores);
-            assert!(
-                f <= prev,
-                "device floor must be monotone non-increasing in cores"
-            );
-            prev = f;
-        }
-    }
-
-    /// Issue #2179 review r2/r3: the Cause hint must name the term that is
-    /// UNIQUELY responsible for holding a share below the rung its own source
-    /// needs — silence is only honest when nothing is being withheld, and
-    /// naming a term that would not change the outcome is worse than silence.
-    ///
-    /// Mutation guards:
-    /// - return `""` unconditionally and every non-empty assertion fails
-    ///   (the false-negative the review round exists to fix);
-    /// - drop the `device > always` arm and the 4-core case reports
-    ///   `ladder-limited`, hiding a real CPU cap one rung worse;
-    /// - compare `device > source` instead of `device > always` and the
-    ///   8-core case blames the CPU for a ladder cap it cannot lift.
-    #[test]
-    fn screen_ceiling_cause_reports_the_uniquely_responsible_term() {
-        // A 4K source wants `native`, which NO path publishes — the ladder tops
-        // out at `1440p`. That is the binding term on a capable machine…
-        assert_eq!(
-            screen_ceiling_cause(3840, 2160, SCREEN_TIER_NATIVE_MIN_CORES, 3),
-            SCREEN_CAUSE_LADDER
-        );
-        // …and it stays the binding term on an 8-core machine, because the
-        // device class caps at the SAME rung the ladder already does. Blaming
-        // the CPU here would send the user optimising something that cannot
-        // help them.
-        assert_eq!(screen_ceiling_cause(3840, 2160, 8, 3), SCREEN_CAUSE_LADDER);
-        // Drop below the 1440p tier bar and the DEVICE really is the binding
-        // term: it caps at `high`, one rung worse than the ladder would.
-        assert_eq!(screen_ceiling_cause(3840, 2160, 4, 3), SCREEN_CAUSE_CPU);
-        assert_eq!(screen_ceiling_cause(3840, 2160, 2, 1), SCREEN_CAUSE_CPU);
-
-        // A source at the rung its own pixels need withholds nothing, whatever
-        // the machine or the stream count.
-        assert_eq!(screen_ceiling_cause(2496, 1440, 8, 3), "");
-        assert_eq!(screen_ceiling_cause(1920, 1080, 2, 1), "");
-        assert_eq!(
-            screen_ceiling_cause(1920, 1080, SCREEN_TIER_NATIVE_MIN_CORES, 3),
-            ""
-        );
-        assert_eq!(screen_ceiling_cause(1280, 720, 4, 1), "");
-        // Unknown source dims never manufacture a cause.
-        assert_eq!(screen_ceiling_cause(0, 0, 0, 1), "");
-
-        // ── The SINGLE-STREAM term is currently SUBSUMED ────────────────────
-        // Its cap and the ladder cap are both `1440p` today, so it never binds
-        // alone and `SCREEN_CAUSE_SINGLE_STREAM` is unreachable. Pinned as an
-        // EQUALITY rather than deleted: if the publish ladder ever gains a rung
-        // above `1440p`, this assertion flips and whoever raised it learns that
-        // the single-stream path starts binding again.
-        assert_eq!(
-            screen_tier_single_stream_floor(SCREEN_TIER_NATIVE_MIN_CORES),
-            screen_ladder_top_index(),
-            "single-stream cap and ladder cap coincide today — if this fails, \
-             SCREEN_CAUSE_SINGLE_STREAM has become reachable and needs coverage"
-        );
-        assert_eq!(
-            screen_ceiling_cause(3840, 2160, SCREEN_TIER_NATIVE_MIN_CORES, 1),
-            SCREEN_CAUSE_LADDER,
-            "while the two caps coincide the LADDER is the honest explanation"
-        );
-    }
-
-    /// Issue #2179 review r3 (security): no path may encode better than the
-    /// publish ladder's own top rung, because the simulcast BASE rung takes its
-    /// geometry from the AQ tier while its budget comes from ladder rung 0 —
-    /// a tier above the ladder made the base rung encode 3840x2160 at 500 kbps,
-    /// and the base rung is exactly what a struggling receiver falls back to.
-    ///
-    /// Mutation guard: drop the `screen_ladder_top_index()` term from
-    /// `resolve_screen_tier_ceiling` and the 4K/capable/simulcast case resolves
-    /// to index 0 (`native`), failing here.
-    #[test]
-    fn no_path_reaches_a_rung_better_than_the_publish_ladder_top() {
-        let top = screen_ladder_top_index();
-        assert_eq!(
-            SCREEN_QUALITY_TIERS[top].label, "1440p",
-            "the ladder's top rung is what bounds every encode path"
-        );
-
-        for &(w, h) in &[(3840u32, 2160u32), (5120, 2880), (2496, 1440), (1920, 1080)] {
-            for cores in [0u32, 4, 6, 8, 10, 16, 64] {
-                for layers in [1u32, 2, 3] {
-                    let ceiling = resolve_screen_tier_ceiling(w, h, cores, layers);
-                    assert!(
-                        ceiling >= top,
-                        "{w}x{h} cores={cores} layers={layers} resolved to {ceiling}, \
-                         better than the ladder top {top}"
-                    );
-                }
-            }
-        }
-
-        // Stated plainly: the `native` rung is unreachable as an ENCODE tier.
-        // It survives only as the CAPTURE-ceiling donor, which is why it is
-        // still index 0 of the table.
-        assert_eq!(
-            SCREEN_QUALITY_TIERS[0].label, "native",
-            "rung 0 still donates the getDisplayMedia capture ceiling"
-        );
-        assert!(
-            resolve_screen_tier_ceiling(3840, 2160, 64, 3) > 0,
-            "no configuration may reach the native rung as an encode tier"
-        );
-    }
-
-    /// Whenever [`screen_ceiling_cause`] is silent the ceiling must equal the
-    /// source-only rung, and whenever it speaks the ceiling must be strictly
-    /// worse. The two functions are read together at every stamp site, so they
-    /// must never disagree.
-    #[test]
-    fn screen_ceiling_cause_agrees_with_resolve_screen_tier_ceiling() {
-        for &(w, h) in &[
-            (1280u32, 720u32),
-            (1920, 1080),
-            (2496, 1440),
-            (3840, 2160),
-            (0, 0),
-        ] {
-            for cores in [0u32, 2, 4, 6, 8, 10, 16] {
-                for layers in [1u32, 2, 3] {
-                    let source = resolve_initial_screen_tier(w, h, 0);
-                    let ceiling = resolve_screen_tier_ceiling(w, h, cores, layers);
-                    let cause = screen_ceiling_cause(w, h, cores, layers);
-                    if cause.is_empty() {
-                        assert_eq!(
-                            ceiling, source,
-                            "silent cause but ceiling {ceiling} != source {source} \
-                             for {w}x{h} cores={cores} layers={layers}"
-                        );
-                    } else {
-                        assert!(
-                            ceiling > source,
-                            "cause '{cause}' but ceiling {ceiling} is not worse than \
-                             source {source} for {w}x{h} cores={cores} layers={layers}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Issue #2179 review: the PERSISTENT ceiling composes the source term with
-    /// the device class and the single-stream cap, most restrictive wins.
-    ///
-    /// Mutation guards, per assertion:
-    /// - drop the `screen_tier_device_floor` term → the sub-bar 4K case reads
-    ///   `1440p` instead of `high` on a sub-bar sender;
-    /// - drop the `effective_layers <= 1` term → the single-stream 4K case reads
-    ///   `native` instead of `1440p`;
-    /// - drop the source term → the 720p case reads `native` instead of `high`.
-    #[test]
-    fn resolve_screen_tier_ceiling_composes_source_device_and_stream_count() {
-        let label_at = |i: usize| SCREEN_QUALITY_TIERS[i].label;
-        let capable = SCREEN_TIER_NATIVE_MIN_CORES; // whole-ladder-class sender
-        let weak = SCREEN_TIER_1440P_MIN_CORES - 1; // below the 1440p tier bar
-
-        // Capable device, 3 rungs, 4K source: the LADDER top, not `native` —
-        // no encode path reaches rung 0 (issue #2179 review r3).
-        assert_eq!(
-            label_at(resolve_screen_tier_ceiling(3840, 2160, capable, 3)),
-            "1440p"
-        );
-        // Same source one core BELOW the native bar: also `1440p` — and NOT
-        // `high`, which is what tying the tier ceiling to the 3-layer bar used
-        // to produce.
-        assert_eq!(
-            label_at(resolve_screen_tier_ceiling(3840, 2160, capable - 1, 3)),
-            "1440p"
-        );
-        // Below the 1440p tier bar it drops to `high`.
-        assert_eq!(
-            label_at(resolve_screen_tier_ceiling(3840, 2160, weak, 3)),
-            "high"
-        );
-        // Capable device but SINGLE-STREAM: also `1440p`. Its own cap and the
-        // ladder cap coincide today, so this asserts the RESULT rather than
-        // which term produced it — see
-        // `screen_ceiling_cause_reports_the_uniquely_responsible_term`.
-        assert_eq!(
-            label_at(resolve_screen_tier_ceiling(3840, 2160, capable, 1)),
-            "1440p"
-        );
-        // Below the 1440p tier bar AND single-stream: `high`.
-        assert_eq!(
-            label_at(resolve_screen_tier_ceiling(3840, 2160, weak, 1)),
-            "high"
-        );
-        // A small source is capped by its OWN size even on the best hardware —
-        // this is the "720p share may not climb to the 8000 kbps rung" rule.
-        assert_eq!(
-            label_at(resolve_screen_tier_ceiling(1280, 720, capable, 3)),
-            "high"
-        );
-        // A 1440p Retina window on a capable 3-rung sender reaches `1440p`.
-        assert_eq!(
-            label_at(resolve_screen_tier_ceiling(2496, 1440, capable, 3)),
-            "1440p"
-        );
-        // Unknown cores (navigator.hardwareConcurrency absent) is the most
-        // conservative class, exactly like the UI capability sniff.
-        assert_eq!(
-            label_at(resolve_screen_tier_ceiling(3840, 2160, 0, 3)),
-            "high"
-        );
-        // Never out of bounds.
-        assert!(resolve_screen_tier_ceiling(1, 1, 0, 1) < SCREEN_QUALITY_TIERS.len());
-    }
-
-    /// The ceiling is a FLOOR on the index, so it can never be BETTER than what
-    /// the source alone would have allowed — i.e. it only ever adds restriction.
-    #[test]
-    fn resolve_screen_tier_ceiling_never_loosens_the_source_term() {
-        for &(w, h) in &[
-            (1280u32, 720u32),
-            (1920, 1080),
-            (2496, 1440),
-            (3840, 2160),
-            (0, 0),
-        ] {
-            for cores in [0u32, 4, 6, 8, 10, 16] {
-                for layers in [1u32, 2, 3] {
-                    let source_only = resolve_initial_screen_tier(w, h, 0);
-                    assert!(
-                        resolve_screen_tier_ceiling(w, h, cores, layers) >= source_only,
-                        "ceiling loosened the source term for {w}x{h} cores={cores} layers={layers}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The composed start must NEVER be better than what the pure network
-    /// signals allow, and NEVER worse than the pre-#2179 start. Together these
-    /// are the "do not regress anyone" contract, checked across the whole ladder
-    /// for a range of real sources.
-    ///
-    /// The pre-#2179 start was `initial_screen_tier`'s answer mapped onto the
-    /// old 3-rung table: `0 → high`, `1 → medium`, `2 → low`. Because the
-    /// constrained answers are now label-resolved to those same rungs, the
-    /// pre-#2179 start is simply `max(network_floor, index_of("high"))`.
-    #[test]
-    fn resolve_initial_screen_tier_brackets_the_pre_2179_start() {
-        let sources = [
-            (1280u32, 720u32),
-            (1920, 1080),
-            (2496, 1440),
-            (2560, 1440),
-            (3840, 1600),
-            (3840, 2160),
-            (5120, 2880),
-            (0, 0),
-        ];
-        let high = screen_tier_index_by_label(SCREEN_TIER_LABEL_1080P);
-        for floor in 0..SCREEN_QUALITY_TIERS.len() {
-            let pre_2179 = floor.max(high);
-            for (w, h) in sources {
-                let resolved = resolve_initial_screen_tier(w, h, floor);
-                assert!(
-                    resolved >= floor,
-                    "{w}x{h} with network floor {floor} resolved to {resolved}, \
-                     which is a BETTER tier than the network allows"
-                );
-                assert!(
-                    resolved <= pre_2179,
-                    "{w}x{h} with network floor {floor} resolved to {resolved}, \
-                     which is WORSE than the pre-#2179 start ({pre_2179})"
-                );
-                assert!(resolved < SCREEN_QUALITY_TIERS.len());
-            }
-        }
-    }
-
-    #[test]
-    fn initial_screen_tier_result_always_in_bounds() {
-        // Whatever inputs are given, result must be a valid SCREEN_QUALITY_TIERS index.
-        let cases = [
-            (None, None),
-            (Some(0.0), None),
-            (Some(RTT_FAIR_MS), Some(0)),
-            (Some(RTT_POOR_MS), Some(4)),
-            (Some(9999.0), Some(99)),
-        ];
-        for (rtt, cam) in cases {
-            let idx = initial_screen_tier(rtt, cam);
-            assert!(
-                idx < SCREEN_QUALITY_TIERS.len(),
-                "initial_screen_tier({:?}, {:?}) = {} is out of bounds (len={})",
-                rtt,
-                cam,
-                idx,
-                SCREEN_QUALITY_TIERS.len(),
-            );
-        }
-    }
-
     // =====================================================================
     // Issue #1531: tier- and transport-aware camera periodic-keyframe ceiling
     // =====================================================================
 
-    /// Pins the per-tier selection over WebTransport (the lossy, primary path):
-    /// full_hd … low keep the flat 5s #1510 guarantee, and ONLY the two lowest
-    /// tiers relax (very_low → 7s, minimal → 8s). Calls the production
-    /// [`camera_periodic_keyframe_max_interval_ms`] so a mutation to the selection
-    /// (flattening a relaxed tier back to the base, or relaxing a tier that must
-    /// stay at 5s) fails here.
     #[test]
     fn camera_keyframe_ceiling_wt_relaxes_only_two_lowest_tiers() {
         let n = VIDEO_QUALITY_TIERS.len();
@@ -5082,17 +3317,15 @@ mod tests {
                 "tier {idx} over WebTransport must keep the flat #1510 5s ceiling"
             );
         }
-        // very_low (n-2) relaxes to 7s.
         assert_eq!(
             camera_periodic_keyframe_max_interval_ms(n - 2, false),
             PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS,
-            "very_low over WebTransport must relax to the 7s ceiling"
+            "very_low over WebTransport must relax to the very_low ceiling"
         );
-        // minimal (n-1) relaxes to 8s.
         assert_eq!(
             camera_periodic_keyframe_max_interval_ms(n - 1, false),
             PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS,
-            "minimal over WebTransport must relax to the 8s ceiling"
+            "minimal over WebTransport must relax to the minimal ceiling"
         );
         // Out-of-range (defensive: a clamp bug upstream) saturates to the lowest
         // tier's relaxed value, never a tighter one.
@@ -5103,18 +3336,11 @@ mod tests {
         );
     }
 
-    /// Pins the TRANSPORT axis: on a lossless (WS) transport the insurance-only
-    /// relief extends one tier higher — the `low` tier (n-3) relaxes to 7s where
-    /// over WebTransport it stays at the flat 5s. The very_low/minimal values are
-    /// transport-independent. This is the mutation guard for the
-    /// `lossless_transport && tier_index == low` arm: deleting it collapses the
-    /// `low`-tier WS value back to 5s and fails the first assertion.
     #[test]
     fn camera_keyframe_ceiling_lossless_transport_extends_relief_band() {
         let n = VIDEO_QUALITY_TIERS.len();
         let low = n - 3;
 
-        // `low` differs by transport: 5s over WT, 7s over lossless WS.
         assert_eq!(
             camera_periodic_keyframe_max_interval_ms(low, false),
             PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
@@ -5123,7 +3349,7 @@ mod tests {
         assert_eq!(
             camera_periodic_keyframe_max_interval_ms(low, true),
             PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS,
-            "the `low` tier over a lossless (WS) transport must relax to 7s (insurance-only)"
+            "the `low` tier over a lossless (WS) transport must relax (insurance-only)"
         );
         // A healthy mid tier does NOT gain relief from lossless transport.
         assert_eq!(
@@ -5144,10 +3370,6 @@ mod tests {
         );
     }
 
-    /// The effective ceiling must never exceed the absolute 8s bound on any
-    /// (tier, transport) combination — the #1662 receiver-interaction guard. A
-    /// retune that pushed any tier past 8s fails here (belt-and-suspenders with the
-    /// compile-time invariant on the constant).
     #[test]
     fn camera_keyframe_ceiling_never_exceeds_absolute_bound() {
         let n = VIDEO_QUALITY_TIERS.len();
@@ -5155,10 +3377,25 @@ mod tests {
             for &lossless in &[false, true] {
                 let ms = camera_periodic_keyframe_max_interval_ms(idx, lossless);
                 assert!(
-                    (PERIODIC_KEYFRAME_MAX_INTERVAL_MS..=8000.0).contains(&ms),
-                    "tier {idx} (lossless={lossless}) ceiling {ms}ms must stay within [5s, 8s]"
+                    (PERIODIC_KEYFRAME_MAX_INTERVAL_MS
+                        ..=CAMERA_PERIODIC_KEYFRAME_ABSOLUTE_CEILING_MS)
+                        .contains(&ms),
+                    "tier {idx} (lossless={lossless}) ceiling {ms}ms must stay within \
+                     [{PERIODIC_KEYFRAME_MAX_INTERVAL_MS}, \
+                     {CAMERA_PERIODIC_KEYFRAME_ABSOLUTE_CEILING_MS}]"
                 );
             }
         }
+    }
+
+    #[test]
+    fn screen_share_camera_ceiling_stays_inside_receiver_hold_window() {
+        let ms =
+            camera_periodic_keyframe_max_interval_ms(screen_share_camera_ceiling_index(), true);
+        assert!(
+            ms < RECEIVER_MAX_KEYFRAME_LESS_HOLD_MS,
+            "the screen-share camera ceiling tier over WebSocket resolves {ms}ms, which must \
+             stay under the receiver's {RECEIVER_MAX_KEYFRAME_LESS_HOLD_MS}ms escalation (#2199)"
+        );
     }
 }

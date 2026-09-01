@@ -1,0 +1,66 @@
+{
+  "_comment": [
+    "Mutation spec for the bots-app simulcast-cap coupling, run by",
+    "scripts/mutation-check.py:  scripts/mutation-check.py run e2e/bots-app/mutation-spec.json",
+    "",
+    "The coupling under test: the entrypoint default and BOTH k8s manifests must agree",
+    "on BOT_HW_CONCURRENCY, and the value must be exactly 10 (the client's >=10 -> 3-rung",
+    "threshold). The 10 -> 100 case is here because a substring assertion",
+    "(toContain('--hardware-concurrency 10')) passed it.",
+    "",
+    "The asserted value and the committed_claims below landed in PR #2252 (issue #2248)."
+  ],
+  "runner": "vitest",
+  "cwd": "e2e",
+  "command": ["npx", "vitest", "run", "bots-app/src/docker-entrypoint.test.ts"],
+  "node": "22",
+  "baseline_tests": 13,
+  "mutations": [
+    {
+      "name": "entrypoint default 10 -> 6 (two rungs)",
+      "file": "e2e/bots-app/docker-entrypoint.sh",
+      "find": "BOT_HW_CONCURRENCY-10",
+      "replace": "BOT_HW_CONCURRENCY-6",
+      "expect_kills": ["defaults the simulcast cap to 3 rungs"]
+    },
+    {
+      "name": "entrypoint default 10 -> 100 (substring hole)",
+      "file": "e2e/bots-app/docker-entrypoint.sh",
+      "find": "BOT_HW_CONCURRENCY-10",
+      "replace": "BOT_HW_CONCURRENCY-100",
+      "expect_kills": ["defaults the simulcast cap to 3 rungs"]
+    },
+    {
+      "name": "statefulset drifts from the entrypoint default",
+      "file": "e2e/bots-app/k8s/statefulset.yaml",
+      "find": "value: \"10\"",
+      "replace": "value: \"6\"",
+      "expect_kills": ["defaults the simulcast cap to 3 rungs"]
+    },
+    {
+      "name": "bot-pod drifts from the entrypoint default",
+      "file": "e2e/bots-app/k8s/bot-pod.yaml",
+      "find": "value: \"10\"",
+      "replace": "value: \"6\"",
+      "expect_kills": ["defaults the simulcast cap to 3 rungs"]
+    }
+  ],
+  "committed_claims": [
+    {
+      "file": "e2e/bots-app/k8s/statefulset.yaml",
+      "present": "NEEDS >= 8 REPLICAS"
+    },
+    {
+      "file": "e2e/bots-app/k8s/statefulset.yaml",
+      "absent": "9-24 tiles, inside the band"
+    },
+    {
+      "file": "e2e/bots-app/k8s/statefulset.yaml",
+      "absent": "only real barrier"
+    },
+    {
+      "file": "e2e/bots-app/README.md",
+      "absent": "crossover moves out to ~13 peers"
+    }
+  ]
+}

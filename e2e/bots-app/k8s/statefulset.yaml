@@ -56,7 +56,7 @@ spec:
   # account") — provision the account first, then scale.
   # ⚠ THE BOT_HW_CONCURRENCY=10 RATIONALE BELOW NEEDS >= 8 REPLICAS. Below 7
   # decoded peers both ladders pick the top rung and the third rung is pure
-  # encode cost on the same 4-core budget it exists to protect. Scale before
+  # encode cost on the same cpu budget it exists to protect. Scale before
   # measuring (README fleet runbook); 3 is a deliberate start-small default.
   replicas: 3
   # The bots are independent — no start/stop ordering between them — so bring
@@ -93,13 +93,9 @@ spec:
         runAsGroup: 1000
       containers:
         - name: bot
-          # Harbor (hclcr.io/hcllabs) — pulled via the pod-level `hclcr-io`
-          # imagePullSecret. `:latest` is what build.sh pushes for the iteration
-          # loop; for a reproducible/pinned run replace it with the dated tag
-          # build.sh also emits (0.1.0-YYYYMMDD-<sha7>).
-          image: hclcr.io/hcllabs/videocall-bots-app:latest
-          # Always-pull so a re-pushed dev `:latest` is re-fetched on restart.
-          imagePullPolicy: Always
+          # prepull-image.sh reads THIS line as the fleet's one image reference.
+          image: hclcr.io/hcllabs/videocall-bots-app:0.1.0-20260822-3a95d0f@sha256:26de7a79fbd0f148557b179d8787d2abaadad36b9628c0efe85ea99c7a11df13
+          imagePullPolicy: IfNotPresent
           # Container securityContext (Increment 3, #2072): grant ONLY CAP_NET_ADMIN.
           # It is now USED — the /netem control endpoint shells out to `tc`
           # (iproute2, already in the image) to shape THIS pod's own network, which
@@ -115,13 +111,8 @@ spec:
           # caps (SYS_CHROOT/SETUID/SETGID) in the bounding set, and dropping ALL
           # would strip them and break the sandbox. That is why Inc1/Inc2 relied on
           # the default set (no container securityContext) — this only extends it.
-          # NOTE (deploy-time validation): a capability added via `capabilities.add`
-          # on a NON-root (uid 1000) container reaches an exec'd child (`tc`) only if
-          # the runtime propagates it to the process AMBIENT set — this MUST be
-          # verified in-cluster. `tc` is granted `cap_net_admin+eip` via `setcap`
-          # at image-build time (Dockerfile) so this non-root (uid 1000) pod can
-          # actually shape eth0 — NET_ADMIN via capabilities.add lands only in the
-          # bounding set (K8s sets no ambient caps), so the file cap is required.
+          # `tc`, `ip` and a setpriv copy carry `cap_net_admin+eip` from image build;
+          # ambient propagation is not required and was never the blocker (#2428).
           securityContext:
             capabilities:
               add: ["NET_ADMIN"]
@@ -166,22 +157,16 @@ spec:
             # decoded peers, so it does NOT hold at the committed replicas (see
             # the warning at `replicas:`).
             #
-            # #2248 carries the figures and three consequences that are not
-            # obvious here: it is ALSO the SCREEN ceiling (`host.rs` feeds one
-            # capability value to both encoders, making a 1440p rung reachable);
-            # it is reported as `client_cores`, so it moves
-            # `videocall_client_cpu_throttled` with no change in real CPU; and the
-            # band's dense end has only ~2px of margin.
+            # CAMERA depth only: the screen path publishes one rung (#2343).
+            # It is reported as `client_cores`, so it moves
+            # `videocall_client_cpu_throttled` with no change in real CPU.
+            # Figures and tile geometry: #2248.
             - name: BOT_HW_CONCURRENCY
               value: "10"
             # Receiver low-power caps (issues #2068/#2069, increment 5) are
             # DELIBERATELY UNSET here: the fleet default is a REALISTIC
             # full-decode client, so a run reproduces the same total-room decode
             # load (and any decode-saturation freeze) a real participant would.
-            # ⚠ Conditional on 3 rungs: once receivers lid to the middle rung the
-            # relay's LAYER_HINT union can shed publishers toward [low, standard],
-            # so the fleet UNDER-loads. Confirm
-            # videocall_encoder_active_layers{media_kind="camera"} reads 3.
             # They are OPT-IN levers — enable them ONLY to trade realism for
             # scale (cap per-bot DECODE + PAINT CPU so the box holds more bots
             # while you load the SERVER with many participants). To opt in, add:
@@ -193,6 +178,10 @@ spec:
             # parses that once + prod config.js freezes it, so they are NOT
             # runtime-toggleable); effect requires the DEPLOYED client to carry
             # videocall-client PR #2078 (bot logs a post-join assertion either way).
+            # Camera duty cycle (#2362) UNSET — cycling LOWERS published load. Opt in
+            # with all four, in seconds (a partial set is rejected at startup):
+            #   BOT_CAMERA_ON_SECS_MIN "20" · BOT_CAMERA_ON_SECS_MAX "90"
+            #   BOT_CAMERA_OFF_SECS_MIN "60" · BOT_CAMERA_OFF_SECS_MAX "240"
             # Control server (Increment 3, #2072). Setting BOT_CTL_PORT turns the
             # control server ON in the entrypoint; it binds 0.0.0.0 so the headless
             # Service name resolves to it on the pod network. The token is a single
@@ -215,6 +204,16 @@ spec:
             - name: ctl
               containerPort: 8080
               protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - curl -fsS -m 3 http://127.0.0.1:${BOT_CTL_PORT:?}/healthz
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           # Inject the WHOLE bot-accounts Secret (BOT_EMAIL_0/BOT_PASSWORD_0, …)
           # into every pod's env; the entrypoint picks only THIS ordinal's pair.
           # A StatefulSet shares one pod template, so per-pod secretKeyRef
@@ -224,28 +223,23 @@ spec:
             - secretRef:
                 name: bot-accounts
           resources:
+            # Measured 8-replica run, 2026-08-22 (#2313): 3.29-4.03 mean cores
+            # per pod, worst 4.03 mean / 4.19 max; peak working set 1736 MiB.
             requests:
               cpu: "1500m"
-              memory: "1.5Gi"
-            limits:
-              # CPU limit set high (not 2) so CFS throttling of the bursty
-              # headless-Chrome encoder can't self-induce a false
-              # RESOURCE_STARVED fps verdict — the signal this tool measures.
-              # The namespace ResourceQuota requires a limit, so it's generous
-              # rather than omitted.
-              cpu: "4"
               memory: "2Gi"
+            limits:
+              # Generous on purpose: a throttled encoder depresses the fps this
+              # tool measures. In lockstep with bot-pod.yaml + the quota, pinned
+              # by src/k8s-resources.drift.test.ts.
+              cpu: "8"
+              memory: "3Gi"
           volumeMounts:
-            # Headless Chrome shared memory. Default container /dev/shm is 64Mi,
-            # a classic crash/OOM gotcha. src/bot.ts also passes
-            # --disable-dev-shm-usage (so Chrome prefers /tmp), making this mount
+            # Headless Chrome shared memory; the 64Mi default is a crash/OOM
+            # gotcha. src/bot.ts also passes --disable-dev-shm-usage, so this is
             # defense-in-depth. A `medium: Memory` emptyDir is charged to the pod
-            # memory limit, so it MUST stay well under the burst headroom
-            # (limit 2Gi − request 1.5Gi = 512Mi): a dshm cap equal to the whole
-            # band would leave zero OOM margin if /dev/shm ever filled while Chrome
-            # sat at its request floor. 256Mi keeps a real margin, and since
-            # --disable-dev-shm-usage already diverts Chrome to /tmp this cap is
-            # rarely approached — 256Mi is ample.
+            # memory limit, so it must stay inside the burst band (limit −
+            # request) or a full /dev/shm OOMs at the request floor.
             - name: dshm
               mountPath: /dev/shm
             # Resource-sampler artifacts (issue #2032): the run's *-raw.csv /
@@ -273,10 +267,10 @@ spec:
             # actually invalidate every on-disk copy again. Deliberately NOT the
             # run-artifacts PVC (which persists by design) and deliberately NOT
             # `medium: Memory` — a tmpfs emptyDir is charged against the pod's
-            # memory limit, and the 2Gi−1.5Gi burst headroom is already budgeted
-            # for /dev/shm (256Mi); a ~200-byte token does not warrant eating
-            # into it. Node-disk backing is fine: the file is 0600 and gone with
-            # the pod. sizeLimit is a cheap blast-radius cap on the node's
+            # memory limit, and the burst headroom is already budgeted for
+            # /dev/shm; a ~200-byte token does not warrant eating into it.
+            # Node-disk backing is fine: the file is 0600 and gone with the
+            # pod. sizeLimit is a cheap blast-radius cap on the node's
             # ephemeral storage — one token file is well under 1Mi.
             # NON-ROOT WRITES: kubelet creates an emptyDir mount point 0777, so
             # this uid-1000 pod can write it with NO fsGroup — the same basis on

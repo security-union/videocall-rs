@@ -59,4 +59,4 @@
 - [`global/us-east/grafana/`](global/us-east/grafana/README.md) — environment
   values and resources for the us-east Grafana deployment.
 - [`global/us-east/postgres/`](global/us-east/postgres/README.md) — PostgreSQL
-  chart for the us-east region.
+  values for the us-east region.

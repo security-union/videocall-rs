@@ -1,0 +1,82 @@
+{
+  "_comment": [
+    "The tool verifying itself. Each mutation is a way mutation-check.py could",
+    "manufacture false confidence, and each names the test that must catch it:",
+    "  scripts/mutation-check.py run scripts/mutation-check-self-spec.json",
+    "",
+    "Requires a clean tree (the tool refuses otherwise) and mutates the tool's own",
+    "source, which is why invalidate_pycache() exists -- without it a mutation could",
+    "report the PREVIOUS mutation's failure signature."
+  ],
+  "runner": "unittest",
+  "cwd": ".",
+  "command": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "scripts",
+    "-p",
+    "test_mutation_check.py"
+  ],
+  "baseline_tests": 34,
+  "mutations": [
+    {
+      "name": "classify always returns KILLED (the worst possible bug)",
+      "file": "scripts/mutation-check.py",
+      "find": "    if not failed:\n        return SURVIVED, \"\"",
+      "replace": "    if not failed:\n        return KILLED, \"\"",
+      "expect_kills": [
+        "test_nothing_failed_is_survived"
+      ]
+    },
+    {
+      "name": "a wrong test dying counts as KILLED",
+      "file": "scripts/mutation-check.py",
+      "find": "    if missing:\n        return ERROR,",
+      "replace": "    if False:\n        return ERROR,",
+      "expect_kills": [
+        "test_wrong_test_died_is_error_not_killed",
+        "test_partial_match_is_error"
+      ]
+    },
+    {
+      "name": "an unparseable run is treated as a result",
+      "file": "scripts/mutation-check.py",
+      "find": "        if not m:\n            return None, []\n        names = [\n",
+      "replace": "        if not m:\n            return 0, []\n        names = [\n",
+      "expect_kills": [
+        "test_no_summary_returns_none"
+      ]
+    },
+    {
+      "name": "ambiguous anchor is guessed instead of refused",
+      "file": "scripts/mutation-check.py",
+      "find": "    if found != want:\n        raise RuntimeError(",
+      "replace": "    if False:\n        raise RuntimeError(",
+      "expect_kills": [
+        "test_ambiguous_anchor_raises",
+        "test_missing_anchor_raises"
+      ]
+    },
+    {
+      "name": "dirty-tree guard disabled (the failure that shipped)",
+      "file": "scripts/mutation-check.py",
+      "find": "    if dirty:\n        sys.exit(",
+      "replace": "    if False:\n        sys.exit(",
+      "expect_kills": [
+        "test_refuses_when_a_target_file_is_dirty"
+      ]
+    },
+    {
+      "name": "spec validation accepts unknown keys",
+      "file": "scripts/mutation-check.py",
+      "find": "    if errs:\n        sys.exit(\"INVALID SPEC:",
+      "replace": "    if False:\n        sys.exit(\"INVALID SPEC:",
+      "expect_kills": [
+        "test_typod_mutation_key_is_rejected"
+      ]
+    }
+  ]
+}

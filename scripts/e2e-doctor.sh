@@ -189,6 +189,63 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6. Backend build freshness (#2513).
+# ---------------------------------------------------------------------------
+
+section "Backend build freshness"
+
+STAMP_DIR="${REPO_ROOT}/e2e/.stack-stamps"
+COMPOSE_E2E="${REPO_ROOT}/docker/docker-compose.e2e.yaml"
+# 30s heartbeat; allow four missed ticks before calling the watcher dead.
+STAMP_STALE_SECS=120
+
+# GNU `-f` means filesystem status and reads %m as a FILE; BSD rejects `-c`.
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+if [[ ! -f "${COMPOSE_E2E}" ]]; then
+  log_fail "cannot read ${COMPOSE_E2E}"
+else
+  supervised="$(grep -oE 'e2e-backend\.sh supervise [A-Za-z0-9_-]+' "${COMPOSE_E2E}" \
+                | awk '{print $3}' | sort -u)"
+  if [[ -z "${supervised}" ]]; then
+    log_fail "no supervised backends found in docker-compose.e2e.yaml" \
+             "  The backend services should run 'e2e-backend.sh supervise <bin>'. If they
+  run a bare 'cargo run' again, nothing rebuilds them and a long-lived
+  stack silently serves a stale binary (#2513)."
+  else
+    while read -r bin; do
+      [[ -z "${bin}" ]] && continue
+      stamp="${STAMP_DIR}/${bin}.json"
+      if [[ ! -f "${stamp}" ]]; then
+        log_warn "${bin}: no build stamp (stack not started, or started before #2513)" \
+                 "  Fix: make e2e-up"
+        continue
+      fi
+      state="$(sed -n 's/.*"build":"\([a-z]*\)".*/\1/p' "${stamp}")"
+      now="$(date +%s)"
+      mtime="$(file_mtime "${stamp}")"
+      [[ "${mtime}" =~ ^[0-9]+$ ]] || mtime=0
+      age=$(( now - mtime ))
+      if (( age > STAMP_STALE_SECS )); then
+        log_fail "${bin}: stamp is ${age}s old — no watcher is supervising it" \
+                 "  Fix: make e2e-up   (the served binary may predate your source)"
+      elif [[ -z "${state}" ]]; then
+        log_fail "${bin}: build stamp is unreadable (${stamp})" "  Fix: make e2e-up"
+      elif [[ "${state}" == "failed" ]]; then
+        log_fail "${bin}: last build FAILED, so nothing is being served" \
+                 "  Fix: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml logs"
+      elif [[ "${state}" == "building" ]]; then
+        log_warn "${bin}: rebuilding right now (${age}s since last heartbeat)"
+      else
+        log_pass "${bin}: supervised, last build ok (${age}s since last heartbeat)"
+      fi
+    done <<< "${supervised}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Final report.
 # ---------------------------------------------------------------------------
 

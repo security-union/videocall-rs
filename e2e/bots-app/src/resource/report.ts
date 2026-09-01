@@ -5,6 +5,7 @@
  * confounded run is flagged and not meeting-analyzed as a product freeze.
  */
 
+import type { ArrivalSpread } from "./arrival";
 import type { FpsStats } from "./fps";
 import type { ResourceSummary, ResourceVerdict } from "./verdict";
 
@@ -12,6 +13,15 @@ import type { ResourceSummary, ResourceVerdict } from "./verdict";
 export const RESOURCE_STARVED_BANNER = "RESOURCE_STARVED";
 /** Counterpart banner for a clean run. */
 export const RESOURCE_OK_BANNER = "RESOURCE_OK";
+/** Banner for a run that produced no evidence either way (issue #2358). */
+export const RESOURCE_NO_EVIDENCE_BANNER = "RESOURCE_NO_EVIDENCE";
+
+/** Starved wins over no-evidence: a fired rule IS evidence. */
+export function bannerFor(verdict: ResourceVerdict): string {
+  if (verdict.starved) return RESOURCE_STARVED_BANNER;
+  if (verdict.noEvidence) return RESOURCE_NO_EVIDENCE_BANNER;
+  return RESOURCE_OK_BANNER;
+}
 
 function mib(kb: number): string {
   return `${Math.round(kb / 1024)} MiB`;
@@ -25,6 +35,7 @@ export interface ReportInput {
   summary: ResourceSummary;
   verdict: ResourceVerdict;
   fpsByBot: ReadonlyMap<string, FpsStats>;
+  arrival: ArrivalSpread | null;
   /** `false` when the sampler ran on a box without /proc (non-Linux). */
   supported: boolean;
   /** `true` when the sysstat tools were absent (a capability note, not a failure). */
@@ -33,28 +44,65 @@ export interface ReportInput {
   derivedCsvPath: string;
 }
 
+function arrivalLines(spread: ArrivalSpread | null, withAggregates: boolean): string[] {
+  if (spread === null) {
+    return ["[resource] arrival spread: not tracked for this report"];
+  }
+  const iso = (ms: number): string => new Date(ms).toISOString();
+  const secs = (ms: number): string => (ms / 1000).toFixed(1);
+  if (spread.count < 2) {
+    const lines = [
+      `[resource] arrival spread: n/a — only ${spread.count} local join observed,` +
+        ` at ${iso(spread.firstJoinMs)} (a fleet's ramp spans processes: issue #2337)`,
+    ];
+    if (withAggregates) {
+      lines.push(
+        "[resource] the capture starts before the launch, so the CPU, RAM, NIC, process and" +
+          " verdict lines below include the pre-join stretch",
+      );
+    }
+    return lines;
+  }
+  const lines = [
+    `[resource] arrival spread: ${secs(spread.spreadMs)}s across ${spread.count} local joins` +
+      ` (first ${iso(spread.firstJoinMs)} → last ${iso(spread.lastJoinMs)});` +
+      " SSH-launched bots join in their own process and are not counted",
+  ];
+  if (withAggregates) {
+    lines.push(
+      "[resource] the capture starts before the first launch, so the CPU, RAM, NIC, process and" +
+        " verdict lines below cover that ramp. This receipt does not state how long the room held" +
+        " every bot",
+    );
+  }
+  return lines;
+}
+
 /**
- * Build the multi-line report. A dedicated banner line — `RESOURCE_STARVED` or
- * `RESOURCE_OK` — is emitted near the top (right after the opening divider) on
- * its own line, so a one-line grep classifies the run.
+ * Build the multi-line report. A dedicated banner line — `RESOURCE_STARVED`,
+ * `RESOURCE_NO_EVIDENCE` or `RESOURCE_OK` — is emitted near the top (right
+ * after the opening divider) on its own line, so a one-line grep classifies the
+ * run. `RESOURCE_OK` is reserved for a run that produced figures to judge.
  */
 export function formatResourceReport(input: ReportInput): string {
   const { summary: s, verdict, fpsByBot } = input;
   const lines: string[] = [];
 
   lines.push("──────────────────────────────────────────────────────────────");
+  const withoutHostCapture = (note: string): string => {
+    lines.push(`${bannerFor(verdict)} (${note})`);
+    if (verdict.starved) for (const r of verdict.reasons) lines.push(`[resource]   - ${r}`);
+    lines.push(...arrivalLines(input.arrival, false));
+    lines.push("──────────────────────────────────────────────────────────────");
+    return lines.join("\n");
+  };
   if (!input.supported) {
-    lines.push(`${RESOURCE_OK_BANNER} (resource capture unsupported on this box — no /proc)`);
-    lines.push("──────────────────────────────────────────────────────────────");
-    return lines.join("\n");
+    return withoutHostCapture("resource capture unsupported on this box — no /proc");
   }
-  if (s.sampleCount === 0) {
-    lines.push(`${RESOURCE_OK_BANNER} (no resource samples captured)`);
-    lines.push("──────────────────────────────────────────────────────────────");
-    return lines.join("\n");
-  }
+  if (s.sampleCount === 0) return withoutHostCapture("no resource samples captured");
 
-  lines.push(verdict.starved ? RESOURCE_STARVED_BANNER : RESOURCE_OK_BANNER);
+  lines.push(bannerFor(verdict));
+  lines.push(...arrivalLines(input.arrival, true));
   lines.push(
     `[resource] run resource capture — ${s.sampleCount} samples over ${Math.round(s.durationSec)}s`,
   );
@@ -112,6 +160,12 @@ export function formatResourceReport(input: ReportInput): string {
       "[resource] Treat client-signal regressions (encoder fps, RTT, sheds) from THIS run as",
     );
     lines.push("[resource] confounded by box saturation, not a product regression.");
+  } else if (verdict.noEvidence) {
+    lines.push(
+      `[resource] VERDICT: ${RESOURCE_NO_EVIDENCE_BANNER} — this run produced no evidence to judge:`,
+    );
+    for (const r of verdict.reasons) lines.push(`[resource]   - ${r}`);
+    lines.push("[resource] No figure from THIS run is representative of a loaded fleet.");
   } else {
     lines.push(`[resource] VERDICT: ${RESOURCE_OK_BANNER} — box had headroom for this run.`);
   }

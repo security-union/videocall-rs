@@ -50,6 +50,8 @@ export interface BotSnapshot {
    * `null`.
    */
   finishedAt?: number | null;
+  /** First join, ms since epoch; `null` until joined and for SSH bots. Absent on older servers. */
+  joinedAt?: number | null;
 }
 
 export interface BotListResponse {

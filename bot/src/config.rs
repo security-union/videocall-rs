@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::fs;
 use url::Url;
 use videocall_aq::constants::SIMULCAST_MAX_LAYERS;
+use videocall_meeting_types::mint::{self, LobbyAuth, MintError};
 
 use crate::netsim::NetworkProfile;
 use videocall_netsim::{list_profiles, resolve_profile};
@@ -48,7 +49,7 @@ pub enum VideoMode {
 /// Bot connection configuration (YAML file).
 ///
 /// Participant details come from the conversation manifest, not from this config.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct BotConfig {
     /// Legacy single-server URL. Use `ws_url`/`wt_url` for new-style config.
     pub server_url: Option<String>,
@@ -64,8 +65,16 @@ pub struct BotConfig {
     /// e.g. `wt_ratio=0.33` with `total_bots=10` yields 3 WT bots. The first N
     /// bots by index are assigned WT, and the remainder use WS.
     pub wt_ratio: Option<f64>,
+    /// HMAC secret used to mint each bot's room access token. Falls back to the
+    /// `JWT_SECRET` environment variable.
     pub jwt_secret: Option<String>,
     pub token_ttl_secs: Option<u64>,
+    /// Opt in to the deprecated unauthenticated `/lobby/{user_id}/{room}` join.
+    /// Only consulted when no secret is configured; the relay rejects it
+    /// whenever `FEATURE_MEETING_MANAGEMENT` is on. Env:
+    /// `BOT_ALLOW_DEPRECATED_PATH=true`.
+    #[serde(default)]
+    pub allow_deprecated_path: Option<bool>,
     pub insecure: Option<bool>,
     pub ramp_up_delay_ms: Option<u64>,
     /// Meeting room ID -- all participants join the same meeting.
@@ -441,6 +450,17 @@ impl BotConfig {
             );
         }
 
+        // Room-access-token credentials. Precedence: YAML file value > env var.
+        if config.jwt_secret.is_none() {
+            config.jwt_secret = std::env::var("JWT_SECRET").ok().filter(|s| !s.is_empty());
+        }
+        if config.allow_deprecated_path.is_none() {
+            if let Ok(raw) = std::env::var("BOT_ALLOW_DEPRECATED_PATH") {
+                config.allow_deprecated_path =
+                    Some(matches!(raw.to_lowercase().as_str(), "true" | "1" | "yes"));
+            }
+        }
+
         Ok((config, num_users))
     }
 
@@ -552,6 +572,23 @@ impl BotConfig {
 
     pub fn token_ttl_secs(&self) -> u64 {
         self.token_ttl_secs.unwrap_or(86400)
+    }
+
+    pub fn allow_deprecated_path(&self) -> bool {
+        self.allow_deprecated_path.unwrap_or(false)
+    }
+
+    /// Resolve how this bot authenticates to the relay (#2298).
+    ///
+    /// A configured secret always wins over `allow_deprecated_path`, and a
+    /// config with neither is an error rather than an unauthenticated join.
+    pub fn resolve_lobby_auth(&self) -> Result<LobbyAuth, MintError> {
+        mint::resolve_lobby_auth(
+            None,
+            self.jwt_secret.clone(),
+            self.token_ttl_secs(),
+            self.allow_deprecated_path(),
+        )
     }
 
     pub fn conversation_dir(&self) -> &str {

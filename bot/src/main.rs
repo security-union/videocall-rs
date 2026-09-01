@@ -35,7 +35,9 @@ use bot::layer_preference_sender::LayerPreferenceSender;
 use bot::metrics_server::{self, BotMetrics};
 use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
 use bot::rtt_probe::spawn_rtt_probe;
-use bot::transport::{self, OutboundFrame, TransportClient};
+use bot::transport::{
+    self, OutboundFrame, OutboundFrameSender, TransportClient, WebSocketStreamByteCounters,
+};
 use bot::video_producer::VideoProducer;
 use bot::viewport_sender::ViewportSender;
 use bot::websocket_client::spawn_heartbeat_producer;
@@ -47,6 +49,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+use videocall_types::url_log::strip_query_for_log;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -64,6 +67,9 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting videocall synthetic client bot");
 
     let (config, num_users) = BotConfig::from_args()?;
+
+    // Fail before any bot is spawned rather than once per client (#2298).
+    config.resolve_lobby_auth()?;
 
     // Bring up the Prometheus metrics endpoint first so bots coming online
     // can publish their labels before the server starts accepting scrapes.
@@ -431,27 +437,21 @@ async fn run_client(
         enable_video: is_broadcaster,
     };
 
+    let lobby_auth = bot_config.resolve_lobby_auth()?;
     let lobby_url = TransportClient::build_lobby_url(
         &resolved_transport,
         &server_url,
-        bot_config.jwt_secret.as_deref(),
+        &lobby_auth,
         &client_config.user_id,
         &client_config.meeting_id,
-        bot_config.token_ttl_secs(),
     )?;
-    // Redact JWT token from log output
-    let display_url = lobby_url
-        .as_str()
-        .split("?token=")
-        .next()
-        .unwrap_or(lobby_url.as_str());
     info!(
         "[{}] Transport: {:?}, Lobby URL: {}{}",
         user_id,
         resolved_transport,
-        display_url,
+        strip_query_for_log(lobby_url.as_str()),
         if lobby_url.query().is_some() {
-            "?token=<redacted>"
+            "?<redacted>"
         } else {
             ""
         }
@@ -587,7 +587,15 @@ async fn run_client(
     // with netsim enabled it applies the uplink impairment; with metrics
     // enabled it also labels Prometheus counters using the pre-tagged
     // `frame.kind` — no protobuf re-parse on the hot path.
-    let (packet_tx, packet_rx) = mpsc::channel::<OutboundFrame>(500);
+    let (packet_tx_raw, packet_rx) = mpsc::channel::<OutboundFrame>(500);
+    // `Some` only on a WebSocket run: one Option both wires the byte accounting
+    // and reaches the health reporter, so the two cannot disagree on transport.
+    let websocket_stream_bytes = matches!(resolved_transport, Transport::WebSocket)
+        .then(|| Arc::new(WebSocketStreamByteCounters::default()));
+    let packet_tx = match websocket_stream_bytes.clone() {
+        Some(counters) => OutboundFrameSender::with_websocket_accounting(packet_tx_raw, counters),
+        None => OutboundFrameSender::new(packet_tx_raw),
+    };
 
     // Shared counters for HealthPacket telemetry:
     // - packets_sent_counter: incremented by the outbound shim/passthrough on
@@ -804,6 +812,7 @@ async fn run_client(
             measured_rtt_ms,
             packets_sent_counter: packets_sent_counter.clone(),
             transport_drops_counter: transport_drops_counter.clone(),
+            websocket_stream_bytes: websocket_stream_bytes.clone(),
             encoder_output_fps: encoder_output_fps.clone(),
             encoder_errors_generic: encoder_errors_generic.clone(),
             encoder_frames_ok: encoder_frames_ok.clone(),

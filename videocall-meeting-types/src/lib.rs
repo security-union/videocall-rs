@@ -18,6 +18,8 @@
 //! It is intentionally framework-agnostic — no actix-web, no database types.
 
 pub mod error;
+#[cfg(feature = "mint")]
+pub mod mint;
 pub mod requests;
 pub mod responses;
 pub mod token;
@@ -26,3 +28,4 @@ pub use error::APIError;
 pub use responses::APIResponse;
 pub use token::RoomAccessTokenClaims;
 pub use token::GUEST_USER_ID_PREFIX;
+pub use token::{check_token_type, TokenTypeCheck};

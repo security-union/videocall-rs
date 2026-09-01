@@ -117,6 +117,65 @@ impl KeyframeMediaKind {
             MediaKind::AUDIO | MediaKind::MEDIA_KIND_UNSPECIFIED => KeyframeMediaKind::Other,
         }
     }
+
+    pub const VALUES: &'static [KeyframeMediaKind] = &[
+        KeyframeMediaKind::Video,
+        KeyframeMediaKind::Screen,
+        KeyframeMediaKind::Other,
+    ];
+
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            KeyframeMediaKind::Video => "video",
+            KeyframeMediaKind::Screen => "screen",
+            KeyframeMediaKind::Other => "other",
+        }
+    }
+}
+
+/// Which rule of the KEYFRAME_REQUEST limiter decided one request (#2394).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeRequestOutcome {
+    AdmittedStrict,
+    /// Admitted only because the #979 congestion relaxation widened the per-pair
+    /// cap: the strict (`congested = false`) budget for this kind was already
+    /// spent in this window.
+    AdmittedCongested,
+    AdmittedStillWaiting,
+    DeniedBudget,
+    DeniedStillWaiting,
+    DeniedGlobal,
+}
+
+impl KeyframeRequestOutcome {
+    pub const VALUES: &'static [KeyframeRequestOutcome] = &[
+        KeyframeRequestOutcome::AdmittedStrict,
+        KeyframeRequestOutcome::AdmittedCongested,
+        KeyframeRequestOutcome::AdmittedStillWaiting,
+        KeyframeRequestOutcome::DeniedBudget,
+        KeyframeRequestOutcome::DeniedStillWaiting,
+        KeyframeRequestOutcome::DeniedGlobal,
+    ];
+
+    pub fn admitted(self) -> bool {
+        matches!(
+            self,
+            KeyframeRequestOutcome::AdmittedStrict
+                | KeyframeRequestOutcome::AdmittedCongested
+                | KeyframeRequestOutcome::AdmittedStillWaiting
+        )
+    }
+
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            KeyframeRequestOutcome::AdmittedStrict => "admitted_strict",
+            KeyframeRequestOutcome::AdmittedCongested => "admitted_congested",
+            KeyframeRequestOutcome::AdmittedStillWaiting => "admitted_still_waiting",
+            KeyframeRequestOutcome::DeniedBudget => "denied_budget",
+            KeyframeRequestOutcome::DeniedStillWaiting => "denied_still_waiting",
+            KeyframeRequestOutcome::DeniedGlobal => "denied_global",
+        }
+    }
 }
 
 /// The per-`(receiver, target_sender)` KEYFRAME_REQUEST budget that applies to a
@@ -266,6 +325,16 @@ pub enum InboundFrameKind {
 }
 
 impl InboundFrameKind {
+    /// Map a wire `MediaPacket.frame_type` to a bounded kind. Only the two
+    /// relay-readable literals map; anything else is `Unknown`, never `Delta`.
+    pub fn from_frame_type(frame_type: &str) -> Self {
+        match frame_type {
+            "key" => InboundFrameKind::Key,
+            "delta" => InboundFrameKind::Delta,
+            _ => InboundFrameKind::Unknown,
+        }
+    }
+
     pub fn as_label(self) -> &'static str {
         match self {
             InboundFrameKind::Key => "key",
@@ -580,17 +649,7 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
                         kind,
                     };
                 }
-                // Map only the two relay-readable literals; an empty/unexpected
-                // `frame_type` (older/malformed publisher, or opaque bytes that
-                // happen to parse as a proto) is NOT a relay-readable kind and must
-                // fall to `Unknown` per the metric contract — mapping it to `Delta`
-                // would pollute the delta bucket with frames whose kind we don't
-                // actually know.
-                match media_packet.frame_type.as_str() {
-                    "key" => InboundFrameKind::Key,
-                    "delta" => InboundFrameKind::Delta,
-                    _ => InboundFrameKind::Unknown,
-                }
+                InboundFrameKind::from_frame_type(&media_packet.frame_type)
             } else {
                 InboundFrameKind::Unknown
             };
@@ -658,8 +717,7 @@ impl KeyframeTarget {
 /// `(target, kind)` since `t`. While it is `Some`, the delivery-aware
 /// relaxation path admits a retry (bounded by
 /// [`KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS`] and the global cap) even
-/// when the strict per-pair budget is exhausted — this is the WS/TCP recovery
-/// path that congestion-relaxation cannot reach on a lossless link. It lives
+/// when the strict per-pair budget is exhausted. It lives
 /// in the SAME map entry as the rate-limit counter so it prunes via the SAME
 /// `cleanup_stale_entries` pass and #1068 layer clamp — no second structure,
 /// no second prune.
@@ -814,12 +872,11 @@ impl KeyframeRequestLimiter {
     /// the pre-existing keyframe-storm risk (OSS #814) stays bounded — this
     /// relaxes the per-pair cap, it does not remove the ceiling.
     ///
-    /// ## #1297 — delivery-aware relaxation (the lossless-WS recovery path)
+    /// ## #1297 — delivery-aware relaxation
     ///
-    /// The `congested` relaxation above can ONLY fire when the relay observed
-    /// inbound-media loss for this receiver, which on a lossless WS/TCP path
-    /// NEVER happens. So before #1297, a genuinely frozen receiver on the common
-    /// all-WS deployment was throttled identically to a flooder and stayed
+    /// The `congested` relaxation above is not available unless the receiver is
+    /// already marked congested, so before #1297 a genuinely frozen receiver
+    /// could be throttled identically to a flooder and stay
     /// frozen. The delivery-aware path fixes that: when the strict per-pair
     /// budget would DENY *and* this bucket is STILL WAITING for a keyframe
     /// (no qualifying frame delivered since the last request — see
@@ -858,6 +915,19 @@ impl KeyframeRequestLimiter {
         layer: u32,
         congested: bool,
     ) -> bool {
+        self.classify_with_congestion(target, kind, layer, congested)
+            .admitted()
+    }
+
+    /// Same decision as [`KeyframeRequestLimiter::allow_with_congestion`] — this
+    /// is the implementation of it — but reporting WHICH rule decided (#2394).
+    pub fn classify_with_congestion(
+        &mut self,
+        target: KeyframeTarget,
+        kind: KeyframeMediaKind,
+        layer: u32,
+        congested: bool,
+    ) -> KeyframeRequestOutcome {
         let now = Instant::now();
         let window = Duration::from_millis(KEYFRAME_REQUEST_WINDOW_MS);
         let min_retry = Duration::from_millis(KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS);
@@ -914,7 +984,7 @@ impl KeyframeRequestLimiter {
                 .global
                 .has_capacity(now, window, KEYFRAME_REQUEST_MAX_PER_SEC)
         {
-            return false;
+            return KeyframeRequestOutcome::DeniedGlobal;
         }
 
         let per_pair_entry = self
@@ -926,20 +996,25 @@ impl KeyframeRequestLimiter {
         // `count` only when it admits.
         let consumed_per_pair = per_pair_entry.try_consume(now, window, per_pair_max);
 
+        // #2394: `try_consume` increments once on admit, so a post-consume count
+        // above the strict (`congested = false`) cap for this kind means only the
+        // #979 relaxation made room. Keying off the count rather than the
+        // `congested` flag keeps the FIRST request of a congested window — which
+        // the strict cap would also have admitted — labelled `AdmittedStrict`.
+        let beyond_strict_budget =
+            consumed_per_pair && per_pair_entry.count > keyframe_per_pair_budget(kind, false);
+
         if !consumed_per_pair {
             // Strict/congested budget exhausted. #1297 delivery-aware path:
             // admit a retry ONLY while this bucket is still waiting for a
             // keyframe to be delivered, and no faster than the min-retry
-            // interval. This is the relaxation a lossless WS/TCP path can reach
-            // (the `congested` relaxation cannot fire there). It deliberately
+            // interval. It deliberately
             // does NOT consume the (already-full) per-pair counter; it is
             // bounded instead by `min_retry` here and the global cap below.
-            let still_waiting_ok = match per_pair_entry.waiting_since {
-                Some(since) => now.duration_since(since) >= min_retry,
-                None => false,
-            };
-            if !still_waiting_ok {
-                return false;
+            match per_pair_entry.waiting_since {
+                Some(since) if now.duration_since(since) >= min_retry => {}
+                Some(_) => return KeyframeRequestOutcome::DeniedStillWaiting,
+                None => return KeyframeRequestOutcome::DeniedBudget,
             }
             // Fall through to the global cap with consumed_per_pair == false
             // (nothing to refund on the per-pair side).
@@ -964,7 +1039,7 @@ impl KeyframeRequestLimiter {
                     entry.count = entry.count.saturating_sub(1);
                 }
             }
-            return false;
+            return KeyframeRequestOutcome::DeniedGlobal;
         }
 
         // Admitted. Mark this bucket as (still) waiting for a keyframe so the
@@ -975,7 +1050,13 @@ impl KeyframeRequestLimiter {
             entry.waiting_since = Some(now);
         }
 
-        true
+        if beyond_strict_budget {
+            KeyframeRequestOutcome::AdmittedCongested
+        } else if consumed_per_pair {
+            KeyframeRequestOutcome::AdmittedStrict
+        } else {
+            KeyframeRequestOutcome::AdmittedStillWaiting
+        }
     }
 
     /// Record that a qualifying keyframe-bearing MEDIA frame for `(target,
@@ -997,8 +1078,8 @@ impl KeyframeRequestLimiter {
     /// O(1): a single HashMap lookup + a field clear. It does NOT create an
     /// entry — only clears an existing one. Creating on delivery would have been
     /// an unbounded-growth vector keyed by the then-forgeable outer `session_id`
-    /// (delivery key option A — see `handle_outbound`); refusing to insert
-    /// closes that independently of #2095's relay-side stamp, which now also
+    /// (delivery key option A — see `observe_outbound_delivery`); refusing to
+    /// insert closes that independently of #2095's relay-side stamp, which also
     /// makes that key unforgeable.
     pub fn observe_delivery(&mut self, target: KeyframeTarget, kind: KeyframeMediaKind) {
         if let Some(entry) = self.per_target.get_mut(&(target, kind, 0u32)) {
@@ -1472,25 +1553,75 @@ pub fn stamp_wrapper_for_broadcast(
     wrapper.write_to_bytes().ok()
 }
 
+/// Byte range within `buf` of the next length-delimited field, consumed WITHOUT copying
+/// (unlike `read_bytes`). `None` if the length is malformed or overruns `buf`.
+fn length_delimited_range(is: &mut CodedInputStream<'_>, buf: &[u8]) -> Option<(usize, usize)> {
+    let len = is.read_raw_varint32().ok()?;
+    let start = is.pos() as usize;
+    let end = start
+        .checked_add(len as usize)
+        .filter(|end| *end <= buf.len())?;
+    is.skip_raw_bytes(len).ok()?;
+    Some((start, end))
+}
+
+/// Frame kind of an inner `MediaPacket`: only `frame_type` (field 4) is read, `data`
+/// (field 3) is skipped without copying. `Unknown` on ANY decode failure or absent
+/// `frame_type` means "not readable", NEVER "not a keyframe" — E2EE seals this packet.
+fn inner_media_frame_kind(inner: &[u8]) -> InboundFrameKind {
+    const FIELD_FRAME_TYPE: u32 = 4;
+
+    let mut is = CodedInputStream::from_bytes(inner);
+    let mut kind = InboundFrameKind::Unknown;
+
+    loop {
+        let raw_tag = match is.read_raw_tag_or_eof() {
+            Ok(Some(t)) => t,
+            Ok(None) => break,
+            Err(_) => return InboundFrameKind::Unknown,
+        };
+        let Some(wire_type) = WireType::new(raw_tag & 0x7) else {
+            return InboundFrameKind::Unknown;
+        };
+        match (raw_tag >> 3, wire_type) {
+            (FIELD_FRAME_TYPE, WireType::LengthDelimited) => {
+                let Some((start, end)) = length_delimited_range(&mut is, inner) else {
+                    return InboundFrameKind::Unknown;
+                };
+                kind = match std::str::from_utf8(&inner[start..end]) {
+                    Ok(label) => InboundFrameKind::from_frame_type(label),
+                    Err(_) => InboundFrameKind::Unknown,
+                };
+            }
+            (_, wt) => {
+                if is.skip_field(wt).is_err() {
+                    return InboundFrameKind::Unknown;
+                }
+            }
+        }
+    }
+
+    kind
+}
+
 /// Cheap delivery-observation peek for an OUTBOUND forwarded frame (#1297).
 ///
 /// Returns `Some((target, kind))` ONLY for a MEDIA packet whose OUTER cleartext
-/// `media_kind` is VIDEO or SCREEN — the only deliveries that can clear a
+/// `media_kind` is VIDEO or SCREEN and whose inner `frame_type` is not a readable `delta` — the only deliveries that can clear a
 /// keyframe wait. Returns `None` for everything else (non-MEDIA, AUDIO,
 /// UNSPECIFIED, unparseable), so the caller does no per-frame map work for the
 /// vast majority of traffic that cannot satisfy a keyframe request.
 ///
 /// ## Why a partial decode (performance — this is the relay's hottest path)
 ///
-/// `handle_outbound` runs once per forwarded frame PER RECEIVER. Each transport
+/// This runs once per ACCEPTED frame PER RECEIVER. Each transport
 /// handler ALREADY does one full `PacketWrapper::parse_from_bytes` per outbound
 /// frame, and that full parse COPIES the multi-KB `data` (field 3) payload. A
 /// second full parse here would DOUBLE that per-frame copy on the busiest path
 /// in the system. Instead we walk the outer wrapper with the protobuf library's
 /// own [`CodedInputStream`] primitives, reading only the three scalar fields we
-/// need — `packet_type` (1), `session_id` (4), `media_kind` (6) — plus
-/// `user_id` (2) for the [`KeyframeTarget::User`] fallback, and SKIPPING every
-/// other field (crucially `data`, field 3) WITHOUT copying it. This is NOT a
+/// need — `packet_type` (1), `session_id` (4), `media_kind` (6) — plus the byte
+/// RANGES of `user_id` (2) and `data` (3), and SKIPPING every other field. Neither range is copied; `data`'s is walked in place by [`inner_media_frame_kind`]. This is NOT a
 /// hand-rolled byte scanner: tag reads, varint reads, and length-delimited
 /// skips are all done by the library, so wire-format correctness is the
 /// library's responsibility. The only manual step is the standard tag unpack
@@ -1500,7 +1631,7 @@ pub fn stamp_wrapper_for_broadcast(
 /// value wins, exactly matching `parse_from_bytes`. We loop to EOF rather than
 /// stopping at the first match, so field order on the wire does not matter.
 ///
-/// On ANY decode error we return `None` (fail-safe): the worst consequence of a
+/// On ANY decode error in the OUTER walk we return `None` (fail-safe): the worst consequence of a
 /// missed observation is that a receiver keeps its delivery-aware relaxation a
 /// little longer (≤ the min-retry rate, still under the global cap) — never a
 /// wrongful throttle and never a storm.
@@ -1511,7 +1642,7 @@ pub fn stamp_wrapper_for_broadcast(
 /// unforgeable — see `chat_server::handle_msg` ~4199), NOT the outer
 /// `session_id`. We key the delivery observation off the outer
 /// `session_id`/`user_id` here (mirroring [`KeyframeTarget::from_request`]) to
-/// keep `handle_outbound` self-contained and off the `Message` hot struct.
+/// keep the observation self-contained and off the `Message` hot struct.
 ///
 /// Since #2095 those outer scalars are no longer publisher-forgeable at all:
 /// the broadcast path stamps BOTH with the publisher's authenticated identity
@@ -1531,6 +1662,7 @@ pub fn outbound_keyframe_observation(data: &[u8]) -> Option<(KeyframeTarget, Key
     // Field numbers on PacketWrapper (see packet_wrapper.proto).
     const FIELD_PACKET_TYPE: u32 = 1;
     const FIELD_USER_ID: u32 = 2;
+    const FIELD_DATA: u32 = 3;
     const FIELD_SESSION_ID: u32 = 4;
     const FIELD_MEDIA_KIND: u32 = 6;
 
@@ -1545,6 +1677,7 @@ pub fn outbound_keyframe_observation(data: &[u8]) -> Option<(KeyframeTarget, Key
     // per-frame `read_bytes` allocation is pure waste in the common session-keyed
     // path. Materialized as a slice only at the end, and only when needed.
     let mut user_id_range: Option<(usize, usize)> = None;
+    let mut inner_range: Option<(usize, usize)> = None;
 
     loop {
         let raw_tag = match is.read_raw_tag_or_eof() {
@@ -1564,28 +1697,10 @@ pub fn outbound_keyframe_observation(data: &[u8]) -> Option<(KeyframeTarget, Key
                 };
             }
             (FIELD_USER_ID, WireType::LengthDelimited) => {
-                // Read the length prefix and record the slice bounds WITHOUT
-                // copying (vs `read_bytes`, which allocates a Vec). The length is
-                // read with `read_raw_varint32` and consumed via `skip_raw_bytes`
-                // as a `u32` with NO truncation cast — byte-for-byte identical to
-                // what `read_bytes_into` does internally (`len = read_raw_varint32`
-                // then `read_raw_bytes_into(len, ..)`, both `u32`), minus the
-                // allocation (#1306, #1350). Bounds-check against `data` before
-                // trusting the attacker-controllable length, then skip the bytes
-                // to keep parsing.
-                let len = match is.read_raw_varint32() {
-                    Ok(v) => v,
-                    Err(_) => return None,
-                };
-                let start = is.pos() as usize;
-                let end = match start.checked_add(len as usize) {
-                    Some(end) if end <= data.len() => end,
-                    _ => return None,
-                };
-                if is.skip_raw_bytes(len).is_err() {
-                    return None;
-                }
-                user_id_range = Some((start, end));
+                user_id_range = Some(length_delimited_range(&mut is, data)?);
+            }
+            (FIELD_DATA, WireType::LengthDelimited) => {
+                inner_range = Some(length_delimited_range(&mut is, data)?);
             }
             (FIELD_SESSION_ID, WireType::Varint) => {
                 session_id = match is.read_uint64() {
@@ -1599,9 +1714,7 @@ pub fn outbound_keyframe_observation(data: &[u8]) -> Option<(KeyframeTarget, Key
                     Err(_) => return None,
                 };
             }
-            // Every other field — crucially `data` (field 3), the multi-KB
-            // payload — is skipped WITHOUT copying. `skip_field` consumes the
-            // value per its wire type (length-delimited → skip N bytes).
+            // Skipped WITHOUT copying: `skip_field` consumes the value per its wire type.
             (_, wt) => {
                 if is.skip_field(wt).is_err() {
                     return None;
@@ -1623,6 +1736,13 @@ pub fn outbound_keyframe_observation(data: &[u8]) -> Option<(KeyframeTarget, Key
         kind @ (KeyframeMediaKind::Video | KeyframeMediaKind::Screen) => kind,
         KeyframeMediaKind::Other => return None,
     };
+
+    // A readable delta cannot end a keyframe wait; `Unknown` fails open.
+    if inner_range.map(|(start, end)| inner_media_frame_kind(&data[start..end]))
+        == Some(InboundFrameKind::Delta)
+    {
+        return None;
+    }
 
     // Mirror the request-side target construction so the delivery key JOINS the
     // request key (session when set, else user_id — #1124). The user_id slice is
@@ -2155,6 +2275,157 @@ mod tests {
         limiter.allow_with_congestion(target, TEST_KIND, layer, congested)
     }
 
+    fn classify_v(
+        limiter: &mut KeyframeRequestLimiter,
+        target: KeyframeTarget,
+        congested: bool,
+    ) -> KeyframeRequestOutcome {
+        limiter.classify_with_congestion(target, TEST_KIND, 0, congested)
+    }
+
+    #[test]
+    fn classify_splits_denied_still_waiting_from_denied_budget() {
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = user_target(b"sender-2394");
+
+        assert_eq!(
+            classify_v(&mut limiter, target.clone(), false),
+            KeyframeRequestOutcome::AdmittedStrict,
+            "first request must be admitted by the strict per-pair budget"
+        );
+
+        assert_eq!(
+            classify_v(&mut limiter, target.clone(), false),
+            KeyframeRequestOutcome::DeniedStillWaiting,
+            "denied while no keyframe has been delivered yet is the frozen-receiver denial"
+        );
+
+        limiter.observe_delivery(target.clone(), TEST_KIND);
+
+        assert_eq!(
+            classify_v(&mut limiter, target, false),
+            KeyframeRequestOutcome::DeniedBudget,
+            "denied AFTER delivery cleared the wait is the limiter working as designed"
+        );
+    }
+
+    #[test]
+    fn classify_reports_admitted_still_waiting_after_the_min_retry_gap() {
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = user_target(b"sender-2394-waiting");
+        assert_eq!(
+            classify_v(&mut limiter, target.clone(), false),
+            KeyframeRequestOutcome::AdmittedStrict
+        );
+
+        let entry = limiter
+            .per_target
+            .get_mut(&(target.clone(), TEST_KIND, 0u32))
+            .expect("the admitted request must have opened a bucket");
+        entry.waiting_since = Some(
+            Instant::now()
+                - Duration::from_millis(KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS + 50),
+        );
+
+        assert_eq!(
+            classify_v(&mut limiter, target, false),
+            KeyframeRequestOutcome::AdmittedStillWaiting,
+            "the strict budget is exhausted, so this admit came from the #1297 relaxation"
+        );
+    }
+
+    #[test]
+    fn classify_reports_denied_global_at_the_receiver_ceiling() {
+        let mut limiter = KeyframeRequestLimiter::new();
+        for i in 0..KEYFRAME_REQUEST_MAX_PER_SEC {
+            let target = format!("sender-{i}");
+            assert_eq!(
+                classify_v(&mut limiter, user_target(target.as_bytes()), false),
+                KeyframeRequestOutcome::AdmittedStrict,
+                "distinct target {i} is a fresh pair and must fit under the global cap"
+            );
+        }
+
+        assert_eq!(
+            classify_v(&mut limiter, user_target(b"sender-over-ceiling"), false),
+            KeyframeRequestOutcome::DeniedGlobal,
+            "the request past KEYFRAME_REQUEST_MAX_PER_SEC must be attributed to the global cap"
+        );
+
+        // The case above is a FRESH key, so it returns at the #1303 new-bucket
+        // guard, never reaching the global `try_consume`. Reuse an ESTABLISHED
+        // pair — congested, so its per-pair budget still has room — to reach the
+        // global cap itself and pin the refund it owes the per-pair counter.
+        let established = user_target(b"sender-0");
+        assert_eq!(
+            classify_v(&mut limiter, established.clone(), true),
+            KeyframeRequestOutcome::DeniedGlobal,
+            "an established pair with per-pair room left is still refused by the never-relaxed \
+             global ceiling"
+        );
+        assert_eq!(
+            limiter
+                .per_target
+                .get(&(established, TEST_KIND, 0u32))
+                .expect("the established bucket must survive a global denial")
+                .count,
+            1,
+            "the global denial must refund the per-pair slot it consumed"
+        );
+    }
+
+    #[test]
+    fn classify_labels_a_congestion_relaxed_admit_separately_from_a_strict_one() {
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = user_target(b"sender-2394-relaxed");
+
+        assert_eq!(
+            classify_v(&mut limiter, target.clone(), true),
+            KeyframeRequestOutcome::AdmittedStrict,
+            "the first request under congestion also fits the strict budget, so the strict rule \
+             is the one that decided it"
+        );
+
+        assert_eq!(
+            classify_v(&mut limiter, target.clone(), true),
+            KeyframeRequestOutcome::AdmittedCongested,
+            "the strict per-pair budget would have denied this; only the #979 relaxation admitted \
+             it, so it must not be reported as admitted_strict"
+        );
+        assert_eq!(
+            classify_v(&mut limiter, target, true),
+            KeyframeRequestOutcome::AdmittedCongested,
+            "every subsequent admit inside the widened cap is congestion-relaxed too"
+        );
+    }
+
+    #[test]
+    fn congestion_relaxed_admit_is_measured_against_the_per_kind_strict_budget() {
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = user_target(b"sender-2394-screen");
+
+        // A classifier measuring every kind against the camera constant would
+        // mislabel requests 2..=4 here.
+        for i in 1..=KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN {
+            assert_eq!(
+                limiter.classify_with_congestion(
+                    target.clone(),
+                    KeyframeMediaKind::Screen,
+                    0,
+                    true
+                ),
+                KeyframeRequestOutcome::AdmittedStrict,
+                "screen request {i} still fits KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN"
+            );
+        }
+
+        assert_eq!(
+            limiter.classify_with_congestion(target, KeyframeMediaKind::Screen, 0, true),
+            KeyframeRequestOutcome::AdmittedCongested,
+            "the request past SCREEN's strict budget is the first one #979 had to admit"
+        );
+    }
+
     /// A `WindowCounter` with no waiting state, for tests that synthesize map
     /// entries directly. Mirrors a fresh per-pair entry that has never issued a
     /// still-waiting allow.
@@ -2618,10 +2889,10 @@ mod tests {
     }
 
     #[test]
-    fn test_keyframe_limiter_still_waiting_admits_retry_on_lossless_path() {
-        // #1297 (a) — the core fix. On a LOSSLESS path (congested == false, so
-        // the #979 relaxation can NEVER fire) a still-frozen receiver whose
-        // strict 1/sec budget is exhausted must STILL be able to re-request once
+    fn test_keyframe_limiter_still_waiting_admits_retry_when_not_congested() {
+        // #1297 (a) — the core fix. With congested == false, a still-frozen
+        // receiver whose strict 1/sec budget is exhausted must STILL be able to
+        // re-request once
         // the min-retry interval elapses, because no qualifying media has been
         // delivered to it (waiting flag still set). Before #1297 this second
         // request was dropped and the receiver stayed frozen.
@@ -2648,10 +2919,10 @@ mod tests {
         // delivery observed) by rewinding the waiting timestamp.
         rewind_waiting(&mut limiter, &key);
 
-        // Now the still-waiting, lossless-path retry must be ADMITTED.
+        // Now the still-waiting retry must be ADMITTED.
         assert!(
             allow_cong_v(&mut limiter, target, 0, false),
-            "a still-waiting receiver on a lossless path must be allowed to \
+            "a still-waiting receiver must be allowed to \
              re-request once the min-retry interval elapses (#1297)"
         );
     }
@@ -3074,6 +3345,133 @@ mod tests {
             outbound_keyframe_observation(&[1, 2, 3, 0xff]),
             None,
             "unparseable bytes fail safe to no observation"
+        );
+    }
+
+    /// Outer VIDEO MEDIA wrapper (publisher session 555) whose `data` is a serialized inner `MediaPacket`.
+    fn framed_video_delivery(frame_type: &str) -> Vec<u8> {
+        let inner = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            frame_type: frame_type.to_string(),
+            data: vec![0xABu8; 4096],
+            ..Default::default()
+        };
+        PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id: 555,
+            media_kind: MediaKind::VIDEO.into(),
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap()
+    }
+
+    #[test]
+    fn test_outbound_observation_delta_does_not_clear_keyframe_wait() {
+        // #2363: `frame_type` lives on the INNER MediaPacket (field 4), so the outer
+        // `media_kind` alone cannot establish that a delivery bears a keyframe.
+        assert_eq!(
+            outbound_keyframe_observation(&framed_video_delivery("delta")),
+            None,
+            "a delivered DELTA frame is not a keyframe delivery"
+        );
+        assert_eq!(
+            outbound_keyframe_observation(&framed_video_delivery("key")),
+            Some((KeyframeTarget::Session(555), KeyframeMediaKind::Video)),
+            "a delivered KEY frame must observe (Session(publisher), Video)"
+        );
+    }
+
+    #[test]
+    fn test_delta_run_leaves_keyframe_wait_set_through_the_limiter() {
+        // A receiver still receiving deltas (the #2363 signature) must remain waiting.
+        let mut limiter = KeyframeRequestLimiter::new();
+        assert!(limiter.allow(KeyframeTarget::Session(555), KeyframeMediaKind::Video, 0));
+        let waiting = |l: &KeyframeRequestLimiter| {
+            l.per_target
+                .get(&(KeyframeTarget::Session(555), KeyframeMediaKind::Video, 0u32))
+                .expect("the request must have created the bucket")
+                .waiting_since
+                .is_some()
+        };
+
+        for _ in 0..30 {
+            if let Some((target, kind)) =
+                outbound_keyframe_observation(&framed_video_delivery("delta"))
+            {
+                limiter.observe_delivery(target, kind);
+            }
+        }
+        assert!(
+            waiting(&limiter),
+            "a run of delta deliveries must leave the keyframe wait set"
+        );
+
+        let (target, kind) = outbound_keyframe_observation(&framed_video_delivery("key")).unwrap();
+        limiter.observe_delivery(target, kind);
+        assert!(
+            !waiting(&limiter),
+            "the keyframe delivery must clear the wait"
+        );
+    }
+
+    #[test]
+    fn test_outbound_observation_fails_open_on_unreadable_inner_packet() {
+        // E2EE seals the inner MediaPacket, so an unreadable one must still observe
+        // rather than pin the receiver in the delivery-aware relaxation.
+        let sealed = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id: 42,
+            media_kind: MediaKind::VIDEO.into(),
+            data: vec![0xFFu8; 512],
+            ..Default::default()
+        };
+        assert_eq!(
+            outbound_keyframe_observation(&sealed.write_to_bytes().unwrap()),
+            Some((KeyframeTarget::Session(42), KeyframeMediaKind::Video)),
+            "an unreadable inner packet must fail open and observe"
+        );
+
+        let no_frame_type = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id: 42,
+            media_kind: MediaKind::VIDEO.into(),
+            data: MediaPacket {
+                media_type: MediaType::VIDEO.into(),
+                data: vec![3u8; 64],
+                ..Default::default()
+            }
+            .write_to_bytes()
+            .unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(
+            outbound_keyframe_observation(&no_frame_type.write_to_bytes().unwrap()),
+            Some((KeyframeTarget::Session(42), KeyframeMediaKind::Video)),
+            "an absent frame_type must fail open and observe"
+        );
+    }
+
+    #[test]
+    fn test_outbound_observation_ignores_frame_type_on_non_video_outer_kind() {
+        let audio_key = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id: 555,
+            media_kind: MediaKind::AUDIO.into(),
+            data: MediaPacket {
+                media_type: MediaType::AUDIO.into(),
+                frame_type: "key".to_string(),
+                ..Default::default()
+            }
+            .write_to_bytes()
+            .unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(
+            outbound_keyframe_observation(&audio_key.write_to_bytes().unwrap()),
+            None,
+            "an AUDIO delivery is never a keyframe delivery, whatever frame_type says"
         );
     }
 

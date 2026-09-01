@@ -22,8 +22,12 @@ use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
 use crate::messages::{
     classify_worker_message_kind, FreshnessSkipMessage, KeyframeArrivalMessage,
-    RequestKeyframeMessage, VideoStatsMessage, WorkerLogMessage, WorkerMessage, WorkerMessageKind,
+    RequestKeyframeMessage, StreamContext, VideoStatsMessage, WorkerLogMessage, WorkerMessage,
+    WorkerMessageKind, WorkerReadyMessage,
 };
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::rc::Rc;
 #[cfg(feature = "wasm")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use wasm_bindgen::prelude::*;
@@ -40,6 +44,11 @@ pub struct WasmDecoder {
     _on_message_closure: Closure<dyn FnMut(web_sys::MessageEvent)>,
     // Store the user's callback
     _on_decoded_frame: Box<dyn Fn(DecodedFrame)>,
+    /// Mirrored onto the MAIN thread because the worker→main DiagEvent forward is dropped
+    /// outright when the worker-supplied `to_peer` is empty (#2524).
+    freshness_evictions: Rc<Cell<FreshnessEvictionAccum>>,
+    gate: Rc<BootGate>,
+    context_reemit: ContextReemitRamp,
 }
 
 impl Decodable for WasmDecoder {
@@ -58,6 +67,8 @@ impl Decodable for WasmDecoder {
         // `MEDIA_TYPE_CAMERA`) is the safe default: there is no real screen-share decoder on this
         // path, so the camera bucket is correct.
         const DECODABLE_DEFAULT_MEDIA_TYPE: &str = "VIDEO";
+        // Camera's `PERIODIC_KEYFRAME_MAX_INTERVAL_MS`, from the non-dependency `videocall-aq`.
+        const DECODABLE_DEFAULT_BOOT_REPLAY_TTL_MS: f64 = 5000.0;
         // Find the worker script URL from the link tag added by Trunk.
         let worker_url = window()
             .expect("no window")
@@ -74,11 +85,12 @@ impl Decodable for WasmDecoder {
         // Convert the Send + Sync callback to a non-Send one for WASM
         let callback: Box<dyn Fn(DecodedFrame)> = unsafe { std::mem::transmute(on_decoded_frame) };
 
+        let freshness_evictions = Rc::new(Cell::new(FreshnessEvictionAccum::default()));
+        let gate = Rc::new(BootGate::new(DECODABLE_DEFAULT_BOOT_REPLAY_TTL_MS));
+
         // Create a closure to handle messages from the worker.
         let on_message_closure = {
             // We need to use Rc<RefCell<>> to share the callback since trait objects can't be cloned
-            use std::cell::{Cell, RefCell};
-            use std::rc::Rc;
             let callback_rc = Rc::new(RefCell::new(callback));
             let callback_for_closure = callback_rc.clone();
             // Stage-3 paint lag (issue #1252): mirror of the active render path's frame-drain count
@@ -87,6 +99,8 @@ impl Decodable for WasmDecoder {
             let painted = Rc::new(Cell::new(0u64));
             let last_ack_ms = Rc::new(Cell::new(0f64));
             let ack_worker = worker.clone();
+            let evictions_for_closure = freshness_evictions.clone();
+            let gate_for_closure = gate.clone();
 
             Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
                 let js_val = event.data();
@@ -108,7 +122,7 @@ impl Decodable for WasmDecoder {
                             cb(decoded_frame);
                         }
                         video_frame.close();
-                        post_paint_progress(&ack_worker, &painted, &last_ack_ms);
+                        post_paint_progress(&ack_worker, &painted, &last_ack_ms, &gate_for_closure);
                     }
                     Err(_) => {
                         // Issue #1025: this `Decodable::new` path is not used for real peer
@@ -116,8 +130,13 @@ impl Decodable for WasmDecoder {
                         // is no proactive keyframe hook to fire here — but we still recognize the
                         // worker's RequestKeyframeMessage so it isn't logged as "unexpected". The
                         // carried `head_age_ms` (#1479) is ignored on this no-render path.
-                        if handle_worker_request_keyframe(&js_val).is_none()
-                            && !handle_worker_diag_message(&js_val, DECODABLE_DEFAULT_MEDIA_TYPE)
+                        if !drain_on_worker_ready(&js_val, &ack_worker, &gate_for_closure)
+                            && handle_worker_request_keyframe(&js_val).is_none()
+                            && !handle_worker_diag_message(
+                                &js_val,
+                                DECODABLE_DEFAULT_MEDIA_TYPE,
+                                &evictions_for_closure,
+                            )
                         {
                             log::warn!("Received unexpected message from worker: {js_val:?}");
                         }
@@ -137,11 +156,14 @@ impl Decodable for WasmDecoder {
             worker,
             _on_message_closure: on_message_closure,
             _on_decoded_frame: dummy_callback,
+            freshness_evictions,
+            gate,
+            context_reemit: ContextReemitRamp::default(),
         }
     }
 
     fn decode(&self, frame: FrameBuffer) {
-        self.push_frame(frame);
+        self.push_frame(frame, None);
     }
 }
 
@@ -164,11 +186,14 @@ impl WasmDecoder {
     /// [`handle_worker_diag_message`]) so `health_reporter` buckets the playout-family metrics
     /// (latency / paint-lag / skip-to-live / content-staleness) into the correct camera-vs-screen
     /// slot, mirroring how `emit_loss_metrics` already stamps its loss/keyframe metrics.
+    ///
+    /// `boot_replay_ttl_ms` (issue 2572): ONE publisher keyframe interval for the stream's kind.
     pub fn new_with_video_frame_callback(
         _codec: crate::decoder::VideoCodec,
         on_video_frame: Box<dyn Fn(VideoFrame)>,
         on_request_keyframe: Box<dyn Fn(f64)>,
         media_type: &'static str,
+        boot_replay_ttl_ms: f64,
     ) -> Self {
         log::info!("Creating WASM decoder with VideoFrame callback");
         // Find the worker script URL from the link tag added by Trunk.
@@ -184,10 +209,11 @@ impl WasmDecoder {
         // Create the worker.
         let worker = Worker::new(&worker_url).expect("Failed to create worker");
 
+        let freshness_evictions = Rc::new(Cell::new(FreshnessEvictionAccum::default()));
+        let gate = Rc::new(BootGate::new(boot_replay_ttl_ms));
+
         // Create a closure to handle messages from the worker.
         let on_message_closure = {
-            use std::cell::Cell;
-            use std::rc::Rc;
             let callback = on_video_frame;
             // Stage-3 paint lag (issue #1252): count every decoded VideoFrame this (main-thread)
             // closure drains from the worker->main postMessage queue — count the queue-drain, not
@@ -202,6 +228,8 @@ impl WasmDecoder {
             // stored on the struct and kept alive for the worker's lifetime) so it survives as
             // long as the decoder. Invoked when the worker posts a RequestKeyframeMessage.
             let request_keyframe = on_request_keyframe;
+            let evictions_for_closure = freshness_evictions.clone();
+            let gate_for_closure = gate.clone();
             Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
                 let js_val = event.data();
 
@@ -210,7 +238,7 @@ impl WasmDecoder {
                     Ok(video_frame) => {
                         painted.set(painted.get().wrapping_add(1));
                         callback(video_frame);
-                        post_paint_progress(&ack_worker, &painted, &last_ack_ms);
+                        post_paint_progress(&ack_worker, &painted, &last_ack_ms, &gate_for_closure);
                     }
                     Err(_) => {
                         // Worker->main serde messages: try the proactive keyframe-request signal
@@ -219,10 +247,16 @@ impl WasmDecoder {
                         // keeps the recovery path off the (more frequent) stats path. The carried
                         // `head_age_ms` (#1479) is forwarded to the route so the main thread's PLI
                         // budget can prioritize the stalest stream.
-                        if let Some(head_age_ms) = handle_worker_request_keyframe(&js_val) {
-                            request_keyframe(head_age_ms);
-                        } else if !handle_worker_diag_message(&js_val, media_type) {
-                            log::warn!("Received unexpected message from worker: {js_val:?}");
+                        if !drain_on_worker_ready(&js_val, &ack_worker, &gate_for_closure) {
+                            if let Some(head_age_ms) = handle_worker_request_keyframe(&js_val) {
+                                request_keyframe(head_age_ms);
+                            } else if !handle_worker_diag_message(
+                                &js_val,
+                                media_type,
+                                &evictions_for_closure,
+                            ) {
+                                log::warn!("Received unexpected message from worker: {js_val:?}");
+                            }
                         }
                     }
                 }
@@ -240,22 +274,47 @@ impl WasmDecoder {
             worker,
             _on_message_closure: on_message_closure,
             _on_decoded_frame: dummy_callback,
+            freshness_evictions,
+            gate,
+            context_reemit: ContextReemitRamp::default(),
         }
     }
 
+    pub fn freshness_eviction_counts(&self) -> (u64, u64) {
+        self.freshness_evictions.get().exported()
+    }
+
+    fn send(&self, msg: WorkerMessage) {
+        self.gate.send(&self.worker, msg);
+    }
+
+    pub fn worker_handshake_seen(&self) -> bool {
+        self.gate.handshake_seen.get()
+    }
+
+    pub fn boot_queue_dropped(&self) -> bool {
+        self.gate.dropped.get()
+    }
+
+    pub fn boot_replay_ttl_ms(&self) -> f64 {
+        self.gate.ttl_ms
+    }
+
+    pub fn boot_replay_max_messages(&self) -> usize {
+        BOOT_REPLAY_MAX_MESSAGES
+    }
+
+    pub fn context_reemit_ramp_frames(&self) -> u32 {
+        CONTEXT_REEMIT_RAMP_FRAMES
+    }
+
+    pub fn context_reemit_interval_ms(&self) -> f64 {
+        CONTEXT_REEMIT_INTERVAL_MS
+    }
+
     /// New ergonomic API: simply push a frame and let the decoder handle the rest
-    pub fn push_frame(&self, frame: FrameBuffer) {
-        let message = WorkerMessage::DecodeFrame(frame);
-        match serde_wasm_bindgen::to_value(&message) {
-            Ok(js_message) => {
-                if let Err(e) = self.worker.post_message(&js_message) {
-                    log::error!("Error posting message to worker: {e:?}");
-                }
-            }
-            Err(e) => {
-                log::error!("Error serializing message: {e:?}");
-            }
-        }
+    pub fn push_frame(&self, frame: FrameBuffer, context: Option<StreamContext>) {
+        self.post_frame(WorkerMessage::DecodeFrame(frame), context);
     }
 
     /// **Test-only** (issue #1022): post a crafted frame the worker will insert at the
@@ -264,33 +323,35 @@ impl WasmDecoder {
     /// stale head-of-line backlog so the worker's ~10ms tick trips the #1020 freshness deadline
     /// and emits an observable `freshness_skip` (#1045). Only the `MOCK_PEERS_ENABLED`-gated
     /// injection hook (`videocall_client::freshness_inject`) calls this; production never does.
-    pub fn inject_stale_frame(&self, frame: FrameBuffer) {
-        let message = WorkerMessage::InjectStaleFrame(frame);
-        match serde_wasm_bindgen::to_value(&message) {
-            Ok(js_message) => {
-                if let Err(e) = self.worker.post_message(&js_message) {
-                    log::error!("Error posting inject-stale-frame message to worker: {e:?}");
-                }
-            }
-            Err(e) => {
-                log::error!("Error serializing inject-stale-frame message: {e:?}");
+    pub fn inject_stale_frame(&self, frame: FrameBuffer, context: Option<StreamContext>) {
+        self.post_frame(WorkerMessage::InjectStaleFrame(frame), context);
+    }
+
+    /// A frame that takes a re-emit slot has its attribution enqueued ahead of it (FIFO), but
+    /// best-effort: a bound breach between the two sends posts the frame bare (issue 1741).
+    fn post_frame(&self, message: WorkerMessage, context: Option<StreamContext>) {
+        if let Some(context) = context {
+            if self
+                .context_reemit
+                .take_reemit_slot(&context, js_sys::Date::now)
+            {
+                self.send_context(context);
             }
         }
+        self.send(message);
     }
 
     /// Provide diagnostic context to the worker so that metrics include original peer IDs
     pub fn set_context(&self, from_peer: String, to_peer: String) {
-        let message = WorkerMessage::SetContext { from_peer, to_peer };
-        match serde_wasm_bindgen::to_value(&message) {
-            Ok(js_message) => {
-                if let Err(e) = self.worker.post_message(&js_message) {
-                    log::error!("Error posting context message to worker: {e:?}");
-                } else {
-                    log::debug!("Sent context to worker");
-                }
-            }
-            Err(e) => log::error!("Error serializing context message: {e:?}"),
-        }
+        let context = StreamContext { from_peer, to_peer };
+        self.context_reemit
+            .open_epoch(&context, js_sys::Date::now());
+        self.send_context(context);
+    }
+
+    fn send_context(&self, context: StreamContext) {
+        let StreamContext { from_peer, to_peer } = context;
+        self.send(WorkerMessage::SetContext { from_peer, to_peer });
     }
 
     /// Check if the decoder is waiting for a keyframe
@@ -303,36 +364,12 @@ impl WasmDecoder {
 
     /// Flush the internal decoder buffer
     pub fn flush(&self) {
-        let message = WorkerMessage::Flush;
-        match serde_wasm_bindgen::to_value(&message) {
-            Ok(js_message) => {
-                if let Err(e) = self.worker.post_message(&js_message) {
-                    log::error!("Error posting flush message to worker: {e:?}");
-                } else {
-                    log::debug!("Sent flush message to worker");
-                }
-            }
-            Err(e) => {
-                log::error!("Error serializing flush message: {e:?}");
-            }
-        }
+        self.send(WorkerMessage::Flush);
     }
 
     /// Reset the decoder to initial state (waiting for keyframe)
     pub fn reset(&self) {
-        let message = WorkerMessage::Reset;
-        match serde_wasm_bindgen::to_value(&message) {
-            Ok(js_message) => {
-                if let Err(e) = self.worker.post_message(&js_message) {
-                    log::error!("Error posting reset message to worker: {e:?}");
-                } else {
-                    log::debug!("Sent reset message to worker");
-                }
-            }
-            Err(e) => {
-                log::error!("Error serializing reset message: {e:?}");
-            }
-        }
+        self.send(WorkerMessage::Reset);
     }
 }
 
@@ -352,8 +389,9 @@ impl Drop for WasmDecoder {
 #[inline]
 fn post_paint_progress(
     worker: &Worker,
-    painted: &std::rc::Rc<std::cell::Cell<u64>>,
-    last_ack_ms: &std::rc::Rc<std::cell::Cell<f64>>,
+    painted: &Cell<u64>,
+    last_ack_ms: &Cell<f64>,
+    gate: &BootGate,
 ) {
     const PAINT_PROGRESS_ACK_INTERVAL_MS: f64 = 500.0;
     let now = js_sys::Date::now();
@@ -361,17 +399,161 @@ fn post_paint_progress(
         return;
     }
     last_ack_ms.set(now);
-    let message = WorkerMessage::PaintProgress {
-        painted: painted.get(),
-    };
-    match serde_wasm_bindgen::to_value(&message) {
+    gate.send(
+        worker,
+        WorkerMessage::PaintProgress {
+            painted: painted.get(),
+        },
+    );
+}
+
+/// Frames from the start of a context epoch that each carry a `SetContext` re-emit.
+const CONTEXT_REEMIT_RAMP_FRAMES: u32 = 30;
+const CONTEXT_REEMIT_INTERVAL_MS: f64 = 1000.0;
+
+/// An epoch is one distinct context VALUE; a differing value re-emits and restarts the ramp.
+#[derive(Default)]
+struct ContextReemitRamp {
+    last_sent: RefCell<Option<StreamContext>>,
+    frames_in_epoch: Cell<u32>,
+    last_sent_ms: Cell<f64>,
+}
+
+impl ContextReemitRamp {
+    /// `true` means the slot is ALREADY taken: deciding and stamping are one step, so a caller
+    /// cannot advance `last_sent_ms` on a frame it does not send. `now` is read lazily.
+    fn take_reemit_slot(&self, context: &StreamContext, now: impl FnOnce() -> f64) -> bool {
+        // Bind, so the shared borrow is released before `open_epoch` takes a mutable one.
+        let changed = self.last_sent.borrow().as_ref() != Some(context);
+        if changed {
+            self.open_epoch(context, now());
+            return true;
+        }
+        let seen = self.frames_in_epoch.get();
+        self.frames_in_epoch.set(seen.saturating_add(1));
+        if seen < CONTEXT_REEMIT_RAMP_FRAMES {
+            return true;
+        }
+        let now_ms = now();
+        if now_ms - self.last_sent_ms.get() < CONTEXT_REEMIT_INTERVAL_MS {
+            return false;
+        }
+        self.last_sent_ms.set(now_ms);
+        true
+    }
+
+    /// Force-opens an epoch for the ungated `set_context` path.
+    fn open_epoch(&self, context: &StreamContext, now_ms: f64) {
+        *self.last_sent.borrow_mut() = Some(context.clone());
+        self.frames_in_epoch.set(0);
+        self.last_sent_ms.set(now_ms);
+    }
+}
+
+/// Holds main->worker posts made before the worker's async `main()` installs `onmessage`, and
+/// replays them on its handshake (issue 2572). Exceeding either bound DISCARDS the backlog rather
+/// than flushing it: `insert_frame_to_jitter_buffer` re-stamps arrival with the worker's clock.
+/// Counts MESSAGES, not frames — a frame that takes a re-emit slot costs two. Local on purpose:
+/// aliasing the jitter buffer's frame capacity would let a retune there silently retune this.
+const BOOT_REPLAY_MAX_MESSAGES: usize = 200;
+
+struct BootGate {
+    /// Set by the handshake OR by a bound; `handshake_seen` is what tells those two apart.
+    ready: Cell<bool>,
+    handshake_seen: Cell<bool>,
+    dropped: Cell<bool>,
+    pending: RefCell<VecDeque<WorkerMessage>>,
+    /// `Date::now()` of the FIRST queued message, or `0.0` while nothing has been queued.
+    first_queued_ms: Cell<f64>,
+    ttl_ms: f64,
+}
+
+impl BootGate {
+    fn new(ttl_ms: f64) -> Self {
+        Self {
+            ready: Cell::new(false),
+            handshake_seen: Cell::new(false),
+            dropped: Cell::new(false),
+            pending: RefCell::new(VecDeque::new()),
+            first_queued_ms: Cell::new(0.0),
+            ttl_ms,
+        }
+    }
+
+    fn over_bound(&self) -> bool {
+        let first = self.first_queued_ms.get();
+        (first != 0.0 && js_sys::Date::now() - first >= self.ttl_ms)
+            || self.pending.borrow().len() >= BOOT_REPLAY_MAX_MESSAGES
+    }
+
+    fn discard(&self) {
+        self.pending.borrow_mut().clear();
+        self.dropped.set(true);
+        self.ready.set(true);
+    }
+
+    fn send(&self, worker: &Worker, msg: WorkerMessage) {
+        if !self.ready.get() && self.over_bound() {
+            self.discard();
+        }
+        // `msg` survives the discard above; once queued it can still be dropped by a later one.
+        if self.ready.get() {
+            post_worker_message(worker, &msg);
+            return;
+        }
+        if self.first_queued_ms.get() == 0.0 {
+            self.first_queued_ms.set(js_sys::Date::now());
+        }
+        self.pending.borrow_mut().push_back(msg);
+    }
+}
+
+fn post_worker_message(worker: &Worker, msg: &WorkerMessage) {
+    let label = worker_message_label(msg);
+    match serde_wasm_bindgen::to_value(msg) {
         Ok(js_message) => {
             if let Err(e) = worker.post_message(&js_message) {
-                log::error!("Error posting PaintProgress to worker: {e:?}");
+                log::error!("Error posting {label} to worker: {e:?}");
             }
         }
-        Err(e) => log::error!("Error serializing PaintProgress: {e:?}"),
+        Err(e) => log::error!("Error serializing {label}: {e:?}"),
     }
+}
+
+fn worker_message_label(msg: &WorkerMessage) -> &'static str {
+    match msg {
+        WorkerMessage::DecodeFrame(_) => "message",
+        WorkerMessage::Flush => "flush message",
+        WorkerMessage::Reset => "reset message",
+        WorkerMessage::SetContext { .. } => "context message",
+        WorkerMessage::PaintProgress { .. } => "PaintProgress",
+        WorkerMessage::InjectStaleFrame(_) => "inject-stale-frame message",
+    }
+}
+
+/// Called from BOTH `onmessage` closures: a constructor that omitted it would queue forever.
+/// The `handshake_seen` guard keeps a one-shot's `from_value` off every worker->main message.
+fn drain_on_worker_ready(js_val: &JsValue, worker: &Worker, gate: &BootGate) -> bool {
+    if gate.handshake_seen.get() {
+        return false;
+    }
+    match serde_wasm_bindgen::from_value::<WorkerReadyMessage>(js_val.clone()) {
+        Ok(msg) if classify_worker_message_kind(&msg.kind) == WorkerMessageKind::WorkerReady => {}
+        _ => return false,
+    }
+    gate.handshake_seen.set(true);
+    if gate.over_bound() {
+        gate.discard();
+    } else {
+        loop {
+            let Some(msg) = gate.pending.borrow_mut().pop_front() else {
+                break;
+            };
+            post_worker_message(worker, &msg);
+        }
+    }
+    gate.ready.set(true);
+    true
 }
 
 /// Recognize the worker's proactive keyframe-request signal (issue #1025). Returns
@@ -405,6 +587,68 @@ fn handle_worker_request_keyframe(js_val: &JsValue) -> Option<f64> {
     }
 }
 
+/// The worker's counters restart at 0 on a #1662 rebuild while this cell survives, so the
+/// export keeps rising rather than showing a drop (#2524).
+#[derive(Clone, Copy, Default)]
+struct FreshnessEvictionAccum {
+    base_total: u64,
+    base_keyframeless: u64,
+    last_raw_total: u64,
+    last_raw_keyframeless: u64,
+}
+
+impl FreshnessEvictionAccum {
+    fn exported(self) -> (u64, u64) {
+        (
+            self.base_total.saturating_add(self.last_raw_total),
+            self.base_keyframeless
+                .saturating_add(self.last_raw_keyframeless),
+        )
+    }
+}
+
+/// A reading below the previous one is a rebuild, never a reorder: both posts ride one FIFO
+/// `postMessage` port. `total` alone decides it — the pair is ONE snapshot of ONE buffer.
+fn accumulate_freshness_evictions(
+    cell: &std::cell::Cell<FreshnessEvictionAccum>,
+    total: u64,
+    keyframeless: u64,
+) {
+    let mut acc = cell.get();
+    if total < acc.last_raw_total {
+        acc.base_total = acc.base_total.saturating_add(acc.last_raw_total);
+        acc.base_keyframeless = acc
+            .base_keyframeless
+            .saturating_add(acc.last_raw_keyframeless);
+    }
+    acc.last_raw_total = total;
+    acc.last_raw_keyframeless = keyframeless;
+    cell.set(acc);
+}
+
+/// Diagnostics event for a peer-attributed worker message. `to_peer` is the per-peer key consumers
+/// fold state under, so an absent or empty one yields `None` rather than a phantom entry;
+/// `from_peer` is stamped only when non-empty.
+#[cfg(feature = "wasm")]
+fn peer_diag_event(
+    subsystem: &'static str,
+    from_peer: Option<String>,
+    to_peer: Option<String>,
+    mut metrics: Vec<Metric>,
+) -> Option<DiagEvent> {
+    let to_peer = to_peer.filter(|p| !p.is_empty())?;
+    if let Some(from_peer) = from_peer.filter(|p| !p.is_empty()) {
+        metrics.push(metric!("from_peer", from_peer));
+    }
+    metrics.push(metric!("to_peer", to_peer));
+    Some(DiagEvent {
+        subsystem,
+        stream_id: None,
+        ts_ms: now_ms(),
+        metrics,
+    })
+}
+
 /// Handle diagnostics objects posted by the worker. Returns true if handled.
 ///
 /// `media_type` (issue #1641) is the owning decoder's stream kind (`"VIDEO"` / `"SCREEN"`),
@@ -414,19 +658,31 @@ fn handle_worker_request_keyframe(js_val: &JsValue) -> Option<f64> {
 /// the owner (`VideoPeerDecoder`), the only place the kind is known. The `worker_log` branch is a
 /// `"worker_log"` subsystem event that `health_reporter` does NOT camera/screen-bucket, so it is
 /// intentionally left unstamped.
-fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> bool {
+fn handle_worker_diag_message(
+    js_val: &JsValue,
+    media_type: &'static str,
+    freshness_evictions: &std::cell::Cell<FreshnessEvictionAccum>,
+) -> bool {
     // video_stats (issue #1252). A freshness_skip message ALSO deserializes into
     // VideoStatsMessage (its fields are all `Option`), so we must check `kind` and
     // fall through rather than treating a successful deserialize as a match.
     if let Ok(stats_msg) = serde_wasm_bindgen::from_value::<VideoStatsMessage>(js_val.clone()) {
         if classify_worker_message_kind(&stats_msg.kind) == WorkerMessageKind::VideoStats {
+            // Gated on presence, not `unwrap_or(0)`: an older worker build that omits the
+            // fields would otherwise read as a rebuild and inflate the banked base.
+            if let (Some(total), Some(keyframeless)) = (
+                stats_msg.freshness_evictions_total,
+                stats_msg.freshness_evictions_keyframeless_total,
+            ) {
+                accumulate_freshness_evictions(freshness_evictions, total, keyframeless);
+            }
             #[cfg(feature = "wasm")]
             {
-                let evt = DiagEvent {
-                    subsystem: "video",
-                    stream_id: None,
-                    ts_ms: now_ms(),
-                    metrics: vec![
+                let evt = peer_diag_event(
+                    "video",
+                    stats_msg.from_peer,
+                    stats_msg.to_peer,
+                    vec![
                         // Issue #1641: stamp the owning decoder's stream kind so health_reporter
                         // routes the playout-family metrics below into the correct camera-vs-screen
                         // bucket. Without this, a peer's SCREEN-decoder worker stats landed in the
@@ -439,8 +695,6 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                             name: "media_type",
                             value: MetricValue::text_static(media_type),
                         },
-                        metric!("from_peer", stats_msg.from_peer.unwrap_or_default()),
-                        metric!("to_peer", stats_msg.to_peer.unwrap_or_default()),
                         metric!("frames_buffered", stats_msg.frames_buffered.unwrap_or(0)),
                         metric!(
                             "playout_latency_ms",
@@ -478,8 +732,10 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                             stats_msg.keyframe_arrivals_total.unwrap_or(0)
                         ),
                     ],
-                };
-                let _ = global_sender().try_broadcast(evt);
+                );
+                if let Some(evt) = evt {
+                    let _ = global_sender().try_broadcast(evt);
+                }
             }
             return true;
         }
@@ -539,11 +795,11 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                     console::debug_1(&line);
                 }
 
-                let evt = DiagEvent {
-                    subsystem: "video",
-                    stream_id: None,
-                    ts_ms: now_ms(),
-                    metrics: vec![
+                let evt = peer_diag_event(
+                    "video",
+                    arrival_msg.from_peer,
+                    arrival_msg.to_peer,
+                    vec![
                         Metric {
                             name: "event",
                             value: MetricValue::text_static("keyframe_arrival"),
@@ -555,8 +811,6 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                             name: "media_type",
                             value: MetricValue::text_static(media_type),
                         },
-                        metric!("from_peer", arrival_msg.from_peer.unwrap_or_default()),
-                        metric!("to_peer", arrival_msg.to_peer.unwrap_or_default()),
                         metric!("keyframe_seq", arrival_msg.seq),
                         metric!("head_age_ms", arrival_msg.head_age_ms),
                         // `MetricValue` has no bool variant; emit the flags as 1/0 u64,
@@ -568,8 +822,10 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                         metric!("rejected_as_old", u64::from(arrival_msg.rejected_as_old)),
                         metric!("stream_restart", u64::from(arrival_msg.stream_restart)),
                     ],
-                };
-                let _ = global_sender().try_broadcast(evt);
+                );
+                if let Some(evt) = evt {
+                    let _ = global_sender().try_broadcast(evt);
+                }
             }
             return true;
         }
@@ -591,6 +847,13 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
     // matches the grep the field investigation already uses for this signal.
     if let Ok(skip_msg) = serde_wasm_bindgen::from_value::<FreshnessSkipMessage>(js_val.clone()) {
         if classify_worker_message_kind(&skip_msg.kind) == WorkerMessageKind::FreshnessSkip {
+            // Ungated on `SetContext`, unlike the 1Hz stats tick that also carries these.
+            if let (Some(total), Some(keyframeless)) = (
+                skip_msg.freshness_evictions_total,
+                skip_msg.freshness_evictions_keyframeless_total,
+            ) {
+                accumulate_freshness_evictions(freshness_evictions, total, keyframeless);
+            }
             #[cfg(feature = "wasm")]
             {
                 // A skip means the head-of-line frame aged past the playout deadline and stale
@@ -607,11 +870,11 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                 // keyframe-`None` rendering fails a host test rather than shipping green.
                 console::warn_1(&skip_msg.console_line().into());
 
-                let evt = DiagEvent {
-                    subsystem: "video",
-                    stream_id: None,
-                    ts_ms: now_ms(),
-                    metrics: vec![
+                let evt = peer_diag_event(
+                    "video",
+                    skip_msg.from_peer,
+                    skip_msg.to_peer,
+                    vec![
                         // Static literal → zero-alloc borrow (#1421).
                         Metric {
                             name: "event",
@@ -627,8 +890,6 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                             name: "media_type",
                             value: MetricValue::text_static(media_type),
                         },
-                        metric!("from_peer", skip_msg.from_peer.unwrap_or_default()),
-                        metric!("to_peer", skip_msg.to_peer.unwrap_or_default()),
                         metric!("head_age_ms", skip_msg.head_age_ms),
                         // -1 marks the keyframe-less (held last-good) case, since the
                         // metric value is numeric and `keyframe_seq` is optional.
@@ -650,8 +911,10 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                         // without parsing the console line.
                         metric!("tick_gap_ms", skip_msg.tick_gap_ms),
                     ],
-                };
-                let _ = global_sender().try_broadcast(evt);
+                );
+                if let Some(evt) = evt {
+                    let _ = global_sender().try_broadcast(evt);
+                }
             }
             return true;
         }
@@ -696,11 +959,11 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                     _ => console::log_1(&line.into()),
                 }
 
-                let evt = DiagEvent {
-                    subsystem: "worker_log",
-                    stream_id: None,
-                    ts_ms: now_ms(),
-                    metrics: vec![
+                let evt = peer_diag_event(
+                    "worker_log",
+                    log_msg.from_peer,
+                    log_msg.to_peer,
+                    vec![
                         // Static literal → zero-alloc borrow (#1421).
                         Metric {
                             name: "event",
@@ -709,15 +972,15 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
                         metric!("level", log_msg.level),
                         metric!("target", log_msg.target),
                         metric!("message", log_msg.message),
-                        metric!("from_peer", log_msg.from_peer.unwrap_or_default()),
-                        metric!("to_peer", log_msg.to_peer.unwrap_or_default()),
                         // Records coalesced by the worker's rate limit since the last forwarded
                         // line (issue #1356); 0 on a normal line. Surfaces dropped volume without
                         // per-record network amplification.
                         metric!("suppressed", log_msg.suppressed),
                     ],
-                };
-                let _ = global_sender().try_broadcast(evt);
+                );
+                if let Some(evt) = evt {
+                    let _ = global_sender().try_broadcast(evt);
+                }
             }
             return true;
         }
@@ -726,4 +989,247 @@ fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> boo
     // Not a recognized diagnostic message
     log::debug!("Received unexpected message from worker: {js_val:?}");
     false
+}
+
+#[cfg(all(test, feature = "wasm"))]
+mod context_reemit_ramp_tests {
+    use super::*;
+
+    fn ctx(from: &str, to: &str) -> StreamContext {
+        StreamContext {
+            from_peer: from.to_string(),
+            to_peer: to.to_string(),
+        }
+    }
+
+    fn exhaust_ramp(ramp: &ContextReemitRamp, context: &StreamContext, now_ms: f64) {
+        for i in 0..CONTEXT_REEMIT_RAMP_FRAMES {
+            assert!(
+                ramp.take_reemit_slot(context, || now_ms),
+                "ramp frame {i} must re-emit; the ramp is shorter than it claims"
+            );
+        }
+        assert!(
+            !ramp.take_reemit_slot(context, || now_ms),
+            "the ramp must end at exactly {CONTEXT_REEMIT_RAMP_FRAMES} frames"
+        );
+    }
+
+    #[test]
+    fn every_frame_of_the_opening_ramp_reemits_then_the_throttle_takes_over() {
+        let ramp = ContextReemitRamp::default();
+        let context = ctx("local", "peer");
+        ramp.open_epoch(&context, 1000.0);
+        // Every post shares one millisecond, so only the ramp can be what admits them.
+        exhaust_ramp(&ramp, &context, 1000.0);
+    }
+
+    #[test]
+    fn a_first_frame_with_an_unsent_context_opens_the_epoch_itself() {
+        let ramp = ContextReemitRamp::default();
+        let context = ctx("local", "peer");
+        assert!(
+            ramp.take_reemit_slot(&context, || 1000.0),
+            "a context the worker was never told must re-emit on its first frame"
+        );
+        exhaust_ramp(&ramp, &context, 1000.0);
+    }
+
+    #[test]
+    fn a_post_ramp_burst_inside_one_interval_reemits_exactly_once() {
+        let ramp = ContextReemitRamp::default();
+        let context = ctx("local", "peer");
+        ramp.open_epoch(&context, 1000.0);
+        exhaust_ramp(&ramp, &context, 1000.0);
+
+        let burst_ms = 1000.0 + CONTEXT_REEMIT_INTERVAL_MS;
+        let sent = (0..20)
+            .filter(|i| ramp.take_reemit_slot(&context, || burst_ms + f64::from(*i)))
+            .count();
+        assert_eq!(
+            sent, 1,
+            "past the ramp, a burst inside one interval must re-emit exactly once"
+        );
+    }
+
+    /// The 1Hz floor holds ACROSS intervals: one tick must not push the next one out.
+    #[test]
+    fn the_throttle_keeps_ticking_over_consecutive_intervals() {
+        let ramp = ContextReemitRamp::default();
+        let context = ctx("local", "peer");
+        ramp.open_epoch(&context, 0.0);
+        exhaust_ramp(&ramp, &context, 0.0);
+
+        let mut sent = u32::from(ramp.take_reemit_slot(&context, || CONTEXT_REEMIT_INTERVAL_MS));
+        let step = CONTEXT_REEMIT_INTERVAL_MS / 3.0;
+        sent += (1..=5)
+            .filter(|i| {
+                ramp.take_reemit_slot(&context, || {
+                    CONTEXT_REEMIT_INTERVAL_MS + step * f64::from(*i)
+                })
+            })
+            .count() as u32;
+        assert_eq!(
+            sent, 2,
+            "two intervals elapsed, so exactly two ticks must fire"
+        );
+    }
+
+    #[test]
+    fn a_post_ramp_frame_just_under_the_interval_is_still_throttled() {
+        let ramp = ContextReemitRamp::default();
+        let context = ctx("local", "peer");
+        ramp.open_epoch(&context, 1000.0);
+        exhaust_ramp(&ramp, &context, 1000.0);
+        assert!(
+            !ramp.take_reemit_slot(&context, || 1000.0 + CONTEXT_REEMIT_INTERVAL_MS - 1.0),
+            "one millisecond short of the interval must not re-emit"
+        );
+        assert!(
+            ramp.take_reemit_slot(&context, || 1000.0 + CONTEXT_REEMIT_INTERVAL_MS),
+            "the interval boundary itself must re-emit"
+        );
+    }
+
+    /// The SESSION_ASSIGNED case: `from_peer` fills in while the gate is throttled.
+    #[test]
+    fn a_changed_context_reemits_mid_throttle_and_restarts_the_ramp() {
+        let ramp = ContextReemitRamp::default();
+        let first = ctx("", "peer");
+        ramp.open_epoch(&first, 1000.0);
+        exhaust_ramp(&ramp, &first, 1000.0);
+
+        let second = ctx("42", "peer");
+        assert!(
+            ramp.take_reemit_slot(&second, || 1000.0),
+            "a changed context must re-emit without waiting for the interval"
+        );
+        exhaust_ramp(&ramp, &second, 1000.0);
+    }
+}
+
+#[cfg(all(test, feature = "wasm"))]
+mod peer_attribution_tests {
+    use super::*;
+
+    fn text(evt: &DiagEvent, name: &str) -> Option<String> {
+        evt.metrics
+            .iter()
+            .find(|m| m.name == name)
+            .and_then(|m| match &m.value {
+                MetricValue::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+    }
+
+    /// Detecting per counter dropped the pre-rebuild keyframeless run whenever the subset did
+    /// not also decrease — and that subset is the one this PR calls the FREEZE.
+    #[test]
+    fn a_rebuild_banks_the_keyframeless_run_even_when_it_did_not_decrease() {
+        let cell = std::cell::Cell::new(FreshnessEvictionAccum::default());
+        accumulate_freshness_evictions(&cell, 12, 1);
+        assert_eq!(cell.get().exported(), (12, 1));
+
+        accumulate_freshness_evictions(&cell, 2, 1);
+        assert_eq!(
+            cell.get().exported(),
+            (14, 2),
+            "the pre-rebuild keyframeless run must be banked off the TOTAL decrease"
+        );
+    }
+
+    #[test]
+    fn a_jitter_buffer_rebuild_is_absorbed_not_discarded() {
+        let cell = std::cell::Cell::new(FreshnessEvictionAccum::default());
+        accumulate_freshness_evictions(&cell, 12, 9);
+        assert_eq!(cell.get().exported(), (12, 9));
+
+        accumulate_freshness_evictions(&cell, 4, 0);
+        assert_eq!(
+            cell.get().exported(),
+            (16, 9),
+            "post-rebuild skips must ADD to the pre-rebuild run, not be dropped"
+        );
+        accumulate_freshness_evictions(&cell, 5, 1);
+        assert_eq!(
+            cell.get().exported(),
+            (17, 10),
+            "and keep advancing on the new run"
+        );
+
+        accumulate_freshness_evictions(&cell, 1, 0);
+        assert_eq!(cell.get().exported(), (18, 10));
+    }
+
+    #[test]
+    fn an_unidentified_target_peer_emits_nothing() {
+        let cases = [
+            (Some("alice"), None),
+            (Some("alice"), Some("")),
+            (None, None),
+            (Some(""), Some("")),
+        ];
+        for (from_peer, to_peer) in cases {
+            let evt = peer_diag_event(
+                "video",
+                from_peer.map(str::to_string),
+                to_peer.map(str::to_string),
+                vec![metric!("frames_buffered", 3u64)],
+            );
+            assert!(
+                evt.is_none(),
+                "from_peer={from_peer:?} to_peer={to_peer:?} must not be broadcast"
+            );
+        }
+    }
+
+    // Issue #1640: `SetContext` carries an empty local id until SESSION_ASSIGNED arrives.
+    #[test]
+    fn an_identified_target_peer_reports_without_a_source_peer() {
+        for from_peer in [None, Some("")] {
+            let evt = peer_diag_event(
+                "video",
+                from_peer.map(str::to_string),
+                Some("bob".to_string()),
+                vec![metric!("frames_buffered", 3u64)],
+            )
+            .expect("an identified target peer must be broadcast");
+            assert_eq!(text(&evt, "to_peer").as_deref(), Some("bob"));
+            assert_eq!(text(&evt, "from_peer"), None);
+            assert_eq!(evt.metrics.len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_complete_peer_pair_is_stamped_onto_the_event() {
+        let evt = peer_diag_event(
+            "video",
+            Some("alice".to_string()),
+            Some("bob".to_string()),
+            vec![metric!("frames_buffered", 3u64)],
+        )
+        .expect("a complete peer pair must be broadcast");
+        assert_eq!(evt.subsystem, "video");
+        assert_eq!(text(&evt, "from_peer").as_deref(), Some("alice"));
+        assert_eq!(text(&evt, "to_peer").as_deref(), Some("bob"));
+        assert_eq!(evt.metrics.len(), 3, "caller metrics must be preserved");
+    }
+
+    #[test]
+    fn peer_labels_are_constructed_at_one_site() {
+        let src: String = include_str!("wasm.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for label in ["from_peer", "to_peer"] {
+            let count: usize = [format!("metric!(\"{label}\""), format!("name:\"{label}\"")]
+                .iter()
+                .map(|spelling| src.matches(spelling.as_str()).count())
+                .sum();
+            assert_eq!(
+                count, 1,
+                "expected exactly 1 {label} construction in this file, found {count}"
+            );
+        }
+    }
 }

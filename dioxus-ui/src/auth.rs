@@ -95,25 +95,6 @@ const PROFILE_USER_ID_KEY: &str = "vc_profile_user_id";
 /// validated id_token payload.
 const PROFILE_DISPLAY_NAME_KEY: &str = "vc_profile_display_name";
 
-/// Session-storage key for the stable guest participant ID (`guest:<uuid>`)
-/// that is reused across re-joins within the same browser tab.
-const GUEST_SESSION_ID_KEY: &str = "vc_guest_session_id";
-
-/// Read the stable guest session ID for the current tab, if any.
-pub fn get_guest_session_id() -> Option<String> {
-    read_session_storage(GUEST_SESSION_ID_KEY)
-}
-
-/// Persist the guest session ID so re-joins reuse the same participant row.
-pub fn store_guest_session_id(id: &str) {
-    write_session_storage(GUEST_SESSION_ID_KEY, id);
-}
-
-/// Clear the guest session ID.
-pub fn clear_guest_session_id() {
-    remove_session_storage(GUEST_SESSION_ID_KEY);
-}
-
 // ---------------------------------------------------------------------------
 // Token storage
 // ---------------------------------------------------------------------------
@@ -236,14 +217,32 @@ pub fn clear_refresh_token() {
 /// No token VALUE is ever logged — only attempt/success/failure markers and
 /// the provider's (token-free) error string on failure.
 pub async fn refresh_access_token() -> Result<String, String> {
-    let refresh_token =
-        get_stored_refresh_token().ok_or_else(|| "no refresh token stored".to_string())?;
-    let token_endpoint = crate::constants::oauth_token_url()
-        .ok_or_else(|| "OAUTH_TOKEN_URL not configured".to_string())?;
-    let client_id = crate::constants::oauth_client_id()
-        .ok_or_else(|| "OAUTH_CLIENT_ID not configured".to_string())?;
+    let refresh_token = match get_stored_refresh_token() {
+        Some(t) => t,
+        None => {
+            let e = "no refresh token stored";
+            log::warn!("PKCE token refresh unavailable: {e}");
+            return Err(e.to_string());
+        }
+    };
+    let client_id = match crate::constants::oauth_client_id() {
+        Some(c) => c,
+        None => {
+            let e = "OAUTH_CLIENT_ID not configured";
+            log::warn!("PKCE token refresh unavailable: {e}");
+            return Err(e.to_string());
+        }
+    };
 
     log::info!("PKCE token refresh attempt");
+
+    let token_endpoint = match crate::token_endpoint::resolve_token_endpoint().await {
+        Ok(url) => url,
+        Err(e) => {
+            log::warn!("PKCE token refresh unavailable: token endpoint unresolved: {e}");
+            return Err(e);
+        }
+    };
 
     // Snapshot the clear-epoch BEFORE the network POST. The matching compare
     // happens strictly AFTER the await resolves (see the logout-resurrection
@@ -367,19 +366,19 @@ pub async fn check_session() -> anyhow::Result<()> {
     // guest — but only when no OAuth session could exist.  When PKCE-based
     // OAuth is active and tokens are present the user has logged in *after*
     // a guest session; bail-out would incorrectly reject a valid session.
-    if get_guest_session_id().is_some() && crate::constants::is_pkce_flow() {
+    if crate::guest_session::has_any() && crate::constants::is_pkce_flow() {
         let has_oauth_tokens =
             get_stored_access_token().is_some() || get_stored_id_token().is_some();
         if !has_oauth_tokens {
-            clear_guest_session_id();
+            crate::guest_session::clear_legacy_marker();
             return Err(anyhow!("guest session; no OAuth session cookie"));
         }
         // If OAuth tokens exist, fall through to normal check
-        clear_guest_session_id();
-    } else if get_guest_session_id().is_some() {
-        // Server-side OAuth: a backend session cookie may still be valid;
-        // clear the stale guest marker and fall through to the network check.
-        clear_guest_session_id();
+        crate::guest_session::clear_legacy_marker();
+    } else if crate::guest_session::has_any() {
+        // Server-side OAuth: a backend session cookie may still be valid; fall
+        // through to the network check.
+        crate::guest_session::clear_legacy_marker();
     }
     if crate::constants::is_pkce_flow()
         && get_stored_access_token().is_none()

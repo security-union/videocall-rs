@@ -64,55 +64,6 @@ runtimeConfig:
   consoleLogUploadEnabled: "false"
   # Independent operator control for client hardware/network/battery telemetry.
   hardwareMetricsEnabled: "true"
-  # Reduced CAMERA simulcast ladder (issue #1768). OMITTED here = OFF = the
-  # shipped 180p/360p/720p ladder (behaviour identical to pre-#1768). Set to
-  # "true" to switch this deployment's MULTI-LAYER publishers to 180p/360p/540p:
-  #
-  #   experimentalReducedLadder: "true"
-  #
-  # WHY it exists: the top rung is ~87.8% of a 3-layer encode's cost (27.65 of
-  # 31.5 Mpx/s), so 720p->540p cuts encode ~38% — but evaluating a candidate
-  # ladder otherwise needs a wasm rebuild + full deploy. Behind this key it is a
-  # `helm upgrade`. It also narrows the n==2 rung gap (2-layer publishers, i.e.
-  # 6-9 core devices) from [180p,720p] to [180p,540p]. It does NOT change WHICH rung
-  # the #1256 tile-size lid selects — that lid never consults the top rung's height.
-  #
-  # SCOPE — applies only to publishers encoding >=2 simulcast layers. The variant is
-  # consulted on the SIMULCAST branch only; a single-stream publisher encodes at its
-  # native capture dims driven by VIDEO_QUALITY_TIERS and is completely unaffected.
-  # That includes devices below MIN_CORES_FOR_MULTILAYER (6 cores), which the
-  # capability sniff clamps to 1 layer -- i.e. some of the weak devices the CPU
-  # rationale cites. (Not an issue for the bot fleet: BOT_HW_CONCURRENCY=10
-  # yields 3 layers -- see e2e/bots-app/k8s/statefulset.yaml.)
-  #
-  # RECEIVER-SIDE WIN (the number that matters for weak clients): a peer decoding the
-  # TOP rung gets 960x540 instead of 1280x720 = 0.5625x the pixels, i.e. ~43.8% less
-  # decode work per frame (15.55 vs 27.65 Mpx/s at 30fps) and 900 vs 1500 kbps of
-  # downlink. On devices without hardware VP8/VP9 decode, software decode is the
-  # binding constraint, so this is the largest single effect of the flag.
-  #
-  # DEPLOYMENT-WIDE, not a per-user A/B: the wire carries only a layer INDEX, so
-  # a receiver resolves rung heights from its own compiled ladder for the size
-  # lid. A mixed-variant room still decodes correctly (the decoder sizes from the
-  # decoded frame, not the ladder) but its lid turns conservative — keep the value
-  # uniform. The native Rust `bot/` crate has no config.js and always publishes
-  # the DEFAULT ladder; the browser bots-app inherits whatever is served here.
-  #
-  # Camera only — the screen ladder is untouched (#1899/#1903 tune it separately).
-  # Verify which ladder a session actually used via the `ladder=` field on the
-  # client's AQ_STATUS console log line.
-  #
-  # KNOWN COSMETIC GAP while this is on: RECEIVER-side readouts still label rungs
-  # from the shipped ladder, because the wire carries only a layer index and the
-  # receiver's resolver (`received_layer_snapshot`) is pinned to the default table.
-  # So the performance panel / peer rows / receive-slider will say "720p · ~1.5M"
-  # for a peer actually publishing 960x540 @ ~900k. Layer SELECTION is unaffected
-  # (the #1256 size lid is provably insensitive to a top-rung change — see
-  # `size_cap_layer_is_insensitive_to_the_reduced_ladder_top_rung`) and DECODE is
-  # unaffected (the decoder sizes from the bitstream). For ground truth during a run
-  # use the PUBLISHER's `AQ_STATUS ladder=default|reduced` console field — NOT the
-  # receiver's rung label, and NOT `videocall_encoder_active_layers`, which is a layer
-  # COUNT with no geometry and reads identically under both variants.
   imageTag: "latest"
 
 ingress:

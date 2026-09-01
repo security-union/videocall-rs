@@ -157,6 +157,20 @@ pub const RELAY_LAYER_PREFERENCE_KINDS: &[&str] = &["video", "screen"];
 /// buckets.
 pub const RELAY_LAYER_ID_BUCKETS: &[&str] = &["0", "1", "2", "other"];
 
+/// Every `outcome` label value of `relay_keyframe_requests_total{room, kind,
+/// outcome}` (#2394), pinned to `KeyframeRequestOutcome::metric_label` by
+/// `metrics::tests::relay_keyframe_request_taxonomies_cover_production_labels`.
+pub const RELAY_KEYFRAME_REQUEST_OUTCOMES: &[&str] = &[
+    "admitted_strict",
+    "admitted_congested",
+    "admitted_still_waiting",
+    "denied_budget",
+    "denied_still_waiting",
+    "denied_global",
+];
+
+pub const RELAY_KEYFRAME_REQUEST_KINDS: &[&str] = &["video", "screen", "other"];
+
 /// Remove EVERY room-labeled relay CounterVec/GaugeVec series for `room`.
 ///
 /// Called by `chat_server` the moment a room drains to empty (see
@@ -224,15 +238,24 @@ pub fn forget_room_metrics(room: &str) {
         }
     }
 
+    // relay_keyframe_requests_total{room, kind, outcome} (#2394): 3 × 6 tuples.
+    for kind in RELAY_KEYFRAME_REQUEST_KINDS {
+        for outcome in RELAY_KEYFRAME_REQUEST_OUTCOMES {
+            let _ = RELAY_KEYFRAME_REQUESTS_TOTAL.remove_label_values(&[room, kind, outcome]);
+        }
+    }
+
     // relay_packet_drops_total{room, transport, drop_reason}: full cartesian
     // product of the two bounded taxonomies.
     for transport in RELAY_DROP_TRANSPORTS {
         for drop_reason in RELAY_DROP_KINDS {
             let _ = RELAY_PACKET_DROPS_TOTAL.remove_label_values(&[room, transport, drop_reason]);
         }
-        // relay_outbound_queue_depth / relay_active_sessions_per_room
-        // {room, transport} gauges.
+        // relay_outbound_queue_{depth,bytes} / relay_active_sessions_per_room.
         let _ = RELAY_OUTBOUND_QUEUE_DEPTH.remove_label_values(&[room, transport]);
+        for kind in crate::actors::priority_drop::QUEUE_BYTE_KINDS {
+            let _ = RELAY_OUTBOUND_QUEUE_BYTES.remove_label_values(&[room, transport, kind]);
+        }
         // EVICTION-PATH ORDERING RACE — benign, transient, self-healing (#1187).
         //
         // `relay_active_sessions_per_room{room,transport}` is `.inc()`'d in
@@ -307,6 +330,40 @@ pub fn forget_outbound_queue_depth_by_session(room: &str, transport: &str, sessi
     for channel in RELAY_OUTBOUND_QUEUE_DEPTH_CHANNELS {
         let _ = RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
             .remove_label_values(&[room, transport, session_id, channel]);
+    }
+}
+
+/// Remove a single session's per-kind outbound queue-byte series.
+pub fn forget_outbound_queue_bytes_by_session(room: &str, transport: &str, session_id: &str) {
+    for kind in crate::actors::priority_drop::QUEUE_BYTE_KINDS {
+        let _ = RELAY_OUTBOUND_QUEUE_BYTES_BY_SESSION
+            .remove_label_values(&[room, transport, session_id, kind]);
+    }
+}
+
+/// Sample one WS session's outbound queue occupancy onto the room-level and
+/// per-session depth/bytes gauges.
+pub fn record_ws_outbound_queue_sample(
+    room: &str,
+    session_id: &str,
+    depth: usize,
+    bytes: &crate::actors::priority_drop::QueueByteMeter,
+) {
+    RELAY_OUTBOUND_QUEUE_DEPTH
+        .with_label_values(&[room, "websocket"])
+        .set(depth as f64);
+    RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
+        .with_label_values(&[room, "websocket", session_id, "ws"])
+        .set(depth as f64);
+    for &priority in crate::actors::priority_drop::QUEUE_BYTE_KIND_PRIORITIES {
+        let kind = crate::actors::priority_drop::queue_byte_kind_label(priority);
+        let queued = bytes.queued_for(priority) as f64;
+        RELAY_OUTBOUND_QUEUE_BYTES
+            .with_label_values(&[room, "websocket", kind])
+            .set(queued);
+        RELAY_OUTBOUND_QUEUE_BYTES_BY_SESSION
+            .with_label_values(&[room, "websocket", session_id, kind])
+            .set(queued);
     }
 }
 
@@ -484,11 +541,10 @@ lazy_static! {
     /// `fps_received > 0` — so whenever this reads 0, staleness holds its 0.0 default,
     /// which is published as "at live".
     ///
-    /// `videocall_video_quality_score` is WORSE than absent — it STALE-LATCHES. The client
-    /// folds it only when fps > 0, and the server export is `if let Some(score) { .set(..) }`,
-    /// so on `None` nothing is written and the GaugeVec keeps serving its LAST value. The only
-    /// removal is `remove_per_peer_metrics` (disconnect GC, not a staleness sweep). A peer that
-    /// scored once therefore reads its last HEALTHY value while its video is frozen.
+    /// `videocall_video_quality_score` STALE-LATCHES whenever omitted: the export is
+    /// `if let Some(score) { .set(..) }` and the only removal is `remove_per_peer_metrics`
+    /// (disconnect GC). Since #2249 it is omitted only when no bytes arrive on either
+    /// stream — a stream receiving and not decoding scores 0.
     ///
     /// Those gates predate #2190, but #2190 widens the window they mislead in: a receiver
     /// pinned to a rung the publisher stopped sending now reads fps 0 where it previously read
@@ -691,18 +747,39 @@ lazy_static! {
     )
     .expect("Failed to create video_quality_score metric");
 
-    /// Per-peer windowed video sequence packet-loss rate (freeze indicator)
+    /// Per-peer windowed video sequence loss rate (freeze indicator)
     pub static ref VIDEO_SEQ_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_video_seq_loss_per_sec",
-        "Per-peer windowed video sequence packet-loss rate (lost packets/sec) observed by the receiver; freeze indicator",
+        "Per-peer windowed video sequence loss rate (lost FRAMES/sec — the sender's sequence advances once per encoded chunk) observed by the receiver; freeze indicator",
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_seq_loss_per_sec metric");
 
-    /// Per-peer windowed rate of keyframe (PLI) requests sent to the peer
+    pub static ref VIDEO_SEQ_MAX_GAP: GaugeVec = register_gauge_vec!(
+        "videocall_video_seq_max_gap_frames",
+        "Largest missing video frame run that outgrew the receiver's reorder window, in FRAMES (issue 2524). The MAX over one client report interval, not a point sample; saturating, so a reading at the ceiling means 'at least this'. Read alongside videocall_video_seq_loss_per_sec, which is normalised by elapsed time and so cannot carry a burst SIZE.",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_seq_max_gap metric");
+
+    pub static ref VIDEO_FRESHNESS_EVICTIONS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_video_freshness_evictions_total",
+        "Lifetime count of receiver freshness-deadline evictions on this video stream (issue 2524): the head-of-line frame aged past MAX_PLAYOUT_AGE_MS (1800ms) and the buffer skipped or evicted. Counted at the jitter-buffer decision point, so it does NOT inherit the console line's ~1s throttle. Read it with rate()/increase(): it restarts at 0 on peer teardown, and the client re-bases it across a decode-pipeline rebuild so a rebuild is absorbed rather than shown as a drop",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_freshness_evictions_total metric");
+
+    pub static ref VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_video_freshness_evictions_keyframeless_total",
+        "Subset of videocall_video_freshness_evictions_total with NO buffered keyframe to skip to — the held-last-good FREEZE, as opposed to a routine skip-to-live (issue 2524). Counts evicting jitter-buffer POLLS, so its rate depends on the receiver's poll rate and is NOT comparable across devices or tab states. It is also 0 when NOTHING is arriving (an empty buffer has nothing to evict), so rate() cannot separate healthy from frozen-with-no-inbound-frames; join videocall_video_fps and videocall_video_keyframe_arrivals_total. Same read semantics as its parent",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_freshness_evictions_keyframeless_total metric");
+
+    /// Per-peer windowed rate of keyframe (PLI) requests the receiver DECIDED to make
     pub static ref KEYFRAME_REQUESTS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_keyframe_requests_per_sec",
-        "Per-peer windowed rate of keyframe (PLI) requests this client sent to the peer; sustained nonzero => stream cannot recover",
+        "Per-peer windowed rate of keyframe (PLI) requests this client DECIDED to make; a decided request that is later discarded is still counted here, so this is an upper bound on requests actually sent. Sustained nonzero => stream cannot recover",
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create keyframe_requests_per_sec metric");
@@ -724,11 +801,11 @@ lazy_static! {
 
     /// Per-peer windowed receive-side audio datagram RAW (uncapped) loss rate
     /// (issue 2031). The magnitude companion to
-    /// `videocall_audio_datagram_loss_per_sec`, which saturates at ~64/gap by the
-    /// 64-slot reorder window and so cannot distinguish 1% from 80% loss. This
-    /// sums the sequence-gap sizes un-truncated, so a heavy burst reads its true
-    /// magnitude; a large raw/capped ratio is the burst severity. Same recover-
-    /// to-0 semantics and WebTransport gate; 0.0 on WebSocket / E2EE-WT.
+    /// `videocall_audio_datagram_loss_per_sec`, which books a contiguous gap as
+    /// its positions shift off the 64-slot reorder window. This sums the
+    /// sequence-gap sizes un-truncated at the jump, so it leads by the positions
+    /// still inside the window.
+    /// Same recover-to-0 semantics and WebTransport gate; 0.0 on WS / E2EE-WT.
     pub static ref AUDIO_DATAGRAM_RAW_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_audio_datagram_raw_loss_per_sec",
         "Per-peer windowed receive-side audio datagram RAW (uncapped) loss rate (skipped sequences/sec) observed by a WebTransport receiver; the magnitude companion to videocall_audio_datagram_loss_per_sec",
@@ -871,6 +948,38 @@ lazy_static! {
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_keyframe_arrivals_total metric");
+
+    /// Measured from the client's decoder-OUTPUT clock, NOT from
+    /// `videocall_video_content_staleness_ms`, which is fps-gated and reads 0 throughout a real
+    /// freeze. ABSENT, not 0, from a client that does not populate the field.
+    pub static ref VIDEO_FREEZE_EPISODES_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_video_freeze_episodes_total",
+        "Receiver-side video freeze episodes per receiver→source pair (#2511); clocked on decoder output. Clients predating this change report the SAME series clocked on decoder INPUT, which reads ~0 through a real freeze. Restarts at 0 on peer teardown or a failed connection, so read it with increase(), not as a session lifetime total",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_freeze_episodes_total metric");
+
+    pub static ref VIDEO_FREEZE_SECONDS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_video_freeze_seconds_total",
+        "Receiver-side video freeze time in seconds per receiver→source pair (#2511); restarts at 0 on peer teardown or a failed connection, so read it with increase()",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_freeze_seconds_total metric");
+
+    pub static ref VIDEO_MAX_DECODE_GAP_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_max_decode_gap_ms",
+        "Longest receiver-side gap without decoder output in ms, accrued while the tile was BILLABLE — on screen and with the source publishing (#2511); despite the name this is NOT an arrival-to-decode gap. Clients predating this change report the SAME series clocked on decoder INPUT, which reads ~0 through a real freeze. Max over the WHOLE connection — unlike videocall_video_max_content_staleness_ms, which is a per-report-interval max — and restarts at 0 on peer teardown or a failed connection",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_max_decode_gap_ms metric");
+
+    /// Sampled upstream of the `fps_received > 0` gate that blanks the point-sampled sibling.
+    pub static ref VIDEO_MAX_CONTENT_STALENESS_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_max_content_staleness_ms",
+        "Max receiver content staleness in ms over ONE report interval (#2511) while decode-eligible; unlike videocall_video_max_decode_gap_ms, which is connection-wide",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_max_content_staleness_ms metric");
 
     /// Call quality score (0-100, min of audio and video)
     pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
@@ -1044,6 +1153,44 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id"]
     )
     .expect("Failed to create websocket_drops metric");
+
+    /// `stream_key`: 1=audio 2=video 3=screen 4=control.
+    pub static ref WEBSOCKET_OFFERED_BYTES_BY_STREAM: GaugeVec = register_gauge_vec!(
+        "videocall_websocket_offered_bytes_by_stream",
+        "Cumulative bytes offered to the WebSocket send path per media stream key, as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "stream_key"]
+    )
+    .expect("Failed to create websocket_offered_bytes_by_stream metric");
+
+    pub static ref WEBSOCKET_DROPPED_BYTES_BY_STREAM: GaugeVec = register_gauge_vec!(
+        "videocall_websocket_dropped_bytes_by_stream",
+        "Cumulative bytes discarded by the WebSocket send-buffer guard per media stream key, as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "stream_key"]
+    )
+    .expect("Failed to create websocket_dropped_bytes_by_stream metric");
+
+    /// Disjoint from WEBSOCKET_DROPS and WEBSOCKET_DROPPED_BYTES_BY_STREAM above,
+    /// which carry the send-buffer backpressure signal only (issue 2577).
+    pub static ref WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STREAM: GaugeVec = register_gauge_vec!(
+        "videocall_websocket_inactive_dropped_frames_by_stream",
+        "Cumulative frames discarded because the WebSocket was neither CONNECTING nor OPEN, per media stream key, as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "stream_key"]
+    )
+    .expect("Failed to create websocket_inactive_dropped_frames_by_stream metric");
+
+    pub static ref WEBSOCKET_INACTIVE_DROPPED_BYTES_BY_STREAM: GaugeVec = register_gauge_vec!(
+        "videocall_websocket_inactive_dropped_bytes_by_stream",
+        "Cumulative bytes discarded because the WebSocket was neither CONNECTING nor OPEN, per media stream key, as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "stream_key"]
+    )
+    .expect("Failed to create websocket_inactive_dropped_bytes_by_stream metric");
+
+    pub static ref WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STATE: GaugeVec = register_gauge_vec!(
+        "videocall_websocket_inactive_dropped_frames_by_state",
+        "Cumulative frames discarded on a non-live WebSocket, split by the readyState that caused it, as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "state"]
+    )
+    .expect("Failed to create websocket_inactive_dropped_frames_by_state metric");
 
     /// Cumulative keyframe requests sent (PLI)
     pub static ref KEYFRAME_REQUESTS_SENT_TOTAL: GaugeVec = register_gauge_vec!(
@@ -1611,6 +1758,70 @@ lazy_static! {
     )
     .expect("Failed to create screen_video_keyframe_arrivals_total metric");
 
+    pub static ref SCREEN_VIDEO_FREEZE_EPISODES_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_freeze_episodes_total",
+        "Receiver-side screen freeze episodes per receiver→source pair (#2511); clocked on decoder output. Clients predating this change report the SAME series clocked on decoder INPUT, which reads ~0 through a real freeze. A share that is enabled but delivering no frames is counted here whether or not anything is wrong, so join videocall_screen_video_keyframe_arrivals_total to separate idle content from a real freeze. Restarts at 0 on peer teardown or a failed connection, so read it with increase()",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_freeze_episodes_total metric");
+
+    pub static ref SCREEN_VIDEO_FREEZE_SECONDS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_freeze_seconds_total",
+        "Receiver-side screen freeze time in seconds per receiver→source pair (#2511); inflated by idle-but-enabled shares — see videocall_screen_video_freeze_episodes_total. Restarts at 0 on peer teardown or a failed connection, so read it with increase()",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_freeze_seconds_total metric");
+
+    pub static ref SCREEN_VIDEO_MAX_DECODE_GAP_MS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_max_decode_gap_ms",
+        "Longest receiver-side screen gap without decoder output in ms, accrued while the tile was BILLABLE — on screen and with the source publishing (#2511); despite the name this is NOT an arrival-to-decode gap. Clients predating this change report the SAME series clocked on decoder INPUT, which reads ~0 through a real freeze. Max over the WHOLE connection — unlike videocall_screen_video_max_content_staleness_ms, which is a per-report-interval max — and inflated by idle-but-enabled shares",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_max_decode_gap_ms metric");
+
+    pub static ref SCREEN_VIDEO_MAX_CONTENT_STALENESS_MS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_max_content_staleness_ms",
+        "Max receiver screen content staleness in ms over ONE report interval (#2511) while decode-eligible; unlike videocall_screen_video_max_decode_gap_ms, which is connection-wide; inflated by idle-but-enabled shares",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_max_content_staleness_ms metric");
+
+    pub static ref SCREEN_VIDEO_SEQ_MAX_GAP: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_seq_max_gap_frames",
+        "Screen sibling of videocall_video_seq_max_gap_frames (issue 2524): largest missing screen frame run that outgrew the receiver's reorder window, in FRAMES, interval MAX, saturating. Screen had NO exported receive-side loss signal at all before this",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_seq_max_gap_frames metric");
+
+    pub static ref SCREEN_VIDEO_FRESHNESS_EVICTIONS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_freshness_evictions_total",
+        "Screen sibling of videocall_video_freshness_evictions_total (issue 2524). An idle share cannot inflate this: an eviction needs a buffered-but-unreleasable frame, and a share publishing nothing drains empty",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_freshness_evictions_total metric");
+
+    pub static ref SCREEN_VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_freshness_evictions_keyframeless_total",
+        "Screen sibling of videocall_video_freshness_evictions_keyframeless_total (issue 2524): the held-last-good screen freeze. Same device-comparability and zero-when-nothing-arrives caveats as the camera sibling",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_freshness_evictions_keyframeless_total metric");
+
+    // Same 4-label set as the peer gauges above, so no new cardinality DIMENSION.
+    pub static ref SCREEN_VIDEO_SEQ_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_seq_loss_per_sec",
+        "Screen sibling of videocall_video_seq_loss_per_sec (issue 2524): per-peer windowed screen-stream sequence loss rate (lost FRAMES/sec — the sender's sequence advances once per encoded chunk) observed by the receiver. The camera series is sourced from PeerStats, which has no screen equivalent, so screen loss was unexportable before this. Normalised by elapsed time, so it cannot carry a burst SIZE — read it alongside videocall_screen_video_seq_max_gap_frames",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_seq_loss_per_sec metric");
+
+    pub static ref SCREEN_KEYFRAME_REQUESTS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_screen_keyframe_requests_per_sec",
+        "Screen sibling of videocall_keyframe_requests_per_sec (issue 2524): per-peer windowed rate of keyframe (PLI) requests this receiver DECIDED to send for the screen stream.",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_keyframe_requests_per_sec metric");
+
     // ===== TIER TRANSITION COUNTER =====
     //
     // CARDINALITY NOTE: 9-label CounterVec. The from_tier/to_tier labels create
@@ -1675,6 +1886,20 @@ lazy_static! {
         &["room", "transport", "drop_reason"]
     )
     .expect("Failed to create relay_packet_drops_total metric");
+
+    /// A nonzero rate is NORMAL: fragmentation happening and being handled (#2600).
+    pub static ref WS_FRAGMENTED_INBOUND_TOTAL: Counter = register_counter!(
+        "relay_ws_fragmented_inbound_total",
+        "Inbound WebSocket messages reassembled from a continuation sequence (issue 2600)"
+    )
+    .expect("Failed to create relay_ws_fragmented_inbound_total metric");
+
+    pub static ref WS_FRAGMENT_DISCARDED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_ws_fragment_discarded_total",
+        "Fragmented inbound WebSocket messages discarded before reassembly completed (issue 2600)",
+        &["reason"]
+    )
+    .expect("Failed to create relay_ws_fragment_discarded_total metric");
 
     /// VIDEO packets INTENTIONALLY not forwarded because the receiver's
     /// viewport set (HCL issue #988) does not include the source session.
@@ -2075,6 +2300,20 @@ lazy_static! {
     )
     .expect("Failed to create relay_layer_preference_sessions metric");
 
+    /// KEYFRAME_REQUEST admissions and denials at the relay limiter, per room
+    /// and media kind, split by which rule decided (#2394).
+    ///
+    /// CARDINALITY: `kind` × `outcome` = 3 × 6 = 18 series per LIVE room, both
+    /// taxonomies bounded in code and neither client-controllable;
+    /// [`forget_room_metrics`] sweeps that full product on room drain. Carries
+    /// no session_id/user_id.
+    pub static ref RELAY_KEYFRAME_REQUESTS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_keyframe_requests_total",
+        "KEYFRAME_REQUEST packets seen by the relay rate limiter per room and media kind, split by outcome (admitted_strict|admitted_congested|admitted_still_waiting|denied_budget|denied_still_waiting|denied_global); admitted_congested only the #979 relaxation made room for, and denied_still_waiting is a frozen receiver being throttled (#2394)",
+        &["room", "kind", "outcome"]
+    )
+    .expect("Failed to create relay_keyframe_requests_total metric");
+
     /// Current outbound channel occupancy per transport
     pub static ref RELAY_OUTBOUND_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
         "relay_outbound_queue_depth",
@@ -2082,6 +2321,24 @@ lazy_static! {
         &["room", "transport"]
     )
     .expect("Failed to create relay_outbound_queue_depth metric");
+
+    /// Outbound channel occupancy in BYTES per media kind (#2261). WS only.
+    /// Split by `kind` because the budgets are: camera must be judged on
+    /// camera bytes, not on a presenter's.
+    pub static ref RELAY_OUTBOUND_QUEUE_BYTES: GaugeVec = register_gauge_vec!(
+        "relay_outbound_queue_bytes",
+        "Current outbound channel occupancy in bytes by media kind (video|screen|other), WebSocket only. video/screen are the dimensions the #2261 priority policy sheds on; `other` (audio, control) is queued and reported but never shed on bytes. Room-level: each scrape reports one arbitrary session, so this does not reliably detect a single backed-up receiver -- use relay_outbound_queue_bytes_by_session for that",
+        &["room", "transport", "kind"]
+    )
+    .expect("Failed to create relay_outbound_queue_bytes metric");
+
+    /// Per-receiver outbound queue occupancy in BYTES keyed by session.
+    pub static ref RELAY_OUTBOUND_QUEUE_BYTES_BY_SESSION: GaugeVec = register_gauge_vec!(
+        "relay_outbound_queue_bytes_by_session",
+        "Per-receiver outbound queue occupancy in bytes keyed by session, split by media kind (video|screen|other), WebSocket only. The attributable form of relay_outbound_queue_bytes: one series per receiver, so a single backed-up receiver at its #2261 byte shed point is visible instead of being overwritten by an idle peer in the same room",
+        &["room", "transport", "session_id", "kind"]
+    )
+    .expect("Failed to create relay_outbound_queue_bytes_by_session metric");
 
     /// NATS publish latency histogram (milliseconds)
     pub static ref RELAY_NATS_PUBLISH_LATENCY_MS: Histogram = register_histogram!(
@@ -2137,8 +2394,8 @@ lazy_static! {
 
     /// JWT room-token rejections, labeled by reason.
     ///
-    /// CARDINALITY: bounded — exactly 5 series (`token_expired`, `invalid_signature`,
-    /// `missing_claim`, `malformed`, `other`). Safe for indefinite retention.
+    /// CARDINALITY: bounded — exactly 6 series (`token_expired`, `invalid_signature`,
+    /// `missing_claim`, `malformed`, `token_type_mismatch`, `other`). Safe indefinitely.
     ///
     /// Incremented from `token_validator::decode_room_token` and
     /// `validate_room_token` on the error-return path so every JWT auth failure
@@ -2149,6 +2406,13 @@ lazy_static! {
         &["reason"]
     )
     .expect("Failed to create videocall_auth_rejections_total metric");
+
+    /// Room tokens accepted despite carrying no `typ` claim (#2411).
+    pub static ref LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL: Counter = register_counter!(
+        "videocall_legacy_token_type_accepted_total",
+        "Room tokens accepted without a `typ` claim (pre-#2411 mints)"
+    )
+    .expect("Failed to create videocall_legacy_token_type_accepted_total metric");
     //
     // CARDINALITY DECISION (dashboard audit Tier B #3 / stale-JWT #562):
     // We deliberately do NOT add a `room`/`meeting_id` label to this counter.
@@ -2961,6 +3225,19 @@ pub fn forget_connection_path_stats(room: &str, session_id: &str) {
 // These tests verify the counter wiring in isolation. End-to-end behavior is
 // covered by `token_validator::tests` (auth) and is the responsibility of the
 // integration test suite for the transport drop sites.
+/// A `CounterVec` child emits no series until first touched, so a dashboard cannot tell
+/// "no discards" from "metric absent" (#2577). Idempotent; safe to call per session.
+pub fn init_ws_fragment_discard_series() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for reason in ["over_size", "abandoned", "interleaved"] {
+            WS_FRAGMENT_DISCARDED_TOTAL
+                .with_label_values(&[reason])
+                .inc_by(0.0);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3046,13 +3323,12 @@ mod tests {
     #[test]
     #[serial(token_validator_counter)]
     fn auth_rejections_counter_is_labeled_by_reason() {
-        // Cardinality contract: only the five documented reasons are valid
-        // labels. This test bumps each one and asserts independence.
         let reasons = [
             "token_expired",
             "invalid_signature",
             "missing_claim",
             "malformed",
+            "token_type_mismatch",
             "other",
         ];
         let before: Vec<f64> = reasons
@@ -3342,6 +3618,47 @@ mod tests {
         }
     }
 
+    /// #2394 leak guard: a label outside the GC taxonomy is never swept, so its
+    /// series survives every room drain (#996 leak class). The witnesses are the
+    /// production `metric_label` functions enumerated over their `VALUES`.
+    #[test]
+    fn relay_keyframe_request_taxonomies_cover_production_labels() {
+        use crate::actors::packet_handler::{KeyframeMediaKind, KeyframeRequestOutcome};
+
+        for outcome in KeyframeRequestOutcome::VALUES {
+            assert!(
+                RELAY_KEYFRAME_REQUEST_OUTCOMES.contains(&outcome.metric_label()),
+                "RELAY_KEYFRAME_REQUEST_OUTCOMES must cover emitted outcome {outcome:?} or \
+                 forget_room_metrics leaks its series (#2394)"
+            );
+        }
+        assert_eq!(
+            RELAY_KEYFRAME_REQUEST_OUTCOMES.len(),
+            KeyframeRequestOutcome::VALUES.len(),
+            "the outcome taxonomy and the production enum must not drift apart"
+        );
+
+        for kind in KeyframeMediaKind::VALUES {
+            assert!(
+                RELAY_KEYFRAME_REQUEST_KINDS.contains(&kind.metric_label()),
+                "RELAY_KEYFRAME_REQUEST_KINDS must cover emitted kind {kind:?} or \
+                 forget_room_metrics leaks its series (#2394)"
+            );
+        }
+        assert_eq!(
+            RELAY_KEYFRAME_REQUEST_KINDS.len(),
+            KeyframeMediaKind::VALUES.len(),
+            "the kind taxonomy and the production enum must not drift apart"
+        );
+
+        assert_eq!(
+            RELAY_KEYFRAME_REQUEST_KINDS.len() * RELAY_KEYFRAME_REQUEST_OUTCOMES.len(),
+            18,
+            "RELAY_KEYFRAME_REQUESTS_TOTAL's documented 18-series-per-room budget must match \
+             the tuples forget_room_metrics actually sweeps"
+        );
+    }
+
     /// REAL ENFORCEMENT of the #996 bound: after `forget_room_metrics(room)`,
     /// EVERY room-labeled relay series for that room must be gone. We seed one
     /// series per metric (covering the multi-label counters with a representative
@@ -3386,6 +3703,9 @@ mod tests {
             .inc();
         RELAY_LAYER_HINT_EMITTED_TOTAL
             .with_label_values(&[room, "suppress"])
+            .inc();
+        RELAY_KEYFRAME_REQUESTS_TOTAL
+            .with_label_values(&[room, "screen", "denied_still_waiting"])
             .inc();
         RELAY_PACKET_DROPS_TOTAL
             .with_label_values(&[room, "nats_delivery", "mailbox_full"])
@@ -3522,6 +3842,14 @@ mod tests {
                 .with_label_values(&[room, "suppress"])
                 .get(),
             0.0
+        );
+        assert_eq!(
+            RELAY_KEYFRAME_REQUESTS_TOTAL
+                .with_label_values(&[room, "screen", "denied_still_waiting"])
+                .get(),
+            0.0,
+            "relay_keyframe_requests_total{{room, kind, outcome}} must be swept by \
+             forget_room_metrics or every ended meeting leaks 18 series (#2394)"
         );
         assert_eq!(
             RELAY_PACKET_DROPS_TOTAL
@@ -3664,11 +3992,24 @@ mod tests {
         ]);
     }
 
+    /// Label-superset probe over `gather()`; cannot resurrect the child it inspects.
+    fn gathered_series_exists(name: &str, labels: &[(&str, &str)]) -> bool {
+        prometheus::gather().iter().any(|mf| {
+            mf.get_name() == name
+                && mf.get_metric().iter().any(|m| {
+                    labels.iter().all(|(k, v)| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == *k && l.get_value() == *v)
+                    })
+                })
+        })
+    }
+
     /// #1737 Phase 0: per-session outbound queue-depth gauges carry the same
     /// unbounded session_id cardinality as per-session drops, so the GC helper
     /// must sweep the full fixed channel set, not just channels observed by a
-    /// caller. Mutation sensitivity: removing any channel from
-    /// `forget_outbound_queue_depth_by_session` leaves a seeded series at 1.0.
+    /// caller.
     #[test]
     #[serial(outbound_queue_depth_by_session_gc)]
     fn outbound_queue_depth_by_session_gc_iterates_full_channel_set() {
@@ -3680,20 +4021,168 @@ mod tests {
             RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
                 .with_label_values(&[room, transport, session_id, channel])
                 .set(1.0);
+            assert!(
+                gathered_series_exists(
+                    "videocall_relay_outbound_queue_depth_by_session",
+                    &[
+                        ("room", room),
+                        ("session_id", session_id),
+                        ("channel", channel)
+                    ]
+                ),
+                "seed for channel {channel:?} must be gathered before removal, else the \
+                 post-sweep assert passes vacuously"
+            );
         }
 
         forget_outbound_queue_depth_by_session(room, transport, session_id);
 
         for channel in ["unistream", "datagram", "ws"] {
-            assert_eq!(
-                RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
-                    .with_label_values(&[room, transport, session_id, channel])
-                    .get(),
-                0.0,
-                "forget_outbound_queue_depth_by_session must remove channel {channel:?}"
+            assert!(
+                !gathered_series_exists(
+                    "videocall_relay_outbound_queue_depth_by_session",
+                    &[
+                        ("room", room),
+                        ("session_id", session_id),
+                        ("channel", channel)
+                    ]
+                ),
+                "forget_outbound_queue_depth_by_session must REMOVE channel {channel:?} from \
+                 the metric family, not merely reset it to 0 -- a zeroed series is still \
+                 encoded on every scrape and still ingested forever"
             );
-            let _ = RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
-                .remove_label_values(&[room, transport, session_id, channel]);
+        }
+    }
+
+    /// #2593: both halves are asserted — the room-level reading is the defect,
+    /// the per-session reading is the fix.
+    #[test]
+    #[serial(outbound_queue_bytes_by_session)]
+    fn per_session_bytes_survive_an_idle_peer_overwriting_the_room_gauge() {
+        use crate::actors::priority_drop::{OutboundPriority, QueueByteMeter};
+
+        let room = "wiretest_outbound_queue_bytes_by_session_2593";
+        let backed_up = "500000111";
+        let idle = "500000222";
+
+        let mut stalled = QueueByteMeter::default();
+        stalled.on_enqueue(OutboundPriority::Screen, 6_400_000);
+        stalled.on_enqueue(OutboundPriority::Video, 400_000);
+        let empty = QueueByteMeter::default();
+
+        record_ws_outbound_queue_sample(room, backed_up, 900, &stalled);
+        record_ws_outbound_queue_sample(room, idle, 0, &empty);
+
+        // Presence FIRST: with_label_values would create the child it checks for.
+        assert!(
+            gathered_series_exists(
+                "relay_outbound_queue_bytes",
+                &[
+                    ("room", room),
+                    ("transport", "websocket"),
+                    ("kind", "screen")
+                ]
+            ),
+            "room-level byte gauge must still be EMITTED, else the 0.0 below means \
+             absent rather than overwritten and proves nothing about #2593"
+        );
+        assert!(
+            gathered_series_exists(
+                "relay_outbound_queue_depth",
+                &[("room", room), ("transport", "websocket")]
+            ),
+            "room-level depth gauge must still be EMITTED, else the 0.0 below means \
+             absent rather than overwritten and proves nothing about #2593"
+        );
+
+        assert_eq!(
+            RELAY_OUTBOUND_QUEUE_BYTES
+                .with_label_values(&[room, "websocket", "screen"])
+                .get(),
+            0.0,
+            "room-level byte gauge is last-writer-wins, so the idle peer must have \
+             erased the stalled receiver's 6.4 MB"
+        );
+        assert_eq!(
+            RELAY_OUTBOUND_QUEUE_DEPTH
+                .with_label_values(&[room, "websocket"])
+                .get(),
+            0.0,
+            "room-level depth gauge has the same property (issue #2593 scope note)"
+        );
+
+        assert_eq!(
+            RELAY_OUTBOUND_QUEUE_BYTES_BY_SESSION
+                .with_label_values(&[room, "websocket", backed_up, "screen"])
+                .get(),
+            6_400_000.0,
+            "per-session byte gauge must still report the backed-up receiver's screen bytes"
+        );
+        assert_eq!(
+            RELAY_OUTBOUND_QUEUE_BYTES_BY_SESSION
+                .with_label_values(&[room, "websocket", backed_up, "video"])
+                .get(),
+            400_000.0,
+            "per-session byte gauge must keep the camera bucket separate"
+        );
+        assert_eq!(
+            RELAY_OUTBOUND_QUEUE_BYTES_BY_SESSION
+                .with_label_values(&[room, "websocket", idle, "screen"])
+                .get(),
+            0.0,
+            "the idle peer's own series must read 0, not the stalled receiver's bytes"
+        );
+        assert_eq!(
+            RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
+                .with_label_values(&[room, "websocket", backed_up, "ws"])
+                .get(),
+            900.0,
+            "per-session depth gauge must attribute the 900 occupied slots to the \
+             backed-up receiver (the retargeted RelayQueueNearFullWS expression)"
+        );
+
+        for session_id in [backed_up, idle] {
+            forget_outbound_queue_bytes_by_session(room, "websocket", session_id);
+            forget_outbound_queue_depth_by_session(room, "websocket", session_id);
+        }
+        forget_room_metrics(room);
+    }
+
+    /// #2593: `session_id` is unbounded over time, so teardown must sweep the
+    /// full fixed kind set, not just the kinds a caller happened to emit.
+    #[test]
+    #[serial(outbound_queue_bytes_by_session_gc)]
+    fn outbound_queue_bytes_by_session_gc_iterates_full_kind_set() {
+        let room = "wiretest_outbound_queue_bytes_gc_2593";
+        let transport = "websocket";
+        let session_id = "999000333";
+
+        for kind in crate::actors::priority_drop::QUEUE_BYTE_KINDS {
+            RELAY_OUTBOUND_QUEUE_BYTES_BY_SESSION
+                .with_label_values(&[room, transport, session_id, kind])
+                .set(1.0);
+            assert!(
+                gathered_series_exists(
+                    "relay_outbound_queue_bytes_by_session",
+                    &[("room", room), ("session_id", session_id), ("kind", kind)]
+                ),
+                "seed for kind {kind:?} must be gathered before removal, else the post-sweep \
+                 assert passes vacuously"
+            );
+        }
+
+        forget_outbound_queue_bytes_by_session(room, transport, session_id);
+
+        for kind in crate::actors::priority_drop::QUEUE_BYTE_KINDS {
+            assert!(
+                !gathered_series_exists(
+                    "relay_outbound_queue_bytes_by_session",
+                    &[("room", room), ("session_id", session_id), ("kind", kind)]
+                ),
+                "forget_outbound_queue_bytes_by_session must REMOVE kind {kind:?} from the \
+                 metric family, not merely reset it to 0 -- a zeroed series is still encoded \
+                 on every scrape and still ingested forever"
+            );
         }
     }
 

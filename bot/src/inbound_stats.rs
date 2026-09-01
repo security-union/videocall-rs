@@ -13,7 +13,7 @@
 
 //! Receiver-side packet quality diagnostics shared by WebSocket and WebTransport clients.
 //!
-//! Parses every inbound `PacketWrapper` → `MediaPacket`, tracks per-sender sequence
+//! Parses every inbound `PacketWrapper` → `MediaPacket`, tracks per-rung sequence
 //! numbers, measures inter-arrival variability, and computes A/V sync drift.
 //! Reports a summary line at `INFO` level every 10 seconds.
 
@@ -26,7 +26,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
-use videocall_aq::constants::{LAYER_AVAILABILITY_WINDOW_MS, SIMULCAST_MAX_LAYERS};
+use videocall_aq::constants::{
+    AUDIO_SIMULCAST_MAX_LAYERS, LAYER_AVAILABILITY_WINDOW_MS, SEQ_RESET_REANCHOR_GAP,
+    SIMULCAST_MAX_LAYERS,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -42,6 +45,12 @@ pub struct SenderHealthCounters {
     pub video_packets: u64,
     pub audio_bytes: u64,
     pub video_bytes: u64,
+    /// Sequence positions the DECODED rung skipped, per drain window — the browser
+    /// gates its tracker the same way, so an unfiltered count would make one proto
+    /// field mean two things by producer. Bounded by `RUNG_WINDOW`: a rung silent
+    /// longer than that re-baselines and books nothing.
+    pub audio_seq_gaps: u64,
+    pub video_seq_gaps: u64,
 }
 
 /// How long a rung stays "arriving" after its last packet.
@@ -50,6 +59,86 @@ pub struct SenderHealthCounters {
 /// `LayerAvailability::DEFAULT_WINDOW_MS` so bot and browser cannot drift on which
 /// rungs a source is offering (#2206).
 const RUNG_WINDOW: Duration = Duration::from_millis(LAYER_AVAILABILITY_WINDOW_MS);
+
+/// A media kind with its own simulcast ladder, layer-id space and sequence space.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum RungKind {
+    Audio,
+    Video,
+}
+
+/// Per-rung receive state. `last_seen` drives rung availability; `max_seq` is that
+/// rung's own high-water mark, since every simulcast layer stamps a dense sequence of
+/// its own.
+struct RungState {
+    last_seen: Instant,
+    max_seq: Option<u64>,
+}
+
+#[derive(Default)]
+struct RungAdmission {
+    would_decode: bool,
+    gap: u64,
+}
+
+/// Welford accumulator for the population standard deviation of consecutive
+/// inter-arrival deltas — NOT RFC 3550 jitter.
+#[derive(Default)]
+struct InterArrival {
+    last_ms: Option<f64>,
+    arrivals: u64,
+    deltas: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl InterArrival {
+    fn record(&mut self, at_ms: f64) {
+        self.arrivals += 1;
+        if let Some(prev) = self.last_ms.replace(at_ms) {
+            let delta = (at_ms - prev).abs();
+            self.deltas += 1;
+            let from_old_mean = delta - self.mean;
+            self.mean += from_old_mean / self.deltas as f64;
+            self.m2 += from_old_mean * (delta - self.mean);
+        }
+    }
+
+    fn stddev_ms(&self) -> f64 {
+        if self.deltas == 0 {
+            return 0.0;
+        }
+        (self.m2 / self.deltas as f64).sqrt()
+    }
+
+    #[cfg(test)]
+    fn arrivals(&self) -> u64 {
+        self.arrivals
+    }
+}
+
+/// `retain` and `remove` never shrink a `HashMap`; this gives the table back.
+fn shrink_if_sparse<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>) {
+    if map.capacity() > 4 * map.len().max(64) {
+        map.shrink_to_fit();
+    }
+}
+
+impl RungKind {
+    fn ladder_len(self) -> usize {
+        match self {
+            RungKind::Audio => AUDIO_SIMULCAST_MAX_LAYERS,
+            RungKind::Video => SIMULCAST_MAX_LAYERS,
+        }
+    }
+
+    fn pin_kind(self) -> PinMediaKind {
+        match self {
+            RungKind::Audio => PinMediaKind::Audio,
+            RungKind::Video => PinMediaKind::Video,
+        }
+    }
+}
 
 /// Tracks inbound packet statistics for quality-of-service diagnostics.
 #[derive(Default)]
@@ -61,28 +150,25 @@ pub struct InboundStats {
     other_packets: u64,
     audio_bytes: u64,
     video_bytes: u64,
-    /// Highest audio sequence number seen per sender (for gap detection under reorder).
-    max_audio_seq: HashMap<String, u64>,
-    /// Highest video sequence number seen per sender (for gap detection under reorder).
-    max_video_seq: HashMap<String, u64>,
     audio_seq_gaps: u64,
     video_seq_gaps: u64,
-    /// Arrival times for inter-arrival variability calculation.
-    video_arrivals: Vec<f64>,
-    audio_arrivals: Vec<f64>,
+    /// Rung marks abandoned this window for silence past `RUNG_WINDOW`. Nonzero means
+    /// the gap counters above under-report by an unknown amount.
+    audio_rung_expiries: u64,
+    video_rung_expiries: u64,
+    /// Inter-arrival variability, over every arriving rung.
+    video_ia: InterArrival,
+    audio_ia: InterArrival,
     // A/V sync dropped: browser audio uses Date.now() ms, video uses EncodedVideoChunk µs — cross-unit delta is meaningless. Re-add when browser wire format is unified.
     parse_errors: u64,
-    /// Last-seen instant per (source session_id, simulcast rung); a rung is "arriving"
-    /// while its last observation is within [`RUNG_WINDOW`]. Lets `video_packets`
-    /// count what the bot WOULD decode rather than every rung the relay forwards —
-    /// the relay fails open, so an unfiltered count reads the ladder sum (#2206).
+    /// Arrival and sequence state per (session_id, kind, rung).
     ///
-    /// Keyed by SESSION, not user: one user on two devices is two independent
-    /// sources the browser selects layers for separately, and a `u64` key also
-    /// avoids cloning the sender name on every video packet.
-    rung_last_seen: HashMap<(u64, u32), Instant>,
+    /// Keyed by SESSION, not user: one user on two devices is two independent sources
+    /// with independent per-rung sequence counters, so a user-keyed mark makes every
+    /// alternation between them look like loss.
+    rung_state: HashMap<(u64, RungKind, u32), RungState>,
     /// Per-sender counters for health reporting (accumulated between drains).
-    health_counters: HashMap<String, SenderHealthCounters>,
+    health_counters: HashMap<Arc<str>, SenderHealthCounters>,
     /// Total inbound packets since last health drain (all types).
     health_total_packets: u64,
     /// Snapshot of the most recently drained health-counter window, kept so
@@ -91,9 +177,9 @@ pub struct InboundStats {
     /// the live counters between producers.
     last_drain_snapshot: HashMap<String, SenderHealthCounters>,
     /// Last time each sender was seen — used to evict stale entries.
-    last_seen: HashMap<String, Instant>,
-    /// Intern map: raw user_id bytes → owned String to avoid per-packet allocation.
-    sender_names: HashMap<Vec<u8>, String>,
+    last_seen: HashMap<Arc<str>, Instant>,
+    /// Intern map: raw user_id bytes → the one shared name every per-sender map keys on.
+    sender_names: HashMap<Vec<u8>, Arc<str>>,
     // NOTE(#1108): the `aq` controller handle and `diagnostics_parse_errors`
     // counter were removed — inbound DIAGNOSTICS are no longer parsed or routed
     // into the AQ (receiver FPS no longer feeds the sender AQ). The bot AQ ticks
@@ -208,37 +294,103 @@ impl InboundStats {
     /// regime bots simulate.
     ///
     /// Freshness is tested inside the lookup rather than pruned first, so this is at
-    /// most `SIMULCAST_MAX_LAYERS` direct lookups — O(1) in publisher count — and
+    /// most `kind.ladder_len()` direct lookups — O(1) in publisher count — and
     /// eviction is left to [`Self::reset`].
-    fn highest_arriving_rung(&self, session_id: u64, now: Instant) -> u32 {
-        (0..SIMULCAST_MAX_LAYERS as u32)
+    fn highest_arriving_rung(&self, kind: RungKind, session_id: u64, now: Instant) -> u32 {
+        (0..kind.ladder_len() as u32)
             .rev()
             .find(|rung| {
-                self.rung_last_seen
-                    .get(&(session_id, *rung))
-                    .is_some_and(|seen| now.duration_since(*seen) <= RUNG_WINDOW)
+                self.rung_state
+                    .get(&(session_id, kind, *rung))
+                    .is_some_and(|st| now.duration_since(st.last_seen) <= RUNG_WINDOW)
             })
             .unwrap_or(0)
     }
 
-    /// The rung this bot would decode from `session_id`.
+    /// The rung this bot would decode from `session_id` for `kind`.
     ///
     /// With `--pin-layer N` the receiver's exact-match guard stays on N: the relay
     /// never drops rung 0, so deriving from arrivals would fall back to 0 and count
-    /// frames the browser would SKIP. So an explicit pin wins over observation.
-    /// Only a VIDEO-scoped pin steers this count. The relay keys its drop on
-    /// `(source, kind)`, so an audio- or screen-scoped pin leaves the video ladder
-    /// fully forwarded — applying its rung here would under-report video by the
-    /// ladder ratio while the pinned rung might never arrive at all.
-    fn decoded_rung_for(&self, session_id: u64, now: Instant) -> u32 {
+    /// frames the browser would SKIP. So a pin wins over observation, and only a pin
+    /// scoped to THIS kind: the relay keys its drop on `(source, kind)`.
+    fn decoded_rung_for(&self, kind: RungKind, session_id: u64, now: Instant) -> u32 {
         if let Some(pinned) = self
             .layer_preference_sender
             .as_ref()
-            .and_then(|lps| lps.pinned_layer_for(PinMediaKind::Video))
+            .and_then(|lps| lps.pinned_layer_for(kind.pin_kind()))
         {
             return pinned;
         }
-        self.highest_arriving_rung(session_id, now)
+        self.highest_arriving_rung(kind, session_id, now)
+    }
+
+    /// The single enforcement point for per-rung inbound accounting: admission,
+    /// availability insert, decode decision, sequence-gap tracking. Returns whether
+    /// this bot would DECODE the packet. `simulcast_layer_id` is publisher-controlled
+    /// cleartext, so an off-ladder value touches NO map — cycling unique ids would
+    /// otherwise mint one entry per packet.
+    fn admit_rung(
+        &mut self,
+        kind: RungKind,
+        session_id: u64,
+        rung: u32,
+        sequence: Option<u64>,
+        now: Instant,
+    ) -> RungAdmission {
+        if (rung as usize) >= kind.ladder_len() {
+            return RungAdmission::default();
+        }
+
+        let mut gap = 0u64;
+        let st = self
+            .rung_state
+            .entry((session_id, kind, rung))
+            .or_insert(RungState {
+                last_seen: now,
+                max_seq: None,
+            });
+        // Enforced HERE, not only in `reset`'s 10s sweep, which bit or missed depending
+        // on where the tick landed inside the silence.
+        let expired = now.duration_since(st.last_seen) > RUNG_WINDOW;
+        st.last_seen = now;
+        // Frames the relay shed were never forwarded here, so they are not loss. Dropped
+        // before the sequence branch: a packet carrying no sequence must still un-anchor,
+        // or the next sequenced one books the whole silence against a stale mark.
+        if expired {
+            st.max_seq = None;
+        }
+        if let Some(seq) = sequence {
+            match st.max_seq {
+                Some(max_seen) if seq > max_seen => {
+                    gap = seq - max_seen - 1;
+                    st.max_seq = Some(seq);
+                }
+                // A restart re-initialises the encoder's sequence to 0: a mic or camera
+                // toggled off then on, a device hot-plug, a page-reload rejoin, or a bot
+                // pod restart. Without re-anchoring the mark wedges at its pre-restart
+                // value and the loss signal goes blind until the sequence climbs back.
+                Some(max_seen) if max_seen.saturating_sub(seq) >= SEQ_RESET_REANCHOR_GAP => {
+                    st.max_seq = Some(seq);
+                }
+                Some(_) => {}
+                None => st.max_seq = Some(seq),
+            }
+        }
+        match kind {
+            RungKind::Audio => {
+                self.audio_seq_gaps += gap;
+                self.audio_rung_expiries += u64::from(expired);
+            }
+            RungKind::Video => {
+                self.video_seq_gaps += gap;
+                self.video_rung_expiries += u64::from(expired);
+            }
+        }
+
+        RungAdmission {
+            would_decode: rung == self.decoded_rung_for(kind, session_id, now),
+            gap,
+        }
     }
 
     // `_my_user_id` is retained in the signature (many callers pass it) but is
@@ -306,10 +458,14 @@ impl InboundStats {
 
         // The relay populates wrapper.user_id but strips media.user_id,
         // so use the wrapper-level user_id for per-sender tracking.
-        let sender = self.intern_sender(&wrapper.user_id).to_owned();
+        let sender = self.intern_sender(&wrapper.user_id);
+
+        // MONOTONIC on purpose: a backward NTP step makes a wall-clock delta negative
+        // and holds stale rungs past the window. `now_ms` is wall-clock by contrast.
+        let now = Instant::now();
 
         // Update last-seen time for stale entry eviction.
-        self.last_seen.insert(sender.clone(), Instant::now());
+        self.last_seen.insert(Arc::clone(&sender), now);
 
         // Notify keyframe requester about newly seen peers.
         if let Some(ref mut kr) = self.keyframe_requester {
@@ -357,31 +513,27 @@ impl InboundStats {
             Ok(MediaType::AUDIO) => {
                 #[cfg(feature = "metrics")]
                 self.bump_received("audio");
-                self.audio_packets += 1;
+                // #2244: count the decoded rung only, as the VIDEO arm has since #2206.
+                let admission = self.admit_rung(
+                    RungKind::Audio,
+                    session_id,
+                    wrapper.simulcast_layer_id,
+                    media.audio_metadata.as_ref().map(|meta| meta.sequence),
+                    now,
+                );
+
                 self.audio_bytes += media.data.len() as u64;
-                self.audio_arrivals.push(now_ms);
+                self.audio_ia.record(now_ms);
+                if admission.would_decode {
+                    self.audio_packets += 1;
+                }
 
                 // Accumulate health counters for this sender
-                let hc = self.health_counters.entry(sender.clone()).or_default();
-                hc.audio_packets += 1;
+                let hc = self.health_counters.entry(Arc::clone(&sender)).or_default();
                 hc.audio_bytes += media.data.len() as u64;
-
-                if let Some(meta) = media.audio_metadata.as_ref() {
-                    let seq = meta.sequence;
-                    if let Some(&max_seen) = self.max_audio_seq.get(&sender) {
-                        if seq > max_seen + 1 {
-                            // Gap: packets between max_seen and seq are missing
-                            self.audio_seq_gaps += seq - max_seen - 1;
-                        }
-                        // Only update if this is a new high-water mark
-                        if seq > max_seen {
-                            self.max_audio_seq.insert(sender.clone(), seq);
-                        }
-                        // seq <= max_seen means reorder/duplicate — do not count as gap
-                    } else {
-                        // First packet from this sender
-                        self.max_audio_seq.insert(sender.clone(), seq);
-                    }
+                if admission.would_decode {
+                    hc.audio_packets += 1;
+                    hc.audio_seq_gaps += admission.gap;
                 }
             }
             Ok(MediaType::VIDEO) => {
@@ -392,61 +544,30 @@ impl InboundStats {
                 // browser's EXACT-MATCH guard. Bytes and arrivals stay unfiltered —
                 // those measure what the link actually delivered, which is the
                 // honest figure for a receiver the relay is fanning every rung to.
-                // Rung freshness uses the MONOTONIC clock: a backward NTP step makes a
-                // wall-clock delta negative, holding stale rungs past the window. `now_ms`
-                // stays wall-clock because the arrival series it feeds reports absolute
-                // times. Sampled here, not per packet — only VIDEO needs it.
-                let now = Instant::now();
-                let rung = wrapper.simulcast_layer_id;
-                // `simulcast_layer_id` is publisher-controlled cleartext, so an
-                // out-of-ladder value must never become a map entry: cycling unique
-                // ids would mint one entry per packet. Off-ladder rungs are also
-                // undecodable, so they are not counted.
-                //
-                // DIVERGES from the client's `clamp_observed_layer_id`, which collapses an
-                // off-ladder id onto the top rung's availability where the bot discards
-                // it, so the fleet cannot see the resulting browser freeze (#2245).
-                let on_ladder = (rung as usize) < SIMULCAST_MAX_LAYERS;
-                let would_decode = if on_ladder {
-                    self.rung_last_seen.insert((session_id, rung), now);
-                    rung == self.decoded_rung_for(session_id, now)
-                } else {
-                    false
-                };
+                let admission = self.admit_rung(
+                    RungKind::Video,
+                    session_id,
+                    wrapper.simulcast_layer_id,
+                    media.video_metadata.as_ref().map(|meta| meta.sequence),
+                    now,
+                );
 
                 self.video_bytes += media.data.len() as u64;
-                self.video_arrivals.push(now_ms);
-                if would_decode {
+                self.video_ia.record(now_ms);
+                if admission.would_decode {
                     self.video_packets += 1;
                 }
 
                 // Accumulate health counters for this sender
-                let hc = self.health_counters.entry(sender.clone()).or_default();
+                let hc = self.health_counters.entry(Arc::clone(&sender)).or_default();
                 hc.video_bytes += media.data.len() as u64;
-                if would_decode {
+                if admission.would_decode {
                     hc.video_packets += 1;
+                    hc.video_seq_gaps += admission.gap;
                 }
 
-                if media.frame_type == "key" {
+                if admission.would_decode && media.frame_type == "key" {
                     self.video_keyframes += 1;
-                }
-
-                if let Some(meta) = media.video_metadata.as_ref() {
-                    let seq = meta.sequence;
-                    if let Some(&max_seen) = self.max_video_seq.get(&sender) {
-                        if seq > max_seen + 1 {
-                            // Gap: packets between max_seen and seq are missing
-                            self.video_seq_gaps += seq - max_seen - 1;
-                        }
-                        // Only update if this is a new high-water mark
-                        if seq > max_seen {
-                            self.max_video_seq.insert(sender.clone(), seq);
-                        }
-                        // seq <= max_seen means reorder/duplicate — do not count as gap
-                    } else {
-                        // First packet from this sender
-                        self.max_video_seq.insert(sender.clone(), seq);
-                    }
                 }
             }
             Ok(MediaType::HEARTBEAT) => {
@@ -462,37 +583,27 @@ impl InboundStats {
         }
     }
 
-    /// Inter-arrival time standard deviation (not RFC 3550 jitter).
-    /// Measures variability in packet arrival timing as the standard deviation
-    /// of consecutive inter-arrival deltas.
-    fn interarrival_stddev_ms(arrivals: &[f64]) -> f64 {
-        if arrivals.len() < 2 {
-            return 0.0;
-        }
-        let deltas: Vec<f64> = arrivals.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
-        let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
-        let variance = deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / deltas.len() as f64;
-        variance.sqrt()
-    }
-
     pub fn report(&self, user_id: &str) {
-        let audio_iastddev = Self::interarrival_stddev_ms(&self.audio_arrivals);
-        let video_iastddev = Self::interarrival_stddev_ms(&self.video_arrivals);
+        let audio_iastddev = self.audio_ia.stddev_ms();
+        let video_iastddev = self.video_ia.stddev_ms();
 
         info!(
-            "[{}] RX STATS (10s): audio={} pkts ({:.0} KB, ia_stddev={:.1}ms, gaps={}), \
-             video={} decoded-rung pkts ({} key, {:.0} KB, ia_stddev={:.1}ms, gaps={} — all rungs), \
+            "[{}] RX STATS (10s): audio={} decoded-rung pkts (all rungs: {:.0} KB, \
+             ia_stddev={:.1}ms, gaps={}, rung_expiries={}), video={} decoded-rung pkts \
+             ({} key, all rungs: {:.0} KB, ia_stddev={:.1}ms, gaps={}, rung_expiries={}), \
              heartbeat={}, errors={}",
             user_id,
             self.audio_packets,
             self.audio_bytes as f64 / 1024.0,
             audio_iastddev,
             self.audio_seq_gaps,
+            self.audio_rung_expiries,
             self.video_packets,
             self.video_keyframes,
             self.video_bytes as f64 / 1024.0,
             video_iastddev,
             self.video_seq_gaps,
+            self.video_rung_expiries,
             self.heartbeat_packets,
             self.parse_errors,
         );
@@ -501,23 +612,34 @@ impl InboundStats {
     pub fn reset(&mut self) {
         // Preserve health counters across diagnostic resets — they are
         // drained independently by the health reporter on a 1s cadence.
-        // Also preserve last_seen, max_*_seq, last_*_ts, and sender_names
-        // since they track cross-window state. They are evicted by evict_stale().
+        // Also preserve last_seen and sender_names since they track cross-window
+        // state. They are evicted by evict_stale(); `rung_state` is swept below.
         let health_counters = std::mem::take(&mut self.health_counters);
         let health_total = self.health_total_packets;
         let last_drain_snapshot = std::mem::take(&mut self.last_drain_snapshot);
         let last_seen = std::mem::take(&mut self.last_seen);
-        let max_audio_seq = std::mem::take(&mut self.max_audio_seq);
-        let max_video_seq = std::mem::take(&mut self.max_video_seq);
         let sender_names = std::mem::take(&mut self.sender_names);
         // Rolling 4s availability window — dropping it on the 10s diagnostic reset
         // would repeat the ramp and inflate the next health sample (#2206). Stale
         // entries are evicted HERE rather than on the packet path: `reset` runs every
         // 10s in both pin and observation modes, so this is the one sweep that bounds
         // the map against per-reconnect `session_id` churn.
-        let mut rung_last_seen = std::mem::take(&mut self.rung_last_seen);
+        let mut rung_state = std::mem::take(&mut self.rung_state);
         let sweep_now = Instant::now();
-        rung_last_seen.retain(|_, seen| sweep_now.duration_since(*seen) <= RUNG_WINDOW);
+        // A rung silent past the window loses its mark: what the relay shed was never sent
+        // here. Counted, like the packet-path expiry, so the abandoned stretch is visible.
+        let mut swept = (0u64, 0u64);
+        rung_state.retain(|&(_, kind, _), st| {
+            let keep = sweep_now.duration_since(st.last_seen) <= RUNG_WINDOW;
+            if !keep {
+                match kind {
+                    RungKind::Audio => swept.0 += 1,
+                    RungKind::Video => swept.1 += 1,
+                }
+            }
+            keep
+        });
+        shrink_if_sparse(&mut rung_state);
         let rtt_probe = self.rtt_probe.take();
         let keyframe_requester = self.keyframe_requester.take();
         let viewport_sender = self.viewport_sender.take();
@@ -529,14 +651,16 @@ impl InboundStats {
         self.health_total_packets = health_total;
         self.last_drain_snapshot = last_drain_snapshot;
         self.last_seen = last_seen;
-        self.max_audio_seq = max_audio_seq;
-        self.max_video_seq = max_video_seq;
         self.sender_names = sender_names;
-        self.rung_last_seen = rung_last_seen;
+        self.rung_state = rung_state;
         self.rtt_probe = rtt_probe;
         self.keyframe_requester = keyframe_requester;
         self.viewport_sender = viewport_sender;
         self.layer_preference_sender = layer_preference_sender;
+        // Seeded, not zeroed: `report` runs before `reset`, so a sweep's marks land in the
+        // window that opens here rather than the one that just closed.
+        self.audio_rung_expiries = swept.0;
+        self.video_rung_expiries = swept.1;
         #[cfg(feature = "metrics")]
         {
             self.metrics = metrics;
@@ -592,25 +716,26 @@ impl InboundStats {
     /// Call this periodically (e.g. from the 10s reporting tick) to bound memory.
     pub fn evict_stale(&mut self, max_age: Duration) {
         let cutoff = Instant::now() - max_age;
-        let stale_senders: Vec<String> = self
+        let stale_senders: Vec<Arc<str>> = self
             .last_seen
             .iter()
             .filter(|(_, &ts)| ts < cutoff)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| Arc::clone(k))
             .collect();
 
         for sender in &stale_senders {
-            self.last_seen.remove(sender);
-            self.max_audio_seq.remove(sender);
-            self.max_video_seq.remove(sender);
-            self.health_counters.remove(sender);
-            self.last_drain_snapshot.remove(sender);
+            self.last_seen.remove(&**sender);
+            self.health_counters.remove(&**sender);
+            self.last_drain_snapshot.remove(&**sender);
         }
 
-        // Also evict from the intern map — find Vec<u8> keys whose String value
+        // Also evict from the intern map — find Vec<u8> keys whose name value
         // matches a stale sender.
         if !stale_senders.is_empty() {
-            self.sender_names.retain(|_, v| !stale_senders.contains(v));
+            self.sender_names
+                .retain(|_, v| !stale_senders.iter().any(|s| s == v));
+            shrink_if_sparse(&mut self.last_seen);
+            shrink_if_sparse(&mut self.sender_names);
         }
     }
 
@@ -622,7 +747,11 @@ impl InboundStats {
     /// reporter) can read the *same* one-second window the health reporter
     /// emitted — a single source of truth for per-sender rate counters.
     pub fn drain_health_counters(&mut self) -> (HashMap<String, SenderHealthCounters>, u64) {
-        let counters = std::mem::take(&mut self.health_counters);
+        let counters: HashMap<String, SenderHealthCounters> =
+            std::mem::take(&mut self.health_counters)
+                .into_iter()
+                .map(|(name, c)| (name.to_string(), c))
+                .collect();
         let total = self.health_total_packets;
         self.health_total_packets = 0;
         self.last_drain_snapshot = counters.clone();
@@ -638,14 +767,15 @@ impl InboundStats {
         self.last_drain_snapshot.clone()
     }
 
-    /// Convert raw user_id bytes to a String, reusing previous conversions
-    /// to avoid per-packet allocation from `String::from_utf8_lossy`.
-    fn intern_sender(&mut self, raw: &[u8]) -> &str {
-        if !self.sender_names.contains_key(raw) {
-            self.sender_names
-                .insert(raw.to_vec(), String::from_utf8_lossy(raw).into_owned());
+    /// An `Arc` and not a borrow so callers can key the per-sender maps while
+    /// still holding `&mut self`.
+    fn intern_sender(&mut self, raw: &[u8]) -> Arc<str> {
+        if let Some(name) = self.sender_names.get(raw) {
+            return Arc::clone(name);
         }
-        &self.sender_names[raw]
+        let name: Arc<str> = Arc::from(String::from_utf8_lossy(raw).as_ref());
+        self.sender_names.insert(raw.to_vec(), Arc::clone(&name));
+        name
     }
 }
 
@@ -714,6 +844,17 @@ mod tests {
         wrapper.write_to_bytes().unwrap()
     }
 
+    /// Seed a rung's arrival instant without a packet, for window-expiry tests.
+    fn seed_rung(stats: &mut InboundStats, kind: RungKind, session: u64, rung: u32, at: Instant) {
+        stats.rung_state.insert(
+            (session, kind, rung),
+            RungState {
+                last_seen: at,
+                max_seq: None,
+            },
+        );
+    }
+
     const ALICE: u64 = 11;
     const BOB: u64 = 22;
 
@@ -759,7 +900,7 @@ mod tests {
         // Bytes and arrivals stay unfiltered — they measure what the link
         // delivered, which is the honest figure for a fanned-out receiver.
         let total_packets = (frames + 1) * 3;
-        assert_eq!(stats.video_arrivals.len() as u64, total_packets);
+        assert_eq!(stats.video_ia.arrivals(), total_packets);
         assert_eq!(stats.video_bytes, total_packets * 100);
     }
 
@@ -848,15 +989,15 @@ mod tests {
         let mut stats = InboundStats::default();
         let t0 = Instant::now();
         for rung in 0..3u32 {
-            stats.rung_last_seen.insert((ALICE, rung), t0);
+            seed_rung(&mut stats, RungKind::Video, ALICE, rung, t0);
         }
-        assert_eq!(stats.highest_arriving_rung(ALICE, t0), 2);
+        assert_eq!(stats.highest_arriving_rung(RungKind::Video, ALICE, t0), 2);
 
         // Rungs 1 and 2 shed; only rung 0 keeps arriving.
         let later = t0 + RUNG_WINDOW + Duration::from_millis(1);
-        stats.rung_last_seen.insert((ALICE, 0), later);
+        seed_rung(&mut stats, RungKind::Video, ALICE, 0, later);
         assert_eq!(
-            stats.highest_arriving_rung(ALICE, later),
+            stats.highest_arriving_rung(RungKind::Video, ALICE, later),
             0,
             "once the shed rungs age out, rung 0 IS the top arriving rung"
         );
@@ -865,7 +1006,7 @@ mod tests {
         // which is the only eviction site now that freshness is folded into the
         // lookup — see `highest_arriving_rung`.
         assert!(
-            stats.rung_last_seen.contains_key(&(ALICE, 2)),
+            stats.rung_state.contains_key(&(ALICE, RungKind::Video, 2)),
             "the probe must not evict; that is reset's job"
         );
     }
@@ -881,26 +1022,103 @@ mod tests {
         let stale = Instant::now() - (RUNG_WINDOW + Duration::from_millis(1));
         for session in 0..50u64 {
             for rung in 0..3u32 {
-                stats.rung_last_seen.insert((session, rung), stale);
+                seed_rung(&mut stats, RungKind::Video, session, rung, stale);
             }
         }
         let fresh_session = 999u64;
-        stats
-            .rung_last_seen
-            .insert((fresh_session, 1), Instant::now());
-        assert_eq!(stats.rung_last_seen.len(), 151);
+        seed_rung(
+            &mut stats,
+            RungKind::Video,
+            fresh_session,
+            1,
+            Instant::now(),
+        );
+        assert_eq!(stats.rung_state.len(), 151);
 
         stats.reset();
 
         assert_eq!(
-            stats.rung_last_seen.len(),
+            stats.rung_state.len(),
             1,
             "every aged entry must be reclaimed, not merely ignored"
         );
         assert!(
-            stats.rung_last_seen.contains_key(&(fresh_session, 1)),
+            stats
+                .rung_state
+                .contains_key(&(fresh_session, RungKind::Video, 1)),
             "a rung still inside the window must SURVIVE reset — dropping it would \
              repeat the ramp and inflate the next health sample (#2206)"
+        );
+    }
+
+    #[test]
+    fn the_sweep_counts_the_marks_it_abandons() {
+        // Without this the expiry figure only sees silences no 10s tick swept, so a 0
+        // would not mean "the window never bit".
+        let mut stats = InboundStats::default();
+        let stale = Instant::now() - (RUNG_WINDOW + Duration::from_millis(1));
+        seed_rung(&mut stats, RungKind::Audio, ALICE, 0, stale);
+        seed_rung(&mut stats, RungKind::Video, ALICE, 0, stale);
+        seed_rung(&mut stats, RungKind::Video, BOB, 1, stale);
+        seed_rung(&mut stats, RungKind::Video, BOB, 0, Instant::now());
+
+        stats.reset();
+
+        assert_eq!(stats.audio_rung_expiries, 1);
+        assert_eq!(
+            stats.video_rung_expiries, 2,
+            "both aged video marks must be counted; the fresh one must not"
+        );
+    }
+
+    #[test]
+    fn reset_gives_back_the_capacity_a_rung_storm_left_pinned() {
+        let mut stats = InboundStats::default();
+        let stale = Instant::now() - (RUNG_WINDOW + Duration::from_millis(1));
+        for session in 0..4_000u64 {
+            seed_rung(&mut stats, RungKind::Video, session, 0, stale);
+        }
+        for session in 0..10u64 {
+            seed_rung(&mut stats, RungKind::Audio, session, 0, Instant::now());
+        }
+        assert!(stats.rung_state.capacity() >= 4_000);
+
+        stats.reset();
+
+        assert_eq!(stats.rung_state.len(), 10);
+        assert!(
+            stats.rung_state.capacity() <= 256,
+            "capacity {} is still the storm high-water mark",
+            stats.rung_state.capacity()
+        );
+    }
+
+    #[test]
+    fn evict_stale_gives_back_the_capacity_a_sender_storm_left_pinned() {
+        let mut stats = InboundStats::default();
+        let stale = Instant::now() - Duration::from_secs(120);
+        for i in 0..4_000u32 {
+            let name: Arc<str> = Arc::from(format!("peer-{i}").as_str());
+            stats
+                .sender_names
+                .insert(name.as_bytes().to_vec(), Arc::clone(&name));
+            stats.last_seen.insert(name, stale);
+        }
+        let live: Arc<str> = Arc::from("bob");
+        stats
+            .sender_names
+            .insert(live.as_bytes().to_vec(), Arc::clone(&live));
+        stats.last_seen.insert(live, Instant::now());
+        assert!(stats.last_seen.capacity() >= 4_000);
+
+        stats.evict_stale(Duration::from_secs(60));
+
+        assert_eq!(stats.last_seen.len(), 1);
+        assert!(
+            stats.last_seen.capacity() <= 256 && stats.sender_names.capacity() <= 256,
+            "capacities {}/{} are still the storm high-water mark",
+            stats.last_seen.capacity(),
+            stats.sender_names.capacity()
         );
     }
 
@@ -1053,7 +1271,7 @@ mod tests {
         );
         assert_eq!(stats.video_packets, 0, "an off-ladder rung is undecodable");
         assert!(
-            stats.rung_last_seen.is_empty(),
+            stats.rung_state.is_empty(),
             "an off-ladder rung must not create a map entry"
         );
 
@@ -1069,7 +1287,7 @@ mod tests {
             "rung == SIMULCAST_MAX_LAYERS is off-ladder (valid ids are 0..SIMULCAST_MAX_LAYERS)"
         );
         assert!(
-            boundary.rung_last_seen.is_empty(),
+            boundary.rung_state.is_empty(),
             "the boundary rung must not create a map entry either"
         );
 
@@ -1159,14 +1377,29 @@ mod tests {
         );
 
         // max_seen should still be 3
-        assert_eq!(stats.max_video_seq.get("bob"), Some(&3));
+        assert_eq!(
+            stats
+                .rung_state
+                .get(&(0, RungKind::Video, 0))
+                .unwrap()
+                .max_seq,
+            Some(3)
+        );
+    }
+
+    /// Drive a series of arrival timestamps through the production accumulator.
+    fn accumulate(arrivals: &[f64]) -> InterArrival {
+        let mut ia = InterArrival::default();
+        for &at in arrivals {
+            ia.record(at);
+        }
+        ia
     }
 
     #[test]
     fn test_interarrival_stddev() {
         // Perfectly uniform arrivals should have zero stddev
-        let uniform = vec![0.0, 10.0, 20.0, 30.0, 40.0];
-        let stddev = InboundStats::interarrival_stddev_ms(&uniform);
+        let stddev = accumulate(&[0.0, 10.0, 20.0, 30.0, 40.0]).stddev_ms();
         assert!(
             stddev < 0.001,
             "uniform arrivals should have ~0 stddev, got {}",
@@ -1175,17 +1408,59 @@ mod tests {
 
         // Alternating 10ms and 20ms inter-arrival deltas
         // deltas = [10, 20, 10, 20], mean = 15, variance = 25, stddev = 5
-        let jittery = vec![0.0, 10.0, 30.0, 40.0, 60.0];
-        let stddev = InboundStats::interarrival_stddev_ms(&jittery);
+        let stddev = accumulate(&[0.0, 10.0, 30.0, 40.0, 60.0]).stddev_ms();
         assert!(
             (stddev - 5.0).abs() < 0.01,
             "expected stddev ~5.0, got {}",
             stddev
         );
 
+        // A backward wall-clock step (NTP) must fold to a positive delta:
+        // deltas = [10, 5, 10], mean = 25/3, stddev = sqrt(50/9)
+        let stddev = accumulate(&[0.0, 10.0, 5.0, 15.0]).stddev_ms();
+        assert!(
+            (stddev - 2.357_022_6).abs() < 0.001,
+            "expected stddev ~2.3570, got {}",
+            stddev
+        );
+
         // Too few arrivals should return 0
-        assert_eq!(InboundStats::interarrival_stddev_ms(&[]), 0.0);
-        assert_eq!(InboundStats::interarrival_stddev_ms(&[42.0]), 0.0);
+        assert_eq!(accumulate(&[]).stddev_ms(), 0.0);
+        assert_eq!(accumulate(&[42.0]).stddev_ms(), 0.0);
+    }
+
+    #[test]
+    fn the_streaming_stddev_agrees_with_two_passes_over_the_retained_series() {
+        // The formula the accumulator replaced — a different algorithm, so
+        // agreement is evidence rather than tautology.
+        fn two_pass(arrivals: &[f64]) -> f64 {
+            if arrivals.len() < 2 {
+                return 0.0;
+            }
+            let deltas: Vec<f64> = arrivals.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+            let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+            let var = deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / deltas.len() as f64;
+            var.sqrt()
+        }
+
+        // On the wall-clock epoch `record_packet` feeds in (~1.75e12 ms).
+        let mut arrivals = Vec::new();
+        let mut t = 1_755_000_000_000.0_f64;
+        for i in 0..5_000u64 {
+            t += 20.0 + ((i * 7919) % 23) as f64 * 0.5;
+            arrivals.push(t);
+        }
+
+        let ia = accumulate(&arrivals);
+        let streaming = ia.stddev_ms();
+        let reference = two_pass(&arrivals);
+        assert!(
+            (streaming - reference).abs() < 1e-9,
+            "streaming {} vs two-pass {}",
+            streaming,
+            reference
+        );
+        assert_eq!(ia.arrivals(), arrivals.len() as u64);
     }
 
     #[test]
@@ -1200,8 +1475,6 @@ mod tests {
 
         assert!(stats.last_seen.contains_key("alice"));
         assert!(stats.last_seen.contains_key("bob"));
-        assert!(stats.max_audio_seq.contains_key("alice"));
-        assert!(stats.max_video_seq.contains_key("bob"));
 
         // Backdate alice's last_seen to simulate being stale
         *stats.last_seen.get_mut("alice").unwrap() = Instant::now() - Duration::from_secs(120);
@@ -1213,11 +1486,9 @@ mod tests {
             !stats.last_seen.contains_key("alice"),
             "alice should be evicted"
         );
-        assert!(!stats.max_audio_seq.contains_key("alice"));
         assert!(!stats.health_counters.contains_key("alice"));
 
         assert!(stats.last_seen.contains_key("bob"), "bob should remain");
-        assert!(stats.max_video_seq.contains_key("bob"));
     }
 
     #[test]
@@ -1251,5 +1522,660 @@ mod tests {
         let (counters2, total2) = stats.drain_health_counters();
         assert_eq!(total2, 0);
         assert!(counters2.is_empty());
+    }
+
+    fn make_audio_packet_on_rung(
+        sender: &str,
+        session_id: u64,
+        seq: u64,
+        timestamp: f64,
+        rung: u32,
+    ) -> Vec<u8> {
+        let mut wrapper = PacketWrapper::parse_from_bytes(&make_media_packet(
+            sender,
+            MediaType::AUDIO,
+            seq,
+            timestamp,
+        ))
+        .unwrap();
+        wrapper.simulcast_layer_id = rung;
+        wrapper.session_id = session_id;
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    fn make_keyframe_on_rung(
+        sender: &str,
+        session_id: u64,
+        seq: u64,
+        timestamp: f64,
+        rung: u32,
+    ) -> Vec<u8> {
+        let mut wrapper = PacketWrapper::parse_from_bytes(&make_video_packet_on_rung(
+            sender, session_id, seq, timestamp, rung,
+        ))
+        .unwrap();
+        let mut media = MediaPacket::parse_from_bytes(&wrapper.data).unwrap();
+        media.frame_type = "key".to_string();
+        wrapper.data = media.write_to_bytes().unwrap();
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    #[test]
+    fn audio_packets_counts_one_rung_not_the_ladder_sum() {
+        let mut stats = InboundStats::default();
+
+        // Warm-up: each rung is the top rung SEEN SO FAR, so frame 1 over-counts.
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_audio_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+        let after_warmup = stats.audio_packets;
+        let (warm, _) = stats.drain_health_counters();
+        assert_eq!(warm.get("alice").map(|c| c.audio_packets), Some(3));
+
+        let frames = 50u64;
+        for seq in 1..=frames {
+            for rung in 0..3u32 {
+                stats.record_packet(
+                    "bot",
+                    &make_audio_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung),
+                );
+            }
+        }
+
+        assert_eq!(
+            stats.audio_packets - after_warmup,
+            frames,
+            "steady state must count ONE rung's packets, not all three"
+        );
+        let (drained, _) = stats.drain_health_counters();
+        let c = drained.get("alice").expect("alice must be present");
+        assert_eq!(
+            c.audio_packets, frames,
+            "the REPORTED counter must count one rung, not the ladder sum"
+        );
+        // Bytes and arrivals stay unfiltered; bytes are what `can_listen` reads.
+        let total = (frames + 1) * 3;
+        assert_eq!(c.audio_bytes, frames * 3 * 100);
+        assert_eq!(stats.audio_ia.arrivals(), total);
+        assert_eq!(stats.audio_bytes, total * 100);
+    }
+
+    #[test]
+    fn per_rung_tracking_detects_single_rung_audio_loss() {
+        // Equal-rate rungs keep a single per-sender mark in lockstep, so it never fires.
+        let mut stats = InboundStats::default();
+        let mut lost = 0u64;
+        for seq in 0..50u64 {
+            for rung in 0..3u32 {
+                if rung == 1 && seq % 5 == 2 {
+                    lost += 1;
+                    continue;
+                }
+                stats.record_packet(
+                    "bot",
+                    &make_audio_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung),
+                );
+            }
+        }
+        assert_eq!(lost, 10, "fixture must actually drop packets");
+        assert_eq!(
+            stats.audio_seq_gaps, lost,
+            "rung-1 loss must be counted, not masked by rungs 0 and 2"
+        );
+    }
+
+    #[test]
+    fn a_clean_multi_rung_video_publisher_reports_no_phantom_loss() {
+        // One mark per sender: observing a mid-call publisher low-rung-first mints a gap.
+        let mut stats = InboundStats::default();
+        stats.record_packet(
+            "bot",
+            &make_video_packet_on_rung("alice", ALICE, 7 * 60, 1000.0, 0),
+        );
+        stats.record_packet(
+            "bot",
+            &make_video_packet_on_rung("alice", ALICE, 30 * 60, 1001.0, 2),
+        );
+        assert_eq!(
+            stats.video_seq_gaps, 0,
+            "two independent per-rung sequences are not a gap in either rung"
+        );
+    }
+
+    #[test]
+    fn per_rung_tracking_detects_base_rung_video_loss_after_a_shed() {
+        // A shed top rung strands a shared mark above base's own sequence.
+        let mut stats = InboundStats::default();
+        for seq in 0..900u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, 2),
+            );
+        }
+        assert_eq!(stats.video_seq_gaps, 0, "the top rung itself lost nothing");
+
+        // Tracking is deliberately NOT gated on decode: tracked without being counted.
+        let mut lost = 0u64;
+        for seq in 0..210u64 {
+            if seq % 3 == 1 {
+                lost += 1;
+                continue;
+            }
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, seq, 2000.0 + seq as f64, 0),
+            );
+        }
+        assert_eq!(lost, 70, "fixture must actually drop packets");
+        assert_eq!(
+            stats.video_seq_gaps, lost,
+            "base-rung loss must be counted against the BASE rung's own sequence"
+        );
+    }
+
+    #[test]
+    fn video_keyframes_counts_one_rung_not_the_ladder_sum() {
+        // A GOP boundary emits one keyframe on EVERY rung.
+        let mut stats = InboundStats::default();
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+        assert_eq!(stats.video_keyframes, 0, "delta frames are not keyframes");
+
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_keyframe_on_rung("alice", ALICE, 1, 1001.0, rung),
+            );
+        }
+        assert_eq!(
+            stats.video_keyframes, 1,
+            "one keyframe per GOP boundary, not one per rung"
+        );
+
+        // KNOWN GAP: any ladder ramp-up (join or post-shed recovery) counts one keyframe
+        // per rung, because `highest_arriving_rung` rises step by step as rungs return.
+        let mut joining = InboundStats::default();
+        for rung in 0..3u32 {
+            joining.record_packet(
+                "bot",
+                &make_keyframe_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+        assert_eq!(
+            joining.video_keyframes, 3,
+            "the join ramp still over-counts the first GOP by the ladder depth"
+        );
+
+        // The same ramp recurs on RECOVERY: age rungs 1-2 out of the window, then let
+        // them return. Each becomes the top arriving rung in turn.
+        let stale = Instant::now() - (RUNG_WINDOW + Duration::from_millis(1));
+        seed_rung(&mut stats, RungKind::Video, ALICE, 1, stale);
+        seed_rung(&mut stats, RungKind::Video, ALICE, 2, stale);
+        let before_recovery = stats.video_keyframes;
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_keyframe_on_rung("alice", ALICE, 2, 1002.0, rung),
+            );
+        }
+        assert_eq!(
+            stats.video_keyframes - before_recovery,
+            3,
+            "post-shed recovery re-counts one keyframe per returning rung"
+        );
+    }
+
+    #[test]
+    fn an_audio_pin_steers_the_audio_count() {
+        // Equal rung rates make selection unobservable by rate; the pin is the observable.
+        let mut stats = stats_pinned(2, PinMediaKind::Audio);
+        for seq in 0..20u64 {
+            stats.record_packet(
+                "bot",
+                &make_audio_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, 0),
+            );
+        }
+        assert_eq!(
+            stats.audio_packets, 0,
+            "a pinned audio rung that never arrives is starvation, not base-rung health"
+        );
+        assert!(
+            stats.audio_bytes > 0,
+            "bytes stay unfiltered so liveness still sees the stream"
+        );
+    }
+
+    #[test]
+    fn a_non_audio_pin_does_not_steer_the_audio_count() {
+        // Another kind's pin would report ZERO forever on a single-rung publisher.
+        for kind in [PinMediaKind::Video, PinMediaKind::Screen] {
+            let mut stats = stats_pinned(2, kind);
+            for seq in 0..20u64 {
+                stats.record_packet(
+                    "bot",
+                    &make_audio_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, 0),
+                );
+            }
+            assert_eq!(
+                stats.audio_packets, 20,
+                "{kind:?} pin must NOT pin the audio count to rung 2"
+            );
+        }
+    }
+
+    #[test]
+    fn the_audio_and_video_ladders_do_not_share_availability() {
+        // Pooling the kinds would let audio rung 2 zero a single-rung video publisher.
+        let mut stats = InboundStats::default();
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_audio_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+        for seq in 1..=5u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, 0),
+            );
+        }
+        assert_eq!(
+            stats.video_packets, 5,
+            "audio's ladder depth must not filter video"
+        );
+    }
+
+    #[test]
+    fn the_audio_rung_guard_admits_the_top_rung_and_rejects_the_one_above() {
+        let mut admitted = InboundStats::default();
+        admitted.record_packet(
+            "bot",
+            &make_audio_packet_on_rung(
+                "alice",
+                ALICE,
+                0,
+                1000.0,
+                AUDIO_SIMULCAST_MAX_LAYERS as u32 - 1,
+            ),
+        );
+        assert_eq!(
+            admitted.audio_packets, 1,
+            "the top audio rung is on-ladder and must be admitted"
+        );
+
+        let mut rejected = InboundStats::default();
+        rejected.record_packet(
+            "bot",
+            &make_audio_packet_on_rung(
+                "alice",
+                ALICE,
+                0,
+                1000.0,
+                AUDIO_SIMULCAST_MAX_LAYERS as u32,
+            ),
+        );
+        assert_eq!(
+            rejected.audio_packets, 0,
+            "the first id above the ladder is undecodable"
+        );
+        assert!(
+            rejected.rung_state.is_empty(),
+            "an off-ladder rung must not create a map entry"
+        );
+        assert!(
+            rejected.audio_bytes > 0,
+            "bytes stay unfiltered even for a rung we cannot decode"
+        );
+    }
+
+    #[test]
+    fn a_shed_audio_rung_expires_so_the_new_top_is_selected() {
+        // Without expiry the bot keeps expecting a rung that stopped arriving.
+        let mut stats = InboundStats::default();
+        let t0 = Instant::now();
+        for rung in 0..3u32 {
+            seed_rung(&mut stats, RungKind::Audio, ALICE, rung, t0);
+        }
+        assert_eq!(stats.highest_arriving_rung(RungKind::Audio, ALICE, t0), 2);
+
+        let later = t0 + RUNG_WINDOW + Duration::from_millis(1);
+        seed_rung(&mut stats, RungKind::Audio, ALICE, 0, later);
+        assert_eq!(
+            stats.highest_arriving_rung(RungKind::Audio, ALICE, later),
+            0,
+            "once the shed rungs age out, rung 0 IS the top arriving rung"
+        );
+    }
+
+    #[test]
+    fn a_publisher_restart_reanchors_instead_of_wedging_the_mark() {
+        // A mic/camera toggle off->on, device hot-plug, page-reload rejoin or bot pod
+        // restart re-initialises the encoder's sequence to 0 mid-stream.
+        let mut stats = InboundStats::default();
+        for seq in 0..5000u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, seq, 1000.0, 0),
+            );
+        }
+        assert_eq!(stats.video_seq_gaps, 0, "the first stream lost nothing");
+
+        let mut lost = 0u64;
+        for seq in 0..300u64 {
+            if seq % 3 == 1 {
+                lost += 1;
+                continue;
+            }
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, seq, 2000.0, 0),
+            );
+        }
+        assert_eq!(lost, 100, "fixture must actually drop packets");
+        assert_eq!(
+            stats.video_seq_gaps, lost,
+            "loss after a restart must be visible, not swallowed as reorder"
+        );
+    }
+
+    #[test]
+    fn a_backward_jump_below_the_reanchor_gap_stays_reorder() {
+        // Ordinary reordering must NOT re-anchor, or the next arrival mints a gap.
+        let mut stats = InboundStats::default();
+        for seq in 0..2000u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, seq, 1000.0, 0),
+            );
+        }
+        let mark = 1999u64;
+        stats.record_packet(
+            "bot",
+            &make_video_packet_on_rung("alice", ALICE, mark - 4, 1001.0, 0),
+        );
+        assert_eq!(
+            stats
+                .rung_state
+                .get(&(ALICE, RungKind::Video, 0))
+                .unwrap()
+                .max_seq,
+            Some(mark),
+            "a sub-gap backward jump must leave the mark alone"
+        );
+        assert_eq!(stats.video_seq_gaps, 0);
+
+        // The other side of the SAME guard, so this fails if the arm is deleted as well
+        // as if its threshold widens: a jump at exactly the gap DOES re-anchor.
+        let reanchored = mark - SEQ_RESET_REANCHOR_GAP;
+        stats.record_packet(
+            "bot",
+            &make_video_packet_on_rung("alice", ALICE, reanchored, 1002.0, 0),
+        );
+        assert_eq!(
+            stats
+                .rung_state
+                .get(&(ALICE, RungKind::Video, 0))
+                .unwrap()
+                .max_seq,
+            Some(reanchored),
+            "a jump at exactly the gap must re-anchor"
+        );
+    }
+
+    #[test]
+    fn two_sessions_of_one_user_do_not_fabricate_loss() {
+        // Same user_id on two devices (phone + laptop, or two tabs) is two independent
+        // sources with independent per-rung sequences. A user-keyed mark makes every
+        // alternation between them a re-anchor plus a gap the size of their separation.
+        const PHONE: u64 = 71;
+        const LAPTOP: u64 = 72;
+        let mut stats = InboundStats::default();
+        for seq in 0..2000u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", PHONE, seq, 1000.0, 0),
+            );
+        }
+        for seq in 0..500u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", LAPTOP, seq, 1000.0, 0),
+            );
+        }
+        assert_eq!(stats.video_seq_gaps, 0, "neither device lost anything");
+
+        // Separation is 1500, above SEQ_RESET_REANCHOR_GAP, so a pooled mark re-anchors
+        // on every switch and books the difference as loss in both directions.
+        for i in 0..10u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", PHONE, 2000 + i, 1000.0, 0),
+            );
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", LAPTOP, 500 + i, 1000.0, 0),
+            );
+        }
+        assert_eq!(
+            stats.video_seq_gaps, 0,
+            "two devices of one user must not fabricate loss for each other"
+        );
+    }
+
+    #[test]
+    fn a_rung_returning_after_the_availability_window_books_no_loss() {
+        let mut stats = InboundStats::default();
+        for seq in 0..100u64 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, seq, 1000.0, 0),
+            );
+            stats.record_packet(
+                "bot",
+                &make_audio_packet_on_rung("alice", ALICE, seq, 1000.0, 0),
+            );
+        }
+        assert_eq!(stats.video_seq_gaps, 0);
+
+        // Both rungs go silent past the window, then the sweep runs.
+        let stale = Instant::now() - (RUNG_WINDOW + Duration::from_millis(1));
+        for kind in [RungKind::Video, RungKind::Audio] {
+            stats
+                .rung_state
+                .get_mut(&(ALICE, kind, 0))
+                .expect("the mark must exist before it can be swept")
+                .last_seen = stale;
+        }
+        stats.reset();
+        assert!(
+            stats.rung_state.is_empty(),
+            "the sweep must drop aged marks"
+        );
+
+        // The rungs return far ahead: the publisher kept encoding through the shed.
+        stats.record_packet(
+            "bot",
+            &make_video_packet_on_rung("alice", ALICE, 5_000, 2000.0, 0),
+        );
+        stats.record_packet(
+            "bot",
+            &make_audio_packet_on_rung("alice", ALICE, 5_000, 2000.0, 0),
+        );
+        assert_eq!(
+            stats.video_seq_gaps, 0,
+            "frames the relay shed are not this receiver's loss"
+        );
+        assert_eq!(stats.audio_seq_gaps, 0, "same contract for audio");
+    }
+
+    #[test]
+    fn a_rung_silent_past_the_window_rebaselines_without_waiting_for_the_sweep() {
+        // #2424: before this, a silence no 10s tick landed inside kept its mark and
+        // booked the publisher's whole un-forwarded run as this receiver's loss.
+        let mut stats = InboundStats::default();
+        let t0 = Instant::now();
+        stats.admit_rung(RungKind::Video, ALICE, 0, Some(10), t0);
+
+        let returned = t0 + RUNG_WINDOW + Duration::from_millis(1);
+        let admission = stats.admit_rung(RungKind::Video, ALICE, 0, Some(5_010), returned);
+
+        assert_eq!(
+            admission.gap, 0,
+            "a rung returning past the window must re-baseline, not book 5000 lost packets"
+        );
+        assert_eq!(stats.video_seq_gaps, 0);
+        assert_eq!(
+            stats.video_rung_expiries, 1,
+            "the un-measurable stretch must be counted, or the 0 above is silent"
+        );
+        assert_eq!(
+            stats
+                .rung_state
+                .get(&(ALICE, RungKind::Video, 0))
+                .and_then(|st| st.max_seq),
+            Some(5_010),
+            "re-baselined onto the returning sequence, so the NEXT gap is measurable"
+        );
+    }
+
+    #[test]
+    fn an_expired_rung_un_anchors_even_when_the_packet_carries_no_sequence() {
+        // Metadata-less media still ends the silence and must un-anchor with it.
+        let mut stats = InboundStats::default();
+        let t0 = Instant::now();
+        stats.admit_rung(RungKind::Video, ALICE, 0, Some(10), t0);
+
+        let returned = t0 + RUNG_WINDOW + Duration::from_millis(1);
+        stats.admit_rung(RungKind::Video, ALICE, 0, None, returned);
+        let admission = stats.admit_rung(
+            RungKind::Video,
+            ALICE,
+            0,
+            Some(5_010),
+            returned + Duration::from_millis(30),
+        );
+
+        assert_eq!(admission.gap, 0);
+        assert_eq!(stats.video_seq_gaps, 0);
+        assert_eq!(stats.video_rung_expiries, 1);
+    }
+
+    #[test]
+    fn a_silence_inside_the_window_still_books_its_gap() {
+        let mut stats = InboundStats::default();
+        let t0 = Instant::now();
+        stats.admit_rung(RungKind::Audio, ALICE, 0, Some(10), t0);
+
+        let still_inside = t0 + RUNG_WINDOW - Duration::from_millis(1);
+        let admission = stats.admit_rung(RungKind::Audio, ALICE, 0, Some(60), still_inside);
+
+        assert_eq!(admission.gap, 49);
+        assert_eq!(stats.audio_seq_gaps, 49);
+        assert_eq!(stats.audio_rung_expiries, 0);
+    }
+
+    #[test]
+    fn reported_gaps_count_the_decoded_rung_not_the_ladder_sum() {
+        // The browser drops a non-selected rung BEFORE its sequence tracker, so an
+        // unfiltered count would read up to the ladder sum against a browser's one rung.
+        let mut stats = InboundStats::default();
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+
+        let mut lost = 0u64;
+        for seq in 1..=60u64 {
+            for rung in 0..3u32 {
+                if rung == 1 && seq % 5 == 2 {
+                    lost += 1;
+                    continue;
+                }
+                stats.record_packet(
+                    "bot",
+                    &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung),
+                );
+            }
+        }
+        assert_eq!(lost, 12, "fixture must actually drop packets");
+        assert_eq!(
+            stats.video_seq_gaps, lost,
+            "the diagnostic counter stays unfiltered: it measures what the link lost"
+        );
+
+        let (drained, _) = stats.drain_health_counters();
+        assert_eq!(
+            drained["alice"].video_seq_gaps, 0,
+            "rung 2 is the decoded rung and lost nothing; rung 1's loss must not be reported"
+        );
+    }
+
+    #[test]
+    fn reported_gaps_do_count_loss_on_the_decoded_rung() {
+        let mut stats = InboundStats::default();
+        for rung in 0..3u32 {
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("alice", ALICE, 0, 1000.0, rung),
+            );
+        }
+
+        let mut lost = 0u64;
+        for seq in 1..=60u64 {
+            for rung in 0..3u32 {
+                if rung == 2 && seq % 5 == 2 {
+                    lost += 1;
+                    continue;
+                }
+                stats.record_packet(
+                    "bot",
+                    &make_video_packet_on_rung("alice", ALICE, seq, 1000.0 + seq as f64, rung),
+                );
+            }
+        }
+        assert_eq!(lost, 12);
+        let (drained, _) = stats.drain_health_counters();
+        assert_eq!(
+            drained["alice"].video_seq_gaps, lost,
+            "the guard must not swallow loss on the rung this bot decodes"
+        );
+    }
+
+    #[test]
+    fn health_counters_attribute_each_rung_gap_to_its_own_sender() {
+        let mut stats = InboundStats::default();
+        for seq in [0u64, 1, 2] {
+            stats.record_packet(
+                "bot",
+                &make_audio_packet_on_rung("alice", ALICE, seq, 1000.0, 0),
+            );
+            stats.record_packet(
+                "bot",
+                &make_video_packet_on_rung("bob", BOB, seq, 1000.0, 0),
+            );
+        }
+        stats.record_packet(
+            "bot",
+            &make_audio_packet_on_rung("alice", ALICE, 5, 1005.0, 0),
+        );
+        stats.record_packet("bot", &make_video_packet_on_rung("bob", BOB, 8, 1008.0, 0));
+
+        let (per_sender, _) = stats.drain_health_counters();
+        assert_eq!(per_sender["alice"].audio_seq_gaps, 2);
+        assert_eq!(
+            per_sender["alice"].video_seq_gaps, 0,
+            "alice sent no video; bob's loss must not land on her"
+        );
+        assert_eq!(per_sender["bob"].video_seq_gaps, 5);
+        assert_eq!(per_sender["bob"].audio_seq_gaps, 0);
     }
 }

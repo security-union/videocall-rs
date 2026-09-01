@@ -42,14 +42,12 @@ const COOKIE_NAME = process.env.COOKIE_NAME || "session";
  *   the `https://127.0.0.1:4433` target the wasm client dials.
  * - `--use-fake-*` replace real camera/mic with synthetic streams so tests
  *   run headlessly without physical devices.
- * - `--disable-gpu` avoids GPU-related flakes in CI containers.
  */
 export const BROWSER_ARGS: string[] = [
   "--ignore-certificate-errors",
   "--origin-to-force-quic-on=127.0.0.1:4433",
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
-  "--disable-gpu",
   "--disable-dev-shm-usage",
   "--renderer-process-limit=1",
 ];

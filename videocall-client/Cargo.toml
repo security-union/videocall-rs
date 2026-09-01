@@ -35,7 +35,7 @@ wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 web-time = "1.1.0"
 serde = { version = "1", features = ["derive"] }
-videocall-transport = { path = "../videocall-transport", version = "0.1.2" }
+videocall-transport = { path = "../videocall-transport", version = "0.2.0" }
 prost = "0.11"
 videocall-codecs = { path = "../videocall-codecs", features = ["wasm"], version = "0.1.13" }
 neteq = { path = "../neteq", features = ["web"], version = "0.8.3", optional = true,  default-features = false }
@@ -172,4 +172,4 @@ features = [
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.20"
-videocall-transport = { path = "../videocall-transport", version = "0.1.2", features = ["netsim"] }
+videocall-transport = { path = "../videocall-transport", version = "0.2.0", features = ["netsim"] }

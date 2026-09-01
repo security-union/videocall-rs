@@ -38,6 +38,11 @@ env:
       secretKeyRef:
         name: jwt-secret
         key: secret
+  # Off => the relay accepts a tokenless join as any identity into any room
+  # (#2298). Deploy workflows replace this whole list via `--set env[N]`, so
+  # they must set this var too; this default only covers a bare chart install.
+  - name: FEATURE_MEETING_MANAGEMENT
+    value: "true"
 resources:
   limits:
     cpu: "500m"

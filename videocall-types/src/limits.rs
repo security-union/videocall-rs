@@ -145,3 +145,9 @@ pub const MEETING_TIMER_WINDOW_MS: u64 = 2000;
 /// benefit (the host may set any end time it likes). `duration_ms` is bounded by
 /// its own magnitude alone, with no clock involved, so it carries no such risk.
 pub const MEETING_TIMER_MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Highest `MediaStreamKey` wire value: 1=audio 2=video 3=screen 4=control.
+pub const MAX_MEDIA_STREAM_KEY: u8 = 4;
+
+/// Per-stream counter-array length; index 0 is unused so a key indexes its slot.
+pub const MEDIA_STREAM_COUNTER_SLOTS: usize = MAX_MEDIA_STREAM_KEY as usize + 1;

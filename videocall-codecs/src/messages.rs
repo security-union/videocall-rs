@@ -21,6 +21,14 @@
 use crate::frame::FrameBuffer;
 use serde::{Deserialize, Serialize};
 
+/// Receiver/publisher session-id pair the worker tags its diagnostics with. NOT a wire type: it
+/// travels as [`WorkerMessage::SetContext`], so no variant changes shape (issues 1741, 2573).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamContext {
+    pub from_peer: String,
+    pub to_peer: String,
+}
+
 /// Messages that can be sent to the web worker
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerMessage {
@@ -101,12 +109,15 @@ pub struct VideoStatsMessage {
     /// deserializes (reads `None`).
     #[serde(default)]
     pub keyframe_arrivals_total: Option<u64>,
+    #[serde(default)]
+    pub freshness_evictions_total: Option<u64>,
+    #[serde(default)]
+    pub freshness_evictions_keyframeless_total: Option<u64>,
 }
 
 impl VideoStatsMessage {
-    // 9 worker→main video-diagnostic fields (#1641 added content_staleness_ms as the 8th;
-    // #2201 added keyframe_arrivals_total as the 9th); bundling them into a struct just to
-    // dodge the lint would not improve this thin DTO ctor.
+    // 11 worker→main video-diagnostic fields; bundling them into a struct just to dodge
+    // the lint would not improve this thin DTO ctor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         from_peer: String,
@@ -118,6 +129,8 @@ impl VideoStatsMessage {
         playout_skip_to_live_total: u64,
         content_staleness_ms: f64,
         keyframe_arrivals_total: u64,
+        freshness_evictions_total: u64,
+        freshness_evictions_keyframeless_total: u64,
     ) -> Self {
         Self {
             kind: "video_stats".to_string(),
@@ -130,6 +143,8 @@ impl VideoStatsMessage {
             playout_skip_to_live_total: Some(playout_skip_to_live_total),
             content_staleness_ms: Some(content_staleness_ms),
             keyframe_arrivals_total: Some(keyframe_arrivals_total),
+            freshness_evictions_total: Some(freshness_evictions_total),
+            freshness_evictions_keyframeless_total: Some(freshness_evictions_keyframeless_total),
         }
     }
 }
@@ -231,6 +246,12 @@ pub struct FreshnessSkipMessage {
     /// that omits it still deserializes (reads `0.0`).
     #[serde(default)]
     pub tick_gap_ms: f64,
+    /// Carried here as well as on `VideoStatsMessage` because this post, unlike the 1Hz stats
+    /// tick, is not `SetContext`-gated. `None` on the escalation post (#2524).
+    #[serde(default)]
+    pub freshness_evictions_total: Option<u64>,
+    #[serde(default)]
+    pub freshness_evictions_keyframeless_total: Option<u64>,
 }
 
 impl FreshnessSkipMessage {
@@ -253,7 +274,17 @@ impl FreshnessSkipMessage {
             dropped,
             escalated,
             tick_gap_ms,
+            freshness_evictions_total: None,
+            freshness_evictions_keyframeless_total: None,
         }
+    }
+
+    pub fn with_eviction_counts(mut self, counts: Option<(u64, u64)>) -> Self {
+        if let Some((total, keyframeless)) = counts {
+            self.freshness_evictions_total = Some(total);
+            self.freshness_evictions_keyframeless_total = Some(keyframeless);
+        }
+        self
     }
 
     /// Render the field-log console line for this skip (issue #1384, follow-up to
@@ -399,6 +430,29 @@ impl KeyframeArrivalMessage {
 /// `"keyframe_arrival"` on the shared serde worker->main channel.
 pub const WORKER_LOG_KIND: &str = "worker_log";
 
+pub const WORKER_READY_KIND: &str = "worker_ready";
+
+/// Worker->main boot handshake (issue 2572), posted at the END of the worker's asynchronously
+/// booted `main()` — after the `onmessage` a main->worker post needs in order to be delivered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerReadyMessage {
+    pub kind: String,
+}
+
+impl WorkerReadyMessage {
+    pub fn new() -> Self {
+        Self {
+            kind: WORKER_READY_KIND.to_string(),
+        }
+    }
+}
+
+impl Default for WorkerReadyMessage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Which worker->main payload a `kind` string selects (issue #2201).
 ///
 /// All worker->main messages ride ONE JS-object channel and are told apart by `kind`,
@@ -419,6 +473,7 @@ pub enum WorkerMessageKind {
     FreshnessSkip,
     KeyframeArrival,
     WorkerLog,
+    WorkerReady,
     /// A `kind` none of the branches claim — the dispatcher logs it as unexpected.
     Unknown,
 }
@@ -431,6 +486,7 @@ pub fn classify_worker_message_kind(kind: &str) -> WorkerMessageKind {
         FRESHNESS_SKIP_KIND => WorkerMessageKind::FreshnessSkip,
         KEYFRAME_ARRIVAL_KIND => WorkerMessageKind::KeyframeArrival,
         WORKER_LOG_KIND => WorkerMessageKind::WorkerLog,
+        WORKER_READY_KIND => WorkerMessageKind::WorkerReady,
         _ => WorkerMessageKind::Unknown,
     }
 }
@@ -550,7 +606,7 @@ mod worker_log_disambiguation_tests {
         // fields (level/target/message) are absent from every other message, so none of them can
         // deserialize into WorkerLogMessage at all -> the branch is structurally unable to swallow
         // them, independent of the kind guard.
-        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0, 6);
+        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0, 6, 7, 8);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
         );
@@ -616,11 +672,26 @@ mod worker_log_disambiguation_tests {
         assert!(!back.rejected_as_old);
     }
 
+    #[test]
+    fn eviction_counts_ride_the_freshness_skip_wire() {
+        let attached = FreshnessSkipMessage::new(None, None, 1800.0, None, 3, false, 10.0)
+            .with_eviction_counts(Some((41, 37)));
+        let wire = serde_json::to_string(&attached).unwrap();
+        let back: FreshnessSkipMessage = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.freshness_evictions_total, Some(41));
+        assert_eq!(back.freshness_evictions_keyframeless_total, Some(37));
+
+        let bare = FreshnessSkipMessage::new(None, None, 1800.0, None, 3, false, 10.0)
+            .with_eviction_counts(None);
+        assert_eq!(bare.freshness_evictions_total, None);
+        assert_eq!(bare.freshness_evictions_keyframeless_total, None);
+    }
+
     /// Issue #2201: the arrival branch must not SWALLOW another message type. Its required
     /// `seq` + bool fields are absent from every other payload.
     #[test]
     fn keyframe_arrival_branch_cannot_swallow_other_messages() {
-        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0, 6);
+        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0, 6, 7, 8);
         assert!(serde_json::from_str::<KeyframeArrivalMessage>(
             &serde_json::to_string(&vs).unwrap()
         )
@@ -666,7 +737,8 @@ mod worker_message_kind_dispatch_tests {
     fn each_message_kind_routes_to_its_own_branch() {
         let cases = [
             (
-                VideoStatsMessage::new("a".into(), "b".into(), 0, 0.0, 0.0, 0.0, 0, 0.0, 0).kind,
+                VideoStatsMessage::new("a".into(), "b".into(), 0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0, 0)
+                    .kind,
                 WorkerMessageKind::VideoStats,
             ),
             (
@@ -685,6 +757,10 @@ mod worker_message_kind_dispatch_tests {
             (
                 WorkerLogMessage::new("WARN".into(), "t".into(), "m".into(), None, None, 0).kind,
                 WorkerMessageKind::WorkerLog,
+            ),
+            (
+                WorkerReadyMessage::new().kind,
+                WorkerMessageKind::WorkerReady,
             ),
         ];
         for (kind, expected) in cases {
@@ -954,11 +1030,7 @@ mod freshness_skip_console_line_tests {
 
     #[test]
     fn empty_peers_render_as_empty_arrow() {
-        // `None` peers (a skip forwarded before SetContext backfill) render as `->`,
-        // matching the prior inline `unwrap_or_default()` behavior — keeps the line
-        // shape stable for the grep. With issue #1640 this is now rare (SetContext is
-        // sent at peer creation), but can still occur if the freshness deadline trips
-        // on the very first frame before the postMessage delivering SetContext arrives.
+        // `None` peers render as `->` so the line stays parseable by the same grep.
         let line =
             FreshnessSkipMessage::new(None, None, 100.0, Some(5), 1, false, 0.0).console_line();
         assert!(

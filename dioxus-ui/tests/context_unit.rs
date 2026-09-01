@@ -937,13 +937,15 @@ fn apply_decision_websocket_not_remembered_clears_all_storage() {
 // ---------------------------------------------------------------------------
 
 /// Resolve prefs starting from `Default` (all enabled) for the given raw stored
-/// strings, returning `(entry_msg, exit_msg, entry_sound, exit_sound)`.
+/// strings, returning
+/// `(entry_msg, exit_msg, entry_sound, exit_sound, hand_raise_sound)`.
 fn resolve_notification_prefs(
     entry_notifications: Option<&str>,
     exit_notifications: Option<&str>,
     entry_sound: Option<&str>,
     exit_sound: Option<&str>,
-) -> (bool, bool, bool, bool) {
+    hand_raise_sound: Option<&str>,
+) -> (bool, bool, bool, bool, bool) {
     let mut settings = AppearanceSettings::default();
     apply_notification_prefs(
         &mut settings,
@@ -951,12 +953,14 @@ fn resolve_notification_prefs(
         exit_notifications,
         entry_sound,
         exit_sound,
+        hand_raise_sound,
     );
     (
         settings.show_entry_notifications,
         settings.show_exit_notifications,
         settings.play_entry_sound,
         settings.play_exit_sound,
+        settings.play_hand_raise_sound,
     )
 }
 
@@ -964,8 +968,8 @@ fn resolve_notification_prefs(
 fn notification_prefs_default_all_enabled() {
     // No stored keys -> every direction stays enabled.
     assert_eq!(
-        resolve_notification_prefs(None, None, None, None),
-        (true, true, true, true)
+        resolve_notification_prefs(None, None, None, None, None),
+        (true, true, true, true, true)
     );
 }
 
@@ -974,8 +978,8 @@ fn notification_prefs_exit_message_independent_of_entry() {
     // Disabling ONLY the exit message must not touch the entry message (or
     // either sound). A single shared flag or a cross-wired read would fail here.
     assert_eq!(
-        resolve_notification_prefs(None, Some("false"), None, None),
-        (true, false, true, true)
+        resolve_notification_prefs(None, Some("false"), None, None, None),
+        (true, false, true, true, true)
     );
 }
 
@@ -983,8 +987,8 @@ fn notification_prefs_exit_message_independent_of_entry() {
 fn notification_prefs_entry_message_independent_of_exit() {
     // Symmetric: disabling only the entry message leaves exit enabled.
     assert_eq!(
-        resolve_notification_prefs(Some("false"), None, None, None),
-        (false, true, true, true)
+        resolve_notification_prefs(Some("false"), None, None, None, None),
+        (false, true, true, true, true)
     );
 }
 
@@ -992,8 +996,8 @@ fn notification_prefs_entry_message_independent_of_exit() {
 fn notification_prefs_exit_sound_independent() {
     // Sounds are independent of messages and of each other.
     assert_eq!(
-        resolve_notification_prefs(None, None, None, Some("false")),
-        (true, true, true, false)
+        resolve_notification_prefs(None, None, None, Some("false"), None),
+        (true, true, true, false, true)
     );
 }
 
@@ -1001,8 +1005,8 @@ fn notification_prefs_exit_sound_independent() {
 fn notification_prefs_entry_sound_independent() {
     // Disabling the entry sound leaves the other three enabled.
     assert_eq!(
-        resolve_notification_prefs(None, None, Some("false"), None),
-        (true, true, false, true)
+        resolve_notification_prefs(None, None, Some("false"), None, None),
+        (true, true, false, true, true)
     );
 }
 
@@ -1011,7 +1015,26 @@ fn notification_prefs_non_false_value_enables() {
     // Any present value other than "false" is treated as enabled, matching the
     // `!= "false"` read used across the boolean prefs.
     assert_eq!(
-        resolve_notification_prefs(Some("true"), Some("garbage"), None, None),
-        (true, true, true, true)
+        resolve_notification_prefs(Some("true"), Some("garbage"), None, None, None),
+        (true, true, true, true, true)
+    );
+}
+
+/// Issue 2329: the hand-raise chime is a FIFTH independent channel, not a
+/// rider on the leave chime.
+///
+/// The risk `apply_notification_prefs` now carries is a cross-wired positional
+/// argument — five same-typed `Option<&str>` in a row — so this asserts the
+/// whole tuple in both directions: the new key must not move any of the four,
+/// and none of the four may move it.
+#[wasm_bindgen_test]
+fn notification_prefs_hand_raise_sound_independent() {
+    assert_eq!(
+        resolve_notification_prefs(None, None, None, None, Some("false")),
+        (true, true, true, true, false)
+    );
+    assert_eq!(
+        resolve_notification_prefs(None, None, None, Some("false"), None),
+        (true, true, true, false, true)
     );
 }

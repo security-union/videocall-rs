@@ -44,7 +44,7 @@ use videocall_codecs::jitter_buffer::{
 };
 use videocall_codecs::messages::{
     FreshnessSkipMessage, KeyframeArrivalMessage, RequestKeyframeMessage, VideoStatsMessage,
-    WorkerLogMessage, WorkerMessage,
+    WorkerLogMessage, WorkerMessage, WorkerReadyMessage,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -476,6 +476,9 @@ pub fn main() {
 
     // Start the jitter buffer check interval
     start_jitter_buffer_interval();
+
+    // LAST (issue 2572): releases the main thread's boot queue; handlers must precede it.
+    post_worker_ready_to_main();
 }
 
 fn handle_worker_message(message: WorkerMessage) {
@@ -494,7 +497,6 @@ fn handle_worker_message(message: WorkerMessage) {
         WorkerMessage::SetContext { from_peer, to_peer } => {
             CONTEXT_FROM.with(|f| *f.borrow_mut() = Some(from_peer));
             CONTEXT_TO.with(|t| *t.borrow_mut() = Some(to_peer));
-            console::log_1(&"[WORKER] Set diagnostics context (from_peer,to_peer)".into());
         }
         WorkerMessage::PaintProgress { painted } => {
             // Stage-3 paint lag (issue #1252): cumulative frames the main thread has drained from
@@ -538,7 +540,7 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
                 sequence_number: frame.sequence_number(),
                 frame_type: frame.frame.frame_type,
                 codec: frame.frame.codec,
-                data: frame.frame.data.clone(),
+                data: frame.frame.data,
                 timestamp: frame.frame.timestamp,
             };
 
@@ -592,7 +594,7 @@ fn inject_stale_frame_to_jitter_buffer(frame: FrameBuffer) {
                 sequence_number: frame.sequence_number(),
                 frame_type: frame.frame.frame_type,
                 codec: frame.frame.codec,
-                data: frame.frame.data.clone(),
+                data: frame.frame.data,
                 timestamp: frame.frame.timestamp,
             };
             // Use the caller-supplied (back-dated) arrival time, NOT Date::now().
@@ -643,7 +645,7 @@ fn check_jitter_buffer_for_ready_frames() {
             // field. Event-driven (only on an actual skip), so unlike the 1Hz stats
             // below it is not rate-limited.
             if let Some(skip) = jb.take_freshness_skip() {
-                post_freshness_skip_to_main(&skip);
+                post_freshness_skip_to_main(&skip, Some(jb.freshness_eviction_counts()));
             }
 
             // Issue #2201 backstop: the insert path is the normal drain site for a keyframe
@@ -711,6 +713,10 @@ fn check_jitter_buffer_for_ready_frames() {
                                     // ~0 but climbs here. Read-only — no playout behavior change.
                                     let content_staleness_ms =
                                         jb.content_staleness_ms_live(current_time_ms);
+                                    let (
+                                        freshness_evictions_total,
+                                        freshness_evictions_keyframeless_total,
+                                    ) = jb.freshness_eviction_counts();
 
                                     // TRUE painted-frame fps (issue #1656): frames actually RELEASED
                                     // to the renderer (FRAMES_EMITTED, posted to main per decoded
@@ -791,6 +797,8 @@ fn check_jitter_buffer_for_ready_frames() {
                                             // load-bearing main-thread path (the worker's own
                                             // DiagEvent broadcast does not cross the boundary).
                                             jb.keyframe_arrival_count(),
+                                            freshness_evictions_total,
+                                            freshness_evictions_keyframeless_total,
                                         );
                                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                             let _ = scope.post_message(&val);
@@ -875,7 +883,8 @@ fn gate_keyframe_less_escalation(signal: EscalationSignal) -> bool {
     // Force-post the escalation diagnostic directly to main, synchronously this poll — before the
     // deferred `reset_jitter_buffer()` runs and without going through the buffer's ~1s
     // `record_freshness_skip` throttle (review B2).
-    post_freshness_skip_to_main(&skip);
+    // `None`: this hook runs inside the buffer's poll and cannot re-borrow it (#2524).
+    post_freshness_skip_to_main(&skip, None);
     true
 }
 
@@ -906,10 +915,25 @@ fn post_request_keyframe_to_main(head_age_ms: f64) {
     }
 }
 
+fn post_worker_ready_to_main() {
+    let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
+        console::warn_1(&"[WORKER] worker_ready: no worker scope; dropping".into());
+        return;
+    };
+    match serde_wasm_bindgen::to_value(&WorkerReadyMessage::new()) {
+        Ok(val) => {
+            let _ = scope.post_message(&val);
+        }
+        Err(e) => {
+            console::warn_1(&format!("[WORKER] worker_ready: serialize failed: {e:?}").into());
+        }
+    }
+}
+
 /// Post a freshness-deadline skip (issue #1045) to the main thread so it lands in
 /// uploaded field logs. Mirrors `post_request_keyframe_to_main`; context
 /// (CONTEXT_FROM/CONTEXT_TO) is read at emit time.
-fn post_freshness_skip_to_main(skip: &FreshnessSkip) {
+fn post_freshness_skip_to_main(skip: &FreshnessSkip, eviction_counts: Option<(u64, u64)>) {
     let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
         console::warn_1(&"[WORKER] freshness_skip: no worker scope; dropping".into());
         return;
@@ -924,7 +948,8 @@ fn post_freshness_skip_to_main(skip: &FreshnessSkip) {
         skip.dropped,
         skip.escalated,
         skip.tick_gap_ms,
-    );
+    )
+    .with_eviction_counts(eviction_counts);
     match serde_wasm_bindgen::to_value(&msg) {
         Ok(val) => {
             let _ = scope.post_message(&val);

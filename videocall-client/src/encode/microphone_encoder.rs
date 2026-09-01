@@ -92,6 +92,16 @@ const _: () = assert!(
     "publisher AUDIO_SIMULCAST_LAYER_KBPS and receiver AUDIO_LAYER_KBPS must have the same length"
 );
 
+const _: () = assert!(
+    AUDIO_SIMULCAST_LAYER_KBPS.len() == videocall_aq::constants::AUDIO_SIMULCAST_MAX_LAYERS,
+    "AUDIO_SIMULCAST_LAYER_KBPS must match videocall_aq AUDIO_SIMULCAST_MAX_LAYERS"
+);
+const _: () = assert!(
+    crate::decode::layer_chooser::audio_layer_kbps_len()
+        == videocall_aq::constants::AUDIO_SIMULCAST_MAX_LAYERS,
+    "AUDIO_LAYER_KBPS must match videocall_aq AUDIO_SIMULCAST_MAX_LAYERS"
+);
+
 /// Clamp a requested audio `max_layers` to `[1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS]`.
 /// Explicitly configured `0`/`1` → single layer (feature-off, byte-identical mic
 /// path). Free function so it is unit-testable without constructing a
@@ -129,9 +139,7 @@ fn clamp_audio_layer_count(max_layers: u32) -> u32 {
 /// SECOND runtime gate driven by the server CONGESTION signal. Audio still has no
 /// shed from encoder backpressure or a relay `LAYER_HINT` (the client ignores
 /// AUDIO hints, and the relay stopped computing the AUDIO union under #1118 N3 /
-/// PR #1330). At the default (Auto) ceilings the full 12/24/48 kbps ladder
-/// (~84 kbps, issue #1768) publishes unconditionally — a deliberate, documented
-/// cost (audio is ~1-3% of call bandwidth).
+/// PR #1330).
 fn audio_layer_is_published(
     layer_id: u32,
     user_ceiling_atomic: u32,
@@ -993,18 +1001,12 @@ pub struct MicrophoneEncoder {
     /// ROLLOUT NOTE (low-power devices): each higher layer (`1..N`) is a SECOND+
     /// full Opus encode of the same mic input, so audio encode CPU scales roughly
     /// linearly with the active layer count. Opus is cheap relative to video, so
-    /// this is acceptable — and it is flag-gated: higher layers are only
-    /// instantiated when the effective audio layer count is > 1 (driven by
-    /// `experimentalSimulcastMaxLayers`, capped by the audio ladder size).
-    /// Unlike video, audio is deliberately decoupled from the device-capability
-    /// ceiling in `dioxus-ui/src/components/host.rs`, so the runtime default of 3
-    /// instantiates the full audio ladder even when video is capability-gated
-    /// lower. If audio-CPU pressure appears on low-power hardware, add an
-    /// audio-specific capability gate.
+    /// this is acceptable. Higher layers are only instantiated when the caller's
+    /// audio layer count is > 1; `dioxus-ui` passes one.
     codecs: Vec<AudioWorkletCodec>,
     /// Maximum audio simulcast layers (issue #989, Phase 3c → up to 3 in #1082).
-    /// 1 = single layer (byte-identical); the runtime default passes 3. Clamped
-    /// in `start` to `[1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS]`.
+    /// 1 = single layer (byte-identical), which is what `dioxus-ui` passes (#2279).
+    /// Clamped in `start` to `[1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS]`.
     max_layers: u32,
     on_error: Option<Callback<String>>,
     /// Classified callback fired ONLY at the real `getUserMedia` rejection site,
@@ -1624,8 +1626,7 @@ impl MicrophoneEncoder {
         // Clone atomic values for use in different closures.
         // Audio simulcast layer count (issue #989, Phase 3c → up to 3 in #1082).
         // 1 = explicitly configured single layer (byte-identical). N>1 = LOW
-        // base (layer 0) plus the higher rungs of AUDIO_SIMULCAST_LAYER_KBPS;
-        // the shipped runtime default supplies 3.
+        // base (layer 0) plus the higher rungs of AUDIO_SIMULCAST_LAYER_KBPS.
         let n_audio_layers = clamp_audio_layer_count(self.max_layers) as usize;
         log::info!(
             "MicrophoneEncoder: effective audio layers = {}",
@@ -3000,6 +3001,71 @@ mod layer_count_tests {
         );
         assert_eq!(next, u32::MAX);
         assert!(done);
+    }
+
+    /// The #1398 single-layer levers are LIVE at the shipped audio layer count.
+    ///
+    /// Both gates are `n_audio_layers == 1`, and every deployed client passed 3 until
+    /// #2279, so neither the FEC/bitrate reconfig nor the uplink-distress detector had
+    /// ever run in production. This pins the activation itself — the pure decisions
+    /// each gate feeds are covered separately above.
+    ///
+    /// MUTATION: make `clamp_audio_layer_count` return 3 and every assertion here
+    /// flips.
+    #[test]
+    fn single_layer_audio_levers_are_live_at_the_shipped_layer_count() {
+        let n = clamp_audio_layer_count(1);
+        assert_eq!(n, 1, "premise: the shipped count collapses to one encoder");
+        let single_layer = n == 1;
+
+        // DETECTOR: the gate opens for an audio-only publisher (camera + screen off),
+        // which is the case that now reaches the mic-side down trigger for the first
+        // time. It stays CLOSED with the camera on and video not exhausted, so the
+        // camera AQ loop is still the sole authority there (no compounding).
+        assert!(audio_detector_gate_open(
+            single_layer,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!audio_detector_gate_open(
+            single_layer,
+            true,
+            false,
+            false,
+            false
+        ));
+
+        // RECONFIG: single-layer mode supplies a `bit_rate` component, so a tier or
+        // floor move is actually re-applied to the live encoder. Camera-OFF with no
+        // cut takes the healthy top tier rather than a stale low tier.
+        let camera_off_no_cut = effective_audio_bitrate(8_000, u32::MAX, false, false);
+        assert_eq!(
+            camera_off_no_cut,
+            AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000
+        );
+        // Camera-OFF with an active cut: the mic floor governs — the newly-reachable
+        // path where an audio-only user's bitrate tracks the congestion floor.
+        assert_eq!(
+            effective_audio_bitrate(48_000, 12_000, false, false),
+            12_000
+        );
+
+        let bit_rate = if single_layer {
+            Some(camera_off_no_cut)
+        } else {
+            None
+        };
+        assert!(
+            bit_rate.is_some(),
+            "single-layer mode must carry a bitrate in the reconfig, or the AQ walk is inert"
+        );
+        assert_eq!(
+            audio_reconfig_change((true, 10, bit_rate), None, None),
+            Some((true, 10, bit_rate)),
+            "the first single-layer reconfig must be emitted, not coalesced away"
+        );
     }
 
     #[test]

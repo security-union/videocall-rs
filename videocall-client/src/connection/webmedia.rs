@@ -75,7 +75,7 @@ impl MediaStreamKey {
     /// are arbitrary but **must not change** without a coordinated
     /// client+server release — they are the wire identity of each
     /// persistent stream.
-    pub fn as_u8(self) -> u8 {
+    pub const fn as_u8(self) -> u8 {
         match self {
             MediaStreamKey::Audio => 1,
             MediaStreamKey::Video => 2,
@@ -84,17 +84,11 @@ impl MediaStreamKey {
         }
     }
 
-    /// Highest currently assigned `MediaStreamKey` wire value. This value and
-    /// the transport crate's per-stream counter slot counts are hand-maintained
-    /// as a cross-crate contract; update them together when adding a key.
-    pub const MAX_WIRE_VALUE: u8 = 4;
+    /// Highest currently assigned `MediaStreamKey` wire value.
+    pub const MAX_WIRE_VALUE: u8 = videocall_types::limits::MAX_MEDIA_STREAM_KEY;
 }
 
-// Verifies that the declared maximum fits the #1677 per-stream distress arrays
-// (slots 0..=4 in videocall-transport). Unknown larger keys safely remain
-// aggregate-only; maintainers must update this value and the transport slots
-// together to preserve per-stream attribution.
-const _: () = assert!(MediaStreamKey::MAX_WIRE_VALUE < 5);
+const _: () = assert!(MediaStreamKey::Control.as_u8() == MediaStreamKey::MAX_WIRE_VALUE);
 
 pub(super) trait WebMedia<TASK> {
     fn connect(options: ConnectOptions) -> anyhow::Result<TASK>;

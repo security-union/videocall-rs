@@ -31,19 +31,16 @@ videocall-aq = { path = "../videocall-aq", version = "0.1.0" }
 # share the same admission algorithm. The bot keeps a thin `BotNetSimShim`
 # wrapper that adds Prometheus metric hooks the wasm consumer doesn't need.
 videocall-netsim = { path = "../videocall-netsim", version = "0.1.0" }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.2", features = ["mint"] }
 protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"
 url = "2.3.1"
-percent-encoding = "2"
 
 # Transports
 web-transport-quinn = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
-
-# JWT authentication
-jsonwebtoken = "9"
 
 # Audio processing (from neteq_player.rs pattern)
 hound = "3.5"  # WAV file reading

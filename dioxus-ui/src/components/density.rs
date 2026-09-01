@@ -11,6 +11,16 @@ pub enum DensityMode {
     Maximum,
 }
 
+/// Viewport width below which `min_tile_width` uses the mobile table. Mirrored by
+/// `e2e/helpers/rust-mirrored-constants.ts` — the viewport-filter spec's `+N` geometry
+/// depends on staying on the desktop side of it.
+pub const MOBILE_WIDTH_BREAKPOINT_PX: f64 = 568.0;
+
+/// `Standard` desktop minimum tile width. Mirrored by
+/// `e2e/helpers/rust-mirrored-constants.ts` — the viewport-filter spec picks its window
+/// so a two-tile layout lands below this.
+pub const STANDARD_MIN_TILE_WIDTH_DESKTOP_PX: f64 = 340.0;
+
 impl DensityMode {
     /// Minimum tile width (px) for this mode, adjusted for viewport.
     /// This is the ONLY knob that differentiates modes — no participant caps.
@@ -19,7 +29,7 @@ impl DensityMode {
     /// visibly different tile counts** for a typical 20-participant call on
     /// both desktop (~1366 px) and mobile (~375 px).
     pub fn min_tile_width(self, viewport_w: f64) -> f64 {
-        if viewport_w < 568.0 {
+        if viewport_w < MOBILE_WIDTH_BREAKPOINT_PX {
             // Mobile: 1-col vs 2-col is the main differentiator.
             match self {
                 DensityMode::Standard => 250.0, // 1 col, ~4 tiles
@@ -30,10 +40,10 @@ impl DensityMode {
         } else {
             // Desktop: 3-col / 4-col / 5-col+ transitions.
             match self {
-                DensityMode::Standard => 340.0, // 3 cols, ~9 tiles
-                DensityMode::Auto => 280.0,     // 4 cols, ~12 tiles
-                DensityMode::Dense => 260.0,    // 4 cols, ~16 tiles
-                DensityMode::Maximum => 120.0,  // 5+ cols, all tiles
+                DensityMode::Standard => STANDARD_MIN_TILE_WIDTH_DESKTOP_PX, // 3 cols, ~9 tiles
+                DensityMode::Auto => 280.0,                                  // 4 cols, ~12 tiles
+                DensityMode::Dense => 260.0,                                 // 4 cols, ~16 tiles
+                DensityMode::Maximum => 120.0,                               // 5+ cols, all tiles
             }
         }
     }

@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "title": "videocall-postgres",
-  "description": "Requires a cluster values file. Helm validates this on lint, template, install and upgrade, so omitting -f fails instead of silently deploying Bitnami defaults.",
+  "description": "Requires cluster-specific database, resource and storage values. Helm validates this on lint, template, install and upgrade.",
   "type": "object",
   "required": ["postgresql"],
   "properties": {
     "postgresql": {
       "type": "object",
-      "required": ["auth", "primary"],
+      "required": ["auth", "image", "primary"],
       "properties": {
         "auth": {
           "type": "object",
@@ -20,25 +20,68 @@
             }
           }
         },
+        "image": {
+          "type": "object",
+          "required": ["tag"],
+          "properties": {
+            "tag": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Explicit image tag. The PVC is retained, so a floating tag can start a different PostgreSQL major against an existing data directory. Required even when digest is set, so blanking the digest cannot fall back to the subchart's latest."
+            },
+            "digest": {
+              "type": "string",
+              "description": "Optional immutable pin. Takes precedence over tag."
+            }
+          }
+        },
         "primary": {
           "type": "object",
           "required": ["persistence", "resources"],
           "properties": {
             "persistence": {
               "type": "object",
-              "required": ["storageClass", "size"],
               "properties": {
+                "enabled": { "type": "boolean" },
+                "existingClaim": { "type": "string" },
                 "storageClass": {
                   "type": "string",
-                  "minLength": 1,
                   "description": "Explicit storage class. Empty means the cluster default, which differs per cluster."
                 },
-                "size": { "type": "string", "minLength": 1 }
-              }
+                "size": { "type": "string" }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "required": ["enabled", "existingClaim"],
+                    "properties": {
+                      "enabled": { "const": true },
+                      "existingClaim": { "maxLength": 0 }
+                    }
+                  },
+                  "then": {
+                    "required": ["storageClass", "size"],
+                    "properties": {
+                      "storageClass": { "minLength": 1 },
+                      "size": { "minLength": 1 }
+                    }
+                  }
+                }
+              ]
             },
             "resources": {
               "type": "object",
-              "required": ["limits", "requests"]
+              "required": ["limits", "requests"],
+              "properties": {
+                "limits": {
+                  "type": "object",
+                  "minProperties": 1
+                },
+                "requests": {
+                  "type": "object",
+                  "minProperties": 1
+                }
+              }
             }
           }
         }

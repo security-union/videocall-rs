@@ -47,6 +47,11 @@ rustlemania-webtransport:
     # (option c); multi-core rearchitecture (#1639 a/b) is gated on #1637.
     - name: TOKIO_BLOCKING_THREADS
       value: "2"  # Small pool for blocking crypto operations
+    - name: JWT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: jwt-secret
+          key: secret
 
   resources:
     limits:

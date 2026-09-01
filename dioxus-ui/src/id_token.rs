@@ -114,7 +114,7 @@ impl IdTokenClaims {
 /// and to `std::time::SystemTime` on native targets.  Both the production
 /// exp-check and the test suite therefore compile and run correctly on every
 /// target without `#[cfg]` guards.
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

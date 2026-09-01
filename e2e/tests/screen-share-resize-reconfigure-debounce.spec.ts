@@ -46,8 +46,10 @@ import { wakeControls } from "../helpers/controls";
  * every `intervalMs`, emitting one frame per step (15 distinct sizes at ~60ms ≈
  * the field's ~18/sec), then holds at the final size and resumes steady emission
  * so a post-settle frame arrives and the single settled reconfigure applies. All
- * sizes stay <= 1280x720 (below every screen tier's `max_*`), so each fits 1:1
- * (no aspect clamping) and every step is a genuine fitted-dim change.
+ * sizes stay <= 1280x720, far below the `SCREEN_MAX_ENCODE_*` ceiling, so each
+ * encodes at its own size 1:1 (no aspect clamping) and every step is a genuine
+ * encode-dim change. (The ceiling's VALUE is deliberately not restated here — it
+ * has already moved once, 3840x2160 -> 2560x1440.)
  *
  * ## Assertions (and why they fail on the un-fixed code)
  *
@@ -102,8 +104,9 @@ const MOCK_RESIZABLE_DISPLAY_MEDIA_SCRIPT = `
   (() => {
     const mediaDevices = navigator.mediaDevices;
     if (!mediaDevices) return;
-    // Initial source size — kept well below every screen tier's max (1280x720)
-    // so it fits 1:1 and the encoder configures at exactly this size.
+    // Initial source size — well below the encode ceiling, so the encoder
+    // configures at exactly this size (issue #2343: encode geometry IS the
+    // capture geometry unless the ceiling bites).
     const state = { w: 1024, h: 640, emitting: true };
     window.__e2e1922 = state;
     const createStream = () => {

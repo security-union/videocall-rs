@@ -24,7 +24,7 @@ import { waitForServices } from "../helpers/wait-for-services";
  *      `/meeting/<id>` without going through the home page first.
  *
  *   4. Guest fast-path fix (auth.rs)
- *      The `check_session()` guest fast-path (`vc_guest_session_id` in
+ *      The `check_session()` guest fast-path (the `vc_guest_*` keys in
  *      sessionStorage) now only short-circuits when `is_pkce_flow()` is true.
  *      In server-side OAuth mode, it clears the stale marker and falls through
  *      to the normal backend session check.

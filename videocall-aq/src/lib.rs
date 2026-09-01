@@ -20,6 +20,7 @@
 //! - [`constants`] — tuning constants (tier definitions, PID gains, thresholds)
 //! - [`manager`] — the [`AdaptiveQualityManager`] tier state machine
 //! - [`controller`] — the [`EncoderBitrateController`] PID loop + tier glue
+//! - [`screen_bitrate`] — the screen-share uplink backoff ladder (issue #2343)
 //! - [`clock`] — a [`Clock`] trait that abstracts over browser `Date.now()`
 //!   and native `SystemTime`, so AQ logic runs identically on both targets
 //!   (and can be tested deterministically with `TestClock`).
@@ -32,10 +33,12 @@ pub mod clock;
 pub mod constants;
 pub mod controller;
 pub mod manager;
+pub mod screen_bitrate;
 
 pub use aspect::{
-    fit_within_preserving_aspect, fit_within_tier_box, orient_box_to_source,
-    simulcast_layer_target_dims, SimulcastLayerDims,
+    capture_exceeds_encode_ceiling, fit_within_preserving_aspect, fit_within_tier_box,
+    orient_box_to_source, screen_encode_box_for_capture, simulcast_layer_target_dims,
+    SimulcastLayerDims,
 };
 
 pub use clock::{default_clock, Clock, TestClock};
@@ -49,3 +52,8 @@ pub use clock::JsDateClock;
 pub use manager::{AdaptiveQualityManager, TierTransitionRecord};
 
 pub use controller::{EncoderBitrateController, EncoderControl};
+
+pub use screen_bitrate::{
+    queued_ms_for, screen_bitrate_at_floor, screen_effective_bitrate_kbps, ScreenBaselineKbps,
+    ScreenPressureStep, ScreenTargetKbps, ScreenUplinkGovernor, ScreenUplinkSample,
+};

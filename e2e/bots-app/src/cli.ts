@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
+import { inspect } from "node:util";
 
 import { Command } from "commander";
 import { chromium } from "@playwright/test";
@@ -11,6 +12,7 @@ import {
   defaultSsoStatePath,
   storageStatePath,
 } from "./auth/storage-state";
+import { FORM_LOGIN_ACTION_TIMEOUT_MS, FORM_LOGIN_TIMEOUT_MS } from "./auth/form-login";
 import { captureSsoStateInteractive } from "./auth/sso-capture";
 import { writeFileSync } from "node:fs";
 
@@ -30,8 +32,12 @@ import {
 } from "./meeting-config";
 import { runBotsToCompletion, type BotTask, type RunOptions } from "./orchestrator";
 import { type VideoMode } from "./bot";
+import { CAMERA_CYCLE_ENV, resolveCameraCycle } from "./camera-cycle";
 import { resolveHardwareConcurrency } from "./hw-concurrency";
+import { botsAppLine, taggedLine } from "./log-line";
+import { resolveBaseBotIndex, sourceGeometryForIndex } from "./posture";
 import { resolveMaxReceivedLayer, resolveSkipCanvasPaint } from "./receiver-caps";
+import { ArrivalTracker } from "./resource/arrival";
 import { FpsTracker } from "./resource/fps";
 import { RemoteResourceManager, ResourceCaptureSession } from "./resource/session";
 import { RESOURCE_FPS_BASE_RUNG } from "./resource/verdict";
@@ -118,6 +124,14 @@ program
     `Netsim profile applied to the bot's outbound media (one of: ${NETSIM_PRESETS.join(", ")}). Appends ?netsim=<profile> to the meeting URL — only takes effect when the served videocall-client is built with --features netsim. In --config mode this acts as a default that per-bot config entries override. See discussion #793 phase 3.`,
   )
   .option(
+    "--login-timeout <ms>",
+    `Budget (ms) for the network-bound waits of the form-login flow (env: BOT_LOGIN_TIMEOUT_MS; CLI flag wins). Raise it when startup network shaping (#2354) is in effect, so the OAuth redirect chain runs over the impaired link. Only consulted with --auth form-login. Default ${FORM_LOGIN_TIMEOUT_MS}.`,
+  )
+  .option(
+    "--login-action-timeout <ms>",
+    `Per-step budget (ms) for the form-login fill/click actions (env: BOT_LOGIN_ACTION_TIMEOUT_MS; CLI flag wins). Only consulted with --auth form-login. Default ${FORM_LOGIN_ACTION_TIMEOUT_MS}.`,
+  )
+  .option(
     "--ctl-port <port>",
     'Phase 4: bind a local HTTP control API so `bots-app ctl <cmd>` can introspect and mutate the running fleet. Pass an integer port, "auto" to let the kernel pick a free port, or omit to disable the control surface entirely. The token is written to run/ctl-<pid>.token (mode 0600). See discussion #793 phase 4.',
   )
@@ -149,20 +163,24 @@ program
     "--skip-canvas-paint <bool>",
     "Skip per-tile canvas paint via window.__APP_CONFIG.skipCanvasPaint (env: BOT_SKIP_CANVAS_PAINT; CLI flag wins). true = decode-and-drop (saves paint/GPU only — decode still runs; use --max-received-layer to cut decode CPU) (issue #2069). Same launch-time injection + PR #2078 dependency as --max-received-layer. When unset the deployment's value is inherited.",
   )
+  .option(
+    "--bot-index <N>",
+    "Fleet index of this process's FIRST bot (env: BOT_INDEX; CLI flag wins). Clock-mode capture geometry is a pure function of the index: every 6th index (1, 7, 13, 19, …) captures 1280x720, the rest 640x480, seeding the observed publisher mix (issue #2236, following #2171). Further bots in this process take the following indices. A K8s pod passes its StatefulSet ordinal (the entrypoint does this in ordinal identity mode). Unset ⇒ 0 ⇒ 640x480.",
+  )
   .action(async (opts: RunCommandOptions) => {
     // Mutual exclusion / required-arg checks ──────────────────────────
     const modeCount = [opts.participant, opts.users, opts.config].filter(Boolean).length;
     if (modeCount > 1) {
-      console.error("bots-app: --participant, --users, and --config are mutually exclusive");
+      console.error(botsAppLine("--participant, --users, and --config are mutually exclusive"));
       process.exit(2);
     }
     if (modeCount === 0) {
-      console.error("bots-app: one of --participant, --users, or --config is required");
+      console.error(botsAppLine("one of --participant, --users, or --config is required"));
       process.exit(2);
     }
     if (!["costume", "file", "clock"].includes(opts.videoMode)) {
       console.error(
-        `bots-app: --video-mode must be "costume", "file", or "clock", got "${opts.videoMode}"`,
+        botsAppLine(`--video-mode must be "costume", "file", or "clock", got "${opts.videoMode}"`),
       );
       process.exit(2);
     }
@@ -172,7 +190,9 @@ program
     // would produce.
     if (opts.network !== undefined && !NETSIM_PRESETS.includes(opts.network)) {
       console.error(
-        `bots-app: --network must be one of: ${NETSIM_PRESETS.join(", ")} (got "${opts.network}")`,
+        botsAppLine(
+          `--network must be one of: ${NETSIM_PRESETS.join(", ")} (got "${opts.network}")`,
+        ),
       );
       process.exit(2);
     }
@@ -201,19 +221,21 @@ program
         configVideoMode = cfg.videoMode ?? null;
         configAuth = cfg.auth ?? null;
         console.log(
-          `bots-app: loaded meeting config from ${opts.config} (${cfg.bots.length} bot(s)` +
-            (cfg.meta?.seed !== undefined ? `, seed=${cfg.meta.seed}` : "") +
-            `)`,
+          botsAppLine(
+            `loaded meeting config from ${opts.config} (${cfg.bots.length} bot(s)` +
+              (cfg.meta?.seed !== undefined ? `, seed=${cfg.meta.seed}` : "") +
+              `)`,
+          ),
         );
       } catch (e) {
-        console.error(`bots-app: failed to read config ${opts.config}:`, (e as Error).message);
+        console.error(botsAppLine(`failed to read config ${opts.config}: ${(e as Error).message}`));
         process.exit(2);
       }
     }
 
     const meetingUrl = opts.meetingUrl ?? configMeetingUrl;
     if (!meetingUrl) {
-      console.error("bots-app: --meeting-url is required (or set it in the --config file)");
+      console.error(botsAppLine("--meeting-url is required (or set it in the --config file)"));
       process.exit(2);
     }
 
@@ -224,7 +246,7 @@ program
     try {
       ttl = parseDuration(ttlRaw);
     } catch (e) {
-      console.error(`bots-app: ${(e as Error).message}`);
+      console.error(botsAppLine((e as Error).message));
       process.exit(2);
     }
 
@@ -233,7 +255,9 @@ program
     if (opts.manifest && opts.manifest !== "") {
       if (!existsSync(opts.manifest)) {
         console.warn(
-          `bots-app: manifest not found at ${opts.manifest} — proceeding without fake-device wiring (Chrome will use its default fake pattern). Run \`bots-app prep-assets\` to fix.`,
+          botsAppLine(
+            `manifest not found at ${opts.manifest} — proceeding without fake-device wiring (Chrome will use its default fake pattern). Run \`bots-app prep-assets\` to fix.`,
+          ),
         );
       } else {
         const loaded = loadManifest(opts.manifest);
@@ -253,25 +277,29 @@ program
       const n = Number.parseInt(opts.users, 10);
       const maxUsers = Number.parseInt(opts.maxUsers, 10);
       if (!Number.isFinite(n) || n <= 0) {
-        console.error(`bots-app: --users must be a positive integer, got "${opts.users}"`);
+        console.error(botsAppLine(`--users must be a positive integer, got "${opts.users}"`));
         process.exit(2);
       }
       if (Number.isFinite(maxUsers) && maxUsers > 0 && n > maxUsers) {
         console.error(
-          `bots-app: --users ${n} exceeds --max-users ${maxUsers}; raise --max-users to override`,
+          botsAppLine(
+            `--users ${n} exceeds --max-users ${maxUsers}; raise --max-users to override`,
+          ),
         );
         process.exit(2);
       }
       if (!manifest) {
         console.error(
-          `bots-app: --users requires a manifest (at ${opts.manifest}). Run \`bots-app prep-assets\` first or pass --manifest <path>.`,
+          botsAppLine(
+            `--users requires a manifest (at ${opts.manifest}). Run \`bots-app prep-assets\` first or pass --manifest <path>.`,
+          ),
         );
         process.exit(2);
       }
       const namedCount = manifest.participants.length;
       if (n > namedCount) {
         console.error(
-          `bots-app: --users ${n} exceeds the manifest's ${namedCount} named participants`,
+          botsAppLine(`--users ${n} exceeds the manifest's ${namedCount} named participants`),
         );
         process.exit(2);
       }
@@ -289,7 +317,9 @@ program
         opts.auth !== "form-login"
       ) {
         console.error(
-          `bots-app: --auth must be "jwt", "storage-state", "none", or "form-login", got "${opts.auth}"`,
+          botsAppLine(
+            `--auth must be "jwt", "storage-state", "none", or "form-login", got "${opts.auth}"`,
+          ),
         );
         process.exit(2);
       }
@@ -322,7 +352,7 @@ program
       opts.hardwareConcurrency ?? process.env.BOT_HW_CONCURRENCY,
     );
     if (hwResult.kind === "invalid") {
-      console.error(`bots-app: ${hwResult.message}`);
+      console.error(botsAppLine(hwResult.message));
       process.exit(2);
     }
     const hardwareConcurrency = hwResult.value;
@@ -334,7 +364,7 @@ program
       opts.maxReceivedLayer ?? process.env.BOT_MAX_RECEIVED_LAYER,
     );
     if (mrlResult.kind === "invalid") {
-      console.error(`bots-app: ${mrlResult.message}`);
+      console.error(botsAppLine(mrlResult.message));
       process.exit(2);
     }
     const maxReceivedLayer = mrlResult.value;
@@ -342,12 +372,42 @@ program
       opts.skipCanvasPaint ?? process.env.BOT_SKIP_CANVAS_PAINT,
     );
     if (scpResult.kind === "invalid") {
-      console.error(`bots-app: ${scpResult.message}`);
+      console.error(botsAppLine(scpResult.message));
       process.exit(2);
     }
     const skipCanvasPaint = scpResult.value;
 
-    const tasks: BotTask[] = participants.map((participant) => {
+    // #2362: env-only (the fleet sets it via the StatefulSet).
+    const cameraCycleResult = resolveCameraCycle({
+      onMin: process.env[CAMERA_CYCLE_ENV.onMin],
+      onMax: process.env[CAMERA_CYCLE_ENV.onMax],
+      offMin: process.env[CAMERA_CYCLE_ENV.offMin],
+      offMax: process.env[CAMERA_CYCLE_ENV.offMax],
+    });
+    if (cameraCycleResult.kind === "invalid") {
+      console.error(botsAppLine(cameraCycleResult.message));
+      process.exit(2);
+    }
+    const cameraCycle = cameraCycleResult.value ?? null;
+
+    const formLoginTimeoutMs = resolvePositiveMs(
+      "--login-timeout",
+      opts.loginTimeout ?? process.env.BOT_LOGIN_TIMEOUT_MS,
+    );
+    const formLoginActionTimeoutMs = resolvePositiveMs(
+      "--login-action-timeout",
+      opts.loginActionTimeout ?? process.env.BOT_LOGIN_ACTION_TIMEOUT_MS,
+    );
+
+    // Issue #2236: this process's first fleet index; later bots take the next.
+    const indexResult = resolveBaseBotIndex(opts.botIndex, process.env.BOT_INDEX);
+    if (indexResult.kind === "invalid") {
+      console.error(botsAppLine(indexResult.message));
+      process.exit(2);
+    }
+    const baseIndex = indexResult.value;
+
+    const tasks: BotTask[] = participants.map((participant, offset) => {
       const displayName =
         opts.displayName && participants.length === 1
           ? opts.displayName
@@ -374,7 +434,9 @@ program
           botTtl = parseDuration(perBotTtl);
         } catch (e) {
           console.warn(
-            `bots-app: invalid per-bot ttl "${perBotTtl}" for ${participant}; falling back to shared ttl. (${(e as Error).message})`,
+            botsAppLine(
+              `invalid per-bot ttl "${perBotTtl}" for ${participant}; falling back to shared ttl. (${(e as Error).message})`,
+            ),
           );
         }
       }
@@ -402,6 +464,10 @@ program
         hardwareConcurrency,
         maxReceivedLayer,
         skipCanvasPaint,
+        formLoginTimeoutMs,
+        formLoginActionTimeoutMs,
+        sourceGeometry: sourceGeometryForIndex(baseIndex + offset),
+        cameraCycle,
       };
     });
 
@@ -416,7 +482,9 @@ program
         const n = Number.parseInt(opts.ctlPort, 10);
         if (!Number.isFinite(n) || n < 0 || n > 65535) {
           console.error(
-            `bots-app: --ctl-port must be a port number (0-65535) or "auto", got "${opts.ctlPort}"`,
+            botsAppLine(
+              `--ctl-port must be a port number (0-65535) or "auto", got "${opts.ctlPort}"`,
+            ),
           );
           process.exit(2);
         }
@@ -429,9 +497,11 @@ program
     // RESOURCE_STARVED verdict instead of being mistaken for a product
     // regression. Best-effort — a sampler failure never blocks the bots.
     const fpsTracker = new FpsTracker(RESOURCE_FPS_BASE_RUNG);
+    const arrivals = new ArrivalTracker();
     const capture = new ResourceCaptureSession({ runDir: opts.assetsDir });
     capture.startLocal();
     const onEncoderFps = (botId: string, fps: number | null): void => fpsTracker.record(botId, fps);
+    const onJoin = (botId: string, joinedAt: number): void => arrivals.record(botId, joinedAt);
     // A ctl-enabled run can launch SSH bots on remote boxes; give those a
     // per-host remote sampler too. Plain local runs never call ensureForHost,
     // so this is inert unless SSH bots appear.
@@ -460,7 +530,9 @@ program
       // this only trips if someone passes --ctl-token "" explicitly.)
       if (!isLoopbackBindAddress(ctlBind) && token.length === 0) {
         console.error(
-          `bots-app: --ctl-bind ${ctlBind} is a non-loopback address and requires a control token (pass --ctl-token or set BOT_CTL_TOKEN). Refusing to expose an unauthenticated control surface.`,
+          botsAppLine(
+            `--ctl-bind ${ctlBind} is a non-loopback address and requires a control token (pass --ctl-token or set BOT_CTL_TOKEN). Refusing to expose an unauthenticated control surface.`,
+          ),
         );
         process.exit(2);
       }
@@ -495,15 +567,21 @@ program
             startedAt: new Date().toISOString(),
             pid: process.pid,
           });
-          console.log(`bots-app: ctl token written to ${tokenFilePath} (mode 0600) — port ${port}`);
+          console.log(
+            botsAppLine(`ctl token written to ${tokenFilePath} (mode 0600) — port ${port}`),
+          );
         },
       };
     }
 
     try {
-      await runBotsToCompletion({ tasks, control, onEncoderFps, remoteResource });
+      await runBotsToCompletion({ tasks, control, onEncoderFps, onJoin, remoteResource });
     } finally {
-      const result = await capture.finalize(fpsTracker.snapshot());
+      const result = await capture.finalize(
+        fpsTracker.snapshot(),
+        arrivals.snapshot(),
+        arrivals.joinedBots,
+      );
       if (result) console.log(result.reportText);
     }
     process.exit(0);
@@ -533,6 +611,19 @@ interface RunCommandOptions {
   hardwareConcurrency?: string;
   maxReceivedLayer?: string;
   skipCanvasPaint?: string;
+  botIndex?: string;
+  loginTimeout?: string;
+  loginActionTimeout?: string;
+}
+
+/** Unset/blank ⇒ `null` (callee default); malformed or non-positive ⇒ exit 2. */
+function resolvePositiveMs(flag: string, raw: string | undefined): number | null {
+  const s = raw?.trim();
+  if (s === undefined || s === "") return null;
+  const n = Number.parseInt(s, 10);
+  if (Number.isFinite(n) && n > 0) return n;
+  console.error(botsAppLine(`${flag} must be a positive integer in ms, got "${raw}"`));
+  process.exit(2);
 }
 
 function defaultDisplayName(participant: string): string {
@@ -565,10 +656,12 @@ program
     const outPath = storageStatePath(opts.assetsDir, account);
     mkdirSync(dirname(outPath), { recursive: true });
 
-    console.log(`bots-app login: opening headed Chrome at ${opts.startUrl}`);
-    console.log(`bots-app login: log in normally, then press Enter here to save the session.`);
+    console.log(botsAppLine(`login: opening headed Chrome at ${opts.startUrl}`));
+    console.log(botsAppLine("login: log in normally, then press Enter here to save the session."));
     console.log(
-      `bots-app login: the captured file at ${outPath} contains real session tokens — do NOT commit or share it.`,
+      botsAppLine(
+        `login: the captured file at ${outPath} contains real session tokens — do NOT commit or share it.`,
+      ),
     );
 
     const browser = await chromium.launch({
@@ -621,7 +714,7 @@ program
     // staying unconditional across Playwright upgrades. Exit 130 is the
     // conventional SIGINT status, matching Playwright's own `sigintHandler`.
     rl.on("SIGINT", () => {
-      console.log("\nbots-app login: aborted — no session captured.");
+      console.log(`\n${botsAppLine("login: aborted — no session captured.")}`);
       rl.close();
       void (async (): Promise<void> => {
         try {
@@ -641,9 +734,11 @@ program
     await context.storageState({ path: outPath });
     await context.close();
     await browser.close();
-    console.log(`bots-app login: captured session → ${outPath}`);
+    console.log(botsAppLine(`login: captured session → ${outPath}`));
     console.log(
-      `bots-app login: reuse with \`bots-app run --participant ${account} --meeting-url <url>\`.`,
+      botsAppLine(
+        `login: reuse with \`bots-app run --participant ${account} --meeting-url <url>\`.`,
+      ),
     );
   });
 
@@ -675,12 +770,16 @@ program
     const outPath = opts.outFile ?? defaultSsoStatePath(opts.assetsDir);
     mkdirSync(dirname(outPath), { recursive: true });
 
-    console.log(`bots-app sso-login: opening headed Chrome at ${opts.startUrl}`);
+    console.log(botsAppLine(`sso-login: opening headed Chrome at ${opts.startUrl}`));
     console.log(
-      `bots-app sso-login: complete the HCL SSO challenge in the browser, then press Enter here to save the session.`,
+      botsAppLine(
+        "sso-login: complete the HCL SSO challenge in the browser, then press Enter here to save the session.",
+      ),
     );
     console.log(
-      `bots-app sso-login: the captured file at ${outPath} contains real SSO cookies — do NOT commit or share it.`,
+      botsAppLine(
+        `sso-login: the captured file at ${outPath} contains real SSO cookies — do NOT commit or share it.`,
+      ),
     );
 
     // Delegate the actual browser dance to the shared helper. Same code
@@ -699,9 +798,11 @@ program
         }
       },
     });
-    console.log(`bots-app sso-login: captured SSO session → ${outPath}`);
+    console.log(botsAppLine(`sso-login: captured SSO session → ${outPath}`));
     console.log(
-      `bots-app sso-login: subsequent \`bots-app run\` invocations against HCL-gated hosts will pick this up automatically.`,
+      botsAppLine(
+        "sso-login: subsequent `bots-app run` invocations against HCL-gated hosts will pick this up automatically.",
+      ),
     );
   });
 
@@ -744,7 +845,7 @@ program
   .action((opts: GenCommandOptions) => {
     const count = Number.parseInt(opts.count, 10);
     if (!Number.isFinite(count) || count <= 0) {
-      console.error(`bots-app: --count must be a positive integer, got "${opts.count}"`);
+      console.error(botsAppLine(`--count must be a positive integer, got "${opts.count}"`));
       process.exit(2);
     }
     const seed =
@@ -752,13 +853,15 @@ program
         ? Number.parseInt(opts.seed, 10)
         : Math.floor(Math.random() * 2 ** 31);
     if (!Number.isFinite(seed)) {
-      console.error(`bots-app: --seed must be an integer, got "${opts.seed}"`);
+      console.error(botsAppLine(`--seed must be an integer, got "${opts.seed}"`));
       process.exit(2);
     }
 
     if (!existsSync(opts.manifest)) {
       console.error(
-        `bots-app: manifest not found at ${opts.manifest} — run \`python3 bot/generate-conversation-edge.py\` first`,
+        botsAppLine(
+          `manifest not found at ${opts.manifest} — run \`python3 bot/generate-conversation-edge.py\` first`,
+        ),
       );
       process.exit(2);
     }
@@ -776,14 +879,14 @@ program
         includeObservers: opts.includeObservers,
       });
     } catch (e) {
-      console.error(`bots-app: gen failed: ${(e as Error).message}`);
+      console.error(botsAppLine(`gen failed: ${(e as Error).message}`));
       process.exit(2);
     }
     const yaml = emitMeetingConfigYaml(config);
     if (opts.out) {
       writeFileSync(opts.out, yaml, "utf8");
       console.error(
-        `bots-app gen: wrote ${config.bots.length} bot(s) → ${opts.out} (seed=${seed})`,
+        botsAppLine(`gen: wrote ${config.bots.length} bot(s) → ${opts.out} (seed=${seed})`),
       );
     } else {
       process.stdout.write(yaml);
@@ -828,7 +931,9 @@ program
   .action(async (opts: PrepAssetsOptions) => {
     if (!existsSync(opts.manifest)) {
       console.error(
-        `bots-app: manifest not found at ${opts.manifest} — run \`python3 bot/generate-conversation-edge.py\` first`,
+        botsAppLine(
+          `manifest not found at ${opts.manifest} — run \`python3 bot/generate-conversation-edge.py\` first`,
+        ),
       );
       process.exit(2);
     }
@@ -850,12 +955,15 @@ program
         if (audio.lineCount > 0) {
           audioPrepped += 1;
           console.log(
-            `[${participant}] audio ${audio.rebuilt ? "stitched" : "cached"} (${audio.lineCount} lines) → ${audio.path}`,
+            taggedLine(
+              participant,
+              `audio ${audio.rebuilt ? "stitched" : "cached"} (${audio.lineCount} lines) → ${audio.path}`,
+            ),
           );
         }
         if (!existsSync(opts.costumeSource)) {
           console.warn(
-            `bots-app: costume source ${opts.costumeSource} not found — skipping y4m conversion`,
+            botsAppLine(`costume source ${opts.costumeSource} not found — skipping y4m conversion`),
           );
           continue;
         }
@@ -868,11 +976,14 @@ program
         if (costume.path !== null) {
           costumesPrepped += 1;
           console.log(
-            `[${participant}] costume ${costume.rebuilt ? "converted" : "cached"} (${costume.costumeName}) → ${costume.path}`,
+            taggedLine(
+              participant,
+              `costume ${costume.rebuilt ? "converted" : "cached"} (${costume.costumeName}) → ${costume.path}`,
+            ),
           );
         }
       } catch (e) {
-        console.error(`[${participant}] prep failed:`, (e as Error).message);
+        console.error(taggedLine(participant, `prep failed: ${(e as Error).message}`));
       }
     }
     console.log(`prep-assets done — ${audioPrepped} audio file(s), ${costumesPrepped} costume(s)`);
@@ -954,7 +1065,7 @@ program
     const port = Number.parseInt(opts.port, 10);
     if (!Number.isFinite(port) || port < 0 || port > 65535) {
       console.error(
-        `bots-app dashboard: --port must be a port number (0-65535), got "${opts.port}"`,
+        botsAppLine(`dashboard: --port must be a port number (0-65535), got "${opts.port}"`),
       );
       process.exit(2);
     }
@@ -963,7 +1074,9 @@ program
       ctlPortNum = Number.parseInt(opts.ctlPort, 10);
       if (!Number.isFinite(ctlPortNum) || ctlPortNum <= 0 || ctlPortNum > 65535) {
         console.error(
-          `bots-app dashboard: --ctl-port must be a port number (1-65535), got "${opts.ctlPort}"`,
+          botsAppLine(
+            `dashboard: --ctl-port must be a port number (1-65535), got "${opts.ctlPort}"`,
+          ),
         );
         process.exit(2);
       }
@@ -996,10 +1109,12 @@ program
         ctl = { port: resolved.port, token: resolved.token };
         daemonMode = "attached";
         console.log(
-          `bots-app dashboard: attached to ctl daemon at 127.0.0.1:${resolved.port} (pid ${resolved.pid || "?"}, started ${resolved.startedAt})`,
+          botsAppLine(
+            `dashboard: attached to ctl daemon at 127.0.0.1:${resolved.port} (pid ${resolved.pid || "?"}, started ${resolved.startedAt})`,
+          ),
         );
       } catch (e) {
-        console.error(`bots-app dashboard: ${(e as Error).message}`);
+        console.error(botsAppLine(`dashboard: ${(e as Error).message}`));
         process.exit(2);
         return;
       }
@@ -1041,7 +1156,9 @@ program
                 pid: process.pid,
               });
               console.log(
-                `bots-app dashboard: self-hosted ctl daemon listening on 127.0.0.1:${resolvedPort} (token at ${tokenFilePath}, mode 0600)`,
+                botsAppLine(
+                  `dashboard: self-hosted ctl daemon listening on 127.0.0.1:${resolvedPort} (token at ${tokenFilePath}, mode 0600)`,
+                ),
               );
               resolveReady({ port: resolvedPort, token: t });
             },
@@ -1056,10 +1173,12 @@ program
     const distDir = opts.distDir;
     const builtMode = existsSync(distDir) && existsSync(join(distDir, "index.html"));
     if (builtMode) {
-      console.log(`bots-app dashboard: serving built UI from ${distDir}`);
+      console.log(botsAppLine(`dashboard: serving built UI from ${distDir}`));
     } else {
       console.log(
-        `bots-app dashboard: no built UI at ${distDir} — falling back to Vite dev mode (spawning \`npm run dev\` in ${dashboardDir}). Run \`npm run build\` there to produce a static bundle.`,
+        botsAppLine(
+          `dashboard: no built UI at ${distDir} — falling back to Vite dev mode (spawning \`npm run dev\` in ${dashboardDir}). Run \`npm run build\` there to produce a static bundle.`,
+        ),
       );
     }
 
@@ -1069,7 +1188,9 @@ program
     const idleTimeout = resolveCtlProxyIdleTimeout(rawIdleTimeout);
     if (idleTimeout.ignored) {
       console.warn(
-        `bots-app dashboard: ignoring BOT_CTL_PROXY_IDLE_TIMEOUT_MS="${rawIdleTimeout}" (must be a non-negative integer in ms); using ${idleTimeout.value}`,
+        botsAppLine(
+          `dashboard: ignoring BOT_CTL_PROXY_IDLE_TIMEOUT_MS="${rawIdleTimeout}" (must be a non-negative integer in ms); using ${idleTimeout.value}`,
+        ),
       );
     }
 
@@ -1083,9 +1204,11 @@ program
       onListen: ({ port: actual }) => {
         const url = `http://127.0.0.1:${actual}/`;
         if (builtMode) {
-          console.log(`bots-app dashboard: listening on ${url}`);
+          console.log(botsAppLine(`dashboard: listening on ${url}`));
         } else {
-          console.log(`bots-app dashboard: backend on ${url} (Vite dev UI will follow on :5173)`);
+          console.log(
+            botsAppLine(`dashboard: backend on ${url} (Vite dev UI will follow on :5173)`),
+          );
         }
         if (opts.open !== false) {
           // In dev mode, prefer to open the Vite URL once it's up.
@@ -1110,7 +1233,7 @@ program
     const cleanup = async (): Promise<void> => {
       if (cleaning) return;
       cleaning = true;
-      console.log("bots-app dashboard: shutting down");
+      console.log(botsAppLine("dashboard: shutting down"));
       await handle.close().catch(() => {});
       if (orchestratorTask) {
         await orchestratorTask.catch(() => {});
@@ -1118,7 +1241,11 @@ program
       // Issue 2032: derive + print the local host's resource verdict once the
       // orchestrator (and its remote finalize) has wound down.
       if (dashCapture) {
-        const result = await dashCapture.finalize(dashFps.snapshot()).catch(() => null);
+        const result = await dashCapture
+          // No arrival spread: a daemon has no run boundary, so its launches are not a ramp,
+          // and joins are not tracked at all.
+          .finalize(dashFps.snapshot(), null, null)
+          .catch(() => null);
         if (result) console.log(result.reportText);
       }
       process.exit(0);
@@ -1159,7 +1286,7 @@ function openInBrowser(url: string): void {
     const child = spawnDetached(cmd, args);
     child.unref();
   } catch (e) {
-    console.warn(`bots-app dashboard: could not auto-open ${url}: ${(e as Error).message}`);
+    console.warn(botsAppLine(`dashboard: could not auto-open ${url}: ${(e as Error).message}`));
   }
 }
 
@@ -1171,6 +1298,7 @@ function spawnDetached(cmd: string, args: string[]): import("node:child_process"
 }
 
 program.parseAsync(process.argv).catch((err: unknown) => {
-  console.error("bots-app fatal:", err);
+  console.error(botsAppLine("fatal"));
+  console.error(inspect(err).replace(/^/gm, "  "));
   process.exit(1);
 });

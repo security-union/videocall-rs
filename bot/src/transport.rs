@@ -16,43 +16,17 @@
 //! Selects WebSocket or WebTransport based on config, builds the lobby URL
 //! (with JWT when configured), and delegates to the concrete client.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{error::TrySendError, Receiver, Sender};
 use tracing::info;
 use url::Url;
-
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-
-/// Characters that must be percent-encoded in a URL path segment (RFC 3986).
-/// This encodes: control chars, space, and the delimiter characters that would
-/// break path parsing (/, ?, #, [, ], @, !, $, &, ', (, ), *, +, ,, ;, =, %).
-const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'/')
-    .add(b'?')
-    .add(b'#')
-    .add(b'[')
-    .add(b']')
-    .add(b'@')
-    .add(b'!')
-    .add(b'$')
-    .add(b'&')
-    .add(b'\'')
-    .add(b'(')
-    .add(b')')
-    .add(b'*')
-    .add(b'+')
-    .add(b',')
-    .add(b';')
-    .add(b'=')
-    .add(b'%');
+use videocall_meeting_types::mint::{self, LobbyAuth};
 
 use crate::config::{ClientConfig, Transport};
 use crate::inbound_stats::InboundStats;
 #[cfg(feature = "metrics")]
 use crate::metrics_server::BotMetrics;
-use crate::token;
 use crate::websocket_client::WebSocketClient;
 use crate::webtransport_client::WebTransportClient;
 
@@ -81,7 +55,28 @@ pub enum MediaTypeLabel {
     Other,
 }
 
+/// Billing bucket behind the `_audio` / `_video` / `_control` suffixes on the
+/// `ws_offered_bytes_*` fields. No `Screen` arm: the bot never publishes one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WebSocketStreamBucket {
+    Audio,
+    Video,
+    Control,
+}
+
 impl MediaTypeLabel {
+    /// Lets a test assert over the whole set. Keep in step with the exhaustive
+    /// matches below, which are what fail to compile when a variant is added.
+    #[cfg(test)]
+    pub(crate) const ALL: [MediaTypeLabel; 6] = [
+        MediaTypeLabel::Audio,
+        MediaTypeLabel::Video,
+        MediaTypeLabel::Health,
+        MediaTypeLabel::Heartbeat,
+        MediaTypeLabel::Diagnostics,
+        MediaTypeLabel::Other,
+    ];
+
     /// Stable string label used as the `media_type` Prometheus label value.
     /// Kept here (not in metrics_server) so non-metrics builds still get the
     /// same strings for debug logs.
@@ -93,6 +88,18 @@ impl MediaTypeLabel {
             MediaTypeLabel::Heartbeat => "heartbeat",
             MediaTypeLabel::Diagnostics => "diagnostics",
             MediaTypeLabel::Other => "other",
+        }
+    }
+
+    /// Which `ws_*_bytes_*` bucket this label's bytes are billed to.
+    pub(crate) fn websocket_stream_bucket(self) -> WebSocketStreamBucket {
+        match self {
+            MediaTypeLabel::Audio => WebSocketStreamBucket::Audio,
+            MediaTypeLabel::Video => WebSocketStreamBucket::Video,
+            MediaTypeLabel::Health
+            | MediaTypeLabel::Heartbeat
+            | MediaTypeLabel::Diagnostics
+            | MediaTypeLabel::Other => WebSocketStreamBucket::Control,
         }
     }
 }
@@ -113,6 +120,88 @@ pub struct OutboundFrame {
 impl OutboundFrame {
     pub fn new(kind: MediaTypeLabel, bytes: Vec<u8>) -> Self {
         Self { kind, bytes }
+    }
+}
+
+/// Cumulative un-framed bytes offered to the WebSocket send path, per bucket.
+/// Offered only — `set_ws_stream_bytes` says why the bot bills no drops.
+#[derive(Default)]
+pub struct WebSocketStreamByteCounters {
+    offered_audio: AtomicU64,
+    offered_video: AtomicU64,
+    offered_control: AtomicU64,
+}
+
+/// Point-in-time read of [`WebSocketStreamByteCounters`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WebSocketStreamByteSnapshot {
+    pub offered_audio: u64,
+    pub offered_video: u64,
+    pub offered_control: u64,
+}
+
+impl WebSocketStreamByteCounters {
+    pub(crate) fn record_offered(&self, kind: MediaTypeLabel, bytes: u64) {
+        match kind.websocket_stream_bucket() {
+            WebSocketStreamBucket::Audio => {
+                self.offered_audio.fetch_add(bytes, Ordering::Relaxed);
+            }
+            WebSocketStreamBucket::Video => {
+                self.offered_video.fetch_add(bytes, Ordering::Relaxed);
+            }
+            WebSocketStreamBucket::Control => {
+                self.offered_control.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> WebSocketStreamByteSnapshot {
+        WebSocketStreamByteSnapshot {
+            offered_audio: self.offered_audio.load(Ordering::Relaxed),
+            offered_video: self.offered_video.load(Ordering::Relaxed),
+            offered_control: self.offered_control.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Wraps the outbound `Sender` so every producer bills at one chokepoint.
+#[derive(Clone)]
+pub struct OutboundFrameSender {
+    tx: Sender<OutboundFrame>,
+    websocket_stream_bytes: Option<Arc<WebSocketStreamByteCounters>>,
+}
+
+impl OutboundFrameSender {
+    pub fn new(tx: Sender<OutboundFrame>) -> Self {
+        Self {
+            tx,
+            websocket_stream_bytes: None,
+        }
+    }
+
+    pub fn with_websocket_accounting(
+        tx: Sender<OutboundFrame>,
+        websocket_stream_bytes: Arc<WebSocketStreamByteCounters>,
+    ) -> Self {
+        Self {
+            tx,
+            websocket_stream_bytes: Some(websocket_stream_bytes),
+        }
+    }
+
+    /// Bills `offered` before the send is attempted, so a rejected frame still
+    /// counts as demand.
+    pub fn try_send(&self, frame: OutboundFrame) -> Result<(), TrySendError<OutboundFrame>> {
+        if let Some(counters) = &self.websocket_stream_bytes {
+            counters.record_offered(frame.kind, frame.bytes.len() as u64);
+        }
+        self.tx.try_send(frame)
+    }
+}
+
+impl From<Sender<OutboundFrame>> for OutboundFrameSender {
+    fn from(tx: Sender<OutboundFrame>) -> Self {
+        Self::new(tx)
     }
 }
 
@@ -140,28 +229,16 @@ impl TransportClient {
         }
     }
 
-    /// Build the lobby URL for this client, minting a JWT if configured.
+    /// Build the lobby URL for this client, minting a fresh JWT per call.
     pub fn build_lobby_url(
         transport: &Transport,
         server_url: &Url,
-        jwt_secret: Option<&str>,
+        auth: &LobbyAuth,
         user_id: &str,
         meeting_id: &str,
-        token_ttl_secs: u64,
     ) -> anyhow::Result<Url> {
-        let base = server_url.to_string();
-        let base = base.trim_end_matches('/');
-
-        let url_string = if let Some(secret) = jwt_secret {
-            let token = token::mint_token(secret, user_id, meeting_id, token_ttl_secs)?;
-            format!("{base}/lobby?token={token}")
-        } else {
-            // Percent-encode user_id and meeting_id so that special characters
-            // (/, ?, #, unicode) don't break the URL path structure.
-            let encoded_user = utf8_percent_encode(user_id, PATH_SEGMENT_ENCODE_SET);
-            let encoded_meeting = utf8_percent_encode(meeting_id, PATH_SEGMENT_ENCODE_SET);
-            format!("{base}/lobby/{encoded_user}/{encoded_meeting}")
-        };
+        let url_string = mint::build_lobby_url(server_url.as_str(), auth, user_id, meeting_id)
+            .map_err(|e| anyhow::anyhow!("failed to build lobby URL: {e}"))?;
 
         // For WebSocket, convert https:// to wss:// and http:// to ws://
         let url_string = match transport {
@@ -213,9 +290,66 @@ impl TransportClient {
 
 #[cfg(test)]
 mod tests {
-    use super::TransportClient;
-    use crate::config::Transport;
+    use super::{
+        MediaTypeLabel, OutboundFrame, OutboundFrameSender, TransportClient, WebSocketStreamBucket,
+        WebSocketStreamByteCounters,
+    };
+    use crate::config::{BotConfig, Transport};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
     use url::Url;
+    use videocall_meeting_types::mint::LobbyAuth;
+
+    fn secret_auth() -> LobbyAuth {
+        LobbyAuth::Secret {
+            secret: "secret".into(),
+            ttl_secs: 60,
+        }
+    }
+
+    #[test]
+    fn websocket_stream_bucket_mapping_covers_every_media_label() {
+        assert_eq!(
+            MediaTypeLabel::Audio.websocket_stream_bucket(),
+            WebSocketStreamBucket::Audio
+        );
+        assert_eq!(
+            MediaTypeLabel::Video.websocket_stream_bucket(),
+            WebSocketStreamBucket::Video
+        );
+        for kind in MediaTypeLabel::ALL {
+            if matches!(kind, MediaTypeLabel::Audio | MediaTypeLabel::Video) {
+                continue;
+            }
+            assert_eq!(
+                kind.websocket_stream_bucket(),
+                WebSocketStreamBucket::Control,
+                "{kind:?} must bill to the control bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_offered_bytes_are_billed_even_when_the_channel_rejects() {
+        let (tx, _rx) = mpsc::channel::<OutboundFrame>(1);
+        let counters = Arc::new(WebSocketStreamByteCounters::default());
+        let sender = OutboundFrameSender::with_websocket_accounting(tx, counters.clone());
+
+        sender
+            .try_send(OutboundFrame::new(MediaTypeLabel::Audio, vec![0; 3]))
+            .expect("first frame fits");
+        assert!(
+            sender
+                .try_send(OutboundFrame::new(MediaTypeLabel::Video, vec![0; 5]))
+                .is_err(),
+            "second frame must hit the full bounded channel"
+        );
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.offered_audio, 3);
+        assert_eq!(snapshot.offered_video, 5);
+        assert_eq!(snapshot.offered_control, 0);
+    }
 
     #[test]
     fn build_lobby_url_uses_ws_scheme_and_trims_trailing_slash() {
@@ -223,10 +357,9 @@ mod tests {
         let url = TransportClient::build_lobby_url(
             &Transport::WebSocket,
             &server_url,
-            None,
+            &LobbyAuth::DeprecatedPath,
             "bot-1",
             "meeting-1",
-            60,
         )
         .unwrap();
 
@@ -242,10 +375,9 @@ mod tests {
         let url = TransportClient::build_lobby_url(
             &Transport::WebTransport,
             &server_url,
-            None,
+            &LobbyAuth::DeprecatedPath,
             "bot-1",
             "meeting-1",
-            60,
         )
         .unwrap();
 
@@ -261,10 +393,9 @@ mod tests {
         let url = TransportClient::build_lobby_url(
             &Transport::WebSocket,
             &server_url,
-            Some("secret"),
+            &secret_auth(),
             "bot-1",
             "meeting-1",
-            60,
         )
         .unwrap();
 
@@ -277,18 +408,15 @@ mod tests {
     fn build_lobby_url_encodes_special_characters_in_path() {
         let server_url = Url::parse("https://relay.example.com/").unwrap();
 
-        // meeting_id with characters that would break URL parsing
         let url = TransportClient::build_lobby_url(
             &Transport::WebSocket,
             &server_url,
-            None,
+            &LobbyAuth::DeprecatedPath,
             "user/admin",
             "room?id=1#top",
-            60,
         )
         .unwrap();
 
-        // Verify the URL is valid and special chars are encoded
         assert_eq!(url.scheme(), "wss");
         assert!(
             !url.path().contains('?'),
@@ -300,25 +428,81 @@ mod tests {
             "path must not contain raw '#' — got: {}",
             url.path()
         );
-        // The path should have exactly 4 segments: "", "lobby", encoded_user, encoded_meeting
         let segments: Vec<_> = url.path().split('/').collect();
         assert_eq!(segments.len(), 4, "expected /lobby/<user>/<meeting>");
         assert_eq!(segments[1], "lobby");
 
-        // Unicode meeting_id
         let url = TransportClient::build_lobby_url(
             &Transport::WebTransport,
             &server_url,
-            None,
+            &LobbyAuth::DeprecatedPath,
             "bot-1",
             "salle-réunion",
-            60,
         )
         .unwrap();
         assert!(
             url.as_str().contains("salle-r%C3%A9union"),
             "unicode should be percent-encoded — got: {}",
             url.as_str()
+        );
+    }
+
+    /// A config with neither a secret nor an explicit opt-in must NOT connect
+    /// unauthenticated (issue #2298).
+    #[test]
+    fn a_config_without_a_secret_refuses_to_join_unauthenticated() {
+        let config = BotConfig::default();
+        let err = config
+            .resolve_lobby_auth()
+            .expect_err("a credential-less config must not resolve to a joinable auth mode");
+        assert!(
+            err.to_string().contains("no room access token"),
+            "expected a missing-credential error — got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn a_config_with_a_secret_defaults_to_token_auth() {
+        // Even with the deprecated path explicitly allowed, the secret wins.
+        let config = BotConfig {
+            jwt_secret: Some("secret".into()),
+            allow_deprecated_path: Some(true),
+            ..Default::default()
+        };
+
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebTransport,
+            &Url::parse("https://relay.example.com").unwrap(),
+            &config.resolve_lobby_auth().unwrap(),
+            "bot-1",
+            "meeting-1",
+        )
+        .unwrap();
+
+        assert_eq!(url.path(), "/lobby");
+        assert!(url.query().unwrap_or_default().starts_with("token="));
+    }
+
+    #[test]
+    fn a_config_that_opts_in_still_reaches_the_deprecated_path() {
+        let config = BotConfig {
+            allow_deprecated_path: Some(true),
+            ..Default::default()
+        };
+
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebTransport,
+            &Url::parse("https://relay.example.com").unwrap(),
+            &config.resolve_lobby_auth().unwrap(),
+            "bot-1",
+            "meeting-1",
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://relay.example.com/lobby/bot-1/meeting-1"
         );
     }
 }

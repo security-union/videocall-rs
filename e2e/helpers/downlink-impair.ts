@@ -26,14 +26,14 @@
  * manufactured:
  *
  *   1. The relay's `WsChatSession` enqueues each outbound frame into a BOUNDED
- *      channel of `WS_OUTBOUND_CHANNEL_CAPACITY = 128` slots
+ *      channel bounded by slots AND `WS_OUTBOUND_VIDEO_BYTE_BUDGET`
  *      (actix-api/src/constants.rs), drained by a `StreamHandler<Vec<u8>>` that
  *      writes straight to the socket via `ctx.binary(bytes)` — with NO
  *      application-level retransmit (ws_chat_session.rs).
  *
  *   2. Bandwidth-limiting THIS receiver's WS TCP connection makes its kernel
  *      send buffer fill. TCP backpressure stalls `ctx.binary`'s framed sink, so
- *      the drain stops pulling and the 128-slot outbound channel fills.
+ *      the drain stops pulling and the outbound channel fills.
  *
  *   3. Once full, `outbound_tx.try_send` returns `Full`. The priority-drop
  *      policy (issue #1057) sheds VIDEO/SCREEN frames first (audio protected to
@@ -170,6 +170,17 @@ export const SHAPED_WS_URL = process.env.SHAPED_WS_URL || "ws://localhost:8666";
 /** Stable name of the downstream bandwidth toxic we add/remove. */
 const TOXIC_NAME = "downlink-bandwidth";
 
+/** Stable name of the UPSTREAM bandwidth toxic (see {@link impairUplink}). */
+const UPLINK_TOXIC_NAME = "uplink-bandwidth";
+
+export interface UplinkImpairOptions {
+  /**
+   * Upstream cap in KILOBYTES per second. Below the share's un-governed budget
+   * so the backlog builds, above the 500 kbps floor so the step-down drains.
+   */
+  rateKb: number;
+}
+
 /**
  * Options for {@link impairDownlink}.
  */
@@ -179,8 +190,8 @@ export interface ImpairOptions {
    * browser direction (toxiproxy `bandwidth` toxic, `rate` field is KB/s).
    *
    * The default 15 KB/s (~120 kbps) is far below a single HD simulcast layer's
-   * steady-state byte rate, so the relay's 128-slot outbound channel saturates
-   * within a couple of seconds and starts shedding video frames — which is what
+   * steady-state byte rate, so the relay's outbound channel passes its video
+   * byte budget and starts shedding video frames — which is what
    * drives the receiver's `loss_per_sec` over the step-down threshold. Raise it
    * to make the impairment milder; lower it to overflow faster.
    */
@@ -378,6 +389,62 @@ export async function impairDownlink(opts: ImpairOptions = {}): Promise<void> {
   throw new Error(
     `Failed to add '${TOXIC_NAME}' bandwidth toxic (HTTP ${create.status}): ${await create.text()}`,
   );
+}
+
+/**
+ * Shape browser->relay — the SENDER's uplink, which the screen encoder's
+ * governor senses via the socket's own `bufferedAmount`. Idempotent. The context
+ * must first be pinned + routed to WS by `routeDownlinkThroughProxy`.
+ */
+export async function impairUplink(opts: UplinkImpairOptions): Promise<void> {
+  await assertProxyUp();
+  const rateKb = opts.rateKb;
+
+  const create = await toxiproxyFetch(`/proxies/${WS_PROXY_NAME}/toxics`, {
+    method: "POST",
+    body: {
+      name: UPLINK_TOXIC_NAME,
+      type: "bandwidth",
+      stream: "upstream",
+      toxicity: 1.0,
+      attributes: { rate: rateKb },
+    },
+  });
+  if (create.ok) return;
+
+  if (create.status === 409) {
+    const update = await toxiproxyFetch(`/proxies/${WS_PROXY_NAME}/toxics/${UPLINK_TOXIC_NAME}`, {
+      method: "POST",
+      body: { attributes: { rate: rateKb } },
+    });
+    if (!update.ok) {
+      throw new Error(
+        `Failed to update existing '${UPLINK_TOXIC_NAME}' toxic (HTTP ${update.status}): ${await update.text()}`,
+      );
+    }
+    return;
+  }
+
+  throw new Error(
+    `Failed to add '${UPLINK_TOXIC_NAME}' bandwidth toxic (HTTP ${create.status}): ${await create.text()}`,
+  );
+}
+
+/** Remove the upstream toxic so the sender's uplink recovers. */
+export async function healUplink(): Promise<void> {
+  let res: Response;
+  try {
+    res = await toxiproxyFetch(`/proxies/${WS_PROXY_NAME}/toxics/${UPLINK_TOXIC_NAME}`, {
+      method: "DELETE",
+    });
+  } catch {
+    return; // proxy not up at all — nothing to heal
+  }
+  if (!res.ok && res.status !== 404) {
+    throw new Error(
+      `Failed to remove '${UPLINK_TOXIC_NAME}' toxic (HTTP ${res.status}): ${await res.text()}`,
+    );
+  }
 }
 
 /**

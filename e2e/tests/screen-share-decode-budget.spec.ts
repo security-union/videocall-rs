@@ -51,7 +51,6 @@ const BROWSER_ARGS = [
   "--origin-to-force-quic-on=127.0.0.1:4433",
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
-  "--disable-gpu",
   "--disable-dev-shm-usage",
   "--renderer-process-limit=1",
   // Auto-accept getDisplayMedia() so the sharer's stream starts headlessly.

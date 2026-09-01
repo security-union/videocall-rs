@@ -1,118 +1,30 @@
 /**
- * E2E: viewport-aware relay video filtering, validated over BOTH transports
- * (HCL issue #995; the feature itself is issue #988 / PR #994).
+ * E2E: the relay's VIEWPORT filter follows the receiver's on-screen LAYOUT roster,
+ * not its local decode-budget cap (issue 2602; filter is #988/PR #994, both-transport
+ * coverage is #995).
  *
- * ## What this guards
+ * PHASE 1 is the only 2602 guard: budget floored to MIN_CAP with both tiles on screen,
+ * `filtered` FLAT while `forwarded` CLIMBS. `forwarded` is room-scoped, so its climb
+ * shows the room is flowing, not that this receiver's own subscription is.
+ * PHASE 2 is the retained #995/#988 drop-check and passes on un-fixed code too: one
+ * publisher folded into `+N` with no canvas, `filtered` CLIMBS.
+ * PHASE 3 is the only guard on the widen-republish path — back to full size, FLAT again.
  *
- * The relay drops a publisher's off-screen VIDEO when that publisher's
- * session_id is not in the RECEIVER's VIEWPORT set, incrementing the dedicated
- * Prometheus counter `relay_viewport_filtered_total{room}` (see
- * `actix-api/src/actors/chat_server.rs::handle_msg` — the per-receiver fan-out
- * closure — and `RELAY_VIEWPORT_FILTERED_TOTAL` in `actix-api/src/metrics.rs`).
- * The viewport set is sent by the client when the rendered set of peers changes:
- * `set_active_decode_set` → `ViewportSender::record` → (debounced) →
- * `send_viewport_via` (`videocall-client/src/client/video_call_client.rs`).
+ * Publishers join MUTED because `compute_effective_density` escalates density while
+ * a remote peer counts as an active speaker; unmuted, PHASE 2's `+N` region does not
+ * form.
  *
- * This spec asserts the feature's only AUTHORITATIVE server-side effect: that
- * the relay ACTUALLY DROPS an off-screen real publisher's VIDEO, observed by
- * scraping `relay_viewport_filtered_total` (see `helpers/relay-metrics.ts`).
- * It validates this on BOTH the WebSocket relay (:8080) and the WebTransport
- * relay (:5321), because the drop-check is transport-agnostic and runs inside
- * BOTH relay binaries (each with its own metrics registry). This is the
- * coverage issue #995 asks for that was previously verifiable only by
- * inspection — the relay-side observable effect of the viewport filter, on
- * both forwarding paths.
- *
- * ## Why a relay metric, not a DOM check
- *
- * A DOM-only check (`data-off-budget="true"`) proves the CLIENT shrank its
- * decode set, but NOT that the relay acted on it. `relay_viewport_filtered_total`
- * is the only server-side proof the relay genuinely dropped the video. This
- * spec asserts BOTH: the DOM signal (the client excluded the publisher) AND the
- * relay counter (the relay dropped that publisher's video).
- *
- * ## Fails if the feature regresses
- *
- * If the client stops sending the VIEWPORT (e.g. `set_active_decode_set` /
- * `send_viewport_via` removed) OR the relay stops honouring it (the `handle_msg`
- * drop-check removed), the relay's viewport set for the receiver stays empty →
- * fail-open → ALL video forwarded → `relay_viewport_filtered_total` stays FLAT →
- * the climb assertion fails. The DOM off-budget assertion separately fails if
- * the client never excludes a publisher.
- *
- * ## Scope note — the RECONNECT-specific re-send (`reset_for_reconnect`)
- *
- * Issue #995's PREFERRED form is an assertion that filtering RESUMES after a
- * transport drop + reconnect (the wasm-only `Connected`-arm re-send
- * `reset_for_reconnect()` → `send_viewport_via`). That isolation was attempted
- * and found INFEASIBLE to make a genuine fail-when-removed guard with the
- * current harness, for two independent reasons established by real runs against
- * the Docker stack:
- *
- *   1. NO RELIABLE PER-CLIENT TRANSPORT DROP. toxiproxy (TCP) can sever a WS,
- *      but routing the media WS through it depends on a `/config.js` `wsUrl`
- *      patch that the e2e stack's comment-prefixed config defeats — the receiver
- *      connected directly to the relay (`server_url: ws://localhost:8080/lobby`)
- *      and the proxy sever had no effect, so no reconnect occurred. netsim only
- *      drops packets (cannot disconnect), and there is no client-side
- *      force-reconnect hook. WT/QUIC has no per-client impairment at all.
- *
- *   2. NORMAL-PATH MASKING. Even with a real reconnect, the `Connected` arm
- *      clears peers (`clear_all_peers` on `Failed`) and the post-reconnect grid
- *      re-render recomputes `active_decode_set`, so the NORMAL debounced path
- *      (`record` → `send_viewport_via`) re-sends the viewport on its own and
- *      re-establishes filtering — masking the SPECIFIC `reset_for_reconnect`
- *      re-send. A relay-metric assertion therefore cannot attribute the
- *      post-reconnect climb to the reconnect glue rather than the normal send.
- *
- * Building a reconnect rig that (a) reliably severs ONE client's transport on
- * both WS and WT and (b) holds the active_decode_set stable across the
- * reconnect so the normal path stays silent is new diagnostics/impairment infra
- * — a separate, larger task (cf. issue #1022). Shipping a reconnect test that
- * passes WHETHER OR NOT the re-send exists (verified: it did) would be a
- * false-green guard, so it is deliberately NOT included. The `reset_for_reconnect`
- * pure logic remains covered by the `viewport_sender.rs` unit tests
- * (`reconnect_forces_resend_of_current_set` et al.); the host-level glue
- * (`Connected` arm) is wasm-only `Callback`/`Rc`/`web_sys`, and — per the masking
- * in (2) — its only observable effect (the relay drop) cannot be attributed to it
- * rather than the normal debounced send, so an e2e guard for it specifically
- * awaits the reconnect-isolation rig described above.
- *
- * ## Topology & why FPS injection
- *
- * Mock peers are layout-only and flow NO real video through the relay, so they
- * cannot trigger a relay drop. We use REAL publishers: 1 receiver + 2 camera-on
- * publishers (3 contexts — the count `diagnostics-peer-transport.spec` already
- * runs). To push a REAL publisher OUT of the receiver's viewport we step the
- * adaptive decode budget down to its floor (`MIN_CAP = 1`) by injecting
- * sustained MILD-low FPS via the test-only `window.__videocall_inject_render_fps`
- * hook (gated on `MOCK_PEERS_ENABLED`, which the e2e stack sets). With 2 remote
- * publishers and cap 1, exactly one publisher becomes an off-budget avatar →
- * removed from `active_decode_set` → VIEWPORT excludes it → relay drops its
- * VIDEO. (The smallest selectable FIXED budget is 4 and it clamps UP to the
- * natural tile count, so a fixed cap can never exclude anyone with only 2
- * publishers; the adaptive floor is the deterministic low-context lever. MILD —
- * not severe — pressure is used so the loop drops a SINGLE tile per step: a
- * severe multi-tile drop would push BOTH remote tiles off at once, overshooting
- * the "exactly one excluded" target.)
+ * The `reset_for_reconnect` re-send is deliberately NOT covered — no per-client
+ * transport-drop rig exists on either transport, and the normal debounced send masks
+ * it (#1022, #1355). Pure logic is covered by `viewport_sender.rs` unit tests.
  */
 
 import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwright/test";
+
 import { createAuthenticatedContext, BROWSER_ARGS } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { readViewportFilteredTotal, readViewportForwardedTotal } from "../helpers/relay-metrics";
-
-// ---------------------------------------------------------------------------
-// Decode-budget control loop constants — mirrored from
-// dioxus-ui/src/components/decode_budget.rs. Kept in lockstep like
-// decode-budget.spec.ts (which copies the same block); if those consts are
-// retuned this spec must follow.
-// ---------------------------------------------------------------------------
-const BUDGET = {
-  FPS_STEP_DOWN: 24, // FPS at/below which the loop considers stepping DOWN
-  FPS_SEVERE: 12, // median FPS at/below which a down-step drops MULTIPLE tiles
-  MIN_CAP: 1, // adaptive floor: at least one remote tile always decodes
-} as const;
+import { BUDGET, DENSITY } from "../helpers/rust-mirrored-constants";
 
 // A synthetic FPS in the MILD band — strictly ABOVE FPS_SEVERE (so each
 // down-step drops a SINGLE tile, not a proportional multi-tile burst) and below
@@ -129,6 +41,18 @@ const INJECT_INTERVAL_MS = 1200;
 // SUSTAIN_SAMPLES (3) + a couple of STEP_DOWN_COOLDOWN_MS windows; generous
 // headroom for CI jitter.
 const MAX_DRIVE_SAMPLES = 14;
+// Dwell long enough that `filtered` is sampled over real time rather than fetch latency,
+// in ticks so the caller can keep its premise true throughout.
+const DWELL_TICKS = 4;
+const DWELL_TICK_MS = 1_000;
+// A 2-tile layout measures 272px here, under Standard's minimum, so the grid seats one
+// and folds the other into `+1`. Locked against the mirrored Rust values.
+const OVERFLOW_VIEWPORT = { width: 600, height: 500 };
+const TWO_TILE_WIDTH_AT_OVERFLOW_VIEWPORT = 272;
+const TWO_TILE_WIDTH_AT_FULL_VIEWPORT = 612;
+// Both tiles on screen, so the budget floor is the only narrowing. Explicit, not
+// inherited — it is a geometry precondition.
+const FULL_VIEWPORT = { width: 1280, height: 720 };
 
 /** The two transports the relay-drop assertion is parameterised over. */
 type Transport = "websocket" | "webtransport";
@@ -162,6 +86,18 @@ const injectFps = (page: Page, fps: number) =>
 const decodedTiles = (page: Page) =>
   page.locator('#grid-container .grid-item[data-off-budget="false"]');
 const offBudgetTiles = (page: Page) => page.locator("#grid-container .grid-item.off-budget-tile");
+// Present only for peers OUTSIDE the layout capacity — no canvas (`GridOverflowBadge`).
+const overflowBadge = (page: Page) => page.locator("#grid-container .grid-overflow-badge");
+
+async function seedStandardDensity(context: BrowserContext) {
+  await context.addInitScript(() => {
+    try {
+      window.localStorage.setItem("vc_density_mode", "standard");
+    } catch {
+      /* storage may be unavailable pre-navigation; the app origin sets it */
+    }
+  });
+}
 
 /**
  * Pin a BrowserContext to a specific media transport BEFORE its first
@@ -192,15 +128,23 @@ async function pinTransport(context: BrowserContext, t: Transport) {
  * button against the grid, disabling the Waiting Room on the host's card so
  * later joiners are auto-admitted.
  */
-async function joinMeeting(page: Page, meetingId: string, displayName: string): Promise<void> {
-  await page.addInitScript(() => {
-    try {
-      window.localStorage.setItem("vc_prejoin_camera_on", "true");
-      window.localStorage.setItem("vc_prejoin_mic_on", "true");
-    } catch {
-      /* storage may be unavailable pre-navigation; the app origin sets it */
-    }
-  });
+async function joinMeeting(
+  page: Page,
+  meetingId: string,
+  displayName: string,
+  micOn = true,
+): Promise<void> {
+  await page.addInitScript(
+    (mic: string) => {
+      try {
+        window.localStorage.setItem("vc_prejoin_camera_on", "true");
+        window.localStorage.setItem("vc_prejoin_mic_on", mic);
+      } catch {
+        /* storage may be unavailable pre-navigation; the app origin sets it */
+      }
+    },
+    micOn ? "true" : "false",
+  );
 
   await page.goto("/");
   await page.waitForTimeout(1500);
@@ -306,13 +250,13 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
   await expect(grid).toBeVisible({ timeout: 15_000 });
 }
 
-/** Open Device Settings → Appearance tab so the decode-budget control shows. */
-async function openAppearancePanel(page: Page): Promise<void> {
+/** Open Device Settings → Preferences tab so the decode-budget control shows. */
+async function openPreferencesPanel(page: Page): Promise<void> {
   await page.locator(".video-controls-container").hover();
   await page.locator('[data-testid="open-settings"]').click();
   await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
-  await page.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
-  await expect(page.locator("#settings-panel-appearance")).toBeVisible({ timeout: 5_000 });
+  await page.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+  await expect(page.locator("#settings-panel-preferences")).toBeVisible({ timeout: 5_000 });
   await expect(page.locator("#decode-budget-override")).toBeVisible({ timeout: 5_000 });
 }
 
@@ -323,7 +267,7 @@ async function closeSettingsModal(page: Page): Promise<void> {
 
 /** Put the receiver's decode budget in Auto so the adaptive loop owns the cap. */
 async function selectAutoBudget(page: Page): Promise<void> {
-  await openAppearancePanel(page);
+  await openPreferencesPanel(page);
   await page.locator('[data-testid="decode-budget-auto"]').click();
   await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
     "aria-checked",
@@ -332,16 +276,22 @@ async function selectAutoBudget(page: Page): Promise<void> {
   await closeSettingsModal(page);
 }
 
-/**
- * Inject sustained MILD-low FPS until at least one REAL publisher is pushed to
- * the off-budget avatar tier (cap stepped down toward MIN_CAP=1). Returns once
- * an off-budget tile is present (the client has shrunk its active_decode_set so
- * the VIEWPORT excludes that publisher) or throws if the floor isn't reached
- * within the sample budget. Keeps the DOM signal and the relay signal
- * independent: this only proves the CLIENT excluded a publisher; the metric
- * proves the relay dropped its video.
- */
+/** A retune of either mirrored value silently changes which window overflows. */
+function assertOverflowGeometryStillHolds(): void {
+  expect(OVERFLOW_VIEWPORT.width).toBeGreaterThan(DENSITY.MOBILE_WIDTH_BREAKPOINT_PX);
+  expect(FULL_VIEWPORT.width).toBeGreaterThan(DENSITY.MOBILE_WIDTH_BREAKPOINT_PX);
+  expect(TWO_TILE_WIDTH_AT_OVERFLOW_VIEWPORT).toBeLessThan(
+    DENSITY.STANDARD_MIN_TILE_WIDTH_DESKTOP_PX,
+  );
+  expect(TWO_TILE_WIDTH_AT_FULL_VIEWPORT).toBeGreaterThan(
+    DENSITY.STANDARD_MIN_TILE_WIDTH_DESKTOP_PX,
+  );
+}
+
 async function driveBudgetToFloor(page: Page): Promise<void> {
+  // A retune can flip MILD_LOW_FPS into the SEVERE band, where a down-step drops
+  // BOTH publishers at once rather than the single tile this asserts.
+  expect(MILD_LOW_FPS).toBeGreaterThan(BUDGET.FPS_SEVERE);
   for (let i = 0; i < MAX_DRIVE_SAMPLES; i++) {
     if ((await offBudgetTiles(page).count()) > 0) break;
     await injectFps(page, MILD_LOW_FPS);
@@ -349,7 +299,7 @@ async function driveBudgetToFloor(page: Page): Promise<void> {
   }
   await expect(
     offBudgetTiles(page),
-    "the receiver must push at least one real publisher off-budget (active_decode_set shrank → VIEWPORT excludes it)",
+    "the receiver must push at least one real publisher off-budget (the local decode gate shrank; the VIEWPORT must NOT)",
   ).not.toHaveCount(0, { timeout: 15_000 });
   // MIN_CAP keeps at least one remote tile decoded. Poll (not an instantaneous
   // read) because the off-budget transition re-lays-out the grid and the
@@ -359,12 +309,9 @@ async function driveBudgetToFloor(page: Page): Promise<void> {
   });
 }
 
-/**
- * Poll the relay's `relay_viewport_filtered_total{room}` until it rises by at
- * least `minDelta` above `from`, or fail. This is the authoritative proof the
- * relay is DROPPING the off-screen publisher's VIDEO server-side.
- */
-async function expectFilteredToClimb(
+/** Poll a relay viewport counter until it rises by `minDelta` above `from`. */
+async function expectCounterToClimb(
+  read: (t: Transport, room: string) => Promise<number>,
   transport: Transport,
   room: string,
   from: number,
@@ -376,7 +323,7 @@ async function expectFilteredToClimb(
   await expect
     .poll(
       async () => {
-        latest = await readViewportFilteredTotal(transport, room);
+        latest = await read(transport, room);
         return latest;
       },
       { timeout: timeoutMs, intervals: [500, 1000, 2000], message },
@@ -385,22 +332,109 @@ async function expectFilteredToClimb(
   return latest;
 }
 
+/** Poll until `filtered` stops moving, so a later flat assertion is not sampled mid-transition. */
+async function expectFilteredToSettle(transport: Transport, room: string): Promise<void> {
+  let previous = -1;
+  await expect
+    .poll(
+      async () => {
+        const current = await readViewportFilteredTotal(transport, room);
+        const settled = current === previous;
+        previous = current;
+        return settled;
+      },
+      {
+        timeout: 30_000,
+        intervals: [1000, 1000, 2000],
+        message: `relay_viewport_filtered_total on the ${transport} relay must stop climbing once the widened viewport lands`,
+      },
+    )
+    .toBe(true);
+}
+
+/** `filtered` must not move over a window in which `forwarded` demonstrably does. */
+async function expectFilteredFlatWhileForwardedClimbs(
+  transport: Transport,
+  room: string,
+  minForwardedDelta: number,
+  timeoutMs: number,
+  premise?: { sustain: () => Promise<void>; assert: () => Promise<void> },
+): Promise<void> {
+  // Hold the caller's premise for the WHOLE helper, not just the dwell. The forwarded-climb
+  // poll below has a 30s budget and applies no pressure, so a floor established once has
+  // already recovered by the time the dwell starts (observed: off-budget count 0 at the
+  // re-read even with the dwell sustaining).
+  let sustaining = premise !== undefined;
+  const sustainLoop = (async () => {
+    while (sustaining) {
+      await premise?.sustain().catch(() => {
+        /* page may be mid-navigation; the next tick retries */
+      });
+      await new Promise((resolve) => setTimeout(resolve, DWELL_TICK_MS));
+    }
+  })();
+
+  try {
+    const filteredBefore = await readViewportFilteredTotal(transport, room);
+    const forwardedBefore = await readViewportForwardedTotal(transport, room);
+    await expectCounterToClimb(
+      readViewportForwardedTotal,
+      transport,
+      room,
+      forwardedBefore,
+      minForwardedDelta,
+      timeoutMs,
+      `the ${transport} relay must keep FORWARDING this room's video while the receiver sits at the ` +
+        "decode-budget floor — otherwise a flat `filtered` proves nothing",
+    );
+    // Dwell: `forwarded` counts per packet per receiver across three layers, so the climb
+    // target is often met by the first poll. Hold the window open so `filtered` is sampled
+    // over real time — and re-check `forwarded` AFTER the sleep, or a stall during the dwell
+    // makes the flat reading meaningless again.
+    const forwardedMidDwell = await readViewportForwardedTotal(transport, room);
+    await new Promise((resolve) => setTimeout(resolve, DWELL_TICKS * DWELL_TICK_MS));
+    // Bare read, not a poll: the claim is "forwarding was alive ACROSS the dwell", and a
+    // 15s-budget poll would only prove "alive somewhere in the next 15s".
+    expect(
+      await readViewportForwardedTotal(transport, room),
+      `the ${transport} relay must still be forwarding across the dwell window`,
+    ).toBeGreaterThan(forwardedMidDwell);
+    // Re-assert HERE, not before the dwell: this is where `filtered` is read.
+    if (premise) {
+      await premise.assert();
+    }
+    const filteredAfter = await readViewportFilteredTotal(transport, room);
+    expect(
+      filteredAfter,
+      `relay_viewport_filtered_total on the ${transport} relay must stay FLAT while the receiver is at ` +
+        "the decode-budget floor with both tiles on screen — a climb means the local cap was published " +
+        "as the viewport and blacked out the other publisher (issue 2602)",
+    ).toBe(filteredBefore);
+  } finally {
+    sustaining = false;
+    await sustainLoop;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Parameterised relay-drop observation over BOTH transports.
 // ---------------------------------------------------------------------------
 
 for (const transport of ["websocket", "webtransport"] as const) {
-  test.describe(`Viewport filter drops off-screen VIDEO over ${transport} (#995/#988)`, () => {
+  test.describe(`Viewport follows the layout, not the decode cap, over ${transport} (2602/#995/#988)`, () => {
     // Three heavy WebCodecs renderers (1 receiver + 2 publishers). Serial +
     // generous timeout for the same renderer-footprint reason as
     // simulcast-per-receiver.spec.ts.
     test.describe.configure({ mode: "serial", timeout: 240_000 });
 
     test.beforeAll(async () => {
+      assertOverflowGeometryStillHolds();
       await waitForServices();
     });
 
-    test(`relay drops an off-screen peer's VIDEO on the ${transport} path`, async ({ baseURL }) => {
+    test(`the viewport follows the layout, not the decode cap, on the ${transport} path`, async ({
+      baseURL,
+    }) => {
       const uiURL = baseURL || "http://localhost:3001";
       const tag = transport === "webtransport" ? "wt" : "ws";
       const meetingId = `e2e_vp_filter_${tag}_${Date.now()}`;
@@ -433,6 +467,7 @@ for (const transport of ["websocket", "webtransport"] as const) {
         for (const ctx of [rxCtx, pub1Ctx, pub2Ctx]) {
           await pinTransport(ctx, transport);
         }
+        await seedStandardDensity(rxCtx);
 
         const rxPage = await rxCtx.newPage();
         const pub1Page = await pub1Ctx.newPage();
@@ -441,8 +476,9 @@ for (const transport of ["websocket", "webtransport"] as const) {
         // Receiver is the first joiner (host) so it can disable the Waiting Room;
         // publishers join after and are auto-admitted.
         await joinMeeting(rxPage, meetingId, "VpReceiver");
-        await joinMeeting(pub1Page, meetingId, "VpPublisher1");
-        await joinMeeting(pub2Page, meetingId, "VpPublisher2");
+        // MUTED — see the header. Audio is irrelevant: the filter is camera-VIDEO only.
+        await joinMeeting(pub1Page, meetingId, "VpPublisher1", false);
+        await joinMeeting(pub2Page, meetingId, "VpPublisher2", false);
 
         if (!(await hasInjectHook(rxPage))) {
           test.skip(
@@ -472,21 +508,57 @@ for (const transport of ["websocket", "webtransport"] as const) {
           })
           .toBeGreaterThan(0);
 
-        // Push one publisher off-screen via the adaptive decode-budget floor.
+        // ---- PHASE 1 (2602): the decode floor must not narrow the viewport.
+        await rxPage.setViewportSize(FULL_VIEWPORT);
         await selectAutoBudget(rxPage);
         await driveBudgetToFloor(rxPage);
+        await expect(
+          overflowBadge(rxPage),
+          "PHASE 1 precondition: at full size no peer is off SCREEN — the budget floor must be the " +
+            "only thing narrowed, so the +N badge must be absent",
+        ).toHaveCount(0);
+        await expectFilteredFlatWhileForwardedClimbs(transport, meetingId, 5, 30_000, {
+          sustain: () => injectFps(rxPage, MILD_LOW_FPS),
+          assert: async () => {
+            await expect(
+              offBudgetTiles(rxPage),
+              "PHASE 1 premise must still hold when `filtered` is re-read: the budget must not " +
+                "have recovered off the floor during the dwell",
+            ).not.toHaveCount(0);
+          },
+        });
 
-        // THE ASSERTION: the relay must now be DROPPING the off-screen
-        // publisher's VIDEO on this transport's path.
-        await expectFilteredToClimb(
+        // ---- PHASE 2 (#995/#988): a genuinely off-screen peer IS dropped.
+        await rxPage.setViewportSize(OVERFLOW_VIEWPORT);
+        await expect(
+          overflowBadge(rxPage),
+          "PHASE 2 precondition: the narrowed window must fold one publisher into the +N badge " +
+            "(no canvas, genuinely off screen)",
+        ).toHaveCount(1, { timeout: 20_000 });
+        await expect(overflowBadge(rxPage)).toHaveAttribute("data-overflow-count", "1");
+
+        const filteredBefore = await readViewportFilteredTotal(transport, meetingId);
+        await expectCounterToClimb(
+          readViewportFilteredTotal,
           transport,
           meetingId,
-          0,
+          filteredBefore,
           5,
           30_000,
-          `relay_viewport_filtered_total on the ${transport} relay must climb once the receiver ` +
-            "excludes a publisher — proves the transport-agnostic drop-check fires on this path",
+          `relay_viewport_filtered_total on the ${transport} relay must climb once a publisher is ` +
+            "genuinely off screen — the transport-agnostic drop-check firing on this path (#995)",
         );
+
+        // ---- PHASE 3: repeat PHASE 1 now that a viewport is PROVEN established.
+        // `forwarded` also increments on the relay's fail-open path, so phase 1 alone is
+        // satisfied by a client that never published a viewport at all.
+        await rxPage.setViewportSize(FULL_VIEWPORT);
+        await expect(overflowBadge(rxPage)).toHaveCount(0, { timeout: 20_000 });
+        // The badge clearing is a DOM fact; the relay keeps dropping until the widened
+        // viewport reaches it (debounce + RTT + packets already in flight). Wait for the
+        // counter to settle before sampling, or the baseline is taken mid-transition.
+        await expectFilteredToSettle(transport, meetingId);
+        await expectFilteredFlatWhileForwardedClimbs(transport, meetingId, 5, 30_000);
       } finally {
         await rxBrowser.close();
         await pub1Browser.close();

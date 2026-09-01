@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# bot-ctl — drive the K8s bot fleet's control API. Run `bot-ctl help` for usage.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+bot-ctl — control K8s-deployed bot fleet pods; handles the port-forward and token for you.
+
+Usage:
+  bot-ctl list [N|all]             bots on pod N, or on every running pod (default: all)
+  bot-ctl netem <profile> [N|all]  apply a netem profile
+  bot-ctl clear [N|all]            remove netem shaping
+  bot-ctl video on|off [N|all]     camera on or off
+  bot-ctl mute [N|all]             mute the mic
+  bot-ctl unmute [N|all]           unmute the mic
+  bot-ctl ttl <seconds> [N|all]    set remaining TTL, in whole seconds
+  bot-ctl status [N]               one bot's full detail as JSON (default: pod 0)
+  bot-ctl leave [N|all]            graceful hang-up
+  bot-ctl help                     this text
+
+Env:
+  BOT_CTL_KUBECONFIG  kubeconfig for the bot fleet; wins over KUBECONFIG
+  KUBECONFIG          fallback kubeconfig (default: ~/qsk8s-config)
+  BOT_NAMESPACE       K8s namespace       (default: bot-load)
+  BOT_STS             StatefulSet name    (default: videocall-bots)
+  BOT_CTL_PORT_BASE   local port base for port-forwards (default: 18080); give
+                      concurrent invocations different bases
+  BOT_CTL_PF_WAIT     seconds to wait for each port-forward (default: 1)
+  E2E_DIR             path to e2e/ (default: derived from this script's location)
+
+Requires kubectl, GNU coreutils, and a node that can run `npm run bot` from e2e/.
+
+Every command targets one pod (N) or all running pods. Mutating commands act on
+the pod's in-meeting bot, print one ✓ or ✗ per pod, and exit non-zero if any pod
+failed.
+
+Examples:
+  bot-ctl list                     # every pod's registry
+  bot-ctl netem congested_wifi     # shape all pods
+  bot-ctl netem satellite 2        # shape pod 2 only
+  bot-ctl clear                    # restore a clean network everywhere
+  bot-ctl video off                # cameras off, all pods
+  bot-ctl ttl 600                  # 10 more minutes on every bot
+EOF
+}
+
+case "${1:-}" in
+-h | --help | help)
+  usage
+  exit 0
+  ;;
+"")
+  usage >&2
+  exit 1
+  ;;
+esac
+
+KUBECONFIG="${BOT_CTL_KUBECONFIG:-${KUBECONFIG:-$HOME/qsk8s-config}}"
+export KUBECONFIG
+NS="${BOT_NAMESPACE:-bot-load}"
+STS="${BOT_STS:-videocall-bots}"
+PORT_BASE="${BOT_CTL_PORT_BASE:-18080}"
+PF_WAIT="${BOT_CTL_PF_WAIT:-1}"
+
+# Above this a TTL overflows setTimeout's 32-bit millisecond argument and fires
+# immediately instead of later.
+TTL_MAX_SECONDS=2147483
+
+# readlink -f so a ~/.local/bin symlink resolves to the real e2e/ path.
+REAL_SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
+E2E_DIR="${E2E_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)/e2e}"
+
+FAILED_COUNT=0
+FAILED_PODS=""
+PORT=$((PORT_BASE - 1))
+PF_PID=""
+BOT_ID=""
+
+fail() {
+  echo "✗ $1: $2" >&2
+  FAILED_COUNT=$((FAILED_COUNT + 1))
+  FAILED_PODS="$FAILED_PODS $1"
+  return 0
+}
+
+TOKEN="$(kubectl get secret bot-ctl-token -n "$NS" -o jsonpath='{.data.token}' | base64 -d)" || {
+  echo "bot-ctl: could not read the bot-ctl-token secret from namespace $NS" >&2
+  exit 1
+}
+if [[ -z "$TOKEN" ]]; then
+  echo "bot-ctl: bot-ctl-token in namespace $NS has no non-empty 'token' key" >&2
+  exit 1
+fi
+
+WORK_DIR="$(mktemp -d)"
+PF_LOG="$WORK_DIR/port-forward.log"
+LIST_OUT="$WORK_DIR/list.out"
+
+kill_pf() {
+  if [[ -n "$PF_PID" ]]; then
+    kill "$PF_PID" 2>/dev/null || true
+    wait "$PF_PID" 2>/dev/null || true
+    PF_PID=""
+  fi
+}
+
+cleanup() {
+  kill_pf
+  rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
+
+next_port() { PORT=$((PORT + 1)); }
+
+# Echo target pod names, one per line.
+resolve_targets() {
+  local target="${1:-all}" pods rc=0
+  if [[ "$target" == "all" ]]; then
+    pods="$(kubectl get pods -n "$NS" \
+      -l "app.kubernetes.io/instance=$STS" \
+      --field-selector=status.phase=Running \
+      --no-headers \
+      -o custom-columns=NAME:.metadata.name)" || rc=$?
+    if ((rc != 0)); then
+      echo "bot-ctl: kubectl could not list pods in namespace $NS (exit $rc)" >&2
+      return 1
+    fi
+    if [[ -z "$pods" ]]; then
+      echo "bot-ctl: no running pods for StatefulSet $STS in namespace $NS" >&2
+      return 1
+    fi
+    pods="$(printf '%s\n' "$pods" | sort -V)"
+  elif [[ "$target" =~ ^[0-9]+$ ]]; then
+    pods="${STS}-${target}"
+  else
+    echo "bot-ctl: pod target must be a whole ordinal or \"all\" (got \"$target\")" >&2
+    return 1
+  fi
+  printf '%s\n' "$pods"
+}
+
+# Usage: run_ctl <pod_name> <local_port> <ctl_args...>
+# Returns ctl's exit code; ctl's stderr is not redirected.
+run_ctl() {
+  local pod="$1" port="$2" rc=0
+  shift 2
+  kubectl port-forward -n "$NS" "pod/$pod" "${port}:8080" >"$PF_LOG" 2>&1 &
+  PF_PID=$!
+  sleep "$PF_WAIT"
+  # A dead forwarder means this port is not ours, so the request — bearer token
+  # included — would reach whatever else is listening on it.
+  if ! kill -0 "$PF_PID" 2>/dev/null; then
+    echo "bot-ctl: port-forward to $pod on local port $port died:" >&2
+    sed 's/^/  /' "$PF_LOG" >&2
+    kill_pf
+    return 1
+  fi
+  # In the child env, not on argv: npm copies its full argv into
+  # ~/.npm/_logs/*-debug-0.log, which would persist the fleet's bearer token.
+  (cd "$E2E_DIR" && BOT_CTL_TOKEN="$TOKEN" npm run bot --silent -- ctl "$@" --port "$port") || rc=$?
+  kill_pf
+  return "$rc"
+}
+
+# Sets BOT_ID to the pod's first bot in state <want> ("in-meeting" or "any"), ""
+# if it has none. Column offsets come from the header row because any cell may
+# contain spaces. A status outside BotStatus is a parse failure, not a selection.
+first_bot() {
+  local pod="$1" port="$2" want="$3" rc=0
+  BOT_ID=""
+  run_ctl "$pod" "$port" list >"$LIST_OUT" || rc=$?
+  ((rc == 0)) || return "$rc"
+  BOT_ID="$(awk -v want="$want" '
+    $1 == "BOT_ID" {
+      sc = index($0, "STATUS"); tc = index($0, "TTL_REMAINING")
+      seen = 1; next
+    }
+    !seen || $1 ~ /^-+$/ { next }
+    {
+      st = substr($0, sc, tc - sc); sub(/ +$/, "", st)
+      if (st == "done" || st == "failed") next
+      if (st !~ /^(priming|launching|joining|in-meeting|leaving)$/) exit 3
+      if (want == "in-meeting" && st != "in-meeting") next
+      print $1; exit
+    }
+  ' "$LIST_OUT")" || {
+    echo "bot-ctl: could not parse the bot table from $pod" >&2
+    return 1
+  }
+  return 0
+}
+
+# Usage: per_pod <label> <target> <ctl_args...>
+per_pod() {
+  local label="$1" target="$2" pods pod
+  shift 2
+  pods="$(resolve_targets "$target")" || return 1
+  for pod in $pods; do
+    next_port
+    if run_ctl "$pod" "$PORT" "$@"; then
+      echo "✓ $pod: $label"
+    else
+      fail "$pod" "$label"
+    fi
+  done
+}
+
+# Usage: per_bot <label> <target> <subcommand> [flags...]
+# Targets in-meeting bots only: orchestrator applyTtl rearms an existing timer and
+# no other, so a wider predicate would report success for a discarded mutation.
+per_bot() {
+  local label="$1" target="$2" subcmd="$3" pods pod
+  shift 3
+  pods="$(resolve_targets "$target")" || return 1
+  for pod in $pods; do
+    next_port
+    if ! first_bot "$pod" "$PORT" in-meeting; then
+      fail "$pod" "could not list bots"
+      continue
+    fi
+    if [[ -z "$BOT_ID" ]]; then
+      fail "$pod" "no bot in-meeting"
+      continue
+    fi
+    next_port
+    if run_ctl "$pod" "$PORT" "$subcmd" "$BOT_ID" "$@"; then
+      echo "✓ $pod: $label"
+    else
+      fail "$pod" "$label"
+    fi
+  done
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+CMD="$1"
+shift
+
+case "$CMD" in
+list)
+  pods="$(resolve_targets "${1:-all}")" || exit 1
+  for pod in $pods; do
+    echo "── $pod ──"
+    next_port
+    run_ctl "$pod" "$PORT" list || fail "$pod" "list"
+  done
+  ;;
+
+netem)
+  profile="${1:-}"
+  shift || true
+  if [[ -z "$profile" ]]; then
+    echo "bot-ctl: netem requires a profile name (e.g. congested_wifi)" >&2
+    exit 1
+  fi
+  per_pod "netem $profile" "${1:-all}" netem --profile "$profile"
+  ;;
+
+clear)
+  per_pod "clear netem" "${1:-all}" netem --clear
+  ;;
+
+video)
+  state="${1:-}"
+  shift || true
+  if [[ ! "$state" =~ ^(on|off)$ ]]; then
+    echo "bot-ctl: video requires on|off (got \"$state\")" >&2
+    exit 1
+  fi
+  # `ctl video` turns the camera OFF by default; only --on is defined.
+  flag=()
+  if [[ "$state" == "on" ]]; then flag=(--on); fi
+  # Empty-array expansion form per docker-entrypoint.sh's bash-compat note.
+  per_bot "video $state" "${1:-all}" video ${flag[@]+"${flag[@]}"}
+  ;;
+
+mute)
+  per_bot "mute" "${1:-all}" mute
+  ;;
+
+unmute)
+  per_bot "unmute" "${1:-all}" mute --off
+  ;;
+
+ttl)
+  secs="${1:-}"
+  shift || true
+  if [[ ! "$secs" =~ ^[0-9]+$ ]]; then
+    echo "bot-ctl: ttl requires a whole number of seconds (got \"$secs\")" >&2
+    exit 1
+  fi
+  # Digit count first: bash arithmetic wraps at 64 bits, and a wrapped value can
+  # compare below the ceiling.
+  while [[ "$secs" == 0?* ]]; do secs="${secs#0}"; done
+  if ((${#secs} > ${#TTL_MAX_SECONDS})) || ((secs > TTL_MAX_SECONDS)); then
+    echo "bot-ctl: ttl must be at most $TTL_MAX_SECONDS seconds (got $secs)" >&2
+    exit 1
+  fi
+  per_bot "ttl ${secs}s" "${1:-all}" ttl --set "${secs}s"
+  ;;
+
+status)
+  ordinal="${1:-0}"
+  if [[ ! "$ordinal" =~ ^[0-9]+$ ]]; then
+    echo "bot-ctl: status takes a single pod ordinal (got \"$ordinal\")" >&2
+    exit 1
+  fi
+  pod="${STS}-${ordinal}"
+  next_port
+  # Read-only, so any non-terminal bot is worth reporting.
+  first_bot "$pod" "$PORT" any || exit 1
+  if [[ -z "$BOT_ID" ]]; then
+    echo "✗ $pod: no live bot in registry" >&2
+    exit 1
+  fi
+  next_port
+  run_ctl "$pod" "$PORT" status "$BOT_ID"
+  ;;
+
+leave)
+  per_bot "leave" "${1:-all}" leave
+  ;;
+
+*)
+  echo "bot-ctl: unknown command \"$CMD\"" >&2
+  usage >&2
+  exit 1
+  ;;
+esac
+
+if ((FAILED_COUNT > 0)); then
+  echo "bot-ctl: $FAILED_COUNT pod(s) failed:$FAILED_PODS" >&2
+  exit 1
+fi

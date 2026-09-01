@@ -847,7 +847,7 @@ impl Handler<Message> for WtChatSession {
             packet_type,
             inner_media_type,
         ) {
-            WtSendResult::Sent => {}
+            WtSendResult::Sent => self.logic.observe_outbound_delivery(&msg),
             WtSendResult::Dead => {
                 ctx.stop();
             }

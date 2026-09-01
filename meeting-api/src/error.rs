@@ -174,6 +174,14 @@ impl AppError {
             APIError::verifier_overloaded(),
         )
     }
+
+    /// `503` — no Argon2 permit became available in time for a password *hash*.
+    pub fn password_hasher_overloaded() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            APIError::password_hasher_overloaded(),
+        )
+    }
 }
 
 impl IntoResponse for AppError {

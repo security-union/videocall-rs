@@ -54,18 +54,15 @@
 use crate::auth::{
     clear_pkce_state, load_pkce_state, store_access_token, store_id_token, store_refresh_token,
 };
-use crate::constants::{
-    meeting_api_base_url, oauth_client_id, oauth_issuer, oauth_redirect_url, oauth_token_url,
-};
+use crate::constants::{meeting_api_base_url, oauth_client_id, oauth_redirect_url};
 use crate::context::{
-    email_to_display_name, is_guid_like, read_session_storage, save_display_name_to_storage,
-    validate_display_name, write_session_storage,
+    email_to_display_name, is_guid_like, save_display_name_to_storage, validate_display_name,
 };
 use crate::id_token::decode_and_validate_id_token;
 use crate::pkce::exchange_code_with_provider;
+use crate::token_endpoint::resolve_token_endpoint;
 use dioxus::prelude::*;
 use gloo_utils::window;
-use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // Component state
@@ -98,119 +95,6 @@ fn parse_query_param(search: &str, key: &str) -> Option<String> {
         }
     }
     None
-}
-
-// ---------------------------------------------------------------------------
-// Token endpoint resolution
-// ---------------------------------------------------------------------------
-
-/// OIDC discovery document (subset — only the fields we need).
-#[derive(Debug, Deserialize)]
-struct OidcDiscovery {
-    token_endpoint: String,
-}
-
-/// Cached session-storage key for the discovered token endpoint URL.
-/// Avoids re-fetching the discovery document on every callback within the
-/// same session.
-const CACHED_TOKEN_ENDPOINT_KEY: &str = "vc_cached_token_endpoint";
-
-/// Resolve the provider's token endpoint URL.
-///
-/// Priority:
-///
-/// 1. `window.__APP_CONFIG.oauthTokenUrl` (explicit env var `OAUTH_TOKEN_URL`).
-/// 2. Per-session cache set by a previous call to this function (browser
-///    `sessionStorage` on web; in-memory on native).
-/// 3. OIDC well-known discovery: `GET {oauthIssuer}/.well-known/openid-configuration`.
-/// 4. Backend fallback: `GET /api/v1/oauth/provider-config` — the meeting-api
-///    exposes the post-discovery `token_url` field.
-async fn resolve_token_endpoint() -> Result<String, String> {
-    // 1. Explicit config value — fastest path, no network.
-    if let Some(url) = oauth_token_url() {
-        return Ok(url);
-    }
-
-    // 2. Per-session cache from a previous discovery call.
-    if let Some(cached) = read_session_storage(CACHED_TOKEN_ENDPOINT_KEY) {
-        return Ok(cached);
-    }
-
-    // 3. OIDC well-known discovery.
-    if let Some(issuer) = oauth_issuer() {
-        let discovery_url = format!(
-            "{}/.well-known/openid-configuration",
-            issuer.trim_end_matches('/')
-        );
-        match fetch_token_endpoint_from_discovery(&discovery_url).await {
-            Ok(url) => {
-                cache_token_endpoint(&url);
-                return Ok(url);
-            }
-            Err(e) => {
-                log::warn!("OIDC discovery failed ({discovery_url}): {e}; trying backend fallback");
-            }
-        }
-    }
-
-    // 4. Backend fallback: meeting-api already ran discovery and stores the
-    //    resolved token_url.
-    fetch_token_endpoint_from_backend().await
-}
-
-async fn fetch_token_endpoint_from_discovery(discovery_url: &str) -> Result<String, String> {
-    let resp = reqwest::get(discovery_url)
-        .await
-        .map_err(|e| format!("OIDC discovery request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("OIDC discovery returned HTTP {status}: {body}"));
-    }
-
-    let doc: OidcDiscovery = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse OIDC discovery document: {e}"))?;
-
-    if doc.token_endpoint.is_empty() {
-        return Err("OIDC discovery document has an empty token_endpoint".to_string());
-    }
-
-    Ok(doc.token_endpoint)
-}
-
-async fn fetch_token_endpoint_from_backend() -> Result<String, String> {
-    // Delegate to the shared provider-config fetch (handles its own cache).
-    let cfg = crate::provider_config::fetch_provider_config().await?;
-
-    if !cfg.token_url.is_empty() {
-        cache_token_endpoint(&cfg.token_url);
-        return Ok(cfg.token_url);
-    }
-
-    // token_url empty but issuer present — try OIDC well-known discovery.
-    if let Some(issuer) = cfg.issuer.filter(|s| !s.is_empty()) {
-        let discovery_url = format!(
-            "{}/.well-known/openid-configuration",
-            issuer.trim_end_matches('/')
-        );
-        let url = fetch_token_endpoint_from_discovery(&discovery_url).await?;
-        cache_token_endpoint(&url);
-        return Ok(url);
-    }
-
-    Err(
-        "Cannot resolve token endpoint: set OAUTH_TOKEN_URL or OAUTH_ISSUER in the \
-         dioxus-ui environment, or ensure the backend has OAUTH_TOKEN_URL / OAUTH_ISSUER \
-         configured."
-            .to_string(),
-    )
-}
-
-fn cache_token_endpoint(url: &str) {
-    write_session_storage(CACHED_TOKEN_ENDPOINT_KEY, url);
 }
 
 // ---------------------------------------------------------------------------

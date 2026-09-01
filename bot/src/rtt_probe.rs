@@ -31,10 +31,9 @@ use protobuf::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
 
-use crate::transport::{MediaTypeLabel, OutboundFrame};
+use crate::transport::{MediaTypeLabel, OutboundFrame, OutboundFrameSender};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -112,7 +111,7 @@ impl RttProbeState {
 /// The task runs until `quit` is set to true.
 pub fn spawn_rtt_probe(
     user_id: String,
-    packet_tx: Sender<OutboundFrame>,
+    packet_tx: OutboundFrameSender,
     quit: Arc<std::sync::atomic::AtomicBool>,
 ) -> Arc<RttProbeState> {
     let state = Arc::new(RttProbeState::new());

@@ -147,8 +147,6 @@ pub fn transform_screen_chunk(
     source_width: u32,
     source_height: u32,
     encoder_target_bitrate_kbps: u32,
-    adaptive_tier: String,
-    cause_hint: String,
     simulcast_layer_id: u32,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
@@ -167,8 +165,6 @@ pub fn transform_screen_chunk(
             source_width,
             source_height,
             encoder_target_bitrate_kbps,
-            adaptive_tier,
-            cause_hint,
             ..Default::default()
         })
         .into(),

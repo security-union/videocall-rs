@@ -3,8 +3,12 @@
 
   if (globalThis.top !== globalThis.self) return;
 
-  const WIDTH = 640;
-  const HEIGHT = 480;
+  // Injected per bot by bot.ts (#2236); each axis falls back on its own. The
+  // fallback pair must equal SD_SOURCE in posture.ts — locked by clock-source.test.ts.
+  const dimension = (value, fallback) =>
+    typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+  const WIDTH = dimension(globalThis.__CLOCK_WIDTH, 640);
+  const HEIGHT = dimension(globalThis.__CLOCK_HEIGHT, 480);
 
   // The layout below is authored against this reference frame and scaled to
   // WIDTH/HEIGHT, so changing the capture size cannot move text off-canvas.
@@ -19,17 +23,8 @@
   // Hoisted: the refactor turned these into per-frame template-literal builds
   // and float multiplies. Immaterial next to the canvas fill, but free to avoid.
   const MAXW_TIME = WIDTH - 160 * SCALE_X;
-  // The time string is the one WIDTH-constrained element: 12 fixed monospace
-  // characters ("HH:MM:SS.mmm"). Size it to the larger of what the height allows
-  // and what the width fits, rather than `SCALE_FONT`.
-  //
-  // Why not simply scale by SCALE_Y (which would preserve the legibility fraction
-  // exactly): at 640x480 that is 90.7px, and 12 monospace chars is ~653px against
-  // a 640px frame — it does not fit at ANY padding, including zero. So full parity
-  // is geometrically impossible for this string at 4:3; this recovers ~86% of the
-  // reference fraction (16.2% of frame height vs 18.9%) instead of the 14.2% a
-  // bare `min(SCALE_X, SCALE_Y)` gives. At the 1280x720 reference the height term
-  // wins and the value is 136px exactly, so commit 1 stays byte-neutral.
+  // The time's width is computable (fixed 12-char monospace string), so its font
+  // size takes a width term; the variable-length rows rely on fillText maxWidth.
   const TIME_CHARS = 12;
   const MONO_ADVANCE_EM = 0.6;
   const FONT_TIME_PX = Math.min(136 * SCALE_Y, MAXW_TIME / (TIME_CHARS * MONO_ADVANCE_EM));
@@ -39,6 +34,7 @@
   const Y_TIME = 330 * SCALE_Y;
   const Y_DATE = 465 * SCALE_Y;
   const Y_NAME = 585 * SCALE_Y;
+  const MAXW_DATE = WIDTH - 120 * SCALE_X;
   const MAXW_NAME = WIDTH - 120 * SCALE_X;
   const FRAME_INTERVAL_MS = 33;
   const DIMENSION_TIMEOUT_MS = 5_000;
@@ -75,16 +71,20 @@
     throw new Error("clock source: silent audio destination produced no track");
   }
 
-  const timeFormatter = new globalThis.Intl.DateTimeFormat(undefined, {
+  const CLOCK_LOCALE = "en-GB";
+  const CLOCK_TIME_ZONE = "UTC";
+  const timeFormatter = new globalThis.Intl.DateTimeFormat(CLOCK_LOCALE, {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-    hour12: false,
+    hourCycle: "h23",
+    timeZone: CLOCK_TIME_ZONE,
   });
-  const dateFormatter = new globalThis.Intl.DateTimeFormat(undefined, {
+  const dateFormatter = new globalThis.Intl.DateTimeFormat(CLOCK_LOCALE, {
     year: "numeric",
     month: "short",
     day: "2-digit",
+    timeZone: CLOCK_TIME_ZONE,
   });
 
   let cachedSecond = -1;
@@ -120,7 +120,7 @@
 
     context.fillStyle = "rgba(255, 255, 255, 0.82)";
     context.font = FONT_DATE;
-    context.fillText(cachedDate, WIDTH / 2, Y_DATE);
+    context.fillText(`${cachedDate} ${CLOCK_TIME_ZONE}`, WIDTH / 2, Y_DATE, MAXW_DATE);
 
     const participant =
       typeof globalThis.__CLOCK_PARTICIPANT === "string" ? globalThis.__CLOCK_PARTICIPANT : "";

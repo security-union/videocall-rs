@@ -5,8 +5,9 @@
 //! When the diagnostics "Show media metrics on tiles" checkbox is on, each tile
 //! renders a small, passive readout anchored at its bottom edge:
 //!   * a REMOTE peer tile shows what THIS client is RECEIVING from that peer —
-//!     decoded video resolution, received video fps, and the received audio
-//!     layer's bitrate;
+//!     decoded video resolution and received video fps. Its audio field is always
+//!     the em-dash: a single-layer publisher's bitrate is set by its own AQ tier,
+//!     which no receiver observes;
 //!   * the LOCAL user's OWN tile shows what it is SENDING — the live encode
 //!     resolution / target fps and the audio send bitrate.
 //!
@@ -17,8 +18,8 @@
 //! `pointer-events: none` so it never intercepts tile interactions. The REMOTE
 //! peer payload (`peer_tile.rs`) is now built entirely from per-tile Dioxus
 //! signals the component already maintains at the ~1 Hz diagnostics cadence —
-//! decoded resolution, smoothed received fps (#1772), and the received-audio kbps
-//! signal (#1769) — so building it is an O(1) signal read with NO per-render
+//! decoded resolution and smoothed received fps (#1772) — so building it is an
+//! O(1) signal read with NO per-render
 //! O(peers) `per_peer_received_snapshots()` scan (that snapshot path still backs
 //! the drawer / signal popup, and `peer_tile` still walks it when a signal popup
 //! is OPEN, but it is no longer walked to build this overlay). The SELF payload
@@ -61,7 +62,6 @@
 //! local receiver.
 
 use dioxus::prelude::*;
-use videocall_client::decode::peer_decode_manager::METRIC_SELECTED_AUDIO_LAYER;
 use videocall_client::decode::peer_decoder::METRIC_FPS_PAINTED;
 use videocall_diagnostics::{Metric, MetricValue};
 
@@ -96,8 +96,8 @@ pub struct MediaMetricsOverlay {
     /// Video frames per second — received (remote) or target (self). `None` →
     /// em-dash.
     pub fps: Option<f64>,
-    /// Audio bitrate (kbps) — the received layer's rung (remote) or the send
-    /// bitrate (self). `None` → em-dash.
+    /// Audio bitrate (kbps): the live send bitrate on the self tile, always `None`
+    /// (em-dash) on a remote peer's. `None` → em-dash.
     pub audio_kbps: Option<u32>,
 }
 
@@ -230,68 +230,22 @@ pub fn overlay_painted_fps_sample(metrics: &[Metric], peer_id: &str) -> Option<f
     fps
 }
 
-/// Received-audio kbps for the overlay: the nominal bitrate of the rung this
-/// receiver is actually decoding (#2132), or `0.0` — which the overlay's `> 0.0`
-/// gate renders as the em-dash "—k".
+/// Received-audio kbps for a REMOTE peer's overlay: always `0.0`, which the
+/// overlay's `> 0.0` gate renders as the em-dash "—k".
 ///
-/// `selected_layer` is `None` when audio is off, when no rung has been reported
-/// yet, or when the selected rung is not currently arriving — all three read as
-/// "—" rather than a number the receiver is not getting.
-pub fn overlay_audio_kbps(audio_enabled: bool, selected_layer: Option<u32>) -> f64 {
-    if !audio_enabled {
-        return 0.0;
-    }
-    selected_layer
-        .and_then(videocall_client::decode::layer_chooser::audio_layer_kbps)
-        .map(f64::from)
-        .unwrap_or(0.0)
+/// Nothing a receiver observes determines a publisher's audio bitrate — the rate
+/// comes from the publisher's own AQ audio tier, not from the layer id being
+/// decoded — so this takes no arguments. The SELF tile's `audio_kbps` is the only
+/// honest audio figure.
+pub fn overlay_audio_kbps() -> f64 {
+    0.0
 }
 
 /// The overlay's `audio_kbps` field from the per-tile signal: a real number, or
-/// `None` for the em-dash. `0.0` means "nothing to report" (audio off, or no rung
-/// arriving), which is the only value that renders as "—".
-///
-/// Extracted because `peer_tile` applied this gate inline and the formatter test
-/// re-implemented it, so nothing called the production form (#2132).
+/// `None` for the em-dash. `0.0` means "nothing to report" and is the only value
+/// that renders as "—".
 pub fn overlay_audio_kbps_display(kbps: f64) -> Option<u32> {
     (kbps > 0.0).then_some(kbps.round() as u32)
-}
-
-/// The overlay's received-audio kbps for one `peer_status` event.
-///
-/// The composition is the seam, not the two halves: `peer_tile` previously called
-/// them separately, so reverting the rung argument to `None` — reinstating the
-/// #2132 bug — left every unit test green because each half was tested with
-/// explicit arguments.
-pub fn overlay_audio_kbps_from_status(
-    audio_enabled: bool,
-    metrics: &[Metric],
-    peer_id: &str,
-) -> f64 {
-    overlay_audio_kbps(
-        audio_enabled,
-        overlay_selected_audio_layer(metrics, peer_id),
-    )
-}
-
-/// Latest `selected_audio_layer` this peer reported on `peer_status` (#2132).
-/// `None` when the metric is absent, which is how the emitter signals "the
-/// selected rung is not arriving".
-pub fn overlay_selected_audio_layer(metrics: &[Metric], peer_id: &str) -> Option<u32> {
-    let mut for_peer = false;
-    let mut layer = None;
-    for m in metrics {
-        match (m.name, &m.value) {
-            ("to_peer", MetricValue::Text(v)) => for_peer = v == peer_id,
-            (METRIC_SELECTED_AUDIO_LAYER, MetricValue::U64(v)) => layer = Some(*v as u32),
-            _ => {}
-        }
-    }
-    if for_peer {
-        layer
-    } else {
-        None
-    }
 }
 
 /// Format the compact overlay line with a leading direction glyph — `"↑ …"` when
@@ -543,8 +497,8 @@ mod tests {
     /// The `↑` prefix is asserted here too: this is the SELF arm, and it is the one
     /// the overlay's own shape-cue contract (CVD-safe self/peer distinction) applies
     /// to. `e2e/tests/media-metrics-overlay.spec.ts` polls PAST this state by
-    /// design — its regex requires digits — so this host test is the only guard on
-    /// it, and unlike that spec it runs in per-PR CI.
+    /// design — its regex requires digits. This test guards the FORMATTER arm only:
+    /// its `None` is a hand-passed literal, so the #2170 publish path cannot reach it.
     #[test]
     fn self_line_renders_an_em_dash_for_unpublished_encode_geometry() {
         assert_eq!(
@@ -684,120 +638,35 @@ mod tests {
     }
 
     #[test]
-    fn overlay_audio_kbps_on_shows_a_number_off_shows_em_dash() {
-        // issue #1769: the exact production mapping `peer_tile.rs` routes both the
-        // peer_status write AND the mount seed through. Audio-ON must yield a real
-        // received-audio kbps that formats as "{n}k"; audio-OFF must yield 0.0,
-        // which the overlay's `> 0.0` gate renders as the em-dash "—k". This is
-        // the discriminating guard for #1769 (not a `== AUDIO_LAYER_KBPS[0]`
-        // tautology): it asserts on→real-number and off→em-dash behaviourally.
-        let on = overlay_audio_kbps(true, Some(0));
-        assert!(
-            on > 0.0,
-            "audio-on must map to a real received-audio kbps, got {on}"
+    fn overlay_audio_kbps_em_dashes_every_remote_peer() {
+        // The nominals come from the production ladder, so this fails the moment a
+        // layer->bitrate mapping is reintroduced here.
+        let kbps = overlay_audio_kbps();
+        assert_eq!(kbps, 0.0);
+        for rung in 0..3u32 {
+            let nominal = videocall_client::decode::layer_chooser::audio_layer_kbps(rung).unwrap();
+            assert_ne!(kbps, f64::from(nominal), "reads as rung {rung}'s nominal");
+        }
+        let line = format_media_metrics_line(
+            false,
+            Some((1280, 720)),
+            Some(30.0),
+            overlay_audio_kbps_display(kbps),
         );
-        // ON routes through the overlay's gate + formatter to a number + "k".
-        let on_kbps = overlay_audio_kbps_display(on);
-        let on_line = format_media_metrics_line(false, Some((1280, 720)), Some(30.0), on_kbps);
         assert!(
-            !on_line.contains("\u{2014}k") && on_line.ends_with(&format!("{}k", on.round() as i64)),
-            "audio-on must render a numeric kbps, not the em-dash: {on_line}"
+            line.ends_with("\u{2014}k"),
+            "a remote peer's audio field must render the em-dash: {line}"
         );
-
-        // OFF → 0.0 → gate drops it → the formatter renders the em-dash "—k".
-        let off = overlay_audio_kbps(false, Some(0));
-        assert_eq!(off, 0.0, "audio-off must map to 0.0");
-        let off_kbps = overlay_audio_kbps_display(off);
-        let off_line = format_media_metrics_line(false, Some((1280, 720)), Some(30.0), off_kbps);
-        assert!(
-            off_line.ends_with("\u{2014}k"),
-            "audio-off must render the em-dash: {off_line}"
-        );
-    }
-
-    #[test]
-    fn overlay_audio_kbps_reports_the_selected_rung_not_the_base() {
-        // Expectations come from the production ladder, so a retune cannot make
-        // this pass against a stale copy.
-        let base = videocall_client::decode::layer_chooser::audio_layer_kbps(0).unwrap();
-        let mid = videocall_client::decode::layer_chooser::audio_layer_kbps(1).unwrap();
-        let top = videocall_client::decode::layer_chooser::audio_layer_kbps(2).unwrap();
-        assert!(base < mid && mid < top, "ladder must be ascending");
-        assert_eq!(overlay_audio_kbps(true, Some(0)), f64::from(base));
-        assert_eq!(overlay_audio_kbps(true, Some(1)), f64::from(mid));
-        assert_eq!(overlay_audio_kbps(true, Some(2)), f64::from(top));
-        assert_ne!(overlay_audio_kbps(true, Some(2)), f64::from(base));
-    }
-
-    #[test]
-    fn overlay_audio_kbps_em_dashes_when_the_rung_is_unknown_or_off_ladder() {
-        assert_eq!(overlay_audio_kbps(true, None), 0.0);
-        assert_eq!(overlay_audio_kbps(true, Some(99)), 0.0);
-        assert_eq!(overlay_audio_kbps(false, Some(2)), 0.0);
     }
 
     #[test]
     fn overlay_audio_kbps_display_gates_zero_to_the_em_dash() {
-        // The last link from the per-tile signal to the rendered field. Chain:
-        // overlay_audio_kbps_from_status -> this gate -> format_media_metrics_line,
-        // each now called by a test rather than re-implemented in one.
+        // The last link to the rendered field: overlay_audio_kbps -> this gate ->
+        // format_media_metrics_line, each called by a test rather than re-implemented.
         assert_eq!(overlay_audio_kbps_display(0.0), None);
         assert_eq!(overlay_audio_kbps_display(48.0), Some(48));
         assert_eq!(overlay_audio_kbps_display(24.4), Some(24));
         assert_eq!(overlay_audio_kbps_display(23.6), Some(24));
-    }
-
-    #[test]
-    fn overlay_audio_kbps_from_status_reports_the_reported_rung() {
-        use videocall_client::decode::peer_decode_manager::METRIC_SELECTED_AUDIO_LAYER;
-        let top = videocall_client::decode::layer_chooser::audio_layer_kbps(2).unwrap();
-        let base = videocall_client::decode::layer_chooser::audio_layer_kbps(0).unwrap();
-        let metrics = vec![
-            Metric {
-                name: "to_peer",
-                value: MetricValue::Text("alice".into()),
-            },
-            Metric {
-                name: METRIC_SELECTED_AUDIO_LAYER,
-                value: MetricValue::U64(2),
-            },
-        ];
-        // The whole point of #2132: a peer decoding rung 2 must not read as the base.
-        assert_eq!(
-            overlay_audio_kbps_from_status(true, &metrics, "alice"),
-            f64::from(top)
-        );
-        assert_ne!(
-            overlay_audio_kbps_from_status(true, &metrics, "alice"),
-            f64::from(base)
-        );
-        // No rung reported for this peer, and audio off, both read as the em-dash.
-        assert_eq!(overlay_audio_kbps_from_status(true, &metrics, "bob"), 0.0);
-        assert_eq!(
-            overlay_audio_kbps_from_status(false, &metrics, "alice"),
-            0.0
-        );
-    }
-
-    #[test]
-    fn overlay_selected_audio_layer_reads_only_its_own_peer() {
-        let metrics = vec![
-            Metric {
-                name: "to_peer",
-                value: MetricValue::Text("alice".into()),
-            },
-            Metric {
-                name: METRIC_SELECTED_AUDIO_LAYER,
-                value: MetricValue::U64(2),
-            },
-        ];
-        assert_eq!(overlay_selected_audio_layer(&metrics, "alice"), Some(2));
-        assert_eq!(overlay_selected_audio_layer(&metrics, "bob"), None);
-        let absent = vec![Metric {
-            name: "to_peer",
-            value: MetricValue::Text("alice".into()),
-        }];
-        assert_eq!(overlay_selected_audio_layer(&absent, "alice"), None);
     }
 
     #[test]

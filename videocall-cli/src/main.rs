@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
                 Some(_index) => {
-                    stream(s.clone()).await;
+                    stream((**s).clone()).await;
                 }
             }
         }

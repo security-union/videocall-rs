@@ -1,4 +1,4 @@
-import { Page } from "@playwright/test";
+import { Page, expect } from "@playwright/test";
 
 /**
  * Wake the auto-hiding video-call action bar.
@@ -19,4 +19,17 @@ import { Page } from "@playwright/test";
  */
 export async function wakeControls(page: Page): Promise<void> {
   await page.mouse.move(400, 400);
+}
+
+// The camera is OFF on join; the tooltip flips to "Stop Video" once capture is
+// live, so this locator only matches while it is still off.
+export async function enableCamera(page: Page): Promise<void> {
+  await wakeControls(page);
+  await page.waitForTimeout(300);
+  const startCamBtn = page.locator("button.video-control-button", {
+    has: page.locator("span.tooltip", { hasText: "Start Video" }),
+  });
+  await expect(startCamBtn).toBeVisible({ timeout: 10_000 });
+  await startCamBtn.click();
+  await page.waitForTimeout(500);
 }

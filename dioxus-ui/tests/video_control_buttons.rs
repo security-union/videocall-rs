@@ -22,7 +22,7 @@ use wasm_bindgen_test::*;
 use dioxus::prelude::*;
 use dioxus_ui::components::video_control_buttons::{
     CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MeetingOptionsButton,
-    MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
+    MicButton, MockPeersButton, OpenChatButton, PeerListButton, ScreenShareButton,
 };
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -701,6 +701,20 @@ async fn mock_peers_button_matches_tooltip_title() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
         rsx! { MockPeersButton { open: false, onclick: move |_| {} } }
+    }
+    render_into(&mount, wrapper);
+    yield_now().await;
+
+    assert_button_aria_label_matches_tooltip_title(&mount);
+
+    cleanup(&mount);
+}
+
+#[wasm_bindgen_test]
+async fn open_chat_button_matches_tooltip_title() {
+    let mount = create_mount_point();
+    fn wrapper() -> Element {
+        rsx! { OpenChatButton { has_unread: false, onclick: move |_| {} } }
     }
     render_into(&mount, wrapper);
     yield_now().await;

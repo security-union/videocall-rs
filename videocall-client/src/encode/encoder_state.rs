@@ -155,6 +155,25 @@ pub(super) struct KeyframeTickInput {
     pub last_keyframe_emit_ms: Option<f64>,
     /// Per-encoder PLI coalescing window (camera 250ms, screen 2000ms).
     pub cooldown_ms: f64,
+    /// An AQ tier change is pending; peeked by the caller like `pli_pending`.
+    pub tier_change_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ForcedKeyframeCause {
+    Pli,
+    TierChange,
+    Both,
+}
+
+impl ForcedKeyframeCause {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Pli => "PLI",
+            Self::TierChange => "tier change",
+            Self::Both => "PLI + tier change",
+        }
+    }
 }
 
 /// The decision returned by [`keyframe_tick_decision`]. The encode loop applies the
@@ -162,13 +181,11 @@ pub(super) struct KeyframeTickInput {
 /// atom, write back `last_keyframe_emit_ms`, log on a forced emit).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct KeyframeTickDecision {
-    /// Emit a keyframe this frame (periodic OR an allowed forced PLI). Fed to
+    /// Emit a keyframe this frame (periodic OR an allowed forced request). Fed to
     /// `VideoEncoderEncodeOptions::set_key_frame`.
     pub want_keyframe: bool,
-    /// The keyframe is being forced by a PLI (vs. a periodic GOP keyframe). Drives
-    /// the "forcing keyframe (PLI)" log line; the encode loop logs ONLY when this is
-    /// `true` (issue #1347) — never on a held/coalesced PLI.
-    pub pli_forced: bool,
+    /// `Some` when the keyframe is FORCED (vs. periodic), carrying what forced it.
+    pub forced_cause: Option<ForcedKeyframeCause>,
     /// The `last_keyframe_emit_ms` clock AFTER this tick. Reflects both the #1311
     /// reset (cleared to `None` when `cooldown_reset`) and the emit (set to `now_ms`
     /// when `want_keyframe`). The caller MUST write this back into its loop-local
@@ -211,14 +228,22 @@ pub(super) fn keyframe_tick_decision(input: KeyframeTickInput) -> KeyframeTickDe
         input.last_keyframe_emit_ms
     };
 
-    // 2. #1287/#1312/#1322: a PLI is forced only when pending AND outside the
-    //    cooldown window. PEEK semantics live in the caller (it `load`s, not
-    //    `swap`s); the held-PLI survival comes from clearing the atom only on emit.
-    let pli_forced = input.pli_pending
-        && pli_keyframe_allowed(input.now_ms, last_keyframe_emit_ms, input.cooldown_ms);
+    // 2. #1287/#1312/#1322: either request kind is honored only outside the cooldown
+    //    window (PEEK semantics live in the caller); only the attribution differs.
+    let forced_allowed =
+        pli_keyframe_allowed(input.now_ms, last_keyframe_emit_ms, input.cooldown_ms);
+    let forced_cause = match (
+        input.pli_pending && forced_allowed,
+        input.tier_change_pending && forced_allowed,
+    ) {
+        (true, true) => Some(ForcedKeyframeCause::Both),
+        (true, false) => Some(ForcedKeyframeCause::Pli),
+        (false, true) => Some(ForcedKeyframeCause::TierChange),
+        (false, false) => None,
+    };
 
     // 3. Periodic GOP keyframe is never gated by the cooldown.
-    let want_keyframe = input.is_periodic || pli_forced;
+    let want_keyframe = input.is_periodic || forced_cause.is_some();
 
     // ANY keyframe (re)starts the cooldown window and satisfies every pending PLI.
     if want_keyframe {
@@ -227,7 +252,7 @@ pub(super) fn keyframe_tick_decision(input: KeyframeTickInput) -> KeyframeTickDe
 
     KeyframeTickDecision {
         want_keyframe,
-        pli_forced,
+        forced_cause,
         last_keyframe_emit_ms,
         clear_force_keyframe: want_keyframe,
     }
@@ -235,7 +260,9 @@ pub(super) fn keyframe_tick_decision(input: KeyframeTickInput) -> KeyframeTickDe
 
 #[cfg(test)]
 mod tests {
-    use super::{keyframe_tick_decision, pli_keyframe_allowed, KeyframeTickInput};
+    use super::{
+        keyframe_tick_decision, pli_keyframe_allowed, ForcedKeyframeCause, KeyframeTickInput,
+    };
 
     /// Build a [`KeyframeTickInput`] with the cooldown-reset edge OFF (the common
     /// steady-state case). Tests that exercise #1311 set `cooldown_reset` explicitly.
@@ -253,6 +280,7 @@ mod tests {
             cooldown_reset: false,
             last_keyframe_emit_ms,
             cooldown_ms,
+            tier_change_pending: false,
         }
     }
 
@@ -298,7 +326,7 @@ mod tests {
     ///  * a pending PLI INSIDE the cooldown window is NOT emitted and NOT cleared
     ///    (so it stays pending — issue #1322; clearing it here would flip the
     ///    `clear_force_keyframe == false` assertion);
-    ///  * a pending PLI at/after the window emits, is flagged `pli_forced` (drives
+    ///  * a pending PLI at/after the window emits, is attributed to the PLI (drives
     ///    the #1347 emit-only log), clears the atom, and restarts the clock.
     #[test]
     fn keyframe_tick_decision_coalesces_and_holds_pli() {
@@ -308,7 +336,10 @@ mod tests {
         // here, but the periodic path is ungated either way) and is NOT a PLI force.
         let d = keyframe_tick_decision(tick(0.0, false, true, None, cd));
         assert!(d.want_keyframe, "periodic GOP frame must emit a keyframe");
-        assert!(!d.pli_forced, "a periodic keyframe is not a PLI force");
+        assert_eq!(
+            d.forced_cause, None,
+            "a periodic keyframe is not a forced keyframe"
+        );
         assert!(
             d.clear_force_keyframe,
             "any keyframe satisfies pending PLIs → clear the request atom"
@@ -325,7 +356,7 @@ mod tests {
             !d.want_keyframe,
             "a PLI inside the cooldown window must be coalesced (not emitted)"
         );
-        assert!(!d.pli_forced, "a coalesced PLI is not a forced emit");
+        assert_eq!(d.forced_cause, None, "a coalesced PLI is not a forced emit");
         assert!(
             !d.clear_force_keyframe,
             "issue #1322: a held PLI must stay pending — do NOT clear the request atom \
@@ -340,8 +371,9 @@ mod tests {
         // t=2000: the window expires (>= cooldown). The held PLI fires.
         let d = keyframe_tick_decision(tick(2_000.0, true, false, Some(0.0), cd));
         assert!(d.want_keyframe, "a held PLI must fire at window expiry");
-        assert!(
-            d.pli_forced,
+        assert_eq!(
+            d.forced_cause,
+            Some(ForcedKeyframeCause::Pli),
             "the window-expiry emit is PLI-forced (drives the #1347 emit-only log)"
         );
         assert!(
@@ -393,6 +425,7 @@ mod tests {
             cooldown_reset: true,
             last_keyframe_emit_ms: Some(pre_emit),
             cooldown_ms: cd,
+            tier_change_pending: false,
         });
         assert!(
             reset.want_keyframe,
@@ -401,7 +434,11 @@ mod tests {
             first_after - pre_emit,
             cd
         );
-        assert!(reset.pli_forced, "the un-gated emit is PLI-forced");
+        assert_eq!(
+            reset.forced_cause,
+            Some(ForcedKeyframeCause::Pli),
+            "the un-gated emit is PLI-forced"
+        );
         assert_eq!(
             reset.last_keyframe_emit_ms,
             Some(first_after),

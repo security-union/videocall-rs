@@ -40,10 +40,9 @@ use protobuf::Message;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
-use crate::transport::{MediaTypeLabel, OutboundFrame};
+use crate::transport::{MediaTypeLabel, OutboundFrame, OutboundFrameSender};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -57,18 +56,18 @@ pub struct KeyframeRequester {
     /// Set of peers we have already sent a keyframe request to.
     requested_peers: HashSet<String>,
     /// Channel to send outbound packets.
-    packet_tx: Sender<OutboundFrame>,
+    packet_tx: OutboundFrameSender,
     /// Counter for total keyframe requests sent (shared with health reporter).
     pub requests_sent: Arc<AtomicU64>,
 }
 
 impl KeyframeRequester {
     /// Create a new keyframe requester.
-    pub fn new(self_user_id: String, packet_tx: Sender<OutboundFrame>) -> Self {
+    pub fn new(self_user_id: String, packet_tx: impl Into<OutboundFrameSender>) -> Self {
         Self {
             self_user_id,
             requested_peers: HashSet::new(),
-            packet_tx,
+            packet_tx: packet_tx.into(),
             requests_sent: Arc::new(AtomicU64::new(0)),
         }
     }

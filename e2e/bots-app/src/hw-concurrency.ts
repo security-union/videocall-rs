@@ -18,11 +18,9 @@
 //     bot. It is `capability_score / cores < 150`, and `capability_score` is a
 //     SINGLE-THREADED benchmark that does not scale with the spoof — so raising
 //     the spoof lowers the ratio and makes the flag fire without any change in
-//     real CPU. The ground truth for a starved pod is the container's CFS
-//     throttling counter — which this tool does NOT sample; read
-//     `container_cpu_cfs_throttled_seconds_total` from cluster Prometheus, not
-//     the run CSVs — plus this tool's own fps-based RESOURCE_STARVED verdict
-//     (resource/verdict.ts).
+//     real CPU. Ground truth is the CFS throttle FRACTION, which this tool does
+//     NOT sample (README has the query and the counter to avoid), plus this
+//     tool's own fps-based RESOURCE_STARVED verdict (resource/verdict.ts).
 
 /**
  * Result of resolving a raw hardware-concurrency input.

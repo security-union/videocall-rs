@@ -7,25 +7,26 @@
 # [NET_ADMIN]` (statefulset.yaml). That is deliberately the entire privilege
 # surface for the fleet's shaping.
 #
-# WHY THIS EXISTS: `tc qdisc ... netem` needs the kernel's `sch_netem` module.
-# On these nodes the module is PRESENT and loadable but NOT auto-loaded, and a
+# WHY THIS EXISTS: netem needs `sch_netem`; the #2353 mirror needs four more, none auto-loaded.
+# `sch_netem` is PRESENT and loadable here; the other four are `.ko`-present only. A
 # non-privileged bot pod cannot `modprobe` it (module loading is a host-global,
 # privileged kernel operation — it is not namespaced and setcap on `tc` does not
-# grant it). So a single privileged DaemonSet loads `sch_netem` once per node,
+# grant it). So a single privileged DaemonSet loads them once per node,
 # for every node a bot can land on, and the bots stay unprivileged. (This is
 # "Option B" — a privileged DaemonSet — chosen over granting the bots privilege.)
 #
 # HOW: privileged + hostPID lets `nsenter --target 1` enter host PID 1's
-# namespaces and run the HOST's `modprobe` against the HOST's /lib/modules. This
-# is the exact command validated in-cluster from a privileged host-namespace pod.
+# namespaces and run the HOST's `modprobe` against the HOST's /lib/modules. That
+# was validated in-cluster for `sch_netem` only; the other four were never run.
 #
 # APPLY ORDER (critical):
 #   1. namespace.yaml                (ns bot-load + ResourceQuota)
 #   2. THIS DaemonSet  → wait until every desired pod is READY
 #        kubectl -n bot-load rollout status ds/netem-preload
 #      Readiness is gated on a real check: the probe greps the host-global
-#      /proc/modules for `sch_netem`, so a Ready pod PROVES the module is loaded
-#      on that node. The bots must NOT run netem before this DaemonSet is Ready
+#      /proc/modules for every module (or modules.builtin), so a Ready pod
+#      PROVES they are present. The bots must NOT run netem before this
+#      DaemonSet is Ready
 #      on the node they land on, or `tc ... netem` fails with
 #      "Error: Specified qdisc kind is unknown" / RTNETLINK.
 #   3. statefulset.yaml + service.yaml   (the bots)
@@ -86,32 +87,61 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Startup writes it; the probe reads it, so the two cannot diverge.
+            - name: MODULE_FILE
+              value: /tmp/netem-modules
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
-              echo "netem-preload: loading sch_netem on node ${NODE_NAME:-unknown}"
-              # Idempotent: modprobe is a no-op if the module is already loaded.
-              # If it FAILS here (module genuinely absent), we exit non-zero and
-              # CrashLoop — a deliberate, visible signal that the prereq is unmet.
-              nsenter --target 1 --mount --uts --ipc --net --pid -- modprobe sch_netem
-              echo "netem-preload: sch_netem loaded on node ${NODE_NAME:-unknown}"
+              MODULES="sch_netem ifb act_mirred cls_u32 sch_ingress"
+              NS="nsenter --target 1 --mount --uts --ipc --net --pid --"
+              BUILTIN="/lib/modules/$(uname -r)/modules.builtin"
+              present() {
+                if grep -q "^$1 " /proc/modules; then return 0; fi
+                $NS grep -qE "(^|/)$1\.ko" "$BUILTIN" 2>/dev/null
+              }
+              ensure_all() {
+                for m in $MODULES; do
+                  if ! present "$m"; then
+                    $NS modprobe "$m" || true
+                    present "$m" || {
+                      echo "netem-preload: $m is neither loadable nor built in on ${NODE_NAME:-unknown}" >&2
+                      return 1
+                    }
+                  fi
+                done
+              }
+              echo "netem-preload: ensuring [$MODULES] on node ${NODE_NAME:-unknown}"
+              ensure_all || exit 1
+              printf '%s\n' "$MODULES" >"$MODULE_FILE"
+              echo "netem-preload: all present on node ${NODE_NAME:-unknown}"
               # A DaemonSet pod must not exit (it would CrashLoop). Stay alive,
-              # and idempotently re-assert the module every hour so an unload on
-              # the node self-heals. A failed re-check only warns (it was loaded
+              # and idempotently re-assert the modules every hour so an unload on
+              # a node self-heals. A failed re-check only warns (they were present
               # once); it does not crash a node that is already serving bots.
               while true; do
                 sleep 3600
-                nsenter --target 1 --mount --uts --ipc --net --pid -- modprobe sch_netem \
-                  || echo "netem-preload: WARN periodic modprobe re-check failed on ${NODE_NAME:-unknown}"
+                ensure_all || echo "netem-preload: WARN periodic re-check failed on ${NODE_NAME:-unknown}"
               done
-          # Readiness = the module is actually loaded on THIS node. /proc/modules
+          # Readiness = every module startup ensured, loaded on THIS node. /proc/modules
           # is host-global (kernel module state is NOT namespaced), so this grep
-          # reflects the node's real state and makes "DaemonSet Ready" a true
-          # gate for the apply order above.
+          # reflects the node's real state and makes "DaemonSet Ready" a true gate
+          # for the apply order above.
           readinessProbe:
             exec:
-              command: ["/bin/sh", "-c", "grep -q '^sch_netem ' /proc/modules"]
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  [ -s "$MODULE_FILE" ]
+                  for m in $(cat "$MODULE_FILE"); do
+                    if ! grep -q "^$m " /proc/modules; then
+                      nsenter --target 1 --mount -- grep -qE "(^|/)$m\.ko" \
+                        "/lib/modules/$(uname -r)/modules.builtin"
+                    fi
+                  done
             initialDelaySeconds: 2
             periodSeconds: 10
             timeoutSeconds: 3

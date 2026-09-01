@@ -17,7 +17,7 @@
  */
 
 use crate::aq_controller::BotAq;
-use crate::transport::{MediaTypeLabel, OutboundFrame};
+use crate::transport::{MediaTypeLabel, OutboundFrame, OutboundFrameSender};
 use opus::{
     Application as OpusApp, Bitrate as OpusBitrate, Channels as OpusChannels,
     Encoder as OpusEncoder,
@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::Sender;
 use tracing::{error, info, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
@@ -67,7 +66,7 @@ impl AudioProducer {
     pub fn new(
         user_id: String,
         audio_data: Vec<f32>,
-        packet_sender: Sender<OutboundFrame>,
+        packet_sender: OutboundFrameSender,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
@@ -106,7 +105,7 @@ impl AudioProducer {
     pub fn from_wav_file(
         user_id: String,
         wav_path: &str,
-        packet_sender: Sender<OutboundFrame>,
+        packet_sender: OutboundFrameSender,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
@@ -172,7 +171,7 @@ impl AudioProducer {
     fn audio_loop(
         user_id: String,
         audio_data: Vec<f32>,
-        packet_sender: Sender<OutboundFrame>,
+        packet_sender: OutboundFrameSender,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,

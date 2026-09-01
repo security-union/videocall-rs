@@ -20,15 +20,25 @@
 FROM mcr.microsoft.com/playwright:v1.58.2-noble
 
 # iproute2 provides `tc`/`ip` for per-pod netem shaping (Increment 3, #2072).
-# libcap2-bin provides `setcap`: we grant the `tc` binary a FILE capability so
-# the non-root (uid 1000) bot process can shape eth0. NET_ADMIN granted via the
-# pod's `capabilities.add` lands only in the bounding set — NOT the ambient set
-# (Kubernetes sets no ambient caps) — so without this file cap a non-root `tc`
-# gets EPERM ("RTNETLINK answers: Operation not permitted"). The file cap
-# (permitted+effective) is honored because NET_ADMIN is in the bounding set.
+# libcap2-bin provides `setcap`: NET_ADMIN from the pod's `capabilities.add`
+# lands only in the bounding set — NOT the ambient set (Kubernetes sets none) —
+# so the non-root bot reaches it only through a FILE capability, else EPERM
+# ("RTNETLINK answers: Operation not permitted").
+# A file cap is not sufficient for `ip`: iproute2 clears its own capabilities
+# unless CAP_NET_ADMIN is in the process INHERITABLE set, which a file cap does
+# not populate — so `ip` is exec'd through this setcap'd COPY of setpriv, which
+# raises it first (#2428). A copy, not /usr/bin/setpriv, keeps the grant off
+# every other caller of setpriv in the image.
+# Targets go through `readlink -f` because setcap refuses a symlink, and the
+# loop re-reads each cap because no CI builds this image (#2293).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 libcap2-bin \
-    && setcap cap_net_admin+eip /usr/sbin/tc \
+    && apt-get install -y --no-install-recommends iproute2 libcap2-bin curl \
+    && cp "$(readlink -f /usr/bin/setpriv)" /usr/local/bin/netem-setpriv \
+    && for b in /usr/sbin/tc /usr/sbin/ip /usr/local/bin/netem-setpriv; do \
+         p="$(readlink -f "$b")"; \
+         setcap cap_net_admin+eip "$p" || exit 1; \
+         getcap "$p" | grep -q cap_net_admin || exit 1; \
+       done \
     && rm -rf /var/lib/apt/lists/*
 
 # The bundled browsers (correct revision for 1.58.2) live at /ms-playwright and

@@ -70,6 +70,7 @@ pub struct VideoFrame {
     #[serde(default)]
     pub codec: FrameCodec,
     /// The encoded video data.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     /// The timestamp of the frame.
     pub timestamp: f64,

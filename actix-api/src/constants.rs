@@ -43,6 +43,28 @@ pub const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]*$";
 /// the cap and triggered a protocol error that closed the entire connection.
 pub const MAX_FRAME_SIZE: usize = 4_000_000;
 
+/// IDLE time between continuation frames. `Pong` refreshes the heartbeat, so `CLIENT_TIMEOUT`
+/// never reclaims an open sequence (#2600). Per FRAME, not per byte.
+pub const FRAGMENT_ASSEMBLY_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Never refreshed, so it bounds a client pumping empty `Continue` frames to hold
+/// [`MAX_FRAME_SIZE`]. Admits 4 MB at ~530 kbps (#2600).
+pub const FRAGMENT_ASSEMBLY_MAX_LIFETIME: Duration = Duration::from_secs(60);
+
+/// The screen encode ceiling must not be able to produce a keyframe larger than
+/// [`MAX_FRAME_SIZE`]: over the cap the relay closes the connection, so this is
+/// a build failure rather than a runtime clamp.
+const _: () = {
+    let ceiling_px = videocall_aq::constants::SCREEN_MAX_ENCODE_WIDTH as usize
+        * videocall_aq::constants::SCREEN_MAX_ENCODE_HEIGHT as usize;
+    assert!(
+        ceiling_px * videocall_aq::constants::SCREEN_KEYFRAME_BYTES_PER_PIXEL <= MAX_FRAME_SIZE,
+        "the screen encode ceiling can produce a keyframe larger than MAX_FRAME_SIZE, \
+         which the relay answers with a connection-closing protocol error. Lower \
+         SCREEN_MAX_ENCODE_WIDTH/HEIGHT, or raise MAX_FRAME_SIZE in its own PR."
+    );
+};
+
 // ---------------------------------------------------------------------------
 // Server Congestion Feedback
 // ---------------------------------------------------------------------------
@@ -233,12 +255,49 @@ pub(crate) fn nonvideo_reached_viewport_drop_branch(
     wire_media_kind != Ok(MediaKind::VIDEO)
 }
 
-/// Bounded channel capacity for WebSocket outbound relay queue.
-///
-/// Half the WebTransport capacity because WS frames are larger
-/// (full frames vs MTU-limited datagrams). 128 slots at ~50KB avg
-/// provides ~6.4MB max queue depth.
-pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
+/// Slot capacity of the WS per-receiver outbound relay queue (issue #2261).
+pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 1024;
+
+pub const WS_OUTBOUND_LEGACY_SLOT_CAPACITY: usize = 128;
+
+/// Bytes one encoded frame of `tier` occupies at its ideal bitrate.
+pub const fn tier_frame_bytes(tier: &videocall_aq::constants::VideoQualityTier) -> usize {
+    (tier.ideal_bitrate_kbps as usize) * 1000 / 8 / (tier.target_fps as usize)
+}
+
+/// Camera VIDEO budget: legacy slots x one default-tier frame.
+pub const WS_OUTBOUND_VIDEO_BYTE_BUDGET: usize = WS_OUTBOUND_LEGACY_SLOT_CAPACITY
+    * tier_frame_bytes(
+        &videocall_aq::constants::VIDEO_QUALITY_TIERS
+            [videocall_aq::constants::DEFAULT_VIDEO_TIER_INDEX],
+    );
+
+pub const WS_OUTBOUND_SCREEN_BYTE_BUDGET: usize = WS_OUTBOUND_LEGACY_SLOT_CAPACITY
+    * tier_frame_bytes(&videocall_aq::constants::SCREEN_QUALITY_TIERS[0]);
+
+pub const AUDIO_SIMULCAST_RUNGS: usize = 3;
+
+pub const AUDIO_PACKETS_PER_SEC_PER_RUNG: usize = 50;
+
+pub const RELAY_SIZING_TARGET_PARTICIPANTS: usize = 27;
+
+pub const RELAY_QUEUE_ABSORPTION_TARGET_MS: usize = 250;
+
+pub const fn audio_fanout_packets_per_sec(
+    participants: usize,
+    rungs: usize,
+    per_rung_pps: usize,
+) -> usize {
+    participants.saturating_sub(1) * rungs * per_rung_pps
+}
+
+/// Milliseconds of a `packets_per_sec` arrival rate that `slots` absorbs.
+pub const fn queue_absorption_millis(slots: usize, packets_per_sec: usize) -> usize {
+    if packets_per_sec == 0 {
+        return usize::MAX;
+    }
+    slots * 1000 / packets_per_sec
+}
 
 /// Bounded channel capacity for the WebTransport **datagram** outbound queue.
 ///
@@ -462,7 +521,7 @@ pub const WT_UNISTREAM_BACKPRESSURE_POLL: Duration = Duration::from_millis(50);
 /// ## Sizing
 ///
 /// `2×` doubles the burst-absorption slack while staying modest:
-/// * WS: mailbox 128 → **256** (channel stays 128).
+/// * WS: mailbox = 2 × [`WS_OUTBOUND_CHANNEL_CAPACITY`] (2048 post-#2261).
 /// * WT: mailbox `unistream + datagram` (default 1024) → **2048**
 ///   (each channel stays 512; the deep-stale-video bound is on the channel,
 ///   so a 2048 mailbox does NOT create a 2048-deep stale-video buffer).
@@ -728,7 +787,8 @@ pub const KEYFRAME_REQUEST_MAX_LAYER_ID: u32 = 2;
 /// VIDEO and SCREEN have independent caps; the keyframe limiter keys on the
 /// cleartext `simulcast_layer_id` WITHOUT knowing the packet's media kind, so a
 /// single clamp bound must cover the DEEPEST ladder across kinds. We therefore
-/// tie to the MAX of the two caps. Today both are 3, so the top id is 2.
+/// tie to the MAX of the two caps: video ships 3 rungs and screen 1, so the
+/// deepest is 3 and the top id is 2.
 ///
 /// If either cap changes in `videocall-aq`, this assert FAILS the build with a
 /// clear message until `KEYFRAME_REQUEST_MAX_LAYER_ID` (and the doc above) are
@@ -762,9 +822,9 @@ const _: () = {
 /// The strict steady-state per-pair budget
 /// ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`], 1/sec) throttles a genuinely
 /// frozen receiver identically to a flooder, and its only relaxation path
-/// ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`]) can NEVER fire on a
-/// lossless WS/TCP path — there is no loss, so the `CongestionTracker` never
-/// marks the receiver congested. On the common deployment (small, all-WS,
+/// ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`]) is not available
+/// unless the receiver is already marked congested. On the common deployment
+/// (small, all-WS,
 /// capable HW, good network) a frozen receiver's legitimate recovery requests
 /// were therefore dropped, leaving its video stuck frozen.
 ///
@@ -1543,5 +1603,60 @@ mod tests {
         assert!(nonvideo_reached_viewport_drop_branch(Ok(MediaKind::AUDIO)));
         assert!(nonvideo_reached_viewport_drop_branch(Ok(MediaKind::SCREEN)));
         assert!(nonvideo_reached_viewport_drop_branch(Err(999)));
+    }
+
+    #[test]
+    fn per_receiver_queues_absorb_the_target_room_audio_fanout() {
+        let pps = audio_fanout_packets_per_sec(
+            RELAY_SIZING_TARGET_PARTICIPANTS,
+            AUDIO_SIMULCAST_RUNGS,
+            AUDIO_PACKETS_PER_SEC_PER_RUNG,
+        );
+        assert_eq!(pps, 3_900, "26 peers x 3 rungs x 50 pkt/s");
+
+        let channel_ms = queue_absorption_millis(WS_OUTBOUND_CHANNEL_CAPACITY, pps);
+        assert!(
+            channel_ms >= RELAY_QUEUE_ABSORPTION_TARGET_MS,
+            "WS outbound channel absorbs only {channel_ms}ms of a {pps} pkt/s \
+             audio fan-out; target is {RELAY_QUEUE_ABSORPTION_TARGET_MS}ms",
+        );
+
+        let mailbox_ms = queue_absorption_millis(ws_mailbox_capacity(), pps);
+        assert!(
+            mailbox_ms >= RELAY_QUEUE_ABSORPTION_TARGET_MS,
+            "WS actor mailbox absorbs only {mailbox_ms}ms of a {pps} pkt/s \
+             audio fan-out; target is {RELAY_QUEUE_ABSORPTION_TARGET_MS}ms",
+        );
+    }
+
+    #[test]
+    fn ws_byte_budgets_track_the_encode_tiers_they_are_derived_from() {
+        assert_eq!(
+            tier_frame_bytes(
+                &videocall_aq::constants::VIDEO_QUALITY_TIERS
+                    [videocall_aq::constants::DEFAULT_VIDEO_TIER_INDEX],
+            ),
+            3_000,
+            "default camera tier is 600 kbps at 25 fps",
+        );
+        assert_eq!(
+            tier_frame_bytes(&videocall_aq::constants::SCREEN_QUALITY_TIERS[0]),
+            55_287,
+            "the single SCREEN rung at its encode ceiling, 10 fps",
+        );
+        assert_eq!(WS_OUTBOUND_VIDEO_BYTE_BUDGET, 384_000);
+        assert_eq!(WS_OUTBOUND_SCREEN_BYTE_BUDGET, 7_076_736);
+        // Locks for the RelayQueueNearFullWS*Bytes alert exprs (YAML, no import).
+        assert_eq!(WS_OUTBOUND_VIDEO_BYTE_BUDGET * 80 / 100, 307_200);
+        assert_eq!(WS_OUTBOUND_SCREEN_BYTE_BUDGET * 90 / 100, 6_369_062);
+    }
+
+    #[test]
+    fn audio_fanout_and_absorption_helpers_are_well_behaved() {
+        assert_eq!(audio_fanout_packets_per_sec(1, 3, 50), 0, "solo call");
+        assert_eq!(audio_fanout_packets_per_sec(0, 3, 50), 0, "no underflow");
+        assert_eq!(audio_fanout_packets_per_sec(2, 1, 50), 50);
+        assert_eq!(queue_absorption_millis(100, 0), usize::MAX);
+        assert_eq!(queue_absorption_millis(1_000, 1_000), 1_000);
     }
 }

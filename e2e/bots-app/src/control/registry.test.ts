@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { BotTask } from "../orchestrator";
+import { SD_SOURCE } from "../posture";
 import {
   generateBotId,
   newRegistryEntry,
@@ -21,6 +22,8 @@ function fakeTask(overrides: Partial<BotTask> = {}): BotTask {
     displayName: "Alice",
     headless: false,
     authBackend: "jwt",
+    sourceGeometry: SD_SOURCE,
+    cameraCycle: null,
     storageStateFile: null,
     ssoStateFile: null,
     manifest: null,
@@ -109,6 +112,15 @@ describe("snapshotEntry", () => {
     e.finishedAt = 1_234_567;
     const snap = snapshotEntry(e);
     expect(snap.finishedAt).toBe(1_234_567);
+  });
+  it("emits joinedAt so the fleet's arrival spread can be aggregated over GET /bots", () => {
+    const e = newRegistryEntry(fakeTask());
+    e.status = "in-meeting";
+    e.joinedAt = 1_700_000_000_000;
+    expect(snapshotEntry(e).joinedAt).toBe(1_700_000_000_000);
+  });
+  it("emits joinedAt=null before the bot has joined", () => {
+    expect(snapshotEntry(newRegistryEntry(fakeTask())).joinedAt).toBeNull();
   });
 });
 

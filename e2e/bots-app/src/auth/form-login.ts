@@ -239,9 +239,12 @@ export async function performFormLogin(args: {
   label: string;
   /** Override the network budget; defaults to {@link FORM_LOGIN_TIMEOUT_MS}. */
   timeoutMs?: number;
+  /** Override the per-step budget; defaults to {@link FORM_LOGIN_ACTION_TIMEOUT_MS}. */
+  actionTimeoutMs?: number;
 }): Promise<void> {
   const { page, email, password, appBaseUrl, meetingId, label } = args;
   const timeout = args.timeoutMs ?? FORM_LOGIN_TIMEOUT_MS;
+  const actionTimeout = args.actionTimeoutMs ?? FORM_LOGIN_ACTION_TIMEOUT_MS;
   const appHost = new URL(appBaseUrl).host;
 
   const emailInput = page.locator(FORM_LOGIN_EMAIL_SELECTOR).first();
@@ -271,7 +274,7 @@ export async function performFormLogin(args: {
 
   if (detected === "trigger") {
     console.log(`[${label}] form-login: clicking app-side login trigger`);
-    await loginTrigger.click({ timeout: FORM_LOGIN_ACTION_TIMEOUT_MS }).catch(() => {
+    await loginTrigger.click({ timeout: actionTimeout }).catch(() => {
       // A trigger that vanished (the app auto-redirected in the meantime)
       // is fine — the form wait below is the real gate.
     });
@@ -317,16 +320,16 @@ export async function performFormLogin(args: {
 
   // ── Phase 2: fill + submit (password NEVER logged) ──────────────────
   console.log(`[${label}] form-login: filling credentials for ${email}`);
-  await emailInput.fill(email, { timeout: FORM_LOGIN_ACTION_TIMEOUT_MS });
-  await passwordInput.fill(password, { timeout: FORM_LOGIN_ACTION_TIMEOUT_MS });
+  await emailInput.fill(email, { timeout: actionTimeout });
+  await passwordInput.fill(password, { timeout: actionTimeout });
 
   const submitVisible = await submitButton.isVisible({ timeout: 2_000 }).catch(() => false);
   if (submitVisible) {
-    await submitButton.click({ timeout: FORM_LOGIN_ACTION_TIMEOUT_MS });
+    await submitButton.click({ timeout: actionTimeout });
   } else {
     // Standard HTML forms submit on Enter and carry the hidden `state`
     // field along with the POST.
-    await passwordInput.press("Enter", { timeout: FORM_LOGIN_ACTION_TIMEOUT_MS });
+    await passwordInput.press("Enter", { timeout: actionTimeout });
   }
 
   // ── Phase 3: wait for the app to land back on the meeting path ──────

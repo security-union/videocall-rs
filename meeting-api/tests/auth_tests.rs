@@ -108,7 +108,7 @@ async fn test_dev_auto_login_round_trip_authorizes_protected_endpoint() {
         .expect("Set-Cookie should be session=<jwt>; ...");
 
     // --- Step 3: verify the JWT encodes the configured DEV_USER identity ---
-    let claims = decode_session_token(TEST_JWT_SECRET, jwt)
+    let claims = decode_session_token(TEST_JWT_SECRET, None, jwt)
         .expect("session JWT from auto-login must be decodable with the configured secret");
     assert_eq!(
         claims.sub, dev_email,

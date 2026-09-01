@@ -22,6 +22,9 @@
 
 set -euo pipefail
 
+# Without the exit, bash resumes past an interrupt and reports a ref to pin.
+trap 'exit 130' INT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
@@ -37,6 +40,15 @@ TAG="${TAG:-${VERSION}-${DATE}-${GIT_SHA}}"
 IMAGE="${REGISTRY}/${IMAGE_NAME}"
 IMAGE_TAGGED="${IMAGE}:${TAG}"
 IMAGE_LATEST="${IMAGE}:latest"
+
+PUSH_LATEST="${PUSH_LATEST:-1}"
+case "${PUSH_LATEST}" in
+0 | 1) ;;
+*)
+  echo "PUSH_LATEST must be 0 or 1, got: ${PUSH_LATEST}" >&2
+  exit 1
+  ;;
+esac
 
 # ── Builder selection ───────────────────────────────────────────────────────
 PODMAN_REMOTE="${PODMAN_REMOTE:-0}"
@@ -66,34 +78,46 @@ echo "    builder:    ${BUILD[*]}"
 # arm64 image that CrashLoopBackOffs on the cluster's amd64 nodes with
 # "exec format error". The remote podman builder is already amd64, so this is
 # a no-op there and a safety net for the local path.
+TAGS=(-t "${IMAGE_TAGGED}")
+if [ "${PUSH_LATEST}" = "1" ]; then
+  TAGS+=(-t "${IMAGE_LATEST}")
+fi
+
 "${BUILD[@]}" \
   --platform linux/amd64 \
-  -t "${IMAGE_TAGGED}" \
-  -t "${IMAGE_LATEST}" \
+  "${TAGS[@]}" \
   -f "${DOCKERFILE}" \
   "${REPO_ROOT}"
 
 echo "==> Built and tagged:"
 echo "    ${IMAGE_TAGGED}"
-echo "    ${IMAGE_LATEST}"
+if [ "${PUSH_LATEST}" = "1" ]; then
+  echo "    ${IMAGE_LATEST}"
+fi
 
-# Guard: the `setcap cap_net_admin+eip /usr/sbin/tc` xattr must survive the
-# build (a lost cap silently reintroduces tc EPERM at runtime, breaking netem).
-# Assert it on the built image; warn loudly rather than fail (some backends drop
-# xattrs and the fleet still works minus netem).
+# Guard: the `setcap cap_net_admin+eip` xattrs must survive the build — the
+# Dockerfile's own re-read runs inside the setcap layer and cannot see a backend
+# dropping them at layer-commit. Binary list locked to the Dockerfile's by
+# src/docker-entrypoint.test.ts; `readlink -f` runs in-image (getcap won't follow).
 #
 # The image sets an ENTRYPOINT (the bot launcher) and no CMD, so a bare
 # `<runtime> run IMAGE getcap …` would APPEND getcap as args to the entrypoint
 # (which ignores argv and aborts on its login preflight) instead of running
-# getcap — the check would then warn on every build. `--entrypoint getcap`
+# getcap — the check would then warn on every build. `--entrypoint sh`
 # actually invokes it. Derive the runtime from BUILD by dropping its trailing
 # `build` subcommand, so the PODMAN_REMOTE path inspects the image on the SAME
 # (remote) daemon that built it rather than a local one that lacks it.
 RUNTIME=("${BUILD[@]:0:${#BUILD[@]}-1}")
-if "${RUNTIME[@]}" run --rm --entrypoint getcap "${IMAGE_TAGGED}" /usr/sbin/tc 2>/dev/null | grep -q cap_net_admin; then
-  echo "==> OK: /usr/sbin/tc retains cap_net_admin+eip"
+if "${RUNTIME[@]}" run --rm --entrypoint sh "${IMAGE_TAGGED}" -c \
+  'for b in /usr/sbin/tc /usr/sbin/ip /usr/local/bin/netem-setpriv; do
+     p="$(readlink -f "$b")"
+     getcap "$p" | grep -q cap_net_admin || { echo "MISSING cap_net_admin: $b"; exit 1; }
+   done' 2>/dev/null; then
+  echo "==> OK: every shaping binary retains cap_net_admin+eip"
 else
-  echo "==> WARNING: cap_net_admin NOT found on /usr/sbin/tc in the built image — per-pod netem will EPERM at runtime" >&2
+  echo "==> FATAL: cap_net_admin missing from a shaping binary in the built image (path above)." >&2
+  echo "==> A shaped pod (BOT_NETEM_PROFILE) would crash-loop on netem_fatal. Refusing to tag this build." >&2
+  exit 1
 fi
 
 # ── Push (opt-in) ────────────────────────────────────────────────────────────
@@ -109,13 +133,57 @@ if [ "${PUSH:-0}" = "1" ]; then
   else
     echo "==> No REGISTRY_USER/REGISTRY_PASS set; assuming an existing login session."
   fi
-  echo "==> Pushing ${IMAGE_TAGGED} and ${IMAGE_LATEST}"
+  echo "==> Pushing ${IMAGE_TAGGED}"
   "${PUSH_CMD[@]}" "${IMAGE_TAGGED}"
-  "${PUSH_CMD[@]}" "${IMAGE_LATEST}"
-  echo "==> Pushed. Update k8s/bot-pod.yaml image: to ${IMAGE_TAGGED}"
+  if [ "${PUSH_LATEST}" = "1" ]; then
+    echo "==> Pushing ${IMAGE_LATEST}"
+    "${PUSH_CMD[@]}" "${IMAGE_LATEST}"
+  else
+    echo "==> PUSH_LATEST=0: leaving :latest where it is"
+  fi
+  # The digest to pin is the one the REGISTRY serves for this tag.
+  DIGEST=""
+  if command -v skopeo >/dev/null 2>&1; then
+    SKOPEO_AUTH=()
+    if [ -n "${REGISTRY_USER:-}" ] && [ -n "${REGISTRY_PASS:-}" ] &&
+      SKOPEO_AUTHDIR="$(mktemp -d)"; then
+      # skopeo fatals on a zero-length authfile, so create the dir and not the file.
+      trap 'rm -rf "${SKOPEO_AUTHDIR}"' EXIT
+      if printf '%s' "${REGISTRY_PASS}" |
+        skopeo login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin \
+          --authfile "${SKOPEO_AUTHDIR}/auth.json" >/dev/null; then
+        SKOPEO_AUTH=(--authfile "${SKOPEO_AUTHDIR}/auth.json")
+      else
+        echo "==> WARNING: skopeo login failed" >&2
+      fi
+    fi
+    DIGEST="$(skopeo inspect --retry-times 3 ${SKOPEO_AUTH[@]+"${SKOPEO_AUTH[@]}"} \
+      --format '{{.Digest}}' "docker://${IMAGE_TAGGED}" || true)"
+    [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || DIGEST=""
+  fi
+  echo "==> Pushed. This tag is reused by a later build at the same HEAD on the same"
+  echo "    day, so pin it BY DIGEST in ALL of"
+  echo "    k8s/{statefulset,bot-pod,conductor-job}.yaml, then re-warm the fleet with"
+  echo "    ./k8s/prepull-image.sh (which refuses to run if the three disagree):"
+  if [ -n "${DIGEST}" ]; then
+    echo "      image: ${IMAGE_TAGGED}@${DIGEST}"
+    echo "    or move all three at once:"
+    echo "      ./k8s/repin.sh ${IMAGE_TAGGED}@${DIGEST}"
+    [ -z "${PINNED_REF_FILE:-}" ] || printf '%s\n' "${IMAGE_TAGGED}@${DIGEST}" >"${PINNED_REF_FILE}"
+  else
+    echo "      image: ${IMAGE_TAGGED}@sha256:<digest>"
+    echo "    Could not read the registry digest (skopeo absent, unauthenticated, no"
+    echo "    egress to ${REGISTRY}, or the tag not yet readable). Read it from Harbor's"
+    echo "    UI or:"
+    echo "    skopeo inspect --format '{{.Digest}}' docker://${IMAGE_TAGGED}"
+    [ -z "${PINNED_REF_FILE:-}" ] || exit 1
+  fi
 else
   echo "==> PUSH not set (build-only). To publish:"
   echo "    ${PUSH_CMD[*]} ${IMAGE_TAGGED}"
-  echo "    ${PUSH_CMD[*]} ${IMAGE_LATEST}"
-  echo "    then set k8s/bot-pod.yaml image: to ${IMAGE_TAGGED}"
+  if [ "${PUSH_LATEST}" = "1" ]; then
+    echo "    ${PUSH_CMD[*]} ${IMAGE_LATEST}"
+  fi
+  echo "    The push prints the digest to pin; set image: to ${IMAGE_TAGGED}@<digest>"
+  echo "    in ALL of k8s/{statefulset,bot-pod,conductor-job}.yaml"
 fi

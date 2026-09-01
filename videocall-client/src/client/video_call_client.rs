@@ -22,7 +22,7 @@ use super::super::connection::{
 };
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use super::layer_preference_sender::LayerPreferenceSender;
-use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
+use super::viewport_sender::{parse_layout_session_ids, ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::layer_chooser::{
@@ -43,6 +43,7 @@ use log::{debug, error, info, trace, warn};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
@@ -256,24 +257,6 @@ pub struct VideoCallClientOptions {
     pub max_received_layer: Option<u32>,
     /// Keep receive/decode active but skip painting decoded video frames.
     pub skip_canvas_paint: bool,
-    /// Which CAMERA simulcast ladder this DEPLOYMENT's publishers encode against
-    /// (`experimentalReducedLadder`, issue #1768). Supplied by the consumer because
-    /// `videocall-client` cannot read `window.__APP_CONFIG` — the dioxus-ui passes
-    /// `crate::constants::camera_ladder_variant()` here, exactly as it does for
-    /// `max_received_layer` / `skip_canvas_paint`.
-    ///
-    /// Affects RECEIVER-SIDE READOUTS ONLY (issue #2156): it is forwarded to
-    /// `PeerDecodeManager::set_camera_ladder_variant` and consumed by the two display
-    /// snapshot producers so a receiver's rung labels, `{w}x{h}` and `~kbps` describe
-    /// the stream it is actually decoding (a `Reduced` deployment otherwise labels a
-    /// 960×540 @ ~900 kbps stream "720p · ~1.5M"). Layer SELECTION never reads it —
-    /// simulcast is EXACT-MATCH here, so the #1256 tile-size lid stays pinned to
-    /// `LadderVariant::Default`.
-    ///
-    /// Defaults are not derived: pass `LadderVariant::Default` for the shipped
-    /// ladder. Every construction site must set it, or that surface silently renders
-    /// Default-labelled readouts on a Reduced deployment.
-    pub camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant,
     pub on_peer_added: Callback<String>,
     pub on_peer_first_frame: Callback<(String, MediaType)>,
     pub on_peer_removed: Option<Callback<String>>,
@@ -769,6 +752,10 @@ pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
     connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
+    /// Last values read through a SUCCESSFUL borrow of `connection_controller`;
+    /// a one-tick `try_borrow` conflict is not "cannot report" (issue #2343).
+    last_send_queue_depth: Rc<Cell<Option<u64>>>,
+    last_active_transport: Rc<Cell<Option<&'static str>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     /// Send-side state machine for the viewport control packet (HCL issue
@@ -1425,6 +1412,16 @@ fn dedup_on_connected(state: &ConnectionState, last: Option<String>) -> (bool, O
     }
 }
 
+/// Split out of the `ConnectionState::Reconnecting` arm so a host test can drive the
+/// real production ordering (#2267): stage, then replay, then `Connected`.
+fn handle_reconnecting_roster_stage(inner: &Weak<RefCell<Inner>>) {
+    if let Some(inner) = Weak::upgrade(inner) {
+        if let Ok(mut inner) = inner.try_borrow_mut() {
+            inner.peer_decode_manager.begin_roster_reconcile();
+        }
+    }
+}
+
 fn handle_connected_reconnect_resets(
     inner: &Weak<RefCell<Inner>>,
     early_seed_timer: &Rc<RefCell<Option<Interval>>>,
@@ -1489,6 +1486,7 @@ fn handle_connected_reconnect_resets(
                         .peer_decode_manager
                         .send_keyframe_request(user_id, *sid, *mt);
                 }
+                inner.peer_decode_manager.promote_roster_reconcile();
             }
             // Record the session we (possibly) reconciled against so a subsequent
             // same-session Connected (re-election fallback) is recognized as NOT fresh.
@@ -1841,6 +1839,8 @@ impl VideoCallClient {
 
         let client = Self {
             options: options.clone(),
+            last_send_queue_depth: Rc::new(Cell::new(None)),
+            last_active_transport: Rc::new(Cell::new(None)),
             inner: Rc::new(RefCell::new(Inner {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
@@ -2207,6 +2207,9 @@ impl VideoCallClient {
                                 }
                             }
                         }
+                        ConnectionState::Reconnecting { .. } => {
+                            handle_reconnecting_roster_stage(&inner);
+                        }
                         ConnectionState::Failed { error, .. } => {
                             on_connection_lost.emit(ConnectionLostReason::HandshakeFailed(error));
                         }
@@ -2392,10 +2395,6 @@ impl VideoCallClient {
         }
         peer_decode_manager.set_vad_threshold(opts.vad_threshold);
         peer_decode_manager.set_skip_canvas_paint(opts.skip_canvas_paint);
-        // Issue #2156: receiver-side READOUT ladder. Set here (construction) rather
-        // than lazily, so every display snapshot from the first render onward already
-        // resolves against the deployment's ladder.
-        peer_decode_manager.set_camera_ladder_variant(opts.camera_ladder_variant);
         peer_decode_manager
     }
 
@@ -2475,8 +2474,8 @@ impl VideoCallClient {
     /// Issue #1883: THIS client's own ACTIVE transport, as the same
     /// `"webtransport"` / `"websocket"` vocabulary the per-tile transport badge
     /// maps (`transport_badge_from_str`). `None` when no connection is active yet
-    /// (pre-election cold start / disconnected) or the controller cell is
-    /// momentarily borrowed — a render-nothing default.
+    /// (pre-election cold start / disconnected) — a render-nothing default. A
+    /// momentarily borrowed controller cell yields the LAST-KNOWN value instead.
     ///
     /// Reflects the CURRENT elected transport, re-read each call: it resolves the
     /// live elected/preserved connection (`ConnectionManager::get_active_connection`),
@@ -2486,18 +2485,50 @@ impl VideoCallClient {
     /// that only exists for REMOTE peers), which is why the self tile cannot use
     /// the per-peer signal and needs this accessor.
     pub fn active_transport(&self) -> Option<&'static str> {
-        if let Ok(cc) = self.connection_controller.try_borrow() {
-            if let Some(controller) = cc.as_ref() {
-                return controller.active_transport().map(|is_wt| {
-                    if is_wt {
-                        "webtransport"
-                    } else {
-                        "websocket"
-                    }
-                });
-            }
+        let read = self.connection_controller.try_borrow().ok().map(|cc| {
+            cc.as_ref()
+                .and_then(|c| c.active_transport())
+                .map(Self::transport_label)
+        });
+        Self::resolve_cached_sensor(read, &self.last_active_transport)
+    }
+
+    fn transport_label(is_webtransport: bool) -> &'static str {
+        if is_webtransport {
+            "webtransport"
+        } else {
+            "websocket"
         }
-        None
+    }
+
+    /// Resolve one sensor read against its cache: `Some` is a DEFINITIVE read
+    /// and refreshes the cache (its inner value may itself be `None`), `None`
+    /// means the cell was contended and yields the last-known value (#2343).
+    fn resolve_cached_sensor<T: Copy>(read: Option<T>, cache: &Cell<T>) -> T {
+        match read {
+            Some(definitive) => {
+                cache.set(definitive);
+                definitive
+            }
+            None => cache.get(),
+        }
+    }
+
+    /// Both screen-uplink sensors under ONE borrow, so the pair cannot tear.
+    pub(crate) fn uplink_sensors(&self) -> (Option<&'static str>, Option<u64>) {
+        let read = self.connection_controller.try_borrow().ok().map(|cc| {
+            let controller = cc.as_ref();
+            (
+                controller
+                    .and_then(|c| c.active_transport())
+                    .map(Self::transport_label),
+                controller.and_then(|c| c.get_send_queue_depth()),
+            )
+        });
+        (
+            Self::resolve_cached_sensor(read.map(|(t, _)| t), &self.last_active_transport),
+            Self::resolve_cached_sensor(read.map(|(_, d)| d), &self.last_send_queue_depth),
+        )
     }
 
     /// This client's active-connection WebSocket send-queue depth
@@ -2510,12 +2541,12 @@ impl VideoCallClient {
     /// connection, so it tracks election, reconnect, and WT↔WS fallback: a fresh
     /// socket after a reconnect reports `Some(0)`, below any drop threshold.
     pub(crate) fn send_queue_depth(&self) -> Option<u64> {
-        if let Ok(cc) = self.connection_controller.try_borrow() {
-            if let Some(controller) = cc.as_ref() {
-                return controller.get_send_queue_depth();
-            }
-        }
-        None
+        let read = self
+            .connection_controller
+            .try_borrow()
+            .ok()
+            .map(|cc| cc.as_ref().and_then(|c| c.get_send_queue_depth()));
+        Self::resolve_cached_sensor(read, &self.last_send_queue_depth)
     }
 
     /// Tear down only the active `ConnectionController` without touching
@@ -2680,6 +2711,15 @@ impl VideoCallClient {
     pub fn get_own_session_id(&self) -> Option<String> {
         match self.inner.try_borrow() {
             Ok(inner) => inner.own_session_id.map(|sid| sid.to_string()),
+            Err(_) => None,
+        }
+    }
+
+    /// The relay-assigned session id. `None` also covers a busy borrow, so a
+    /// caller using this as a session-CHANGE edge must HOLD its previous reading.
+    pub fn own_session_id_u64(&self) -> Option<u64> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.own_session_id,
             Err(_) => None,
         }
     }
@@ -2901,7 +2941,8 @@ impl VideoCallClient {
     /// `kind` is `PrefMediaKind::{Video, Screen, Audio}`. `min`/`max` are
     /// inclusive **LAYER indices**, where **0 = base = LOWEST quality** and a
     /// HIGHER index = HIGHER quality (the OPPOSITE of the 8-tier SEND index
-    /// convention). Ladders: video/screen `0..=2`, audio `0..=1`. `None` =
+    /// convention). Ladders: video/screen/audio `0..=2`; the receive UI offers
+    /// only `0` for audio (#2279). `None` =
     /// "no bound" on that end; `(None, None)` (the default) = full range = pure
     /// auto-adaptation.
     ///
@@ -3593,34 +3634,47 @@ impl VideoCallClient {
         }
     }
 
-    /// Update the peer set that is eligible for video/screen decode.
-    ///
-    /// The UI layout computes this set from the peers it actively renders.
-    /// Peers outside the set remain connected and continue decoding audio, but
-    /// skip video and screen decode to cap renderer load in large meetings.
+    /// LOCAL decode gate, narrowed by the decode-budget cap. Must never be published as
+    /// the `VIEWPORT` — see [`Self::set_viewport_session_ids`]. (It does reach the wire
+    /// indirectly: the invisible->visible edge dispatches a keyframe request.) Excluded
+    /// peers still hear audio.
     pub fn set_active_decode_set(&self, active_session_ids: &std::collections::HashSet<u64>) {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             inner
                 .peer_decode_manager
                 .set_active_decode_set(active_session_ids);
         }
+    }
 
-        // Relay the rendered set to the relay as a VIEWPORT control packet so
-        // it can drop VIDEO for peers we are not looking at (HCL issue #988).
-        // `active_session_ids` are the relay/peer session_ids (u64) — the exact
-        // keys `PeerDecodeManager` and the relay index on — so they go on the
-        // wire unchanged. We only (re)arm the debounce timer when the set
-        // actually changed, so repeated identical layout passes are free.
+    /// Publish the on-screen roster as the `VIEWPORT` packet (#988): the relay forwards
+    /// VIDEO only for these session_ids. Takes `&[String]` so the budget-capped
+    /// `HashSet<u64>` cannot be routed here. Returns false when the roster did not reach
+    /// the sender, so the caller must not record it as published.
+    #[must_use = "returns false when the roster did not reach the sender; recording it as \
+                  published strands a stale filter at the relay"]
+    pub fn set_viewport_session_ids(&self, layout_session_ids: &[String]) -> bool {
+        let ids = match parse_layout_session_ids(layout_session_ids) {
+            Some(ids) => ids,
+            None => {
+                warn!(
+                    "set_viewport_session_ids: none of {} layout session_ids parsed as u64, skipping viewport update",
+                    layout_session_ids.len()
+                );
+                return false;
+            }
+        };
+
         let changed = match self.viewport_sender.try_borrow_mut() {
-            Ok(mut sender) => sender.record(active_session_ids),
+            Ok(mut sender) => sender.record(&ids),
             Err(_) => {
-                warn!("set_active_decode_set: viewport_sender busy, skipping viewport update");
-                return;
+                warn!("set_viewport_session_ids: viewport_sender busy, skipping viewport update");
+                return false;
             }
         };
         if changed {
             self.schedule_viewport_flush();
         }
+        true
     }
 
     /// Arm (or re-arm) the debounce timer that emits a single `VIEWPORT`
@@ -4839,6 +4893,8 @@ impl Inner {
                                     meeting_packet.session_id,
                                     meeting_packet.is_guest,
                                 );
+                                self.peer_decode_manager
+                                    .confirm_peer_present(meeting_packet.session_id);
                             }
 
                             // NOTE: Do NOT emit on_display_name_changed here.
@@ -4931,6 +4987,52 @@ impl Inner {
                                         String::new()
                                     };
                                     cb.emit((display_name, target_str, session_id_str));
+                                }
+                            }
+                        }
+                        Ok(MeetingEventType::PARTICIPANT_SESSION_RESUMED) => {
+                            // #2269: sent INSTEAD of a LEFT/JOINED pair, so
+                            // neither callback fires and no toast is shown.
+                            let previous_session_id = meeting_packet.previous_session_id;
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            let is_own_resumption = {
+                                let history = self.own_session_ids.borrow();
+                                history.contains(previous_session_id)
+                                    || history.contains(meeting_packet.session_id)
+                            };
+                            if is_own_resumption {
+                                debug!(
+                                    "Ignoring PARTICIPANT_SESSION_RESUMED for our own session {} -> {}",
+                                    previous_session_id, meeting_packet.session_id
+                                );
+                            } else {
+                                info!(
+                                    "Session resumed for {}: {} -> {}",
+                                    target_str, previous_session_id, meeting_packet.session_id
+                                );
+                                let display_name = if meeting_packet.display_name.is_empty() {
+                                    None
+                                } else {
+                                    Some(
+                                        String::from_utf8_lossy(&meeting_packet.display_name)
+                                            .to_string(),
+                                    )
+                                };
+                                let evicted = self.peer_decode_manager.adopt_resumed_session(
+                                    previous_session_id,
+                                    meeting_packet.session_id,
+                                    display_name,
+                                    meeting_packet.is_guest,
+                                );
+                                if evicted {
+                                    // Mirrors the PARTICIPANT_LEFT arm: a map
+                                    // `delete_peer` does not reach.
+                                    if let Some(hr) = &self.health_reporter {
+                                        if let Ok(reporter) = hr.try_borrow() {
+                                            reporter.remove_peer(&previous_session_id.to_string());
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -5306,11 +5408,10 @@ impl Inner {
                             // controller converts the max-layer id to a count and
                             // composes it with backpressure + the real ladder depth
                             // (fail-open if the value is the u32::MAX sentinel).
-                            // AUDIO entries are ignored on purpose (#1201): audio
-                            // HAS a 3-rung ladder (#1086), but the publisher never
-                            // acts on a relay AUDIO hint, so the full audio ladder is
-                            // always published (the relay side stops emitting the
-                            // AUDIO union under #1118 N3 / PR #1330). UNSPECIFIED is
+                            // AUDIO entries are ignored on purpose (#1201): the
+                            // publisher never acts on a relay AUDIO hint, and the
+                            // relay side stops emitting the AUDIO union under
+                            // #1118 N3 / PR #1330. UNSPECIFIED is
                             // the back-compat default the relay never emits. Ignore
                             // both (fail-open).
                             for entry in &hint.entries {
@@ -5786,7 +5887,6 @@ impl VideoCallClient {
             enable_webtransport: false,
             max_received_layer: None,
             skip_canvas_paint: false,
-            camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant::Default,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -5874,7 +5974,6 @@ mod disconnect_tests {
             enable_webtransport: false,
             max_received_layer: None,
             skip_canvas_paint: false,
-            camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant::Default,
             user_id: "drop_test_user".to_string(),
             display_name: "Drop Tester".to_string(),
             is_guest: false,
@@ -6086,7 +6185,6 @@ mod dedup_tests {
             enable_webtransport: false,
             max_received_layer: None,
             skip_canvas_paint: false,
-            camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant::Default,
             user_id: "dedup_test_user".to_string(),
             display_name: "Dedup Tester".to_string(),
             is_guest: false,
@@ -6432,6 +6530,7 @@ mod cooldown_reset_hardening_tests {
     use super::arm_keyframe_cooldown_reset_slot;
     use super::cap_receive_max;
     use super::handle_connected_reconnect_resets;
+    use super::handle_reconnecting_roster_stage;
     use super::publish_and_reconcile;
     use super::VideoCallClient;
     use super::VideoCallClientOptions;
@@ -6449,6 +6548,41 @@ mod cooldown_reset_hardening_tests {
         assert_eq!(cap_receive_max(None, Some(0)), Some(0));
         assert_eq!(cap_receive_max(Some(2), None), Some(2));
         assert_eq!(cap_receive_max(None, None), None);
+    }
+
+    /// #2343: a contended controller cell is not evidence the transport cannot
+    /// report. A `None` transport — or a `None` depth on WS — reaches
+    /// `screen_uplink_sample` as `Unobservable` and resets the governor's dwell.
+    #[test]
+    fn uplink_sensors_survive_a_transient_borrow_conflict() {
+        let client = build_test_client_with(None, true);
+        client.last_send_queue_depth.set(Some(64_000));
+        client.last_active_transport.set(Some("websocket"));
+
+        let held = client.connection_controller.borrow_mut();
+        assert_eq!(
+            client.send_queue_depth(),
+            Some(64_000),
+            "a contended cell must yield the last-known depth"
+        );
+        assert_eq!(
+            client.active_transport(),
+            Some("websocket"),
+            "a contended cell must yield the last-known transport"
+        );
+        assert_eq!(
+            client.uplink_sensors(),
+            (Some("websocket"), Some(64_000)),
+            "the single-borrow pair must agree with the individual accessors"
+        );
+        drop(held);
+
+        // A definitive read overwrites the cache, including to `None`.
+        let no_controller = "no elected controller: the seeded value must not survive";
+        assert_eq!(client.send_queue_depth(), None, "{no_controller}");
+        assert_eq!(client.active_transport(), None, "{no_controller}");
+        assert_eq!(client.last_send_queue_depth.get(), None, "{no_controller}");
+        assert_eq!(client.last_active_transport.get(), None, "{no_controller}");
     }
 
     /// #2068 P1-C: the `maxReceivedLayer` config knob (VideoCallClientOptions)
@@ -6483,46 +6617,6 @@ mod cooldown_reset_hardening_tests {
                 .clamp(2),
             2,
             "no cap = open (current auto behavior)"
-        );
-    }
-
-    /// Issue #2156: `VideoCallClientOptions::camera_ladder_variant` must actually
-    /// REACH the `PeerDecodeManager`, which is what makes every receiver-side rung
-    /// label / `{w}x{h}` / `~kbps` readout describe the real stream.
-    ///
-    /// This is the options→manager seam. Without it the field could be added, plumbed
-    /// through four UI construction sites, and still be dead — the exact class of
-    /// silent-no-op the #1768 review caught.
-    ///
-    /// MUTATION: delete the
-    /// `peer_decode_manager.set_camera_ladder_variant(opts.camera_ladder_variant)`
-    /// line from `create_peer_decoder_manager` and the Reduced assertion fails.
-    #[test]
-    fn camera_ladder_variant_option_reaches_the_peer_decode_manager() {
-        use crate::adaptive_quality_constants::LadderVariant;
-
-        let reduced = build_test_client_full(None, false, LadderVariant::Reduced);
-        assert_eq!(
-            reduced
-                .inner
-                .borrow()
-                .peer_decode_manager
-                .camera_ladder_variant_for_test(),
-            LadderVariant::Reduced,
-            "the Reduced option must reach the manager, or every receiver readout \
-             silently keeps the shipped 720p labels (#2156)"
-        );
-
-        // Default is the shipped behaviour, and must NOT be reported as Reduced.
-        let shipped = build_test_client_full(None, false, LadderVariant::Default);
-        assert_eq!(
-            shipped
-                .inner
-                .borrow()
-                .peer_decode_manager
-                .camera_ladder_variant_for_test(),
-            LadderVariant::Default,
-            "the Default option must stay Default (default-OFF guarantee)"
         );
     }
 
@@ -6573,24 +6667,11 @@ mod cooldown_reset_hardening_tests {
         max_received_layer: Option<u32>,
         skip_canvas_paint: bool,
     ) -> VideoCallClient {
-        build_test_client_full(
-            max_received_layer,
-            skip_canvas_paint,
-            crate::adaptive_quality_constants::LadderVariant::Default,
-        )
-    }
-
-    fn build_test_client_full(
-        max_received_layer: Option<u32>,
-        skip_canvas_paint: bool,
-        camera_ladder_variant: crate::adaptive_quality_constants::LadderVariant,
-    ) -> VideoCallClient {
         VideoCallClient::new(VideoCallClientOptions {
             enable_e2ee: false,
             enable_webtransport: false,
             max_received_layer,
             skip_canvas_paint,
-            camera_ladder_variant,
             on_peer_added: Callback::noop(),
             on_peer_first_frame: Callback::noop(),
             on_peer_removed: None,
@@ -7422,6 +7503,138 @@ mod cooldown_reset_hardening_tests {
             "#1700 re-election fallback: same-session Connected must NOT snap the guard \
              above the relay's still-recorded wire (L0) — snapping to L2 reintroduces \
              the #1695 freeze"
+        );
+    }
+
+    /// #2267 in PRODUCTION ORDER. The relay dispatches its replay at `JoinRoom`,
+    /// mid-election, so it lands ~2s BEFORE `Connected`; staging first inverts that.
+    /// 700 is replayed, 800 is not, and BOTH are silent.
+    #[test]
+    fn roster_reconcile_in_production_order_spares_the_replayed_peer() {
+        use protobuf::Message;
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let client = build_test_client();
+        let local_user_id = client.inner.borrow().options.user_id.clone();
+        {
+            let mut inner = client.inner.borrow_mut();
+            for sid in [700u64, 800] {
+                inner
+                    .peer_decode_manager
+                    .insert_zero_loss_top_peer_for_test(sid);
+                inner.peer_decode_manager.silence_peer_for_test(sid);
+            }
+            inner.own_session_id = Some(99);
+            inner.last_reconnect_reconciled_session = Some(99);
+        }
+
+        handle_reconnecting_roster_stage(&Rc::downgrade(&client.inner));
+        assert_eq!(
+            client
+                .inner
+                .borrow()
+                .peer_decode_manager
+                .superseded_candidate_count(),
+            2,
+            "the loss edge stages the pre-disconnect roster"
+        );
+
+        // Self-targeted so `should_emit` short-circuits before
+        // `is_duplicate_peer_event` (`js_sys::Date::now()` panics natively).
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_JOINED.into(),
+            room_id: "TonyBots".to_string(),
+            target_user_id: local_user_id.as_bytes().to_vec(),
+            session_id: 700,
+            display_name: b"Still Here".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: local_user_id.as_bytes().to_vec(),
+            session_id: 0,
+            data: meeting_packet
+                .write_to_bytes()
+                .expect("MeetingPacket must serialise"),
+            ..Default::default()
+        };
+        {
+            let mut inner = client.inner.borrow_mut();
+            let _ = inner.on_inbound_media(wrapper);
+        }
+
+        client.inner.borrow_mut().own_session_id = Some(100);
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+            &client.audio_congestion_bitrate_floor,
+            &client.audio_detector_reconnect_reseed,
+            1200,
+        );
+
+        let removed = client
+            .inner
+            .borrow_mut()
+            .peer_decode_manager
+            .run_peer_monitor();
+
+        assert_eq!(
+            removed,
+            vec!["800".to_string()],
+            "only the session the replay omitted is superseded"
+        );
+        assert!(
+            client
+                .inner
+                .borrow()
+                .peer_decode_manager
+                .sorted_keys()
+                .contains(&700),
+            "700 was replayed by the relay, so it is live and must survive even though \
+             it is silent — reaping it is the outcome #2267 set out to avoid"
+        );
+    }
+
+    /// #2267: a re-election that ABORTS re-emits `Connected` on the SAME session. No
+    /// `JoinRoom` ran, so no replay can confirm anyone.
+    #[test]
+    fn same_session_connected_does_not_promote_the_staged_roster() {
+        let client = build_test_client();
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .insert_zero_loss_top_peer_for_test(700);
+            inner.peer_decode_manager.silence_peer_for_test(700);
+            inner.own_session_id = Some(99);
+            inner.last_reconnect_reconciled_session = Some(99);
+        }
+        handle_reconnecting_roster_stage(&Rc::downgrade(&client.inner));
+
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+            &client.audio_congestion_bitrate_floor,
+            &client.audio_detector_reconnect_reseed,
+            1100,
+        );
+
+        assert!(
+            client
+                .inner
+                .borrow_mut()
+                .peer_decode_manager
+                .run_peer_monitor()
+                .is_empty(),
+            "a same-session fallback re-keyed nobody and brought no replay — the pass \
+             must fall back to the 3-strike watchdog, not reap the staged roster"
         );
     }
 

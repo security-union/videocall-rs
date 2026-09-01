@@ -24,6 +24,13 @@ pub struct Config {
     pub database_url: String,
     /// Shared secret used to sign room access tokens (HMAC-SHA256).
     pub jwt_secret: String,
+    /// Secret used to sign session cookies (HMAC-SHA256). Falls back to
+    /// [`Self::jwt_secret`] when `SESSION_JWT_SECRET` is unset (#2411).
+    pub session_jwt_secret: String,
+    /// Predecessor of [`Self::session_jwt_secret`], accepted on verify only and
+    /// never used to sign (#2455). `None` when `SESSION_JWT_SECRET_PREVIOUS` is
+    /// unset OR blank — a blank value must not become an empty HMAC key.
+    pub session_jwt_secret_previous: Option<String>,
     /// Room access token time-to-live in seconds (default: 86400 = 24 hours).
     /// Must cover the longest expected meeting plus any connection re-election —
     /// see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
@@ -228,6 +235,10 @@ impl Config {
     ///   WT/WS URLs to expire before a re-election can complete, stranding users with
     ///   "No valid connections". See
     ///   [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
+    /// - `SESSION_JWT_SECRET` (default: the value of `JWT_SECRET`) — signs
+    ///   session cookies. See [`Config::session_jwt_secret`].
+    /// - `SESSION_JWT_SECRET_PREVIOUS` (default: unset) — verify-only rotation
+    ///   window. See [`Config::session_jwt_secret_previous`].
     /// - `COOKIE_DOMAIN`
     /// - `COOKIE_NAME` (default: `"session"`) — set to a unique value (e.g. `"pr-session"`)
     ///   in PR preview environments to avoid collision with the production cookie
@@ -255,6 +266,15 @@ impl Config {
             .map_err(|_| "DATABASE_URL environment variable is required")?;
         let jwt_secret =
             env::var("JWT_SECRET").map_err(|_| "JWT_SECRET environment variable is required")?;
+
+        let session_jwt_secret = env::var("SESSION_JWT_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| jwt_secret.clone());
+
+        let session_jwt_secret_previous = env::var("SESSION_JWT_SECRET_PREVIOUS")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
 
         let oauth_allow_unverified = env::var("OAUTH_ALLOW_UNVERIFIED")
             .map(|v| {
@@ -537,6 +557,8 @@ impl Config {
             listen_addr,
             database_url,
             jwt_secret,
+            session_jwt_secret,
+            session_jwt_secret_previous,
             token_ttl_secs,
             session_ttl_secs,
             session_refresh_threshold_secs,
@@ -670,6 +692,8 @@ mod tests {
             listen_addr: "127.0.0.1:8081".to_string(),
             database_url: "postgres://test/test".to_string(),
             jwt_secret: "secret".to_string(),
+            session_jwt_secret: "secret".to_string(),
+            session_jwt_secret_previous: None,
             token_ttl_secs: 86400,
             session_ttl_secs: 604800,
             session_refresh_threshold_secs: 7200,
@@ -685,6 +709,108 @@ mod tests {
             display_name_rate_limit_disabled: false,
             dev_user: None,
             oauth_allow_unverified: false,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn session_jwt_secret_falls_back_to_jwt_secret_and_is_overridable() {
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+        let prior_session = std::env::var("SESSION_JWT_SECRET").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "room-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+
+        with_env_unset("SESSION_JWT_SECRET", || {
+            let cfg = Config::from_env().expect("unset SESSION_JWT_SECRET must not fail");
+            assert_eq!(
+                cfg.session_jwt_secret, "room-secret",
+                "unset must fall back to JWT_SECRET, not to an empty key"
+            );
+        });
+
+        std::env::set_var("SESSION_JWT_SECRET", "   ");
+        let cfg = Config::from_env().expect("blank SESSION_JWT_SECRET must not fail");
+        assert_eq!(cfg.session_jwt_secret, "room-secret");
+
+        std::env::set_var("SESSION_JWT_SECRET", "session-secret");
+        let cfg = Config::from_env().expect("from_env must succeed");
+        assert_eq!(cfg.session_jwt_secret, "session-secret");
+        assert_eq!(
+            cfg.jwt_secret, "room-secret",
+            "the room-token key must be untouched by the session key"
+        );
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+        match prior_session {
+            Some(v) => std::env::set_var("SESSION_JWT_SECRET", v),
+            None => std::env::remove_var("SESSION_JWT_SECRET"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn session_jwt_secret_previous_is_none_unless_explicitly_set() {
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_cors = std::env::var("CORS_ALLOWED_ORIGIN").ok();
+        let prior_previous = std::env::var("SESSION_JWT_SECRET_PREVIOUS").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "room-secret");
+        std::env::set_var("CORS_ALLOWED_ORIGIN", "https://app.example.test");
+
+        with_env_unset("SESSION_JWT_SECRET_PREVIOUS", || {
+            let cfg = Config::from_env().expect("unset must not fail");
+            assert_eq!(
+                cfg.session_jwt_secret_previous, None,
+                "no window may open unless an operator asks for one"
+            );
+        });
+
+        std::env::set_var("SESSION_JWT_SECRET_PREVIOUS", "   ");
+        let cfg = Config::from_env().expect("blank must not fail");
+        assert_eq!(
+            cfg.session_jwt_secret_previous, None,
+            "a blank value must not become an empty HMAC verification key"
+        );
+
+        std::env::set_var("SESSION_JWT_SECRET_PREVIOUS", "outgoing-secret");
+        let cfg = Config::from_env().expect("from_env must succeed");
+        assert_eq!(
+            cfg.session_jwt_secret_previous.as_deref(),
+            Some("outgoing-secret")
+        );
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_cors {
+            Some(v) => std::env::set_var("CORS_ALLOWED_ORIGIN", v),
+            None => std::env::remove_var("CORS_ALLOWED_ORIGIN"),
+        }
+        match prior_previous {
+            Some(v) => std::env::set_var("SESSION_JWT_SECRET_PREVIOUS", v),
+            None => std::env::remove_var("SESSION_JWT_SECRET_PREVIOUS"),
         }
     }
 

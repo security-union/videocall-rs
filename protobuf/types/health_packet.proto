@@ -141,6 +141,21 @@ message VideoStats {
   // read as total keyframe delivery loss. `optional` lets the server tell "not
   // reported" from "zero arrived" and omit the series entirely for old clients.
   optional uint64 keyframe_arrivals_total = 10;
+  // Freeze episodes (#2511): decode-gap counters, folded at fps 0.
+  optional uint64 freeze_episodes_total = 11;
+  optional uint64 freeze_ms_total = 12;
+  optional uint64 max_decode_gap_ms = 13;
+  optional uint64 max_content_staleness_ms = 14;
+  // Interval MAX; saturating (#2524).
+  optional uint64 max_seq_gap_frames = 15;
+  // Lifetime; the keyframeless subset is the held-last-good freeze (#2524).
+  optional uint64 freshness_evictions_total = 16;
+  optional uint64 freshness_evictions_keyframeless_total = 17;
+  // Per-stream siblings of PeerStats fields 15/16, which carry the CAMERA stream
+  // only, leaving screen share with no loss or PLI signal at all (#2524). Loss
+  // counts FRAMES.
+  optional double video_seq_loss_per_sec = 18;
+  optional double keyframe_requests_per_sec = 19;
 }
 
 message PeerStats {
@@ -195,18 +210,18 @@ message PeerStats {
   // a pathology previously invisible in every dashboard. ~0 on WebSocket and on
   // E2EE-on WebTransport (both reliable paths).
   //
-  // PRESENCE signal, not magnitude: capped at ~64 lost per contiguous gap by
-  // the 64-slot reorder window, so it cannot distinguish 1% from 80% loss. Read
-  // it alongside audio_datagram_raw_loss_per_sec (field 18, uncapped) — a large
-  // raw/capped ratio is the burst-severity indicator.
+  // A contiguous gap is booked as its positions shift off the 64-slot reorder
+  // window, so the ones still inside it — which may yet arrive — are not
+  // counted yet. Read it alongside audio_datagram_raw_loss_per_sec (field 18,
+  // uncapped), which leads this field by that still-arrivable tail.
   optional double audio_datagram_loss_per_sec = 17;
 
   // Per-peer receive-side audio DATAGRAM RAW loss rate (uncapped skipped-
   // sequence sum per second, windowed) observed for this peer while THIS client
   // is on WebTransport (issue 2031). The magnitude companion to
-  // audio_datagram_loss_per_sec (field 17): field 17 saturates at ~64/gap due to
-  // the reorder window and so reads "nonzero, sustained" during a heavy burst,
-  // while this field sums the actual sequence-gap sizes un-truncated, so a
+  // audio_datagram_loss_per_sec (field 17): field 17 defers the positions still
+  // inside the reorder window to later arrivals, while this field sums the
+  // actual sequence-gap sizes un-truncated at the jump, so a
   // battery-throttled receiver losing 20-44 pkt/s reads its true magnitude here.
   // Same WebTransport gate and ~1 Hz cadence as field 17; folds definitional 0.0
   // on WebSocket (audio rides ordered TCP — no datagram loss possible) so the
@@ -638,6 +653,36 @@ message HealthPacket {
   // empty field also covers a client predating this field, and both mean "no
   // geometry to show."
   repeated EncoderLayerGeometry camera_layer_geometry = 112; // (issue 2170)
+
+  // Un-framed payload bytes offered to the WebSocket send path per stream, billed
+  // before every gate so a closed socket is included (issue 2510). NOT comparable
+  // with the framed, post-admission unistream_bytes_* fields.
+  optional uint64 ws_offered_bytes_audio = 113;
+  optional uint64 ws_offered_bytes_video = 114;
+  optional uint64 ws_offered_bytes_screen = 115;
+  optional uint64 ws_offered_bytes_control = 116;
+  // Discarded by the 1 MiB bufferedAmount guard. A failed send is in neither, so
+  // offered != accepted + dropped + inactive-discarded.
+  optional uint64 ws_dropped_bytes_audio = 117;
+  optional uint64 ws_dropped_bytes_video = 118;
+  optional uint64 ws_dropped_bytes_screen = 119;
+  optional uint64 ws_dropped_bytes_control = 120;
+
+  // Discarded because the socket was neither CONNECTING nor OPEN — a close or a
+  // flap, not backpressure (issue 2577). Disjoint from ws_dropped_bytes_* above.
+  optional uint64 ws_inactive_dropped_frames_audio = 121;
+  optional uint64 ws_inactive_dropped_frames_video = 122;
+  optional uint64 ws_inactive_dropped_frames_screen = 123;
+  optional uint64 ws_inactive_dropped_frames_control = 124;
+  optional uint64 ws_inactive_dropped_bytes_audio = 125;
+  optional uint64 ws_inactive_dropped_bytes_video = 126;
+  optional uint64 ws_inactive_dropped_bytes_screen = 127;
+  optional uint64 ws_inactive_dropped_bytes_control = 128;
+  // The same discards decomposed by readyState instead of by stream; never sum
+  // across the decompositions. Set UNCONDITIONALLY, including zero, per the
+  // keyframe_arrivals_total convention (field 10).
+  optional uint64 ws_inactive_dropped_frames_by_state_closing = 129;
+  optional uint64 ws_inactive_dropped_frames_by_state_closed = 130;
 }
 
 // One active camera rung's FITTED geometry and measured output rate.

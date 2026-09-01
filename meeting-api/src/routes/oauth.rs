@@ -293,8 +293,13 @@ pub async fn callback(
             now,
         )
         .max(1);
-        let session_jwt =
-            token::generate_session_token(&state.jwt_secret, &email, &display_name, ttl, now)?;
+        let session_jwt = token::generate_session_token(
+            &state.session_jwt_secret,
+            &email,
+            &display_name,
+            ttl,
+            now,
+        )?;
         let session_cookie = build_session_cookie(
             &state.cookie_name,
             &session_jwt,
@@ -1223,6 +1228,9 @@ mod tests {
         AppState {
             db,
             jwt_secret: "test-secret".to_string(),
+            session_jwt_secret: "test-secret".to_string(),
+            session_jwt_secret_previous: None,
+            session_previous_secret_expires_at: 0,
             token_ttl_secs: 60,
             session_ttl_secs: 3600,
             session_refresh_threshold_secs: 7200,

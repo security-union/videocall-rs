@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { BotTask } from "../orchestrator";
+import { SD_SOURCE } from "../posture";
 import { generateToken } from "./auth";
 import {
   type ControlServerHandle,
@@ -21,6 +22,8 @@ function fakeTask(overrides: Partial<BotTask> = {}): BotTask {
     displayName: "Alice",
     headless: false,
     authBackend: "jwt",
+    sourceGeometry: SD_SOURCE,
+    cameraCycle: null,
     storageStateFile: null,
     ssoStateFile: null,
     manifest: null,

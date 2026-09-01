@@ -4,8 +4,9 @@ Cluster-agnostic PostgreSQL chart for the videocall application: a thin wrapper 
 `bitnami/postgresql` and carries only the settings every deployment shares.
 
 **This chart alone will not render.** `values.schema.json` requires `auth.database`,
-`primary.persistence.storageClass`, `primary.persistence.size` and `primary.resources`, so
-`helm lint`, `template`, `install` and `upgrade` all fail without a cluster values file:
+`image.tag` and `primary.resources`. When the chart creates a PVC, it also requires
+`primary.persistence.storageClass` and `primary.persistence.size`. `helm lint`, `template`,
+`install` and `upgrade` therefore fail without cluster values:
 
 ```
 Error: values don't meet the specifications of the schema(s) in the following chart(s):
@@ -19,7 +20,7 @@ default-storage-class PVC and no application database — a silent wrong deploym
 error. Supply the cluster values file:
 
 ```bash
-helm dependency build helm/videocall-postgres/
+make build-videocall-postgres
 helm upgrade --install postgres helm/videocall-postgres/ \
   -n videocall \
   -f helm/global/<cluster>/postgres/values.yaml
@@ -30,8 +31,10 @@ helm upgrade --install postgres helm/videocall-postgres/ \
 | In this chart | In the cluster values file |
 |---|---|
 | `auth.*` (secret name and keys, `postgres` user) | `auth.database` |
-| `metrics.enabled: false` | `image.*` (registry, repository, tag, pull secrets) |
-| `persistence.enabled` + the `resource-policy: keep` annotation | `persistence.storageClass`, `persistence.size` |
+| `image.tag: ""` — empty so the subchart's `latest` default cannot satisfy the schema | `image.*` (registry, repository, **`tag` — required**, optional `digest`, pull secrets) |
+| `metrics.enabled: false` | `metrics.image.*` when metrics are enabled |
+| | `global.security.allowInsecureImages: true` when Bitnami reports the configured images as unrecognized, including digest-pinned and `bitnamilegacy/*` images |
+| `persistence.enabled` + the `resource-policy: keep` annotation | `persistence.storageClass`, `persistence.size`, or `persistence.existingClaim` |
 | `primary.service` (ClusterIP :5432) | `primary.resources` |
 | `readReplicas.replicaCount: 0` | `primary.extendedConfiguration` (tuned to those resources) |
 
@@ -46,15 +49,25 @@ A `postgres-credentials` secret in the target namespace with keys `postgres-pass
 ## Upgrading
 
 Bumping `dependencies[0].version` in `Chart.yaml` replaces the chart **templates** only. It does
-not change the running PostgreSQL: the image comes from each cluster's `image.*` (pinned on
-Ascend, unpinned elsewhere), and the PVC is retained by `resource-policy: keep`. So a chart bump
-alone either does nothing to the database or, on an unpinned cluster, lets `latest` roll against
-an older major's data directory.
+not change the running PostgreSQL: the image comes from each cluster's `image.*`, and the PVC is
+retained by `resource-policy: keep`. So a chart bump alone does nothing to the database.
+
+**`image.tag` is schema-required**, so a chart bump can no longer *silently* move the image
+underneath a retained data directory — the version is declared where it is reviewable. Two guards,
+with different reach: the schema requires a tag to be *stated* and would accept the literal
+`tag: "latest"`; `make test-videocall-postgres` additionally fails any cluster values file whose
+rendered images include a `:latest` reference.
+
+Where the registry publishes no versioned tags — Docker Hub's `bitnami/*`, since versioned tags
+moved to paid Secure Images — pin `image.digest` as well and keep `image.tag` beside it. The digest
+is what gets pulled; the tag documents which version that digest is, and turns a blanked digest
+into a failed pull instead of a silent roll onto the subchart's `latest` default.
 
 A real major-version upgrade needs three things, in order:
 
 1. the chart bump (templates),
-2. an explicit `image.tag` change in each cluster's values file,
+2. an explicit `image.tag` change — plus `image.digest`, where one is pinned — in each cluster's
+   values file,
 3. a supported data migration — `pg_upgrade` or dump/restore. PostgreSQL cannot read a data
    directory written by a newer major, and Bitnami's image does not migrate one for you.
 

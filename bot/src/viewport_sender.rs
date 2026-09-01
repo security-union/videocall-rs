@@ -50,10 +50,9 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
-use crate::transport::{MediaTypeLabel, OutboundFrame};
+use crate::transport::{MediaTypeLabel, OutboundFrame, OutboundFrameSender};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::viewport_packet::ViewportPacket;
@@ -93,7 +92,7 @@ pub struct ViewportSender {
     /// the fail-open.
     off_viewport_video_seen: bool,
     /// Channel to send outbound packets.
-    packet_tx: Sender<OutboundFrame>,
+    packet_tx: OutboundFrameSender,
     /// Counter for total VIEWPORT packets sent.
     pub viewports_sent: Arc<AtomicU64>,
     /// When the last *reconnect re-assert* (via [`Self::resend_on_reconnect`])
@@ -118,7 +117,7 @@ impl ViewportSender {
     pub fn new(
         self_user_id: String,
         visible_count: Option<usize>,
-        packet_tx: Sender<OutboundFrame>,
+        packet_tx: impl Into<OutboundFrameSender>,
     ) -> Self {
         Self {
             self_user_id,
@@ -128,7 +127,7 @@ impl ViewportSender {
             pending: None,
             has_sent: false,
             off_viewport_video_seen: false,
-            packet_tx,
+            packet_tx: packet_tx.into(),
             viewports_sent: Arc::new(AtomicU64::new(0)),
             last_resend: None,
         }

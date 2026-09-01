@@ -23,7 +23,7 @@
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
-use videocall_meeting_types::RoomAccessTokenClaims;
+use videocall_meeting_types::{check_token_type, RoomAccessTokenClaims, TokenTypeCheck};
 
 use crate::error::AppError;
 
@@ -48,10 +48,17 @@ pub struct SessionTokenClaims {
     pub auth_time: Option<i64>,
     /// Issuer.
     pub iss: String,
+    /// Token-type discriminator (#2411). `None` means the token was minted
+    /// before this claim existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typ: Option<String>,
 }
 
 impl SessionTokenClaims {
     pub const ISSUER: &'static str = "videocall-meeting-backend";
+
+    /// The expected `typ` value; must differ from [`RoomAccessTokenClaims::TOKEN_TYPE`].
+    pub const TOKEN_TYPE: &'static str = "session";
 }
 
 #[derive(Deserialize)]
@@ -120,6 +127,7 @@ pub fn generate_session_token(
         iat: now,
         auth_time: Some(auth_time),
         iss: SessionTokenClaims::ISSUER.to_string(),
+        typ: Some(SessionTokenClaims::TOKEN_TYPE.to_string()),
     };
 
     encode(
@@ -134,20 +142,68 @@ pub fn generate_session_token(
 }
 
 /// Decode and validate a session JWT. Returns the claims on success.
-pub fn decode_session_token(secret: &str, token: &str) -> Result<SessionTokenClaims, AppError> {
+///
+/// `previous_secret` is the verify-only predecessor key (#2455). It is tried
+/// only after `secret` fails, and it is never handed to
+/// [`generate_session_token`] — every mint signs with `secret` alone. Pass
+/// `None` to accept the current key only.
+pub fn decode_session_token(
+    secret: &str,
+    previous_secret: Option<&str>,
+    token: &str,
+) -> Result<SessionTokenClaims, AppError> {
     let mut validation = Validation::default();
     validation.set_issuer(&[SessionTokenClaims::ISSUER]);
 
-    decode::<SessionTokenClaims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )
-    .map(|data| data.claims)
-    .map_err(|e| {
-        tracing::warn!("Session JWT validation failed: {e}");
-        AppError::unauthorized_msg("invalid or expired session")
-    })
+    let verify = |key: &str| {
+        decode::<SessionTokenClaims>(
+            token,
+            &DecodingKey::from_secret(key.as_bytes()),
+            &validation,
+        )
+        .map(|data| data.claims)
+    };
+
+    let claims = match verify(secret) {
+        Ok(claims) => claims,
+        Err(current_err) => match previous_secret.map(verify) {
+            Some(Ok(claims)) => {
+                tracing::info!("accepted session cookie signed with the previous key (#2455)");
+                claims
+            }
+            _ => {
+                tracing::warn!("Session JWT validation failed: {current_err}");
+                return Err(AppError::unauthorized_msg("invalid or expired session"));
+            }
+        },
+    };
+
+    require_token_type(
+        claims.typ.as_deref(),
+        SessionTokenClaims::TOKEN_TYPE,
+        "session",
+    )?;
+
+    Ok(claims)
+}
+
+/// Enforce the `typ` discriminator (#2411).
+pub(crate) fn require_token_type(
+    typ: Option<&str>,
+    expected: &str,
+    kind: &str,
+) -> Result<(), AppError> {
+    match check_token_type(typ, expected) {
+        TokenTypeCheck::Match => Ok(()),
+        TokenTypeCheck::Legacy => {
+            tracing::warn!("accepted {kind} token with no 'typ' claim (pre-#2411 mint)");
+            Ok(())
+        }
+        TokenTypeCheck::Mismatch { found } => {
+            tracing::warn!("rejected token presented as {kind}: typ '{found}' != '{expected}'");
+            Err(AppError::unauthorized_msg("token type mismatch"))
+        }
+    }
 }
 
 /// Decode any guest JWT - either an observer token or a room-access token.
@@ -167,6 +223,12 @@ pub fn decode_guest_token(secret: &str, token: &str) -> Result<RoomAccessTokenCl
         tracing::warn!("Guest JWT validation failed: {e}");
         AppError::unauthorized_msg("invalid or expired guest token")
     })?;
+
+    require_token_type(
+        claims.typ.as_deref(),
+        RoomAccessTokenClaims::TOKEN_TYPE,
+        "guest room",
+    )?;
 
     if !claims.is_guest {
         return Err(AppError::unauthorized_msg("token is not a guest token"));
@@ -205,6 +267,7 @@ pub fn generate_room_token(
         end_on_host_leave,
         exp: now + ttl_secs,
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
+        typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
     };
 
     encode(
@@ -245,6 +308,7 @@ pub fn generate_observer_token(
         end_on_host_leave: true,
         exp: now + OBSERVER_TOKEN_TTL_SECS,
         iss: RoomAccessTokenClaims::ISSUER.to_string(),
+        typ: Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string()),
     };
 
     encode(
@@ -328,7 +392,7 @@ mod tests {
     fn session_token_round_trips() {
         let token = generate_session_token(TEST_SECRET, "alice@test.com", "Alice", 3600, 1234)
             .expect("should sign");
-        let claims = decode_session_token(TEST_SECRET, &token).expect("should decode");
+        let claims = decode_session_token(TEST_SECRET, None, &token).expect("should decode");
 
         assert_eq!(claims.sub, "alice@test.com");
         assert_eq!(claims.name, "Alice");
@@ -340,7 +404,7 @@ mod tests {
     fn session_token_wrong_secret_fails() {
         let token =
             generate_session_token(TEST_SECRET, "a@b.com", "A", 3600, 1234).expect("should sign");
-        let err = decode_session_token("wrong-secret", &token);
+        let err = decode_session_token("wrong-secret", None, &token);
         assert!(err.is_err());
     }
 
@@ -349,7 +413,7 @@ mod tests {
         // Use a TTL of -120s to exceed jsonwebtoken's default 60s leeway.
         let token =
             generate_session_token(TEST_SECRET, "a@b.com", "A", -120, 1234).expect("should sign");
-        let err = decode_session_token(TEST_SECRET, &token);
+        let err = decode_session_token(TEST_SECRET, None, &token);
         assert!(err.is_err());
     }
 
@@ -360,9 +424,226 @@ mod tests {
             generate_session_token(TEST_SECRET, "a@b.com", "A", 3600, 1234).expect("should sign");
         let after = Utc::now().timestamp();
 
-        let claims = decode_session_token(TEST_SECRET, &token).expect("should decode");
+        let claims = decode_session_token(TEST_SECRET, None, &token).expect("should decode");
         assert!(claims.iat >= before);
         assert!(claims.iat <= after);
+    }
+
+    fn sign_raw(claims: &serde_json::Value) -> String {
+        encode(
+            &Header::default(),
+            claims,
+            &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+        )
+        .expect("should sign")
+    }
+
+    fn session_shaped(typ: Option<&str>) -> serde_json::Value {
+        let now = Utc::now().timestamp();
+        let mut claims = serde_json::json!({
+            "sub": "attacker@example.com",
+            "name": "Attacker",
+            "iat": now,
+            "exp": now + 3600,
+            "iss": SessionTokenClaims::ISSUER,
+        });
+        if let Some(typ) = typ {
+            claims["typ"] = serde_json::json!(typ);
+        }
+        claims
+    }
+
+    fn room_shaped(typ: Option<&str>) -> serde_json::Value {
+        let now = Utc::now().timestamp();
+        let mut claims = serde_json::json!({
+            "sub": "guest:abc-123",
+            "room": "victim-room",
+            "room_join": true,
+            "is_host": true,
+            "is_guest": true,
+            "display_name": "Attacker",
+            "exp": now + 3600,
+            "iss": RoomAccessTokenClaims::ISSUER,
+        });
+        if let Some(typ) = typ {
+            claims["typ"] = serde_json::json!(typ);
+        }
+        claims
+    }
+
+    #[test]
+    fn a_room_typed_token_is_refused_by_the_session_path_on_the_discriminator() {
+        let token = sign_raw(&session_shaped(Some(RoomAccessTokenClaims::TOKEN_TYPE)));
+
+        let mut validation = Validation::default();
+        validation.set_issuer(&[SessionTokenClaims::ISSUER]);
+        decode::<SessionTokenClaims>(
+            &token,
+            &DecodingKey::from_secret(TEST_SECRET.as_bytes()),
+            &validation,
+        )
+        .expect("the blob must satisfy SessionTokenClaims, else this tests serde, not typ");
+
+        let err = decode_session_token(TEST_SECRET, None, &token)
+            .expect_err("a room-typed token must not be accepted as a session cookie");
+        assert_eq!(
+            err.body.engineering_error.as_deref(),
+            Some("token type mismatch")
+        );
+    }
+
+    #[test]
+    fn the_same_session_blob_with_the_session_typ_is_accepted() {
+        // Control: byte-identical apart from `typ`.
+        let claims = decode_session_token(
+            TEST_SECRET,
+            None,
+            &sign_raw(&session_shaped(Some(SessionTokenClaims::TOKEN_TYPE))),
+        )
+        .expect("must accept");
+
+        assert_eq!(claims.sub, "attacker@example.com");
+    }
+
+    #[test]
+    fn a_legacy_session_token_without_typ_is_still_accepted() {
+        let claims = decode_session_token(TEST_SECRET, None, &sign_raw(&session_shaped(None)))
+            .expect("pre-#2411 cookies must keep working");
+
+        assert_eq!(claims.typ, None);
+    }
+
+    #[test]
+    fn a_session_typed_token_is_refused_by_the_room_path_on_the_discriminator() {
+        let token = sign_raw(&room_shaped(Some(SessionTokenClaims::TOKEN_TYPE)));
+
+        let mut validation = Validation::default();
+        validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
+        decode::<RoomAccessTokenClaims>(
+            &token,
+            &DecodingKey::from_secret(TEST_SECRET.as_bytes()),
+            &validation,
+        )
+        .expect("the blob must satisfy RoomAccessTokenClaims, else this tests serde, not typ");
+
+        let err = decode_guest_token(TEST_SECRET, &token)
+            .expect_err("a session-typed token must not be accepted as a room token");
+        assert_eq!(
+            err.body.engineering_error.as_deref(),
+            Some("token type mismatch")
+        );
+    }
+
+    #[test]
+    fn the_same_room_blob_with_the_room_typ_is_accepted() {
+        let claims = decode_guest_token(
+            TEST_SECRET,
+            &sign_raw(&room_shaped(Some(RoomAccessTokenClaims::TOKEN_TYPE))),
+        )
+        .expect("must accept");
+
+        assert_eq!(claims.sub, "guest:abc-123");
+    }
+
+    #[test]
+    fn a_legacy_guest_room_token_without_typ_is_still_accepted() {
+        let claims = decode_guest_token(TEST_SECRET, &sign_raw(&room_shaped(None)))
+            .expect("pre-#2411 room tokens must keep working");
+
+        assert_eq!(claims.typ, None);
+    }
+
+    #[test]
+    fn every_mint_path_stamps_its_own_typ() {
+        let session = generate_session_token(TEST_SECRET, "a@b.com", "A", 3600, 1234).unwrap();
+        assert_eq!(
+            decode_session_token(TEST_SECRET, None, &session)
+                .unwrap()
+                .typ,
+            Some(SessionTokenClaims::TOKEN_TYPE.to_string())
+        );
+
+        let room =
+            generate_room_token(TEST_SECRET, 600, "guest:1", "r", false, "G", true, true).unwrap();
+        assert_eq!(
+            decode_guest_token(TEST_SECRET, &room).unwrap().typ,
+            Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string())
+        );
+
+        let observer = generate_observer_token(TEST_SECRET, "guest:1", "r", "G", true).unwrap();
+        assert_eq!(
+            decode_guest_token(TEST_SECRET, &observer).unwrap().typ,
+            Some(RoomAccessTokenClaims::TOKEN_TYPE.to_string())
+        );
+    }
+    // -----------------------------------------------------------------------
+    // Verify-only previous-key window (#2455)
+    // -----------------------------------------------------------------------
+
+    const PREVIOUS_SECRET: &str = "outgoing-session-key";
+
+    fn sign_raw_with(secret: &str, claims: &serde_json::Value) -> String {
+        encode(
+            &Header::default(),
+            claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("should sign")
+    }
+
+    #[test]
+    fn a_previous_key_cookie_verifies_only_when_the_window_is_configured() {
+        let token = generate_session_token(PREVIOUS_SECRET, "alice@test.com", "Alice", 3600, 1234)
+            .expect("should sign");
+
+        assert!(
+            decode_session_token(TEST_SECRET, None, &token).is_err(),
+            "with no window configured, a predecessor-key cookie must be rejected"
+        );
+
+        let claims = decode_session_token(TEST_SECRET, Some(PREVIOUS_SECRET), &token)
+            .expect("with the window configured, a predecessor-key cookie must verify");
+        assert_eq!(claims.sub, "alice@test.com");
+    }
+
+    #[test]
+    fn an_open_window_admits_only_the_one_configured_previous_key() {
+        let forged = generate_session_token("some-unrelated-key", "mallory@test.com", "M", 3600, 1)
+            .expect("should sign");
+
+        assert!(
+            decode_session_token(TEST_SECRET, Some(PREVIOUS_SECRET), &forged).is_err(),
+            "an open window must not widen acceptance beyond the configured predecessor"
+        );
+    }
+
+    #[test]
+    fn a_previous_key_cookie_is_still_subject_to_the_typ_gate() {
+        let err = decode_session_token(
+            TEST_SECRET,
+            Some(PREVIOUS_SECRET),
+            &sign_raw_with(
+                PREVIOUS_SECRET,
+                &session_shaped(Some(RoomAccessTokenClaims::TOKEN_TYPE)),
+            ),
+        )
+        .expect_err("a room-typed token must not ride in through the previous key");
+        assert_eq!(
+            err.body.engineering_error.as_deref(),
+            Some("token type mismatch")
+        );
+
+        // Control: same blob and same predecessor key, session `typ`.
+        let claims = decode_session_token(
+            TEST_SECRET,
+            Some(PREVIOUS_SECRET),
+            &sign_raw_with(
+                PREVIOUS_SECRET,
+                &session_shaped(Some(SessionTokenClaims::TOKEN_TYPE)),
+            ),
+        )
+        .expect("must accept");
+        assert_eq!(claims.sub, "attacker@example.com");
     }
 
     // -----------------------------------------------------------------------

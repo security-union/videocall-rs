@@ -12,6 +12,7 @@ use protobuf::Message;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use url::Url;
+use videocall_meeting_types::mint::{self, LobbyAuth};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -19,7 +20,7 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 #[command(
     name = "vcprobe",
     about = "videocall.rs meeting diagnostic probe",
-    long_about = "Join a videocall.rs meeting as a passive observer and print human-readable packet summaries.\n\nURL format:\n  https://<host>/lobby/<username>/<meeting_id>  (WebTransport)\n  wss://<host>/lobby/<username>/<meeting_id>    (WebSocket)\n\nNATS mode:\n  vcprobe --nats <url> --meeting <id> [--proctor]"
+    long_about = "Join a videocall.rs meeting as a passive observer and print human-readable packet summaries.\n\nURL format (supplies the relay origin, the username and the meeting):\n  https://<host>/lobby/<username>/<meeting_id>  (WebTransport)\n  wss://<host>/lobby/<username>/<meeting_id>    (WebSocket)\n\nThe join itself is authenticated: pass --token <JWT>, or --jwt-secret/JWT_SECRET\nto mint one. Use --deprecated-path only against a relay running with\nFEATURE_MEETING_MANAGEMENT disabled.\n\nNATS mode:\n  vcprobe --nats <url> --meeting <id> [--proctor]"
 )]
 struct Args {
     /// Meeting URL — https://<host>/lobby/<username>/<meeting_id>  or  wss://...
@@ -62,6 +63,30 @@ struct Args {
     /// Display timestamps in UTC instead of local time
     #[arg(long)]
     utc: bool,
+
+    /// Pre-minted room access token. Takes precedence over --jwt-secret.
+    #[arg(long = "token", value_name = "JWT")]
+    token: Option<String>,
+
+    /// HMAC secret the relay validates room access tokens with. vcprobe mints
+    /// its own token from it, joining as the username in the URL.
+    #[arg(
+        long = "jwt-secret",
+        value_name = "SECRET",
+        env = "JWT_SECRET",
+        hide_env_values = true
+    )]
+    jwt_secret: Option<String>,
+
+    /// Lifetime of a minted token, in seconds.
+    #[arg(long = "token-ttl-secs", value_name = "N", default_value_t = 3600)]
+    token_ttl_secs: u64,
+
+    /// Join over the deprecated unauthenticated /lobby/<username>/<meeting_id>
+    /// path. Ignored when a token or secret is available, and rejected by any
+    /// relay running with FEATURE_MEETING_MANAGEMENT enabled.
+    #[arg(long = "deprecated-path")]
+    deprecated_path: bool,
 }
 
 struct ParsedUrl {
@@ -108,10 +133,42 @@ fn parse_meeting_url(raw: &str) -> Result<ParsedUrl> {
     })
 }
 
-async fn connect(parsed: &ParsedUrl, insecure: bool) -> Result<mpsc::Receiver<Vec<u8>>> {
+/// Pick the auth mode for this invocation (#2298).
+///
+/// Token auth is the default; the deprecated unauthenticated path is reachable
+/// only via `--deprecated-path`, and only when no credential was supplied.
+fn resolve_auth(args: &Args) -> std::result::Result<LobbyAuth, mint::MintError> {
+    mint::resolve_lobby_auth(
+        args.token.clone(),
+        args.jwt_secret.clone(),
+        args.token_ttl_secs,
+        args.deprecated_path,
+    )
+}
+
+/// Build the URL vcprobe actually connects to.
+///
+/// The positional URL supplies the relay origin plus the identity vcprobe
+/// stamps on its CONNECTION/heartbeat packets; the join itself is authenticated
+/// with `?token=` unless the caller explicitly asked for the deprecated path.
+fn resolve_connect_url(parsed: &ParsedUrl, auth: &LobbyAuth) -> Result<Url> {
+    let mut base = parsed.url.clone();
+    base.set_path("");
+    base.set_query(None);
+    base.set_fragment(None);
+
+    let url = mint::build_lobby_url(base.as_str(), auth, &parsed.username, &parsed.meeting_id)?;
+    Ok(Url::parse(&url)?)
+}
+
+async fn connect(
+    parsed: &ParsedUrl,
+    connect_url: Url,
+    insecure: bool,
+) -> Result<mpsc::Receiver<Vec<u8>>> {
     if parsed.use_websocket {
         transport::connect_websocket(
-            parsed.url.clone(),
+            connect_url,
             insecure,
             parsed.username.clone(),
             parsed.meeting_id.clone(),
@@ -119,7 +176,7 @@ async fn connect(parsed: &ParsedUrl, insecure: bool) -> Result<mpsc::Receiver<Ve
         .await
     } else {
         transport::connect_webtransport(
-            parsed.url.clone(),
+            connect_url,
             insecure,
             parsed.username.clone(),
             parsed.meeting_id.clone(),
@@ -146,7 +203,7 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     // ── Determine mode: NATS or WebTransport/WebSocket ───────────────────────
-    let (mut rx, meeting_id, transport_name) = if let Some(nats_url) = args.nats_url {
+    let (mut rx, meeting_id, transport_name) = if let Some(nats_url) = args.nats_url.clone() {
         // NATS mode
         let meeting_id = match args.meeting_id.as_ref() {
             Some(id) => id,
@@ -200,11 +257,27 @@ async fn main() {
             "WebTransport"
         };
 
+        let auth = match resolve_auth(&args) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(2);
+            }
+        };
+
+        let connect_url = match resolve_connect_url(&parsed, &auth) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(2);
+            }
+        };
+
         if !args.quiet && !args.proctor {
             eprintln!("* connecting to {} [{}]", url_str, transport_name);
         }
 
-        let mut rx = match connect(&parsed, args.insecure).await {
+        let mut rx = match connect(&parsed, connect_url, args.insecure).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("* connection failed: {}", e);
@@ -280,5 +353,73 @@ async fn main() {
         let _ = tokio::time::timeout(Duration::from_secs(secs), obs).await;
     } else {
         obs.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_meeting_url, resolve_auth, resolve_connect_url, Args};
+    use clap::Parser;
+    use videocall_meeting_types::mint::LobbyAuth;
+
+    /// `--jwt-secret ""` neutralises the `JWT_SECRET` env fallback so these
+    /// assertions hold on a developer machine that has the relay secret set.
+    fn args_from(extra: &[&str]) -> Args {
+        let mut argv = vec!["vcprobe", "https://relay.example.com/lobby/probe-1/room-1"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    #[test]
+    fn a_probe_without_a_credential_refuses_to_join() {
+        let args = args_from(&["--jwt-secret", ""]);
+        let err = resolve_auth(&args)
+            .expect_err("a credential-less invocation must not resolve to a joinable auth mode");
+        assert!(
+            err.to_string().contains("no room access token"),
+            "expected a missing-credential error — got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_secret_defaults_to_a_token_authenticated_url() {
+        let args = args_from(&["--jwt-secret", "secret"]);
+        let parsed = parse_meeting_url(args.url.as_ref().unwrap()).unwrap();
+        let url = resolve_connect_url(&parsed, &resolve_auth(&args).unwrap()).unwrap();
+
+        assert_eq!(url.path(), "/lobby");
+        assert!(url.query().unwrap_or_default().starts_with("token="));
+    }
+
+    #[test]
+    fn a_secret_wins_over_an_explicit_deprecated_path_request() {
+        let args = args_from(&["--jwt-secret", "secret", "--deprecated-path"]);
+        assert!(matches!(
+            resolve_auth(&args).unwrap(),
+            LobbyAuth::Secret { .. }
+        ));
+    }
+
+    #[test]
+    fn the_deprecated_path_is_still_reachable_on_request() {
+        let args = args_from(&["--jwt-secret", "", "--deprecated-path"]);
+        let parsed = parse_meeting_url(args.url.as_ref().unwrap()).unwrap();
+        let url = resolve_connect_url(&parsed, &resolve_auth(&args).unwrap()).unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://relay.example.com/lobby/probe-1/room-1"
+        );
+    }
+
+    #[test]
+    fn a_websocket_url_keeps_its_scheme_and_port() {
+        let mut args = args_from(&["--jwt-secret", ""]);
+        args.url = Some("wss://relay.example.com:4443/lobby/probe-1/room-1".into());
+        args.token = Some("tok".into());
+        let parsed = parse_meeting_url(args.url.as_ref().unwrap()).unwrap();
+        let url = resolve_connect_url(&parsed, &resolve_auth(&args).unwrap()).unwrap();
+
+        assert_eq!(url.as_str(), "wss://relay.example.com:4443/lobby?token=tok");
     }
 }

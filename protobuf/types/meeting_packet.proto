@@ -36,6 +36,8 @@ message MeetingPacket {
     HOST_GRANTED = 15;
     // Host revoked from a participant
     HOST_REVOKED = 16;
+    // Transport reconnect: `session_id` supersedes `previous_session_id` (#2269)
+    PARTICIPANT_SESSION_RESUMED = 17;
   }
 
   MeetingEventType event_type = 1;
@@ -75,5 +77,7 @@ message MeetingPacket {
   // relay; receivers then fall back to keying on session_id, which is the
   // pre-#1600 behaviour.
   string requester_instance_id = 12;
+  // PARTICIPANT_SESSION_RESUMED: the superseded session_id receivers evict.
+  uint64 previous_session_id = 13;
 }
 

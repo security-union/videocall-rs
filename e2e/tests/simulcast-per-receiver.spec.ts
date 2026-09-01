@@ -58,11 +58,9 @@
  *   2. receive needle never exceeds the user's max-layer threshold
  *   3. default receive preference is Auto (full range)
  *   4. receive Performance panel renders video + audio + content controls
- *   5. audio readout reflects the multi-layer ladder when the flag is on (the
- *      waiting-room auto-admit fix unblocks the 2-context join; audio's capability
- *      ceiling is DECOUPLED from the cores-based video clamp (#1082), so the
- *      publisher emits the full 3-rung audio ladder regardless of runner core
- *      count — NO capability override needed)
+ *   5. audio publishes a single layer with the flag on (#2279: audio's publish
+ *      count no longer reads the flag at all, so no capability override is
+ *      needed and there is no runner-dependent skip)
  *   6. flag pinned to 1 / single-layer no-regression (the same 2-context join,
  *      unblocked by the waiting-room fix; needs NO override — it pins the flag to 1)
  *
@@ -103,22 +101,16 @@
  *
  *       5. Performance panel renders ALL THREE received-quality controls
  *          (video + audio + content) — #1082 structural assertion.
- *       6. AUDIO layering active under the flag (#1082-B: 2 → 3 layers). The
- *          audio needle readout's `{Q} · {i}/{N} · {kbps} kbps` (#1222
- *          quality-letter format) reports the live
- *          per-snapshot `layer_count` (the only DOM signal of audio simulcast);
- *          the ladder-length and bitrate invariants are asserted unconditionally
- *          and the >1-layer assertion is capability-gated like VIDEO send.
+ *       6. AUDIO publishes one layer under the flag (#2279). The receive readout
+ *          reports no receiver-observable bitrate, while the send rung strip is
+ *          covered in `performance-settings.spec.ts`.
  *
  *   - FLAG-OFF CONTROL (separate describe block at the bottom):
  *       Flag pinned to 1 via `pinSimulcastMaxLayers(ctx, 1)` = single layer =
- *       feature OFF. (The runtime DEFAULT was flipped 1 → 3, so the OFF path can
- *       no longer be reached by simply omitting the flag — it must be pinned to 1
- *       explicitly.) The publisher then emits a SINGLE layer for every kind, so
- *       each received-quality readout reports `/1`. This guards the
- *       no-regression byte-identical single-layer path for #1082 (the ladder
- *       machinery went N-generic but the single-layer behavior
- *       must be unchanged).
+ *       feature OFF. The publisher then emits a SINGLE layer for every kind. This
+ *       guards the no-regression byte-identical single-layer path for #1082 (the
+ *       ladder machinery went N-generic but the single-layer behavior must be
+ *       unchanged).
  *
  *   - RUNS UNDER THE `@impair` PROJECT ONLY (issues #1080 + #1108):
  *       2. Per-receiver congestion DIVERGENCE (WS path) — one of two
@@ -176,7 +168,9 @@
  *       text format: `{Q} · {idx+1}/{count} · {w}x{h}` or "Not receiving"
  *       (#1222: `{Q}` is the quality letter L/M/H, or "1" single-layer)
  *   - `#perf-vu-recv-audio-readout`                 audio received-quality readout
- *       text format: `{Q} · {idx+1}/{count} · {kbps} kbps` or "Not receiving"
+ *       text format: `— kbps` — one audio layer means no position chip and no
+ *       receiver-observable bitrate (#2279) — or "Not receiving" before the
+ *       first audio frame is decoded
  *   - `[data-testid="perf-recv-video-range-max"]`   video max-layer range thumb
  *   - `[data-testid="perf-recv-video-auto"]`        video "Reset" button (#1131 §D
  *       REPURPOSED this testid off the former Auto TOGGLE; it is now a plain
@@ -185,7 +179,7 @@
  *       to the full automatic range.)
  */
 
-import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwright/test";
+import { test, expect, chromium, Browser, BrowserContext, Locator, Page } from "@playwright/test";
 import { createAuthenticatedContext, BROWSER_ARGS } from "../helpers/auth-context";
 import { enableSimulcastFlag, pinSimulcastMaxLayers } from "../helpers/simulcast-config";
 import {
@@ -208,6 +202,7 @@ import {
   longestFrozenRunMs,
   distinctChecksumsInWindow,
 } from "../helpers/frame-liveness";
+import { BUDGET } from "../helpers/rust-mirrored-constants";
 import { waitForServices } from "../helpers/wait-for-services";
 
 // ---------------------------------------------------------------------------
@@ -346,7 +341,7 @@ async function pinReceiverToBaseLayer(page: Page, kind: "video" | "audio" | "scr
 async function joinMeeting(page: Page, meetingId: string, displayName: string): Promise<void> {
   // Pre-join camera AND mic default to OFF (see `load_preferred_camera_on` /
   // `load_preferred_mic_on`, context.rs); force BOTH ON before the app boots so
-  // the publisher emits video AND audio. The audio-ladder / flag-OFF specs read
+  // the publisher emits video AND audio. The audio readout specs read
   // the receiver's AUDIO readout, which stays "Not receiving" forever unless the
   // publisher's mic is actually sending. addInitScript runs on every navigation
   // in this page before the page's own scripts.
@@ -490,8 +485,8 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
     }
 
     // Enable the MIC on the pre-join card too, so the publisher actually sends
-    // audio (the receiver's audio-ladder / flag-OFF readout assertions need a
-    // real decoded audio stream). The persisted `vc_prejoin_mic_on=true` seed
+    // audio (the receiver readout assertions need a real decoded audio stream).
+    // The persisted `vc_prejoin_mic_on=true` seed
     // above is the primary lever; this click is belt-and-suspenders in case the
     // toggle rendered from a stale default before the seed was read. Same
     // `aria-pressed` contract as the camera toggle (pre_join_settings_card.rs).
@@ -720,6 +715,21 @@ async function openPerformancePanel(page: Page) {
  * letter itself is not load-bearing for these tests (the position/count is the
  * 0-based index basis every assertion uses), so we skip past it permissively.
  */
+// The selected peer's NetEq `Packets / s`, `NaN` before its first sample. NetEq
+// samples exist per DECODED-audio peer; `auto_select_peer` picks the sole 1:1 peer.
+async function readNetEqPacketsPerSec(drawer: Locator): Promise<number> {
+  const rows = drawer.locator(".neteq-status .status-secondary .status-row");
+  const count = await rows.count();
+  for (let i = 0; i < count; i++) {
+    const row = rows.nth(i);
+    const label = (await row.locator(".status-row__label").textContent())?.trim();
+    if (label === "Packets / s") {
+      return Number((await row.locator(".status-row__value").textContent())?.trim());
+    }
+  }
+  return NaN;
+}
+
 async function readVideoLayer(
   page: Page,
 ): Promise<{ layerIndex: number; layerCount: number } | null> {
@@ -728,49 +738,6 @@ async function readVideoLayer(
   if (!m) return null;
   return { layerIndex: Number(m[1]) - 1, layerCount: Number(m[2]) };
 }
-
-/**
- * Parse the AUDIO received-quality readout `#perf-vu-recv-audio-readout`.
- *
- * The audio readout format (see `format_readout` in
- * `dioxus-ui/src/components/performance_settings.rs`) is
- * `"{Q} · {idx+1}/{count} · {kbps} kbps"` while receiving (#1222 Directive 4:
- * `{Q}` is the quality letter L/M/H, or "1" single-layer), or "Not receiving"
- * before the first audio frame is decoded.
- *
- * `count` is the LIVE per-snapshot `layer_count` reported by the publisher's
- * audio ladder — this is the only DOM-observable signal of #1082-B (AUDIO went
- * 2 → 3 layers: 24/32/50 kbps). Note the audio *slider* labels intentionally
- * still expose 2 rungs (a product decision in `AUDIO_LAYER_LABELS`); the readout
- * `count`, by contrast, mirrors what the encoder actually emitted, so it is what
- * we assert here.
- *
- * Returns null while the readout reads "Not receiving"; otherwise
- * `{ layerIndex (0-based), layerCount, kbps }`. We skip the leading quality
- * letter + " · " and parse the `{position}/{count} · {kbps} kbps` tail.
- */
-async function readAudioLayer(
-  page: Page,
-): Promise<{ layerIndex: number; layerCount: number; kbps: number } | null> {
-  const text = (await page.locator("#perf-vu-recv-audio-readout").textContent())?.trim() ?? "";
-  const m = text.match(/^\S+\s+·\s+(\d+)\/(\d+)\s+·\s+(\d+)\s+kbps/);
-  if (!m) return null;
-  return {
-    layerIndex: Number(m[1]) - 1,
-    layerCount: Number(m[2]),
-    kbps: Number(m[3]),
-  };
-}
-
-/**
- * The supported AUDIO ladder length after #1082-B (24/32/50 kbps). The readout's
- * reported `layer_count` must never exceed this — a higher value would mean the
- * publisher/receiver ladders silently diverged from the documented #1082 ladder.
- */
-const AUDIO_MAX_SUPPORTED_LAYERS = 3;
-
-/** Per-rung AUDIO bitrates (issue 1768: retuned lighter), lowest layer first (kbps). */
-const AUDIO_LADDER_KBPS = [12, 24, 48] as const;
 
 // ---------------------------------------------------------------------------
 // Suite
@@ -1082,9 +1049,6 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // UN-FIXME rationale matches test #3: the serial-describe + launch-flag
   // renderer mitigation lets the 2-context join survive on CI, and the override
   // forces the multi-layer headroom the layer-down needs.
-  //
-  // Mirrors of dioxus-ui/src/components/decode_budget.rs (keep in sync; same
-  // consts decode-budget.spec.ts pins — a retune there must update both specs).
   // -------------------------------------------------------------------------
   test("local CPU pressure steps the received simulcast layer DOWN (#1569)", async ({
     baseURL,
@@ -1092,17 +1056,10 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_cpu_down_${Date.now()}`;
 
-    // --- Decode-budget loop consts (mirror decode_budget.rs / decode-budget.spec.ts). ---
-    // FPS_SEVERE (12) is the median FPS at/below which a down-step drops MULTIPLE
-    // tiles; LOW_FPS below is kept strictly ABOVE it so the DOWN phase takes
-    // single-tile / single-rung steps (the severe multi-drop is covered by Rust
-    // unit tests, not this timing-sensitive E2E).
-    const FPS_STEP_DOWN = 24; // FPS at/below which the loop considers stepping DOWN
-    const SUSTAIN_SAMPLES = 3; // consecutive 1 Hz samples required before a step
-    const STEP_DOWN_COOLDOWN_MS = 2000; // min ms between two DOWN steps
-    // LOW_FPS sits in the MILD band (above SEVERE=12, below STEP_DOWN=24) so the
-    // DOWN phase takes single-tile / single-rung steps.
-    const LOW_FPS = FPS_STEP_DOWN - 6; // 18: < FPS_STEP_DOWN, > FPS_SEVERE (12)
+    const { FPS_STEP_DOWN, FPS_SEVERE, SUSTAIN_SAMPLES, STEP_DOWN_COOLDOWN_MS } = BUDGET;
+    const LOW_FPS = FPS_STEP_DOWN - 6;
+    // A retune can flip LOW_FPS into the SEVERE band (multi-rung drop).
+    expect(LOW_FPS).toBeGreaterThan(FPS_SEVERE);
     // Slightly above the loop's 1 s bucket cadence so each injection lands in a
     // fresh bucket and accumulates wall-time for the down cooldown.
     const INJECT_INTERVAL_MS = 1200;
@@ -1518,8 +1475,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 
   // -------------------------------------------------------------------------
   // 5. Performance panel renders ALL THREE received-quality controls (#1082).
-  //    #1082 keeps video + content at 3 layers and brings AUDIO to 3 layers
-  //    (24/32/50 kbps). The receive Performance panel must expose a needle gauge
+  //    The receive Performance panel must expose a needle gauge
   //    + Auto toggle + range slider for every kind — video, audio, AND content —
   //    so a user can independently bound each. This is a pure structural
   //    assertion (no capability ceiling dependency): the controls are always
@@ -1611,10 +1567,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         ).toBeAttached();
       }
 
-      // The audio readout must be present and reflect a valid state: either
-      // actively decoding ("{Q} · {i}/{n} · {kbps} kbps" — #1222 quality-letter
-      // format) or the "Not receiving" placeholder before the first audio frame.
-      // (Layer-count content is asserted in the dedicated audio-layering test below.)
+      // The audio readout must be present and reflect a valid state: an em-dash
+      // bitrate while receiving, or the placeholder before the first audio frame.
       await expect(panel.locator("#perf-vu-recv-audio-readout")).toBeVisible();
       await expect
         .poll(
@@ -1624,7 +1578,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
             intervals: [500, 1000, 2000],
           },
         )
-        .toMatch(/^(\S+ · \d+\/\d+ · \d+ kbps|Not receiving)/);
+        .toMatch(/^(—\s+kbps|Not receiving)$/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -1632,22 +1586,176 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 6. AUDIO layering is active under the flag (#1082-B: audio 2 → 3 layers).
-  //    The only DOM-observable signal of audio simulcast is the audio needle
-  //    readout's reported `layer_count` (`{Q} · {i}/{N} · {kbps} kbps`, #1222
-  //    quality-letter format). With the
-  //    flag on and a capable runner, the publisher emits up to 3 audio layers,
-  //    so the receiver's readout `N` rises above 1. As with VIDEO send, a weak
-  //    CI runner's capability ceiling can clamp audio to a single layer — in
-  //    that case we SKIP (a single layer is not a feature failure), but we
-  //    ALWAYS assert the invariant that `N` never exceeds the documented
-  //    3-rung ladder and the reported bitrate is one of {24,32,50} kbps.
+  // 5b. Every received-layer readout agrees on the DENOMINATOR (issue #2343).
   //
-  // FIXME(#1093): multi-party (2-context) — needs a renderer-crash-resilient
-  // runner + a capability-override hook to force >=2 layers. Headless CI crashes
-  // the 2nd context ("Target page/context closed") and clamps audio to 1 layer.
+  // Three surfaces describe one decoded stream in the same open drawer. Before
+  // #2343 the per-peer row resolved `{i}/{n}` against `full_ladder_len`
+  // (`max_layers_for_kind`, 3 for video) while the meter and the diagnostics line
+  // used `snap.layer_count` (what the peer actually publishes) — so the row read
+  // `1/3` beside two `1/1`s. #2343 dropped `peer_row_metric`'s `full_ladder_len`
+  // parameter, and moved `peer_row_aria_label`'s call site to `snap.layer_count`
+  // with it. Restore either and this test goes red at the row.
+  //
+  // The denominators only differ when the peer publishes fewer layers than the
+  // kind ceiling, so this runs on the COMMITTED config (`experimentalSimulcastMaxLayers: 1`)
+  // and asserts both halves before relying on them:
+  //   PREMISE A — the receive slider's `max` is `2` (`top_index(Video)`, a 3-rung
+  //     ladder). A different constant from the old denominator, but the only one
+  //     with a DOM surface; if video is ever cut to 1 rung the way screen was, the
+  //     two denominators converge and this assertion fires instead of going green.
+  //   PREMISE B — the meter denominator is `1` (this peer publishes one layer).
+  //
+  // DO NOT add `enableSimulcastFlag` here. This test sits in the "(flag-on)"
+  // describe only to reuse its serial mode; turning the flag on raises
+  // `layer_count` to 3, collapses the two denominators, and makes the test prove
+  // nothing. PREMISE B fails loudly if that edit is ever made.
+  //
+  // SELECTORS: `diag-simulcast-recv-peer-{sid}` is NOT kind-qualified — the same
+  // session id renders one such div under each of video/audio/screen — so it must
+  // be scoped by its `diag-simulcast-recv-video` ancestor. The row metric has no
+  // testid; it is `span.perf-peer-row__metric`, a direct child of `li.perf-peer-row`.
+  // The per-peer list is behind a `<details>` that mounts collapsed and renders
+  // rows lazily, so the summary must be clicked before any row exists.
   // -------------------------------------------------------------------------
-  test("audio readout reflects the multi-layer ladder when the flag is on", async ({ baseURL }) => {
+  test("every received-layer readout reports the SAME layer denominator (#2343)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_denom_${Date.now()}`;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub-denom@videocall.rs",
+        "SimPublisherDenom",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-rx-denom@videocall.rs",
+        "SimReceiverDenom",
+        uiURL,
+      );
+      // NO enableSimulcastFlag — see the premise note above. The committed
+      // config.js pin of 1 layer is what creates the 1-vs-3 divergence.
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+
+      await joinMeeting(pubPage, meetingId, "SimPublisherDenom");
+      await joinMeeting(rxPage, meetingId, "SimReceiverDenom");
+
+      // The receiver must actually be decoding the publisher before any readout
+      // is meaningful.
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      const drawer = await openPerformancePanel(rxPage);
+
+      // ── PREMISE A: the UI's full video ladder is 3 rungs (the OLD denominator). ─
+      const videoMax = drawer.locator('[data-testid="perf-recv-video-range-max"]');
+      await expect(videoMax).toBeAttached({ timeout: 10_000 });
+      await expect(
+        videoMax,
+        "the video receive ladder must be 3 rungs, or `full_ladder_len` equals " +
+          "`layer_count` and this test cannot discriminate the #2343 fix",
+      ).toHaveAttribute("max", "2");
+
+      // ── PREMISE B: this peer publishes ONE layer (the NEW denominator). ───────
+      // Poll until the meter shows a real decoded layer ("Not receiving" until the
+      // first frame). `readVideoLayer` returns null while the placeholder is up.
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage))?.layerCount ?? null, {
+          timeout: 60_000,
+          intervals: [500, 1000, 2000],
+        })
+        .toBe(1);
+
+      const meterLayer = await readVideoLayer(rxPage);
+      expect(meterLayer, "the video meter readout never reported a decoded layer").not.toBeNull();
+      const denominator = meterLayer!.layerCount;
+
+      // ── SURFACE 2: the diagnostics per-peer line, scoped to the VIDEO block. ──
+      const videoBlock = drawer.locator('[data-testid="diag-simulcast-recv-video"]');
+      await expect(
+        videoBlock,
+        "the diagnostics video block must be rendered before its line is read",
+      ).toBeVisible({ timeout: 30_000 });
+      const diagLine = videoBlock.locator(".simulcast-recv-peer-line").first();
+      await expect(diagLine).toBeVisible({ timeout: 30_000 });
+      const diagText = (await diagLine.textContent())?.trim() ?? "";
+      const diagFraction = diagText.match(/(\d+)\/(\d+)/);
+      expect(
+        diagFraction,
+        `the diagnostics peer line carried no {i}/{n} fraction, got: ${diagText}`,
+      ).not.toBeNull();
+
+      // ── SURFACE 3: the per-peer row inside the receive disclosure. ────────────
+      // The <details> mounts collapsed and builds its rows only once open.
+      const peersSummary = drawer.locator('[data-testid="perf-recv-video-peers-summary"]');
+      await expect(
+        peersSummary,
+        "the video receive per-peer disclosure never rendered (no peer snapshot)",
+      ).toBeVisible({ timeout: 30_000 });
+      await peersSummary.click();
+
+      const peerRow = drawer.locator('li[data-testid^="perf-recv-video-peer-"]').first();
+      await expect(
+        peerRow,
+        "the per-peer row did not render after expanding the disclosure",
+      ).toBeVisible({ timeout: 15_000 });
+
+      const rowMetric = peerRow.locator(".perf-peer-row__metric");
+      await expect(rowMetric).toBeVisible({ timeout: 10_000 });
+      const rowText = (await rowMetric.textContent())?.trim() ?? "";
+      const rowFraction = rowText.match(/(\d+)\/(\d+)/);
+      expect(
+        rowFraction,
+        `the per-peer row metric carried no {i}/{n} fraction, got: ${rowText}`,
+      ).not.toBeNull();
+
+      // ── THE ASSERTION: all three surfaces name the same ladder depth. ─────────
+      // Un-fixed, the row alone reports the compile-time ceiling (3) while the
+      // meter and the diagnostics line report the published depth (1).
+      expect(
+        Number(rowFraction![2]),
+        `the per-peer row says the peer publishes ${rowFraction![2]} layers while the ` +
+          `meter readout says ${denominator}. Both describe the SAME snapshot, so the ` +
+          `row is resolving its denominator against the kind ceiling instead of the ` +
+          `peer's own layer_count (issue #2343). Row: "${rowText}"`,
+      ).toBe(denominator);
+      expect(
+        Number(diagFraction![2]),
+        `the diagnostics peer line says ${diagFraction![2]} layers, the meter says ` +
+          `${denominator}. Diagnostics line: "${diagText}"`,
+      ).toBe(denominator);
+
+      // And the spoken sentence must move with the visible text — `peer_row_aria_label`
+      // is the SECOND call site #2343 re-pointed at `snap.layer_count`, and a screen
+      // reader user would otherwise still hear the stale ceiling.
+      await expect(
+        peerRow,
+        "the row's aria-label must speak the same ladder depth as its visible metric",
+      ).toHaveAttribute("aria-label", new RegExp(`layer \\d+ of ${denominator}\\b`));
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 6. AUDIO publishes ONE layer even with the flag at 3 (issue #2279).
+  //    The DOM-observable signal is the readout's position chip, which
+  //    `layer_position_suffix` suppresses only at one layer.
+  //
+  // ⚠ The flag is set to 3 DELIBERATELY: that is the deployed-cluster value, and
+  // the whole point is that audio no longer reads it. Pinning it to 1 here would
+  // make the assertion pass on the un-fixed code.
+  // -------------------------------------------------------------------------
+  test("audio publishes a single layer with the flag on", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_audio_${Date.now()}`;
 
@@ -1679,46 +1787,27 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         timeout: 30_000,
       });
 
-      await openPerformancePanel(rxPage);
+      const drawer = await openPerformancePanel(rxPage);
 
-      // Poll until the receiver is actually decoding the publisher's AUDIO
-      // (readout leaves the "Not receiving" placeholder).
-      let snapshot: { layerIndex: number; layerCount: number; kbps: number } | null = null;
+      await expect
+        .poll(async () => readNetEqPacketsPerSec(drawer), {
+          timeout: 60_000,
+          intervals: [1000, 2000, 3000],
+          message:
+            "issue 2279: NetEq must report audio packets arriving before the readout " +
+            "shape is asserted — without this the shape assertion also passes on a " +
+            "receiver getting no audio at all",
+        })
+        .toBeGreaterThan(0);
+
+      // Pre-#2279 this same flag rendered `H · 3/3 · 48 kbps`.
       await expect
         .poll(
-          async () => {
-            snapshot = await readAudioLayer(rxPage);
-            return snapshot !== null;
-          },
+          async () =>
+            (await rxPage.locator("#perf-vu-recv-audio-readout").textContent())?.trim() ?? "",
           { timeout: 45_000, intervals: [500, 1000, 2000] },
         )
-        .toBe(true);
-
-      const { layerCount, layerIndex, kbps } = snapshot!;
-
-      // INVARIANT (always holds, even on a single-layer runner): the audio
-      // ladder reported to the receiver must never exceed the documented #1082-B
-      // 3-rung ladder, the selected index must be in range, and the reported
-      // bitrate must be a known rung. This catches a silent publisher/receiver
-      // ladder drift regardless of the capability ceiling.
-      expect(layerCount).toBeGreaterThanOrEqual(1);
-      expect(layerCount).toBeLessThanOrEqual(AUDIO_MAX_SUPPORTED_LAYERS);
-      expect(layerIndex).toBeGreaterThanOrEqual(0);
-      expect(layerIndex).toBeLessThan(layerCount);
-      expect(AUDIO_LADDER_KBPS).toContain(kbps);
-
-      // CAPABILITY CEILING: a weak/containerized CI runner clamps the publisher
-      // to a single audio layer regardless of the flag. That is not a feature
-      // failure — skip the multi-layer assertion (see helpers/simulcast-config.ts).
-      test.skip(
-        layerCount <= 1,
-        `runner capability ceiling clamped audio to ${layerCount} layer(s); ` +
-          "multi-layer audio send cannot be exercised on this runner",
-      );
-
-      // Flag-on success signal for #1082-B: the publisher produced a >1-layer
-      // AUDIO ladder (2 or 3 rungs) and the receiver sees it.
-      expect(layerCount).toBeGreaterThan(1);
+        .toMatch(/^—\s+kbps$/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -2333,8 +2422,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       ).not.toBeNull();
 
       // PHASE 2 — clamp ONLY the degraded receiver's downlink hard enough to
-      // overflow the relay's 128-slot outbound channel (sheds video → loss →
-      // step down). ~120 kbps is far below one HD layer's byte rate.
+      // pass the relay's camera-video byte budget (sheds video → loss → step
+      // down). ~120 kbps is far below one HD layer's byte rate.
       await impairDownlink({ rateKb: 15 });
 
       // PHASE 3 — the degraded receiver's chosen layer must drop strictly BELOW
@@ -2875,8 +2964,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 //   3. relay_layer_filtered_total RISES (receiver published LAYER_PREFERENCE
 //      stepping down → relay layer filter engaged the durable path)
 //   4. ISOLATION: healthy receiver metrics UNCHANGED
-//   5. AUDIO PROTECTION: audio NOT shed (audio always passes the pre-filter)
-//   6. RECOVERY: relay_receiver_downlink_recovered_total RISES after heal
+//   5. RECOVERY: relay_receiver_downlink_recovered_total RISES after heal
 //
 // These tests EXTEND the existing impair harness (same 3-browser topology) but
 // add relay-metric assertions alongside the UI-layer assertions. They are
@@ -3055,26 +3143,6 @@ test.describe("#1219 Half 2 relay-side congestion validation (#1434)", () => {
           "peer's downlink congestion)",
       ).toBeGreaterThan(0);
 
-      // PHASE 3e — AUDIO PROTECTION: audio is NOT shed for the congested receiver.
-      // The audio readout on the degraded page should still report receiving audio
-      // (the Half 2 pre-filter only sheds non-base VIDEO/SCREEN, never AUDIO).
-      // Allow a generous window since audio may briefly blip under heavy loss.
-      await expect
-        .poll(
-          async () => {
-            const audio = await readAudioLayer(degradedPage);
-            return audio !== null;
-          },
-          {
-            timeout: 30_000,
-            intervals: [2000, 3000, 5000],
-            message:
-              "#1434 assertion 4 (audio protection): the degraded receiver must " +
-              "still be receiving AUDIO — the Half 2 shed path protects audio",
-          },
-        )
-        .toBe(true);
-
       // PHASE 4 — RECOVERY: heal the downlink and assert the relay's recovery
       // counter increments (the relief window elapses with no fresh overflow).
       await healDownlink();
@@ -3250,22 +3318,7 @@ test.describe("#1219 Half 2 relay-side congestion validation (#1434)", () => {
         "#1434 WT isolation: healthy receiver must stay above base",
       ).toBeGreaterThan(0);
 
-      // PHASE 3c — AUDIO PROTECTION: degraded receiver still receives audio.
-      await expect
-        .poll(
-          async () => {
-            const audio = await readAudioLayer(degradedPage!);
-            return audio !== null;
-          },
-          {
-            timeout: 30_000,
-            intervals: [2000, 3000, 5000],
-            message: "#1434 WT audio protection: degraded receiver must still receive AUDIO",
-          },
-        )
-        .toBe(true);
-
-      // PHASE 3d — RELAY CONGESTION (soft assertion): check if the WT relay's
+      // PHASE 3c — RELAY CONGESTION (soft assertion): check if the WT relay's
       // congestion counter also rose. Under netsim the loss is client-side, so
       // relay-side congestion detection may not fire (QUIC window may still drain).
       // We log but do NOT hard-fail if it did not rise — the durable path (3a) is
@@ -3520,22 +3573,13 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
       expect(video!.layerCount, "flag-off video must be single-layer").toBe(1);
       expect(video!.layerIndex).toBe(0);
 
-      // AUDIO must likewise be single-layer with the flag off — the #1082-B
-      // 3-rung ladder is gated behind the flag and must not leak into the
-      // default path. The base rung is the lowest (24 kbps).
-      let audio: { layerIndex: number; layerCount: number; kbps: number } | null = null;
       await expect
         .poll(
-          async () => {
-            audio = await readAudioLayer(rxPage);
-            return audio !== null;
-          },
+          async () =>
+            (await rxPage.locator("#perf-vu-recv-audio-readout").textContent())?.trim() ?? "",
           { timeout: 45_000, intervals: [500, 1000, 2000] },
         )
-        .toBe(true);
-      expect(audio!.layerCount, "flag-off audio must be single-layer").toBe(1);
-      expect(audio!.layerIndex).toBe(0);
-      expect(AUDIO_LADDER_KBPS).toContain(audio!.kbps);
+        .toMatch(/^—\s+kbps$/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();

@@ -1,4 +1,48 @@
 services:
+  # LOCAL DEV same-origin edge. Serves the videocall UI and proxies ONLY the
+  # external smatter chat paths (/jmap*, /sse*) under one origin so the smatter
+  # SSE auth cookie (SameSite=Lax; Secure; Path=/sse) is first-party.
+  #
+  # >>> Browse https://meet.localhost (NOT http://localhost:${DIOXUS_SERVE_PORT}) for chat SSE
+  # to work. The external smatter backend must be running on https://127.0.0.1:8443
+  # with enable_sse=true — this stack does NOT start smatter. See docker/Caddyfile.
+  caddy:
+    image: caddy:2
+    # Profile-gated so a normal `docker compose up` / `make up` does NOT start it:
+    # in the combined smatter+videocall dev topology a separately-running host
+    # Caddy already owns :443, and two processes cannot bind the same port. Start
+    # this containerized edge explicitly with `--profile edge` only when you want
+    # it instead of the host Caddy.
+    profiles: ["edge"]
+    ports:
+      - "443:443"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      # External smatter chat backend (host :8443), reached from this container
+      # via the host gateway. Override if smatter listens elsewhere.
+      - SMATTER_UPSTREAM=${SMATTER_UPSTREAM:-host.docker.internal:8443}
+      # videocall app services — reached by Docker SERVICE NAME + CONTAINER port
+      # on the shared compose network (NOT the host-published ports). dioxus-ui
+      # listens on TRUNK_SERVE_PORT (=DIOXUS_SERVE_PORT), meeting-api on its
+      # LISTEN_ADDR :8081, websocket-api on ACTIX_PORT :8080.
+      - UI_UPSTREAM=${UI_UPSTREAM:-dioxus-ui:${DIOXUS_SERVE_PORT:-3001}}
+      - MEETING_API_UPSTREAM=${MEETING_API_UPSTREAM:-meeting-api:8081}
+      - WEBSOCKET_API_UPSTREAM=${WEBSOCKET_API_UPSTREAM:-websocket-api:${ACTIX_PORT:-8080}}
+    extra_hosts:
+      # Lets the container reach the HOST smatter backend (:8443) via the gateway.
+      # App services are reached by service name, not through this.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - dioxus-ui
+      - meeting-api
+      - websocket-api
+
   dioxus-ui:
     volumes:
       - type: bind
@@ -56,7 +100,7 @@ services:
       - OAUTH_PROMPT=${OAUTH_PROMPT:-}
       # Default (unset) ⇒ is_pkce_flow()==false ⇒ server-side confidential flow
       # (UI redirects to meeting-api /login; cookie auth). Set OAUTH_FLOW=pkce in
-      # .env for browser PKCE (public client).
+      # .env for browser PKCE (public client) — required for chat's id_token Bearer.
       - OAUTH_FLOW=${OAUTH_FLOW:-}
       - MOCK_PEERS_ENABLED=${MOCK_PEERS_ENABLED:-false}
     ports:
@@ -211,8 +255,9 @@ services:
       - FEATURE_MEETING_MANAGEMENT=${FEATURE_MEETING_MANAGEMENT:-false}
       - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
     ports:
-      # Host 8096 -> container 8080 (container listens on ACTIX_PORT). Published
-      # on host 8096 to avoid colliding with other local services on :8080/:8086.
+      # Host 8096 → container 8080. Host :8080 is left for cc7's `dx serve`
+      # (smatter's chat.localhost edge expects cc7 there); they collide otherwise.
+      # Remapped 8086→8096 so it doesn't collide with jmap-mail-server (:8086).
       # The meet.localhost Caddy /lobby route proxies to 127.0.0.1:8096.
       - "8096:${ACTIX_PORT:-8080}"
     volumes:
@@ -341,6 +386,9 @@ services:
       - RUST_LOG=debug
       - BOT_CONFIG_PATH=/config/bot-config.yaml
       - INSECURE=true
+      # Same expansion as webtransport-api above, so an override cannot leave the
+      # bot minting tokens under a different secret than the relay verifies with.
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
       - CARGO_TARGET_DIR=/app/bot/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
@@ -443,3 +491,5 @@ volumes:
   rustlemania-bot-cache:
   prometheus_data:
   grafana_data:
+  caddy_data:
+  caddy_config:

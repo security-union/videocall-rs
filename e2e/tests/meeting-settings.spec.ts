@@ -386,7 +386,6 @@ const BROWSER_ARGS = [
   "--ignore-certificate-errors",
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
-  "--disable-gpu",
   "--disable-dev-shm-usage",
   "--renderer-process-limit=1",
 ];
@@ -1078,6 +1077,17 @@ test.describe("Meeting settings – announcement notifications matrix (issue 184
       key: "vc_appearance_exit_sound",
       name: "Participant leaves Sound",
     },
+    // Issue 2329. Sound-only: the row has no Message cell, because the
+    // raised-hands banner is already a persistent room-wide message surface and
+    // is not optional, so a Message switch there would promise control it could
+    // not deliver. Its accessible name composes the same way as the others
+    // (`aria-labelledby="announce-row-hand announce-col-sound"`), which is why
+    // the a11y test needs no special case for it.
+    {
+      testid: "announce-hand-sound",
+      key: "vc_appearance_hand_raise_sound",
+      name: "Hand raised or lowered Sound",
+    },
   ] as const;
 
   test.beforeAll(async () => {
@@ -1136,7 +1146,10 @@ test.describe("Meeting settings – announcement notifications matrix (issue 184
     await expect(page.locator("#settings-panel-preferences")).toBeVisible({ timeout: 5_000 });
   }
 
-  test("renders the 2x2 matrix structure and drops the legacy helper sentences", async ({
+  // Named for the matrix rather than for its shape: issue 2329 made it three
+  // rows and five switches, so a title saying "2x2" would be a false claim in
+  // the one place a reader looks first.
+  test("renders the announcement matrix structure and drops the legacy helper sentences", async ({
     page,
   }) => {
     test.setTimeout(120_000);
@@ -1148,17 +1161,31 @@ test.describe("Meeting settings – announcement notifications matrix (issue 184
     await expect(matrix).toHaveAttribute("role", "group");
     await expect(matrix).toHaveAttribute("aria-label", "Participant announcements");
 
-    // Exactly four channel toggles, one per testid.
-    await expect(matrix.locator('input[type="checkbox"]')).toHaveCount(4);
+    // Exactly one toggle per testid, and no others. FIVE since issue 2329 added
+    // the hand row: two full rows (join, leave) plus a Sound-only third.
+    await expect(matrix.locator('input[type="checkbox"]')).toHaveCount(ANNOUNCE_TOGGLES.length);
     for (const { testid } of ANNOUNCE_TOGGLES) {
       await expect(matrix.locator(`[data-testid="${testid}"]`)).toHaveCount(1);
     }
+
+    // The hand row's Message cell is a decorative placeholder, not a control.
+    // Omitting the cell rather than filling it would slide the Sound switch left
+    // into the Message column of an auto-placed 3-column grid and misalign the
+    // whole row, so its presence is layout-load-bearing.
+    await expect(matrix.locator(".announce-matrix__cell-empty")).toHaveCount(1);
+    await expect(matrix.locator(".announce-matrix__cell-empty")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
 
     // Axis labels carry the per-cell meaning.
     await expect(matrix.locator("#announce-col-message")).toHaveText("Message");
     await expect(matrix.locator("#announce-col-sound")).toHaveText("Sound");
     await expect(matrix.locator("#announce-row-join")).toHaveText("Participant joins");
     await expect(matrix.locator("#announce-row-leave")).toHaveText("Participant leaves");
+    // Named for the STATE CHANGE, not the actor: one switch governs both
+    // directions, so the label has to say it also chimes on the way down.
+    await expect(matrix.locator("#announce-row-hand")).toHaveText("Hand raised or lowered");
 
     // The four pre-1845 helper sentences are gone from the DOM.
     for (const sentence of [
@@ -1180,7 +1207,8 @@ test.describe("Meeting settings – announcement notifications matrix (issue 184
 
     const matrix = page.locator('[data-testid="announce-matrix"]');
 
-    // All four default to checked (enabled).
+    // Every channel defaults to checked (enabled), the hand row included — a
+    // notification feature that ships default-off is invisible.
     for (const { testid } of ANNOUNCE_TOGGLES) {
       await expect(matrix.locator(`[data-testid="${testid}"]`)).toBeChecked();
     }
@@ -1257,7 +1285,10 @@ test.describe("Meeting settings – announcement notifications matrix (issue 184
         help: "announce-help-sound",
         tip: "announce-tip-sound",
         ariaLabel: "About sound announcements",
-        text: "Play a chime when someone joins or leaves.",
+        // Issue 2329 put a third channel under this column, so the tooltip has
+        // to enumerate it — a help text that still said "joins or leaves" would
+        // describe two of the three switches it sits above.
+        text: "Play a chime when someone joins, leaves, or raises their hand.",
       },
     ];
 

@@ -409,5 +409,245 @@ class CensusTest(unittest.TestCase):
         self.assertIn("further signature(s) omitted", c)
 
 
+class FreezeSectionTest(unittest.TestCase):
+    """Each case fails if the production line named in its assertion is reverted."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="freeze-test-")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write_session(self, email, session_ts, lines):
+        path = os.path.join(self.dir, f"{email}_{session_ts}_00001.log.gz")
+        with gzip.open(path, "wt") as fh:
+            fh.write(preamble(email) + "\n")
+            for line in lines:
+                fh.write(line + "\n")
+
+    def section(self, heading, stop):
+        out = subprocess.run(["bash", SCRIPT, self.dir], capture_output=True,
+                             text=True, timeout=300).stdout
+        start = out.find(heading)
+        self.assertNotEqual(start, -1, f"no {heading!r} in output:\n{out[:2000]}")
+        end = out.find(stop, start)
+        return out[start:end if end != -1 else len(out)]
+
+    def freeze(self):
+        return self.section("### Video Freeze Episodes", "### Keyframe Arrivals")
+
+    def keyframes(self):
+        return self.section("### Keyframe Arrivals", "### Layer Gate Skips")
+
+    def gate(self):
+        return self.section("### Layer Gate Skips", "### ProtectiveMode Episodes")
+
+    def protective(self):
+        return self.section("### ProtectiveMode Episodes", "### Peer ID")
+
+    @staticmethod
+    def skip(ts, recv="", pub="", head=1800, dropped=1, escalated="false"):
+        pair = f"{recv}->{pub}"
+        return rec(f"[JITTER_BUFFER] freshness_skip {pair}: head_age={head}ms "
+                   f"tick_gap=10ms dropped={dropped} keyframe_seq=none "
+                   f"(held last-good) escalated={escalated}",
+                   level="warn", ts=ts)
+
+    @staticmethod
+    def arrival(ts, recv="", pub=""):
+        return rec(f"[JITTER_BUFFER] keyframe_arrival {recv}->{pub}: seq=1 "
+                   "head_age=0ms in_keyframe_less_hold=false pli_age=0ms "
+                   "awaiting_proactive=false rejected_as_old=false "
+                   "stream_restart=false", level="warn", ts=ts)
+
+    def cells(self, row):
+        return [c.strip() for c in row.strip().strip("|").split("|")]
+
+    def row_for(self, section, publisher):
+        rows = [ln for ln in section.splitlines()
+                if ln.startswith("|") and not ln.startswith("|---")
+                and not ln.startswith("| Receiver") and f"`{publisher}`" in ln]
+        self.assertEqual(len(rows), 1,
+                         f"want exactly one row for {publisher}, got:\n{section}")
+        return self.cells(rows[0])
+
+    def test_episodes_coalesce_on_the_gap_not_per_skip(self):
+        self.write_session("alice@x.com", "1786546775631", [
+            self.skip("2026-08-28T13:00:00.000Z", "111", "222"),
+            self.skip("2026-08-28T13:00:01.000Z", "111", "222"),
+            self.skip("2026-08-28T13:00:30.000Z", "111", "222"),
+        ])
+        cells = self.row_for(self.freeze(), "222")
+        self.assertEqual(cells[2], "2", "episode coalescing collapsed or split")
+        self.assertEqual(cells[3], "3", "skip count must be every skip")
+
+    def test_an_unparseable_timestamp_is_excluded_and_surfaced(self):
+        good = [self.skip("2026-08-28T13:00:00.000Z", "111", "222"),
+                self.skip("2026-08-28T13:00:01.000Z", "111", "222")]
+        bad = [rec("[JITTER_BUFFER] freshness_skip 111->222: head_age=1800ms "
+                   "tick_gap=10ms dropped=1 keyframe_seq=none (held last-good) "
+                   "escalated=false", level="warn", ts="2026-08-28T13:00:00Z")]
+        self.write_session("alice@x.com", "1786546775631", good + bad)
+        section = self.freeze()
+        self.assertIn("unparseable timestamp", section,
+                      "the excluded line must be surfaced, not silently dropped")
+        cells = self.row_for(section, "222")
+        self.assertEqual(cells[2], "1",
+                         "an epoch-0 line would forge a second episode")
+        self.assertEqual(cells[3], "2", "only the two parseable skips count")
+
+    def test_an_id_less_skip_keeps_its_receiver_and_is_not_merged(self):
+        self.write_session("alice@x.com", "1786546775631",
+                           [self.skip("2026-08-28T13:00:00.000Z")])
+        self.write_session("bob@x.com", "1786546775632",
+                           [self.skip("2026-08-28T13:00:05.000Z")])
+        section = self.freeze()
+        rows = [ln for ln in section.splitlines()
+                if ln.startswith("|") and "`-`" in ln]
+        self.assertEqual(len(rows), 2,
+                         f"two peers must stay two rows, not one:\n{section}")
+        self.assertTrue(any("alice@x.com" in r for r in rows), section)
+        self.assertTrue(any("bob@x.com" in r for r in rows), section)
+
+    def test_id_less_keyframe_arrivals_are_counted_not_dropped(self):
+        # Both ids come from the same SetContext locals as freshness_skip.
+        self.write_session("alice@x.com", "1786546775631", [
+            self.arrival("2026-08-28T13:00:00.000Z", "111", "222"),
+            self.arrival("2026-08-28T13:00:05.000Z", "111", "222"),
+            self.arrival("2026-08-28T13:00:10.000Z"),
+            self.arrival("2026-08-28T13:00:15.000Z"),
+        ])
+        section = self.keyframes()
+        self.assertEqual(self.row_for(section, "222")[2], "2")
+        self.assertEqual(self.row_for(section, "-")[2], "2",
+                         "id-less arrivals must be reported, not dropped")
+
+    def test_layer_gate_takes_the_max_not_the_sum_or_the_last(self):
+        self.write_session("alice@x.com", "1786546775631", [
+            rec("LAYER_GATE_SKIPS session_id=222 video_above=9 audio_above=2",
+                level="info", ts="2026-08-28T13:00:00.000Z"),
+            rec("LAYER_GATE_SKIPS session_id=222 video_above=4 audio_above=1",
+                level="info", ts="2026-08-28T13:00:05.000Z"),
+        ])
+        cells = self.row_for(self.gate(), "222")
+        self.assertEqual(cells[2], "9",
+                         "13 means summed; 4 means last-wins instead of max")
+
+    def test_screen_gate_counters_are_reported(self):
+        # The emitter omits zero fields, so no real corpus can reveal this.
+        self.write_session("alice@x.com", "1786546775631", [
+            rec("LAYER_GATE_SKIPS session_id=222 screen_above=77 screen_below=5",
+                level="info", ts="2026-08-28T13:00:00.000Z"),
+        ])
+        cells = self.row_for(self.gate(), "222")
+        self.assertEqual([cells[4], cells[5]], ["77", "5"],
+                         "screen_above / screen_below dropped from the table")
+
+    def test_no_freshness_skip_reports_none(self):
+        self.write_session("alice@x.com", "1786546775631",
+                           [rec("nothing to see", level="info")])
+        self.assertIn("_None", self.freeze())
+
+    @staticmethod
+    def entered(ts, fps="60.0", longtask="0", buf="900"):
+        return rec(f"ProtectiveMode: ENTERED trigger=audio_buffer median_fps={fps} "
+                   f"longtask_ms_per_sec={longtask} audio_buffer_ms={buf} "
+                   "cap_score=none participants=14", level="warn", ts=ts)
+
+    @staticmethod
+    def emergency(ts, prev, new, buf="900"):
+        return rec(f"ProtectiveMode: EMERGENCY cap {prev}->{new} (speaker-only) "
+                   f"audio_buffer_ms={buf} natural=false", level="warn", ts=ts)
+
+    def pm_row(self, email):
+        rows = [ln for ln in self.protective().splitlines()
+                if ln.startswith("|") and not ln.startswith("|---")
+                and email in ln]
+        self.assertEqual(len(rows), 1, f"want one row for {email}, got {rows}")
+        return self.cells(rows[0])
+
+    def test_renderer_health_reports_the_worst_onset_not_the_last(self):
+        self.write_session("alice@x.com", "1786546775631", [
+            self.entered("2026-08-31T14:00:00.000Z", fps="42.0", longtask="0"),
+            self.entered("2026-08-31T14:01:00.000Z", fps="120.0", longtask="0"),
+        ])
+        cells = self.pm_row("alice@x.com")
+        self.assertEqual(cells[6], "YES (min fps 42, max longtask 0)",
+                         "fps 120 means last-ENTERED-wins instead of worst onset")
+        self.assertEqual(cells[7], "2026-08-31T14:00:00.000Z")
+
+    def test_longtask_from_any_onset_disqualifies_the_healthy_verdict(self):
+        self.write_session("alice@x.com", "1786546775631", [
+            self.entered("2026-08-31T14:00:00.000Z", fps="120.0", longtask="350"),
+            self.entered("2026-08-31T14:01:00.000Z", fps="120.0", longtask="0"),
+        ])
+        self.assertEqual(self.pm_row("alice@x.com")[6],
+                         "no (min fps 120, max longtask 350)",
+                         "a clean later onset must not erase an earlier stall")
+
+    def test_an_unmeasured_onset_cannot_earn_the_healthy_verdict(self):
+        self.write_session("alice@x.com", "1786546775631", [
+            self.entered("2026-08-31T14:00:00.000Z", fps="none", longtask="0"),
+            self.entered("2026-08-31T14:01:00.000Z", fps="60.0", longtask="0"),
+        ])
+        self.assertEqual(self.pm_row("alice@x.com")[6], "unknown",
+                         "YES over an onset whose median_fps was never measured")
+
+    def test_a_bad_onset_still_verdicts_no_on_partial_data(self):
+        self.write_session("alice@x.com", "1786546775631", [
+            self.entered("2026-08-31T14:00:00.000Z", fps="12.0", longtask="none"),
+        ])
+        self.assertEqual(self.pm_row("alice@x.com")[6],
+                         "no (min fps 12, max longtask unknown)",
+                         "fps 12 refutes health regardless of the missing axis")
+
+    def test_absent_audio_buffer_is_not_rendered_as_zero(self):
+        self.write_session("alice@x.com", "1786546775631", [
+            self.entered("2026-08-31T14:00:00.000Z", buf="none"),
+        ])
+        self.assertEqual(self.pm_row("alice@x.com")[5], "-",
+                         "0 conflates 'no data' with a real 0 ms buffer")
+
+    def test_worst_cap_is_the_largest_collapse_not_the_last(self):
+        self.write_session("alice@x.com", "1786546775631", [
+            self.emergency("2026-08-31T14:00:00.000Z", 14, 1),
+            self.emergency("2026-08-31T14:01:00.000Z", 4, 3),
+        ])
+        cells = self.pm_row("alice@x.com")
+        self.assertEqual(cells[4], "`14->1`", "4->3 means last-wins instead of worst")
+        self.assertEqual(cells[3], "2", "emergency caps miscounted")
+
+    def test_no_protective_mode_reports_none(self):
+        self.write_session("alice@x.com", "1786546775631",
+                           [rec("nothing to see", level="info")])
+        self.assertIn("| _none_ |", self.protective())
+
+    def test_verify_reports_every_protective_mode_phrase(self):
+        """The optional loop never sets verify_failed, so registration IS the
+        whole guard: an unregistered phrase is invisible to --verify."""
+        required = [rec(p, level="info", ts="2026-08-31T13:59:00.000Z") for p in (
+            "DIOXUS-UI: Creating VideoCallClient", "Elected connection wt_0:",
+            "Baseline RTT for re-election monitoring: 40",
+            "Applying pending SESSION_ASSIGNED")]
+        self.write_session("alice@x.com", "1786546775631", required + [
+            self.entered("2026-08-31T14:00:00.000Z"),
+            rec("ProtectiveMode: EXITED median_fps=60.0 audio_buffer_ms=100 "
+                "participants=14", level="info", ts="2026-08-31T14:02:00.000Z"),
+            self.emergency("2026-08-31T14:01:00.000Z", 14, 1),
+            rec("ProtectiveMode: audio-driven pressured latch (renderer healthy, "
+                "audio starving) audio_buffer_ms=1200",
+                level="warn", ts="2026-08-31T14:01:30.000Z"),
+        ])
+        r = subprocess.run(["bash", SCRIPT, self.dir, "--verify"],
+                           capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stdout
+        for phrase in ("ProtectiveMode: ENTERED", "ProtectiveMode: EXITED",
+                       "ProtectiveMode: EMERGENCY cap",
+                       "ProtectiveMode: audio-driven pressured latch"):
+            self.assertRegex(out, rf"\[OK\]\s+1 matches: {re.escape(phrase)}\n",
+                             f"{phrase} missing from VERIFY_OPTIONAL")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

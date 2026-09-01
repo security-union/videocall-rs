@@ -20,11 +20,12 @@ pub mod callback;
 pub mod feature_flags;
 pub mod limits;
 pub mod protos;
+pub mod url_log;
 pub mod user_id;
 pub mod validation;
 
 pub use callback::Callback;
-pub use feature_flags::FeatureFlags;
+pub use feature_flags::{FeatureFlags, ResolvedFlag};
 use protobuf::Message;
 pub use user_id::{is_system_user, to_user_id_bytes, user_id_bytes_to_string};
 
@@ -277,6 +278,88 @@ mod video_stats_wire_tests {
             "a pre-#2201 peer must decode as None so the server can OMIT the series rather \
              than publish a 0 that reads as total keyframe delivery loss"
         );
+    }
+
+    /// Issue 2511: fields 11-14 round-trip with explicit presence, and field 14 is a
+    /// VARINT — changing that once clients ship it would require a new field number.
+    #[test]
+    fn freeze_family_round_trips_and_field_14_is_a_varint() {
+        let mut vs = VideoStats::new();
+        vs.freeze_episodes_total = Some(3);
+        vs.freeze_ms_total = Some(7_400);
+        vs.max_decode_gap_ms = Some(5_100);
+        vs.max_content_staleness_ms = Some(0);
+
+        let bytes = vs.write_to_bytes().expect("VideoStats must serialize");
+        let decoded = VideoStats::parse_from_bytes(&bytes).expect("must parse back");
+        assert_eq!(decoded.freeze_episodes_total, Some(3));
+        assert_eq!(decoded.freeze_ms_total, Some(7_400));
+        assert_eq!(decoded.max_decode_gap_ms, Some(5_100));
+        assert_eq!(
+            decoded.max_content_staleness_ms,
+            Some(0),
+            "explicit presence: Some(0) must not collapse to None, or a genuine \
+             'observed, and it was 0' becomes indistinguishable from a pre-2511 client"
+        );
+
+        let mut only_14 = VideoStats::new();
+        only_14.max_content_staleness_ms = Some(4_800);
+        let bytes = only_14.write_to_bytes().expect("VideoStats must serialize");
+        assert_eq!(
+            bytes[0], 0x70,
+            "field 14 must carry wire type 0 (varint); 0x71 means it went back to double"
+        );
+        assert_eq!(
+            bytes.len(),
+            3,
+            "4800 is a 2-byte varint plus 1 tag byte; 9 bytes means a fixed64 double: {bytes:?}"
+        );
+    }
+
+    /// Issue 2524: fields 15-17 round-trip with explicit presence, and a pre-2524 peer decodes
+    /// them as absent so the server omits the series instead of publishing a 0 that reads as
+    /// "no burst" / "never froze".
+    #[test]
+    fn loss_and_freshness_fields_round_trip_with_explicit_presence() {
+        let mut vs = VideoStats::new();
+        vs.max_seq_gap_frames = Some(437);
+        vs.freshness_evictions_total = Some(31);
+        vs.freshness_evictions_keyframeless_total = Some(0);
+
+        let bytes = vs.write_to_bytes().expect("VideoStats must serialize");
+        let decoded = VideoStats::parse_from_bytes(&bytes).expect("must parse back");
+        assert_eq!(decoded.max_seq_gap_frames, Some(437));
+        assert_eq!(decoded.freshness_evictions_total, Some(31));
+        assert_eq!(
+            decoded.freshness_evictions_keyframeless_total,
+            Some(0),
+            "explicit presence: Some(0) must not collapse to None, or 'observed, and it was \
+             0' becomes indistinguishable from a pre-2524 client"
+        );
+
+        let old = VideoStats::new();
+        let old_bytes = old.write_to_bytes().expect("must serialize");
+        let decoded_old = VideoStats::parse_from_bytes(&old_bytes).expect("must parse back");
+        assert_eq!(decoded_old.max_seq_gap_frames, None);
+        assert_eq!(decoded_old.freshness_evictions_total, None);
+        assert_eq!(decoded_old.freshness_evictions_keyframeless_total, None);
+
+        // Tag AND payload: a `sint64` retype keeps the tag, zigzags the payload, and
+        // round-trips cleanly — only pinning the bytes catches it.
+        for (field, want) in [
+            (15u8, vec![0x78u8, 0xB5, 0x03]),
+            (16, vec![0x80, 0x01, 0xB5, 0x03]),
+            (17, vec![0x88, 0x01, 0xB5, 0x03]),
+        ] {
+            let mut only = VideoStats::new();
+            match field {
+                15 => only.max_seq_gap_frames = Some(437),
+                16 => only.freshness_evictions_total = Some(437),
+                _ => only.freshness_evictions_keyframeless_total = Some(437),
+            }
+            let b = only.write_to_bytes().expect("must serialize");
+            assert_eq!(b, want, "field {field} must be tag + varint(437)");
+        }
     }
 }
 

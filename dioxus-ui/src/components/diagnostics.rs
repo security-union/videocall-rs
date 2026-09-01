@@ -63,6 +63,8 @@ struct ReceptionEntry {
     fps: Option<f64>,
     bitrate_kbps: Option<f64>,
     loss_per_sec: Option<f64>,
+    /// Largest confirmed contiguous gap in the window, in FRAMES (#2524).
+    max_gap: Option<u64>,
     kf_req_per_sec: Option<f64>,
     // issue 1656: content staleness (skew-cancelled ms the painted content is
     // behind real-time — #1641's `content_staleness_ms`) and TRUE painted-frame
@@ -91,6 +93,7 @@ fn update_reception(
     let mut fps = None;
     let mut bitrate = None;
     let mut loss = None;
+    let mut max_gap = None;
     let mut kf = None;
     let mut lag = None;
     let mut painted = None;
@@ -101,6 +104,7 @@ fn update_reception(
             ("fps_received", MetricValue::F64(v)) => fps = Some(*v),
             ("bitrate_kbps", MetricValue::F64(v)) => bitrate = Some(*v),
             ("video_seq_loss_per_sec", MetricValue::F64(v)) => loss = Some(*v),
+            ("video_seq_max_gap", MetricValue::U64(v)) => max_gap = Some(*v),
             ("keyframe_requests_per_sec", MetricValue::F64(v)) => kf = Some(*v),
             // issue 1656: worker `"video"` event metrics (content staleness is
             // #1641's `content_staleness_ms`).
@@ -132,6 +136,9 @@ fn update_reception(
     }
     if let Some(v) = loss {
         entry.loss_per_sec = Some(v);
+    }
+    if let Some(v) = max_gap {
+        entry.max_gap = Some(v);
     }
     if let Some(v) = kf {
         entry.kf_req_per_sec = Some(v);
@@ -195,10 +202,11 @@ fn render_reception(map: &BTreeMap<(String, String), ReceptionEntry>) -> Option<
         // SUM, ~52 for an 8fps 3-rung camera.) Still a decode-CALL count, not a paint
         // count — `FPS(painted)` below is the paint-truthful one.
         text.push_str(&format!(
-            "Peer: {peer} ({kind})\nFPS(decoded): {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nStale: {} ms\nTimestamp: {}s\n\n",
+            "Peer: {peer} ({kind})\nFPS(decoded): {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nMax gap: {} frames\nKeyframe requests: {}/s\nStale: {} ms\nTimestamp: {}s\n\n",
             fmt1(e.fps_painted),
             fmt1(e.bitrate_kbps),
             fmt1(e.loss_per_sec),
+            e.max_gap.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
             fmt1(e.kf_req_per_sec),
             fmt0(e.content_staleness_ms),
             e.last_ts_ms / 1000,
@@ -2413,7 +2421,11 @@ fn SimulcastReceiveBreakdown(
                             .map(|p| p.snap.layer_index)
                             .max()
                             .unwrap_or(0);
-                        let spread = if lo_idx == hi_idx {
+                        // A one-rung ladder has no position to report, so the
+                        // spread and the tail label are omitted entirely.
+                        let spread = if count <= 1 {
+                            String::new()
+                        } else if lo_idx == hi_idx {
                             layer_quality_label(lo_idx, count, true).to_string()
                         } else {
                             format!(
@@ -2422,8 +2434,11 @@ fn SimulcastReceiveBreakdown(
                                 layer_quality_label(hi_idx, count, true)
                             )
                         };
-                        // Full quality word for the "+N more" tail (e.g. "Low").
-                        let tail_label = layer_quality_label(lo_idx, count, false);
+                        let tail_label = if count <= 1 {
+                            String::new()
+                        } else {
+                            layer_quality_label(lo_idx, count, false).to_string()
+                        };
                         // Sort by layer DESC (highest quality first) — top-3 shown.
                         kind_peers.sort_by_key(|p| std::cmp::Reverse(p.snap.layer_index));
                         let extra = n.saturating_sub(3);
@@ -2514,11 +2529,16 @@ fn SimulcastReceiveBreakdown(
                                                             };
                                                             let letter = layer_quality_label(layer_id, recv_count, true);
                                                             let led_label = if on { "receiving" } else { "not receiving" };
+                                                            let led_aria = if recv_count <= 1 {
+                                                                led_label.to_string()
+                                                            } else {
+                                                                format!("{letter} layer {led_label}")
+                                                            };
                                                             rsx! {
                                                                 span {
                                                                     class: led_class,
                                                                     "data-testid": "diag-simulcast-recv-led-{kind_label}-{session_id}-{layer_id}",
-                                                                    "aria-label": "{letter} layer {led_label}",
+                                                                    "aria-label": "{led_aria}",
                                                                     title: "{letter} · {led_label}",
                                                                 }
                                                             }
@@ -2728,6 +2748,10 @@ mod tests {
             text.contains("Keyframe requests: -/s"),
             "keyframe placeholder: {text}"
         );
+        assert!(
+            text.contains("Max gap: - frames"),
+            "gap placeholder: {text}"
+        );
     }
 
     /// Anti-flap regression (user-reported): the heartbeat event (fps/bitrate)
@@ -2778,6 +2802,31 @@ mod tests {
             text.matches("Peer: ").count(),
             1,
             "one merged block: {text}"
+        );
+    }
+
+    /// #2524: the burst SIZE renders as a count, visible when the rate reads 0.
+    #[test]
+    fn reception_renders_max_gap_alongside_the_capped_rate() {
+        let mut map = BTreeMap::new();
+        let evt = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_500_000,
+            metrics: vec![
+                m("media_type", MetricValue::Text("VIDEO".into())),
+                m("to_peer", MetricValue::Text("peer-abc".into())),
+                m("video_seq_loss_per_sec", MetricValue::F64(0.0)),
+                m("video_seq_max_gap", MetricValue::U64(437)),
+                m("keyframe_requests_per_sec", MetricValue::F64(0.5)),
+            ],
+        };
+        assert!(update_reception(&mut map, &evt), "keyed event must fold");
+        let text = render_reception(&map).expect("non-empty map");
+        assert!(text.contains("Loss: 0.0/s"), "capped line present: {text}");
+        assert!(
+            text.contains("Max gap: 437 frames"),
+            "burst size present: {text}"
         );
     }
 

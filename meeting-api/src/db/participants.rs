@@ -393,14 +393,14 @@ pub async fn transfer_host(
         return Ok(None);
     }
 
-    // Promote the target (must be an admitted participant). If it matches no
-    // row, roll back — which also undoes the demote above, so the caller keeps
-    // host and the meeting is never left without one.
+    // Promote the target (must be an admitted, non-guest participant). If it
+    // matches no row, roll back — which also undoes the demote above, so the
+    // caller keeps host and the meeting is never left without one.
     let promote_query = format!(
         r#"
         UPDATE meeting_participants
         SET is_host = TRUE, updated_at = NOW()
-        WHERE meeting_id = $1 AND user_id = $2 AND status = 'admitted'
+        WHERE meeting_id = $1 AND user_id = $2 AND status = 'admitted' AND is_guest = FALSE
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );

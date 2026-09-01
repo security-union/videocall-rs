@@ -13,7 +13,7 @@ Synthetic bot that streams real VP9 video and Opus audio to videocall-rs meeting
 - **Broadcaster/observer mode**: first N participants send A/V, rest are receive-only observers
 - **Warmup period**: configurable silence before conversation starts (one-time, no gap on loop)
 - **50-participant manifest**: 20 named characters + 30 observer slots
-- **JWT authentication**: mints per-client JWTs when `jwt_secret` is configured
+- **JWT authentication**: mints per-client JWTs from `jwt_secret` / `JWT_SECRET`
 
 ## Prerequisites
 
@@ -111,7 +111,7 @@ video_mode: costume               # "costume" or "ekg"
 broadcasters: 5                   # first 5 send A/V, rest observe (0 = all broadcast)
 warmup_secs: 15                   # silence before conversation starts
 ramp_up_delay_ms: 500
-jwt_secret: "your-base64-secret"
+jwt_secret: "your-base64-secret"   # or set JWT_SECRET in the environment
 token_ttl_secs: 86400
 ```
 
@@ -229,12 +229,18 @@ On the remote machine:
 | `video_mode` | no | `"ekg"` | `"costume"` (recorded clips) or `"ekg"` (waveform) |
 | `broadcasters` | no | `0` | First N send A/V, rest observe (0 = all broadcast) |
 | `warmup_secs` | no | `15` | Seconds of silence before conversation starts |
-| `jwt_secret` | no | — | HMAC secret for JWT auth |
+| `jwt_secret` | yes\*\* | — | HMAC secret for JWT auth. Falls back to `JWT_SECRET` |
 | `token_ttl_secs` | no | `86400` | JWT token lifetime in seconds |
+| `allow_deprecated_path` | no | `false` | Opt in to the deprecated unauthenticated join. Env: `BOT_ALLOW_DEPRECATED_PATH` |
 | `ramp_up_delay_ms` | no | `1000` | Delay between starting each client |
 | `insecure` | no | `false` | Skip TLS cert verification (WT only) |
 
 \* At least one of `ws_url` / `wt_url` required, or use legacy `transport` + `server_url`.
+
+\*\* Since issue #2298 the bot refuses to start without a credential. Supply
+`jwt_secret` (or `JWT_SECRET`), or set `allow_deprecated_path: true` to keep using
+the unauthenticated `/lobby/{user_id}/{room}` join — which any relay running with
+`FEATURE_MEETING_MANAGEMENT` enabled rejects.
 
 CLI arguments:
 

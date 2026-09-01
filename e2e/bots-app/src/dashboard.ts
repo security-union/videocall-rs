@@ -120,6 +120,50 @@ export interface DashboardServerHandle {
   close(): Promise<void>;
 }
 
+/** `none` is a user-initiated load (typed URL, bookmark); a page cannot produce it. */
+const SAME_ORIGIN_FETCH_SITES = new Set(["same-origin", "none"]);
+
+/** Serialized `URL.hostname` forms — `[::ffff:127.0.0.1]` arrives as `[::ffff:7f00:1]`. */
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "[::1]", "[::ffff:7f00:1]"]);
+
+/** Unparseable — the opaque `"null"` of a sandboxed frame included — is not loopback. */
+export function isLoopbackOrigin(origin: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  if (LOOPBACK_HOSTNAMES.has(parsed.hostname)) return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(parsed.hostname);
+}
+
+/** Node joins a duplicated header with commas; stringifying keeps that unparseable. */
+function headerValue(raw: string | string[] | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const value = String(raw).trim();
+  return value === "" ? undefined : value.toLowerCase();
+}
+
+/**
+ * CSRF gate for `/api/*` (#2211): rejection reason, or `null` to allow. Both signals
+ * are checked independently, and neither is settable by page script. Absent BOTH is
+ * deliberately allowed — that is a non-browser caller (curl, a probe), and a browser
+ * page cannot suppress `Sec-Fetch-Site`.
+ */
+export function crossOriginRejection(headers: IncomingMessage["headers"]): string | null {
+  const site = headerValue(headers["sec-fetch-site"]);
+  if (site !== undefined && !SAME_ORIGIN_FETCH_SITES.has(site)) {
+    return `sec-fetch-site: ${site}`;
+  }
+  const origin = headerValue(headers["origin"]);
+  if (origin !== undefined && !isLoopbackOrigin(origin)) {
+    return `origin: ${origin}`;
+  }
+  return null;
+}
+
 /**
  * Spin up the dashboard's Node-side HTTP listener. Binds to
  * `127.0.0.1` only — never exposed over the network. Three classes
@@ -175,6 +219,16 @@ async function handleRequest(
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const { pathname } = url;
   const method = req.method ?? "GET";
+
+  // 0. Gate all of /api/* before any dispatch — the proxy attaches the ctl bearer
+  // token downstream (#2211). Static stays outside: a cross-site link must still open.
+  if (pathname.startsWith("/api/")) {
+    const rejection = crossOriginRejection(req.headers);
+    if (rejection !== null) {
+      sendJson(res, 403, { error: `cross-origin /api request rejected (${rejection})` });
+      return;
+    }
+  }
 
   // 1. Locally-synthesized endpoints. These never reach the ctl API.
   if (method === "GET" && pathname === "/api/daemon") {

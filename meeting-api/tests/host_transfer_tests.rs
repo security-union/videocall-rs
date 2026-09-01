@@ -624,3 +624,65 @@ async fn eohl_off_sole_host_leave_keeps_meeting_alive() {
 
     cleanup_test_data(&pool, room_id).await;
 }
+
+/// Issue #2331: `transfer_host` must refuse a guest target on its own, not only
+/// via the route handler's `guest:` prefix check, and roll back the demote so a
+/// refused transfer never leaves the meeting hostless.
+#[tokio::test]
+#[serial]
+async fn transfer_host_refuses_a_guest_target_and_the_demote_rolls_back() {
+    let pool = get_test_pool().await;
+    let room_id = "test-2331-transfer-host-to-guest";
+    cleanup_test_data(&pool, room_id).await;
+
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("POST", "/api/v1/meetings", HOST)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "meeting_id": room_id,
+                "attendees": [],
+                "allow_guests": true,
+                "waiting_room_enabled": false
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+    join(&pool, room_id, HOST).await;
+
+    let app = build_app(pool.clone());
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/meetings/{room_id}/join-guest"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"display_name":"Guest"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    let guest_id = body.result.user_id;
+    assert_eq!(body.result.status, "admitted");
+
+    let meeting = db_meetings::get_by_room_id(&pool, room_id)
+        .await
+        .unwrap()
+        .expect("meeting exists");
+    let transferred = db_participants::transfer_host(&pool, meeting.id, HOST, &guest_id)
+        .await
+        .expect("transfer_host query should not error");
+
+    assert!(
+        transferred.is_none(),
+        "an admitted guest must not be promotable to host"
+    );
+    assert!(
+        fetch_is_host(&pool, room_id, HOST).await,
+        "the refused transfer must roll back the demote so the meeting keeps its host"
+    );
+    assert!(
+        !fetch_is_host(&pool, room_id, &guest_id).await,
+        "the guest must not hold is_host"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}

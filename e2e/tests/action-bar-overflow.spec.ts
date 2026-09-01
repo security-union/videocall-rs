@@ -176,15 +176,13 @@ test.describe("Action bar overflow menu", () => {
       hasText: /Chat/i,
     });
 
-    // If Chat is in the overflow, click it and verify the sidebar opens.
-    // If Chat is NOT in the overflow at this width (unlikely at 400px but
-    // possible depending on priority order), skip gracefully.
-    if ((await chatItem.count()) > 0) {
-      await chatItem.click();
-      await expect(page.locator("#chat-sidebar")).toHaveClass(/visible/, { timeout: 5_000 });
-    } else {
-      test.skip();
-    }
+    // At 400px `action_bar_overflow_hidden` fits ZERO secondary slots (budget
+    // 34.8px < the 49.6px button), so EVERY non-sacred slot is in the overflow
+    // regardless of priority order — Chat's presence here is deterministic.
+    await expect(chatItem).toHaveCount(1);
+
+    await chatItem.click();
+    await expect(page.locator("#chat-sidebar")).toHaveClass(/visible/, { timeout: 5_000 });
   });
 
   // -- Escape closes the overflow popover ----------------------------------

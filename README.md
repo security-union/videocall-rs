@@ -348,7 +348,7 @@ the relay then fans each selected layer out per receiver.
 
 ### Local/Docker: start-dioxus.sh
 
-`docker/start-dioxus.sh` generates `/app/dioxus-ui/scripts/config.js` from environment variables at container startup. For the current list of supported variables and defaults, refer directly to `docker/start-dioxus.sh`. Restart the container to apply changes.
+`docker/start-dioxus.sh` generates the gitignored `/app/dioxus-ui/scripts/config.local.js` from environment variables at container startup, leaving the tracked `config.js` alone. For the current list of supported variables and defaults, refer directly to `docker/start-dioxus.sh`. Restart the container to apply changes.
 
 ### Kubernetes/Helm: configmap-configjs.yaml
 

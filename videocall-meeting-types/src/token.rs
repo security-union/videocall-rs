@@ -35,7 +35,8 @@ use serde::{Deserialize, Serialize};
 ///   "display_name": "Alice",
 ///   "observer": false,
 ///   "exp": 1707004800,
-///   "iss": "videocall-meeting-backend"
+///   "iss": "videocall-meeting-backend",
+///   "typ": "room_access"
 /// }
 /// ```
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -77,15 +78,41 @@ pub struct RoomAccessTokenClaims {
 
     /// Issuer identifier. Always `"videocall-meeting-backend"`.
     pub iss: String,
+
+    /// Token-type discriminator (#2411); `None` predates the claim. See [`check_token_type`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typ: Option<String>,
 }
 
 impl RoomAccessTokenClaims {
     /// The expected issuer value for tokens produced by the Meeting Backend.
     pub const ISSUER: &'static str = "videocall-meeting-backend";
+
+    /// The expected `typ` value; `meeting-api`'s `SessionTokenClaims` uses `"session"`.
+    pub const TOKEN_TYPE: &'static str = "room_access";
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Outcome of comparing a token's `typ` claim against the expected type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenTypeCheck {
+    Match,
+    Legacy,
+    Mismatch { found: String },
+}
+
+/// Classify a token's `typ` claim against `expected`.
+pub fn check_token_type(typ: Option<&str>, expected: &str) -> TokenTypeCheck {
+    match typ {
+        None => TokenTypeCheck::Legacy,
+        Some(found) if found == expected => TokenTypeCheck::Match,
+        Some(found) => TokenTypeCheck::Mismatch {
+            found: found.to_string(),
+        },
+    }
 }
 
 /// Prefix used for guest participant user IDs: `"guest:{uuid}"`.
@@ -94,3 +121,69 @@ fn default_true() -> bool {
 /// prefix, so any code that receives a user ID can distinguish guests from
 /// authenticated users without inspecting the `is_guest` flag.
 pub const GUEST_USER_ID_PREFIX: &str = "guest:";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXPECTED: &str = RoomAccessTokenClaims::TOKEN_TYPE;
+
+    #[test]
+    fn check_token_type_classifies_all_three_outcomes() {
+        assert_eq!(
+            check_token_type(Some(EXPECTED), EXPECTED),
+            TokenTypeCheck::Match
+        );
+        assert_eq!(check_token_type(None, EXPECTED), TokenTypeCheck::Legacy);
+        assert_eq!(
+            check_token_type(Some("session"), EXPECTED),
+            TokenTypeCheck::Mismatch {
+                found: "session".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn room_and_session_type_values_differ() {
+        assert_ne!(RoomAccessTokenClaims::TOKEN_TYPE, "session");
+    }
+
+    #[test]
+    fn absent_typ_deserialises_as_legacy() {
+        let legacy = r#"{
+            "sub": "alice@test.com",
+            "room": "room-1",
+            "room_join": true,
+            "is_host": false,
+            "display_name": "Alice",
+            "exp": 1707004800,
+            "iss": "videocall-meeting-backend"
+        }"#;
+
+        let claims: RoomAccessTokenClaims = serde_json::from_str(legacy).expect("must deserialise");
+        assert_eq!(claims.typ, None);
+        assert_eq!(
+            check_token_type(claims.typ.as_deref(), EXPECTED),
+            TokenTypeCheck::Legacy
+        );
+    }
+
+    #[test]
+    fn none_typ_is_omitted_from_the_wire() {
+        let claims = RoomAccessTokenClaims {
+            sub: "alice@test.com".to_string(),
+            room: "room-1".to_string(),
+            room_join: true,
+            is_host: false,
+            is_guest: false,
+            display_name: "Alice".to_string(),
+            observer: false,
+            end_on_host_leave: true,
+            exp: 1707004800,
+            iss: RoomAccessTokenClaims::ISSUER.to_string(),
+            typ: None,
+        };
+
+        assert!(!serde_json::to_string(&claims).unwrap().contains("typ"));
+    }
+}

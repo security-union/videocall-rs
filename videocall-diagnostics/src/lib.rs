@@ -54,7 +54,7 @@ pub enum MetricValue {
     ///
     /// Holds a [`Cow<'static, str>`] so static string literals (e.g. the
     /// `"webtransport"` / `"websocket"` / `"unknown"` `peer_transport` labels
-    /// emitted at ~2 Hz per peer in `broadcast_peer_status`) can be stored as
+    /// emitted at ~0.2 Hz per peer in `broadcast_peer_status`) can be stored as
     /// [`Cow::Borrowed`] with **zero heap allocation** per emit, while dynamic
     /// or computed strings stay [`Cow::Owned`].
     ///

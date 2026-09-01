@@ -14,12 +14,13 @@ path = "examples/test_health_publisher.rs"
 
 [dependencies]
 videocall-types = { path = "../videocall-types" }
+videocall-meeting-types = { path = "../videocall-meeting-types", features = ["mint"] }
 web-transport-quinn = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
 tokio = { version = "1", features = ["full"] }
 protobuf = "=3.7.2"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = { workspace = true }
 log = "0.4"
 env_logger = "0.11"

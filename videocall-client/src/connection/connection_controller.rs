@@ -525,12 +525,16 @@ impl Drop for ConnectionController {
     }
 }
 
+// wasm32 because both tests construct a real `ConnectionController`, which
+// drives `Connection::connect()` into the browser transport constructors. They
+// use `#[wasm_bindgen_test]`: a plain `#[test]` here runs nowhere (#2446).
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
     use super::super::connection_manager::SessionIdHistory;
     use super::*;
     use std::sync::{Arc, Mutex};
     use videocall_types::Callback;
+    use wasm_bindgen_test::wasm_bindgen_test;
 
     // Test helper to capture state changes
     #[derive(Debug, Clone)]
@@ -588,7 +592,7 @@ mod tests {
         Rc::new(Aes128State::from_vecs(key, iv, true))
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn test_connection_controller_creation() {
         let state_capture = StateCapture::new();
         let options = create_test_options(&state_capture);
@@ -599,7 +603,7 @@ mod tests {
         // Just testing that creation works without panicking
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn test_connection_controller_delegation() {
         let state_capture = StateCapture::new();
         let options = create_test_options(&state_capture);

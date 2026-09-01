@@ -14,7 +14,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use crate::constants::meeting_api_client;
+use crate::meeting_api::JoinError;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::ParticipantStatusResponse;
 use wasm_bindgen::JsCast;
@@ -22,6 +22,10 @@ use web_sys::HtmlAudioElement;
 
 /// Polling interval in milliseconds for the safety-net timer.
 const POLL_INTERVAL_MS: i32 = 10_000;
+
+/// Log one error per this many consecutive unauthenticated polls (~1/minute at
+/// [`POLL_INTERVAL_MS`]).
+const POLL_AUTH_ERROR_EVERY: u32 = 6;
 
 pub type WaitingParticipant = ParticipantStatusResponse;
 
@@ -54,7 +58,7 @@ pub fn HostControls(
                     }
                     Err(e) => {
                         log::warn!("Failed to fetch waiting room: {e}");
-                        error.set(Some(e));
+                        error.set(Some(e.to_string()));
                     }
                 }
             });
@@ -86,7 +90,7 @@ pub fn HostControls(
                     }
                     Err(e) => {
                         log::warn!("Failed to fetch waiting room: {e}");
-                        error.set(Some(e));
+                        error.set(Some(e.to_string()));
                     }
                 }
             });
@@ -98,9 +102,11 @@ pub fn HostControls(
     // attendees who joined the waiting room before the host's observer
     // WebSocket was connected (NATS event lost).
     let poll_interval_id: Rc<Cell<i32>> = use_hook(|| Rc::new(Cell::new(-1)));
+    let poll_auth_failures: Rc<Cell<u32>> = use_hook(|| Rc::new(Cell::new(0)));
     {
         let meeting_id = meeting_id.clone();
         let poll_interval_id = poll_interval_id.clone();
+        let poll_auth_failures = poll_auth_failures.clone();
         use_effect(move || {
             if !is_admitted {
                 return;
@@ -113,8 +119,10 @@ pub fn HostControls(
             log::info!("HostControls: starting polling safety net (every {POLL_INTERVAL_MS}ms)");
 
             let meeting_id = meeting_id.clone();
+            let poll_auth_failures = poll_auth_failures.clone();
             let poll_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
                 let meeting_id = meeting_id.clone();
+                let poll_auth_failures = poll_auth_failures.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     match fetch_waiting(&meeting_id).await {
                         Ok(w) => {
@@ -126,9 +134,10 @@ pub fn HostControls(
                             prev_waiting_count.set(new_count);
                             waiting.set(w);
                             error.set(None);
+                            poll_auth_failures.set(0);
                         }
                         Err(e) => {
-                            log::warn!("HostControls poll: failed to fetch waiting room: {e}");
+                            report_poll_failure(&poll_auth_failures, &e);
                         }
                     }
                 });
@@ -333,38 +342,77 @@ fn play_knock_sound() {
     }
 }
 
-async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, String> {
-    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
-    match client.get_waiting_room(meeting_id).await {
-        Ok(response) => Ok(response.waiting),
-        Err(videocall_meeting_client::ApiError::NotFound(_)) => Ok(Vec::new()),
-        Err(e) => Err(format!("{e}")),
+/// Whether the `n`th consecutive unauthenticated poll gets an error line.
+/// Periodic, not first-only: a long outage must never fall permanently silent.
+fn should_report_auth_failure(n: u32) -> bool {
+    n % POLL_AUTH_ERROR_EVERY == 1
+}
+
+/// Report a poll failure. An unauthenticated one means the waiting list has
+/// stopped updating, so it is an error, rate-limited by
+/// [`should_report_auth_failure`] and reset by the next successful poll.
+fn report_poll_failure(consecutive_auth_failures: &Cell<u32>, e: &JoinError) {
+    if !matches!(e, JoinError::NotAuthenticated) {
+        log::warn!("HostControls poll: failed to fetch waiting room: {e}");
+        return;
+    }
+    let n = consecutive_auth_failures.get().saturating_add(1);
+    consecutive_auth_failures.set(n);
+    if should_report_auth_failure(n) {
+        log::error!(
+            "HostControls poll: waiting room unauthenticated ({n} consecutive); \
+             host controls are not updating: {e}"
+        );
     }
 }
 
+async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, JoinError> {
+    crate::meeting_api::get_waiting_room(meeting_id).await
+}
+
 async fn admit_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
-    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
-    client
-        .admit_participant(meeting_id, user_id)
+    crate::meeting_api::admit_participant(meeting_id, user_id)
         .await
-        .map(|_| ())
         .map_err(|e| format!("{e}"))
 }
 
 async fn reject_participant(meeting_id: &str, user_id: &str) -> Result<(), String> {
-    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
-    client
-        .reject_participant(meeting_id, user_id)
+    crate::meeting_api::reject_participant(meeting_id, user_id)
         .await
-        .map(|_| ())
         .map_err(|e| format!("{e}"))
 }
 
 async fn admit_all_participants(meeting_id: &str) -> Result<(), String> {
-    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
-    client
-        .admit_all(meeting_id)
+    crate::meeting_api::admit_all(meeting_id)
         .await
-        .map(|_| ())
         .map_err(|e| format!("{e}"))
+}
+
+#[cfg(test)]
+mod poll_failure_tests {
+    use super::*;
+
+    /// Issue #2291: 77 consecutive unauthenticated polls were rendered as warn
+    /// noise.
+    #[test]
+    fn auth_failure_reporting_is_periodic_and_never_silent() {
+        assert!(should_report_auth_failure(1), "first failure must report");
+        let reported: Vec<u32> = (1..=80)
+            .filter(|n| should_report_auth_failure(*n))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![1, 7, 13, 19, 25, 31, 37, 43, 49, 55, 61, 67, 73, 79]
+        );
+    }
+
+    #[test]
+    fn only_unauthenticated_failures_advance_the_counter() {
+        let counter = Cell::new(0u32);
+        report_poll_failure(&counter, &JoinError::NotFound("gone".into()));
+        assert_eq!(counter.get(), 0);
+        report_poll_failure(&counter, &JoinError::NotAuthenticated);
+        report_poll_failure(&counter, &JoinError::NotAuthenticated);
+        assert_eq!(counter.get(), 2);
+    }
 }

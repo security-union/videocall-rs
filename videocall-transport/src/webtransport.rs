@@ -199,10 +199,8 @@ fn configure_incoming_datagram_queue(datagrams: &WebTransportDatagramDuplexStrea
 /// (teardown vs. saturation) and are consumed by independent AQ windows.
 static UNISTREAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
-// Indexed by `MediaStreamKey::as_u8()` (0..=4; slot 0 unused, keys 1..=4).
-// Keep this hand-maintained size above the declared max in videocall-client;
-// unknown larger keys remain aggregate-only.
-const PERSISTENT_STREAM_COUNTER_SLOTS: usize = 5;
+// Indexed by `MediaStreamKey::as_u8()`; slot 0 unused so a key indexes itself.
+const PERSISTENT_STREAM_COUNTER_SLOTS: usize = videocall_types::limits::MEDIA_STREAM_COUNTER_SLOTS;
 
 static UNISTREAM_DROP_COUNT_BY_STREAM: [AtomicU64; PERSISTENT_STREAM_COUNTER_SLOTS] = [
     AtomicU64::new(0),
@@ -217,7 +215,7 @@ fn stream_counter(
     stream_key: u8,
 ) -> Option<&AtomicU64> {
     match stream_key {
-        1..=4 => counters.get(usize::from(stream_key)),
+        1..=videocall_types::limits::MAX_MEDIA_STREAM_KEY => counters.get(usize::from(stream_key)),
         _ => None,
     }
 }

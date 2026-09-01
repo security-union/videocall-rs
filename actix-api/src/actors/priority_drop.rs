@@ -55,7 +55,7 @@
 //!
 //! The decision is per-session: no global state is introduced, and the
 //! drop policy is identical for the WebTransport and WebSocket transports.
-//! Both call into [`evaluate`] with their own resolved channel capacity.
+//! WT calls [`evaluate`]; WS calls [`evaluate_dual`] (#2261).
 //!
 //! ### Why drop at the enqueue site instead of inside the bridge?
 //!
@@ -320,6 +320,24 @@ pub fn evaluate(
     free_capacity: usize,
     total_capacity: usize,
 ) -> PriorityDropDecision {
+    evaluate_dual(priority, free_capacity, total_capacity, 0, 0)
+}
+
+fn dimension_fill(used: usize, budget: usize) -> f32 {
+    if budget == 0 {
+        return 0.0;
+    }
+    used as f32 / budget as f32
+}
+
+/// Sheds on `max(slot_fill, byte_fill)`; `byte_budget == 0` gives [`evaluate`].
+pub fn evaluate_dual(
+    priority: OutboundPriority,
+    free_capacity: usize,
+    total_capacity: usize,
+    queued_bytes: usize,
+    byte_budget: usize,
+) -> PriorityDropDecision {
     // Critical and Control never preempt — they admit and let
     // `try_send` fail naturally on actual overflow.
     if matches!(
@@ -329,13 +347,12 @@ pub fn evaluate(
         return PriorityDropDecision::Admit;
     }
 
-    if total_capacity == 0 {
+    if total_capacity == 0 && byte_budget == 0 {
         return PriorityDropDecision::Admit;
     }
-    let used = total_capacity.saturating_sub(free_capacity);
-    // f32 is sufficient — we are comparing against constants with two
-    // significant digits of precision (0.80, 0.95).
-    let fill_ratio = used as f32 / total_capacity as f32;
+    let used_slots = total_capacity.saturating_sub(free_capacity);
+    let fill_ratio =
+        dimension_fill(used_slots, total_capacity).max(dimension_fill(queued_bytes, byte_budget));
 
     match priority {
         OutboundPriority::Audio => {
@@ -376,6 +393,73 @@ pub fn evaluate(
         }
     }
 }
+
+/// Live byte occupancy PER MEDIA KIND: `mpsc` reports free SLOTS only, and a
+/// presenter's screen bytes must not be charged against the camera budget.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QueueByteMeter {
+    video: usize,
+    screen: usize,
+    other: usize,
+}
+
+impl QueueByteMeter {
+    pub fn queued_for(&self, priority: OutboundPriority) -> usize {
+        match priority {
+            OutboundPriority::Video => self.video,
+            OutboundPriority::Screen => self.screen,
+            OutboundPriority::Audio | OutboundPriority::Critical | OutboundPriority::Control => {
+                self.other
+            }
+        }
+    }
+
+    /// Every byte in the queue, all kinds summed.
+    pub fn queued_total(&self) -> usize {
+        self.video + self.screen + self.other
+    }
+
+    pub fn on_enqueue(&mut self, priority: OutboundPriority, len: usize) {
+        let bucket = self.bucket_mut(priority);
+        *bucket = bucket.saturating_add(len);
+    }
+
+    /// Saturating: a lost pairing must under-report, never wrap to "full".
+    pub fn on_dequeue(&mut self, priority: OutboundPriority, len: usize) {
+        let bucket = self.bucket_mut(priority);
+        *bucket = bucket.saturating_sub(len);
+    }
+
+    fn bucket_mut(&mut self, priority: OutboundPriority) -> &mut usize {
+        match priority {
+            OutboundPriority::Video => &mut self.video,
+            OutboundPriority::Screen => &mut self.screen,
+            OutboundPriority::Audio | OutboundPriority::Critical | OutboundPriority::Control => {
+                &mut self.other
+            }
+        }
+    }
+}
+
+/// Stable `kind` label for the per-kind byte gauge, one per bucket.
+pub fn queue_byte_kind_label(priority: OutboundPriority) -> &'static str {
+    match priority {
+        OutboundPriority::Video => "video",
+        OutboundPriority::Screen => "screen",
+        OutboundPriority::Audio | OutboundPriority::Critical | OutboundPriority::Control => "other",
+    }
+}
+
+/// Every value [`queue_byte_kind_label`] can return, for gauge sweeps.
+pub const QUEUE_BYTE_KINDS: &[&str] = &["video", "screen", "other"];
+
+/// One representative priority per [`QUEUE_BYTE_KINDS`] bucket. The gauge emit
+/// loop iterates THIS, so it cannot silently stop emitting a bucket.
+pub const QUEUE_BYTE_KIND_PRIORITIES: &[OutboundPriority] = &[
+    OutboundPriority::Video,
+    OutboundPriority::Screen,
+    OutboundPriority::Audio,
+];
 
 #[cfg(test)]
 mod tests {
@@ -943,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn ws_128_thresholds_make_sense() {
+    fn thresholds_make_sense_at_128_slots() {
         // 128 slots: video starts dropping at ~102 used, audio at ~122.
         let total = 128usize;
 
@@ -1371,5 +1455,135 @@ mod tests {
             before_free,
             "evaluate must be side-effect-free"
         );
+    }
+
+    #[test]
+    fn video_sheds_on_bytes_even_when_slots_are_nearly_empty() {
+        assert_eq!(
+            evaluate_dual(OutboundPriority::Video, 1_014, 1_024, 800_000, 1_000_000),
+            PriorityDropDecision::Drop {
+                reason: "priority_drop_video"
+            },
+        );
+        assert_eq!(
+            evaluate_dual(OutboundPriority::Video, 1_014, 1_024, 799_000, 1_000_000),
+            PriorityDropDecision::Admit,
+        );
+    }
+
+    #[test]
+    fn slot_dimension_still_sheds_when_bytes_are_negligible() {
+        assert_eq!(
+            evaluate_dual(OutboundPriority::Audio, 40, 1_024, 98_400, 1_000_000),
+            PriorityDropDecision::Drop {
+                reason: "priority_drop_audio"
+            },
+        );
+    }
+
+    #[test]
+    fn zero_byte_budget_preserves_pure_slot_behaviour() {
+        let total = 100;
+        for priority in [
+            OutboundPriority::Critical,
+            OutboundPriority::Control,
+            OutboundPriority::Audio,
+            OutboundPriority::Video,
+            OutboundPriority::Screen,
+        ] {
+            for used in 0..=total {
+                let free = total - used;
+                assert_eq!(
+                    evaluate_dual(priority, free, total, usize::MAX, 0),
+                    slot_only_expectation(priority, used, total),
+                    "priority {priority:?} at {used}/{total} must be unchanged \
+                     by a disabled byte dimension",
+                );
+            }
+        }
+    }
+
+    /// The pre-#2261 decision, written out independently of the code under test.
+    fn slot_only_expectation(
+        priority: OutboundPriority,
+        used: usize,
+        total: usize,
+    ) -> PriorityDropDecision {
+        let fill = used as f32 / total as f32;
+        match priority {
+            OutboundPriority::Critical | OutboundPriority::Control => PriorityDropDecision::Admit,
+            OutboundPriority::Audio if fill >= 0.95 => PriorityDropDecision::Drop {
+                reason: "priority_drop_audio",
+            },
+            OutboundPriority::Video if fill >= 0.80 => PriorityDropDecision::Drop {
+                reason: "priority_drop_video",
+            },
+            OutboundPriority::Screen if fill >= 0.90 => PriorityDropDecision::Drop {
+                reason: "priority_drop_video",
+            },
+            _ => PriorityDropDecision::Admit,
+        }
+    }
+
+    #[test]
+    fn byte_dimension_never_sheds_control_or_critical() {
+        for priority in [OutboundPriority::Critical, OutboundPriority::Control] {
+            assert_eq!(
+                evaluate_dual(priority, 0, 1_024, usize::MAX, 1_000),
+                PriorityDropDecision::Admit,
+                "{priority:?} must be admitted at any fill on either dimension",
+            );
+        }
+    }
+
+    #[test]
+    fn queue_byte_meter_tracks_enqueue_and_drain() {
+        let mut meter = QueueByteMeter::default();
+        assert_eq!(meter.queued_total(), 0);
+        meter.on_enqueue(OutboundPriority::Video, 1_000);
+        meter.on_enqueue(OutboundPriority::Video, 500);
+        assert_eq!(meter.queued_for(OutboundPriority::Video), 1_500);
+        meter.on_dequeue(OutboundPriority::Video, 1_000);
+        assert_eq!(meter.queued_for(OutboundPriority::Video), 500);
+        meter.on_dequeue(OutboundPriority::Video, 500);
+        assert_eq!(meter.queued_for(OutboundPriority::Video), 0);
+        meter.on_dequeue(OutboundPriority::Video, 9_999);
+        assert_eq!(meter.queued_for(OutboundPriority::Video), 0);
+    }
+
+    #[test]
+    fn queue_byte_meter_keeps_the_kinds_apart() {
+        let mut meter = QueueByteMeter::default();
+        meter.on_enqueue(OutboundPriority::Screen, 55_287);
+        meter.on_enqueue(OutboundPriority::Audio, 100);
+        // Screen and audio bytes must not reach the camera bucket.
+        assert_eq!(meter.queued_for(OutboundPriority::Video), 0);
+        assert_eq!(meter.queued_for(OutboundPriority::Screen), 55_287);
+        assert_eq!(meter.queued_for(OutboundPriority::Audio), 100);
+        assert_eq!(meter.queued_for(OutboundPriority::Control), 100);
+        assert_eq!(meter.queued_total(), 55_387);
+    }
+
+    #[test]
+    fn queue_byte_kind_label_covers_every_bucket() {
+        use std::collections::HashSet;
+        let expected: HashSet<&str> = QUEUE_BYTE_KINDS.iter().copied().collect();
+        let from_variants: HashSet<&str> = [
+            OutboundPriority::Video,
+            OutboundPriority::Screen,
+            OutboundPriority::Audio,
+            OutboundPriority::Critical,
+            OutboundPriority::Control,
+        ]
+        .into_iter()
+        .map(queue_byte_kind_label)
+        .collect();
+        assert_eq!(from_variants, expected);
+        let from_emit_set: HashSet<&str> = QUEUE_BYTE_KIND_PRIORITIES
+            .iter()
+            .copied()
+            .map(queue_byte_kind_label)
+            .collect();
+        assert_eq!(from_emit_set, expected);
     }
 }

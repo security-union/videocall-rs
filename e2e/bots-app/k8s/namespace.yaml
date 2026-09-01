@@ -5,12 +5,9 @@
 # need for per-pod tc/netem in a later increment (one reason the fleet gets its
 # own dedicated namespace rather than borrowing a shared one). The ResourceQuota
 # keeps the fleet a good neighbor on the shared cluster, well under its free
-# headroom. Sizing target: ~20 bots. The binding constraint is limits.cpu vs
-# the pod's 4-CPU limit (bot-pod.yaml raised it to 4 so CFS throttling can't
-# self-induce a false RESOURCE_STARVED verdict): 96 / 4 = 24 pods, comfortably
-# above the ~20-bot target. The other quotas admit at least that many
-# (requests.cpu 48 / 1500m = 32; limits.memory 96Gi / 2Gi = 48; pods = 48), so
-# limits.cpu is what to raise for a bigger fleet.
+# headroom. Sizing target: ~20 bots; limits.cpu against the pod's own limit is
+# the binding constraint. src/k8s-resources.drift.test.ts pins every ratio here
+# against the pod manifests, so a half-applied raise fails the build.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -27,9 +24,8 @@ metadata:
 spec:
   hard:
     requests.cpu: "48"
-    # 96 / 4-CPU pod limit = 24 pods, >= the ~20-bot target + a coexisting Inc-1
-    # pod. This is the binding constraint; raise it (and pods) to grow the fleet.
-    limits.cpu: "96" # headroom: 20 fleet bots x4 (80) + a coexisting Inc-1 pod (4) = 84, under 96 with slack
+    # 20 bots x8 + an Inc-1 pod + netem DS (7x100m) + conductor = 169.2.
+    limits.cpu: "176"
     requests.memory: 64Gi
     limits.memory: 96Gi
     # 20 fleet bots + ~1 per-node netem-preload DS pod (they share THIS quota,

@@ -17,7 +17,7 @@ set -e
 # Prerequisites:
 #   - kubectl configured for the target cluster
 #   - helm available
-#   - helm/global/us-east/postgres/charts/postgresql-18.1.3.tgz present (committed to repo)
+#   - network access to the PostgreSQL chart repository
 #
 # Usage:
 #   export KUBECONFIG=~/videocall-us-east-kubeconfig.yaml
@@ -34,7 +34,7 @@ echo ""
 
 # ── Preflight checks ────────────────────────────────────────────────────────
 
-for cmd in kubectl helm; do
+for cmd in kubectl helm jq; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "❌ $cmd not found in PATH"
     exit 1
@@ -102,23 +102,18 @@ echo ""
 
 echo "3. Deploying PostgreSQL into ${NAMESPACE}"
 
-CHART_DIR="helm/global/us-east/postgres"
-
-# The chart dependency tgz is committed to the repo; fail early if somehow missing
-if ! ls "${CHART_DIR}/charts/postgresql-"*.tgz &>/dev/null 2>&1; then
-  echo "❌ Helm chart dependency missing: ${CHART_DIR}/charts/postgresql-*.tgz"
-  echo "   Re-run: git submodule update --init (or restore charts/ from git)"
-  exit 1
-fi
-echo "   Chart dependency present: $(ls ${CHART_DIR}/charts/postgresql-*.tgz)"
+CHART_DIR="helm/videocall-postgres"
+CLUSTER_VALUES="helm/global/us-east/postgres/values.yaml"
+./scripts/build-videocall-postgres-dependencies.sh "${CHART_DIR}" >/dev/null
 
 if helm list -n "${NAMESPACE}" | grep -q "^postgres"; then
   echo "   PostgreSQL is already deployed — skipping"
-  echo "   To upgrade: helm upgrade postgres helm/global/us-east/postgres/ -n ${NAMESPACE} -f <values>"
+  echo "   To upgrade: helm upgrade postgres ${CHART_DIR} -n ${NAMESPACE} -f ${CLUSTER_VALUES}"
 else
   echo "   Installing PostgreSQL..."
   helm install postgres "${CHART_DIR}" \
     --namespace "${NAMESPACE}" \
+    -f "${CLUSTER_VALUES}" \
     --set postgresql.auth.existingSecret=postgres-credentials \
     --set postgresql.auth.secretKeys.adminPasswordKey=postgres-password \
     --set postgresql.auth.secretKeys.userPasswordKey=password \

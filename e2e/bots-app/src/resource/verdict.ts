@@ -186,6 +186,11 @@ export interface ResourceVerdict {
   cpuStarved: boolean;
   /** Whether the FPS-below-base-rung rule fired. */
   fpsStarved: boolean;
+  /**
+   * The run produced nothing to judge, so neither starved nor healthy is
+   * supportable. Never set together with `starved`.
+   */
+  noEvidence: boolean;
 }
 
 /**
@@ -201,10 +206,17 @@ export interface ResourceVerdict {
  *     verdict).
  *
  * The two rules are independent — either alone marks the run RESOURCE_STARVED.
+ *
+ * When NEITHER fires, the healthy reading still has to be earned: with no
+ * derived samples, or with join tracking reporting zero joined bots, the
+ * verdict is `noEvidence` rather than clean. `joinedBots === null` means joins
+ * were not tracked for this receipt, which cannot support that conclusion
+ * either way.
  */
 export function evaluateVerdict(
   samples: readonly DerivedSample[],
   fpsByBot: ReadonlyMap<string, FpsStats>,
+  joinedBots: number | null = null,
   opts: VerdictOptions = {},
 ): ResourceVerdict {
   const cpuThreshold = opts.cpuThresholdPct ?? RESOURCE_CPU_STARVED_PCT;
@@ -231,7 +243,20 @@ export function evaluateVerdict(
     }
   }
 
-  return { starved: cpuStarved || fpsStarved, reasons, cpuStarved, fpsStarved };
+  const starved = cpuStarved || fpsStarved;
+  let noEvidence = false;
+  if (!starved) {
+    if (samples.length === 0) {
+      noEvidence = true;
+      reasons.push("no resource samples were derived, so the box was never measured");
+    }
+    if (joinedBots === 0) {
+      noEvidence = true;
+      reasons.push("no bot was observed to join, so nothing loaded the box");
+    }
+  }
+
+  return { starved, reasons, cpuStarved, fpsStarved, noEvidence };
 }
 
 /**

@@ -436,8 +436,8 @@ pub fn non_distress_growth_qualifying(samples: &[BudgetSample], n: usize) -> boo
 /// (`state.cap < target`, the up-cooldown has elapsed, and
 /// [`non_distress_growth_qualifying`] is true). The fourth, `emergency_now`, is
 /// the stage-4 protective EMERGENCY flag — i.e. [`protective_emergency_cap`]
-/// would return `Some(MIN_CAP)` this tick (protective mode active AND audio
-/// still growing past [`PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS`]).
+/// would return `Some(MIN_CAP)` this tick (protective mode active AND the audio
+/// buffer past [`PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS`]).
 ///
 /// ## Why `emergency_now` MUST veto growth (the flap this closes)
 ///
@@ -681,6 +681,39 @@ pub fn next_layer_drop_ms(prev_last_layer_drop_ms: f64, now: f64, stepped: bool)
 pub fn re_arm_cascade_after_recovery(state: &mut BudgetState, now: f64) {
     state.layers_at_floor = false;
     state.last_layer_drop_ms = now;
+}
+
+/// Which budget-loop state this tick must reset (#2271). Two scopes, deliberately
+/// not merged: the cascade's at-floor flag and settle clock are RELAY-SESSION
+/// scoped with no other exit path, while every [`DistressSignals`] input behind the
+/// #1558 protective latch is DEVICE-local, so a network event must not clear it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetResetActions {
+    pub rearm_cascade: bool,
+    pub clear_protective: bool,
+}
+
+/// A `None` on either side never counts as a change: a cold start and a busy
+/// `inner` borrow both read `None`. See [`advance_observed_session`].
+pub fn budget_reset_actions(
+    natural: usize,
+    prev_natural: usize,
+    session: Option<u64>,
+    prev_session: Option<u64>,
+) -> BudgetResetActions {
+    let peers_reset = natural <= MIN_CAP && prev_natural > MIN_CAP;
+    let session_changed = match (session, prev_session) {
+        (Some(current), Some(previous)) => current != previous,
+        _ => false,
+    };
+    BudgetResetActions {
+        rearm_cascade: peers_reset || session_changed,
+        clear_protective: peers_reset,
+    }
+}
+
+pub fn advance_observed_session(prev_session: Option<u64>, session: Option<u64>) -> Option<u64> {
+    session.or(prev_session)
 }
 
 /// The cap to PIN on a [`CascadeAction::LowerLayer`] outcome (issue #1557 BLOCKER
@@ -1025,6 +1058,106 @@ pub fn merge_pinned_decode(
     }
 }
 
+/// The LOCAL decode gate and the REMOTE viewport filter, each `Some` only when its
+/// own input changed.
+#[derive(Debug, Default, PartialEq)]
+pub struct DecodePublishPlan {
+    pub decode: Option<std::collections::HashSet<u64>>,
+    pub viewport: Option<Vec<String>>,
+}
+
+/// Each set deduped against its OWN previous value: keying the viewport's dedup off
+/// the decode set would strand a stale viewport at the relay across a layout change.
+pub fn plan_decode_publish(
+    previous_decode: &std::collections::HashSet<u64>,
+    active_decode_set: &std::collections::HashSet<u64>,
+    previous_layout_roster: &[String],
+    layout_roster: &[String],
+) -> DecodePublishPlan {
+    DecodePublishPlan {
+        decode: (previous_decode != active_decode_set).then(|| active_decode_set.clone()),
+        viewport: (previous_layout_roster != layout_roster).then(|| layout_roster.to_vec()),
+    }
+}
+
+use videocall_client::TileHint;
+
+/// Device-pixel tile height published for an on-screen-but-not-decoded tile, to floor
+/// its received video at layer 0. Must be non-zero: `size_cap_layer` reads `0` as "size
+/// unknown" and returns `highest_available`, which is no lid at all.
+pub const AVATAR_TILE_HINT_PX: u32 = 1;
+
+/// Build the per-peer size-lid hint map (#1256) over the peers the relay is FORWARDING,
+/// not just the ones being decoded.
+///
+/// An on-screen-but-not-decoded tile with no entry resolves to [`TileHint::Uncapped`],
+/// which emits no advertise entry, so the relay stays
+/// fail-open and forwards the whole ladder — the downlink flood the decode-budget clamp is
+/// supposed to be relieving. Such peers are floored at [`AVATAR_TILE_HINT_PX`].
+///
+/// `uncapped` names peers exempt from any lid (the pin and the active screen sharer).
+pub fn build_peer_tile_hints(
+    viewport_sessions: &[u64],
+    decoded_sessions: &std::collections::HashSet<u64>,
+    uncapped: &[u64],
+    tile_device_px_h: Option<u32>,
+) -> std::collections::HashMap<u64, TileHint> {
+    viewport_sessions
+        .iter()
+        .chain(decoded_sessions.iter())
+        .copied()
+        .collect::<std::collections::BTreeSet<u64>>()
+        .into_iter()
+        .map(|sid| {
+            let hint = if uncapped.contains(&sid) {
+                TileHint::Uncapped
+            } else if !decoded_sessions.contains(&sid) {
+                TileHint::Capped {
+                    device_px_h: AVATAR_TILE_HINT_PX,
+                }
+            } else {
+                match tile_device_px_h {
+                    Some(h) => TileHint::Capped { device_px_h: h },
+                    None => TileHint::Uncapped,
+                }
+            };
+            (sid, hint)
+        })
+        .collect()
+}
+
+/// Session_ids to publish as the relay's `VIEWPORT` filter.
+///
+/// Grid path: the whole rendered tile list, so an avatar-tier tile the decode budget
+/// paused still keeps its publisher forwarded. `+N`-overflow peers are already absent
+/// from that list.
+///
+/// Screen-share path: `ss_viewport_tiles`, unchanged from before this fix. The SS panel
+/// renders every participant behind a vertical scroll, so its render list is NOT an
+/// on-screen set and publishing it would disable the filter for the whole share.
+pub fn viewport_roster(
+    has_screen_share: bool,
+    unified_tiles: &[(String, TileRenderMode)],
+    ss_viewport_tiles: &[String],
+) -> Vec<String> {
+    // Mock tiles (`mock-N`) publish nothing and do not parse; dropping them yields an
+    // EMPTY roster the relay fails open on, not an unparseable one.
+    let numeric = |id: &String| id.parse::<u64>().is_ok();
+    if has_screen_share {
+        return ss_viewport_tiles
+            .iter()
+            .filter(|id| numeric(id))
+            .cloned()
+            .collect();
+    }
+    unified_tiles
+        .iter()
+        .map(|(id, _)| id)
+        .filter(|id| numeric(id))
+        .cloned()
+        .collect()
+}
+
 /// Promote user-requested ("PLAY") peers that are still ranked beyond the
 /// decoded window INWARD into decoded slots, so they render live instead of
 /// decoded-but-shown-paused (issues #1466 / #1286).
@@ -1291,9 +1424,7 @@ pub fn build_unified_render_list(
 /// Presenter-aware decode-shed factor (issue #1559).
 ///
 /// While the LOCAL user is screen-sharing, the sharer's CPU is split between the
-/// heavy screen ENCODE (which since #1554 seeds the screen ladder at two rungs
-/// including the 1080p `high` rung) and every concurrent WebCodecs peer-video
-/// DECODE. In a large meeting (~15 peers) the decode load starves the screen
+/// heavy screen ENCODE and every concurrent WebCodecs peer-video DECODE. In a large meeting (~15 peers) the decode load starves the screen
 /// encoder, so the shared screen's bitrate/FPS collapses (~3x worse than a
 /// 7-peer call on the same machine — the #1562 audit). Freeing CPU from peer
 /// decodes is the higher-leverage lever than per-peer resolution because decode
@@ -1555,9 +1686,7 @@ pub const PROTECTIVE_LONGTASK_DISTRESS_MS_PER_SEC: f64 = 500.0;
 pub const PROTECTIVE_AUDIO_BUFFER_DISTRESS_MS: f64 = 500.0;
 
 /// Per-peer audio-buffer depth (ms) above which the EMERGENCY stage (stage 4)
-/// fires: audio is STILL growing past a higher water mark even after stages 1-3
-/// (layers → pause → encoder self-shed). At this point ALL non-speaker video
-/// decode is paused to protect audio. Strictly above
+/// fires: ALL non-speaker video decode is paused to protect audio. Strictly above
 /// [`PROTECTIVE_AUDIO_BUFFER_DISTRESS_MS`] so the emergency is a distinct, worse
 /// condition than mere entry-level distress (hysteresis between stages).
 ///
@@ -1842,13 +1971,11 @@ pub fn protective_encoder_layer_ceiling(
 /// The EMERGENCY decode cap protective mode forces this tick — the step-4
 /// "pause ALL non-speaker video decode" lever (issue #1558 item 5).
 ///
-/// Returns `Some(MIN_CAP)` ONLY when protective mode is active AND audio is STILL
-/// growing past [`PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS`] after stages 1-3 — i.e.
-/// every cheaper lever (received layers, tile pause, encoder self-shed) has fired
-/// and audio is still losing. Flooring the cap at [`MIN_CAP`] leaves exactly ONE
-/// decoded tile, which the caller's `promote_speakers` fills with the active
-/// speaker — so the speaker's video survives the emergency and every other
-/// non-speaker tile is paused to protect audio.
+/// Returns `Some(MIN_CAP)` when protective mode is active AND the observed audio
+/// buffer is past [`PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS`]. Flooring the cap at
+/// [`MIN_CAP`] leaves exactly ONE decoded tile, which the caller's
+/// `promote_speakers` fills with the active speaker; every other non-speaker tile
+/// is paused to protect audio.
 ///
 /// Returns `None` (no emergency clamp) otherwise, so the cap recovers via the
 /// normal cascade/growth path once audio drains — the stage reverses on recovery.
@@ -1864,10 +1991,10 @@ pub fn protective_emergency_cap(
     if !active {
         return None;
     }
-    let still_growing = max_peer_audio_buffer_ms
+    let over_emergency_mark = max_peer_audio_buffer_ms
         .map(|buf| buf > PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS)
         .unwrap_or(false);
-    if still_growing {
+    if over_emergency_mark {
         Some(MIN_CAP)
     } else {
         None
@@ -1952,6 +2079,102 @@ mod tests {
 
     // Far enough in the past that BOTH the down and up cooldowns have elapsed.
     const PAST_COOLDOWN: f64 = STEP_UP_COOLDOWN_MS + 1.0;
+
+    // ---- Issue #2271: budget-loop reset scoping ------------------------------
+
+    /// Deleting the session term restores the pre-fix gate and FAILS this.
+    #[test]
+    fn session_change_re_arms_cascade_when_peer_count_rises() {
+        assert!(budget_reset_actions(49, 46, Some(2), Some(1)).rearm_cascade);
+    }
+
+    /// A PROCEEDED re-election mints a new session on RTT degradation with the device
+    /// unchanged. Clearing the protective latch there would zero
+    /// `PROTECTIVE_EXIT_RECOVERY` ticks of asymmetric exit hysteresis.
+    #[test]
+    fn proceeded_re_election_re_arms_cascade_but_spares_protective_state() {
+        let actions = budget_reset_actions(46, 46, Some(2), Some(1));
+        assert!(actions.rearm_cascade);
+        assert!(
+            !actions.clear_protective,
+            "protective state is DEVICE scoped; a session change must not clear it"
+        );
+    }
+
+    /// The last remote peer leaving is the only reset the latch honours (#1558).
+    #[test]
+    fn peer_set_reset_clears_both_halves() {
+        let actions = budget_reset_actions(MIN_CAP, 5, Some(1), Some(1));
+        assert!(actions.rearm_cascade);
+        assert!(actions.clear_protective);
+    }
+
+    #[test]
+    fn cold_start_resets_nothing() {
+        assert_eq!(
+            budget_reset_actions(12, 12, Some(1), None),
+            BudgetResetActions {
+                rearm_cascade: false,
+                clear_protective: false
+            }
+        );
+    }
+
+    /// #1700 re-election abort/fallback: guards were not snapped, so at-floor holds.
+    #[test]
+    fn same_session_re_emit_resets_nothing() {
+        assert_eq!(
+            budget_reset_actions(46, 46, Some(1), Some(1)),
+            BudgetResetActions {
+                rearm_cascade: false,
+                clear_protective: false
+            }
+        );
+    }
+
+    #[test]
+    fn busy_session_read_neither_fires_nor_clears_the_watermark() {
+        assert!(!budget_reset_actions(46, 46, None, Some(1)).rearm_cascade);
+        assert_eq!(advance_observed_session(Some(1), None), Some(1));
+        assert_eq!(advance_observed_session(Some(1), Some(2)), Some(2));
+        assert_eq!(advance_observed_session(None, Some(1)), Some(1));
+    }
+
+    #[test]
+    fn re_armed_cascade_routes_next_down_edge_to_lower_layer() {
+        let mut state = BudgetState {
+            cap: MIN_CAP,
+            last_step_ms: 1_000.0,
+            direction_hold: 0,
+            last_layer_drop_ms: 1_000.0,
+            layers_at_floor: true,
+        };
+        let now = 1_000.0 + STEP_DOWN_COOLDOWN_MS + 1.0;
+        assert_eq!(
+            cascade_action(
+                true,
+                state.layers_at_floor,
+                settle_window_elapsed(now, state.last_layer_drop_ms)
+            ),
+            CascadeAction::PauseTiles,
+            "precondition: stale at-floor state escalates straight to PauseTiles"
+        );
+
+        re_arm_cascade_after_recovery(&mut state, now);
+
+        assert_eq!(
+            cascade_action(
+                true,
+                state.layers_at_floor,
+                settle_window_elapsed(now, state.last_layer_drop_ms)
+            ),
+            CascadeAction::LowerLayer
+        );
+        assert_eq!(
+            state.cap, MIN_CAP,
+            "the cap is the actuator's, not session-derived"
+        );
+    }
 
     #[test]
     fn step_down_on_sustained_low_fps() {
@@ -4430,7 +4653,7 @@ mod tests {
     // stepping 2→1 by severity, never below the base layer, and `None` when
     // inactive so the user's ceiling rules), and the emergency cap
     // (`protective_emergency_cap`: floors at MIN_CAP — the speaker tile — only
-    // while audio is still growing, `None` otherwise so it reverses on recovery).
+    // while the audio buffer is over the mark, `None` otherwise so it reverses).
 
     /// `in_distress` truth table: each trigger flips the predicate INDEPENDENTLY,
     /// the all-clear set is false, and every `None` sub-signal is conservative
@@ -4677,7 +4900,7 @@ mod tests {
     /// instead of the EMERGENCY mark) fires it too early. The boundary case pins
     /// the exact threshold. Expected values are independent literals.
     #[test]
-    fn protective_emergency_floors_cap_only_while_audio_still_growing() {
+    fn protective_emergency_floors_cap_only_while_audio_is_over_the_mark() {
         // Inactive ⇒ never an emergency clamp, even with a huge buffer.
         assert_eq!(
             protective_emergency_cap(false, Some(PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS + 500.0)),
@@ -4691,12 +4914,12 @@ mod tests {
             None,
             "audio exactly at the emergency mark is not ABOVE it ⇒ no emergency yet"
         );
-        // Active AND audio still growing past the emergency mark ⇒ floor the cap
+        // Active AND audio past the emergency mark ⇒ floor the cap
         // at MIN_CAP (one tile, filled by the active speaker).
         assert_eq!(
             protective_emergency_cap(true, Some(PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS + 1.0)),
             Some(MIN_CAP),
-            "active + audio still growing floors the cap to the speaker tile"
+            "active + audio over the mark floors the cap to the speaker tile"
         );
         // A None buffer reading cannot trigger the emergency (conservative).
         assert_eq!(
@@ -4740,7 +4963,7 @@ mod tests {
         );
 
         let emergency_cap = protective_emergency_cap(active, audio)
-            .expect("active + audio still growing ⇒ the emergency cap");
+            .expect("active + audio over the mark ⇒ the emergency cap");
         assert!(
             emergency_cap >= MIN_CAP,
             "the emergency decode cap never starves the active-speaker slot (>= MIN_CAP)"
@@ -4918,5 +5141,248 @@ mod tests {
         let join_times = std::collections::HashMap::new();
         let result = build_unified_render_list(&[], &[], &[], &join_times);
         assert!(result.is_empty());
+    }
+
+    fn roster(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// Drives the real EMERGENCY path. Returns `(layout_roster, active_decode_set)`.
+    fn emergency_latched(
+        ids: &[&str],
+        pinned_idx: Option<usize>,
+        requested: &std::collections::HashSet<String>,
+    ) -> (Vec<String>, std::collections::HashSet<u64>) {
+        let layout = roster(ids);
+        let emergency =
+            protective_emergency_cap(true, Some(PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS + 100.0))
+                .expect("protective mode past the emergency mark must clamp the cap");
+        let cap = effective_cap(
+            crate::context::DecodeBudgetOverride::Auto,
+            true,
+            layout.len(),
+            emergency,
+            None,
+        );
+        assert_eq!(cap, MIN_CAP, "the emergency clamp must reach the floor");
+        let mut all_tiles = layout.clone();
+        let decoded_bucket =
+            build_decoded_bucket(&mut all_tiles, cap, layout.len(), pinned_idx, requested);
+        let mut active = decoded_bucket.clone();
+        if let Some(idx) = pinned_idx {
+            let pinned: u64 = layout[idx].parse().unwrap();
+            merge_pinned_decode(&mut active, pinned, &decoded_bucket);
+        }
+        merge_user_requested_decode(&mut active, requested, &decoded_bucket);
+        // Route through the PRODUCTION roster fn — a raw layout Vec stays green when
+        // `viewport_roster` is mutated to re-narrow by cap.
+        let published = viewport_roster(false, &render_list(ids, ids.len(), cap), &[]);
+        (published, active)
+    }
+
+    #[test]
+    fn emergency_cap_never_narrows_the_published_viewport() {
+        let (layout, active) = emergency_latched(&["11", "22", "33"], None, &Default::default());
+        assert_eq!(
+            active.len(),
+            1,
+            "fixture precondition: the emergency cap collapsed the decode set"
+        );
+
+        let plan = plan_decode_publish(&Default::default(), &active, &[], &layout);
+        let published = plan
+            .viewport
+            .expect("a first-ever layout roster must publish a viewport");
+        assert!(
+            published.len() > 1,
+            "a viewport of <= 1 blacks out every other publisher at the relay"
+        );
+    }
+
+    #[test]
+    fn emergency_cap_still_narrows_the_local_decode_gate() {
+        let (layout, active) = emergency_latched(&["11", "22", "33"], None, &Default::default());
+        let plan = plan_decode_publish(&Default::default(), &active, &[], &layout);
+        assert_eq!(
+            plan.decode,
+            Some(active),
+            "the local decode gate must still receive the budget-capped set"
+        );
+        assert_eq!(plan.decode.unwrap().len(), MIN_CAP);
+    }
+
+    #[test]
+    fn layout_growth_publishes_a_viewport_with_the_decode_set_unchanged() {
+        let capped: std::collections::HashSet<u64> = [11].into_iter().collect();
+        let before = roster(&["11", "22"]);
+        let after = roster(&["11", "22", "33"]);
+        let plan = plan_decode_publish(&capped, &capped, &before, &after);
+        assert_eq!(
+            plan.decode, None,
+            "an unchanged decode set must not be re-pushed"
+        );
+        assert_eq!(
+            plan.viewport,
+            Some(after),
+            "a peer joining must publish a fresh viewport even though the capped decode set is identical"
+        );
+    }
+
+    #[test]
+    fn layout_shrink_publishes_a_viewport_with_the_decode_set_unchanged() {
+        let capped: std::collections::HashSet<u64> = [11].into_iter().collect();
+        let before = roster(&["11", "22", "33"]);
+        let after = roster(&["11", "22"]);
+        let plan = plan_decode_publish(&capped, &capped, &before, &after);
+        assert_eq!(plan.decode, None);
+        assert_eq!(plan.viewport, Some(after));
+    }
+
+    #[test]
+    fn unchanged_layout_and_decode_set_publish_nothing() {
+        let capped: std::collections::HashSet<u64> = [11].into_iter().collect();
+        let layout = roster(&["11", "22"]);
+        assert_eq!(
+            plan_decode_publish(&capped, &capped, &layout, &layout),
+            DecodePublishPlan::default()
+        );
+    }
+
+    #[test]
+    fn pinned_and_requested_peers_survive_in_the_published_viewport() {
+        let requested: std::collections::HashSet<String> = ["33".to_string()].into_iter().collect();
+        let (layout, active) = emergency_latched(&["11", "22", "33", "44"], Some(3), &requested);
+        assert!(
+            !active.contains(&33) || !active.contains(&44),
+            "fixture precondition: the emergency floor cannot decode both"
+        );
+
+        let plan = plan_decode_publish(&Default::default(), &active, &[], &layout);
+        let published = plan.viewport.expect("first publish");
+        for id in ["33", "44"] {
+            assert!(
+                published.iter().any(|entry| entry == id),
+                "the relay must still forward video for pinned/PLAY-requested peer {id}"
+            );
+        }
+    }
+
+    /// `displayed` tiles on screen, the rest in `+N`; split at `cap` as the render
+    /// path does.
+    fn render_list(ids: &[&str], displayed: usize, cap: usize) -> Vec<(String, TileRenderMode)> {
+        let all = roster(ids);
+        let visible: Vec<String> = all.iter().take(cap.min(displayed)).cloned().collect();
+        let avatars: Vec<String> = all
+            .iter()
+            .skip(visible.len())
+            .take(displayed - visible.len())
+            .cloned()
+            .collect();
+        let join_times: std::collections::HashMap<String, f64> = all
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i as f64))
+            .collect();
+        build_unified_render_list(&visible, &avatars, &[], &join_times)
+    }
+
+    /// Routes through the PRODUCTION `viewport_roster` — a test-local re-map would
+    /// stay green when its body is mutated.
+    fn roster_ids(list: &[(String, TileRenderMode)]) -> Vec<String> {
+        viewport_roster(false, list, &[])
+    }
+
+    #[test]
+    fn screen_share_publishes_its_own_source_not_the_grid_roster() {
+        let grid = render_list(&["11", "22", "33", "44"], 3, MIN_CAP);
+        let ss = roster(&["11", "22"]);
+        assert_eq!(viewport_roster(true, &grid, &ss), ss);
+        assert_eq!(
+            viewport_roster(false, &grid, &ss),
+            roster(&["11", "22", "33"])
+        );
+    }
+
+    #[test]
+    fn avatar_tier_peers_are_lidded_to_video_layer_0_not_left_uncapped() {
+        use videocall_client::{size_cap_layer, PrefMediaKind};
+        let viewport: Vec<u64> = vec![11, 22, 33];
+        let decoded: std::collections::HashSet<u64> = [11].into_iter().collect();
+        let hints = build_peer_tile_hints(&viewport, &decoded, &[], Some(720));
+
+        // Every FORWARDED peer is covered — an absent entry is Uncapped, which is the
+        // whole-ladder fail-open this guards.
+        for sid in &viewport {
+            assert!(hints.contains_key(sid), "peer {sid} has no hint entry");
+        }
+        // The decoded tile keeps its real size lid.
+        assert_eq!(hints[&11], TileHint::Capped { device_px_h: 720 });
+        // The avatar-tier tiles resolve, through the PRODUCTION chooser, to layer 0.
+        for sid in [22u64, 33] {
+            let TileHint::Capped { device_px_h } = hints[&sid] else {
+                panic!("peer {sid} is Uncapped — the relay would forward every layer");
+            };
+            assert_eq!(
+                size_cap_layer(device_px_h, 2, 3, PrefMediaKind::Video),
+                0,
+                "an on-screen-but-undecoded tile must resolve to video layer 0"
+            );
+        }
+    }
+
+    #[test]
+    fn uncapped_members_are_not_lidded_even_when_undecoded() {
+        let viewport: Vec<u64> = vec![11, 22];
+        let decoded: std::collections::HashSet<u64> = [11].into_iter().collect();
+        let hints = build_peer_tile_hints(&viewport, &decoded, &[22], Some(720));
+        assert_eq!(hints[&22], TileHint::Uncapped);
+    }
+
+    #[test]
+    fn viewport_roster_drops_non_numeric_mock_ids_on_both_branches() {
+        let mock_only = vec![("mock-0".to_string(), TileRenderMode::Avatar)];
+        // Grid branch.
+        assert_eq!(
+            viewport_roster(false, &mock_only, &[]),
+            Vec::<String>::new(),
+            "a mock tile carries no session_id and must never enter the published viewport"
+        );
+        // Screen-share branch — the filter has to be applied symmetrically.
+        assert_eq!(
+            viewport_roster(true, &[], &roster(&["mock-1"])),
+            Vec::<String>::new()
+        );
+        // Mixed: the real peer survives, the mock does not.
+        let mixed = vec![
+            ("mock-0".to_string(), TileRenderMode::Avatar),
+            ("42".to_string(), TileRenderMode::Decoded),
+        ];
+        assert_eq!(viewport_roster(false, &mixed, &[]), roster(&["42"]));
+        assert_eq!(
+            viewport_roster(true, &[], &roster(&["mock-1", "42"])),
+            roster(&["42"])
+        );
+    }
+
+    #[test]
+    fn a_decoded_peer_outside_the_viewport_still_gets_a_hint() {
+        // Defensive: `decoded` is a subset of the viewport on both live paths today, so
+        // the union in `build_peer_tile_hints` cannot add a key. Pinned because if that
+        // ever stops holding, the missing entry means Uncapped — the whole-ladder
+        // fail-open this fix exists to close.
+        let viewport: Vec<u64> = vec![11];
+        let decoded: std::collections::HashSet<u64> = [11, 99].into_iter().collect();
+        let hints = build_peer_tile_hints(&viewport, &decoded, &[], Some(720));
+        assert_eq!(hints[&99], TileHint::Capped { device_px_h: 720 });
+    }
+
+    #[test]
+    fn published_viewport_carries_only_the_displayed_window() {
+        let published = roster_ids(&render_list(&["11", "22", "33", "44"], 3, MIN_CAP));
+        assert_eq!(published, roster(&["11", "22", "33"]));
+        assert!(
+            !published.iter().any(|id| id == "44"),
+            "a +N-overflow peer must never enter the published viewport"
+        );
     }
 }

@@ -12,8 +12,7 @@ use std::collections::VecDeque;
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 use videocall_client::{
-    max_layers_for_kind, quality_state, PeerDeviceInfo, PeerReceiveDiag, PrefMediaKind,
-    ReceivedLayerSnapshot,
+    quality_state, PeerDeviceInfo, PeerReceiveDiag, PrefMediaKind, ReceivedLayerSnapshot,
 };
 use wasm_bindgen::JsCast;
 
@@ -24,7 +23,7 @@ use wasm_bindgen::JsCast;
 // surfaces render identical quality dots / metric text / reason chips for the
 // same peer snapshot.
 use crate::components::performance_settings::{
-    format_peer_device_compact, format_send_layer_short, peer_row_aria_label, peer_row_metric,
+    format_peer_device_compact, peer_row_aria_label, peer_row_metric, peer_row_res_or_bitrate,
     quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
     reason_chip_title,
 };
@@ -244,40 +243,8 @@ pub struct SignalSample {
     /// Issue #903: publisher's encoder *target* bitrate for the screen-share // @token-exempt: issue ref, not a color
     /// track (kbps). What the encoder is currently trying to produce, not
     /// the realised on-the-wire bitrate (which is `screen_bitrate_kbps`).
-    /// `0` means the publisher hasn't stamped the field — an older client, or a
-    /// publisher that is NOT constrained (see `screen_cause_hint` for what that
-    /// means since issue #2179). This field alone never renders the Cause line:
-    /// `build_screen_cause_line` requires a stamped tier or hint.
+    /// `0` means the publisher hasn't stamped the field yet.
     pub screen_encoder_target_bitrate_kbps: u32,
-    /// Issue #903: name of the adaptive-quality tier the publisher's screen-share // @token-exempt: issue ref, not a color
-    /// encoder is being held at (e.g. `"1440p"`, `"high"`, `"low"`). Empty when
-    /// the publisher is not constrained, or is older and doesn't supply it.
-    pub screen_adaptive_tier: String,
-    /// Issue #903: short publisher-classified cause of the downscale, // @token-exempt: issue ref, not a color
-    /// one of `"bitrate-limited"`, `"cpu-pressure"`, `"network-rtt"`,
-    /// `"network-loss"`, `"manual-cap"`, or empty.
-    ///
-    /// Empty means the publisher is NOT constrained, or doesn't supply the field.
-    /// "Constrained" is SOURCE-relative since issue #2179: the publisher stamps
-    /// this only while its live rung is below the rung its captured surface alone
-    /// needs (`resolve_initial_screen_tier`), so a 1080p share sitting on the
-    /// 1080p rung reports nothing even though the tier table has higher rungs.
-    ///
-    /// When a STATIC cap holds the encoder below that rung the hint names the term
-    /// UNIQUELY responsible, rather than the generic `"bitrate-limited"` (which is
-    /// reserved for a dynamic cause — network floor or live congestion):
-    /// - `"ladder-limited"` — the product's publish ladder tops out at 1440p. The
-    ///   common case for any 4K / Retina share on a capable machine, and
-    ///   deliberately NOT called CPU: no amount of the user's hardware lifts it.
-    /// - `"cpu-pressure"` — the sender's device class is the binding term, which
-    ///   since review round 3 means only below the 1440p core bar; at or above it
-    ///   the device cap and the ladder cap coincide and the ladder is the honest
-    ///   explanation.
-    /// - `"single-stream-limited"` — LATENT. Its cap and the ladder cap are both
-    ///   1440p today, so it never binds alone and never reaches a user. The
-    ///   publisher keeps the path because the two are independent policies; it
-    ///   starts firing if the ladder ever gains a rung above 1440p.
-    pub screen_cause_hint: String,
     /// Issue #906: held-last value to render when the current screen FPS // @token-exempt: issue ref, not a color
     /// sample reads zero but a recent non-zero value exists. `None` means
     /// either the current sample is itself live (use `screen_fps`) or the
@@ -324,8 +291,6 @@ impl PartialEq for SignalSample {
             && self.screen_resolution == other.screen_resolution
             && self.screen_source_resolution == other.screen_source_resolution
             && self.screen_encoder_target_bitrate_kbps == other.screen_encoder_target_bitrate_kbps
-            && self.screen_adaptive_tier == other.screen_adaptive_tier
-            && self.screen_cause_hint == other.screen_cause_hint
             && self.screen_fps_held == other.screen_fps_held
             && self.screen_bitrate_kbps_held == other.screen_bitrate_kbps_held
             && self.peer_status_age_ms == other.peer_status_age_ms
@@ -356,14 +321,6 @@ pub struct SampleData {
     /// Issue #903: publisher's encoder target bitrate for the screen-share // @token-exempt: issue ref, not a color
     /// track (kbps); `0` when the publisher doesn't supply the field.
     pub screen_encoder_target_bitrate_kbps: u32,
-    /// Issue #903: name of the AQ tier the publisher's screen-share encoder is // @token-exempt: issue ref, not a color
-    /// being held at. Empty when the publisher is not constrained.
-    pub screen_adaptive_tier: String,
-    /// Issue #903: short publisher-classified cause of the downscale. Empty when // @token-exempt: issue ref, not a color
-    /// the publisher is not constrained — measured against the rung its captured
-    /// surface needs, see `SignalSample::screen_cause_hint` — or doesn't supply
-    /// the field.
-    pub screen_cause_hint: String,
     /// Issue #906: milliseconds since the most recent `peer_status` // @token-exempt: issue ref, not a color
     /// heartbeat from the peer at sample-record time. `None` when no
     /// heartbeat has been observed yet. Passed straight through onto
@@ -635,8 +592,6 @@ impl PeerSignalHistory {
             screen_resolution: data.screen_resolution.clone(),
             screen_source_resolution: data.screen_source_resolution.clone(),
             screen_encoder_target_bitrate_kbps: data.screen_encoder_target_bitrate_kbps,
-            screen_adaptive_tier: data.screen_adaptive_tier.clone(),
-            screen_cause_hint: data.screen_cause_hint.clone(),
             screen_fps_held,
             screen_bitrate_kbps_held,
             peer_status_age_ms: data.peer_status_age_ms,
@@ -1714,7 +1669,6 @@ fn show_body_tooltip(
         String::new()
     };
     let screen_line = build_screen_tooltip_line(sample, show_screen);
-    let screen_cause_line = build_screen_cause_line(sample, show_screen);
     let latency_line = if show_latency {
         format!(
             "<span style='color:{}'>Server RTT: {:.0} ms</span>",
@@ -1744,15 +1698,6 @@ fn show_body_tooltip(
             None
         } else {
             Some(format!("<div>{screen_line}</div>"))
-        },
-        if screen_cause_line.is_empty() {
-            None
-        } else {
-            // Slight left-indent (font-size:11px) so the cause line reads as
-            // a continuation of the Screen row above it.
-            Some(format!(
-                "<div style='font-size:11px;padding-left:8px'>{screen_cause_line}</div>"
-            ))
         },
         if latency_line.is_empty() {
             None
@@ -2026,154 +1971,6 @@ fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String
     )
 }
 
-/// Render the optional **Cause** sub-line that explains *why* the publisher's
-/// encoder downscaled in transit (issue #903). The line is sourced from the // @token-exempt: issue ref, not a color
-/// publisher-stamped `VideoMetadata` fields
-/// `encoder_target_bitrate_kbps` / `adaptive_tier` / `cause_hint` and renders
-/// in one of these compact shapes (post-#903 tightening — drop "encoder // @token-exempt: issue ref, not a color
-/// target", "limited by", "adaptive-quality"; join units to numbers; use
-/// middle-dot separators):
-///
-///   1. **Combined** — all three present:
-///      `Cause: <cause_hint> · <N>kbps · tier '<tier>'`
-///   2. **Primary** — bitrate + tier present:
-///      `Cause: <N>kbps · tier '<tier>'`
-///   3. **Hint-only fallback** — only `cause_hint`:
-///      `Cause: <cause_hint>`
-///
-/// `tier` is preserved as a literal word because users may not recognise a
-/// bare `'low'` / `'1440p'` / `'high'` label without that cue.
-///
-/// # What "constrained" means (issue #2179 review, UX B1 + round 2)
-/// SOURCE-relative, not ladder-relative. The publisher stamps the cause fields
-/// only while its live rung is BELOW the rung its CAPTURED SURFACE alone needs
-/// (`resolve_initial_screen_tier`, published as
-/// `ScreenQualitySnapshot::source_tier_index`), and clears them otherwise. So a
-/// 1080p window riding the `high` rung stamps nothing even though the ladder has
-/// two better rungs above it that only a larger screen could use.
-///
-/// Round 2 split that yardstick from the share's REACHABLE ceiling
-/// (`best_source_tier_index` = `resolve_screen_tier_ceiling`, which also folds in
-/// the sender's CPU class and stream count). The two diverge when the hardware or
-/// the stream count binds, and the publisher then still stamps — naming the
-/// binding term (`ladder-limited`, `cpu-pressure`) rather than staying silent,
-/// which is what used to leave a viewer staring at a red downscale badge with no
-/// explanation. Since review round 3 the publish ladder caps every path at 1440p,
-/// so `ladder-limited` is the usual answer for a 4K or Retina share, and `native`
-/// (2160p) is not reachable as an encode rung at all — it survives only as the
-/// capture ceiling `getDisplayMedia` requests. The perf panel's SEND meter deliberately uses the OTHER
-/// rung; see `performance_settings::screen_meter_level` for why the same share can
-/// honestly read full bars here and constrained there.
-///
-/// This function must NOT re-derive "constrained" from the tier's position in the
-/// ladder: an index-based test here would re-introduce exactly the false flag the
-/// publisher-side fix removed (after #2179 grew the ladder 3 → 5, "index != 0"
-/// flagged every share that was not 4K). The receiver also cannot compute the
-/// ceiling itself — it is a property of the SENDER's screen and machine, which the
-/// receiver never sees — so the publisher's stamp is the single source of truth by
-/// necessity, not merely by convention.
-///
-/// Returns an empty string when:
-/// * the screen series is hidden or `screen_enabled` is false, OR
-/// * neither cause field is stamped — no `adaptive_tier` and no `cause_hint`.
-///   That covers the unconstrained publisher, the older publisher that supplies
-///   nothing, and the partial publisher that supplies only a target bitrate.
-///
-/// The empty-string return is load-bearing: the tooltip render loop omits
-/// the line entirely when this helper returns empty, so older publishers
-/// never see a placeholder shipped in their UI. See the unit tests below.
-/// Every cause classifier the Screen help popover enumerates for the user.
-///
-/// Kept as DATA rather than inlined in the rsx prose so it can be pinned against
-/// the publisher's vocabulary: `screen_cause_legend_covers_every_aq_cause_string`
-/// asserts each `SCREEN_CAUSE_*` constant the AQ crate exports appears here. That
-/// pin is the reason this const exists — issue #2179 round 2 added
-/// `single-stream-limited` on the publisher side, and without a lockstep check the
-/// legend silently omits a string users will actually see.
-///
-/// The three trigger-derived classifiers (`network-rtt`, `network-loss`,
-/// `manual-cap`) come from `cause_hint_from_trigger`, which is private to
-/// `screen_encoder`, so they cannot be pinned from here and are listed by hand.
-///
-/// `single-stream-limited` is LATENT as of review round 3: the single-stream cap
-/// and the publish-ladder cap are both 1440p, so it never binds alone and no user
-/// sees it today. It stays listed because the publisher still exports and can
-/// still stamp it — the two caps are independent policies that merely coincide,
-/// and it fires again if the ladder gains a rung above 1440p. Do NOT write an e2e
-/// spec that expects to observe it.
-pub(crate) const SCREEN_CAUSE_LEGEND: [&str; 7] = [
-    "bitrate-limited",
-    "ladder-limited",
-    "cpu-pressure",
-    "single-stream-limited",
-    "network-rtt",
-    "network-loss",
-    "manual-cap",
-];
-
-/// The legend rendered as the parenthetical list the help copy shows.
-pub(crate) fn screen_cause_legend_text() -> String {
-    SCREEN_CAUSE_LEGEND.join(", ")
-}
-
-fn build_screen_cause_line(sample: &SignalSample, show_screen: bool) -> String {
-    if !show_screen || !sample.screen_enabled {
-        return String::new();
-    }
-
-    let bitrate = sample.screen_encoder_target_bitrate_kbps;
-    let tier = sample.screen_adaptive_tier.trim();
-    let hint = sample.screen_cause_hint.trim();
-    let has_bitrate = bitrate > 0;
-    let has_tier = !tier.is_empty();
-    let has_hint = !hint.is_empty();
-
-    // No CAUSE EVIDENCE → no line. The line asserts that the publisher is being
-    // held back, so it may only render on a field that carries that assertion.
-    // Only `adaptive_tier` and `cause_hint` do: the publisher stamps them exactly
-    // when its live rung is below the best rung the share can reach (its own
-    // screen, machine and stream count — see the fn doc), and clears both
-    // otherwise. The target bitrate is a MAGNITUDE, not an assertion — a
-    // bitrate arriving without either cause field (a partial publisher, or a
-    // stamp that raced a clear) says nothing about whether the encoder is
-    // constrained, so it renders no Cause line on its own. Older publishers, an
-    // unconstrained publisher, and zero-initialised samples all land here too.
-    if !has_tier && !has_hint {
-        return String::new();
-    }
-
-    // Use U+00B7 MIDDLE DOT as the inline separator, matching the Screen
-    // tooltip line's tightened style. Each branch builds the trailing
-    // evidence list once with the same dot-joining rule.
-    let body = match (has_bitrate, has_tier, has_hint) {
-        // Combined: hint + bitrate + tier. Most informative — lead with
-        // the hint summary, then dot-join the concrete signals.
-        (true, true, true) => {
-            format!("Cause: {hint} \u{00B7} {bitrate}kbps \u{00B7} tier '{tier}'")
-        }
-        // Primary: bitrate + tier without a hint.
-        (true, true, false) => {
-            format!("Cause: {bitrate}kbps \u{00B7} tier '{tier}'")
-        }
-        // Bitrate + hint (no tier).
-        (true, false, true) => format!("Cause: {hint} \u{00B7} {bitrate}kbps"),
-        // Tier + hint (no bitrate).
-        (false, true, true) => format!("Cause: {hint} \u{00B7} tier '{tier}'"),
-        // Single signal fallbacks.
-        (false, true, false) => format!("Cause: tier '{tier}'"),
-        (false, false, true) => format!("Cause: {hint}"),
-        // No cause evidence — already excluded by the guard above. A bare target
-        // bitrate is not a constraint claim; see that guard's comment.
-        (_, false, false) => return String::new(),
-    };
-
-    format!(
-        "<span style='color:{}'>{}</span>",
-        theme_color::TEXT_MUTED,
-        body
-    )
-}
-
 /// Hide the global tooltip.
 fn hide_body_tooltip() {
     if let Some(el) = gloo_utils::document().get_element_by_id("signal-chart-tooltip-global") {
@@ -2242,44 +2039,35 @@ fn layer_kind_noun(kind: PrefMediaKind) -> &'static str {
 /// full-sentence `aria-label` ([`peer_row_aria_label`]) so color is never the
 /// sole signal, and the dot/glyph are `aria-hidden`.
 ///
-/// The `full_ladder_len` denominator and absolute quality both come from the
-/// client's [`quality_state`] / `max_layers_for_kind`, NOT the per-peer
-/// observed count — the SAME basis the perf dialog uses.
+/// The denominator and absolute quality both come from the peer's own
+/// `layer_count` — the SAME basis the perf dialog uses.
 #[component]
 fn SignalLayerRow(
     /// DOM-id prefix for the popup (peer + meter mode), so testids are unique
     /// across simultaneously-open popups.
     id_prefix: String,
-    kind: PrefMediaKind,
     snap: ReceivedLayerSnapshot,
 ) -> Element {
-    let full_ladder_len = max_layers_for_kind(kind);
-    let q = quality_state(snap.layer_index, full_ladder_len);
+    let q = quality_state(snap.layer_index, snap.layer_count);
     let q_mod = quality_state_modifier(q);
     let q_glyph = quality_state_glyph(q);
-    // Audio rung label for the metric ("low (12k)" / "mid (24k)" / "high (48k)")
-    // — the receive submodule owns this mapping, same as the perf dialog.
+    // Audio rung label for the metric ("as sent") — the receive submodule owns
+    // this mapping, same as the perf dialog.
     let audio_label = crate::components::performance_settings::receive::index_label(
         PrefMediaKind::Audio,
         snap.layer_index,
     );
-    let metric = peer_row_metric(&snap, full_ladder_len, audio_label);
-    let kind_noun = layer_kind_noun(kind);
-    // The human res/bitrate detail used inside the aria sentence (mirrors the
-    // perf dialog's `res_or_bitrate`).
-    let res_or_bitrate = if matches!(kind, PrefMediaKind::Audio) {
-        format!("{}k", snap.kbps)
-    } else {
-        format_send_layer_short(snap.width, snap.height)
-    };
+    let metric = peer_row_metric(&snap, audio_label);
+    let kind_noun = layer_kind_noun(snap.kind);
+    let res_or_bitrate = peer_row_res_or_bitrate(&snap);
     // The popup row's aria-label uses the peer's display name when known; the
     // perf dialog passes the peer label here. The popup doesn't thread the
     // display name into this child, so we lead with the spoken kind — the
-    // sentence still carries kind, quality, res/bitrate, layer fraction, and
-    // (when present) the reason clause, so color is never the sole signal.
+    // sentence still carries kind, quality, res/bitrate and (when present) the
+    // reason clause, so color is never the sole signal.
     let aria = peer_row_aria_label(
         // Capitalized kind noun as the row subject (no peer-name available here).
-        match kind {
+        match snap.kind {
             PrefMediaKind::Video => "Video",
             PrefMediaKind::Audio => "Audio",
             PrefMediaKind::Screen => "Shared content",
@@ -2288,10 +2076,10 @@ fn SignalLayerRow(
         q,
         &res_or_bitrate,
         snap.layer_index + 1,
-        full_ladder_len,
+        snap.layer_count,
         snap.reason,
     );
-    let kind_id = match kind {
+    let kind_id = match snap.kind {
         PrefMediaKind::Video => "video",
         PrefMediaKind::Audio => "audio",
         PrefMediaKind::Screen => "screen",
@@ -3133,23 +2921,9 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                                 "<25% in muted text."
                             }
                             p {
-                                strong { "Cause: " }
-                                "Sub-line shown below the Screen row only when the publisher is "
-                                "sending LESS than the screen they picked actually needs. Sourced "
-                                "from their adaptive-quality system: the encoder's current target "
-                                "bitrate, the tier it is being held at, and a short cause classifier "
-                                "({screen_cause_legend_text()})."
-                            }
-                            p {
-                                "The yardstick is the publisher\u{2019}s own screen \u{2014} not the top "
-                                "of the quality ladder. A 1080p window sent at 1080p is already at "
-                                "its best and shows no Cause line. But a 4K or Retina screen sent "
-                                "at 1440p IS held back, so it shows one \u{2014} usually "
-                                "ladder-limited, meaning 1440p is the highest quality this app "
-                                "publishes, so nothing the publisher changes will raise it. "
-                                "cpu-pressure appears instead when their machine is the binding "
-                                "limit. The line is also absent for an older client that "
-                                "doesn\u{2019}t report this data."
+                                "A share is sent at the resolution of the window or screen the "
+                                "publisher picked, up to 2560\u{00D7}1440. Nothing downscales it "
+                                "to a lower quality tier."
                             }
                             p {
                                 strong { "FPS: " }
@@ -3190,7 +2964,6 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             SignalLayerRow {
                                 key: "{kind:?}",
                                 id_prefix: layers_id_prefix.clone(),
-                                kind,
                                 snap,
                             }
                         }
@@ -3396,8 +3169,6 @@ mod tests {
             screen_resolution: "1920x1080".to_string(),
             screen_source_resolution: "1920x1080".to_string(),
             screen_encoder_target_bitrate_kbps: 0,
-            screen_adaptive_tier: String::new(),
-            screen_cause_hint: String::new(),
             peer_status_age_ms: None,
             latency_ms: 40.0,
             audio_enabled: true,
@@ -3502,19 +3273,16 @@ mod tests {
              the CAMERA ladder's top rung (got {q_best})"
         );
 
-        // And the FLOOR rung is worse still: `low` targets 5 fps, so a correct share reads
-        // ~0.17 => `Bad`. This is the number the earlier comment got wrong (it claimed the
-        // floor was ~0.33), understating the regression by a full band.
         let q_worst = sample_screen_quality(worst_screen_fps as f64);
         assert!(
             (q_worst - worst_screen_fps as f64 / 30.0).abs() < 1e-9,
             "the floor screen rung ({worst_screen_fps} fps) must score its true ratio \
              (got {q_worst})"
         );
-        assert_eq!(
+        assert_ne!(
             SignalLevel::from_quality(q_worst),
-            SignalLevel::Bad,
-            "a correct floor-rung share lands in `Bad` on the screen-only meter — the \
+            SignalLevel::Good,
+            "a correct share still cannot read Good on the screen-only meter — the \
              concrete cost of the deferred denominator, asserted rather than asserted-about"
         );
 
@@ -3701,8 +3469,6 @@ mod tests {
             screen_resolution: received.to_string(),
             screen_source_resolution: source.to_string(),
             screen_encoder_target_bitrate_kbps: 0,
-            screen_adaptive_tier: String::new(),
-            screen_cause_hint: String::new(),
             screen_fps_held: None,
             screen_bitrate_kbps_held: None,
             peer_status_age_ms: None,
@@ -3886,191 +3652,6 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn cause_line_empty_when_no_publisher_data() {
-        // Older publisher / unconstrained AQ tier: all three fields
-        // arrive as proto3 defaults. We MUST omit the line — shipping
-        // "not yet instrumented" or any placeholder regressed in #891. // @token-exempt: issue ref, not a color
-        let s = screen_sample("1280x720", "2560x1440");
-        assert_eq!(s.screen_encoder_target_bitrate_kbps, 0);
-        assert!(s.screen_adaptive_tier.is_empty());
-        assert!(s.screen_cause_hint.is_empty());
-        assert_eq!(build_screen_cause_line(&s, true), "");
-    }
-
-    #[test]
-    fn cause_line_primary_shape_with_bitrate_and_tier() {
-        // Bitrate + tier with no hint → compact "Cause: 800kbps · tier 'low'".
-        let mut s = screen_sample("1280x720", "1920x1080");
-        s.screen_encoder_target_bitrate_kbps = 800;
-        s.screen_adaptive_tier = "low".to_string();
-        let line = build_screen_cause_line(&s, true);
-        assert!(line.contains("Cause: 800kbps \u{00B7} tier 'low'"));
-        // Wordy phrasing must be gone.
-        assert!(!line.contains("encoder target"));
-        assert!(!line.contains("limited by"));
-        assert!(!line.contains("adaptive-quality"));
-        assert!(line.contains(theme_color::TEXT_MUTED));
-    }
-
-    #[test]
-    fn cause_line_hint_only_fallback() {
-        // Older / partial publisher only stamps cause_hint. Compact
-        // fallback: bare "Cause: <hint>" — no bitrate, no tier word.
-        let mut s = screen_sample("1280x720", "1920x1080");
-        s.screen_cause_hint = "cpu-pressure".to_string();
-        let line = build_screen_cause_line(&s, true);
-        assert!(line.contains("Cause: cpu-pressure"));
-        assert!(!line.contains("kbps"));
-        assert!(!line.contains("tier"));
-        assert!(line.contains(theme_color::TEXT_MUTED));
-    }
-
-    #[test]
-    fn cause_line_combined_shape_with_all_three() {
-        // All three present → `Cause: <hint> · <N>kbps · tier '<tier>'`.
-        // Hint leads as the human summary; the dot-joined evidence
-        // follows for users who want the concrete numbers.
-        let mut s = screen_sample("1280x720", "2560x1440");
-        s.screen_encoder_target_bitrate_kbps = 500;
-        s.screen_adaptive_tier = "low".to_string();
-        s.screen_cause_hint = "network-rtt".to_string();
-        let line = build_screen_cause_line(&s, true);
-        assert!(
-            line.contains("Cause: network-rtt \u{00B7} 500kbps \u{00B7} tier 'low'"),
-            "unexpected combined cause line: {line}"
-        );
-        // No legacy wordy phrasing.
-        assert!(!line.contains("encoder target"));
-        assert!(!line.contains("\u{2014}")); // em-dash gone, dot is the joiner
-    }
-
-    #[test]
-    fn cause_line_empty_when_screen_disabled() {
-        let mut s = screen_sample("1280x720", "2560x1440");
-        s.screen_enabled = false;
-        // Even with publisher data, hide when screen series is off.
-        s.screen_encoder_target_bitrate_kbps = 800;
-        s.screen_adaptive_tier = "low".to_string();
-        s.screen_cause_hint = "bitrate-limited".to_string();
-        assert_eq!(build_screen_cause_line(&s, true), "");
-    }
-
-    #[test]
-    fn cause_line_empty_when_screen_series_hidden() {
-        let mut s = screen_sample("1280x720", "2560x1440");
-        s.screen_encoder_target_bitrate_kbps = 800;
-        s.screen_adaptive_tier = "low".to_string();
-        s.screen_cause_hint = "bitrate-limited".to_string();
-        assert_eq!(build_screen_cause_line(&s, false), "");
-    }
-
-    #[test]
-    fn cause_line_no_placeholder_text() {
-        // Regression test for the #891 lesson — earlier code shipped a // @token-exempt: issue ref, not a color
-        // "not yet instrumented" placeholder when no publisher data was
-        // available. The omit-line behaviour is the contract; verify the
-        // helper never emits that placeholder for any of the no-data
-        // configurations (resolution match, resolution mismatch, source
-        // unknown).
-        let cases = [
-            ("1920x1080", "1920x1080"),
-            ("1280x720", "2560x1440"),
-            ("1280x720", ""),
-            ("", ""),
-        ];
-        for (recv, src) in cases {
-            let s = screen_sample(recv, src);
-            let line = build_screen_cause_line(&s, true);
-            assert!(!line.contains("not yet instrumented"));
-            assert!(!line.contains("#903")); // @token-exempt: issue ref, not a color
-        }
-    }
-
-    /// Issue #2179 review (UX B1): "constrained" is SOURCE-relative. A publisher
-    /// sharing a 1080p window rides the `high` rung — index 2 of 5 once the ladder
-    /// grew — while doing everything its source allows, and clears all three cause
-    /// fields. The receiver must render NOTHING for that sample.
-    ///
-    /// This is the receive-side half of the fix: the renderer derives the line
-    /// ONLY from the stamped fields, so it cannot re-invent a "tier index != 0"
-    /// constrained test of its own. The screen row's own metrics are populated so
-    /// the empty result cannot be coming from an empty-row shortcut.
-    ///
-    /// MUTATION: make `build_screen_cause_line` render on `has_bitrate` alone
-    /// (the pre-review predicate) and the bare-bitrate case below fails.
-    #[test]
-    fn cause_line_absent_for_an_unconstrained_non_top_rung_publisher() {
-        // Received == source: the publisher is at its source's own size.
-        let mut s = screen_sample("1920x1080", "1920x1080");
-        s.screen_fps = 10.0;
-        s.screen_bitrate_kbps = 2400.0;
-        // All three cleared by the publisher: it is AT its best source rung.
-        s.screen_encoder_target_bitrate_kbps = 0;
-        s.screen_adaptive_tier.clear();
-        s.screen_cause_hint.clear();
-        assert_eq!(build_screen_cause_line(&s, true), "");
-
-        // A target bitrate arriving WITHOUT either cause field is not a constraint
-        // claim and must not resurrect the line.
-        s.screen_encoder_target_bitrate_kbps = 2500;
-        assert_eq!(
-            build_screen_cause_line(&s, true),
-            "",
-            "a bare target bitrate is a magnitude, not evidence of a constraint"
-        );
-
-        // The line returns as soon as the publisher actually stamps a cause.
-        s.screen_cause_hint = "cpu-pressure".to_string();
-        let line = build_screen_cause_line(&s, true);
-        assert!(
-            line.contains("Cause: cpu-pressure \u{00B7} 2500kbps"),
-            "unexpected cause line once a hint is stamped: {line}"
-        );
-    }
-
-    /// Lockstep pin (issue #2179 review round 2): the Screen help popover
-    /// enumerates the cause classifiers for the user, so every string the
-    /// publisher can actually stamp must appear there. Round 2 added
-    /// `single-stream-limited` on the publisher side; without this pin the legend
-    /// would silently omit a classifier users see on their own screen.
-    ///
-    /// Derived from the AQ crate's exported constants, so a future cause string
-    /// fails here rather than shipping an incomplete legend.
-    ///
-    /// MUTATION: drop any entry from `SCREEN_CAUSE_LEGEND` that names an AQ
-    /// constant and this fails.
-    #[test]
-    fn screen_cause_legend_covers_every_aq_cause_string() {
-        use videocall_client::adaptive_quality_constants::{
-            SCREEN_CAUSE_BITRATE, SCREEN_CAUSE_CPU, SCREEN_CAUSE_LADDER, SCREEN_CAUSE_SINGLE_STREAM,
-        };
-        // Every cause the PUBLISHER can stamp. `SCREEN_CAUSE_SINGLE_STREAM` is
-        // latent today (see `SCREEN_CAUSE_LEGEND`) but is still pinned: the code
-        // path exists and stamps it the moment the ladder gains a rung above the
-        // single-stream cap, and the legend must not have to be remembered then.
-        let publisher_causes = [
-            SCREEN_CAUSE_BITRATE,
-            SCREEN_CAUSE_LADDER,
-            SCREEN_CAUSE_CPU,
-            SCREEN_CAUSE_SINGLE_STREAM,
-        ];
-        let text = screen_cause_legend_text();
-        for cause in publisher_causes {
-            assert!(
-                SCREEN_CAUSE_LEGEND.contains(&cause),
-                "the Screen help legend must name the publisher cause \'{cause}\' — \
-                 users see this string in their own Cause line"
-            );
-            // The rendered prose must contain it too (the const is only useful if
-            // the copy is built FROM it).
-            assert!(
-                text.contains(cause),
-                "legend text must render \'{cause}\': {text}"
-            );
-        }
-    }
-
-    #[test]
     fn push_sample_carries_source_resolution_through_to_signal_sample() {
         let mut history = PeerSignalHistory::new();
         let data = SampleData {
@@ -4103,8 +3684,6 @@ mod tests {
             screen_resolution: "1280x720".to_string(),
             screen_source_resolution: "2560x1440".to_string(),
             screen_encoder_target_bitrate_kbps: 500,
-            screen_adaptive_tier: "low".to_string(),
-            screen_cause_hint: "bitrate-limited".to_string(),
             video_enabled: true,
             audio_enabled: true,
             ..Default::default()
@@ -4112,8 +3691,6 @@ mod tests {
         history.push_sample_at(&data, 6_000.0);
         let s = &history.samples_vec()[0];
         assert_eq!(s.screen_encoder_target_bitrate_kbps, 500);
-        assert_eq!(s.screen_adaptive_tier, "low");
-        assert_eq!(s.screen_cause_hint, "bitrate-limited");
     }
 
     #[test]
@@ -4816,7 +4393,12 @@ mod tests {
             } else {
                 720
             },
-            kbps: 600,
+            // Audio matches the resolver: no geometry AND no bitrate.
+            kbps: if matches!(kind, PrefMediaKind::Audio) {
+                0
+            } else {
+                600
+            },
             reason,
         }
     }
@@ -4911,25 +4493,18 @@ mod tests {
         );
     }
 
+    /// The popup and the perf dialog resolve the dot AND the metric from the
+    /// peer's own `layer_count`, so one snapshot cannot render two answers.
+    ///
+    /// MUTATION: point either back at `max_layers_for_kind`.
     #[test]
-    fn layer_row_uses_full_ladder_basis_like_perf_dialog() {
-        // A video stream pinned to the base layer (index 0) of a 3-rung ladder
-        // must read Low — the SAME `quality_state(layer_index, full_ladder_len)`
-        // basis the perf dialog uses (full ladder, NOT the per-peer observed
-        // count). This is the parity the feature promises: identical inputs →
-        // identical dot/metric/reason. The mapping itself is tested in
-        // `performance_settings`; here we assert the popup feeds the helper the
-        // full-ladder denominator.
-        let full = max_layers_for_kind(PrefMediaKind::Video);
-        assert_eq!(full, 3);
-        let q_base = quality_state(0, full);
-        let q_top = quality_state(full - 1, full);
-        assert_ne!(q_base, q_top);
-        // Metric is 1-based and uses the full-ladder denominator. After the
-        // Directive 4 layer-name rename (#1222) the visible chip is the quality
-        // LETTER + position/total: index 1 of a 3-rung ladder → "M · 2/3".
+    fn layer_row_uses_the_same_helpers_as_the_perf_dialog() {
         let s = snap(PrefMediaKind::Video, 1, None);
-        let metric = peer_row_metric(&s, full, "");
+        assert_eq!(s.layer_count, 3, "fixture publishes three rungs");
+        let q_base = quality_state(0, s.layer_count);
+        let q_top = quality_state(s.layer_count - 1, s.layer_count);
+        assert_ne!(q_base, q_top);
+        let metric = peer_row_metric(&s, "");
         assert!(metric.contains("M · 2/3"), "metric was: {metric}");
     }
 }

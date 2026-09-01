@@ -35,6 +35,11 @@ rustlemania-websocket:
       value: "5"
     - name: TOKIO_WORKER_THREADS
       value: "1"  # Optimal for 700m CPU (I/O bound WebSocket operations)
+    - name: JWT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: jwt-secret
+          key: secret
 
   resources:
     limits:

@@ -142,32 +142,107 @@ Two layers of validation prevent silent breakage:
 | `make e2e-up` fails with "openssl not found"                                                           | Tool missing                                                                                                                    | `apt-get install -y openssl` (Debian/WSL) or `brew install openssl` (macOS)                                                                                                                          |
 | Browser console shows `Failed to fetch http://localhost:8082/...` mid-test                             | Stale `dioxus-ui/scripts/config.js` from a pre-PR-#909 checkout — that revision had a phantom `meetingApiBaseUrl: 8082` default | Update the branch (or apply the fix manually). The current committed `config.js` has no `meetingApiBaseUrl` so the wasm falls back to `apiBaseUrl` (`8081`) — see `dioxus-ui/src/constants.rs:14-16` |
 
-### Gotcha: the dioxus-ui container mutates `scripts/config.js`
+### Gotcha: runtime config comes from a gitignored override
 
 The `dioxus-ui` service in `docker/docker-compose.e2e.yaml` bind-mounts the
-host repo at `/app`. At container start, `docker/start-dioxus.sh` regenerates
-`/app/dioxus-ui/scripts/config.js` from environment variables — which means
-**the container is writing to a tracked source file in your working tree**.
+host repo at `/app`. At container start, `docker/start-dioxus.sh` generates
+`/app/dioxus-ui/scripts/config.local.js` from environment variables. That path
+is gitignored, so the tracked `dioxus-ui/scripts/config.js` is left alone. The
+stack does write a tracked file: `tailwindcss` runs in both serve modes and
+writes `dioxus-ui/static/tailwind.css`, so that path can show up modified in
+`git status` while the stack is up.
 
-You'll see this as `dioxus-ui/scripts/config.js` showing as modified in
-`git status` whenever the e2e stack is up. That is normal. But it means:
+The two files reach `dist/` by different mechanisms, and `index.html` loads them
+in this order:
 
-- Don't `git add` that file casually; you'll commit env-var noise.
-- A `git checkout dioxus-ui/scripts/config.js` while the stack is running
-  will silently revert to the committed default. Trunk hot-reload picks up
-  the change and serves it to the browser without restarting the wasm. If
-  the committed default is broken or stale, the browser starts hitting wrong
-  URLs mid-test.
-- A clean wasm rebuild (e.g. after a Rust change) is the only way to make
-  trunk re-run its dist-copy step. Touching the file alone is not enough.
+| File                                   | Into `dist/` via                                          | Loaded by                         |
+| -------------------------------------- | --------------------------------------------------------- | --------------------------------- |
+| `scripts/config.js` (tracked)          | trunk `rel="copy-file"` asset                             | `<script src="/config.js">`       |
+| `scripts/config.local.js` (gitignored) | `Trunk.toml` `post_build` hook + `start-dioxus.sh` copies | sync XHR afterwards; its keys win |
 
 The committed `dioxus-ui/scripts/config.js` is intentionally a "minimal
 correct fallback" — every key it carries must work against a vanilla
-`make e2e-up` stack, because that's the file the wasm sees if anything
-reverts the container's runtime-generated version. If you add a new field
-to the wasm `RuntimeConfig`, give it a value that is correct for the local
-e2e stack OR wrap the deserializer in `Option<T>` + `#[serde(default)]` so
-absence is tolerated.
+`make e2e-up` stack, because that's the file the wasm sees when no override is
+present. If you add a new field to the wasm `RuntimeConfig`, give it a value
+that is correct for the local e2e stack OR wrap the deserializer in `Option<T>`
++ `#[serde(default)]` so absence is tolerated.
+
+### Gotcha: `DIOXUS_SERVE_MODE=static` has no watcher
+
+`docker/start-dioxus.sh` branches on `DIOXUS_SERVE_MODE`. `make e2e-up` does not
+set it, so compose's `${DIOXUS_SERVE_MODE:-dev}` default applies whenever the
+variable is unset or exported empty — `dev` runs `trunk serve --poll` and
+re-copies `config.local.js` into `dist/` on a one-second loop. Both e2e workflows
+(`.github/workflows/e2e-hcl.yaml`, `pr-check-e2e-smoke-hcl.yaml`) set `static`,
+which runs `trunk build`, copies `config.local.js` into `dist/`, then serves
+`dist/` with `miniserve`.
+
+After that initial build `static` mode neither recompiles nor re-copies. A source
+edit — Rust or JS — reaches the browser only after `start-dioxus.sh` runs again,
+which re-runs `trunk build`:
+
+```bash
+docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml restart dioxus-ui
+```
+
+Skip that and the spec exercises whatever `dist/` already held, which can be
+arbitrarily old.
+
+`config.local.js` is the exception: `start-dioxus.sh` regenerates it from the
+container environment on every start, so a hand-edit is discarded rather than
+picked up. Change those values through the `dioxus-ui` service's `environment`
+block in `docker/docker-compose.e2e.yaml`, not by editing the file — and apply
+them with a recreate, not the restart above, because `restart` reuses the
+container's existing environment:
+
+```bash
+docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d dioxus-ui
+```
+
+Add `--force-recreate` if compose does not detect the drift.
+
+### The backend services rebuild themselves (and prove they did)
+
+`websocket-api`, `meeting-api` and `webtransport-api` run their binary through
+`docker/e2e-backend.sh`, which supervises it with `cargo watch`. Edit any Rust
+source those binaries compile — in `actix-api/`, or in a workspace crate they
+depend on such as `videocall-types` — and the service rebuilds and restarts on
+its own, typically within seconds. Checking the mounted clone out to another
+branch counts as an edit, so it is picked up the same way.
+
+Before #2513 these services ran a bare `cargo run` at container start and
+nothing ever rebuilt them. A stack left up for days served the binary it built
+on day one, so a spec whose discriminator lived in the relay failed in a way
+that looked exactly like a broken fix or a broken spec. Local receipts for any
+PR with a backend half were suspect by that mechanism; CI never was, because it
+builds from a fresh checkout.
+
+Two things follow from the watcher being in charge:
+
+- **The watch set is not maintained by hand.** `cargo watch` derives it from
+  cargo's dependency graph — the crate plus every local path dependency — so a
+  new workspace crate is covered as soon as a backend depends on it. A crate
+  nothing depends on is correctly not watched; `dioxus-ui` edits do not bounce
+  the relay. This is why `e2e-backend.sh` passes no `-w`: that flag would
+  disable dependency discovery and freeze the set.
+- **A build failure stops the service.** The watcher keeps the compile error in
+  the container log and nothing is served until it is fixed. Fix the source and
+  it rebuilds; no restart needed.
+- **A rebuild drops live connections.** The watcher stops the old process before
+  starting the new one, so editing backend source while a suite is running will
+  fail the specs in flight. Let a run finish, or expect to re-run it.
+
+Each service writes `e2e/.stack-stamps/<bin>.json` (gitignored) recording the
+state of its last build, and touches it every 30s while the watcher lives.
+`e2e/helpers/backend-freshness.ts` reads those in `waitForServices()` and fails
+the run — before any spec, with the fix in the message — when a backend is not
+demonstrably supervised, rather than letting the suite report an ordinary
+assertion failure. It covers three cases: a stack that predates the supervisor
+and writes no stamp, a backend whose last build failed, and a stamp left behind
+by a stack that is no longer running (the heartbeat stops).
+
+`E2E_SKIP_BACKEND_FRESHNESS=1` disables the check. Nothing then stands between
+a stale relay and a green run, so do not collect a receipt behind it.
 
 ### Common coding patterns
 
@@ -381,6 +456,40 @@ One real-Chromium harness does exist in this tree, and it is easy to miss:
 type-check it, like everything under `e2e/`), so a test added there proves nothing
 on a PR — prefer the CI-run suites above, and reach for this one only for a local
 check that genuinely needs a browser.
+
+## Verifying a test actually guards something
+
+A test that cannot fail proves nothing, so this repo's acceptance criteria require
+a regression test to **fail on the un-fixed code**. `scripts/mutation-check.py`
+runs that check from a declared spec instead of ad-hoc shell:
+
+```bash
+scripts/mutation-check.py run    <spec>.json
+scripts/mutation-check.py verify <spec>.json [--sha REV]
+```
+
+Run `scripts/mutation-check.py run --help` for the spec format. Keep a spec next to
+the code it guards (e.g. `e2e/bots-app/mutation-spec.json`) so the mutation evidence
+is re-runnable, rather than a transcript pasted into a PR body that nobody can
+reproduce.
+
+`run` applies each mutation, runs the suite, and asserts the **named** test dies —
+so a mutation that kills some *other* test is reported as an error rather than a
+pass. `verify` asserts claims against **committed blobs** (`git show <sha>:<path>`),
+which is the check to use after a fix round; `--sha` audits an older commit.
+
+It exists because every one of these produced a wrong conclusion that a reviewer
+then had to catch:
+
+| Failure | Guard |
+|---|---|
+| `git checkout -- <path>` discarded an uncommitted fix, which then shipped | refuses to run on a dirty tree; restores by explicit SHA |
+| a shell delimiter split a spec on the `:` inside `value: "10"` | mutations are structured data, never split |
+| the suite ran on the wrong node, printed nothing, and "0 failures" read as "0 killed" | no parseable summary is **ERROR**, never SURVIVED; node version asserted |
+| verification read the working tree after a restore | `verify` reads committed blobs only |
+| an anchor matched twice and the wrong instance was mutated | occurrence count asserted before replacing |
+
+Runners: `vitest` (e2e/`bots-app`), `cargo` (Rust crates), and `unittest` (the `scripts/` Python tools). **Scope the command to the narrowest target** — a whole-suite or workspace-scoped command is paid once per mutation (`cargo test -p <crate>` ≈ 1s; `cargo test --workspace` ≈ 77s even warm). Runs are serial by design: mutations rewrite the shared working tree, so they cannot safely overlap. Keep it out of required per-PR CI — `baseline_tests` is an absolute count, so an unrelated PR adding a test would turn the job red. The tool has its own unit tests (`scripts/test_mutation_check.py`, run with `python3 -m unittest discover -s scripts -p 'test_*.py'`) and a spec that mutates **itself** — `scripts/mutation-check.py run scripts/mutation-check-self-spec.json` — so the verifier is held to the standard it enforces.
 
 ## Choosing the right layer
 

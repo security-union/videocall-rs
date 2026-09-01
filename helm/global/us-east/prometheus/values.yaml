@@ -256,38 +256,48 @@ prometheus:
                 summary: "NATS publish latency p99 > 50ms"
                 description: "NATS publish p99 latency is {{ $value | printf \"%.1f\" }}ms"
 
-            # RelayQueueNearFull is split per transport because the single
-            # relay_outbound_queue_depth gauge carries an 8x-different max per
-            # transport, so one scalar threshold cannot express "near full" for
-            # both: WS max = WS_OUTBOUND_CHANNEL_CAPACITY (128); WT max = the SUM
-            # of the unistream (WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 512) and
-            # datagram (WT_DATAGRAM_CHANNEL_CAPACITY, 512) channels = 1024. The
-            # gauge has only room+transport labels (no per-primitive label yet),
-            # so the WT rule anchors on 410 (~80% of the 512 unistream queue),
-            # not 80% of the 1024 sum: under congestion the reliable unistream
-            # backs up first (it blocks on QUIC flow control) while the datagram
-            # path drops rather than queues, so a ~410-deep unistream backlog —
-            # the source of the freeze symptom — would otherwise hide under the
-            # summed gauge whenever datagrams are near-empty. Exporting a
-            # per-primitive depth label so the WT rule can target the unistream
-            # queue directly is a source-side follow-up (issue #710).
+            # These four MUST read the *_by_session series: the room-level
+            # relay_outbound_queue_{depth,bytes} are last-writer-wins across a
+            # room's sessions, so an idle peer erases a stalled one (#2593).
+            # Thresholds are ~80% of each queue's OWN capacity — WS 819/1024,
+            # WT 410/512 per `channel`, never on a uni+datagram sum, so the WT
+            # rule is strictly LESS sensitive than the summed form it replaced.
             - alert: RelayQueueNearFullWS
-              expr: relay_outbound_queue_depth{transport="websocket"} > 102
-              for: 30s
+              expr: max by (room, transport, channel, pod) (min_over_time(videocall_relay_outbound_queue_depth_by_session{transport="websocket",channel="ws"}[1m])) > 819
+              for: 15s
               labels:
                 severity: warning
               annotations:
-                summary: "Relay WS outbound queue near capacity"
-                description: "Room {{ $labels.room }} (websocket) queue depth: {{ $value }} of 128 (WS cap=128)"
+                summary: "Relay WS outbound queue near capacity (slots)"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (websocket): one receiver held a queue depth of at least {{ $value }} of 1024 slots across every sample in the last minute. This is a max over that room's receivers, not a room total — one stalled receiver is enough. Attribute it to a session_id on the 'Relay Outbound Queue Depth by Session' panel in the meeting-investigation dashboard"
+
+            # 0.80 x WS_OUTBOUND_VIDEO_BYTE_BUDGET / 0.90 x WS_OUTBOUND_SCREEN_BYTE_BUDGET, pinned by constants.rs tests.
+            - alert: RelayQueueNearFullWSVideoBytes
+              expr: max by (room, transport, kind, pod) (min_over_time(relay_outbound_queue_bytes_by_session{transport="websocket",kind="video"}[1m])) > 307200
+              for: 15s
+              labels:
+                severity: warning
+              annotations:
+                summary: "Relay WS camera-video queue at its byte shed point"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (websocket): one receiver held at least {{ $value }} queued camera bytes across every sample in the last minute — past 0.80 x WS_OUTBOUND_VIDEO_BYTE_BUDGET (307,200), so camera VIDEO is being shed to that receiver. This is a max over the room's receivers, not a room total. Attribute it to a session_id on the 'Relay Outbound Queue Bytes by Session' panel in the meeting-investigation dashboard"
+
+            - alert: RelayQueueNearFullWSScreenBytes
+              expr: max by (room, transport, kind, pod) (min_over_time(relay_outbound_queue_bytes_by_session{transport="websocket",kind="screen"}[1m])) > 6369062
+              for: 15s
+              labels:
+                severity: warning
+              annotations:
+                summary: "Relay WS screen queue at its byte shed point"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (websocket): one receiver held at least {{ $value }} queued screen bytes across every sample in the last minute — past 0.90 x WS_OUTBOUND_SCREEN_BYTE_BUDGET (6,369,062), so SCREEN is being shed to that receiver. That is ~115 queued frames at the 1440p encode ceiling, and more at lower share resolutions, where frames are smaller. Attribute it to a session_id on the 'Relay Outbound Queue Bytes by Session' panel in the meeting-investigation dashboard"
 
             - alert: RelayQueueNearFullWT
-              expr: relay_outbound_queue_depth{transport="webtransport"} > 410
-              for: 30s
+              expr: max by (room, transport, channel, pod) (min_over_time(videocall_relay_outbound_queue_depth_by_session{transport="webtransport"}[1m])) > 410
+              for: 15s
               labels:
                 severity: warning
               annotations:
-                summary: "Relay WT outbound queue near capacity"
-                description: "Room {{ $labels.room }} (webtransport) queue depth: {{ $value }} (WT cap=1024: unistream 512 + datagram 512; alert anchors on the 512 unistream queue)"
+                summary: "Relay WT {{ $labels.channel }} queue near capacity"
+                description: "Relay pod {{ $labels.pod }}, room {{ $labels.room }} (webtransport) {{ $labels.channel }}: one receiver held a queue depth of at least {{ $value }} across every sample in the last minute, past ~80% of that queue's capacity (datagram is a fixed 512; unistream defaults to 512 and is overridable at deploy time via WT_OUTBOUND_CHANNEL_CAPACITY). A unistream fire is receiver downlink; a datagram fire is runtime starvation, not downlink. This is a max over the room's receivers, not a room total, and per-channel rather than the uni+datagram sum it replaces. Attribute it to a session_id on the 'Relay Outbound Queue Depth by Session' panel in the meeting-investigation dashboard"
 
             # =====================================================================
             # relay viewport alerts (#1437)

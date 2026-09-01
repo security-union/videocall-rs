@@ -27,6 +27,7 @@ use url::Url;
 use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::url_log::strip_query_for_log;
 use web_transport_quinn::{ClientBuilder, Session};
 
 /// Maximum length-prefixed frame payload the relay will accept on a uni stream.
@@ -90,7 +91,11 @@ impl WebTransportClient {
         is_speaking: Arc<AtomicBool>,
         inbound_hook: Option<InboundHook>,
     ) -> anyhow::Result<()> {
-        info!("Connecting client {} to {}", self.config.user_id, lobby_url);
+        info!(
+            "Connecting client {} to {}",
+            self.config.user_id,
+            strip_query_for_log(lobby_url.as_str())
+        );
 
         let client = if insecure {
             warn!("Certificate verification disabled (--insecure)");
@@ -101,7 +106,6 @@ impl WebTransportClient {
             ClientBuilder::new().with_system_roots()?
         };
 
-        info!("Connecting to {}", lobby_url);
         let session = client.connect(lobby_url.clone()).await?;
         info!(
             "WebTransport session established for {}",

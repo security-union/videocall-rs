@@ -54,6 +54,10 @@ The Layout header switches to **ctl :<port>** in that mode.
   `Authorization: Bearer <token>` server-side before forwarding to the ctl API.
 - The token never reaches the browser tab and is never logged.
 - All proxied endpoints are 127.0.0.1 ⇄ 127.0.0.1, never crossing the network.
+- `/api/*` returns 403 when `Sec-Fetch-Site` reports another site, or when
+  `Origin` is present and is not a loopback origin. Binding to loopback does
+  not by itself keep a page in the operator's browser from reaching this port,
+  and the sidecar attaches the bearer token to whatever it forwards.
 
 ### Why a proxy (not "token in the page")?
 
@@ -71,8 +75,7 @@ Two reasons:
 
 The dashboard sidecar binds to `127.0.0.1` **only** — there is no in-product
 remote-access surface (no remote-auth login screen, no exposed listening
-socket, no published port). This is by design: the security model relies on
-"if you're on the loopback, you're already authorized."
+socket, no published port).
 
 To reach a dashboard running on a different machine, use **SSH local
 forwarding** (or a VPN — same effect):

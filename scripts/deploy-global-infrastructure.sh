@@ -439,7 +439,38 @@ validate_prerequisites() {
         fi
         log_info "✓ Chart '${chart}' exists"
     done
-    
+
+    # deploy_chart runs `helm upgrade` without --wait, so without this preflight
+    # a missing `jwt-secret` would still be reported as a successful deploy.
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_warning "Dry run: skipping the live 'jwt-secret' check (needs cluster access)"
+    else
+        local checked_contexts=""
+        for chart in "${charts[@]}"; do
+            case "${chart}" in
+                */websocket|*/webtransport) ;;
+                *) continue ;;
+            esac
+            local secret_context
+            secret_context="$(get_context_for_chart "${chart}")"
+            case " ${checked_contexts} " in
+                *" ${secret_context} "*) continue ;;
+            esac
+            checked_contexts="${checked_contexts} ${secret_context}"
+            if ! kubectl --context "${secret_context}" get secret jwt-secret >/dev/null 2>&1; then
+                error_exit "Secret 'jwt-secret' not found in context '${secret_context}' (or that cluster is unreachable).
+
+Every relay validates room tokens minted by the single meeting-api, so this secret
+must hold the SAME value in every cluster. Copy it from a cluster that already has
+it rather than generating a new one:
+
+  SECRET=\$(kubectl --context <source-context> get secret jwt-secret -o jsonpath='{.data.secret}' | base64 -d)
+  kubectl --context ${secret_context} create secret generic jwt-secret --from-literal=secret=\"\${SECRET}\""
+            fi
+            log_info "✓ Secret 'jwt-secret' exists in ${secret_context}"
+        done
+    fi
+
     # Check cert-manager components exist
     for component in "${CERT_MANAGER_COMPONENTS[@]}"; do
         local component_path="${HELM_DIR}/${component}"

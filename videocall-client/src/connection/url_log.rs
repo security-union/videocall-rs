@@ -25,27 +25,13 @@
 //! error-capture library that scoops up console output (Sentry, Datadog RUM,
 //! etc.).
 //!
-//! This module provides a single tiny helper, [`strip_query_for_log`], that
-//! removes the query string before formatting. Use it at every site that
-//! logs a connection URL — see PR #570 (Phase 1) for the diagnostic-bus fix
-//! and security-audit follow-up F2 for the log-scrubbing context.
+//! The implementation lives in `videocall_types::url_log` because the relay
+//! logs connection URLs too and must redact them identically. Use it at every
+//! site that logs a connection URL — see PR #570 (Phase 1) for the
+//! diagnostic-bus fix and security-audit follow-up F2 for the log-scrubbing
+//! context.
 
-/// Strip the query string from a URL before logging it.
-///
-/// - URLs containing `?` are truncated at the first `?`.
-/// - URLs without `?` are returned unchanged.
-/// - Inputs that don't look like URLs (no `://`) collapse to an empty string,
-///   so a malformed value can never accidentally print a token-bearing
-///   fragment to the console.
-pub(crate) fn strip_query_for_log(url: &str) -> String {
-    if !url.contains("://") {
-        return String::new();
-    }
-    match url.find('?') {
-        Some(i) => url[..i].to_string(),
-        None => url.to_string(),
-    }
-}
+pub(crate) use videocall_types::url_log::strip_query_for_log;
 
 #[cfg(test)]
 mod tests {

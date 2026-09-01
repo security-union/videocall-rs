@@ -83,8 +83,22 @@ where
             let outcome = refresh_single_flight().await;
             match outcome {
                 Ok(()) => op().await,
-                Err(()) => Err(JoinError::NotAuthenticated),
+                Err(()) => {
+                    log::warn!(
+                        "meeting-api 401: token refresh produced no credential; \
+                         failing this request without a retry"
+                    );
+                    Err(JoinError::NotAuthenticated)
+                }
             }
+        }
+        Err(JoinError::NotAuthenticated) => {
+            log::warn!(
+                "meeting-api 401 on the cookie-session flow: the session cookie is \
+                 expired or absent and this flow has no client-side refresh — \
+                 re-login is required"
+            );
+            Err(JoinError::NotAuthenticated)
         }
         other => other,
     }
@@ -171,19 +185,19 @@ where
 }
 
 /// Public single-flight provider-refresh entry for callers OUTSIDE the meeting
-/// API path.
+/// API path (currently: the chat SSE re-establish loop in `chat_sidebar`).
 ///
 /// Returns `Ok(())` if the refresh produced a token, `Err(())` otherwise.
 ///
-/// Routing an out-of-band refresh through here — rather than calling
-/// `auth::refresh_access_token()` directly — means it COALESCES with a concurrent
-/// meeting-driven refresh through the same `REFRESH_INFLIGHT` slot: the underlying
-/// PKCE network POST fires exactly once per wave even if two paths that auth on
-/// the SAME session token 401 at the same instant (a likely race, since they
-/// expire together). Without this, two separate refreshes could fire, the second
-/// using a refresh-token the first already rotated away (Okta rotates refresh
-/// tokens) → a spurious `invalid_grant` that clears the now-valid token and logs
-/// the user out.
+/// Routing chat through here — rather than calling `auth::refresh_access_token()`
+/// directly — means a chat-driven refresh and a concurrent meeting-driven
+/// refresh COALESCE through the same `REFRESH_INFLIGHT` slot: the underlying
+/// PKCE network POST fires exactly once per wave even if the meeting path 401s
+/// and the chat SSE reports `token_expired` at the same instant (a likely race,
+/// since both auth on the SAME session token and expire together). Without this,
+/// two separate refreshes could fire, the second using a refresh-token the first
+/// already rotated away (Okta rotates refresh tokens) → a spurious
+/// `invalid_grant` that clears the now-valid token and logs the user out.
 pub async fn refresh_token_single_flight() -> Result<(), ()> {
     refresh_single_flight().await
 }
@@ -243,9 +257,16 @@ pub async fn check_guest_status(
     meeting_id: &str,
     observer_token: &str,
 ) -> Result<JoinMeetingResponse, JoinError> {
-    make_guest_client(observer_token)?
+    let result = make_guest_client(observer_token)?
         .get_guest_status(meeting_id)
-        .await
+        .await?;
+    crate::guest_session::remember(
+        meeting_id,
+        &result.user_id,
+        result.room_token.as_deref(),
+        result.observer_token.as_deref(),
+    );
+    Ok(result)
 }
 
 /// Fetch the participant's current status using the appropriate auth mode.
@@ -289,6 +310,8 @@ pub async fn update_meeting(
         allow_guests,
         recording_allowed_for_all,
         chat_allowed_for_all,
+        password: None,
+        remove_password: None,
     };
     let req = &req;
     with_refresh_retry(|| async move { client()?.update_meeting(meeting_id, req).await }).await
@@ -323,6 +346,57 @@ pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
             Ok(())
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Fetch the waiting-room list. A meeting with no waiting room reads as empty.
+pub async fn get_waiting_room(meeting_id: &str) -> Result<Vec<JoinMeetingResponse>, JoinError> {
+    match with_refresh_retry(|| async { client()?.get_waiting_room(meeting_id).await }).await {
+        Ok(response) => Ok(response.waiting),
+        Err(JoinError::NotFound(_)) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn admit_participant(meeting_id: &str, user_id: &str) -> Result<(), JoinError> {
+    with_refresh_retry(|| async { client()?.admit_participant(meeting_id, user_id).await })
+        .await
+        .map(|_| ())
+}
+
+pub async fn reject_participant(meeting_id: &str, user_id: &str) -> Result<(), JoinError> {
+    with_refresh_retry(|| async { client()?.reject_participant(meeting_id, user_id).await })
+        .await
+        .map(|_| ())
+}
+
+pub async fn admit_all(meeting_id: &str) -> Result<(), JoinError> {
+    with_refresh_retry(|| async { client()?.admit_all(meeting_id).await })
+        .await
+        .map(|_| ())
+}
+
+/// Wall-clock budget a leave request may hold the page before navigation.
+pub const LEAVE_DEADLINE_MS: u32 = 4_000;
+
+/// Await a leave for at most [`LEAVE_DEADLINE_MS`], then let the caller navigate
+/// regardless. A leave the server did not acknowledge is logged at error level.
+pub async fn leave_within_deadline<F>(meeting_id: &str, leave: F)
+where
+    F: std::future::Future<Output = Result<(), JoinError>>,
+{
+    let timeout = gloo_timers::future::TimeoutFuture::new(LEAVE_DEADLINE_MS);
+    match futures::future::select(std::pin::pin!(leave), timeout).await {
+        futures::future::Either::Left((Ok(()), _)) => {}
+        futures::future::Either::Left((Err(e), _)) => {
+            log::error!("Leave NOT acknowledged for meeting {meeting_id}: {e}");
+        }
+        futures::future::Either::Right(((), _)) => {
+            log::error!(
+                "Leave NOT acknowledged for meeting {meeting_id}: \
+                 still pending after {LEAVE_DEADLINE_MS}ms; navigating away"
+            );
+        }
     }
 }
 
@@ -366,6 +440,20 @@ pub async fn create_meeting(
     with_refresh_retry(|| async move { client()?.create_meeting(req).await }).await
 }
 
+/// Decide how a join-guest request authenticates and which id it claims. The id
+/// and the token proving it go out together or not at all (#2331).
+fn guest_join_auth(
+    resume: Option<(String, String)>,
+) -> (videocall_meeting_client::AuthMode, Option<String>) {
+    match resume {
+        Some((user_id, token)) => (
+            videocall_meeting_client::AuthMode::Bearer(token),
+            Some(user_id),
+        ),
+        None => (videocall_meeting_client::AuthMode::Cookie, None),
+    }
+}
+
 /// Join a meeting as a guest.
 ///
 /// `password` is the meeting password (issue #1613). A guest is never the
@@ -379,16 +467,18 @@ pub async fn join_meeting_as_guest(
     password: Option<&str>,
 ) -> Result<JoinMeetingResponse, JoinError> {
     log::info!("Joining meeting as guest via API: {meeting_id} (display_name: {display_name})");
-    let stored_id = crate::auth::get_guest_session_id();
+    let (auth, claimed_id) = guest_join_auth(crate::guest_session::resume(meeting_id));
     let base_url = crate::constants::meeting_api_base_url().map_err(JoinError::Config)?;
-    let result = videocall_meeting_client::MeetingApiClient::new(
-        &base_url,
-        videocall_meeting_client::AuthMode::Cookie,
-    )
-    .join_meeting_as_guest(meeting_id, display_name, stored_id.as_deref(), password)
-    .await?;
+    let result = videocall_meeting_client::MeetingApiClient::new(&base_url, auth)
+        .join_meeting_as_guest(meeting_id, display_name, claimed_id.as_deref(), password)
+        .await?;
 
-    crate::auth::store_guest_session_id(&result.user_id);
+    crate::guest_session::remember(
+        meeting_id,
+        &result.user_id,
+        result.room_token.as_deref(),
+        result.observer_token.as_deref(),
+    );
     log::info!(
         "Guest join response: status={}, is_host={}, user_id={}",
         result.status,
@@ -721,5 +811,34 @@ mod tests {
             let _ = h1.await;
             let _ = h2.await;
         });
+    }
+}
+
+#[cfg(test)]
+mod guest_join_auth_tests {
+    //! `guest_join_auth` is the whole identity decision; the request carrying it
+    //! needs a server (#2331).
+
+    use super::*;
+    use videocall_meeting_client::AuthMode;
+
+    #[test]
+    fn a_resumable_session_sends_the_token_as_bearer_and_claims_the_id() {
+        let (auth, claimed) = guest_join_auth(Some((
+            "guest:2f1c".to_string(),
+            "the.guest.token".to_string(),
+        )));
+        match auth {
+            AuthMode::Bearer(token) => assert_eq!(token, "the.guest.token"),
+            AuthMode::Cookie => panic!("a stored token must go out as a Bearer credential"),
+        }
+        assert_eq!(claimed.as_deref(), Some("guest:2f1c"));
+    }
+
+    #[test]
+    fn without_a_resumable_session_no_id_is_claimed() {
+        let (auth, claimed) = guest_join_auth(None);
+        assert!(matches!(auth, AuthMode::Cookie));
+        assert_eq!(claimed, None);
     }
 }

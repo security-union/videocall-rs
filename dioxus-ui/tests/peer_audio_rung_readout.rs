@@ -1,41 +1,13 @@
 // Copyright 2026 Security Union LLC
 // Licensed under MIT OR Apache-2.0
 //
-// Issue #2132: the peer tile's received-audio readout must report the audio rung
-// the receiver is actually decoding, not the layer-0 nominal.
+// A REMOTE peer's audio kbps is not derivable from the layer id it reports, so the
+// peer tile's received-audio field renders the em-dash even when `peer_status`
+// carries a rung.
 //
-// WHY THIS FILE EXISTS. The host unit tests are mutation-sensitive on each link
-// of the chain — `overlay_audio_kbps_from_status` (peer_status -> kbps),
-// `overlay_audio_kbps_display` (kbps -> Option, the em-dash gate), and
-// `format_media_metrics_line` (Option -> text). What none of them can see is
-// whether `PeerTile` WIRES them together: replacing its call with
-// `overlay_audio_kbps(a, None)` reinstates the bug and leaves every host test
-// green, because each helper is tested with explicit arguments.
-//
-// The Playwright spec `e2e/tests/media-metrics-overlay.spec.ts` does assert this
-// surface with real peers, and this PR extends it. But it cannot currently run:
-// issue #2193 means its 2-peer `setupTwoUserMeeting` helper times out on
-// `.grid-item:has(canvas)` before reaching any assertion — verified on this head,
-// where the two PRE-EXISTING tests in that file fail identically. It is also
-// untagged, so `pr-check-e2e-smoke-hcl.yaml` (`--project=bvt1`) would not run it
-// even once #2193 lands.
-//
-// So without this file, reverting the tile's wiring leaves every per-PR CI job
-// green. Same seam #2170 was faulted for, applied here because the reviewer
-// asked for exactly this link.
-//
-// It runs in a browser (`wasm_bindgen_test`) for two reasons: the assertion is on
-// rendered DOM text, and the `peer_status` event that carries the rung travels the
-// `videocall-diagnostics` broadcast bus, whose native `SENDER` drops its receiver
-// — so a host test cannot deliver the event at all.
-//
-// COVERAGE SPLIT — what this deliberately does NOT observe:
-//   * the EMISSION side (`Peer::displayed_audio_layer` and the availability
-//     window). This injects a `peer_status` event directly; the emission is
-//     covered by `peer_status_carries_the_arriving_audio_rung_and_omits_a_stale_one`
-//     in `videocall-client`.
-//   * the real decode path that sets `selected_audio_layer`. Client-side host
-//     tests pin the chooser; this file starts from "a rung was reported."
+// Browser-only: the assertion is on rendered DOM text, and the `peer_status` event
+// travels the `videocall-diagnostics` broadcast bus, whose native `SENDER` drops
+// its receiver.
 
 use dioxus::prelude::*;
 use dioxus_ui::components::canvas_generator::PinnedTile;
@@ -57,8 +29,9 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 const PEER: &str = "alice";
 
-/// The rung the test reports over `peer_status`. Deliberately NOT rung 0: rung 0's
-/// nominal is what the pre-fix code always rendered, so it cannot discriminate.
+/// The rung the test reports over `peer_status`. Deliberately the TOP rung: its
+/// ladder nominal is the largest, so a reintroduced mapping is unmistakable in the
+/// rendered text.
 const REPORTED_RUNG: u64 = 2;
 
 #[allow(non_snake_case)]
@@ -109,7 +82,7 @@ fn broadcast_peer_status(rung: u64) {
 }
 
 #[wasm_bindgen_test]
-async fn peer_tile_readout_reports_the_rung_from_peer_status() {
+async fn peer_tile_readout_em_dashes_a_reported_audio_rung() {
     inject_app_config();
     let mount = create_mount_point();
     render_into(&mount, TileParent);
@@ -129,23 +102,20 @@ async fn peer_tile_readout_reports_the_rung_from_peer_status() {
         .map(|e| e.text_content().unwrap_or_default())
         .unwrap_or_default();
 
-    let expected = videocall_client::decode::layer_chooser::audio_layer_kbps(REPORTED_RUNG as u32)
-        .expect("reported rung must be on the ladder");
-    let base = videocall_client::decode::layer_chooser::audio_layer_kbps(0).unwrap();
-    assert_ne!(
-        expected, base,
-        "premise: the reported rung's nominal must differ from the base, or this \
-         assertion cannot discriminate the fix"
-    );
     assert!(
-        text.contains(&format!("{expected}k")),
-        "readout must report the rung carried on peer_status ({expected}k); got {text:?}"
+        text.contains("\u{2014}k"),
+        "the received-audio field must render the em-dash even with a rung \
+         reported; got {text:?}"
     );
-    assert!(
-        !text.contains(&format!("{base}k")),
-        "readout must NOT fall back to the base nominal ({base}k) — that is the \
-         #2132 bug; got {text:?}"
-    );
+    // Every rung nominal, read from the production ladder so a retune moves with it.
+    for rung in 0..3u32 {
+        let nominal =
+            videocall_client::decode::layer_chooser::audio_layer_kbps(rung).expect("on-ladder");
+        assert!(
+            !text.contains(&format!("{nominal}k")),
+            "readout must carry no ladder bitrate; found {nominal}k in {text:?}"
+        );
+    }
 
     cleanup(&mount);
 }

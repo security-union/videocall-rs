@@ -93,6 +93,45 @@ export async function createMeeting(
   return json.result.meeting_id;
 }
 
+/** Settings accepted by `PATCH /api/v1/meetings/{id}` (`UpdateMeetingRequest`). */
+export interface MeetingSettingsPatch {
+  waiting_room_enabled?: boolean;
+  admitted_can_admit?: boolean;
+  end_on_host_leave?: boolean;
+  allow_guests?: boolean;
+  recording_allowed_for_all?: boolean;
+  chat_allowed_for_all?: boolean;
+}
+
+/**
+ * Change meeting settings via `PATCH /api/v1/meetings/{id}`.
+ *
+ * Owner-only: a non-owner caller gets a 403 and this throws.
+ *
+ * `{waiting_room_enabled: false}` is not a pure settings write — the same
+ * transaction bulk-admits everyone currently `waiting`, and the route then
+ * publishes one `PARTICIPANT_ADMITTED` per admitted user.
+ */
+export async function patchMeetingSettings(
+  ownerEmail: string,
+  ownerName: string,
+  meetingId: string,
+  settings: MeetingSettingsPatch,
+): Promise<void> {
+  const res = await fetch(`${API_URL}/api/v1/meetings/${meetingId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: authCookie(ownerEmail, ownerName),
+    },
+    body: JSON.stringify(settings),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`PATCH /api/v1/meetings/${meetingId} failed (${res.status}): ${txt}`);
+  }
+}
+
 /**
  * Have the given user "join" the meeting via `POST /api/v1/meetings/{id}/join`.
  *

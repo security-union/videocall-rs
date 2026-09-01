@@ -23,17 +23,20 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::priority_drop::{
-    evaluate as evaluate_priority_drop, OutboundPriority, PriorityDropDecision,
+    evaluate_dual as evaluate_priority_drop_dual, OutboundPriority, PriorityDropDecision,
+    QueueByteMeter,
 };
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{
-    ws_mailbox_capacity, CLIENT_TIMEOUT, HEARTBEAT_INTERVAL, WS_OUTBOUND_CHANNEL_CAPACITY,
+    ws_mailbox_capacity, CLIENT_TIMEOUT, FRAGMENT_ASSEMBLY_IDLE_TIMEOUT,
+    FRAGMENT_ASSEMBLY_MAX_LIFETIME, HEARTBEAT_INTERVAL, MAX_FRAME_SIZE,
+    WS_OUTBOUND_CHANNEL_CAPACITY, WS_OUTBOUND_SCREEN_BYTE_BUDGET, WS_OUTBOUND_VIDEO_BYTE_BUDGET,
 };
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{
-    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH,
-    RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION, RELAY_PACKET_DROPS_TOTAL,
+    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_PACKET_DROPS_TOTAL, WS_FRAGMENTED_INBOUND_TOTAL,
+    WS_FRAGMENT_DISCARDED_TOTAL,
 };
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -43,10 +46,11 @@ use actix::{
     Running, StreamHandler, WrapFuture,
 };
 use actix_web_actors::ws::{self, WebsocketContext};
+use bytes::BytesMut;
 use protobuf::Message as ProtobufMessage;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -95,6 +99,38 @@ pub(crate) fn drop_kind_label(
     }
 }
 
+/// One queued outbound packet. The priority rides WITH the payload, so the
+/// drain knows which [`QueueByteMeter`] bucket to credit — no parallel
+/// structure exists to fall out of step (#2261).
+pub(crate) struct OutboundFrame {
+    priority: OutboundPriority,
+    bytes: Vec<u8>,
+}
+
+/// `0` disables the byte dimension: audio costs slots, not bytes (#2261).
+pub(crate) fn ws_byte_budget_for(priority: OutboundPriority) -> usize {
+    match priority {
+        OutboundPriority::Video => WS_OUTBOUND_VIDEO_BYTE_BUDGET,
+        OutboundPriority::Screen => WS_OUTBOUND_SCREEN_BYTE_BUDGET,
+        OutboundPriority::Audio | OutboundPriority::Critical | OutboundPriority::Control => 0,
+    }
+}
+
+/// The WS queue's slot and byte bounds, bound here so they are testable.
+pub(crate) fn ws_outbound_decision(
+    priority: OutboundPriority,
+    free_capacity: usize,
+    queued: &QueueByteMeter,
+) -> PriorityDropDecision {
+    evaluate_priority_drop_dual(
+        priority,
+        free_capacity,
+        WS_OUTBOUND_CHANNEL_CAPACITY,
+        queued.queued_for(priority),
+        ws_byte_budget_for(priority),
+    )
+}
+
 /// WebSocket Chat Session Actor
 ///
 /// A thin transport adapter that delegates business logic to `SessionLogic`.
@@ -112,10 +148,85 @@ pub struct WsChatSession {
     /// Bounded outbound channel sender — packets are enqueued here and
     /// drained by a `StreamHandler<Vec<u8>>` registered in `started()`.
     /// When the channel is full, `on_outbound_drop()` records the drop.
-    outbound_tx: mpsc::Sender<Vec<u8>>,
+    outbound_tx: mpsc::Sender<OutboundFrame>,
 
     /// Receiver half, consumed once by `started()` via `ctx.add_stream()`.
-    outbound_rx: Option<ReceiverStream<Vec<u8>>>,
+    outbound_rx: Option<ReceiverStream<OutboundFrame>>,
+
+    /// Live byte occupancy of `outbound_tx`; both mutators take `&mut self`.
+    outbound_bytes: QueueByteMeter,
+
+    /// In-flight fragmented inbound message (#2600).
+    fragment: FragmentBuffer,
+}
+
+/// Length- and time-bounded accumulator for a fragmented inbound WS message (#2600).
+#[derive(Default)]
+pub(crate) struct FragmentBuffer {
+    buf: Option<BytesMut>,
+    /// Set once by `begin`; never refreshed, so it bounds a deliberate holder.
+    opened: Option<Instant>,
+    /// Refreshed by every accepted `extend`, so a slow uplink survives.
+    last_active: Option<Instant>,
+}
+
+impl FragmentBuffer {
+    /// `true` when a partial was actually discarded, so the caller can count it.
+    fn reset(&mut self) -> bool {
+        self.opened = None;
+        self.last_active = None;
+        self.buf.take().is_some()
+    }
+
+    fn begin(&mut self, bytes: &[u8], now: Instant) {
+        self.buf = Some(BytesMut::from(bytes));
+        self.opened = Some(now);
+        self.last_active = Some(now);
+    }
+
+    /// `false` only when the LIMIT refused the append. Refreshes the idle clock but NOT
+    /// [`FragmentBuffer::opened`], so an empty-`Continue` trickle cannot extend the lifetime.
+    fn extend(&mut self, bytes: &[u8], limit: usize, now: Instant) -> bool {
+        let Some(buf) = self.buf.as_mut() else {
+            return true;
+        };
+        if buf.len().saturating_add(bytes.len()) > limit {
+            self.reset();
+            return false;
+        }
+        buf.extend_from_slice(bytes);
+        self.last_active = Some(now);
+        true
+    }
+
+    fn take(&mut self) -> Option<BytesMut> {
+        self.opened = None;
+        self.last_active = None;
+        self.buf.take()
+    }
+
+    /// Reclaims on EITHER bound; only the lifetime resists a client refreshing the idle clock.
+    fn reap_if_stale(&mut self, now: Instant) -> Option<usize> {
+        let opened = self.opened?;
+        let idle_from = self.last_active.unwrap_or(opened);
+        if now.duration_since(idle_from) <= FRAGMENT_ASSEMBLY_IDLE_TIMEOUT
+            && now.duration_since(opened) <= FRAGMENT_ASSEMBLY_MAX_LIFETIME
+        {
+            return None;
+        }
+        let n = self.buf.as_ref().map(|b| b.len()).unwrap_or(0);
+        self.reset();
+        Some(n)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buf.as_ref().map(|b| b.len()).unwrap_or(0)
+    }
+    #[cfg(test)]
+    fn is_open(&self) -> bool {
+        self.buf.is_some()
+    }
 }
 
 impl WsChatSession {
@@ -150,7 +261,8 @@ impl WsChatSession {
             end_on_host_leave,
         );
 
-        let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(WS_OUTBOUND_CHANNEL_CAPACITY);
+        let (outbound_tx, outbound_rx) =
+            mpsc::channel::<OutboundFrame>(WS_OUTBOUND_CHANNEL_CAPACITY);
 
         WsChatSession {
             logic,
@@ -158,25 +270,32 @@ impl WsChatSession {
             activated: false,
             outbound_tx,
             outbound_rx: Some(ReceiverStream::new(outbound_rx)),
+            outbound_bytes: QueueByteMeter::default(),
+            fragment: FragmentBuffer::default(),
         }
     }
 
     /// Start heartbeat check (WebSocket-specific: uses ping frames)
     fn start_heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
         ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
-            // Sample outbound queue depth for Prometheus
+            // Sample outbound queue depth/bytes for Prometheus
             let depth = WS_OUTBOUND_CHANNEL_CAPACITY - act.outbound_tx.capacity();
-            RELAY_OUTBOUND_QUEUE_DEPTH
-                .with_label_values(&[&act.logic.room, "websocket"])
-                .set(depth as f64);
-            RELAY_OUTBOUND_QUEUE_DEPTH_BY_SESSION
-                .with_label_values(&[
-                    &act.logic.room,
-                    "websocket",
-                    &act.logic.id.to_string(),
-                    "ws",
-                ])
-                .set(depth as f64);
+            crate::metrics::record_ws_outbound_queue_sample(
+                &act.logic.room,
+                &act.logic.id.to_string(),
+                depth,
+                &act.outbound_bytes,
+            );
+
+            if let Some(n) = act.fragment.reap_if_stale(Instant::now()) {
+                WS_FRAGMENT_DISCARDED_TOTAL
+                    .with_label_values(&["abandoned"])
+                    .inc();
+                debug!(
+                    "Abandoned fragment sequence ({n} B) reclaimed on session {}",
+                    act.logic.id
+                );
+            }
 
             if Instant::now().duration_since(act.heartbeat) > CLIENT_TIMEOUT {
                 error!("WebSocket client heartbeat failed, disconnecting!");
@@ -196,6 +315,8 @@ impl Actor for WsChatSession {
     type Context = WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        crate::metrics::init_ws_fragment_discard_series();
+
         // Relocate the overflow point off the tiny default actor mailbox
         // onto the policy-aware bounded outbound channel (issue #1057).
         //
@@ -203,7 +324,7 @@ impl Actor for WsChatSession {
         // (16). That mailbox sits *in front* of `outbound_tx` in the relay
         // fan-out path: ChatServer does `recipient.try_send(Message)` (a
         // mailbox enqueue), then `Handler<Message>` enqueues into the
-        // 128-slot `outbound_tx`. Under a bursty fan-out storm (keyframe /
+        // bounded `outbound_tx`. Under a bursty fan-out storm (keyframe /
         // join / screen-share spikes) the 16-slot mailbox overflows long
         // before `outbound_tx` does — and that mailbox is a *dumb* queue:
         // it drops indiscriminately (audio, control, video alike) and cannot
@@ -232,7 +353,7 @@ impl Actor for WsChatSession {
         // hand-off in `Handler<Message>` is CPU-bound (it does NOT block on the
         // socket write), so the actor drains this slack quickly; the headroom
         // is burst-absorption, NOT a deep buffer for a slow receiver (the
-        // outbound channel — unchanged at 128 — still enforces fail-fast video
+        // outbound channel's byte budgets still enforce fail-fast video
         // staleness bounds). The argument is the shared `ws_mailbox_capacity()`
         // binding (issue #1062) — the SINGLE source of truth that the guard
         // test also asserts, so editing the value here is tracked by the test
@@ -309,6 +430,11 @@ impl Actor for WsChatSession {
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        if self.fragment.reset() {
+            WS_FRAGMENT_DISCARDED_TOTAL
+                .with_label_values(&["abandoned"])
+                .inc();
+        }
         self.logic.on_stopping();
         Running::Stop
     }
@@ -387,7 +513,7 @@ impl Handler<Message> for WsChatSession {
         let priority = OutboundPriority::classify(parse_succeeded, packet_type, media_type);
         let free_capacity = self.outbound_tx.capacity();
         if let PriorityDropDecision::Drop { reason } =
-            evaluate_priority_drop(priority, free_capacity, WS_OUTBOUND_CHANNEL_CAPACITY)
+            ws_outbound_decision(priority, free_capacity, &self.outbound_bytes)
         {
             // Priority-driven preempt: record both the per-room and
             // protocol-wide counters with the policy-specific label,
@@ -413,8 +539,12 @@ impl Handler<Message> for WsChatSession {
             return;
         }
 
-        match self.outbound_tx.try_send(bytes) {
-            Ok(()) => {}
+        let enqueued_len = bytes.len();
+        match self.outbound_tx.try_send(OutboundFrame { priority, bytes }) {
+            Ok(()) => {
+                self.outbound_bytes.on_enqueue(priority, enqueued_len);
+                self.logic.observe_outbound_delivery(&msg)
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "websocket", "channel_full"])
@@ -485,9 +615,11 @@ impl Handler<Packet> for WsChatSession {
 /// Drain the bounded outbound channel into actual WebSocket binary frames.
 /// This runs on the actor's event loop, so writes are serialized with all
 /// other actor processing — no additional synchronization needed.
-impl StreamHandler<Vec<u8>> for WsChatSession {
-    fn handle(&mut self, bytes: Vec<u8>, ctx: &mut Self::Context) {
-        ctx.binary(bytes);
+impl StreamHandler<OutboundFrame> for WsChatSession {
+    fn handle(&mut self, frame: OutboundFrame, ctx: &mut Self::Context) {
+        self.outbound_bytes
+            .on_dequeue(frame.priority, frame.bytes.len());
+        ctx.binary(frame.bytes);
     }
 
     /// Override default `finished()` which calls `ctx.stop()`. The outbound
@@ -499,6 +631,73 @@ impl StreamHandler<Vec<u8>> for WsChatSession {
 // =============================================================================
 // WebSocket Stream Handler
 // =============================================================================
+
+impl WsChatSession {
+    /// A complete data frame mid-sequence is an RFC 6455 violation actix passes through;
+    /// the partial must not survive to be spliced onto later bytes.
+    fn discard_open_fragment(&mut self) {
+        if self.fragment.reset() {
+            WS_FRAGMENT_DISCARDED_TOTAL
+                .with_label_values(&["interleaved"])
+                .inc();
+            debug!(
+                "Discarded an open fragment sequence on session {}: interleaved data frame",
+                self.logic.id
+            );
+        }
+    }
+
+    fn extend_fragment(&mut self, bytes: &[u8]) {
+        if !self.fragment.extend(bytes, MAX_FRAME_SIZE, Instant::now()) {
+            WS_FRAGMENT_DISCARDED_TOTAL
+                .with_label_values(&["over_size"])
+                .inc();
+            debug!(
+                "Fragmented inbound message exceeded {} B on session {}; discarded",
+                MAX_FRAME_SIZE, self.logic.id
+            );
+        }
+    }
+
+    /// BOTH inbound arms must route through here (#2600).
+    fn dispatch_inbound(&mut self, data: &[u8], ctx: &mut ws::WebsocketContext<Self>) {
+        let action = self.logic.handle_inbound(data);
+
+        if !self.activated && SessionLogic::should_activate_on_action(&action) {
+            self.logic.addr.do_send(ActivateConnection {
+                session: self.logic.id,
+            });
+            self.activated = true;
+            info!(
+                "Session {} activated on first non-RTT packet",
+                self.logic.id
+            );
+        }
+
+        match action {
+            InboundAction::Echo(bytes) => {
+                ctx.binary(bytes.as_ref().clone());
+            }
+            InboundAction::Forward(bytes) => {
+                ctx.notify(Packet {
+                    data: bytes,
+                    requires_host: false,
+                });
+            }
+            // #2136: same mailbox hop as `Forward`; the flag tells
+            // `Handler<Packet>` to build a host-gated `ClientMessage` that
+            // `ChatServer` refuses to fan out unless this session is the room's
+            // current host.
+            InboundAction::ForwardHostOnly(bytes) => {
+                ctx.notify(Packet {
+                    data: bytes,
+                    requires_host: true,
+                });
+            }
+            InboundAction::Processed | InboundAction::KeepAlive => {}
+        }
+    }
+}
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
     fn handle(&mut self, item: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
@@ -514,41 +713,34 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
         match msg {
             ws::Message::Binary(data) => {
                 self.heartbeat = Instant::now();
-
-                let action = self.logic.handle_inbound(&data);
-
-                if !self.activated && SessionLogic::should_activate_on_action(&action) {
-                    self.logic.addr.do_send(ActivateConnection {
-                        session: self.logic.id,
-                    });
-                    self.activated = true;
-                    info!(
-                        "Session {} activated on first non-RTT packet",
-                        self.logic.id
-                    );
-                }
-
-                match action {
-                    InboundAction::Echo(bytes) => {
-                        ctx.binary(bytes.as_ref().clone());
+                self.discard_open_fragment();
+                self.dispatch_inbound(&data, ctx);
+            }
+            // #2600: a large binary message can arrive as
+            // `FirstBinary` -> `Continue`* -> `Last` instead of one `Binary`.
+            ws::Message::Continuation(item) => {
+                self.heartbeat = Instant::now();
+                match item {
+                    actix_http::ws::Item::FirstBinary(bytes) => {
+                        self.fragment.begin(&bytes, Instant::now());
                     }
-                    InboundAction::Forward(bytes) => {
-                        ctx.notify(Packet {
-                            data: bytes,
-                            requires_host: false,
-                        });
+                    actix_http::ws::Item::FirstText(_) => {}
+                    actix_http::ws::Item::Continue(bytes) => {
+                        self.extend_fragment(&bytes);
                     }
-                    // #2136: same mailbox hop as `Forward`; the flag tells
-                    // `Handler<Packet>` to build a host-gated `ClientMessage`
-                    // that `ChatServer` refuses to fan out unless this session
-                    // is the room's current host.
-                    InboundAction::ForwardHostOnly(bytes) => {
-                        ctx.notify(Packet {
-                            data: bytes,
-                            requires_host: true,
-                        });
+                    actix_http::ws::Item::Last(bytes) => {
+                        self.extend_fragment(&bytes);
+                        if let Some(buf) = self.fragment.take() {
+                            WS_FRAGMENTED_INBOUND_TOTAL.inc();
+                            let data = buf.freeze();
+                            debug!(
+                                "ws reassembled session={} bytes={}",
+                                self.logic.id,
+                                data.len()
+                            );
+                            self.dispatch_inbound(&data, ctx);
+                        }
                     }
-                    InboundAction::Processed | InboundAction::KeepAlive => {}
                 }
             }
             ws::Message::Ping(msg) => {
@@ -560,6 +752,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             }
             ws::Message::Text(_) => {
                 self.heartbeat = Instant::now();
+                self.discard_open_fragment();
             }
             ws::Message::Close(reason) => {
                 info!(
@@ -573,7 +766,9 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 ctx.close(reason);
                 ctx.stop();
             }
-            _ => (),
+            // Exhaustive on purpose (#2600): a new actix variant must be a compile
+            // error, not a silent drop. `Nop` is encoder-only.
+            ws::Message::Nop => {}
         }
     }
 
@@ -610,7 +805,7 @@ impl WsChatSession {
 mod tests {
     use super::*;
     use crate::actors::chat_server::ChatServer;
-    use crate::constants::INBOUND_MAILBOX_HEADROOM_FACTOR;
+    use crate::constants::{INBOUND_MAILBOX_HEADROOM_FACTOR, WS_OUTBOUND_LEGACY_SLOT_CAPACITY};
     use crate::server_diagnostics::ServerDiagnostics;
     use crate::session_manager::SessionManager;
     use actix::Actor;
@@ -652,6 +847,199 @@ mod tests {
     //     accidental revert to the tiny default mailbox fails CI.
     // ----------------------------------------------------------------------
 
+    // Issue #2261. Frame counts below are LITERAL, not recomputed from the
+    // fill ratios, so mutating a ratio fails these rather than moving with it.
+    /// One camera frame at the default tier (600 kbps / 25 fps).
+    const CAMERA_FRAME_BYTES: usize = 3_000;
+    /// One SCREEN frame at the single rung (4423 kbps / 10 fps).
+    const SCREEN_FRAME_BYTES: usize = 55_287;
+
+    #[test]
+    fn ws_byte_budgets_reproduce_the_legacy_slot_depths() {
+        for (priority, admit_frames, shed_frames) in [
+            (OutboundPriority::Video, 102usize, 103usize),
+            (OutboundPriority::Screen, 115, 116),
+        ] {
+            assert_eq!(
+                evaluate_legacy_slot_bound(priority, admit_frames),
+                PriorityDropDecision::Admit,
+                "{priority:?}: legacy 128-slot bound admitted {admit_frames} frames",
+            );
+            assert!(
+                matches!(
+                    evaluate_legacy_slot_bound(priority, shed_frames),
+                    PriorityDropDecision::Drop { .. }
+                ),
+                "{priority:?}: legacy 128-slot bound shed at {shed_frames} frames",
+            );
+        }
+
+        #[allow(clippy::type_complexity)]
+        let cases = [
+            (
+                OutboundPriority::Video,
+                CAMERA_FRAME_BYTES,
+                102usize,
+                103usize,
+            ),
+            (OutboundPriority::Screen, SCREEN_FRAME_BYTES, 115, 116),
+        ];
+        for (priority, frame_bytes, admit_frames, shed_frames) in cases {
+            assert_eq!(
+                ws_outbound_decision(
+                    priority,
+                    WS_OUTBOUND_CHANNEL_CAPACITY,
+                    &meter_of(priority, admit_frames, frame_bytes),
+                ),
+                PriorityDropDecision::Admit,
+                "{priority:?} must still be admitted at {admit_frames} queued frames",
+            );
+            assert!(
+                matches!(
+                    ws_outbound_decision(
+                        priority,
+                        WS_OUTBOUND_CHANNEL_CAPACITY,
+                        &meter_of(priority, shed_frames, frame_bytes),
+                    ),
+                    PriorityDropDecision::Drop { .. }
+                ),
+                "{priority:?} must shed at {shed_frames} queued frames — the depth \
+                 the legacy 128-slot bound produced",
+            );
+        }
+    }
+
+    fn meter_of(priority: OutboundPriority, frames: usize, frame_bytes: usize) -> QueueByteMeter {
+        let mut meter = QueueByteMeter::default();
+        for _ in 0..frames {
+            meter.on_enqueue(priority, frame_bytes);
+        }
+        meter
+    }
+
+    #[test]
+    fn camera_shed_point_ignores_screen_bytes_in_the_same_queue() {
+        // A receiver's queue is mixed by construction. 6 screen frames is
+        // 331,722 B, past 0.80 x WS_OUTBOUND_VIDEO_BYTE_BUDGET (307,200), so a
+        // SHARED byte counter sheds every camera packet in the room here.
+        let mut queue = meter_of(OutboundPriority::Screen, 6, SCREEN_FRAME_BYTES);
+        assert!(
+            queue.queued_total() > WS_OUTBOUND_VIDEO_BYTE_BUDGET * 80 / 100,
+            "precondition: the screen backlog alone must exceed the camera \
+             shed point, or this test proves nothing",
+        );
+        assert_eq!(
+            ws_outbound_decision(
+                OutboundPriority::Video,
+                WS_OUTBOUND_CHANNEL_CAPACITY,
+                &queue
+            ),
+            PriorityDropDecision::Admit,
+            "camera must be judged on camera bytes, not on the presenter's",
+        );
+
+        for _ in 0..102 {
+            queue.on_enqueue(OutboundPriority::Video, CAMERA_FRAME_BYTES);
+        }
+        assert_eq!(
+            ws_outbound_decision(
+                OutboundPriority::Video,
+                WS_OUTBOUND_CHANNEL_CAPACITY,
+                &queue
+            ),
+            PriorityDropDecision::Admit,
+            "102 camera frames is the pre-#2261 depth and must still be admitted",
+        );
+
+        queue.on_enqueue(OutboundPriority::Video, CAMERA_FRAME_BYTES);
+        assert_eq!(
+            ws_outbound_decision(
+                OutboundPriority::Video,
+                WS_OUTBOUND_CHANNEL_CAPACITY,
+                &queue
+            ),
+            PriorityDropDecision::Drop {
+                reason: "priority_drop_video"
+            },
+        );
+
+        // Screen is likewise unaffected by the camera bytes.
+        assert_eq!(
+            ws_outbound_decision(
+                OutboundPriority::Screen,
+                WS_OUTBOUND_CHANNEL_CAPACITY,
+                &queue
+            ),
+            PriorityDropDecision::Admit,
+        );
+    }
+
+    /// The pre-#2261 decision for `queued` packets in a 128-slot queue.
+    fn evaluate_legacy_slot_bound(
+        priority: OutboundPriority,
+        queued: usize,
+    ) -> PriorityDropDecision {
+        crate::actors::priority_drop::evaluate(
+            priority,
+            WS_OUTBOUND_LEGACY_SLOT_CAPACITY - queued,
+            WS_OUTBOUND_LEGACY_SLOT_CAPACITY,
+        )
+    }
+
+    #[test]
+    fn ws_audio_is_slot_bound_never_byte_bound() {
+        assert_eq!(ws_byte_budget_for(OutboundPriority::Audio), 0);
+
+        assert_eq!(
+            ws_outbound_decision(
+                OutboundPriority::Audio,
+                WS_OUTBOUND_CHANNEL_CAPACITY.saturating_sub(116),
+                &meter_of(OutboundPriority::Screen, 116, SCREEN_FRAME_BYTES),
+            ),
+            PriorityDropDecision::Admit,
+        );
+
+        assert_eq!(
+            ws_outbound_decision(
+                OutboundPriority::Audio,
+                WS_OUTBOUND_CHANNEL_CAPACITY.saturating_sub(390),
+                &meter_of(OutboundPriority::Audio, 390, 100),
+            ),
+            PriorityDropDecision::Admit,
+        );
+
+        assert!(matches!(
+            ws_outbound_decision(
+                OutboundPriority::Audio,
+                WS_OUTBOUND_CHANNEL_CAPACITY.saturating_sub(973),
+                &meter_of(OutboundPriority::Audio, 973, 100),
+            ),
+            PriorityDropDecision::Drop { .. }
+        ));
+    }
+
+    #[test]
+    fn ws_outbound_decision_uses_both_the_slot_and_byte_bounds() {
+        assert_eq!(
+            ws_outbound_decision(
+                OutboundPriority::Audio,
+                WS_OUTBOUND_CHANNEL_CAPACITY.saturating_sub(900),
+                &meter_of(OutboundPriority::Audio, 900, 100),
+            ),
+            PriorityDropDecision::Admit,
+        );
+        assert_eq!(
+            ws_outbound_decision(
+                OutboundPriority::Video,
+                WS_OUTBOUND_CHANNEL_CAPACITY.saturating_sub(103),
+                &meter_of(OutboundPriority::Video, 103, CAMERA_FRAME_BYTES),
+            ),
+            PriorityDropDecision::Drop {
+                reason: "priority_drop_video"
+            },
+        );
+    }
+
     /// actix mailbox default — see `actix::mailbox::DEFAULT_CAPACITY`.
     /// Re-declared here so the test fails loudly if the dumb default mailbox
     /// ever becomes the overflow point again (issue #1057).
@@ -662,7 +1050,7 @@ mod tests {
         // Sentinel: the outbound channel capacity itself. Relocating overflow
         // to this policy-aware channel is the #1057 fix.
         assert_eq!(
-            WS_OUTBOUND_CHANNEL_CAPACITY, 128,
+            WS_OUTBOUND_CHANNEL_CAPACITY, 1024,
             "WS outbound channel capacity changed; update issue #1057 \
              rationale and any operator docs before changing this sentinel",
         );
@@ -682,7 +1070,7 @@ mod tests {
             "ws_mailbox_capacity() must equal channel × headroom — this is the \
              exact argument WsChatSession::started feeds set_mailbox_capacity",
         );
-        assert_eq!(ws_mailbox_capacity(), 256);
+        assert_eq!(ws_mailbox_capacity(), 2048);
         // #1057 invariant: the mailbox must be >= the smart channel, never
         // smaller (a smaller mailbox would re-create the dumb-bottleneck).
         assert!(ws_mailbox_capacity() >= WS_OUTBOUND_CHANNEL_CAPACITY);
@@ -887,6 +1275,400 @@ mod tests {
             }
         }
         anyhow::bail!("Timeout waiting for MEETING_STARTED")
+    }
+
+    #[test]
+    fn fragment_buffer_refuses_over_limit_and_discards_the_partial() {
+        let t0 = Instant::now();
+        let mut f = FragmentBuffer::default();
+        f.begin(&[1u8; 10], t0);
+        assert!(
+            f.extend(&[2u8; 5], 20, t0),
+            "under the limit must be accepted"
+        );
+        assert_eq!(f.len(), 15);
+        assert!(
+            !f.extend(&[3u8; 100], 20, t0),
+            "over the limit must be REFUSED"
+        );
+        assert!(
+            !f.is_open(),
+            "the partial must be DISCARDED, never truncated"
+        );
+        assert!(
+            f.take().is_none(),
+            "a Last after a refusal must dispatch nothing"
+        );
+    }
+
+    #[test]
+    fn fragment_buffer_ignores_continuation_without_an_opener() {
+        let mut f = FragmentBuffer::default();
+        assert!(
+            f.extend(b"orphan", 1000, Instant::now()),
+            "no opener: a no-op, not an error"
+        );
+        assert!(!f.is_open());
+        assert!(f.take().is_none());
+    }
+
+    #[test]
+    fn fragment_buffer_reset_drops_a_spliceable_partial() {
+        let mut f = FragmentBuffer::default();
+        f.begin(b"first-half", Instant::now());
+        f.reset();
+        assert!(f.extend(b"attacker", 1000, Instant::now()));
+        assert!(f.take().is_none(), "must not splice across the reset");
+    }
+
+    #[test]
+    fn fragment_buffer_reaps_an_abandoned_sequence() {
+        let t0 = Instant::now();
+        let mut f = FragmentBuffer::default();
+        f.begin(&[7u8; 4096], t0);
+        assert_eq!(
+            f.reap_if_stale(t0 + Duration::from_secs(5)),
+            None,
+            "5s idle must NOT be reaped"
+        );
+        assert!(f.is_open());
+        assert_eq!(
+            f.reap_if_stale(t0 + Duration::from_secs(20)),
+            Some(4096),
+            "20s idle MUST be reaped, reporting the bytes freed"
+        );
+        assert!(!f.is_open());
+        assert_eq!(
+            f.reap_if_stale(t0 + Duration::from_secs(99)),
+            None,
+            "nothing open: nothing to reap"
+        );
+    }
+
+    /// Covers BOTH live arms: actix's codec emits a finished frame without consulting its
+    /// continuation flag, so `Binary` and `Text` can each arrive mid-sequence (#2600).
+    #[actix_rt::test]
+    #[serial]
+    async fn interleaved_binary_discards_the_open_fragment_issue_2600() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+
+        let room = "ws-frag-splice-2600";
+        let port = 18097;
+        start_websocket_server(port).await;
+        wait_for_server_ready(port).await;
+
+        let mut pubr = connect_ws_client(port, room, "splice-publisher")
+            .await
+            .expect("connect publisher");
+        let mut recv = connect_ws_client(port, room, "splice-receiver")
+            .await
+            .expect("connect receiver");
+
+        let build = |tag: u8, len: u32| -> Vec<u8> {
+            let media = MediaPacket {
+                media_type: MediaType::VIDEO.into(),
+                user_id: b"splice-publisher".to_vec(),
+                data: (0..len).map(|_| tag).collect(),
+                frame_type: "key".to_string(),
+                ..Default::default()
+            };
+            let w = PacketWrapper {
+                packet_type: PacketType::MEDIA.into(),
+                user_id: b"splice-publisher".to_vec(),
+                media_kind: MediaKind::VIDEO.into(),
+                data: media.write_to_bytes().expect("serialize MediaPacket"),
+                ..Default::default()
+            };
+            w.write_to_bytes().expect("serialize PacketWrapper")
+        };
+        let abandoned = build(0xAA, 2048);
+        let interleaved = build(0xBB, 512);
+        // A distinct length, so a splice through the Text arm is distinguishable from the Binary one.
+        let abandoned_text_phase = build(0xCC, 3072);
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Phase 1: interleave a complete Binary frame (actix passes it through despite RFC 6455).
+        let half = abandoned.len() / 2;
+        pubr.send(Message::Frame(Frame::message(
+            abandoned[..half].to_vec(),
+            OpCode::Data(Data::Binary),
+            false,
+        )))
+        .await
+        .expect("send opener");
+        pubr.send(Message::Binary(interleaved.clone()))
+            .await
+            .expect("send interleaved complete frame");
+        pubr.send(Message::Frame(Frame::message(
+            abandoned[half..].to_vec(),
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await
+        .expect("send closer");
+
+        // Phase 2: same splice via a complete TEXT frame — a live guard, not defence-in-depth.
+        let half_t = abandoned_text_phase.len() / 2;
+        pubr.send(Message::Frame(Frame::message(
+            abandoned_text_phase[..half_t].to_vec(),
+            OpCode::Data(Data::Binary),
+            false,
+        )))
+        .await
+        .expect("send text-phase opener");
+        pubr.send(Message::Text("x".repeat(64)))
+            .await
+            .expect("send interleaved complete Text frame");
+        pubr.send(Message::Frame(Frame::message(
+            abandoned_text_phase[half_t..].to_vec(),
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await
+        .expect("send text-phase closer");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut saw_interleaved = false;
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                msg = recv.next() => match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        if let Ok(w) = PacketWrapper::parse_from_bytes(&data) {
+                            if w.packet_type == PacketType::MEDIA.into() {
+                                let inner = MediaPacket::parse_from_bytes(&w.data)
+                                    .expect("forwarded MEDIA must parse");
+                                assert_ne!(
+                                    inner.data.len(),
+                                    2048,
+                                    "the abandoned partial was SPLICED and forwarded — \
+                                     the Binary arm did not discard it (issue 2600)"
+                                );
+                                assert_ne!(
+                                    inner.data.len(),
+                                    3072,
+                                    "the abandoned partial was SPLICED and forwarded — \
+                                     the Text arm did not discard it (issue 2600)"
+                                );
+                                if inner.data.len() == 512 {
+                                    saw_interleaved = true;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => panic!("receiver socket error: {e}"),
+                    None => panic!("receiver socket closed"),
+                },
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        assert!(
+            saw_interleaved,
+            "premise: the interleaved complete frame must itself be forwarded"
+        );
+    }
+
+    /// An empty `Continue` is an accepted append, so it refreshes the idle clock (#2600).
+    #[test]
+    fn fragment_buffer_lifetime_cap_reclaims_an_empty_continue_trickle() {
+        let t0 = Instant::now();
+        let mut f = FragmentBuffer::default();
+        f.begin(&[0u8; 1024], t0);
+
+        let step = FRAGMENT_ASSEMBLY_IDLE_TIMEOUT.mul_f32(0.9);
+        let mut now = t0;
+        while now.duration_since(t0) < FRAGMENT_ASSEMBLY_MAX_LIFETIME {
+            now += step;
+            assert!(
+                f.extend(&[], MAX_FRAME_SIZE, now),
+                "empty append is accepted"
+            );
+            if now.duration_since(t0) <= FRAGMENT_ASSEMBLY_MAX_LIFETIME {
+                assert_eq!(
+                    f.reap_if_stale(now),
+                    None,
+                    "inside the lifetime the idle refresh still spares it"
+                );
+            }
+        }
+        assert_eq!(
+            f.reap_if_stale(now),
+            Some(1024),
+            "past the lifetime it is reclaimed DESPITE a refreshed idle clock"
+        );
+        assert!(!f.is_open(), "and the held bytes are released");
+    }
+
+    #[test]
+    fn fragment_buffer_completed_sequence_is_not_later_reaped() {
+        let t0 = Instant::now();
+        let mut f = FragmentBuffer::default();
+        f.begin(&[7u8; 512], t0);
+        assert_eq!(f.take().map(|b| b.len()), Some(512));
+        assert_eq!(
+            f.reap_if_stale(t0 + Duration::from_secs(99)),
+            None,
+            "a completed sequence must not later read as abandoned"
+        );
+    }
+
+    /// The ordering asserts below admit 5s..20s, so they cannot pin the value (#2600).
+    #[test]
+    fn fragment_deadlines_are_the_shipped_values() {
+        assert_eq!(FRAGMENT_ASSEMBLY_IDLE_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(FRAGMENT_ASSEMBLY_MAX_LIFETIME, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn fragment_idle_timeout_is_bounded_and_below_client_timeout() {
+        assert!(
+            FRAGMENT_ASSEMBLY_MAX_LIFETIME > FRAGMENT_ASSEMBLY_IDLE_TIMEOUT,
+            "lifetime {FRAGMENT_ASSEMBLY_MAX_LIFETIME:?} must exceed idle {FRAGMENT_ASSEMBLY_IDLE_TIMEOUT:?}"
+        );
+        assert!(
+            FRAGMENT_ASSEMBLY_IDLE_TIMEOUT < CLIENT_TIMEOUT,
+            "idle deadline {FRAGMENT_ASSEMBLY_IDLE_TIMEOUT:?} must be under CLIENT_TIMEOUT {CLIENT_TIMEOUT:?}"
+        );
+        assert!(
+            FRAGMENT_ASSEMBLY_IDLE_TIMEOUT >= HEARTBEAT_INTERVAL,
+            "must be at least the {HEARTBEAT_INTERVAL:?} tick or reaping is coin-flip granular"
+        );
+    }
+
+    /// A slow uplink still sending must survive, or a multi-MB keyframe dies mid-arrival.
+    #[test]
+    fn fragment_buffer_idle_clock_spares_a_slow_but_active_uplink() {
+        let t0 = Instant::now();
+        let mut f = FragmentBuffer::default();
+        f.begin(&[0u8; 1024], t0);
+        let step = FRAGMENT_ASSEMBLY_IDLE_TIMEOUT.mul_f32(0.9);
+        let steps = (FRAGMENT_ASSEMBLY_MAX_LIFETIME.as_secs_f64() / step.as_secs_f64()) as u32 - 1;
+        let mut now = t0;
+        for _ in 0..steps {
+            now += step;
+            assert!(f.extend(&[1u8; 1024], MAX_FRAME_SIZE, now));
+            assert_eq!(
+                f.reap_if_stale(now),
+                None,
+                "still arriving: must not be reaped"
+            );
+        }
+        assert!(f.is_open(), "many idle deadlines elapsed and it survived");
+        assert!(
+            f.reap_if_stale(now + Duration::from_secs(20)).is_some(),
+            "then it goes idle and IS reaped"
+        );
+    }
+
+    #[actix_rt::test]
+    #[serial]
+    async fn fragmented_inbound_media_is_reassembled_and_forwarded_issue_2600() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+
+        let room = "ws-frag-2600";
+        let port = 18099;
+        start_websocket_server(port).await;
+        wait_for_server_ready(port).await;
+
+        let mut pubr = connect_ws_client(port, room, "frag-publisher")
+            .await
+            .expect("connect publisher");
+        let mut recv = connect_ws_client(port, room, "frag-receiver")
+            .await
+            .expect("connect receiver");
+
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            user_id: b"frag-publisher".to_vec(),
+            data: payload.clone(),
+            frame_type: "key".to_string(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: b"frag-publisher".to_vec(),
+            // Without this `classify_packet` takes the opaque-Data branch, not Media.
+            media_kind: videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::VIDEO
+                .into(),
+            data: media.write_to_bytes().expect("serialize MediaPacket"),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().expect("serialize PacketWrapper");
+        assert!(bytes.len() > 2, "need a payload we can split");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // THREE frames. A *finished* `OpCode::Continue` decodes to `Item::Last`, so a
+        // two-frame sequence never reaches the `Item::Continue` arm at all.
+        let a = bytes.len() / 3;
+        let b = 2 * bytes.len() / 3;
+        for (chunk, opcode, fin) in [
+            (&bytes[..a], OpCode::Data(Data::Binary), false),
+            (&bytes[a..b], OpCode::Data(Data::Continue), false),
+            (&bytes[b..], OpCode::Data(Data::Continue), true),
+        ] {
+            pubr.send(Message::Frame(Frame::message(chunk.to_vec(), opcode, fin)))
+                .await
+                .expect("send fragment");
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut got = false;
+        while tokio::time::Instant::now() < deadline && !got {
+            tokio::select! {
+                msg = recv.next() => {
+                    match msg {
+                        Some(Ok(Message::Binary(data))) => {
+                            if let Ok(w) = PacketWrapper::parse_from_bytes(&data) {
+                                if w.packet_type == PacketType::MEDIA.into() {
+                                    let inner = MediaPacket::parse_from_bytes(&w.data)
+                                        .expect("forwarded MEDIA must parse");
+                                    assert_eq!(
+                                        inner.data, payload,
+                                        "reassembled payload must be byte-identical"
+                                    );
+                                    got = true;
+                                }
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => panic!("receiver socket error: {e}"),
+                        None => panic!("receiver socket closed"),
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+
+        assert!(
+            got,
+            "fragmented MEDIA packet was never forwarded — the relay dropped the \
+             continuation sequence (issue #2600)"
+        );
     }
 
     #[actix_rt::test]

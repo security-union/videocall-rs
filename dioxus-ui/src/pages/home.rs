@@ -302,6 +302,9 @@ pub fn Home() -> Element {
         clear_id_token();
         clear_user_profile();
         clear_display_name_from_storage();
+        // A guest token is a bearer credential; an explicit logout should not
+        // leave one behind (issue #2331).
+        crate::guest_session::clear_all();
 
         // Defense-in-depth: drop any in-flight refresh Shared so a stale wave
         // can't linger post-logout.

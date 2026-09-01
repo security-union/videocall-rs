@@ -56,10 +56,9 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
-use crate::transport::{MediaTypeLabel, OutboundFrame};
+use crate::transport::{MediaTypeLabel, OutboundFrame, OutboundFrameSender};
 use videocall_types::protos::layer_preference_packet::layer_preference_packet::{
     Entry, EntryMediaKind,
 };
@@ -135,7 +134,7 @@ pub struct LayerPreferenceSender {
     /// Whether we have emitted at least one LAYER_PREFERENCE this connection.
     has_sent: bool,
     /// Channel to send outbound packets.
-    packet_tx: Sender<OutboundFrame>,
+    packet_tx: OutboundFrameSender,
     /// Counter for total LAYER_PREFERENCE packets sent.
     pub preferences_sent: Arc<AtomicU64>,
     /// When the last reconnect re-assert (via [`Self::resend_on_reconnect`])
@@ -150,7 +149,7 @@ impl LayerPreferenceSender {
         self_user_id: String,
         desired_layer: Option<u32>,
         media_kind: PinMediaKind,
-        packet_tx: Sender<OutboundFrame>,
+        packet_tx: impl Into<OutboundFrameSender>,
     ) -> Self {
         Self {
             self_user_id,
@@ -160,7 +159,7 @@ impl LayerPreferenceSender {
             last_sent: Vec::new(),
             pending: None,
             has_sent: false,
-            packet_tx,
+            packet_tx: packet_tx.into(),
             preferences_sent: Arc::new(AtomicU64::new(0)),
             last_resend: None,
         }

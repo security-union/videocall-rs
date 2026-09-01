@@ -415,10 +415,11 @@ mod tests {
     ///   * its return type is `Result<(), JsValue>` (i.e. fallible — not
     ///     the unit-returning web-sys binding).
     ///
-    /// The body never actually runs — the test is purely a type-shape lock.
-    /// It only compiles on wasm32 because that's where `observe_safe` lives.
+    /// The body asserts nothing at runtime — this is purely a type-shape lock.
+    /// It only compiles on wasm32 because that's where `observe_safe` lives, so
+    /// it is a `#[wasm_bindgen_test]`; a `#[test]` here runs nowhere (#2446).
     #[cfg(target_arch = "wasm32")]
-    #[test]
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn observe_safe_returns_result_unit_jsvalue_for_issue_606() {
         // If this stops compiling, audit the call-site in
         // `LongTaskObserver::start` — the issue #606 panic regression is
@@ -429,9 +430,7 @@ mod tests {
         ) -> Result<(), wasm_bindgen::JsValue> {
             obs.observe_safe(init)
         }
-        // Don't actually invoke at runtime — there's no live JS heap under
-        // `cargo test --lib` on wasm32 unless a wasm-bindgen-test harness is
-        // running. The compile check above is the assertion.
+        // Never invoked: the compile check above is the assertion.
         let _ = _assert_signature
             as fn(
                 &super::PerformanceObserverFb,

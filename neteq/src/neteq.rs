@@ -206,6 +206,12 @@ pub struct NetEq {
     // A buffer for already time streched samples. Separate from leftover_samples to avoid
     // double time-streching.
     leftover_time_stretched_samples: Vec<f32>,
+    /// Sender is in a DTX gap (RFC 7587 semantics): sequence numbers stayed
+    /// contiguous while timestamps jumped, i.e. frames were deliberately not
+    /// sent. An empty buffer then means *silence*, not loss.
+    dtx_active: bool,
+    /// (sequence, timestamp) of the last inserted packet, for DTX detection.
+    last_inserted: Option<(u16, u32)>,
     /// Number of samples added by time-stretching operations (matches WebRTC sample_memory_,
     /// but with clearer meaning for positive/negative values).
     timestretch_added_samples: i32,
@@ -277,6 +283,8 @@ impl NetEq {
             last_packets_second_instant: Instant::now(),
             packets_per_sec_snapshot: 0,
             leftover_time_stretched_samples: Vec::new(),
+            dtx_active: false,
+            last_inserted: None,
             timestretch_added_samples: 0,
         })
     }
@@ -310,9 +318,35 @@ impl NetEq {
         }
 
         // Normal NetEQ processing
-        // Update delay manager
-        self.delay_manager
-            .update(packet.header.timestamp, packet.sample_rate, false)?;
+
+        // DTX detection. A silence gap produced by a DTX encoder arrives as
+        // *contiguous* sequence numbers with a *jumped* timestamp (frames
+        // were deliberately skipped) — unlike loss, which gaps the sequence
+        // numbers. During such a gap the sender only emits sparse
+        // comfort-noise refreshes (Opus: ~1 per 400 ms); those must not
+        // feed the inter-arrival delay estimator, and get_decision() treats
+        // an empty buffer as silence (ComfortNoise) instead of loss
+        // (Expand). Normal packet cadence ends the gap.
+        let frame_ts = packet.duration_ms * packet.sample_rate / 1000;
+        let mut is_dtx_refresh = false;
+        if let Some((last_seq, last_ts)) = self.last_inserted {
+            let contiguous = packet.header.sequence_number.wrapping_sub(last_seq) == 1;
+            let ts_delta = packet.header.timestamp.wrapping_sub(last_ts);
+            if contiguous && ts_delta > frame_ts {
+                self.dtx_active = true;
+                is_dtx_refresh = true;
+            } else if self.dtx_active && ts_delta <= frame_ts {
+                self.dtx_active = false;
+            }
+        }
+        self.last_inserted = Some((packet.header.sequence_number, packet.header.timestamp));
+
+        // Update delay manager — except for DTX refreshes, whose sparse
+        // inter-arrival times say nothing about network jitter.
+        if !is_dtx_refresh {
+            self.delay_manager
+                .update(packet.header.timestamp, packet.sample_rate, false)?;
+        }
 
         // Insert packet into buffer
         let target_delay = self.delay_manager.target_delay_ms();
@@ -533,6 +567,21 @@ impl NetEq {
 
         if !self.leftover_time_stretched_samples.is_empty() {
             return Ok(Operation::TimeStretchBuffer);
+        }
+
+        // A recognized DTX gap is silence, not loss. Decode buffered
+        // packets (the sparse comfort-noise refreshes) normally, and
+        // synthesize comfort noise when the buffer is starved — never run
+        // loss concealment. This also breaks the expand run: without it,
+        // `consecutive_expands > 0` with a below-low-limit buffer keeps
+        // returning Expand even though a decodable packet is available,
+        // and long silences ratchet into the ~6 s safety-valve reset.
+        if self.dtx_active {
+            self.consecutive_expands = 0;
+            if current_buffer_samples >= self.output_frame_size_samples {
+                return Ok(Operation::Normal);
+            }
+            return Ok(Operation::ComfortNoise);
         }
 
         if self.consecutive_expands > 0 && current_buffer_samples < low_limit as usize {
@@ -996,6 +1045,128 @@ mod tests {
         let frame = neteq.get_audio().unwrap();
         assert_eq!(frame.speech_type, SpeechType::Expand);
         assert!(!frame.vad_activity);
+    }
+
+    /// A DTX gap (contiguous seq, jumped ts, sparse refreshes) must play
+    /// as comfort noise — never as loss concealment.
+    #[test]
+    fn test_dtx_gap_plays_comfort_noise_not_expand() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Steady speech: 10 ms packets at normal cadence, drained as we go.
+        for i in 0..10u16 {
+            neteq
+                .insert_packet(create_test_packet(i, i as u32 * 160, 10))
+                .unwrap();
+            neteq.get_audio().unwrap();
+        }
+
+        // The sender enters DTX: a comfort-noise refresh 400 ms later —
+        // sequence contiguous, timestamp jumped by 40 frames.
+        neteq
+            .insert_packet(create_test_packet(10, 50 * 160, 10))
+            .unwrap();
+
+        // Pull through the gap: comfort noise must dominate and loss
+        // concealment must not run (a handful of transition frames while
+        // the refresh itself decodes are fine).
+        let mut cng = 0;
+        let mut expand = 0;
+        for _ in 0..60 {
+            let frame = neteq.get_audio().unwrap();
+            match frame.speech_type {
+                SpeechType::Cng => cng += 1,
+                SpeechType::Expand => expand += 1,
+                _ => {}
+            }
+        }
+        assert!(
+            cng >= 40,
+            "DTX gap must synthesize comfort noise (cng={cng}, expand={expand})"
+        );
+        assert!(
+            expand <= 10,
+            "DTX gap must not run loss concealment (cng={cng}, expand={expand})"
+        );
+
+        // Speech resumes at normal cadence: decoding returns to normal.
+        // (The first packet after a gap still looks like a refresh; normal
+        // cadence from the second onward ends the DTX state.)
+        for i in 0..5u16 {
+            neteq
+                .insert_packet(create_test_packet(11 + i, (100 + i as u32) * 160, 10))
+                .unwrap();
+        }
+        let mut normal = 0;
+        for _ in 0..10 {
+            if neteq.get_audio().unwrap().speech_type == SpeechType::Normal {
+                normal += 1;
+            }
+        }
+        assert!(normal > 0, "speech must resume after the gap");
+    }
+
+    /// Loss (a sequence gap) must still be concealed with expand — DTX
+    /// awareness must not change loss handling.
+    #[test]
+    fn test_sequence_gap_still_expands() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        for i in 0..5u16 {
+            neteq
+                .insert_packet(create_test_packet(i, i as u32 * 160, 10))
+                .unwrap();
+            neteq.get_audio().unwrap();
+        }
+        // Lost packets: sequence jumps 5 -> 9 (timestamps consistent).
+        neteq
+            .insert_packet(create_test_packet(9, 9 * 160, 10))
+            .unwrap();
+        let mut expand = 0;
+        let mut cng = 0;
+        for _ in 0..20 {
+            match neteq.get_audio().unwrap().speech_type {
+                SpeechType::Expand => expand += 1,
+                SpeechType::Cng => cng += 1,
+                _ => {}
+            }
+        }
+        assert!(expand > 0, "a sequence gap is loss and must be concealed");
+        assert_eq!(cng, 0, "loss must never be mistaken for DTX silence");
+    }
+
+    /// Sparse DTX refreshes must not drag the delay target around.
+    #[test]
+    fn test_dtx_refreshes_do_not_move_target_delay() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        for i in 0..20u16 {
+            neteq
+                .insert_packet(create_test_packet(i, i as u32 * 160, 10))
+                .unwrap();
+            neteq.get_audio().unwrap();
+        }
+        let before = neteq.target_delay_ms();
+
+        // A minute of DTX: 150 refreshes, 400 ms apart on the RTP clock
+        // (arrival times are all "now" — precisely the mismatch that would
+        // look like catastrophic jitter if fed to the delay manager).
+        let mut ts = 20u32 * 160;
+        for i in 0..150u16 {
+            ts += 40 * 160;
+            neteq
+                .insert_packet(create_test_packet(20 + i, ts, 10))
+                .unwrap();
+            let _ = neteq.get_audio();
+        }
+        let after = neteq.target_delay_ms();
+        assert_eq!(
+            before, after,
+            "DTX refreshes must not feed the delay estimator"
+        );
     }
 
     #[test]

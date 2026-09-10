@@ -329,7 +329,13 @@ impl NetEq {
         // (Expand). Normal packet cadence ends the gap.
         let frame_ts = packet.duration_ms * packet.sample_rate / 1000;
         let mut is_dtx_refresh = false;
-        if let Some((last_seq, last_ts)) = self.last_inserted {
+        if packet.header.marker {
+            // RFC 3550/3551: for audio, a set marker bit signals the first
+            // packet of a talkspurt — an explicit end-of-DTX. This resolves
+            // the refresh-vs-resume ambiguity immediately for senders that
+            // set it; the cadence rules below remain the fallback.
+            self.dtx_active = false;
+        } else if let Some((last_seq, last_ts)) = self.last_inserted {
             let contiguous = packet.header.sequence_number.wrapping_sub(last_seq) == 1;
             let ts_delta = packet.header.timestamp.wrapping_sub(last_ts);
             if contiguous && ts_delta > frame_ts {
@@ -1105,6 +1111,49 @@ mod tests {
             }
         }
         assert!(normal > 0, "speech must resume after the gap");
+    }
+
+    /// A set RTP marker bit (RFC 3550/3551: first packet of a talkspurt)
+    /// ends a DTX gap immediately — no cadence confirmation needed.
+    #[test]
+    fn test_marker_bit_ends_dtx_immediately() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        for i in 0..10u16 {
+            neteq
+                .insert_packet(create_test_packet(i, i as u32 * 160, 10))
+                .unwrap();
+            neteq.get_audio().unwrap();
+        }
+        // DTX gap with one refresh, then comfort noise while starved.
+        neteq
+            .insert_packet(create_test_packet(10, 50 * 160, 10))
+            .unwrap();
+        for _ in 0..30 {
+            neteq.get_audio().unwrap();
+        }
+
+        // Speech resumes with the marker bit set (timestamp jumped again).
+        let header = RtpHeader::new(11, 100 * 160, 12345, 96, true);
+        let mut payload = Vec::new();
+        for i in 0..160 {
+            let sample = (i as f32 / 160.0 * 2.0 * std::f32::consts::PI * 440.0).sin() * 0.1;
+            payload.extend_from_slice(&sample.to_le_bytes());
+        }
+        neteq
+            .insert_packet(AudioPacket::new(header, payload, 16000, 1, 10))
+            .unwrap();
+
+        // Without the marker this packet would be held as a possible
+        // refresh; with it, it must decode as speech straight away.
+        let mut normal = 0;
+        for _ in 0..3 {
+            if neteq.get_audio().unwrap().speech_type == SpeechType::Normal {
+                normal += 1;
+            }
+        }
+        assert!(normal > 0, "marker-bit resume must decode immediately");
     }
 
     /// Loss (a sequence gap) must still be concealed with expand — DTX

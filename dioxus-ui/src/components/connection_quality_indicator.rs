@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Persistent connection quality warning indicator for the self-view tile.
-//!
-//! Subscribes to RTT diagnostics from the connection manager and displays
-//! a compact signal-bars badge when the round-trip time exceeds warning
-//! thresholds. Hysteresis logic prevents the indicator from strobing on
-//! marginal connections — it only activates after several consecutive
-//! high-RTT samples and only deactivates after several consecutive
-//! low-RTT samples.
+//! The self-view tile's signal meter: the disc every peer tile carries, fed by
+//! `connection_manager` RTT diagnostics. Hysteresis keeps the level steady.
 
-use crate::components::icons::signal_bars::SignalBarsIcon;
+use crate::components::attendants::action_bar_announce_text;
+use crate::components::icons::signal_spark::SignalSparkIcon;
+use crate::components::signal_quality::{
+    build_spark_points, flat_spark_segment, prefers_reduced_motion, SignalLevel, SparkPaint,
+    SPARK_MIN_POINTS, SPARK_POINTS,
+};
 use dioxus::prelude::*;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use videocall_diagnostics::{recv_loop_action, subscribe, MetricValue, RecvLoopAction};
 
@@ -19,14 +19,14 @@ use videocall_diagnostics::{recv_loop_action, subscribe, MetricValue, RecvLoopAc
 // Thresholds & hysteresis constants
 // ---------------------------------------------------------------------------
 
-/// RTT at or above this value (ms) triggers the "Slow connection" warning.
+/// RTT at or above this value (ms) triggers [`QualityLevel::Warn`].
 /// Deliberately higher than `RTT_FAIR_MS` (200ms) from adaptive_quality_constants
 /// to avoid showing warnings that don't correspond to visible quality impact.
 /// The AQ system degrades proactively; this indicator only fires when users
 /// would notice degraded call quality.
 const WARN_THRESHOLD_MS: f64 = 300.0;
 
-/// RTT at or above this value (ms) triggers the "Poor connection" warning.
+/// RTT at or above this value (ms) triggers [`QualityLevel::Critical`].
 /// Deliberately higher than `RTT_POOR_MS` (400ms) from adaptive_quality_constants
 /// for the same reason as `WARN_THRESHOLD_MS` above.
 const CRITICAL_THRESHOLD_MS: f64 = 500.0;
@@ -47,6 +47,74 @@ const EXIT_COUNT: u32 = 5;
 /// plus probing, so normal 1 Hz samples never trigger a false reset.
 const SAMPLE_GAP_RESET_MS: u64 = 10_000;
 
+/// Retained RTT samples. `connection_manager` reports at 1 Hz, so this is the
+/// 10-second window the sparkline plots.
+const SELF_RTT_HISTORY_LEN: usize = SPARK_POINTS;
+
+/// The `connection_manager` cadence: `connection_controller` drives
+/// `trigger_diagnostics_report` from an `Interval::new(1000, ..)`.
+const RTT_SAMPLE_INTERVAL_MS: u32 = 1000;
+
+/// Missed ticks before the meter stops claiming a level: two plus slack.
+const fn stale_after_missed_ticks() -> u32 {
+    (RTT_SAMPLE_INTERVAL_MS * 3) / RTT_SAMPLE_INTERVAL_MS
+}
+
+/// What the disc presents. `active_server_rtt` is emitted ONLY when Elected with
+/// a fresh probe, and nothing else ages the history — hence `Stale`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presented {
+    Measuring,
+    Live(QualityLevel),
+    Stale,
+}
+
+/// Never having measured outranks having stopped; the LED covers cold start.
+fn presented_state(sample_count: usize, missed_ticks: u32, level: QualityLevel) -> Presented {
+    if sample_count == 0 {
+        Presented::Measuring
+    } else if missed_ticks >= stale_after_missed_ticks() {
+        Presented::Stale
+    } else if sample_count < SPARK_MIN_POINTS {
+        Presented::Measuring
+    } else {
+        Presented::Live(level)
+    }
+}
+
+/// RTT-to-quality breakpoints, interpolated between and clamped at both ends.
+/// 300/500 ms are the thresholds and 0.90/0.75/0.50/0.25 are
+/// `SignalLevel::from_quality` boundaries, so line and ring cannot disagree.
+const RTT_QUALITY_BREAKPOINTS: [(f64, f64); 7] = [
+    (0.0, 1.00),
+    (100.0, 0.90),
+    (200.0, 0.75),
+    (300.0, 0.50),
+    (500.0, 0.25),
+    (1000.0, 0.05),
+    (1500.0, 0.02),
+];
+
+fn rtt_to_quality(rtt_ms: f64) -> f64 {
+    let points = &RTT_QUALITY_BREAKPOINTS;
+    let first = points[0];
+    let last = points[points.len() - 1];
+    if rtt_ms.is_nan() || rtt_ms <= first.0 {
+        return first.1;
+    }
+    if rtt_ms >= last.0 {
+        return last.1;
+    }
+    for pair in points.windows(2) {
+        let (x0, y0) = pair[0];
+        let (x1, y1) = pair[1];
+        if rtt_ms <= x1 {
+            return y0 + (y1 - y0) * (rtt_ms - x0) / (x1 - x0);
+        }
+    }
+    last.1
+}
+
 // ---------------------------------------------------------------------------
 // Quality level
 // ---------------------------------------------------------------------------
@@ -60,6 +128,57 @@ enum QualityLevel {
     Warn,
     /// RTT >= CRITICAL_THRESHOLD — red warning.
     Critical,
+}
+
+impl QualityLevel {
+    fn signal_level(self) -> SignalLevel {
+        match self {
+            // Not `Excellent`: a healthy PEER reads `Good`.
+            Self::Good => SignalLevel::Good,
+            Self::Warn => SignalLevel::Fair,
+            Self::Critical => SignalLevel::Bad,
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Good => "good",
+            Self::Warn => "slow",
+            Self::Critical => "poor",
+        }
+    }
+}
+
+const ANNOUNCE_CRITICAL: &str = "Your connection is poor.";
+const ANNOUNCE_RECOVERED: &str = "Your connection is back to normal.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LevelEvent {
+    Transition(QualityLevel),
+    /// A reconnect: the connection the outstanding announcement described is gone.
+    Discontinuity,
+}
+
+/// The live-region message, or `None`. Sole owner of the policy. Warn is silent
+/// both ways; recovery keys off the latch, not a `Critical -> Good` edge,
+/// because hysteresis can exit through Warn.
+fn announcement_for(event: LevelEvent, announced_critical: &mut bool) -> Option<&'static str> {
+    match event {
+        // Retires the owed recovery WITHOUT speaking it.
+        LevelEvent::Discontinuity => {
+            *announced_critical = false;
+            None
+        }
+        LevelEvent::Transition(QualityLevel::Critical) if !*announced_critical => {
+            *announced_critical = true;
+            Some(ANNOUNCE_CRITICAL)
+        }
+        LevelEvent::Transition(QualityLevel::Good) if *announced_critical => {
+            *announced_critical = false;
+            Some(ANNOUNCE_RECOVERED)
+        }
+        LevelEvent::Transition(_) => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,45 +350,114 @@ impl HysteresisState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RttSample {
+    /// A wall clock, not a monotonic one.
+    timestamp_ms: u64,
+    rtt_ms: f64,
+}
+
+struct SelfRttHistory {
+    samples: VecDeque<RttSample>,
+}
+
+impl SelfRttHistory {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(SELF_RTT_HISTORY_LEN),
+        }
+    }
+
+    fn push(&mut self, sample: RttSample) {
+        if self.samples.len() >= SELF_RTT_HISTORY_LEN {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    fn quality_series(&self) -> Vec<(f64, f64)> {
+        self.samples
+            .iter()
+            .map(|s| (s.timestamp_ms as f64, rtt_to_quality(s.rtt_ms)))
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampleEffect {
+    Ignored,
+    Recorded {
+        reset: bool,
+        level_change: Option<QualityLevel>,
+    },
+}
+
+fn fold_sample(
+    hysteresis: &mut HysteresisState,
+    history: &mut SelfRttHistory,
+    last_sample_ts_ms: &mut u64,
+    sample: RttSample,
+) -> SampleEffect {
+    let reset = match classify_sample(sample.timestamp_ms, last_sample_ts_ms) {
+        SampleAction::Skip => return SampleEffect::Ignored,
+        SampleAction::Reset => {
+            hysteresis.reset();
+            history.clear();
+            true
+        }
+        SampleAction::Accept => false,
+    };
+
+    history.push(sample);
+    let level_change = hysteresis.update(sample.rtt_ms);
+
+    SampleEffect::Recorded {
+        reset,
+        level_change,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
-/// Renders a persistent connection quality warning on the self-view tile.
-///
-/// Subscribes to `connection_manager` diagnostics events and applies
-/// hysteresis to avoid indicator strobe on marginal connections.
 #[component]
-pub fn ConnectionQualityIndicator() -> Element {
+pub fn ConnectionQualityIndicator(on_open_diagnostics: EventHandler<()>) -> Element {
     // Displayed quality level (drives rendering).
     let mut quality = use_signal(|| QualityLevel::Good);
-    // Latest raw RTT for the title/aria-label tooltip. Using a Signal so
-    // the tooltip text stays current while the indicator is visible. It is
-    // read only AFTER the Good-state early return below, so the 1 Hz signal
-    // updates do not re-render the component while it renders nothing.
     let mut raw_rtt_ms = use_signal(|| 0.0_f64);
-    // Track whether we are in the "exiting" transition (fading out).
-    let mut exiting = use_signal(|| false);
-    // The last non-Good level, so the exit animation renders the correct
-    // prior state (e.g., Critical fades out with 1 red bar, not 2 amber).
-    let mut exit_level = use_signal(|| QualityLevel::Warn);
-    // Generation counter to invalidate stale exit timers.  Incremented on
-    // every level transition; the timer closure captures the generation at
-    // scheduling time and no-ops if it has changed.
-    let exit_generation: Rc<Cell<u32>> = use_hook(|| Rc::new(Cell::new(0)));
+    let mut announcement = use_signal(String::new);
+    let mut announce_nonce = use_signal(|| 0_u32);
+    // Flipped only when the verdict changes, so a healthy call is not woken.
+    let mut stale = use_signal(|| false);
+    let missed_ticks: Rc<Cell<u32>> = use_hook(|| Rc::new(Cell::new(0)));
+    let announced_critical: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
 
     // Hysteresis state — stored in a RefCell so it survives across renders
     // without triggering re-renders on every sample.
     let hysteresis: Rc<RefCell<HysteresisState>> =
         use_hook(|| Rc::new(RefCell::new(HysteresisState::new())));
 
+    let rtt_history: Rc<RefCell<SelfRttHistory>> =
+        use_hook(|| Rc::new(RefCell::new(SelfRttHistory::new())));
+
+    let mut sample_counter = use_signal(|| 0_u32);
+
     // Subscribe to diagnostics events.
     {
         let hysteresis = hysteresis.clone();
-        let exit_gen = exit_generation.clone();
+        let rtt_history = rtt_history.clone();
+        let announced = announced_critical.clone();
+        let missed = missed_ticks.clone();
         use_effect(move || {
             let hysteresis = hysteresis.clone();
-            let exit_gen = exit_gen.clone();
+            let rtt_history = rtt_history.clone();
+            let announced = announced.clone();
+            let missed = missed.clone();
             spawn(async move {
                 let mut rx = subscribe();
                 // Track the timestamp of the last processed sample so we can
@@ -278,7 +466,7 @@ pub fn ConnectionQualityIndicator() -> Element {
                 loop {
                     // Issue 2174: a bare `while let Ok(..)` here died permanently
                     // on the first `Overflowed`, which is recoverable — see
-                    // `videocall_diagnostics::recv_loop_action`. The RTT pill then
+                    // `videocall_diagnostics::recv_loop_action`. The meter then
                     // froze on whatever quality it last showed.
                     let evt = match rx.recv().await {
                         Ok(evt) => evt,
@@ -304,59 +492,64 @@ pub fn ConnectionQualityIndicator() -> Element {
                         }
                     }
                     let Some(rtt_val) = rtt else {
+                        // The main event ticks in every election state, so its
+                        // arrival without the metric IS the staleness clock.
+                        let n = missed.get().saturating_add(1);
+                        missed.set(n);
+                        if n >= stale_after_missed_ticks() && !*stale.peek() {
+                            stale.set(true);
+                        }
                         continue;
                     };
+                    missed.set(0);
+                    if *stale.peek() {
+                        stale.set(false);
+                    }
 
-                    // Classify the sample against the timestamp watermark:
-                    // out-of-order replays are dropped, and gaps that indicate a
-                    // transport reconnect or re-election reset the (now stale)
-                    // hysteresis state so the indicator starts fresh with the
-                    // new connection. `classify_sample` owns the watermark
-                    // advance, so a skipped event cannot rewind it.
-                    match classify_sample(evt.ts_ms, &mut last_sample_ts_ms) {
-                        SampleAction::Skip => continue,
-                        SampleAction::Reset => {
-                            hysteresis.borrow_mut().reset();
-                            // If the indicator was visible, immediately hide it.
-                            // The next sample will re-evaluate from a clean state.
-                            if quality() != QualityLevel::Good {
-                                let gen = exit_gen.get().wrapping_add(1);
-                                exit_gen.set(gen);
-                                quality.set(QualityLevel::Good);
-                                exiting.set(false);
-                            }
+                    let effect = fold_sample(
+                        &mut hysteresis.borrow_mut(),
+                        &mut rtt_history.borrow_mut(),
+                        &mut last_sample_ts_ms,
+                        RttSample {
+                            timestamp_ms: evt.ts_ms,
+                            rtt_ms: rtt_val,
+                        },
+                    );
+                    let (reset, level_change) = match effect {
+                        SampleEffect::Ignored => continue,
+                        SampleEffect::Recorded {
+                            reset,
+                            level_change,
+                        } => (reset, level_change),
+                    };
+
+                    let mut latched = announced.get();
+                    let mut msg = None;
+
+                    if reset {
+                        msg = announcement_for(LevelEvent::Discontinuity, &mut latched);
+                        if quality() != QualityLevel::Good {
+                            quality.set(QualityLevel::Good);
                         }
-                        SampleAction::Accept => {}
                     }
 
                     raw_rtt_ms.set(rtt_val);
+                    let prev_count = *sample_counter.peek();
+                    sample_counter.set(prev_count.wrapping_add(1));
 
-                    if let Some(new_level) = hysteresis.borrow_mut().update(rtt_val) {
-                        // Bump generation to invalidate any pending exit timer.
-                        let gen = exit_gen.get().wrapping_add(1);
-                        exit_gen.set(gen);
+                    if let Some(new_level) = level_change {
+                        quality.set(new_level);
+                        msg = announcement_for(LevelEvent::Transition(new_level), &mut latched);
+                    }
 
-                        if new_level == QualityLevel::Good {
-                            // Start the exit animation — the CSS fade-out plays
-                            // while we keep rendering the last non-Good state.
-                            exiting.set(true);
-                            let mut q = quality;
-                            let mut ex = exiting;
-                            let exit_gen_clone = exit_gen.clone();
-                            gloo_timers::callback::Timeout::new(500, move || {
-                                // Only complete the exit if no new transition
-                                // happened while we were fading out.
-                                if exit_gen_clone.get() == gen {
-                                    q.set(QualityLevel::Good);
-                                    ex.set(false);
-                                }
-                            })
-                            .forget();
-                        } else {
-                            exiting.set(false);
-                            exit_level.set(new_level);
-                            quality.set(new_level);
-                        }
+                    announced.set(latched);
+                    if let Some(msg) = msg {
+                        // Nonce on every write, repeats included: `diff_vtext`
+                        // skips an identical value, so a repeat would never
+                        // announce (issue 1765).
+                        announcement.set(msg.to_string());
+                        let next = announce_nonce.peek().wrapping_add(1);
+                        announce_nonce.set(next);
                     }
                 }
             });
@@ -364,62 +557,84 @@ pub fn ConnectionQualityIndicator() -> Element {
     }
 
     let level = quality();
-    let is_exiting = exiting();
-
-    // Do not render anything in the Good state (after exit animation completes).
-    if level == QualityLevel::Good && !is_exiting {
-        return rsx! {};
-    }
-
-    // Read the RTT only past the early return. A Dioxus scope re-subscribes
-    // from scratch on every render (`ReactiveContext::reset_and_run_in`), so a
-    // read that does not execute drops the subscription: in the Good state the
-    // 1 Hz `raw_rtt_ms.set` above cannot wake this component, and when it does
-    // become visible the read re-subscribes and the tooltip tracks live again.
     let rtt = raw_rtt_ms();
+    let _ = sample_counter();
+    // Read so the staleness flip wakes this scope; the Cell cannot.
+    let _ = stale();
 
-    // During exit animation, render the last non-Good state so the fade-out
-    // shows the correct icon/label (e.g., red 1-bar for Critical, not amber).
-    let display_level = if level == QualityLevel::Good {
-        exit_level()
-    } else {
-        level
+    let series = rtt_history.borrow().quality_series();
+    let sample_count = series.len();
+    let rtt_int = rtt as u32;
+
+    // The RTT lives in `title` only: that is the accessible DESCRIPTION,
+    // announced on focus, never on mutation.
+    let (signal_level, state_attr, aria_text, title_text) =
+        match presented_state(sample_count, missed_ticks.get(), level) {
+            Presented::Measuring => (
+                SignalLevel::Unmeasured,
+                "measuring",
+                "Your connection: measuring. Open diagnostics.".to_string(),
+                "Connection: measuring…".to_string(),
+            ),
+            Presented::Stale => (
+                SignalLevel::Unmeasured,
+                "stale",
+                "Your connection: not measured. Open diagnostics.".to_string(),
+                "Connection: not measured — no recent samples".to_string(),
+            ),
+            Presented::Live(level) => {
+                let word = level.word();
+                (
+                    level.signal_level(),
+                    "measured",
+                    format!("Your connection: {word}. Open diagnostics."),
+                    format!("Connection: {word} — RTT {rtt_int} ms"),
+                )
+            }
+        };
+    // `stale`/`reduce` are PERSISTENT so they get the readout; `measuring` is
+    // transient, and only `state_attr` tells it from `stale`.
+    let plot = matches!(state_attr, "measured") && !prefers_reduced_motion();
+    let paint = SparkPaint {
+        segments: if plot {
+            build_spark_points(&series)
+        } else if matches!(state_attr, "measuring") {
+            Vec::new()
+        } else {
+            vec![flat_spark_segment(signal_level)]
+        },
+        level: signal_level,
+        sample_count,
+        latency_ms: rtt.trunc(),
     };
 
-    let (bar_level, label, rtt_int) = match display_level {
-        QualityLevel::Good => (2u8, "Slow connection", rtt as u32),
-        QualityLevel::Warn => (2, "Slow connection", rtt as u32),
-        QualityLevel::Critical => (1, "Poor connection", rtt as u32),
-    };
-
-    let visible_class = if is_exiting {
-        "connection-quality-indicator exiting"
-    } else {
-        "connection-quality-indicator visible"
-    };
-
-    let title_text = format!("RTT: {rtt_int}ms");
-    let aria_text = match display_level {
-        QualityLevel::Good | QualityLevel::Warn => {
-            format!("Connection quality: slow, round trip time {rtt_int} milliseconds")
-        }
-        QualityLevel::Critical => {
-            format!("Connection quality: poor, round trip time {rtt_int} milliseconds")
-        }
-    };
+    let announce = action_bar_announce_text(&announcement(), announce_nonce());
 
     rsx! {
-        div {
-            class: "{visible_class}",
-            role: "status",
-            "aria-live": "polite",
+        button {
+            class: "signal-indicator",
+            "data-testid": "self-signal-indicator",
+            "data-signal-state": "{state_attr}",
+            "data-signal-level": "{signal_level.bars()}",
+            "data-signal-lost": "false",
+            "data-signal-samples": "{sample_count}",
             "aria-label": "{aria_text}",
             title: "{title_text}",
-            // aria-hidden on children prevents screen readers from
-            // double-announcing: the outer div's aria-label is the
-            // single announcement source.
-            span { "aria-hidden": "true", SignalBarsIcon { level: bar_level } }
-            span { class: "connection-quality-label", "aria-hidden": "true", "{label}" }
+            // stop_propagation: a tile-overlay control, not a grid click — it
+            // must not light-dismiss an open side panel (issue 1790).
+            onclick: move |e: MouseEvent| {
+                e.stop_propagation();
+                on_open_diagnostics.call(());
+            },
+            // A spec handle only: the self disc repaints through RSX.
+            SignalSparkIcon { paint, spark_id: "self".to_string() }
+        }
+        span {
+            class: "visually-hidden",
+            role: "status",
+            "aria-live": "polite",
+            "aria-atomic": "true",
+            "{announce}"
         }
     }
 }
@@ -664,5 +879,364 @@ mod tests {
             "the sample following a replay must stay contiguous, not reset hysteresis"
         );
         assert_eq!(watermark, 103_000);
+    }
+
+    fn sample(timestamp_ms: u64, rtt_ms: f64) -> RttSample {
+        RttSample {
+            timestamp_ms,
+            rtt_ms,
+        }
+    }
+
+    struct Folder {
+        hysteresis: HysteresisState,
+        history: SelfRttHistory,
+        watermark: u64,
+    }
+
+    impl Folder {
+        fn seeded_at(watermark: u64) -> Self {
+            Self {
+                hysteresis: HysteresisState::new(),
+                history: SelfRttHistory::new(),
+                watermark,
+            }
+        }
+
+        fn fold(&mut self, timestamp_ms: u64, rtt_ms: f64) -> SampleEffect {
+            fold_sample(
+                &mut self.hysteresis,
+                &mut self.history,
+                &mut self.watermark,
+                sample(timestamp_ms, rtt_ms),
+            )
+        }
+    }
+
+    #[test]
+    fn history_evicts_the_oldest_sample_at_capacity() {
+        let mut history = SelfRttHistory::new();
+        let overflow = 5_u64;
+        for i in 0..(SELF_RTT_HISTORY_LEN as u64 + overflow) {
+            history.push(sample(1_000 + i, i as f64));
+        }
+
+        assert_eq!(
+            history.samples.len(),
+            SELF_RTT_HISTORY_LEN,
+            "the ring must stay bounded, not grow with the call count"
+        );
+        assert_eq!(
+            history.samples.front().copied(),
+            Some(sample(1_000 + overflow, overflow as f64)),
+            "the oldest surviving sample must be the first one not evicted"
+        );
+        assert_eq!(
+            history.samples.back().copied(),
+            Some(sample(
+                1_000 + SELF_RTT_HISTORY_LEN as u64 + overflow - 1,
+                (SELF_RTT_HISTORY_LEN as u64 + overflow - 1) as f64
+            )),
+            "the newest sample must be retained"
+        );
+    }
+
+    #[test]
+    fn fold_sample_records_each_accepted_sample() {
+        let mut folder = Folder::seeded_at(100_000);
+
+        assert_eq!(
+            folder.fold(100_000, 120.0),
+            SampleEffect::Recorded {
+                reset: false,
+                level_change: None
+            }
+        );
+        assert_eq!(
+            folder.fold(101_000, 140.0),
+            SampleEffect::Recorded {
+                reset: false,
+                level_change: None
+            }
+        );
+
+        assert_eq!(
+            folder.history.samples.iter().copied().collect::<Vec<_>>(),
+            vec![sample(100_000, 120.0), sample(101_000, 140.0)],
+            "every accepted sample must land in the history, in arrival order"
+        );
+    }
+
+    #[test]
+    fn fold_sample_reports_the_level_change_that_enters_warn() {
+        let mut folder = Folder::seeded_at(100_000);
+
+        assert_eq!(
+            folder.fold(100_000, 350.0),
+            SampleEffect::Recorded {
+                reset: false,
+                level_change: None
+            }
+        );
+        assert_eq!(
+            folder.fold(101_000, 350.0),
+            SampleEffect::Recorded {
+                reset: false,
+                level_change: None
+            }
+        );
+        assert_eq!(
+            folder.fold(102_000, 350.0),
+            SampleEffect::Recorded {
+                reset: false,
+                level_change: Some(QualityLevel::Warn)
+            },
+            "the ENTER_COUNT-th consecutive high sample must surface the transition"
+        );
+    }
+
+    #[test]
+    fn fold_sample_ignores_a_replay_without_touching_any_state() {
+        let mut folder = Folder::seeded_at(100_000);
+        folder.fold(100_000, 350.0);
+        folder.fold(101_000, 350.0);
+
+        assert_eq!(
+            folder.fold(93_000, 900.0),
+            SampleEffect::Ignored,
+            "an in-window backwards timestamp is a replay, not a new reading"
+        );
+        assert_eq!(
+            folder.history.samples.len(),
+            2,
+            "a replayed sample must not be recorded"
+        );
+        assert_eq!(
+            folder.hysteresis.above_critical_count, 0,
+            "a replayed sample must not feed hysteresis"
+        );
+        assert_eq!(
+            folder.watermark, 101_000,
+            "a replayed sample must not rewind the watermark"
+        );
+    }
+
+    #[test]
+    fn fold_sample_discards_pre_discontinuity_history_on_a_gap() {
+        let mut folder = Folder::seeded_at(100_000);
+        folder.fold(100_000, 120.0);
+        folder.fold(101_000, 130.0);
+        folder.fold(102_000, 140.0);
+        assert_eq!(folder.history.samples.len(), 3);
+
+        let after_gap = 102_000 + SAMPLE_GAP_RESET_MS + 1;
+        assert_eq!(
+            folder.fold(after_gap, 200.0),
+            SampleEffect::Recorded {
+                reset: true,
+                level_change: None
+            }
+        );
+        assert_eq!(
+            folder.history.samples.iter().copied().collect::<Vec<_>>(),
+            vec![sample(after_gap, 200.0)],
+            "samples from before a reconnect / clock step must not be graphed \
+             alongside samples from after it"
+        );
+    }
+
+    #[test]
+    fn fold_sample_gap_clears_hysteresis_so_one_bad_sample_cannot_re_trigger() {
+        let mut folder = Folder::seeded_at(100_000);
+        folder.fold(100_000, 600.0);
+        folder.fold(101_000, 600.0);
+        assert_eq!(
+            folder.fold(102_000, 600.0),
+            SampleEffect::Recorded {
+                reset: false,
+                level_change: Some(QualityLevel::Critical)
+            }
+        );
+
+        let after_gap = 102_000 + SAMPLE_GAP_RESET_MS + 1;
+        assert_eq!(
+            folder.fold(after_gap, 600.0),
+            SampleEffect::Recorded {
+                reset: true,
+                level_change: None
+            },
+            "a wiped hysteresis cannot re-enter Critical on a single sample"
+        );
+        assert_eq!(folder.hysteresis.level, QualityLevel::Good);
+        assert_eq!(folder.hysteresis.above_critical_count, 1);
+    }
+
+    #[test]
+    fn rtt_quality_lands_exactly_on_every_breakpoint() {
+        for (rtt, q) in RTT_QUALITY_BREAKPOINTS {
+            let got = rtt_to_quality(rtt);
+            assert!(
+                (got - q).abs() < 1e-9,
+                "breakpoint {rtt}ms should plot at {q}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtt_quality_puts_the_warn_threshold_on_the_reference_line() {
+        assert_eq!(rtt_to_quality(WARN_THRESHOLD_MS), 0.5);
+        assert!(rtt_to_quality(CRITICAL_THRESHOLD_MS) < 0.5);
+    }
+
+    #[test]
+    fn rtt_quality_interpolates_between_breakpoints() {
+        assert!((rtt_to_quality(250.0) - 0.625).abs() < 1e-9);
+        assert!((rtt_to_quality(750.0) - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rtt_quality_is_monotonic_and_never_leaves_the_plot_box() {
+        let mut prev = f64::INFINITY;
+        for step in 0..400 {
+            let q = rtt_to_quality(step as f64 * 10.0);
+            assert!(q <= prev, "quality must never rise as RTT rises");
+            assert!((0.02..=1.0).contains(&q), "q={q} escaped the plot box");
+            prev = q;
+        }
+    }
+
+    #[test]
+    fn rtt_quality_clamps_outside_the_table_and_survives_nan() {
+        assert_eq!(rtt_to_quality(-50.0), 1.0);
+        assert_eq!(rtt_to_quality(0.0), 1.0);
+        assert_eq!(rtt_to_quality(9_000.0), 0.02);
+        assert_eq!(
+            rtt_to_quality(f64::NAN),
+            1.0,
+            "a NaN must resolve here, not reach the SVG as a NaN coordinate"
+        );
+    }
+
+    #[test]
+    fn each_hysteresis_level_gets_its_own_ring() {
+        assert_eq!(QualityLevel::Good.signal_level(), SignalLevel::Good);
+        assert_eq!(QualityLevel::Warn.signal_level(), SignalLevel::Fair);
+        assert_eq!(QualityLevel::Critical.signal_level(), SignalLevel::Bad);
+
+        let colors = [
+            QualityLevel::Good.signal_level().level_color(),
+            QualityLevel::Warn.signal_level().level_color(),
+            QualityLevel::Critical.signal_level().level_color(),
+        ];
+        assert_ne!(colors[0], colors[1]);
+        assert_ne!(colors[1], colors[2]);
+        assert_ne!(colors[0], colors[2]);
+    }
+
+    fn announce(level: QualityLevel, latched: &mut bool) -> Option<&'static str> {
+        announcement_for(LevelEvent::Transition(level), latched)
+    }
+
+    #[test]
+    fn a_link_that_stops_reporting_stops_claiming_a_level() {
+        let live = presented_state(6, 0, QualityLevel::Good);
+        assert_eq!(live, Presented::Live(QualityLevel::Good));
+
+        assert_eq!(
+            presented_state(6, stale_after_missed_ticks(), QualityLevel::Good),
+            Presented::Stale
+        );
+        assert_eq!(
+            presented_state(6, stale_after_missed_ticks() - 1, QualityLevel::Good),
+            live,
+            "one tick short of the bound must not flip it"
+        );
+    }
+
+    #[test]
+    fn cold_start_reads_measuring_rather_than_stale() {
+        assert_eq!(
+            presented_state(0, stale_after_missed_ticks() * 4, QualityLevel::Good),
+            Presented::Measuring
+        );
+        assert_eq!(
+            presented_state(SPARK_MIN_POINTS - 1, 0, QualityLevel::Good),
+            Presented::Measuring,
+            "a partial history is still measuring"
+        );
+    }
+
+    #[test]
+    fn only_critical_is_announced_and_only_once() {
+        let mut latched = false;
+        assert_eq!(announce(QualityLevel::Warn, &mut latched), None);
+        assert!(!latched, "warn is not actionable and must stay silent");
+
+        assert_eq!(
+            announce(QualityLevel::Critical, &mut latched),
+            Some(ANNOUNCE_CRITICAL)
+        );
+        assert_eq!(
+            announce(QualityLevel::Critical, &mut latched),
+            None,
+            "a second critical transition must not re-announce"
+        );
+    }
+
+    #[test]
+    fn a_discontinuity_retires_the_owed_recovery_without_speaking_it() {
+        let mut latched = false;
+        announce(QualityLevel::Critical, &mut latched);
+        assert!(latched);
+
+        assert_eq!(
+            announcement_for(LevelEvent::Discontinuity, &mut latched),
+            None,
+            "a reconnect must not announce anything about the old connection"
+        );
+        assert!(
+            !latched,
+            "the owed recovery must be retired, not carried over"
+        );
+
+        assert_eq!(announce(QualityLevel::Good, &mut latched), None);
+    }
+
+    #[test]
+    fn recovery_is_announced_even_when_it_exits_through_warn() {
+        let mut latched = false;
+        announce(QualityLevel::Critical, &mut latched);
+        assert_eq!(announce(QualityLevel::Warn, &mut latched), None);
+        assert_eq!(
+            announce(QualityLevel::Good, &mut latched),
+            Some(ANNOUNCE_RECOVERED)
+        );
+        assert!(!latched);
+    }
+
+    #[test]
+    fn a_connection_that_was_never_critical_never_announces_recovery() {
+        let mut latched = false;
+        assert_eq!(announce(QualityLevel::Warn, &mut latched), None);
+        assert_eq!(
+            announce(QualityLevel::Good, &mut latched),
+            None,
+            "nothing was announced, so there is nothing to take back"
+        );
+    }
+
+    #[test]
+    fn quality_series_maps_every_retained_sample_through_the_rtt_curve() {
+        let mut history = SelfRttHistory::new();
+        history.push(sample(1_000, 0.0));
+        history.push(sample(2_000, WARN_THRESHOLD_MS));
+        history.push(sample(3_000, 9_000.0));
+
+        let series = history.quality_series();
+        assert_eq!(
+            series,
+            vec![(1_000.0, 1.0), (2_000.0, 0.5), (3_000.0, 0.02)],
+            "the plotted series must be the retained RTTs run through rtt_to_quality"
+        );
     }
 }

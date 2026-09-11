@@ -254,6 +254,7 @@ pub fn ScreenShareButton(
     rsx! {
         button {
             class,
+            "data-testid": "screen-share-button",
             "aria-label": tooltip_title,
             "aria-describedby": describedby,
             disabled,
@@ -319,6 +320,7 @@ pub fn PeerListButton(
         button {
             id: if id.is_empty() { None } else { Some(id.clone()) },
             class,
+            "data-testid": "peer-list-button",
             "aria-label": tooltip_title,
             "aria-describedby": describedby,
             onclick: move |evt| onclick.call(evt),
@@ -854,6 +856,7 @@ pub fn HangUpButton(onclick: EventHandler<MouseEvent>) -> Element {
     rsx! {
         button {
             class: "video-control-button danger",
+            "data-testid": "hang-up-button",
             "aria-label": "Hang up",
             onclick: move |evt| onclick.call(evt),
             span { class: "tooltip",

@@ -34,17 +34,18 @@
    Height-driven with `aspect-ratio: 3/2` cap (matches `.grid-item` in
    style.css): on very wide viewports the tile letterboxes horizontally
    against the page background instead of stretching edge-to-edge. The
-   `inset: 0; margin: auto` pair centers the fixed-position element when
-   `max-width: 100vw` is not binding (i.e., viewport wider than 1.5x its
+   `inset: 0; margin: auto` pair centers the absolutely positioned element when
+   `max-width: 100%` is not binding (i.e., `#grid-container`'s padding box —
+   which carries the issue 2701 drawer insets — wider than 1.5x its
    height). */
 .grid-item.full-bleed {
-  position: fixed;
+  position: absolute;
   inset: 0;
   margin: auto;
   width: auto;
-  height: 100vh;
-  max-width: 100vw;
-  max-height: 100vh;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
   aspect-ratio: 3 / 2;
   z-index: 0;
 
@@ -58,19 +59,19 @@
   height: 100%;
 }
 /* Meeting-wide status bar reserve for the full-bleed single-peer tile.
-   Unlike in-flow grid tiles, `.grid-item.full-bleed` is `position: fixed;
-   inset: 0; height: 100vh`, so it escapes the grid's `pad_top` and the bar
+   Unlike in-flow grid tiles, `.grid-item.full-bleed` is `position: absolute;
+   inset: 0`, so it escapes the grid's `pad_top` and the bar
    would otherwise overlap its `.floating-name` label (the reported 2-participant
    bug). When attendants.rs mounts the bar it adds `status-bar-active` to
    `#grid-container` and sets `--status-bar-reserve` (px) to the SAME value it
    adds to `pad_top`, so the tile's top inset always matches the painted bar
    height. Overriding `top`/`height`/`max-height` shrinks and re-centers the
-   fixed tile into the area BELOW the bar; the rule vanishes (tile back to full
-   viewport) the instant the class/var are gone. */
+   tile into the area BELOW the bar; the rule vanishes (tile back to the full
+   container) the instant the class/var are gone. */
 #grid-container.status-bar-active .grid-item.full-bleed {
   top: var(--status-bar-reserve, 0px);
-  height: calc(100vh - var(--status-bar-reserve, 0px));
-  max-height: calc(100vh - var(--status-bar-reserve, 0px));
+  height: calc(100% - var(--status-bar-reserve, 0px));
+  max-height: calc(100% - var(--status-bar-reserve, 0px));
 }
 /* 2-peer layout: each tile fills its half of the viewport.
    Overrides the `aspect-ratio: 3 / 2` cap from `.grid-item` (style.css) and
@@ -674,11 +675,6 @@ html[data-theme="dark"] {
   --legend-help-text: rgba(255, 255, 255, 0.5);
   --legend-help-border-hover: rgba(255, 255, 255, 0.6);
 
-  /* Connection/transport badge (signal popup) */
-  --transport-badge-bg: #1c1c1e;
-  --transport-badge-text: #0a84ff;
-  --transport-badge-border: #38383a;
-
   /* Issue 1483: per-tile WT/WS transport badge — OPAQUE fills with fixed text
      colors for guaranteed AA contrast over arbitrary peer video (translucent
      tints failed WCAG on mid-tone video). WT (primary) = solid blue + white;
@@ -1014,10 +1010,6 @@ html[data-theme="light"] {
   --legend-help-text: rgba(0, 0, 0, 0.45);
   --legend-help-border-hover: rgba(0, 0, 0, 0.45);
 
-  --transport-badge-bg: #f0f0f2;
-  --transport-badge-text: #0a84ff;
-  --transport-badge-border: #e0e0e2;
-
   /* Issue 1483: light-theme per-tile WT/WS badge — identical OPAQUE fixed
      fills to dark theme. The badge sits over arbitrary peer VIDEO (not the UI
      surface), so its contrast must be theme-independent.
@@ -1209,7 +1201,7 @@ html[data-theme="dark"] {
 
   /* Speaker Highlight preview tile — calm surface, not bright (dark). */
   --appearance-preview-tile-bg: rgba(255, 255, 255, 0.03);
-  --appearance-preview-tile-border-color: rgba(100, 100, 100, 0.30);
+  --appearance-preview-tile-border-color: var(--grid-item-border);
   --preview-glow-speaking-box-shadow:
     0 0 calc(var(--preview-glow-outer-blur) * 1px)
       calc(var(--preview-glow-outer-spread) * 1px)
@@ -1405,7 +1397,7 @@ html[data-theme="light"] {
 
   /* Speaker Highlight preview tile — muted slate, not near-white (light). */
   --appearance-preview-tile-bg: rgba(40, 55, 80, 0.06);
-  --appearance-preview-tile-border-color: rgba(100, 100, 100, 0.30);
+  --appearance-preview-tile-border-color: var(--grid-item-border);
   --preview-glow-speaking-box-shadow:
     0 0 calc(var(--preview-glow-outer-blur) * 1px)
       calc(var(--preview-glow-outer-spread) * 1px)
@@ -1431,10 +1423,6 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 :root {
-    /* Fallback tile border color used as a defensive var() fallback by
-      preview-tile styles if the primary token chain is unavailable. */
-  --tile-border-color-fallback: rgba(100, 100, 100, 0.30);
-
   --glass-blur: 20px;
   --glass-saturate: 180%;
 
@@ -1696,8 +1684,11 @@ html[data-theme="light"] #invite-overlay p {
   --settings-sidebar-width: 250px;
 
   /* Speaker Highlight layout */
-  --speaker-label-width: 82px;
-  --speaker-control-width: 185px;
+  /* Label and control widths trade off; the value column stays put. */
+  --speaker-label-width: 108px;
+  --speaker-control-width: 159px;
+  /* Keeps the pre-`(?)` 185px so the six default swatches (184px) stay on one line. */
+  --speaker-swatch-row-width: 185px;
   --speaker-value-width: 44px;
   --speaker-preview-column: 260px;
   --speaker-preview-shift-x: 25px;
@@ -2171,9 +2162,17 @@ html[data-theme="light"] #invite-overlay p {
 
 /* === (а) Dock positions === */
 
-/* Bottom (default) */
+/* Bottom (default). Fixed to the viewport, so it re-centres itself in the free
+   band; only `left` moves, `transform` carries the slide. (issue 2701) */
 .video-controls-container.dock-bottom {
-  left: 50%;
+  left: calc(
+    50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
+      2
+  );
+  max-width: calc(
+    100vw - var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px) -
+      32px
+  );
   bottom: 20px;
   transform: translateX(-50%);
   flex-direction: row;
@@ -2191,7 +2190,7 @@ html[data-theme="light"] #invite-overlay p {
 
 /* Left side */
 .video-controls-container.dock-left {
-  left: 16px;
+  left: calc(16px + var(--drawer-left-reserve, 0px));
   top: 50%;
   transform: translateY(-50%);
   flex-direction: column;
@@ -2211,7 +2210,7 @@ html[data-theme="light"] #invite-overlay p {
 
 /* Right side */
 .video-controls-container.dock-right {
-  right: 16px;
+  right: calc(16px + var(--drawer-right-reserve, 0px));
   top: 50%;
   transform: translateY(-50%);
   flex-direction: column;
@@ -4502,8 +4501,8 @@ html[data-theme="light"] #invite-overlay p {
 .meeting-status-bar {
   position: absolute;
   top: 0;
-  left: 0;
-  right: 0;
+  left: var(--drawer-left-reserve, 0px);
+  right: var(--drawer-right-reserve, 0px);
   height: 40px;
   z-index: 20;
   display: flex;

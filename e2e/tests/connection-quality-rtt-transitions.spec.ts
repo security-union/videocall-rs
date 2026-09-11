@@ -1,20 +1,26 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, Locator, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
+import { CQI } from "../helpers/rust-mirrored-constants";
+import {
+  deepestTrendY,
+  newestTrendY,
+  SELF_SIGNAL_DISC,
+  SELF_SIGNAL_SPARK,
+  SPARK_MIN_POINTS,
+  SPARK_REMOVED_CIRCLES,
+  SPARK_TREND,
+  SPARK_WARN_Y,
+  SPARK_X_NEWEST,
+} from "../helpers/signal-meter";
 import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
- * Connection-quality indicator: tri-state RTT transitions (issue #367).
- *
- * The sibling spec `connection-quality.spec.ts` covers the NEGATIVE side — the
- * indicator must never appear on a healthy localhost link. This spec covers the
- * positive side: Good -> Warn -> Critical -> Good, driven end-to-end through the
- * production hysteresis path.
- *
- * ===========================================================================
- * WHAT ACTUALLY MOVES THE INDICATOR (and why it is not network emulation)
- * ===========================================================================
+ * Self signal disc: Good -> Warn -> Critical -> Good through the production
+ * hysteresis path (#367, #2661). Issue 2661 made the meter always-mounted, so
+ * the old join gate counted a class that now exists nowhere and passed VACUOUSLY.
  *
  * `ConnectionQualityIndicator` (dioxus-ui/src/components/connection_quality_indicator.rs)
  * does not read page-load latency. It subscribes to the `videocall_diagnostics`
@@ -66,15 +72,8 @@ import { waitForServices } from "../helpers/wait-for-services";
  *
  * So this spec publishes the diagnostics sample itself, via the
  * `MOCK_PEERS_ENABLED`-gated `window.__videocall_inject_server_rtt` hook
- * (dioxus-ui/src/components/connection_quality_inject.rs), and everything
- * downstream of the bus is untouched production code: the subsystem filter, the
- * metric extraction, `classify_sample`'s ordering/gap watermark,
- * `HysteresisState::update`'s counters, the level -> class/label/icon mapping,
- * and the 500 ms exit animation before the element unmounts.
- *
- * ===========================================================================
- * DETERMINISM: WHY EXACTLY `ENTER_COUNT` INJECTED SAMPLES SUFFICE
- * ===========================================================================
+ * (dioxus-ui/src/components/connection_quality_inject.rs); everything
+ * downstream of the bus is untouched production code.
  *
  * The real 1 Hz `connection_manager` tick keeps emitting low-RTT samples for the
  * whole test, and a single low sample resets `above_warn_count` to 0. Injected
@@ -91,33 +90,11 @@ import { waitForServices } from "../helpers/wait-for-services";
  * timing unobservable (real low samples accumulate toward `EXIT_COUNT` on their
  * own). The precise counter arithmetic is pinned by the Rust unit tests in
  * `connection_quality_indicator.rs`; what this spec pins is that the whole
- * pipeline reaches each rendered state and then tears down.
+ * pipeline reaches each rendered state and comes back.
  */
 
-// --- Mirrors of dioxus-ui/src/components/connection_quality_indicator.rs ---
-// These are LOCKSTEP constants, not loose test data. `ENTER_COUNT` samples is
-// exactly what the tests inject, so raising the production constant without
-// updating this block turns the entering assertions red — which is the intended
-// signal, not flake.
-const CQI = {
-  WARN_THRESHOLD_MS: 300, // >= this renders "Slow connection" (2 bars)
-  CRITICAL_THRESHOLD_MS: 500, // >= this renders "Poor connection" (1 bar)
-  ENTER_COUNT: 3, // consecutive samples above a threshold to enter it
-  EXIT_COUNT: 5, // consecutive samples below a threshold to leave it
-  SAMPLE_GAP_RESET_MS: 10_000, // inter-sample gap that resets hysteresis
-  EXIT_FADE_MS: 500, // gloo Timeout before the element unmounts
-} as const;
-
-// Deadline for the gap-reset test's teardown assertion. It is a DISCRIMINATOR,
-// not a generous "eventually" timeout — see that test's comment for the full
-// arithmetic. Derived from the two exit paths it must separate:
-//   - reset path:   next render, no fade (tens of ms)
-//   - counter path: EXIT_COUNT samples at the real 1 Hz tick + EXIT_FADE_MS
-//                   = 5 * 1000 + 500 = 5500 ms, at the very fastest
-// A retune that lowers EXIT_COUNT (or speeds the diagnostics tick) narrows this
-// margin, so the floor is asserted below rather than left implicit.
 const GAP_RESET_DEADLINE_MS = 2_000;
-const FASTEST_COUNTER_EXIT_MS = CQI.EXIT_COUNT * 1_000 + CQI.EXIT_FADE_MS;
+const FASTEST_COUNTER_EXIT_MS = CQI.EXIT_COUNT * 1_000;
 if (GAP_RESET_DEADLINE_MS >= FASTEST_COUNTER_EXIT_MS) {
   throw new Error(
     `GAP_RESET_DEADLINE_MS (${GAP_RESET_DEADLINE_MS}) must stay below the fastest ` +
@@ -126,16 +103,30 @@ if (GAP_RESET_DEADLINE_MS >= FASTEST_COUNTER_EXIT_MS) {
   );
 }
 
-// Sample values, derived from the mirrored thresholds so a retune keeps them in
-// their intended bands.
 const WARN_RTT = CQI.WARN_THRESHOLD_MS + 50; // 350: in [WARN, CRITICAL)
 const CRITICAL_RTT = CQI.CRITICAL_THRESHOLD_MS + 150; // 650: >= CRITICAL
 const GOOD_RTT = 40; // well under WARN
 
-// The unfilled bar colour in `SignalBarsIcon` (dioxus-ui/src/components/icons/signal_bars.rs).
-// Filled bars take a level-dependent colour; counting the rects that are NOT
-// this colour is how the spec reads the rendered bar level out of the DOM.
-const UNFILLED_BAR = "#555";
+// GOOD IS 4, NOT 5: self moved off `Excellent`.
+const LEVEL = { GOOD: "4", WARN: "3", CRITICAL: "1" } as const;
+
+const TREND = {
+  GOOD: "rgb(76, 175, 80)",
+  WARN: "rgb(255, 193, 7)",
+  CRITICAL: "rgb(255, 68, 68)",
+} as const;
+
+const ARIA = {
+  GOOD: "Your connection: good. Open diagnostics.",
+  WARN: "Your connection: slow. Open diagnostics.",
+  CRITICAL: "Your connection: poor. Open diagnostics.",
+} as const;
+
+// `toContainText`: `action_bar_announce_text` appends U+00A0 on odd nonces (1765).
+const ANNOUNCE = {
+  CRITICAL: "Your connection is poor.",
+  RECOVERED: "Your connection is back to normal.",
+} as const;
 
 const HOOK = "__videocall_inject_server_rtt";
 
@@ -143,32 +134,23 @@ type InjectHookWindow = Window & {
   __videocall_inject_server_rtt?: (rttMs: number, count?: number, tsMs?: number) => boolean;
 };
 
-// --- Locators. Every selector below is anchored to production RSX: ---
-// `div.host-tile-chrome` is attendants.rs (the self-view's top-right cluster);
-// `ConnectionQualityIndicator {}` is its DIRECT child there, and the component's
-// root element is the `div` carrying
-// `class: "connection-quality-indicator visible" | "... exiting"`,
-// `role: "status"`, `aria-live: "polite"`, `aria-label`, `title`. So the
-// direct-child combinator below is structurally correct, not a guess.
-//
-// Two locators, deliberately: the component swaps `visible` for `exiting` while
-// it fades, and during that fade it keeps rendering the LAST non-Good level
-// (same label, same bar count). Content assertions therefore use the
-// state-agnostic locator, so a real 1 Hz low sample nudging the component into
-// its fade mid-assertion cannot turn a correct render into a false failure.
-// Only the opacity check — the one thing that genuinely differs between the two
-// classes — uses the `.visible` locator, and it runs first.
-const chrome = (page: Page) => page.locator(".host-tile-chrome");
-const indicatorAnyState = (page: Page) => page.locator(".connection-quality-indicator");
-const indicatorVisible = (page: Page) =>
-  page.locator(".host-tile-chrome > .connection-quality-indicator.visible");
-const indicatorRendered = (page: Page) =>
-  page.locator(".host-tile-chrome > .connection-quality-indicator");
-const indicatorLabel = (page: Page) => indicatorRendered(page).locator(".connection-quality-label");
-const filledBars = (page: Page) =>
-  indicatorRendered(page).locator(`svg rect:not([fill="${UNFILLED_BAR}"])`);
+// The live region is a SIBLING of the disc; scoping it off the disc hangs.
+const chrome = (page: Page): Locator => page.locator(".host-tile-chrome");
+const disc = (page: Page): Locator => chrome(page).locator(SELF_SIGNAL_DISC);
+const liveRegion = (page: Page): Locator =>
+  chrome(page).locator('span[role="status"][aria-live="polite"]');
+const spark = (page: Page): Locator => disc(page).locator(SELF_SIGNAL_SPARK);
+const sparkRuns = (page: Page): Locator => spark(page).locator(SPARK_TREND);
 
-/** Join a fresh meeting and settle on the in-call grid. */
+// WINDOWED, not newest-only: the real 1 Hz tick retakes the newest slot within a
+// second of an injection, so polling the newest y here would be a race.
+async function trendDepthBelow(page: Page, floor: number, message: string): Promise<number> {
+  await expect
+    .poll(async () => await deepestTrendY(spark(page)), { timeout: 15_000, message })
+    .toBeGreaterThan(floor);
+  return await deepestTrendY(spark(page));
+}
+
 async function joinMeeting(page: Page, label: string): Promise<void> {
   const meetingId = `e2e_cqi_${label}_${Date.now()}`;
   await fillAndSubmitJoinForm(page, meetingId, `cqi-${label}`);
@@ -195,16 +177,16 @@ async function joinMeeting(page: Page, label: string): Promise<void> {
   }
   await expect(grid).toBeVisible({ timeout: 15_000 });
 
-  // PRESENCE GATE (must precede every measurement below). The indicator mounts
-  // inside `div.host-tile-chrome`, which lives in the `can_stream`-gated
-  // `nav#host-controls-nav`. If that cluster is absent, every later
-  // "indicator is gone" assertion would pass for the wrong reason.
+  // PRESENCE GATE: an absent cluster must fail here, not satisfy a count-0.
   await expect(chrome(page)).toHaveCount(1, { timeout: 15_000 });
+  await expect(disc(page), "the self signal disc must be mounted").toHaveCount(1, {
+    timeout: 15_000,
+  });
+  await expect(disc(page), "the self signal disc must be painted, not just in the DOM").toBeVisible(
+    { timeout: 15_000 },
+  );
 
-  // The indicator itself renders `rsx! {}` while quality is Good, so it must be
-  // absent right now — this is both the precondition for the transitions and a
-  // guard that we are not reading a stale element from a previous phase.
-  await expect(indicatorAnyState(page)).toHaveCount(0);
+  await expect(disc(page)).toHaveAttribute("data-signal-level", LEVEL.GOOD, { timeout: 15_000 });
 }
 
 /**
@@ -253,81 +235,149 @@ async function injectRtt(page: Page, rttMs: number, count: number): Promise<void
   expect(accepted, `${HOOK}(${rttMs}, ${count}) was rejected by the hook`).toBe(true);
 }
 
-test.describe("Connection quality indicator: RTT transitions (#367)", () => {
+async function expectDiscLevel(
+  page: Page,
+  level: string,
+  trend: string,
+  aria: string,
+  word: string,
+): Promise<void> {
+  await expect(disc(page)).toHaveAttribute("data-signal-level", level, { timeout: 10_000 });
+
+  await expect(disc(page)).toHaveAttribute("data-signal-state", "measured", { timeout: 10_000 });
+  await expect
+    .poll(async () => await sparkRuns(page).count(), { timeout: 10_000 })
+    .toBeGreaterThanOrEqual(1);
+  await expect(
+    sparkRuns(page).first(),
+    "the level colour must reach the trend's computed paint",
+  ).toHaveCSS("stroke", trend);
+
+  await expect(disc(page)).toHaveAttribute("aria-label", aria);
+  await expect(disc(page)).toHaveAttribute(
+    "title",
+    new RegExp(`^Connection: ${word} — RTT \\d+ ms$`),
+  );
+  await expect(disc(page)).toHaveAttribute("data-signal-lost", "false");
+}
+
+test.describe("Self signal disc: RTT transitions (#367, #2661)", () => {
   test.beforeAll(async () => {
     await waitForServices();
   });
 
   test.beforeEach(async ({ context, baseURL }) => {
     await injectSessionCookie(context, { baseURL });
+    await enableDiagnosticsTileIndicators(context);
   });
 
-  test("indicator walks Good -> Warn -> Critical -> Good as active_server_rtt changes", async ({
+  test("disc walks Good -> Warn -> Critical -> Good as active_server_rtt changes", async ({
     page,
   }) => {
     await joinMeeting(page, "tristate");
     await assertInjectHook(page);
 
+    // Does NOT discriminate 2661: `spark_y` is untouched. The stroke does.
+    await expect
+      .poll(async () => await newestTrendY(spark(page)), {
+        timeout: 15_000,
+        message: "a Good link must plot its newest sample at or above the 300 ms mark",
+      })
+      .toBeLessThanOrEqual(SPARK_WARN_Y);
+
     // --- Good -> Warn ---------------------------------------------------
     // ENTER_COUNT consecutive samples in the [WARN, CRITICAL) band.
     // FAILS ON REGRESSION: if the warn threshold, the enter-counter, or the
-    // level->class mapping breaks, no `.visible` element ever appears and this
-    // times out. If the CRITICAL branch were entered instead (threshold
-    // comparison inverted), the label assertion below catches it.
+    // mapping breaks the disc stays at LEVEL.GOOD; an inverted compare reads CRITICAL.
     await injectRtt(page, WARN_RTT, CQI.ENTER_COUNT);
+    await expectDiscLevel(page, LEVEL.WARN, TREND.WARN, ARIA.WARN, "slow");
 
-    // `.visible`-specific assertions run FIRST, while the fade cannot have
-    // started: leaving Warn needs EXIT_COUNT real low samples (~5 s at 1 Hz)
-    // and these resolve in well under a second.
-    await expect(indicatorVisible(page)).toHaveCount(1, { timeout: 10_000 });
-    // The pill is actually painted, not merely in the DOM: the base rule sets
-    // `opacity: 0` and only `.visible` raises it to 1 (static/style.css). A
-    // DOM-presence assertion alone would pass on an invisible element.
-    await expect(indicatorVisible(page)).toHaveCSS("opacity", "1");
+    // Warn is the state that rendered "Slow connection"; emptiness at Good proves nothing.
+    await expect(disc(page)).toHaveText("");
 
-    await expect(indicatorLabel(page)).toHaveText("Slow connection");
-    await expect(indicatorRendered(page)).toHaveAttribute(
-      "aria-label",
-      /^Connection quality: slow, round trip time \d+ milliseconds$/,
+    const warnDepth = await trendDepthBelow(
+      page,
+      SPARK_WARN_Y,
+      `an injected ${WARN_RTT} ms sample must plot below the 300 ms mark (y > ${SPARK_WARN_Y})`,
     );
-    await expect(indicatorRendered(page)).toHaveAttribute("role", "status");
-    await expect(indicatorRendered(page)).toHaveAttribute("aria-live", "polite");
-    // Warn renders SignalBarsIcon at level 2 -> exactly two filled bars.
-    await expect(filledBars(page)).toHaveCount(2);
+
+    await expect(liveRegion(page)).toHaveText("");
+
+    // The floor is asserted, not assumed; a stutter can split the run.
+    await expect
+      .poll(async () => Number(await disc(page).getAttribute("data-signal-samples")), {
+        timeout: 15_000,
+      })
+      .toBeGreaterThanOrEqual(SPARK_MIN_POINTS);
+    await expect
+      .poll(async () => await sparkRuns(page).count(), { timeout: 15_000 })
+      .toBeGreaterThanOrEqual(1);
+    await expect(
+      disc(page).locator(SPARK_REMOVED_CIRCLES),
+      "2661 removed the head dot AND the ring arc; neither may come back",
+    ).toHaveCount(0);
+
+    // Right-anchored at SPARK_X_LAST; re-scaling k points across the width fails.
+    await expect
+      .poll(
+        async () => {
+          const points = await sparkRuns(page).last().getAttribute("points");
+          return points?.trim().split(/\s+/).pop() ?? null;
+        },
+        { timeout: 15_000 },
+      )
+      .toMatch(new RegExp(`^${SPARK_X_NEWEST.replace(".", "\\.")},\\d+\\.\\d\\d$`));
 
     // --- Warn -> Critical ------------------------------------------------
     // FAILS ON REGRESSION: if the critical threshold or its enter-counter
-    // breaks, the pill stays at "Slow connection"/2 bars and both assertions
-    // below fail on the stale amber state — not on an absent element, so the
-    // failure names the actual defect.
+    // breaks, the disc stays amber at LEVEL.WARN and the failure names that.
     await injectRtt(page, CRITICAL_RTT, CQI.ENTER_COUNT);
+    await expectDiscLevel(page, LEVEL.CRITICAL, TREND.CRITICAL, ARIA.CRITICAL, "poor");
+    await expect(disc(page)).toHaveText("");
 
-    await expect(indicatorVisible(page)).toHaveCount(1, { timeout: 10_000 });
-    await expect(indicatorLabel(page)).toHaveText("Poor connection", { timeout: 10_000 });
-    await expect(indicatorRendered(page)).toHaveAttribute(
-      "aria-label",
-      /^Connection quality: poor, round trip time \d+ milliseconds$/,
+    await trendDepthBelow(
+      page,
+      warnDepth,
+      `an injected ${CRITICAL_RTT} ms sample must plot below the deepest Warn sample ` +
+        `(y > ${warnDepth}) — depth, not hue, is what a colour-blind reader gets`,
     );
-    // Critical renders SignalBarsIcon at level 1 -> exactly one filled bar.
-    await expect(filledBars(page)).toHaveCount(1);
+
+    await expect(liveRegion(page)).toContainText(ANNOUNCE.CRITICAL, { timeout: 10_000 });
 
     // --- Critical -> Good ------------------------------------------------
     // EXIT_COUNT consecutive samples below WARN. The component skips straight
     // from Critical to Good when `below_warn_count` reaches EXIT_COUNT (it does
-    // not pause at Warn), then plays a EXIT_FADE_MS fade before returning
-    // `rsx! {}` and unmounting.
-    //
-    // FAILS ON REGRESSION: the element is asserted GONE, not merely faded —
-    // `.connection-quality-indicator` in ANY state (`visible` or `exiting`).
-    // An exit path that leaves the pill mounted, or a fade timer that never
-    // completes its `quality.set(Good)`, keeps the count at 1 and fails here.
-    // (An opacity assertion could not distinguish those: the base rule is
-    // already `opacity: 0`.)
     await injectRtt(page, GOOD_RTT, CQI.EXIT_COUNT);
+    await expectDiscLevel(page, LEVEL.GOOD, TREND.GOOD, ARIA.GOOD, "good");
 
-    await expect(indicatorAnyState(page)).toHaveCount(0, {
-      timeout: CQI.EXIT_FADE_MS + 5_000,
-    });
+    await expect
+      .poll(async () => await newestTrendY(spark(page)), {
+        timeout: 15_000,
+        message: "recovery must lift the newest sample back to or above the 300 ms mark",
+      })
+      .toBeLessThanOrEqual(SPARK_WARN_Y);
+
+    // HEADLINE: Good no longer unmounts the meter. Restore the early return and
+    // this goes to count 0.
+    await expect(disc(page), "the disc must survive a return to Good").toHaveCount(1);
+    await expect(disc(page)).toBeVisible();
+
+    // A direct Critical -> Good step, so this does NOT discriminate latch-vs-edge.
+    await expect(liveRegion(page)).toContainText(ANNOUNCE.RECOVERED, { timeout: 10_000 });
+  });
+
+  test("the disc is a button that is never itself a live region", async ({ page }) => {
+    // `role="status"` on a named `<button>` makes several AT read the name and
+    // suppress the content. FAILS ON REGRESSION both ways.
+    await joinMeeting(page, "liveregion");
+
+    await expect(disc(page)).toHaveJSProperty("tagName", "BUTTON");
+    await expect(disc(page)).not.toHaveAttribute("role", "status");
+    await expect(disc(page)).not.toHaveAttribute("aria-live", "polite");
+
+    await expect(liveRegion(page)).toHaveCount(1);
+    await expect(liveRegion(page)).toHaveAttribute("aria-atomic", "true");
+    await expect(liveRegion(page)).toHaveText("");
   });
 
   test("a replayed out-of-order sample does not suppress a genuine warning", async ({ page }) => {
@@ -347,12 +397,11 @@ test.describe("Connection quality indicator: RTT transitions (#367)", () => {
     //
     // FIXED:   C is `SampleAction::Skip` — dropped without touching the
     //          counters or the watermark — so D is the third consecutive
-    //          critical sample and the "Poor connection" pill appears.
+    //          critical sample and the disc turns red.
     // UNFIXED: C is processed, zeroing `above_critical_count` and rewinding the
     //          watermark to t-R. D then reads as an (R+20) ms gap — still under
     //          SAMPLE_GAP_RESET_MS, so not even a reset — and leaves
-    //          `above_critical_count` at 1. The pill never appears and this
-    //          test times out.
+    //          `above_critical_count` at 1; the disc stays green and times out.
     //
     // Reverting `classify_sample` therefore breaks this test. That is only true
     // because all four samples are published in ONE synchronous evaluate body:
@@ -388,62 +437,19 @@ test.describe("Connection quality indicator: RTT transitions (#367)", () => {
     );
     expect(accepted, "one of the four injected samples was rejected by the hook").toBe(true);
 
-    await expect(indicatorVisible(page)).toHaveCount(1, { timeout: 10_000 });
-    await expect(indicatorLabel(page)).toHaveText("Poor connection");
-    await expect(filledBars(page)).toHaveCount(1);
+    await expectDiscLevel(page, LEVEL.CRITICAL, TREND.CRITICAL, ARIA.CRITICAL, "poor");
   });
 
   test("a sample gap longer than the reset window clears an active warning", async ({ page }) => {
-    // The other half of `classify_sample`: a FORWARD jump beyond
-    // SAMPLE_GAP_RESET_MS means the connection context changed (reconnect,
-    // re-election), so the stale hysteresis is wiped and a visible pill is
-    // hidden at once — rather than lingering with counters describing a
-    // connection that no longer exists.
-    //
-    // WHAT MAKES THIS DISCRIMINATING IS THE DEADLINE, NOT THE SAMPLE VALUE.
-    // The gap sample is CRITICAL, but that alone does not pin anything: as this
-    // file's header states, the real 1 Hz `connection_manager` tick keeps
-    // emitting LOW-RTT samples throughout, so a pill left up by a broken reset
-    // is eventually retired by the ordinary counter path anyway. An earlier
-    // revision asserted `toHaveCount(0)` with a 10 s timeout and therefore
-    // passed on both the fixed and the broken code — it could not tell the two
-    // exits apart. The two paths differ in LATENCY, so the deadline is the
-    // discriminator:
-    //
-    //   reset path   — `SampleAction::Reset` calls `hysteresis.reset()` and, if
-    //                  the pill is visible, sets quality Good with `exiting`
-    //                  left FALSE. The element unmounts on the next render with
-    //                  no fade: tens of ms.
-    //   counter path — needs EXIT_COUNT (5) consecutive accepted low samples at
-    //                  the real 1 Hz tick (>= 5000 ms) and THEN the 500 ms
-    //                  EXIT_FADE_MS timeout: >= 5500 ms, and materially longer
-    //                  while the monotonicity guard holds, because the
-    //                  future-stamped watermark makes each real sample a
-    //                  backwards `Skip` until wall-clock catches up past it.
-    //
-    // GAP_RESET_DEADLINE_MS sits between them with ~20x margin over the reset
-    // path and ~2.75x clearance under the fastest counter exit, so it is a
-    // timing separation, not a race.
-    //
-    // FAILS ON REGRESSION: delete or neuter the `SampleAction::Reset` arm and
-    // the pill survives the deadline — the counter path cannot retire it that
-    // fast — so `toHaveCount(0)` fails.
-    //
-    // (Re-injecting CRITICAL samples to starve the counter path was considered
-    // instead of the deadline. It is not clean here: one sample only defers the
-    // natural exit by one tick, and after the gap sample the watermark is ~11 s
-    // ahead, so any top-up stamped "now" is discarded as a backwards Skip and
-    // changes nothing. Keeping them coming with future stamps for the whole
-    // window would also risk re-entering Critical on the FIXED path.)
+    // THE DEADLINE IS THE DISCRIMINATOR, NOT THE SAMPLE VALUE: the 1 Hz tick
+    // retires a stuck ring eventually, so a long-timeout assertion passes on
+    // fixed AND broken code. FAILS ON REGRESSION: neuter `SampleAction::Reset`.
     await joinMeeting(page, "gapreset");
     await assertInjectHook(page);
 
     await injectRtt(page, CRITICAL_RTT, CQI.ENTER_COUNT);
-    await expect(indicatorVisible(page)).toHaveCount(1, { timeout: 10_000 });
-    await expect(indicatorLabel(page)).toHaveText("Poor connection");
+    await expectDiscLevel(page, LEVEL.CRITICAL, TREND.CRITICAL, ARIA.CRITICAL, "poor");
 
-    // One sample stamped far enough ahead to exceed the reset window. It is
-    // still a CRITICAL value, so only the reset can hide the pill.
     const accepted = await page.evaluate(
       ({ criticalRtt, gapMs }) => {
         const fn = (window as InjectHookWindow).__videocall_inject_server_rtt;
@@ -453,16 +459,19 @@ test.describe("Connection quality indicator: RTT transitions (#367)", () => {
     );
     expect(accepted, "the gap sample was rejected by the hook").toBe(true);
 
-    // The reset path calls `quality.set(Good)` with `exiting` left false, so the
-    // element unmounts on the next render with no fade at all. The deadline is
-    // what makes this discriminating (see the comment at the top of this test):
-    // only the reset path can clear the pill this fast.
-    await expect(
-      indicatorAnyState(page),
-      `the pill must be gone within ${GAP_RESET_DEADLINE_MS}ms of the gap sample — only ` +
-        `SampleAction::Reset unmounts it that fast (no fade). The counter-driven exit ` +
-        `needs >= ${FASTEST_COUNTER_EXIT_MS}ms, so a pill still mounted here means the ` +
-        `reset arm did not fire.`,
-    ).toHaveCount(0, { timeout: GAP_RESET_DEADLINE_MS });
+    // "NOT Critical" rather than a positive level: `fold_sample` clears history
+    // too, so the disc reads Measuring for a tick. The counter path fails both.
+    await expect
+      .poll(async () => await disc(page).getAttribute("data-signal-level"), {
+        timeout: GAP_RESET_DEADLINE_MS,
+        message:
+          `the disc must leave Critical within ${GAP_RESET_DEADLINE_MS}ms of the gap sample — ` +
+          `only SampleAction::Reset does that this fast. The counter-driven exit needs ` +
+          `>= ${FASTEST_COUNTER_EXIT_MS}ms, so a still-red disc here means the reset arm ` +
+          `did not fire.`,
+      })
+      .not.toBe(LEVEL.CRITICAL);
+
+    await expect(disc(page)).toHaveAttribute("data-signal-level", LEVEL.GOOD, { timeout: 15_000 });
   });
 });

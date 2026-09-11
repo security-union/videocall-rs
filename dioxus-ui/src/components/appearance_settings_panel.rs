@@ -3,7 +3,9 @@
  * Licensed under MIT OR Apache-2.0
  */
 
-use crate::components::canvas_generator::{calculate_glow_params, glow_transition_seconds};
+use crate::components::canvas_generator::{
+    calculate_glow_params, glow_tail_seconds, glow_transition_seconds,
+};
 use crate::components::color_picker::HsvColorPicker;
 use crate::context::{
     apply_theme_to_dom, load_custom_colors_from_storage, save_custom_colors_to_storage,
@@ -184,68 +186,112 @@ fn is_keyboard_activation_key(key: &Key) -> bool {
     *key == Key::Enter || matches!(key, Key::Character(s) if s == " ")
 }
 
-/// The Decay explanation. Rendered as a real `role="tooltip"` element and
-/// wired to the `(?)` trigger through `aria-describedby`, which is what makes
-/// it reach screen readers: CSS `content` on a pseudo-element is not reliably
-/// exposed to assistive technology and cannot be referenced by an `id`
-/// (issue 1871). Kept as one constant so the visible bubble and the accessible
-/// description cannot drift apart.
-const DECAY_HELP_TEXT: &str = "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail.";
+/// One constant per slider: the bubble and its `aria-describedby` description
+/// render the same text and cannot drift (issue 1871).
+const BRIGHTNESS_HELP_TEXT: &str =
+    "Brightness sets how intense the glow's color is. 0% is a faint hint; 100% is the most vivid.";
+const GLOW_HELP_TEXT: &str = "Glow sets how far the light reaches past the tile edge. 0% is a border only; 100% is the widest spread.";
+const VELOCITY_HELP_TEXT: &str = "Velocity sets how fast the glow reacts to your voice. 0% is a slow, smooth rise; 100% snaps to every change.";
+const DECAY_HELP_TEXT: &str = "Decay sets how long the glow lingers after speech. 0% is an instant cutoff; 100% is the longest tail.";
 
-/// Next `(is_open, is_suppressed)` for the Decay `(?)` trigger when it is
-/// activated by click/tap or by Enter/Space.
-///
-/// Toggling OFF must **latch suppression**, not merely clear `--open`. The
-/// trigger still holds focus immediately after the activation, and
-/// `:focus-within` is one of the CSS reveal conditions — clearing `--open`
-/// alone therefore leaves the bubble on screen and the second tap looks
-/// broken. On touch there is no hover and no Escape key, so re-tapping the
-/// trigger is the *only* dismissal available, and WCAG 2.1 SC 1.4.13
-/// "Dismissible" requires a dismissal that does not move pointer hover or
-/// keyboard focus (tapping elsewhere moves focus, so it does not count).
-///
-/// Turning ON clears suppression so an explicit open wins over a prior
-/// Escape-dismissal. `onfocusout` clears both, so leaving the trigger re-arms
-/// the affordance for the next visit.
-///
-/// Because each branch sets one flag and clears the other, the only two
-/// outputs are `(false, true)` and `(true, false)` — never `(true, true)`.
-/// `decay_help_class` relies on that.
-fn next_decay_help_state(is_open: bool) -> (bool, bool) {
-    if is_open {
-        (false, true)
+/// Next `(open, suppressed)` slider keys after the `slug` trigger is activated.
+/// One shared pair drives all four, so opening one closes the rest. Toggling
+/// OFF latches suppression: the trigger keeps focus and `:focus-within` reveals.
+fn next_help_state(
+    slug: &'static str,
+    open: Option<&'static str>,
+) -> (Option<&'static str>, Option<&'static str>) {
+    if open == Some(slug) {
+        (None, Some(slug))
     } else {
-        (true, false)
+        (Some(slug), None)
     }
 }
 
-/// Class string for the Decay `(?)` help trigger, given whether its tooltip is
-/// click/tap-latched open and/or Escape-suppressed.
-///
-/// `--open` forces the tooltip visible (touch devices have no hover, so a tap
-/// latches it); `--suppressed` forces it hidden even while the trigger keeps
-/// keyboard focus. Suppression is what makes *both* dismissals observable —
-/// Escape, and a second tap/activation — because `:focus-within` would
-/// otherwise keep the bubble on screen while the trigger stays focused.
-/// Mirrors `announce_help_class` in `preferences_settings_panel.rs`, the
-/// shipped instance of this pattern.
-///
-/// **The branch order is load-bearing.** Production never reaches
-/// `(true, true)` — both writers clear one flag as they set the other (see
-/// `next_decay_help_state`, and the Escape branch on the trigger) — so testing
-/// suppression first is defensive against that input, not required by it. But
-/// the resulting precedence is a pinned contract
-/// (`decay_help_class_escape_suppression_wins_over_open`): should the pair ever
-/// arise, Escape must win, because emitting `--open` would keep the bubble on
-/// screen and make the dismissal look like a no-op. Swapping the two branches
-/// compiles and fails that test.
-fn decay_help_class(is_open: bool, is_suppressed: bool) -> &'static str {
-    if is_suppressed {
+/// Class string for the `slug` trigger. Branch order is load-bearing —
+/// suppression wins, pinned by `help_class_escape_suppression_wins_over_open`.
+fn help_class(slug: &str, open: Option<&str>, suppressed: Option<&str>) -> &'static str {
+    if suppressed == Some(slug) {
         "settings-info-icon speaker-highlight-help-icon speaker-highlight-help-icon--suppressed"
-    } else if is_open {
+    } else if open == Some(slug) {
         "settings-info-icon speaker-highlight-help-icon speaker-highlight-help-icon--open"
     } else {
         "settings-info-icon speaker-highlight-help-icon"
+    }
+}
+
+/// The `(?)` trigger and its tooltip for one slider. A SIBLING of the label:
+/// nesting it would fold the help text into the slider's accessible name.
+#[component]
+fn SpeakerHighlightHelp(
+    slug: &'static str,
+    label: &'static str,
+    text: &'static str,
+    /// Open downward: the topmost row's upward bubble is clipped by
+    /// `.settings-panel`'s scroll box when that row reaches the viewport top.
+    open_below: bool,
+    open: Signal<Option<&'static str>>,
+    suppressed: Signal<Option<&'static str>>,
+) -> Element {
+    let mut open = open;
+    let mut suppressed = suppressed;
+    let base_class = help_class(slug, open(), suppressed());
+    let class = if open_below {
+        format!("{base_class} speaker-highlight-help-icon--below")
+    } else {
+        base_class.to_string()
+    };
+
+    rsx! {
+        span {
+            class: "{class}",
+            role: "button",
+            tabindex: 0,
+            "aria-label": "About the {label} setting",
+            "aria-describedby": "speaker-highlight-{slug}-tip",
+            "data-testid": "speaker-highlight-{slug}-help",
+            onclick: move |evt: Event<MouseData>| {
+                evt.stop_propagation();
+                let (next_open, next_suppressed) = next_help_state(slug, open());
+                open.set(next_open);
+                suppressed.set(next_suppressed);
+            },
+            onkeydown: move |evt: Event<KeyboardData>| {
+                let key = evt.key();
+                if is_keyboard_activation_key(&key) {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    let (next_open, next_suppressed) = next_help_state(slug, open());
+                    open.set(next_open);
+                    suppressed.set(next_suppressed);
+                } else if key == Key::Escape && suppressed() != Some(slug) {
+                    // Dismiss the tooltip only, without blurring. A second Escape
+                    // finds this slug suppressed and bubbles, closing the modal.
+                    evt.stop_propagation();
+                    open.set(None);
+                    suppressed.set(Some(slug));
+                }
+            },
+            onfocusout: move |_| {
+                if *open.peek() == Some(slug) {
+                    open.set(None);
+                }
+                if *suppressed.peek() == Some(slug) {
+                    suppressed.set(None);
+                }
+            },
+            "(?)"
+            // `role="button"` is children-presentational, so this child's
+            // `role="tooltip"` is inert and `aria-describedby` above does all
+            // the work. Not a bug to fix.
+            span {
+                id: "speaker-highlight-{slug}-tip",
+                class: "speaker-highlight-help-tip",
+                role: "tooltip",
+                "data-testid": "speaker-highlight-{slug}-help-text",
+                {text}
+            }
+        }
     }
 }
 
@@ -262,6 +308,7 @@ pub fn AppearanceSettingsPanel() -> Element {
 
     let brightness_slider_style = slider_fill_style(appearance.glow_brightness);
     let inner_slider_style = slider_fill_style(appearance.inner_glow_strength);
+    let velocity_slider_style = slider_fill_style(appearance.glow_velocity);
     let decay_slider_style = slider_fill_style(appearance.glow_decay);
 
     let mut custom_colors = use_signal(load_custom_colors_from_storage);
@@ -275,15 +322,9 @@ pub fn AppearanceSettingsPanel() -> Element {
         try_use_context::<CustomThemeCtx>().unwrap_or(CustomThemeCtx(fallback_custom_theme));
     let mut import_error: Signal<Option<String>> = use_signal(|| None);
 
-    // Decay `(?)` help affordance (issue 1871). Touch has no hover, so a
-    // tap/click latches the tooltip open; hover and keyboard focus reveal it
-    // through CSS alone. Both dismissals — Escape, and a second
-    // tap/Enter/Space — suppress a still-focused tooltip without blurring the
-    // trigger and without closing the settings modal, which is what WCAG 2.1
-    // SC 1.4.13 "Dismissible" requires (a dismissal that moves focus does not
-    // count, and on touch the re-tap is the only one available).
-    let mut decay_help_open = use_signal(|| false);
-    let mut decay_help_suppressed = use_signal(|| false);
+    // One shared pair for all four `(?)` triggers: opening one closes the rest.
+    let help_open = use_signal(|| None::<&'static str>);
+    let help_suppressed = use_signal(|| None::<&'static str>);
 
     let preset_colors = [
         GlowColor::White,
@@ -1009,11 +1050,22 @@ pub fn AppearanceSettingsPanel() -> Element {
                             } // appearance-control-row (Color)
 
                             div { class: "appearance-slider-row",
-                                label { class: "appearance-slider-label", "Brightness" }
+                                div { class: "appearance-slider-label-group",
+                                    label { class: "appearance-slider-label", "Brightness" }
+                                    SpeakerHighlightHelp {
+                                        slug: "brightness",
+                                        label: "Brightness",
+                                        text: BRIGHTNESS_HELP_TEXT,
+                                        open_below: true,
+                                        open: help_open,
+                                        suppressed: help_suppressed,
+                                    }
+                                }
                                 input {
                                     r#type: "range",
                                     class: "appearance-slider",
                                     "data-testid": "speaker-highlight-brightness-slider",
+                                    "aria-label": "Brightness",
                                     style: "{brightness_slider_style}",
                                     min: "0",
                                     max: "100",
@@ -1035,11 +1087,22 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
 
                             div { class: "appearance-slider-row",
-                                label { class: "appearance-slider-label", "Glow" }
+                                div { class: "appearance-slider-label-group",
+                                    label { class: "appearance-slider-label", "Glow" }
+                                    SpeakerHighlightHelp {
+                                        slug: "glow",
+                                        label: "Glow",
+                                        text: GLOW_HELP_TEXT,
+                                        open_below: false,
+                                        open: help_open,
+                                        suppressed: help_suppressed,
+                                    }
+                                }
                                 input {
                                     r#type: "range",
                                     class: "appearance-slider",
                                     "data-testid": "speaker-highlight-glow-slider",
+                                    "aria-label": "Glow",
                                     style: "{inner_slider_style}",
                                     min: "0",
                                     max: "100",
@@ -1061,92 +1124,54 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
 
                             div { class: "appearance-slider-row",
-                                // The `(?)` trigger is a sibling of the label, not a
-                                // child of it: were the label ever wired to the slider
-                                // with `for`/`id`, nested help text would be folded into
-                                // the slider's accessible name.
                                 div { class: "appearance-slider-label-group",
-                                    label { class: "appearance-slider-label", "Decay" }
-                                    span {
-                                        class: decay_help_class(decay_help_open(), decay_help_suppressed()),
-                                        role: "button",
-                                        tabindex: 0,
-                                        "aria-label": "About the Decay setting",
-                                        "aria-describedby": "speaker-highlight-decay-tip",
-                                        "data-testid": "speaker-highlight-decay-help",
-                                        onclick: move |evt: Event<MouseData>| {
-                                            evt.stop_propagation();
-                                            let (open, suppressed) = next_decay_help_state(
-                                                decay_help_open(),
-                                            );
-                                            decay_help_open.set(open);
-                                            decay_help_suppressed.set(suppressed);
-                                        },
-                                        onkeydown: move |evt: Event<KeyboardData>| {
-                                            let key = evt.key();
-                                            if is_keyboard_activation_key(&key) {
-                                                evt.prevent_default();
-                                                evt.stop_propagation();
-                                                let (open, suppressed) = next_decay_help_state(
-                                                    decay_help_open(),
-                                                );
-                                                decay_help_open.set(open);
-                                                decay_help_suppressed.set(suppressed);
-                                            } else if key == Key::Escape && !decay_help_suppressed() {
-                                                // First Escape while the tooltip shows: dismiss ONLY
-                                                // the tooltip. Stop propagation so the modal's own
-                                                // Escape handler (device_settings_modal.rs) does not
-                                                // close the modal, and do NOT blur — focus stays on
-                                                // the trigger. A second Escape finds the tooltip
-                                                // already suppressed, falls through and bubbles, so
-                                                // the modal closes as usual.
-                                                evt.stop_propagation();
-                                                decay_help_open.set(false);
-                                                decay_help_suppressed.set(true);
-                                            }
-                                        },
-                                        onfocusout: move |_| {
-                                            decay_help_open.set(false);
-                                            decay_help_suppressed.set(false);
-                                        },
-                                        "(?)"
-                                        // `role="button"` is children-presentational, so this
-                                        // child's `role="tooltip"` is INERT: the AX tree reports
-                                        // it as `{role: "none", ignored: true}`. Do not "fix"
-                                        // that — `aria-describedby` above does 100% of the work
-                                        // (an `aria-describedby` target contributes its text
-                                        // even when unrendered and even when its own role is
-                                        // dropped). The role is kept only as authoring intent.
-                                        // Children-presentational is also what guarantees this
-                                        // full sentence-pair explanation can never leak into the
-                                        // trigger's accessible name; the explicit `aria-label`
-                                        // above is the second guard.
-                                        span {
-                                            id: "speaker-highlight-decay-tip",
-                                            class: "speaker-highlight-help-tip",
-                                            role: "tooltip",
-                                            "data-testid": "speaker-highlight-decay-help-text",
-                                            {DECAY_HELP_TEXT}
-                                        }
+                                    label { class: "appearance-slider-label", "Velocity" }
+                                    SpeakerHighlightHelp {
+                                        slug: "velocity",
+                                        label: "Velocity",
+                                        text: VELOCITY_HELP_TEXT,
+                                        open_below: false,
+                                        open: help_open,
+                                        suppressed: help_suppressed,
                                     }
                                 }
-                                // DELIBERATE: this slider carries no
-                                // `aria-describedby`. The `(?)` trigger above
-                                // already exposes the full explanation and is
-                                // the immediately preceding stop in both DOM
-                                // and tab order, so pointing the slider at the
-                                // same `#speaker-highlight-decay-tip` would
-                                // replay the whole explanation at two
-                                // consecutive tab stops. The choice is "once
-                                // vs. twice", not "described vs. undescribed".
-                                //
-                                // This is NOT the sibling-not-child concern in
-                                // the comment above: `aria-describedby` never
-                                // contributes to the accessible NAME, so it
-                                // could not pollute this slider's name the way
-                                // nesting the trigger inside the `label` would.
-                                // Different problem — do not conflate them, and
-                                // do not "fix" this omission as an oversight.
+                                input {
+                                    r#type: "range",
+                                    class: "appearance-slider",
+                                    "data-testid": "speaker-highlight-velocity-slider",
+                                    "aria-label": "Velocity",
+                                    style: "{velocity_slider_style}",
+                                    min: "0",
+                                    max: "100",
+                                    value: "{(appearance.glow_velocity * 100.0) as i32}",
+                                    oninput: move |evt: Event<FormData>| {
+                                        if let Ok(value) = evt.value().parse::<f32>() {
+                                            appearance_ctx
+                                                .0
+                                                .set(AppearanceSettings {
+                                                    glow_velocity: (value / 100.0).clamp(0.0, 1.0),
+                                                    ..appearance_ctx.0()
+                                                });
+                                        }
+                                    },
+                                }
+                                span { class: "appearance-slider-value",
+                                    "{(appearance.glow_velocity * 100.0) as i32}%"
+                                }
+                            }
+
+                            div { class: "appearance-slider-row",
+                                div { class: "appearance-slider-label-group",
+                                    label { class: "appearance-slider-label", "Decay" }
+                                    SpeakerHighlightHelp {
+                                        slug: "decay",
+                                        label: "Decay",
+                                        text: DECAY_HELP_TEXT,
+                                        open_below: false,
+                                        open: help_open,
+                                        suppressed: help_suppressed,
+                                    }
+                                }
                                 input {
                                     r#type: "range",
                                     class: "appearance-slider",
@@ -1187,6 +1212,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                             glow_brightness: defaults.glow_brightness,
                                             inner_glow_strength: defaults.inner_glow_strength,
                                             glow_decay: defaults.glow_decay,
+                                            glow_velocity: defaults.glow_velocity,
                                             ..appearance_ctx.0()
                                         });
                                     },
@@ -1309,7 +1335,7 @@ fn prefers_reduced_motion() -> bool {
 }
 
 /// Duration of the "speaking burst" phase in the preview animation (ms).
-const PREVIEW_SPEAKING_MS: u32 = 600;
+const PREVIEW_SPEAKING_MS: u32 = 900;
 /// Minimum silent phase so the cycle doesn't spin too fast at 0% decay.
 const PREVIEW_SILENT_MIN_MS: u32 = 400;
 
@@ -1318,7 +1344,7 @@ const PREVIEW_SILENT_MIN_MS: u32 = 400;
 /// Longer decay → longer visible tail → more silent time needed to perceive it.
 /// The silent phase is hold + fade + a small minimum baseline.
 fn preview_silent_duration_ms(decay: f32) -> u32 {
-    let (_fade_in, fade_out, hold) = glow_transition_seconds(decay);
+    let (fade_out, hold) = glow_tail_seconds(decay);
     let tail_ms = ((hold + fade_out) * 1000.0) as u32;
     PREVIEW_SILENT_MIN_MS + tail_ms
 }
@@ -1337,7 +1363,7 @@ fn preview_silent_duration_ms(decay: f32) -> u32 {
 fn preview_glow_style(settings: &AppearanceSettings) -> String {
     let p = calculate_glow_params(0.55, settings.glow_brightness, settings.inner_glow_strength);
     let (fade_in_seconds, fade_out_duration, hold_delay) =
-        glow_transition_seconds(settings.glow_decay);
+        glow_transition_seconds(settings.glow_decay, settings.glow_velocity);
     let (r, g, b) = settings.glow_color.to_rgb();
     let blur_scale = 0.60_f32;
     let spread_scale = 0.70_f32;
@@ -1379,9 +1405,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decay_help_class_resting_state_carries_no_modifier() {
-        let class = decay_help_class(false, false);
+    fn help_class_resting_state_carries_no_modifier() {
         // The CSS reveal + suppression rules are all keyed off this base class.
+        let class = help_class("decay", None, None);
         assert!(class.contains("speaker-highlight-help-icon"));
         assert!(
             !class.contains("--open"),
@@ -1394,8 +1420,8 @@ mod tests {
     }
 
     #[test]
-    fn decay_help_class_latched_open_adds_open_modifier() {
-        let class = decay_help_class(true, false);
+    fn help_class_latched_open_adds_open_modifier() {
+        let class = help_class("decay", Some("decay"), None);
         assert!(
             class.contains("speaker-highlight-help-icon--open"),
             "tap/click latch must force the tooltip visible: {class}"
@@ -1404,29 +1430,44 @@ mod tests {
     }
 
     #[test]
-    fn decay_help_toggling_on_opens_and_clears_suppression() {
+    fn help_class_ignores_another_sliders_keys() {
+        let class = help_class("brightness", Some("glow"), Some("decay"));
+        assert!(!class.contains("--open"), "{class}");
+        assert!(!class.contains("--suppressed"), "{class}");
+    }
+
+    #[test]
+    fn help_toggling_on_opens_and_clears_suppression() {
         // An explicit open must beat a prior Escape-dismissal.
-        assert_eq!(next_decay_help_state(false), (true, false));
+        assert_eq!(next_help_state("decay", None), (Some("decay"), None));
     }
 
     #[test]
-    fn decay_help_toggling_off_latches_suppression() {
-        // The regression this pins: clearing `--open` alone is NOT a dismissal.
-        // The trigger still holds focus right after the tap, and `:focus-within`
-        // is a CSS reveal condition, so the bubble would stay on screen. Touch
-        // has no hover and no Escape key, so this re-tap is the only dismissal
-        // that does not move focus — which is precisely what WCAG 2.1 SC 1.4.13
-        // "Dismissible" demands. Restore the old `suppressed = false;
-        // open = !open` and this fails on the second element.
-        assert_eq!(next_decay_help_state(true), (false, true));
+    fn opening_one_slider_help_closes_the_others() {
+        let (open, suppressed) = next_help_state("glow", Some("brightness"));
+        assert_eq!((open, suppressed), (Some("glow"), None));
+        assert!(
+            !help_class("brightness", open, suppressed).contains("--open"),
+            "the previously open trigger must lose its latch"
+        );
+        assert!(help_class("glow", open, suppressed).contains("--open"));
     }
 
     #[test]
-    fn decay_help_toggle_off_renders_the_suppressed_modifier() {
+    fn help_toggling_off_latches_suppression() {
+        // Return `(None, None)` here and the bubble survives its own dismissal.
+        assert_eq!(
+            next_help_state("decay", Some("decay")),
+            (None, Some("decay"))
+        );
+    }
+
+    #[test]
+    fn help_toggle_off_renders_the_suppressed_modifier() {
         // End-to-end through the production class builder: the state the
         // off-toggle produces must be the state CSS keys its hide rule off.
-        let (is_open, is_suppressed) = next_decay_help_state(true);
-        let class = decay_help_class(is_open, is_suppressed);
+        let (open, suppressed) = next_help_state("decay", Some("decay"));
+        let class = help_class("decay", open, suppressed);
         assert!(
             class.contains("speaker-highlight-help-icon--suppressed"),
             "a second tap must render the suppressed modifier, since only that \
@@ -1435,31 +1476,24 @@ mod tests {
     }
 
     #[test]
-    fn decay_help_toggle_round_trip_returns_to_a_revealing_state() {
-        // Tap-open → tap-closed → tap-open again. The middle state latches
-        // suppression, so the third tap must clear it or the affordance would
-        // stay dead for the rest of the visit.
-        let (open_1, suppressed_1) = next_decay_help_state(false);
-        assert!(open_1 && !suppressed_1);
-        let (open_2, suppressed_2) = next_decay_help_state(open_1);
-        assert!(!open_2 && suppressed_2);
-        let (open_3, suppressed_3) = next_decay_help_state(open_2);
-        assert!(
-            open_3 && !suppressed_3,
+    fn help_toggle_round_trip_returns_to_a_revealing_state() {
+        let (open_1, suppressed_1) = next_help_state("velocity", None);
+        assert_eq!((open_1, suppressed_1), (Some("velocity"), None));
+        let (open_2, suppressed_2) = next_help_state("velocity", open_1);
+        assert_eq!((open_2, suppressed_2), (None, Some("velocity")));
+        let (open_3, suppressed_3) = next_help_state("velocity", open_2);
+        assert_eq!(
+            (open_3, suppressed_3),
+            (Some("velocity"), None),
             "re-tapping a suppressed trigger must reopen it"
         );
-        assert!(
-            decay_help_class(open_3, suppressed_3).contains("speaker-highlight-help-icon--open")
-        );
+        assert!(help_class("velocity", open_3, suppressed_3)
+            .contains("speaker-highlight-help-icon--open"));
     }
 
     #[test]
-    fn decay_help_class_escape_suppression_wins_over_open() {
-        // Escape must beat the open latch. The trigger keeps focus after
-        // Escape, so leaving `--open` on would keep the bubble on screen via
-        // both the latch and `:focus-within`, making Escape look like a no-op
-        // (WCAG 2.1 SC 1.4.13 "Dismissible").
-        let class = decay_help_class(true, true);
+    fn help_class_escape_suppression_wins_over_open() {
+        let class = help_class("decay", Some("decay"), Some("decay"));
         assert!(
             class.contains("speaker-highlight-help-icon--suppressed"),
             "suppressed state must be reflected in the class: {class}"
@@ -1471,12 +1505,16 @@ mod tests {
     }
 
     #[test]
-    fn decay_help_text_is_the_single_source_for_the_explanation() {
-        // The visible `role="tooltip"` element and the accessible description
-        // both render this one constant, so they cannot drift. Guard the two
-        // endpoints the copy exists to explain.
-        assert!(DECAY_HELP_TEXT.contains("0%"), "{DECAY_HELP_TEXT}");
-        assert!(DECAY_HELP_TEXT.contains("100%"), "{DECAY_HELP_TEXT}");
+    fn every_slider_help_text_explains_both_endpoints() {
+        for text in [
+            BRIGHTNESS_HELP_TEXT,
+            GLOW_HELP_TEXT,
+            VELOCITY_HELP_TEXT,
+            DECAY_HELP_TEXT,
+        ] {
+            assert!(text.contains("0%"), "{text}");
+            assert!(text.contains("100%"), "{text}");
+        }
     }
 
     #[test]
@@ -1559,5 +1597,48 @@ mod tests {
         assert!(style.contains("--preview-glow-fade-out: 1.50s;"));
         assert!(style.contains("--preview-glow-hold-delay: 1.00s;"));
         assert!(style.contains("--preview-glow-border-alpha:"));
+    }
+
+    #[test]
+    fn preview_glow_style_fade_in_follows_velocity() {
+        let at = |velocity: f32| {
+            preview_glow_style(&AppearanceSettings {
+                glow_velocity: velocity,
+                ..AppearanceSettings::default()
+            })
+        };
+        assert!(
+            at(0.0).contains("--preview-glow-fade-in: 0.45s;"),
+            "{}",
+            at(0.0)
+        );
+        assert!(
+            at(0.5).contains("--preview-glow-fade-in: 0.15s;"),
+            "{}",
+            at(0.5)
+        );
+        assert!(
+            at(1.0).contains("--preview-glow-fade-in: 0.03s;"),
+            "{}",
+            at(1.0)
+        );
+    }
+
+    #[test]
+    fn preview_glow_style_velocity_leaves_the_decay_tail_alone() {
+        let at = |velocity: f32| {
+            preview_glow_style(&AppearanceSettings {
+                glow_velocity: velocity,
+                glow_decay: 0.5,
+                ..AppearanceSettings::default()
+            })
+        };
+        for style in [at(0.0), at(1.0)] {
+            assert!(style.contains("--preview-glow-fade-out: 1.50s;"), "{style}");
+            assert!(
+                style.contains("--preview-glow-hold-delay: 1.00s;"),
+                "{style}"
+            );
+        }
     }
 }

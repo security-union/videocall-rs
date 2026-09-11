@@ -1,6 +1,17 @@
 import { test, expect, Page, chromium } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
+import {
+  keylinesMatchTrends,
+  keylinesPrecedeTrends,
+  plottedTrendYs,
+  SIGNAL_SPARK,
+  SPARK_MIN_POINTS,
+  SPARK_REMOVED_CIRCLES,
+  SPARK_TREND,
+  sparkAreaFillState,
+} from "../helpers/signal-meter";
 
 /**
  * Per-tile SIGNAL INDICATOR trust check (issue #2190).
@@ -136,6 +147,7 @@ test.describe("Per-tile signal indicator", () => {
       uiURL,
     );
     await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+    await enableDiagnosticsTileIndicators(hostCtx);
 
     const guestCtx = await createAuthenticatedContext(
       browserA,
@@ -144,6 +156,7 @@ test.describe("Per-tile signal indicator", () => {
       uiURL,
     );
     await guestCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+    await enableDiagnosticsTileIndicators(guestCtx);
 
     const hostPage = await hostCtx.newPage();
     const guestPage = await guestCtx.newPage();
@@ -162,7 +175,7 @@ test.describe("Per-tile signal indicator", () => {
       });
       await expect(guestTile).toBeVisible({ timeout: 45_000 });
 
-      // The signal indicator renders unconditionally on a peer tile (canvas or avatar).
+      // Since #2673 the disc is diagnostics-gated; the context seed above is what mounts it.
       const signalIcon = guestTile.locator("[data-signal-level]").first();
       await expect(signalIcon).toHaveCount(1, { timeout: 30_000 });
 
@@ -209,6 +222,156 @@ test.describe("Per-tile signal indicator", () => {
         `a healthy decoding peer must read >= 4 bars; 3 is the pre-fix averaged-in-zero value ` +
           `(got ${bars})`,
       ).toBeGreaterThanOrEqual(4);
+
+      // FAILS ON 0d48bec5^: the disc wore an opaque `#101114` of its own.
+      const iconCluster = guestTile.locator(".tile-top-icons");
+      await expect(iconCluster).toHaveCount(1, { timeout: 30_000 });
+      await expect(iconCluster.locator(".signal-indicator")).toHaveCount(1);
+      await expect(iconCluster.locator(".audio-indicator")).toHaveCount(1);
+      await expect(iconCluster.locator(".signal-indicator")).toBeVisible();
+      await expect(iconCluster.locator(".audio-indicator")).toBeVisible();
+      const [signalBg, micBg] = await iconCluster.evaluate((cluster) => [
+        getComputedStyle(cluster.querySelector(".signal-indicator") as Element).backgroundColor,
+        getComputedStyle(cluster.querySelector(".audio-indicator") as Element).backgroundColor,
+      ]);
+      expect(micBg, "a transparent mic scrim would make the sameness comparison vacuous").not.toBe(
+        "rgba(0, 0, 0, 0)",
+      );
+      expect(
+        signalBg,
+        `the disc must wear the mic icon's scrim — retokenise either rule and they diverge ` +
+          `silently (disc ${signalBg}, mic ${micBg})`,
+      ).toBe(micBg);
+
+      const spark = signalIcon.locator(SIGNAL_SPARK);
+      await expect(spark).toHaveCount(1);
+      await expect
+        .poll(async () => await spark.locator(SPARK_TREND).count(), {
+          timeout: 30_000,
+          message:
+            "the peer sparkline must be drawn — `refresh_peer_disc` writes it into the " +
+            "`[data-signal-spark]` mount at the 1 Hz sample tick",
+        })
+        .toBeGreaterThanOrEqual(1);
+
+      // Discriminating: the un-fixed builder renders 3 circles here.
+      await expect(
+        signalIcon.locator(SPARK_REMOVED_CIRCLES),
+        "2661 removed the head dot AND the ring arc; neither may come back",
+      ).toHaveCount(0);
+
+      // POSITIVE: a count-0 on the deleted `.spark-grid` would pass vacuously.
+      await expect
+        .poll(async () => await keylinesMatchTrends(spark), {
+          timeout: 30_000,
+          message: "every peer trend run rides on its own keyline",
+        })
+        .toBe(true);
+      await expect
+        .poll(async () => await keylinesPrecedeTrends(spark), {
+          timeout: 30_000,
+          message: "a keyline painted OVER its trend erases the mark it backs",
+        })
+        .toBe(true);
+      await expect
+        .poll(async () => await sparkAreaFillState(spark), {
+          timeout: 30_000,
+          message: "the disc interior is one flat colour: nothing may fill under the trend",
+        })
+        .toBe("no-area-fill");
+
+      await expect
+        .poll(async () => Number(await signalIcon.getAttribute("data-signal-samples")), {
+          timeout: 30_000,
+        })
+        .toBeGreaterThanOrEqual(SPARK_MIN_POINTS);
+    } finally {
+      await browserHost.close();
+      await browserA.close();
+    }
+  });
+
+  test("a measured peer keeps its reading under prefers-reduced-motion @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `signal_reduce_${Date.now()}`;
+
+    const browserHost = await chromium.launch({ args: BROWSER_ARGS });
+    const browserA = await chromium.launch({ args: BROWSER_ARGS });
+
+    const hostCtx = await createAuthenticatedContext(
+      browserHost,
+      "reducehost@videocall.rs",
+      "ReduceHost",
+      uiURL,
+    );
+    await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+    await enableDiagnosticsTileIndicators(hostCtx);
+
+    const guestCtx = await createAuthenticatedContext(
+      browserA,
+      "reduceguest@videocall.rs",
+      "ReduceGuest",
+      uiURL,
+    );
+    await guestCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+    await enableDiagnosticsTileIndicators(guestCtx);
+
+    const hostPage = await hostCtx.newPage();
+    const guestPage = await guestCtx.newPage();
+
+    try {
+      await hostPage.emulateMedia({ reducedMotion: "reduce" });
+
+      await navigateToMeeting(hostPage, meetingId, "ReduceHost");
+      expect(await joinMeetingFromPage(hostPage)).toBe("in-meeting");
+
+      await navigateToMeeting(guestPage, meetingId, "ReduceGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      const guestTile = hostPage.locator("#grid-container .grid-item", {
+        has: hostPage.locator(`text="ReduceGuest"`),
+      });
+      await expect(guestTile).toBeVisible({ timeout: 45_000 });
+
+      const signalIcon = guestTile.locator("[data-signal-level]").first();
+      await expect(signalIcon).toHaveCount(1, { timeout: 30_000 });
+      await expect(signalIcon).toHaveAttribute("data-signal-state", "measured", {
+        timeout: 45_000,
+      });
+
+      const spark = signalIcon.locator(SIGNAL_SPARK);
+      await expect(spark).toHaveCount(1);
+
+      // FAILS ON c4f238bc^: reduce emptied `series`, so samples read 0 and the name said
+      // "measuring". KEEP THIS ORDER: under 4 samples a 2-point run is not yet proof of reduce.
+      await expect
+        .poll(async () => Number(await signalIcon.getAttribute("data-signal-samples")), {
+          timeout: 45_000,
+          message: "reduce drops the trend, not the reading",
+        })
+        .toBeGreaterThanOrEqual(SPARK_MIN_POINTS);
+
+      await expect
+        .poll(
+          async () => {
+            const ys = await plottedTrendYs(spark);
+            return ys.length === 2 && ys[0] === ys[1];
+          },
+          {
+            timeout: 45_000,
+            message: "under reduce the trend must collapse to one flat full-width run",
+          },
+        )
+        .toBe(true);
+
+      await expect(signalIcon).toHaveAttribute(
+        "aria-label",
+        /^ReduceGuest connection: (?!measuring)[a-z]+\. Show signal quality details\.$/,
+      );
     } finally {
       await browserHost.close();
       await browserA.close();
@@ -254,6 +417,7 @@ test.describe("Per-tile signal indicator", () => {
       uiURL,
     );
     await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+    await enableDiagnosticsTileIndicators(hostCtx);
     // Pin the budget BEFORE navigation so the shed is deterministic rather than dependent on
     // auto-adaptation timing.
     await hostCtx.addInitScript(
@@ -263,6 +427,7 @@ test.describe("Per-tile signal indicator", () => {
     const mk = async (browser: typeof browserA, email: string, name: string) => {
       const ctx = await createAuthenticatedContext(browser, email, name, uiURL);
       await ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+      await enableDiagnosticsTileIndicators(ctx);
       return ctx;
     };
     const guestACtx = await mk(browserA, "obguesta@videocall.rs", "ObGuestA");

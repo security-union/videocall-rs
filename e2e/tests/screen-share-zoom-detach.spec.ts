@@ -1437,7 +1437,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
 
   // ──────────────────────────────────────────────────────────────────────────
   // Issue #1821 — shared-content stats overlay (res·fps), gated by the SAME
-  // diagnostics "Show media metrics on tiles" checkbox as the camera overlay.
+  // diagnostics "Show diagnostics on tiles" checkbox as the camera overlay.
   //
   // Fails-on-unfixed: the media-metrics-overlay-screen testid does not exist on
   // the un-fixed feature; the OFF→ON reactive appearance + the "↓ WxH · Nfps"
@@ -1464,7 +1464,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       // OFF by default: no shared-content stats overlay is in the DOM.
       await expect(screenOverlay).toHaveCount(0);
 
-      // Turn the diagnostics "Show media metrics on tiles" checkbox ON.
+      // Turn the diagnostics "Show diagnostics on tiles" checkbox ON.
       await wakeControls(hostPage);
       const diagButton = hostPage.locator("button", {
         has: hostPage.locator("span.tooltip", { hasText: "Open Diagnostics" }),

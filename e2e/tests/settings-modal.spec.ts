@@ -81,12 +81,19 @@ async function openAppearanceTab(
 }
 
 /**
- * The Decay explanation, pinned here independently of the Rust source
- * (`DECAY_HELP_TEXT` in `dioxus-ui/src/components/appearance_settings_panel.rs`).
- * Changing the copy on one side without the other turns this spec red.
+ * The four speaker-highlight explanations, pinned here independently of the
+ * Rust source (`*_HELP_TEXT` in
+ * `dioxus-ui/src/components/appearance_settings_panel.rs`). Changing the copy
+ * on one side without the other turns this spec red.
  */
+const BRIGHTNESS_HELP_TEXT =
+  "Brightness sets how intense the glow's color is. 0% is a faint hint; 100% is the most vivid.";
+const GLOW_HELP_TEXT =
+  "Glow sets how far the light reaches past the tile edge. 0% is a border only; 100% is the widest spread.";
+const VELOCITY_HELP_TEXT =
+  "Velocity sets how fast the glow reacts to your voice. 0% is a slow, smooth rise; 100% snaps to every change.";
 const DECAY_HELP_TEXT =
-  "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail.";
+  "Decay sets how long the glow lingers after speech. 0% is an instant cutoff; 100% is the longest tail.";
 
 /** `rgb()` / `rgba()` (the only forms `getComputedStyle` returns) → channels. */
 function parseCssColor(value: string): { r: number; g: number; b: number; a: number } {
@@ -242,6 +249,31 @@ function speakerHighlightRow(page: import("@playwright/test").Page, label: strin
   return page.locator(".speaker-highlight-controls .appearance-slider-row").filter({
     has: page.getByText(label, { exact: true }),
   });
+}
+
+const SPEAKER_HIGHLIGHT_HELP: ReadonlyArray<{ key: string; label: string; text: string }> = [
+  { key: "brightness", label: "Brightness", text: BRIGHTNESS_HELP_TEXT },
+  { key: "glow", label: "Glow", text: GLOW_HELP_TEXT },
+  { key: "velocity", label: "Velocity", text: VELOCITY_HELP_TEXT },
+  { key: "decay", label: "Decay", text: DECAY_HELP_TEXT },
+];
+
+function highlightSlider(page: import("@playwright/test").Page, key: string) {
+  return page.locator(`[data-testid="speaker-highlight-${key}-slider"]`);
+}
+
+function highlightSliderValue(page: import("@playwright/test").Page, key: string) {
+  return highlightSlider(page, key).locator(
+    "xpath=ancestor::div[contains(@class, 'appearance-slider-row')]//span[contains(@class, 'appearance-slider-value')]",
+  );
+}
+
+function helpTrigger(page: import("@playwright/test").Page, key: string) {
+  return page.locator(`[data-testid="speaker-highlight-${key}-help"]`);
+}
+
+function helpTip(page: import("@playwright/test").Page, key: string) {
+  return page.locator(`[data-testid="speaker-highlight-${key}-help-text"]`);
 }
 
 test.describe("Device settings modal", () => {
@@ -846,6 +878,357 @@ test.describe("Device settings modal", () => {
     ).toBe("0s");
   });
 
+  test("Velocity slider updates the speaker glow attack speed and leaves the tail alone", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    const meetingId = `e2e_settings_velocity_${Date.now()}`;
+
+    await openAppearanceTab(page, meetingId, "velocity-user");
+
+    const velocitySlider = highlightSlider(page, "velocity");
+    const velocityValue = highlightSliderValue(page, "velocity");
+    const previewTile = page.locator(".speaker-highlight-preview .preview-tile");
+
+    await expect(velocitySlider).toHaveValue("50", { timeout: 5_000 });
+    await expect(velocityValue).toHaveText("50%", { timeout: 5_000 });
+    await expect(velocitySlider).toHaveAttribute("aria-label", "Velocity");
+    await expect(previewTile).toBeVisible({ timeout: 5_000 });
+
+    const previewStyle = async () => (await previewTile.getAttribute("style")) || "";
+    const expectFadeIn = async (expected: string) =>
+      expect
+        .poll(
+          async () => {
+            const style = await previewStyle();
+            return style.includes(expected) ? expected : `style: ${style}`;
+          },
+          {
+            timeout: 15_000,
+            intervals: [200],
+            message: `expected preview tile to publish ${expected}`,
+          },
+        )
+        .toBe(expected);
+
+    // This default anchor also passes pre-Velocity (0.15s was the constant);
+    // the two below cannot.
+    await expectFadeIn("--preview-glow-fade-in: 0.15s;");
+
+    await velocitySlider.fill("0");
+    await expect(velocityValue).toHaveText("0%");
+    await expectFadeIn("--preview-glow-fade-in: 0.45s;");
+
+    await velocitySlider.fill("100");
+    await expect(velocityValue).toHaveText("100%");
+    await expectFadeIn("--preview-glow-fade-in: 0.03s;");
+
+    const styleAtTopVelocity = await previewStyle();
+    expect(styleAtTopVelocity).toContain("--preview-glow-fade-out: 1.50s;");
+    expect(styleAtTopVelocity).toContain("--preview-glow-hold-delay: 1.00s;");
+
+    const sliderOrder = await page.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(
+          '.speaker-highlight-controls [data-testid^="speaker-highlight-"][data-testid$="-slider"]',
+        ),
+      ).map((el) => el.getAttribute("data-testid")),
+    );
+    expect(sliderOrder).toEqual([
+      "speaker-highlight-brightness-slider",
+      "speaker-highlight-glow-slider",
+      "speaker-highlight-velocity-slider",
+      "speaker-highlight-decay-slider",
+    ]);
+
+    await page.waitForTimeout(500);
+
+    await expect
+      .poll(async () => page.evaluate(() => localStorage.getItem("vc_appearance_glow_velocity")), {
+        timeout: 5_000,
+        intervals: [200],
+      })
+      .toBe("1");
+
+    await page.reload();
+    await page.waitForTimeout(1500);
+
+    await openDeviceSettingsModal(page);
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    await expect(highlightSlider(page, "velocity")).toHaveValue("100", { timeout: 5_000 });
+    await expect(highlightSliderValue(page, "velocity")).toHaveText("100%");
+  });
+
+  test("Velocity is not a dead control at 0% Decay", async ({ page }) => {
+    test.setTimeout(90_000);
+    const meetingId = `e2e_settings_velocity_zero_decay_${Date.now()}`;
+
+    await openAppearanceTab(page, meetingId, "velocity-zero-decay-user");
+
+    const previewTile = page.locator(".speaker-highlight-preview .preview-tile");
+    await expect(previewTile).toBeVisible({ timeout: 5_000 });
+
+    await highlightSlider(page, "decay").fill("0");
+    await highlightSlider(page, "velocity").fill("0");
+
+    // Pre-Velocity code returned `(0.0, 0.0, 0.0)` at zero decay: keeping that
+    // early-out publishes a 0.00s attack here and times this poll out.
+    await expect
+      .poll(
+        async () => {
+          const style = (await previewTile.getAttribute("style")) || "";
+          const slowAttackInstantOff =
+            style.includes("--preview-glow-fade-in: 0.45s;") &&
+            style.includes("--preview-glow-fade-out: 0.00s;");
+          return slowAttackInstantOff ? "slow-attack-instant-off" : `style: ${style}`;
+        },
+        {
+          timeout: 15_000,
+          intervals: [200],
+          message: "expected a slow attack and an instant-off tail at velocity 0 / decay 0",
+        },
+      )
+      .toBe("slow-attack-instant-off");
+  });
+
+  test("every speaker highlight slider has an accessible help trigger", async ({ page }) => {
+    test.setTimeout(120_000);
+    const meetingId = `e2e_settings_help_triggers_${Date.now()}`;
+
+    await openAppearanceTab(page, meetingId, "help-trigger-user");
+
+    const dialog = page.locator("#device-settings-dialog");
+    const openTriggers = page.locator(
+      ".speaker-highlight-controls .speaker-highlight-help-icon--open",
+    );
+
+    for (let i = 0; i < SPEAKER_HIGHLIGHT_HELP.length; i += 1) {
+      const { key, label, text } = SPEAKER_HIGHLIGHT_HELP[i];
+      const partner = SPEAKER_HIGHLIGHT_HELP[(i + 1) % SPEAKER_HIGHLIGHT_HELP.length];
+      const trigger = helpTrigger(page, key);
+      const tip = helpTip(page, key);
+      const slider = highlightSlider(page, key);
+
+      await expect(trigger, label).toBeVisible({ timeout: 5_000 });
+      await expect(trigger, label).toHaveAttribute("role", "button");
+      await expect(trigger, label).toHaveAttribute("tabindex", "0");
+      await expect(trigger, label).toHaveAttribute("aria-label", `About the ${label} setting`);
+      await expect(trigger, label).toHaveAttribute(
+        "aria-describedby",
+        `speaker-highlight-${key}-tip`,
+      );
+      // The trigger's OWN text nodes: `toHaveText` here would fold in the
+      // tooltip child's whole sentence.
+      const glyph = await trigger.evaluate((el) =>
+        Array.from(el.childNodes)
+          .filter((node) => node.nodeType === Node.TEXT_NODE)
+          .map((node) => (node.textContent || "").trim())
+          .join(""),
+      );
+      expect(glyph, label).toBe("(?)");
+
+      await expect(tip, label).toHaveCount(1);
+      await expect(tip, label).toHaveText(text);
+      await expect(tip, label).toBeHidden();
+
+      // The description association RESOLVES — the attribute assertion above
+      // still passes on a dangling id.
+      const describedText = await trigger.evaluate((el) => {
+        const id = el.getAttribute("aria-describedby");
+        if (!id) return null;
+        return document.getElementById(id)?.textContent ?? null;
+      });
+      expect(describedText, label).toBe(text);
+
+      // Keyboard-reachable from its OWN slider: a duplicated id lands elsewhere.
+      await slider.focus();
+      await page.keyboard.press("Shift+Tab");
+      await expect(trigger, label).toBeFocused();
+      await expect(tip, label).toBeVisible();
+
+      await page.keyboard.press("Escape");
+      await expect(trigger, label).toHaveClass(/speaker-highlight-help-icon--suppressed/);
+      await expect(tip, label).toBeHidden();
+      await expect(dialog, label).toBeVisible();
+
+      await slider.focus();
+      await expect(trigger, label).not.toHaveClass(/speaker-highlight-help-icon--suppressed/);
+
+      await trigger.click();
+      await expect(trigger, label).toHaveClass(/speaker-highlight-help-icon--open/);
+      await expect(tip, label).toBeVisible();
+      await expect(openTriggers, label).toHaveCount(1);
+
+      const partnerTrigger = helpTrigger(page, partner.key);
+      await partnerTrigger.click();
+      await expect(partnerTrigger, partner.label).toHaveClass(/speaker-highlight-help-icon--open/);
+      await expect(trigger, label).not.toHaveClass(/speaker-highlight-help-icon--open/);
+      await expect(openTriggers, label).toHaveCount(1);
+
+      await partnerTrigger.click();
+      await expect(openTriggers, label).toHaveCount(0);
+    }
+  });
+
+  test("help trigger keeps every slider label on one line and inside the panel", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    const meetingId = `e2e_settings_help_layout_${Date.now()}`;
+
+    await openAppearanceTab(page, meetingId, "help-layout-user");
+
+    const settingsPanel = page.locator("#device-settings-dialog .settings-panel");
+
+    const assertRowsFit = async (viewport: string) => {
+      for (const { key, label } of SPEAKER_HIGHLIGHT_HELP) {
+        const trigger = helpTrigger(page, key);
+        const tip = helpTip(page, key);
+        const slider = highlightSlider(page, key);
+        const labelEl = speakerHighlightRow(page, label).locator("label.appearance-slider-label");
+
+        await trigger.scrollIntoViewIfNeeded({ timeout: 5_000 });
+
+        const triggerBox = await trigger.boundingBox();
+        const sliderBox = await slider.boundingBox();
+        expect(triggerBox, `${viewport} ${label}: trigger box`).not.toBeNull();
+        expect(sliderBox, `${viewport} ${label}: slider box`).not.toBeNull();
+
+        // A label column too narrow for "Brightness (?)" shrinks the 28px target.
+        expect(triggerBox!.width, `${viewport} ${label}: trigger width`).toBeGreaterThanOrEqual(27);
+
+        const labelMetrics = await labelEl.evaluate((el) => {
+          const style = getComputedStyle(el);
+          const lineHeight = parseFloat(style.lineHeight);
+          const fontSize = parseFloat(style.fontSize);
+          return {
+            height: el.getBoundingClientRect().height,
+            lineHeight: Number.isFinite(lineHeight) ? lineHeight : fontSize * 1.2,
+          };
+        });
+        expect(labelMetrics.height, `${viewport} ${label}: label height`).toBeLessThanOrEqual(
+          labelMetrics.lineHeight * 1.6,
+        );
+
+        expect(
+          triggerBox!.x + triggerBox!.width,
+          `${viewport} ${label}: trigger overlaps slider`,
+        ).toBeLessThanOrEqual(sliderBox!.x + 1);
+
+        // `.settings-panel` is `overflow-x: hidden`: `z-index` cannot escape it.
+        await trigger.click({ timeout: 5_000 });
+        await expect(tip, `${viewport} ${label}`).toBeVisible();
+        const tipBox = await tip.boundingBox();
+        const panelBox = await settingsPanel.boundingBox();
+        expect(tipBox, `${viewport} ${label}: tip box`).not.toBeNull();
+        expect(panelBox, `${viewport} ${label}: panel box`).not.toBeNull();
+        expect(tipBox!.x, `${viewport} ${label}: tip left edge`).toBeGreaterThanOrEqual(
+          panelBox!.x - 1,
+        );
+        expect(
+          tipBox!.x + tipBox!.width,
+          `${viewport} ${label}: tip right edge`,
+        ).toBeLessThanOrEqual(panelBox!.x + panelBox!.width + 1);
+
+        await trigger.click({ timeout: 5_000 });
+      }
+    };
+
+    await assertRowsFit("default viewport");
+
+    await page.setViewportSize({ width: 320, height: 720 });
+    await page.waitForTimeout(300);
+    await assertRowsFit("320px viewport");
+  });
+
+  test("help trigger on the top row opens downward only in the stacked layout", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    const meetingId = `e2e_settings_help_below_${Date.now()}`;
+
+    await openAppearanceTab(page, meetingId, "help-below-user");
+
+    const trigger = helpTrigger(page, "brightness");
+    const tip = helpTip(page, "brightness");
+    const panel = page.locator("#device-settings-dialog .settings-panel");
+    const brightnessRow = speakerHighlightRow(page, "Brightness");
+
+    const openTip = async (label: string) => {
+      await trigger.click({ timeout: 10_000 });
+      await expect(trigger, `${label}: open latch`).toHaveClass(/--open/);
+      await expect(tip, `${label}: tip visible`).toBeVisible({ timeout: 5_000 });
+      await expect
+        .poll(async () => tip.evaluate((el) => getComputedStyle(el).opacity), {
+          timeout: 5_000,
+          intervals: [200],
+          message: `${label}: tip opacity`,
+        })
+        .toBe("1");
+    };
+
+    const closeTip = async (label: string) => {
+      await trigger.click({ timeout: 10_000 });
+      await expect(tip, `${label}: tip hidden after second click`).toBeHidden({ timeout: 5_000 });
+    };
+
+    // Above the trigger on desktop; red if `--below` stops being media-scoped.
+    await trigger.scrollIntoViewIfNeeded({ timeout: 10_000 });
+    await openTip("1280px viewport");
+
+    const wideTrigger = await trigger.boundingBox();
+    const wideTip = await tip.boundingBox();
+    expect(wideTrigger, "1280px viewport: trigger box").not.toBeNull();
+    expect(wideTip, "1280px viewport: tip box").not.toBeNull();
+    expect(
+      wideTip!.y + wideTip!.height,
+      "1280px viewport: bubble should sit above the trigger",
+    ).toBeLessThanOrEqual(wideTrigger!.y + 1);
+
+    await closeTip("1280px viewport");
+
+    // 481-600px: preview stacks, sidebar folds, so the row reaches the scroll top.
+    await page.setViewportSize({ width: 560, height: 420 });
+    await page.waitForTimeout(300);
+
+    await brightnessRow.evaluate((el) => el.scrollIntoView({ block: "start" }));
+    await page.waitForTimeout(300);
+
+    const rowBox = await brightnessRow.boundingBox();
+    const panelBefore = await panel.boundingBox();
+    expect(rowBox, "560px viewport: Brightness row box").not.toBeNull();
+    expect(panelBefore, "560px viewport: panel box").not.toBeNull();
+    expect(
+      rowBox!.y - panelBefore!.y,
+      "560x420 no longer scrolls the Brightness row to the top of the settings panel, so this test would pass vacuously — re-pick the viewport",
+    ).toBeLessThanOrEqual(40);
+
+    await openTip("560px viewport");
+
+    const narrowTrigger = await trigger.boundingBox();
+    const narrowTip = await tip.boundingBox();
+    const panelBox = await panel.boundingBox();
+    expect(narrowTrigger, "560px viewport: trigger box").not.toBeNull();
+    expect(narrowTip, "560px viewport: tip box").not.toBeNull();
+    expect(panelBox, "560px viewport: panel box").not.toBeNull();
+
+    expect(
+      narrowTip!.y,
+      "560px viewport: bubble should sit below the trigger",
+    ).toBeGreaterThanOrEqual(narrowTrigger!.y + narrowTrigger!.height - 1);
+    expect(
+      narrowTip!.y,
+      "560px viewport: bubble top clipped by the scroll box",
+    ).toBeGreaterThanOrEqual(panelBox!.y - 1);
+    expect(
+      narrowTip!.x + narrowTip!.width,
+      "560px viewport: bubble right edge outside the panel",
+    ).toBeLessThanOrEqual(panelBox!.x + panelBox!.width + 1);
+
+    await closeTip("560px viewport");
+  });
+
   test("Reset restores the speaker highlight defaults", async ({ page }) => {
     const meetingId = `e2e_settings_reset_${Date.now()}`;
 
@@ -860,6 +1243,8 @@ test.describe("Device settings modal", () => {
     const decaySlider = page.locator('[data-testid="speaker-highlight-decay-slider"]');
     const brightnessSlider = page.locator('[data-testid="speaker-highlight-brightness-slider"]');
     const glowSlider = page.locator('[data-testid="speaker-highlight-glow-slider"]');
+    const velocitySlider = highlightSlider(page, "velocity");
+    const velocityValue = highlightSliderValue(page, "velocity");
     const resetButton = page.locator('[data-testid="speaker-highlight-reset-btn"]');
 
     const brightnessValue = brightnessRow.locator(".appearance-slider-value");
@@ -872,12 +1257,14 @@ test.describe("Device settings modal", () => {
     await glowSwitch.click();
     await brightnessSlider.fill("70");
     await glowSlider.fill("30");
+    await velocitySlider.fill("80");
     await decaySlider.fill("10");
 
     await expect(cyanSwatch).toHaveAttribute("aria-pressed", "true");
     await expect(glowToggle).not.toBeChecked();
     await expect(brightnessValue).toHaveText("70%");
     await expect(glowValue).toHaveText("30%");
+    await expect(velocityValue).toHaveText("80%");
     await expect(decayValue).toHaveText("10%");
     await expect(resetButton).toHaveText("Reset highlight");
 
@@ -888,9 +1275,11 @@ test.describe("Device settings modal", () => {
     await expect(cyanSwatch).toHaveAttribute("aria-pressed", "false");
     await expect(brightnessValue).toHaveText("50%");
     await expect(glowValue).toHaveText("50%");
+    await expect(velocityValue).toHaveText("50%");
     await expect(decayValue).toHaveText("50%");
     await expect(brightnessSlider).toHaveValue("50");
     await expect(glowSlider).toHaveValue("50");
+    await expect(velocitySlider).toHaveValue("50");
     await expect(decaySlider).toHaveValue("50");
 
     await page.waitForTimeout(500);
@@ -898,6 +1287,13 @@ test.describe("Device settings modal", () => {
     await expect
       .poll(async () => page.evaluate(() => localStorage.getItem("vc_appearance_glow_decay")), {
         timeout: 5_000,
+      })
+      .toBe("0.5");
+
+    await expect
+      .poll(async () => page.evaluate(() => localStorage.getItem("vc_appearance_glow_velocity")), {
+        timeout: 5_000,
+        intervals: [200],
       })
       .toBe("0.5");
   });

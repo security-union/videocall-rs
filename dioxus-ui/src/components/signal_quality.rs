@@ -3,7 +3,7 @@
 //! Per-peer signal quality tracking and popup chart.
 //!
 //! [`PeerSignalHistory`] collects periodic quality samples and derives a
-//! [`SignalLevel`] that drives the [`SignalBarsIcon`] overlay on each tile.
+//! [`SignalLevel`], which colours the disc on each tile.
 //! [`SignalQualityPopup`] renders a scrollable SVG line chart of the history
 //! with separate lines for audio, video, screen share, and latency.
 
@@ -23,7 +23,7 @@ use wasm_bindgen::JsCast;
 // surfaces render identical quality dots / metric text / reason chips for the
 // same peer snapshot.
 use crate::components::performance_settings::{
-    format_peer_device_compact, peer_row_aria_label, peer_row_metric, peer_row_res_or_bitrate,
+    format_peer_device_compact, layer_row_aria_label, peer_row_metric, peer_row_title,
     quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
     reason_chip_title,
 };
@@ -145,29 +145,22 @@ impl SignalPopupPosition {
     }
 }
 
-/// Discrete signal quality level shown as 0-5 filled bars.
+/// Discrete quality level. Sets the trend colour on the disc.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SignalLevel {
-    /// 5 bars -- excellent quality
     #[default]
     Excellent,
-    /// 4 bars -- good quality
     Good,
-    /// 3 bars -- fair quality
     Fair,
-    /// 2 bars -- poor quality
     Poor,
-    /// 1 bar -- bad quality
     Bad,
-    /// Neutral empty bars -- this client paused local video decode, so video
-    /// quality is not measured.
+    /// This client paused local video decode, so quality is not measured.
     Unmeasured,
-    /// 0 bars with red slash -- connection lost
     Lost,
 }
 
 impl SignalLevel {
-    /// Number of filled bars for this level (0..=5).
+    /// The level as a 0..=5 rank; feeds `data-signal-level`.
     pub fn bars(self) -> u8 {
         match self {
             Self::Excellent => 5,
@@ -182,6 +175,31 @@ impl SignalLevel {
     /// Whether the signal is completely lost.
     pub fn is_lost(self) -> bool {
         self == Self::Lost
+    }
+
+    /// Fixed hex, not a theme token: the disc stays dark in both themes.
+    // @token-exempt: fixed hex on a fixed-dark disc
+    pub fn level_color(self) -> &'static str {
+        match self {
+            Self::Excellent => "#5bcf9f",
+            Self::Good => "#4CAF50",
+            Self::Fair => "#FFC107",
+            Self::Poor => "#FF8C00",
+            Self::Bad => "#FF4444",
+            Self::Unmeasured | Self::Lost => "#8a8f98",
+        }
+    }
+
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Excellent => "excellent",
+            Self::Good => "good",
+            Self::Fair => "fair",
+            Self::Poor => "poor",
+            Self::Bad => "bad",
+            Self::Unmeasured => "not measured",
+            Self::Lost => "lost",
+        }
     }
 
     /// Whether local decode is paused, so no video signal claim can be made.
@@ -467,12 +485,6 @@ impl PeerSignalHistory {
         }
     }
 
-    /// Append a new sample, computing quality scores internally from raw
-    /// metrics. Evicts the oldest sample when at capacity.
-    pub fn push_sample(&mut self, data: &SampleData) {
-        self.push_sample_at(data, js_sys::Date::now());
-    }
-
     /// Append a sample with an explicit timestamp. Lets host unit tests
     /// exercise the quality-derivation logic without depending on `js_sys`.
     pub fn push_sample_at(&mut self, data: &SampleData, timestamp_ms: f64) {
@@ -504,10 +516,9 @@ impl PeerSignalHistory {
         // #2190 CHANGED WHAT THIS READS (behavior note, not observability-only). `video_fps`
         // is `fps_received`, which until #2190 counted every arriving simulcast rung — so a
         // 3-rung publisher fed the LADDER SUM (~52 for an 8fps sender), `52/30` clamped to
-        // 1.0, and the bar sat PERMANENTLY FULL no matter the peer's real cadence. Every
-        // multi-rung peer therefore showed full strength, and the indicator could not fall.
-        // It now reads the DECODED rung, so a truthful 8fps peer reads ~0.27 and the bar
-        // moves again. Peers that previously pinned full will now show partial bars.
+        // 1.0, and the score sat PERMANENTLY AT FULL no matter the peer's real cadence,
+        // so the indicator could not fall. It now reads the DECODED rung, so a truthful
+        // 8fps peer reads ~0.27 and the indicator moves again.
         //
         // KNOWN LIMITATION (pre-existing, deliberately NOT changed here): the `30.0`
         // denominator is the CAMERA ladder's TOP rung (`target_fps` 7/15/30). A receiver
@@ -631,6 +642,73 @@ impl PeerSignalHistory {
             None => SignalLevel::Excellent, // no data yet -- assume good
         }
     }
+
+    /// Everything the disc paints. `level` is passed in, not recomputed.
+    pub fn spark_paint(
+        &self,
+        level: SignalLevel,
+        audio_enabled: bool,
+        video_enabled: bool,
+        screen_enabled: bool,
+        is_decoding: bool,
+        reduced_motion: bool,
+    ) -> SparkPaint {
+        // Reduced motion drops the trend rather than slowing it: it is the only
+        // moving part, and 20 tiles redrawing for a whole call with no way to
+        // stop it is WCAG 2.2.2. Both states keep a static level readout.
+        let suppressed = level.is_unmeasured() || reduced_motion;
+        let series = if suppressed {
+            Vec::new()
+        } else {
+            let (a, v, s) =
+                signal_enabled_flags(audio_enabled, video_enabled, screen_enabled, is_decoding);
+            self.recent_quality_series(a, v, s)
+        };
+        SparkPaint {
+            segments: if suppressed {
+                vec![flat_spark_segment(level)]
+            } else {
+                build_spark_points(&series)
+            },
+            level,
+            // Reduce drops the TREND, not the reading. Unmeasured has neither.
+            sample_count: if reduced_motion && !level.is_unmeasured() {
+                self.samples.len().min(SPARK_POINTS)
+            } else {
+                series.len()
+            },
+            // Truncated, not rounded: the only consumer renders `as u32`.
+            latency_ms: self.samples.back().map_or(0.0, |s| s.latency_ms).trunc(),
+        }
+    }
+
+    /// The newest `SPARK_POINTS` samples as `(timestamp_ms, combined quality)`,
+    /// sharing `combined_quality` and the flags with [`Self::current_level`].
+    pub fn recent_quality_series(
+        &self,
+        audio_enabled: bool,
+        video_enabled: bool,
+        screen_enabled: bool,
+    ) -> Vec<(f64, f64)> {
+        let skip = self.samples.len().saturating_sub(SPARK_POINTS);
+        self.samples
+            .iter()
+            .skip(skip)
+            .map(|s| {
+                (
+                    s.timestamp_ms,
+                    combined_quality(
+                        s.audio_quality,
+                        s.video_quality,
+                        s.screen_quality,
+                        audio_enabled,
+                        video_enabled,
+                        screen_enabled,
+                    ),
+                )
+            })
+            .collect()
+    }
 }
 
 /// Issue #906: walk the recorded samples backwards looking for the most // @token-exempt: issue ref, not a color
@@ -692,7 +770,7 @@ fn find_recent_non_zero_screen_metrics(
 /// When multiple streams are enabled the score is the mean of the active ones.
 /// When none are active we return 1.0 (peer has everything intentionally off --
 /// not a quality problem).
-fn combined_quality(
+pub(crate) fn combined_quality(
     audio: f64,
     video: f64,
     screen: f64,
@@ -724,7 +802,9 @@ fn combined_quality(
 /// Convenience bundle passed through the rendering pipeline so we don't keep
 /// adding individual arguments.
 pub struct SignalInfo {
+    pub show_signal_meter: bool,
     pub level: SignalLevel,
+    pub spark: SparkPaint,
     /// True when this client paused video/screen decode for the peer.
     pub decode_paused_locally: bool,
     pub history: Vec<SignalSample>,
@@ -758,9 +838,9 @@ pub struct SignalInfo {
     /// otherwise. Drives the popup's compact "Device" line.
     pub device_info: Option<PeerDeviceInfo>,
     /// Issue #1483: the per-tile "WT"/"WS" transport badge to render next to
-    /// the signal meter. Already gated UPSTREAM in `peer_tile` by BOTH the
-    /// server-side `transportBadgeEnabled` flag AND the transport being known:
-    /// it is `Some(Wt | Ws)` only when both hold, and `None` otherwise (flag
+    /// the signal meter. Already gated UPSTREAM in `peer_tile` by the diagnostics
+    /// checkbox, the `transportBadgeEnabled` flag AND the transport being known:
+    /// it is `Some(Wt | Ws)` only when all hold, and `None` otherwise (gated
     /// off, or transport unknown / not yet observed). Unlike the popup's
     /// `transport: Option<String>` field — which is populated only while the
     /// popup is open — this is computed on EVERY tile render so the badge can
@@ -769,7 +849,7 @@ pub struct SignalInfo {
     /// contract lives in one place.
     pub badge_transport: Option<crate::components::canvas_generator::TransportBadge>,
     /// Issue 1768: pre-resolved per-tile media-metrics overlay payload, or
-    /// `None` when the "Show media metrics on tiles" checkbox is off (the common
+    /// `None` when the "Show diagnostics on tiles" checkbox is off (the common
     /// default) so the render path adds nothing to the DOM. Built once per
     /// diagnostics tick in `peer_tile`; rendered by
     /// [`crate::components::media_metrics_overlay::media_metrics_overlay`] inside
@@ -781,7 +861,7 @@ pub struct SignalInfo {
     /// presenter's resolution changes. `None` for non-screen tiles / pre-decode.
     pub screen_resolution: Option<(u32, u32)>,
     /// Issue 1821: pre-resolved shared-content stats overlay payload, or `None`
-    /// when the "Show media metrics on tiles" checkbox is off or this is not the
+    /// when the "Show diagnostics on tiles" checkbox is off or this is not the
     /// ScreenOnly sharer tile. Rendered by
     /// [`crate::components::media_metrics_overlay::screen_metrics_overlay`] inside
     /// the shared-content tile's `.canvas-container`.
@@ -1628,36 +1708,7 @@ fn show_body_tooltip(
     style.set_property("top", &format!("{y:.0}px")).unwrap();
     style.set_property("display", "block").unwrap();
 
-    let video_tier = infer_video_tier(&sample.video_resolution);
-    let video_line = if show_video {
-        if sample.video_resolution.is_empty() {
-            format!(
-                "<span style='color:{}'>Video: {:.1} fps decoded | {:.0} kbps</span>",
-                theme_color::SIGNAL_VIDEO,
-                sample.video_fps,
-                sample.video_bitrate_kbps
-            )
-        } else if video_tier.is_empty() {
-            format!(
-                "<span style='color:{}'>Video: {} | {:.1} fps decoded | {:.0} kbps</span>",
-                theme_color::SIGNAL_VIDEO,
-                sample.video_resolution,
-                sample.video_fps,
-                sample.video_bitrate_kbps
-            )
-        } else {
-            format!(
-                "<span style='color:{}'>Video: {} ({}) | {:.1} fps decoded | {:.0} kbps</span>",
-                theme_color::SIGNAL_VIDEO,
-                sample.video_resolution,
-                video_tier,
-                sample.video_fps,
-                sample.video_bitrate_kbps
-            )
-        }
-    } else {
-        String::new()
-    };
+    let video_line = build_video_tooltip_line(sample, show_video);
     let audio_line = if show_audio {
         format!(
             "<span style='color:{}'>Audio: buf {:.0}ms | expand {:.0}\u{2030}</span>",
@@ -1711,6 +1762,27 @@ fn show_body_tooltip(
     el.set_inner_html(&lines.join(""));
 }
 
+/// The camera-video tooltip line — `"Video: {res} | {fps} fps decoded | {kbps}
+/// kbps"`, dropping `{res} | ` when unknown, empty when the mode hides video.
+fn build_video_tooltip_line(sample: &SignalSample, show_video: bool) -> String {
+    if !show_video {
+        return String::new();
+    }
+    let res = if sample.video_resolution.is_empty() {
+        String::new()
+    } else {
+        format!("{} | ", sample.video_resolution)
+    };
+    format!(
+        "<span style='color:{}'>Video: {res}{:.1} fps decoded | {:.0} kbps</span>",
+        theme_color::SIGNAL_VIDEO,
+        sample.video_fps,
+        sample.video_bitrate_kbps
+    )
+}
+
+/// A pixel-DENSITY bucket for a `"{w}x{h}"` string, keyed on height alone. It is
+/// not a simulcast layer identifier — see [`build_video_tooltip_line`].
 fn infer_video_tier(resolution: &str) -> &'static str {
     let mut parts = resolution.split('x');
     let _width = parts.next().and_then(|w| w.parse::<u32>().ok());
@@ -1737,9 +1809,8 @@ fn infer_video_tier(resolution: &str) -> &'static str {
 /// stay as-is because they're already short or have no widely-understood
 /// abbreviation.
 ///
-/// The camera-video tooltip line continues to use [`infer_video_tier`]
-/// because that row has more horizontal real estate and the full label is
-/// easier to scan when only a single value is shown.
+/// The only caller of [`infer_video_tier`] left on a rendered line: the screen
+/// ladder has one rung, so a density word cannot be read as a ladder position here.
 fn infer_video_tier_short(resolution: &str) -> &'static str {
     match infer_video_tier(resolution) {
         "Full HD" => "FHD",
@@ -2059,13 +2130,12 @@ fn SignalLayerRow(
     );
     let metric = peer_row_metric(&snap, audio_label);
     let kind_noun = layer_kind_noun(snap.kind);
-    let res_or_bitrate = peer_row_res_or_bitrate(&snap);
     // The popup row's aria-label uses the peer's display name when known; the
     // perf dialog passes the peer label here. The popup doesn't thread the
     // display name into this child, so we lead with the spoken kind — the
     // sentence still carries kind, quality, res/bitrate and (when present) the
     // reason clause, so color is never the sole signal.
-    let aria = peer_row_aria_label(
+    let aria = layer_row_aria_label(
         // Capitalized kind noun as the row subject (no peer-name available here).
         match snap.kind {
             PrefMediaKind::Video => "Video",
@@ -2073,17 +2143,14 @@ fn SignalLayerRow(
             PrefMediaKind::Screen => "Shared content",
         },
         kind_noun,
-        q,
-        &res_or_bitrate,
-        snap.layer_index + 1,
-        snap.layer_count,
-        snap.reason,
+        &snap,
     );
     let kind_id = match snap.kind {
         PrefMediaKind::Video => "video",
         PrefMediaKind::Audio => "audio",
         PrefMediaKind::Screen => "screen",
     };
+    let row_title = peer_row_title(&snap).unwrap_or_default();
 
     rsx! {
         li {
@@ -2103,6 +2170,7 @@ fn SignalLayerRow(
             span {
                 class: "perf-peer-row__metric",
                 "data-testid": "{id_prefix}-layer-{kind_id}-metric",
+                title: "{row_title}",
                 "{metric}"
             }
             if let Some(r) = snap.reason {
@@ -2988,6 +3056,201 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     }
 }
 
+// Badge sparkline geometry (issue 2661). NOT `build_quality_polyline`.
+
+/// Samples plotted: the last 10 seconds at 1 Hz.
+pub(crate) const SPARK_POINTS: usize = 10;
+
+/// Samples before a trend is drawn; below it the disc plots nothing.
+pub(crate) const SPARK_MIN_POINTS: usize = 4;
+
+/// What one disc paints, for both the initial render and the 1 Hz refresh.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SparkPaint {
+    /// One `points` string per contiguous run.
+    pub segments: Vec<String>,
+    pub level: SignalLevel,
+    pub sample_count: usize,
+    pub latency_ms: f64,
+}
+
+pub const SIGNAL_UNMEASURED_TEXT: &str =
+    "Video paused to save CPU. Signal is not measured for this peer.";
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+pub fn peer_signal_aria(
+    name: &str,
+    level: SignalLevel,
+    sample_count: usize,
+    screen_scope: bool,
+) -> String {
+    if level.is_unmeasured() {
+        return SIGNAL_UNMEASURED_TEXT.to_string();
+    }
+    // The two discs sit side by side and open DIFFERENT popups, so an identical
+    // name is the repeated-icon-button failure of issue 1653.
+    let (subject, action) = if screen_scope {
+        (
+            format!("{name} screen share"),
+            "Show screen-share signal quality details.",
+        )
+    } else {
+        (name.to_string(), "Show signal quality details.")
+    };
+    if level.is_lost() {
+        return format!("{subject} connection: lost. {action}");
+    }
+    if sample_count == 0 {
+        return format!("{subject} connection: measuring. {action}");
+    }
+    // No reading here: a 1 Hz name re-announces on every tick while focused.
+    // `title` carries it, as the accessible description.
+    format!("{subject} connection: {}. {action}", level.word())
+}
+
+pub fn peer_signal_title(
+    level: SignalLevel,
+    sample_count: usize,
+    latency_ms: f64,
+    screen_scope: bool,
+) -> String {
+    if level.is_unmeasured() {
+        return SIGNAL_UNMEASURED_TEXT.to_string();
+    }
+    let action = if screen_scope {
+        "Click for screen-share details."
+    } else {
+        "Click for details."
+    };
+    if level.is_lost() {
+        return format!("Connection lost. {action}");
+    }
+    if sample_count == 0 {
+        return "Measuring…".to_string();
+    }
+    let word = capitalized(level.word());
+    let rtt = latency_ms as u32;
+    format!("{word} — {rtt} ms round trip. {action}")
+}
+
+/// Samples further apart than this start a new polyline — just under two sample
+/// intervals, so a dropped 1 Hz sample splits the line but jitter does not.
+pub(crate) const SPARK_GAP_MS: f64 = 1900.0;
+
+/// Every margin here is the halo cap rounded up: nothing clips, and the ink
+/// runs the full width. Both `spark_cap_*`/`the_plot_is_flush_*` pin it.
+pub(crate) const SPARK_X_FIRST: f64 = 2.9;
+pub(crate) const SPARK_X_LAST: f64 = 22.6;
+pub(crate) const SPARK_Y_TOP: f64 = 3.0;
+pub(crate) const SPARK_Y_BOTTOM: f64 = 13.0;
+
+/// Floor, keeping a bad-but-connected sample distinct from "lost".
+const SPARK_Q_FLOOR: f64 = 0.02;
+
+const SPARK_X_STEP: f64 = (SPARK_X_LAST - SPARK_X_FIRST) / (SPARK_POINTS as f64 - 1.0);
+
+/// One viewBox unit of plot height, and coarse enough that a +-1 fps wobble
+/// (0.033 of quality) does not move the plot — which is what lets the repaint
+/// guard bite. Measured, not tuned.
+const SPARK_Q_STEP: f64 = 0.10;
+
+/// Quality to y; inverted, so up is good. Quantised before the floor applies, so
+/// a bad-but-connected sample does not round down onto it.
+pub(crate) fn spark_y(q: f64) -> f64 {
+    let q = ((q / SPARK_Q_STEP).round() * SPARK_Q_STEP).clamp(SPARK_Q_FLOOR, 1.0);
+    SPARK_Y_BOTTOM - (SPARK_Y_BOTTOM - SPARK_Y_TOP) * q
+}
+
+/// A full-width flat run at the level's height, for the states with no trend:
+/// an empty plot reads as a chart that failed to load. Pure in `level`, so the
+/// repaint guard is unaffected.
+pub(crate) fn flat_spark_segment(level: SignalLevel) -> String {
+    let y = level_flat_y(level);
+    format!("{SPARK_X_FIRST:.2},{y:.2} {SPARK_X_LAST:.2},{y:.2}")
+}
+
+/// Band midpoint, NOT via `spark_y`: quantising drops Excellent onto the top
+/// rail.
+fn level_flat_y(level: SignalLevel) -> f64 {
+    let q = match level {
+        SignalLevel::Excellent => 0.95,
+        SignalLevel::Good => 0.825,
+        SignalLevel::Fair => 0.625,
+        SignalLevel::Poor => 0.375,
+        SignalLevel::Bad => 0.125,
+        SignalLevel::Unmeasured | SignalLevel::Lost => 0.25,
+    };
+    SPARK_Y_BOTTOM - (SPARK_Y_BOTTOM - SPARK_Y_TOP) * q
+}
+
+/// Live `prefers-reduced-motion: reduce`, read rather than cached so a mid-call
+/// change takes effect. A property read, reached once per disc per second.
+pub fn prefers_reduced_motion() -> bool {
+    web_sys::window()
+        .and_then(|w| {
+            w.match_media("(prefers-reduced-motion: reduce)")
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|m| m.matches())
+}
+
+/// The `data-signal-spark` handle. A screen-sharing peer has TWO discs with one
+/// `peer_id`; scoping the handle gives each exactly one writer.
+pub fn spark_node_id(peer_id: &str, screen_scope: bool) -> String {
+    if screen_scope {
+        format!("{peer_id}:screen")
+    } else {
+        peer_id.to_string()
+    }
+}
+
+/// x for a slot back from the newest, so a partial history grows leftward.
+fn spark_x(slots_from_newest: usize) -> f64 {
+    SPARK_X_LAST - slots_from_newest as f64 * SPARK_X_STEP
+}
+
+/// One `points` string per contiguous run, oldest first; only the newest
+/// [`SPARK_POINTS`] are plotted. Single-point runs are dropped.
+pub(crate) fn build_spark_points(samples: &[(f64, f64)]) -> Vec<String> {
+    let plotted = &samples[samples.len().saturating_sub(SPARK_POINTS)..];
+    if plotted.len() < SPARK_MIN_POINTS {
+        return Vec::new();
+    }
+
+    let newest = plotted.len() - 1;
+    let mut segments: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut prev_ts: Option<f64> = None;
+
+    for (i, (ts, q)) in plotted.iter().enumerate() {
+        if prev_ts.is_some_and(|p| ts - p > SPARK_GAP_MS) {
+            if current.len() >= 2 {
+                segments.push(current.join(" "));
+            }
+            current.clear();
+        }
+        prev_ts = Some(*ts);
+        current.push(format!("{:.2},{:.2}", spark_x(newest - i), spark_y(*q)));
+    }
+    // A lone point in the TRAILING run is the live reading, orphaned by a
+    // dropped sample. Doubled so the round cap paints it. Interior ones drop.
+    match current.len() {
+        0 => {}
+        1 => segments.push(format!("{0} {0}", current[0])),
+        _ => segments.push(current.join(" ")),
+    }
+
+    segments
+}
+
 /// Build a polyline `points` string from history, mapping a quality accessor
 /// to y-coordinates on the chart (0.0 at top = 100%, 1.0 at bottom = 0%).
 fn build_quality_polyline(
@@ -3188,18 +3451,18 @@ mod tests {
         assert!((s.screen_quality - 0.5).abs() < 1e-9);
     }
 
-    /// Issue #2190: the VIDEO signal bar must track the DECODED rung, not the simulcast
+    /// Issue #2190: the VIDEO quality score must track the DECODED rung, not the simulcast
     /// ladder sum — and must therefore be able to read below full strength.
     ///
     /// `video_quality` is `(video_fps / 30.0).clamp(0.0, 1.0)`, and it drives the rendered
-    /// per-tile signal bars — a trust indicator a viewer reads to judge a peer's health.
+    /// the per-tile signal disc — a trust indicator a viewer reads to judge peer health.
     /// Before #2190 the receive-side fps counted every arriving simulcast rung, so a 3-rung
     /// publisher reported the LADDER SUM (~52 for an 8fps sender). 52/30 clamps to 1.0, so
-    /// the bar sat PERMANENTLY FULL regardless of the peer's real cadence — the indicator
-    /// could not fall, which is the worst failure mode for a health display. With the
-    /// counter fixed, the same publisher reports its true 8fps and the bar reads ~0.27.
+    /// the score sat PERMANENTLY AT FULL regardless of the peer's real cadence — the
+    /// indicator could not fall, the worst failure mode for a health display. With the
+    /// counter fixed, the same publisher reports its true 8fps and the score reads ~0.27.
     ///
-    /// This pins both ends: the honest rung reads a partial bar, and the pre-fix ladder-sum
+    /// This pins both ends: the honest rung scores partial, and the pre-fix ladder-sum
     /// value is what saturation looks like. It is a host test because the arithmetic and
     /// the clamp are pure; `push_sample_at` is the production entry point the live tile
     /// calls (via `push_sample`), so this is not a re-implementation.
@@ -3449,6 +3712,36 @@ mod tests {
     // formatter, so we can drive them through host `cargo test` without
     // any browser / DOM dependency.
     // -----------------------------------------------------------------
+
+    /// MUTATION: restore the `(tier)` arm — it rendered `"640x480 (Medium)"`.
+    #[test]
+    fn video_tooltip_line_carries_no_density_word() {
+        let s = SignalSample {
+            video_fps: 20.0,
+            video_bitrate_kbps: 300.0,
+            video_resolution: "640x480".to_string(),
+            ..screen_sample("", "")
+        };
+        assert_eq!(infer_video_tier("640x480"), "Medium");
+
+        let line = build_video_tooltip_line(&s, true);
+        assert!(line.contains("640x480"), "line was: {line}");
+        assert!(line.contains("20.0 fps decoded"), "line was: {line}");
+        assert!(line.contains("300 kbps"), "line was: {line}");
+        assert!(
+            !line.contains('('),
+            "no parenthetical label may sit beside the resolution: {line}"
+        );
+
+        let unknown = SignalSample {
+            video_resolution: String::new(),
+            ..s.clone()
+        };
+        let line = build_video_tooltip_line(&unknown, true);
+        assert!(line.contains("Video: 20.0 fps decoded"), "line was: {line}");
+
+        assert_eq!(build_video_tooltip_line(&s, false), "");
+    }
 
     fn screen_sample(received: &str, source: &str) -> SignalSample {
         SignalSample {
@@ -4505,6 +4798,534 @@ mod tests {
         let q_top = quality_state(s.layer_count - 1, s.layer_count);
         assert_ne!(q_base, q_top);
         let metric = peer_row_metric(&s, "");
-        assert!(metric.contains("M · 2/3"), "metric was: {metric}");
+        assert!(metric.contains("Medium · 2/3"), "metric was: {metric}");
+    }
+
+    fn steady_series(k: usize, q: f64) -> Vec<(f64, f64)> {
+        (0..k).map(|i| (1_000.0 + i as f64 * 1_000.0, q)).collect()
+    }
+
+    fn parse_xs(points: &str) -> Vec<f64> {
+        points
+            .split(' ')
+            .map(|p| p.split(',').next().unwrap().parse::<f64>().unwrap())
+            .collect()
+    }
+
+    fn parse_ys(points: &str) -> Vec<f64> {
+        points
+            .split(' ')
+            .map(|p| p.split(',').nth(1).unwrap().parse::<f64>().unwrap())
+            .collect()
+    }
+
+    /// `spark_y` at the 2dp the polyline writes, so a round-trip compares exactly.
+    fn plotted_y(q: f64) -> f64 {
+        format!("{:.2}", spark_y(q)).parse().unwrap()
+    }
+
+    #[test]
+    fn spark_y_inverts_and_clamps_at_both_ends() {
+        assert_eq!(spark_y(1.0), SPARK_Y_TOP, "perfect quality sits at the top");
+        assert_eq!(
+            spark_y(0.5),
+            8.0,
+            "quality 0.5 plots here; e2e's SPARK_WARN_Y pins this exact number"
+        );
+        assert_eq!(spark_y(0.0), spark_y(0.02), "a zero reading is floored");
+        assert_eq!(spark_y(5.0), SPARK_Y_TOP, "an over-unity reading is capped");
+        assert_eq!(spark_y(-3.0), spark_y(0.02));
+    }
+
+    #[test]
+    fn spark_points_anchor_the_newest_sample_at_the_right_edge() {
+        let partial = build_spark_points(&steady_series(SPARK_MIN_POINTS, 0.8));
+        assert_eq!(partial.len(), 1);
+        let xs = parse_xs(&partial[0]);
+        assert_eq!(xs.len(), SPARK_MIN_POINTS);
+        let newest = xs[xs.len() - 1];
+        assert!(
+            (newest - SPARK_X_LAST).abs() < 1e-9,
+            "newest must sit at the right edge, got {newest}"
+        );
+        let step = xs[1] - xs[0];
+        assert!(
+            (step - (xs[2] - xs[1])).abs() < 0.011,
+            "spacing must be even"
+        );
+
+        let full = build_spark_points(&steady_series(SPARK_POINTS, 0.8));
+        let full_xs = parse_xs(&full[0]);
+        assert_eq!(full_xs.len(), SPARK_POINTS);
+        assert!((full_xs[SPARK_POINTS - 1] - SPARK_X_LAST).abs() < 1e-9);
+        assert!((full_xs[1] - full_xs[0] - step).abs() < 0.011);
+        assert!(
+            full_xs[0] < xs[0],
+            "a fuller history must reach further left, not rescale"
+        );
+    }
+
+    #[test]
+    fn spark_points_plot_only_the_newest_window() {
+        let long = steady_series(SPARK_POINTS + 7, 0.6);
+        let segments = build_spark_points(&long);
+        assert_eq!(parse_xs(&segments[0]).len(), SPARK_POINTS);
+    }
+
+    #[test]
+    fn spark_points_hold_the_neutral_dash_below_the_minimum() {
+        assert!(build_spark_points(&[]).is_empty());
+        assert!(
+            build_spark_points(&steady_series(SPARK_MIN_POINTS - 1, 0.9)).is_empty(),
+            "a stub short of the minimum reads as a rendering artifact, not a trend"
+        );
+        assert_eq!(
+            build_spark_points(&steady_series(SPARK_MIN_POINTS, 0.9)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn spark_points_split_at_a_gap_instead_of_bridging_it() {
+        let mut series = steady_series(4, 0.9);
+        let resume = series[3].0 + SPARK_GAP_MS + 1.0;
+        for i in 0..3 {
+            series.push((resume + i as f64 * 1_000.0, 0.3));
+        }
+        let segments = build_spark_points(&series);
+        assert_eq!(
+            segments.len(),
+            2,
+            "a gap must break the line, not bridge it"
+        );
+        assert_eq!(parse_xs(&segments[0]).len(), 4);
+        assert_eq!(parse_xs(&segments[1]).len(), 3);
+
+        let after = parse_xs(&segments[1]);
+        assert!((after[2] - SPARK_X_LAST).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spark_points_treat_the_gap_boundary_as_contiguous() {
+        let mut contiguous = steady_series(SPARK_MIN_POINTS - 1, 0.9);
+        let last = contiguous[contiguous.len() - 1].0;
+        contiguous.push((last + SPARK_GAP_MS, 0.9));
+        assert_eq!(build_spark_points(&contiguous).len(), 1);
+
+        let mut split = steady_series(SPARK_MIN_POINTS - 1, 0.9);
+        split.push((last + SPARK_GAP_MS + 1.0, 0.55));
+        let segments = build_spark_points(&split);
+        assert_eq!(segments.len(), 2, "the orphaned newest sample must draw");
+        assert_eq!(parse_xs(&segments[0]).len(), SPARK_MIN_POINTS - 1);
+
+        // Two IDENTICAL points: a single-point `<polyline>` paints nothing.
+        let orphan = parse_xs(&segments[1]);
+        assert_eq!(
+            orphan.len(),
+            2,
+            "a lone point paints nothing: {}",
+            segments[1]
+        );
+        assert_eq!(orphan[0], orphan[1]);
+        assert_eq!(
+            orphan[0], SPARK_X_LAST,
+            "it is the newest, so right-anchored"
+        );
+        assert_eq!(
+            parse_ys(&segments[1]),
+            vec![plotted_y(0.55); 2],
+            "and it sits at the orphaned sample's own quality"
+        );
+    }
+
+    #[test]
+    fn the_newest_sample_is_the_last_point_on_the_line() {
+        let mut series = steady_series(SPARK_MIN_POINTS - 1, 0.9);
+        series.push((series[series.len() - 1].0 + 1_000.0, 0.25));
+        let segments = build_spark_points(&series);
+        let last = segments.last().expect("a full series plots");
+        assert_eq!(
+            parse_ys(last).pop(),
+            Some(plotted_y(0.25)),
+            "the line must END on the newest sample: {last}"
+        );
+        assert_ne!(
+            plotted_y(0.25),
+            plotted_y(0.9),
+            "fixture cannot discriminate, so the assertion above is vacuous"
+        );
+    }
+
+    fn history_with(qualities: &[f64]) -> PeerSignalHistory {
+        let mut history = PeerSignalHistory::new();
+        for (i, q) in qualities.iter().enumerate() {
+            let data = SampleData {
+                // A healthy 100 ms buffer scores 1.0, so `audio_quality` is a
+                // pure function of the expand rate.
+                audio_expand_rate: (1.0 - q) * 1000.0,
+                audio_buffer_ms: 100.0,
+                audio_enabled: true,
+                video_enabled: false,
+                screen_enabled: false,
+                latency_ms: 40.0 + i as f64,
+                ..SampleData::default()
+            };
+            history.push_sample_at(&data, 1_000.0 + i as f64 * 1_000.0);
+        }
+        history
+    }
+
+    #[test]
+    fn spark_head_and_ring_level_come_from_the_same_number() {
+        for q in [0.95, 0.8, 0.6, 0.3, 0.1] {
+            let history = history_with(&[0.5, 0.5, q]);
+            let level = history.current_level(true, false, false);
+            let series = history.recent_quality_series(true, false, false);
+            let head = series.last().expect("samples were pushed").1;
+            assert_eq!(
+                SignalLevel::from_quality(head),
+                level,
+                "the plotted head {head} must classify to the rendered ring"
+            );
+        }
+    }
+
+    #[test]
+    fn spark_paint_carries_the_level_it_was_given() {
+        let history = history_with(&[0.9, 0.9, 0.9, 0.9, 0.9]);
+        let paint = history.spark_paint(SignalLevel::Poor, true, false, false, true, false);
+        assert_eq!(
+            paint.level,
+            SignalLevel::Poor,
+            "the trend must be the level the tile rendered, never a recomputed one"
+        );
+        assert_eq!(paint.sample_count, 5);
+        assert!(!paint.segments.is_empty());
+        assert_eq!(
+            paint.latency_ms, 44.0,
+            "latency comes from the newest sample"
+        );
+    }
+
+    #[test]
+    fn spark_paint_scores_the_line_with_the_flags_the_ring_used() {
+        let history = history_with(&[0.9, 0.9, 0.9, 0.9, 0.6]);
+        let (a, v, sc) = signal_enabled_flags(true, false, false, true);
+        let level = history.current_level(a, v, sc);
+        let paint = history.spark_paint(level, true, false, false, true, false);
+
+        let newest = history.samples_vec().pop().expect("samples were pushed");
+        let folded = combined_quality(
+            newest.audio_quality,
+            newest.video_quality,
+            newest.screen_quality,
+            a,
+            v,
+            sc,
+        );
+        let newest_plotted = parse_ys(paint.segments.last().expect("the trend plotted"))
+            .pop()
+            .expect("a segment has points");
+        assert_eq!(newest_plotted, plotted_y(folded));
+
+        let unfolded = combined_quality(
+            newest.audio_quality,
+            newest.video_quality,
+            newest.screen_quality,
+            true,
+            true,
+            true,
+        );
+        assert_ne!(
+            plotted_y(unfolded),
+            plotted_y(folded),
+            "fixture cannot discriminate the fold, so the assertion above is vacuous"
+        );
+    }
+
+    /// It never reaches the markup but IS in the compared struct.
+    #[test]
+    fn sub_millisecond_rtt_drift_does_not_defeat_the_repaint_guard() {
+        let paint_at = |latency_ms: f64| {
+            let mut history = PeerSignalHistory::new();
+            for i in 0..5 {
+                let data = SampleData {
+                    audio_expand_rate: 100.0,
+                    audio_buffer_ms: 100.0,
+                    audio_enabled: true,
+                    latency_ms,
+                    ..SampleData::default()
+                };
+                history.push_sample_at(&data, 1_000.0 + i as f64 * 1_000.0);
+            }
+            history.spark_paint(SignalLevel::Good, true, false, false, true, false)
+        };
+        let low = paint_at(212.2);
+        let high = paint_at(212.7);
+        assert_eq!(
+            low, high,
+            "a difference the UI cannot render must not cost a repaint"
+        );
+        // TRUNCATED: `as u32` truncates, so `.round()` would shift it 1 ms.
+        assert!(peer_signal_title(SignalLevel::Good, 5, 212.7, false).contains("212 ms"));
+        assert!(peer_signal_title(SignalLevel::Good, 5, high.latency_ms, false).contains("212 ms"));
+        assert_ne!(
+            paint_at(213.4),
+            high,
+            "a whole millisecond must still repaint"
+        );
+    }
+
+    #[test]
+    fn spark_paint_gives_an_unmeasured_peer_a_flat_grey_readout() {
+        let history = history_with(&[0.9, 0.9, 0.9]);
+        let paint = history.spark_paint(SignalLevel::Unmeasured, true, true, false, false, false);
+        assert_eq!(
+            paint.segments,
+            vec![flat_spark_segment(SignalLevel::Unmeasured)],
+            "an empty plot reads as a chart that failed to load"
+        );
+        assert_eq!(
+            paint.sample_count, 0,
+            "no frames are decoded, so there is no quality to claim"
+        );
+        let ys = parse_ys(&paint.segments[0]);
+        assert_eq!(ys[0], ys[1], "the readout must be level: {ys:?}");
+        assert_eq!(
+            parse_xs(&paint.segments[0]),
+            vec![SPARK_X_FIRST, SPARK_X_LAST]
+        );
+        // By collision, not by literal: the colour guard forbids literals here.
+        for measured in [
+            SignalLevel::Excellent,
+            SignalLevel::Good,
+            SignalLevel::Fair,
+            SignalLevel::Poor,
+            SignalLevel::Bad,
+        ] {
+            assert_ne!(
+                SignalLevel::Unmeasured.level_color(),
+                measured.level_color(),
+                "the unknown grey must not collide with {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flat_readout_is_a_pure_function_of_the_level() {
+        let mut seen: Vec<f64> = Vec::new();
+        for level in [
+            SignalLevel::Excellent,
+            SignalLevel::Good,
+            SignalLevel::Fair,
+            SignalLevel::Poor,
+            SignalLevel::Bad,
+        ] {
+            let y = parse_ys(&flat_spark_segment(level))[0];
+            assert!(
+                y > SPARK_Y_TOP && y < SPARK_Y_BOTTOM,
+                "{level:?} leaves the plot box at y={y}"
+            );
+            assert!(
+                seen.last().is_none_or(|prev| y > *prev),
+                "{level:?} at y={y} must sit below {seen:?}"
+            );
+            seen.push(y);
+        }
+        assert_eq!(seen.len(), 5);
+        assert_eq!(
+            flat_spark_segment(SignalLevel::Unmeasured),
+            flat_spark_segment(SignalLevel::Lost)
+        );
+    }
+
+    #[test]
+    fn peer_names_report_state_before_they_report_a_reading() {
+        assert_eq!(
+            peer_signal_aria("Ada", SignalLevel::Unmeasured, 0, false),
+            SIGNAL_UNMEASURED_TEXT
+        );
+        assert_eq!(
+            peer_signal_title(SignalLevel::Unmeasured, 0, 0.0, false),
+            SIGNAL_UNMEASURED_TEXT
+        );
+
+        assert_eq!(
+            peer_signal_aria("Ada", SignalLevel::Lost, 4, false),
+            "Ada connection: lost. Show signal quality details."
+        );
+
+        assert_eq!(
+            peer_signal_aria("Ada", SignalLevel::Excellent, 0, false),
+            "Ada connection: measuring. Show signal quality details."
+        );
+        assert_eq!(
+            peer_signal_title(SignalLevel::Excellent, 0, 0.0, false),
+            "Measuring…"
+        );
+
+        assert_eq!(
+            peer_signal_aria("Ada", SignalLevel::Fair, 6, false),
+            "Ada connection: fair. Show signal quality details."
+        );
+        assert_eq!(
+            peer_signal_title(SignalLevel::Fair, 6, 212.7, false),
+            "Fair — 212 ms round trip. Click for details."
+        );
+    }
+
+    #[test]
+    fn the_peer_name_is_stable_while_the_reading_moves() {
+        let name = peer_signal_aria("Ada", SignalLevel::Fair, 6, false);
+        assert_eq!(name, peer_signal_aria("Ada", SignalLevel::Fair, 7, false));
+        assert!(
+            !name.chars().any(|c| c.is_ascii_digit()),
+            "no reading may reach the accessible name: {name}"
+        );
+        assert!(peer_signal_title(SignalLevel::Fair, 6, 212.7, false).contains("212 ms"));
+    }
+
+    #[test]
+    fn plotted_quality_is_quantised_so_invisible_wobble_does_not_repaint() {
+        let base = 30.0_f64;
+        let steady = spark_y(24.0 / base);
+        for fps in [23.0, 24.0, 25.0] {
+            assert_eq!(
+                spark_y(fps / base),
+                steady,
+                "{fps}fps must land on the same y as 24fps"
+            );
+        }
+        assert_ne!(
+            steady,
+            spark_y(28.0 / base),
+            "a real move must still be visible"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_still_reports_a_reading_to_the_accessible_name() {
+        let history = history_with(&[0.9, 0.9, 0.9, 0.9, 0.9]);
+        let still = history.spark_paint(SignalLevel::Good, true, false, false, true, true);
+        assert_eq!(
+            still.sample_count, 5,
+            "the samples exist, the trend is hidden"
+        );
+        let name = peer_signal_aria("Ada", still.level, still.sample_count, false);
+        assert_eq!(name, "Ada connection: good. Show signal quality details.");
+        assert!(!name.contains("measuring"), "{name}");
+        assert!(
+            !peer_signal_title(still.level, still.sample_count, still.latency_ms, false)
+                .contains("Measuring"),
+        );
+        // Unmeasured keeps 0: decode is paused, so there IS no reading.
+        let paused = history.spark_paint(SignalLevel::Unmeasured, true, true, false, false, true);
+        assert_eq!(paused.sample_count, 0);
+    }
+
+    #[test]
+    fn reduced_motion_drops_the_trend_for_a_static_level_readout() {
+        let history = history_with(&[0.9, 0.9, 0.9, 0.9, 0.9]);
+        let moving = history.spark_paint(SignalLevel::Good, true, false, false, true, false);
+        let still = history.spark_paint(SignalLevel::Good, true, false, false, true, true);
+
+        assert!(!moving.segments.is_empty());
+        assert_ne!(
+            still.segments, moving.segments,
+            "the trend is the only moving part, so reduced motion drops it"
+        );
+        // Not empty: `reduce` is permanent, and a bucket readout is state.
+        assert_eq!(
+            still.segments,
+            vec![flat_spark_segment(SignalLevel::Good)],
+            "reduced motion must still carry the level"
+        );
+        assert_eq!(still.level, SignalLevel::Good);
+    }
+
+    #[test]
+    fn an_unmeasured_peer_paints_identically_every_tick() {
+        let history = history_with(&[0.9, 0.8, 0.7, 0.6, 0.5]);
+        let first = history.spark_paint(SignalLevel::Unmeasured, true, true, false, false, false);
+        let second = history.spark_paint(SignalLevel::Unmeasured, true, true, false, false, false);
+        assert_eq!(first, second);
+
+        let lost = history.spark_paint(SignalLevel::Lost, true, false, false, true, false);
+        assert_eq!(
+            lost,
+            history.spark_paint(SignalLevel::Lost, true, false, false, true, false)
+        );
+    }
+
+    #[test]
+    fn the_screen_disc_is_named_and_handled_apart_from_the_camera_disc() {
+        let camera = peer_signal_aria("Ada", SignalLevel::Good, 6, false);
+        let screen = peer_signal_aria("Ada", SignalLevel::Good, 6, true);
+        assert_ne!(
+            camera, screen,
+            "the two discs sit side by side and open different popups"
+        );
+        assert_eq!(
+            screen,
+            "Ada screen share connection: good. Show screen-share signal quality details."
+        );
+        assert_ne!(
+            peer_signal_title(SignalLevel::Good, 6, 40.0, false),
+            peer_signal_title(SignalLevel::Good, 6, 40.0, true)
+        );
+
+        assert_eq!(spark_node_id("abc", false), "abc");
+        assert_eq!(
+            spark_node_id("abc", true),
+            "abc:screen",
+            "one writer per disc: the scoped handle is what stops two futures \
+             each repainting both"
+        );
+    }
+
+    #[test]
+    fn every_ring_colour_is_an_opaque_hex_literal() {
+        for level in [
+            SignalLevel::Excellent,
+            SignalLevel::Good,
+            SignalLevel::Fair,
+            SignalLevel::Poor,
+            SignalLevel::Bad,
+            SignalLevel::Unmeasured,
+            SignalLevel::Lost,
+        ] {
+            let c = level.level_color();
+            assert!(
+                c.len() == 7
+                    && c.starts_with('#')
+                    && c[1..].chars().all(|ch| ch.is_ascii_hexdigit()),
+                "{level:?} level colour {c:?} is not a #rrggbb literal"
+            );
+        }
+    }
+
+    #[test]
+    fn every_ring_colour_is_distinct_per_level() {
+        let discriminating = [
+            SignalLevel::Excellent,
+            SignalLevel::Good,
+            SignalLevel::Fair,
+            SignalLevel::Poor,
+            SignalLevel::Bad,
+        ];
+        for (i, a) in discriminating.iter().enumerate() {
+            for b in &discriminating[i + 1..] {
+                assert_ne!(
+                    a.level_color(),
+                    b.level_color(),
+                    "{a:?} and {b:?} share a colour"
+                );
+            }
+        }
+        assert_eq!(
+            SignalLevel::Lost.level_color(),
+            SignalLevel::Unmeasured.level_color(),
+            "both are 'no reading', and the slash is what separates them"
+        );
     }
 }

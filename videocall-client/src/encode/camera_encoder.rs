@@ -170,7 +170,9 @@ use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::health_reporter::ClimbLimiterSnapshot;
-use videocall_aq::{fit_within_preserving_aspect, simulcast_layer_target_dims};
+use videocall_aq::{
+    camera_layer_encode_box, fit_within_preserving_aspect, simulcast_layer_target_dims,
+};
 
 // Issue #2199: only this crate sees both the mirror and the real constant.
 const _: () = assert!(
@@ -647,12 +649,8 @@ fn clear_layer_output_metric(
 }
 
 /// One active simulcast layer's live diagnostics: its layer id, the bitrate the
-/// AQ controller is currently targeting for it, and its fixed tier resolution
+/// AQ controller is currently targeting for it, and the geometry it is ENCODED at
 /// (issue #1095 observability). Used by [`SimulcastSendSnapshot`].
-///
-/// Resolution comes from the per-layer SIMULCAST ladder rung (the layer's tier
-/// is fixed; only the bitrate adapts), so it is stable and panic-safely resolved
-/// at snapshot time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimulcastLayerInfo {
     /// This layer's simulcast id (0 = base / lowest quality).
@@ -660,9 +658,9 @@ pub struct SimulcastLayerInfo {
     /// The bitrate (kbps) the AQ controller is currently targeting for this
     /// layer. `0` until the control loop has published a value.
     pub bitrate_kbps: u32,
-    /// Fixed tier width (px) for this layer.
+    /// Encoded width (px): the source fitted inside this layer's box, never upscaled
+    /// to it. `0` = not published yet (#2659).
     pub width: u32,
-    /// Fixed tier height (px) for this layer.
     pub height: u32,
 }
 
@@ -708,7 +706,8 @@ pub struct SimulcastSendSnapshot {
 ///
 /// `layer_idx` is clamped into the ladder, so an out-of-range rung degrades to the
 /// top rung rather than panicking a live call.
-fn simulcast_layer_encode_params(
+/// The fit is [`camera_layer_encode_box`], which the RECEIVER also calls (#2659).
+pub(crate) fn simulcast_layer_encode_params(
     n_layers: usize,
     layer_idx: usize,
     src_w: u32,
@@ -718,8 +717,7 @@ fn simulcast_layer_encode_params(
     let idx = layer_idx.min(tiers.len().saturating_sub(1));
     let tier = &tiers[idx];
     // Seed the first GOP at the aspect-fitted dims, not the raw 16:9 tier dims.
-    let (fit_w, fit_h) =
-        fit_within_preserving_aspect(src_w, src_h, tier.max_width, tier.max_height);
+    let (fit_w, fit_h) = camera_layer_encode_box(src_w, src_h, layer_idx, n_layers);
     (
         fit_w,
         fit_h,
@@ -732,8 +730,7 @@ fn simulcast_layer_encode_params(
 
 /// Build the per-EFFECTIVE-layer simulcast breakdown (issue #1095), lowest layer
 /// first. One [`SimulcastLayerInfo`] per layer in `0..effective`:
-///   * resolution from `resolutions[layer_id]` (resolvable for ALL effective
-///     layers, shed included, since each layer's tier is fixed),
+///   * resolution from `resolutions[layer_id]`, else `(0, 0)`,
 ///   * `bitrate_kbps` = the live value from `active_bitrates_kbps[layer_id]` for
 ///     ACTIVE layers (`layer_id < active`), or **`0` for SHED layers**
 ///     (`layer_id >= active`) — the UI lights up the dashed shed styling off the
@@ -1167,8 +1164,7 @@ pub struct CameraEncoder {
     ///
     /// Written by the encode loop through [`LayerEncoder::set_encode_dims`] — the
     /// single chokepoint for `current_w`/`current_h` — and read by
-    /// [`CameraEncoder::top_published_layer_dims`], whose only consumer today is
-    /// [`CameraEncoder::live_quality_snapshot`] (the self-view readout).
+    /// [`CameraEncoder::top_published_layer_dims`] and [`CameraEncoder::live_simulcast_snapshot`].
     ///
     /// **Why this exists:** before #2170 the fitted dims lived ONLY inside the
     /// encode loop's `LayerEncoder`, so the self-view readout re-derived geometry
@@ -1190,12 +1186,6 @@ pub struct CameraEncoder {
     /// AQ's tier targets still render. Deliberate: the AQ's intent (how many rungs it
     /// wants active, at what bitrate) genuinely survives a codec restart, whereas the
     /// geometry does not exist until the new generation publishes it.
-    ///
-    /// **`live_simulcast_snapshot` deliberately does NOT read this** — the
-    /// diagnostics ladder still resolves rung bounding boxes from the ladder table,
-    /// the same defect one surface over. Routing it here needs the sentinel rendered
-    /// in the drawer (em-dash copy, a11y labels, shed-rung CSS) and is issue #2170's
-    /// second half, not a loose end of this change.
     shared_layer_dims: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
     /// Measured output fps per camera rung. These observability-only atomics are
     /// written by each layer's output callback and are never read by AQ control.
@@ -2988,10 +2978,8 @@ impl CameraEncoder {
     }
 
     /// Live SEND-side simulcast diagnostics for the camera (issue #1095
-    /// observability). Reads the active-layer count + per-layer target-bitrate
-    /// atomics published by the AQ control loop, and resolves EVERY effective
-    /// layer's fixed resolution from the SIMULCAST ladder. Panic-safe (indices
-    /// clamped); cheap to poll at the needle cadence.
+    /// observability). Reads the active-layer count, the AQ loop's per-layer bitrate
+    /// atomics, and the encode loop's per-layer FITTED geometry. Panic-safe.
     ///
     /// Emits one rung per EFFECTIVE layer (the configured ladder depth), not just
     /// the active ones, so a layer the AQ has SHED under congestion stays visible
@@ -3010,12 +2998,19 @@ impl CameraEncoder {
                 layers: Vec::new(),
             };
         }
-        // Fixed per-layer resolutions for the FULL ladder (lowest layer first) —
-        // resolvable for every effective layer, shed included.
-        let resolutions: Vec<(u32, u32)> = simulcast_layers(effective as usize)
-            .iter()
-            .map(|t| (t.max_width, t.max_height))
+        // What the encode loop configured, not the box it fitted inside (#2659).
+        let published = self.shared_layer_dims.try_borrow();
+        let resolutions: Vec<(u32, u32)> = (0..effective)
+            .map(|layer_id| {
+                published
+                    .as_ref()
+                    .ok()
+                    .and_then(|dims| dims.get(layer_id as usize))
+                    .map(|slot| unpack_layer_dims(slot.load(Ordering::Relaxed)))
+                    .unwrap_or((0, 0))
+            })
             .collect();
+        drop(published);
         // Active layer count is shed-aware (the AQ loop drops the top layer under
         // congestion); clamp it to the ladder size defensively.
         let active = (self.shared_active_layer_count.load(Ordering::Relaxed))
@@ -6371,40 +6366,68 @@ mod tests {
         );
     }
 
-    /// The diagnostics ladder is DELIBERATELY unchanged by this PR: it still
-    /// resolves rung bounding boxes from the ladder table.
-    ///
-    /// This pins the descope boundary so the split is explicit rather than an
-    /// accident of what got ported. Routing `live_simulcast_snapshot` through
-    /// `shared_layer_dims` requires rendering the sentinel in the drawer (em-dash
-    /// copy, a11y labels, shed-rung CSS) and is #2170's second half. If you are
-    /// implementing that, this test SHOULD fail — replace it, do not delete it.
     #[test]
-    fn simulcast_ladder_still_reports_rung_boxes_not_fitted_dims() {
+    fn simulcast_ladder_reports_fitted_dims_not_rung_boxes() {
         use videocall_aq::constants::simulcast_layers;
 
+        const FITTED: [(u32, u32); 3] = [(240, 180), (480, 360), (640, 480)];
+
         let encoder = encoder_with_layers(3);
-        // Publish fitted dims no rung contains...
-        seed_published_dims(&encoder, &[(241, 181), (481, 361), (613, 461)]);
+        seed_published_dims(&encoder, &FITTED);
         encoder
             .shared_active_layer_count
             .store(3, Ordering::Relaxed);
 
-        // ...and the ladder still reports the NOMINAL boxes.
         let got: Vec<(u32, u32)> = encoder
             .live_simulcast_snapshot()
             .layers
             .iter()
             .map(|l| (l.width, l.height))
             .collect();
+        assert_eq!(
+            got,
+            FITTED.to_vec(),
+            "every layer must report what the encode loop configured"
+        );
+
         let nominal: Vec<(u32, u32)> = simulcast_layers(3)
             .iter()
             .map(|t| (t.max_width, t.max_height))
             .collect();
-        assert_eq!(
+        assert_ne!(
             got, nominal,
-            "the ladder half of #2170 is deliberately out of scope in this PR"
+            "reporting the nominal box is the #2659 defect"
         );
+
+        for (idx, expected) in FITTED.iter().enumerate() {
+            let (fit_w, fit_h, _, _, _, _) = simulcast_layer_encode_params(3, idx, 640, 480);
+            assert_eq!(
+                (fit_w, fit_h),
+                *expected,
+                "video layer {idx}: fixture must be the encode path's own fit"
+            );
+        }
+    }
+
+    #[test]
+    fn simulcast_ladder_reports_unknown_for_a_layer_that_has_not_published() {
+        let cold = encoder_with_layers(3);
+        let snap = cold.live_simulcast_snapshot();
+        assert_eq!(snap.layers.len(), 3, "one entry per effective layer");
+        assert!(
+            snap.layers.iter().all(|l| (l.width, l.height) == (0, 0)),
+            "before any publish every layer is unknown, not a ladder box"
+        );
+
+        let partial = encoder_with_layers(3);
+        seed_published_dims(&partial, &[(240, 180), (480, 360)]);
+        let dims: Vec<(u32, u32)> = partial
+            .live_simulcast_snapshot()
+            .layers
+            .iter()
+            .map(|l| (l.width, l.height))
+            .collect();
+        assert_eq!(dims, vec![(240, 180), (480, 360), (0, 0)]);
     }
 
     /// **The ENCODE-PATH guard.** The other encoder tests observe
@@ -6480,13 +6503,20 @@ mod tests {
     /// geometry read reachable off-browser; the other three sit inside `spawn_local`
     /// futures that need WebCodecs.
     ///
-    /// MUTATION: hardcode any rung in `live_simulcast_snapshot`, or resolve it from
-    /// a table other than the camera ladder, and this fails.
+    /// A 16:9 1080p source fits every box exactly, keeping the ladder assertable (#2659).
     #[test]
     fn encoder_geometry_comes_from_the_shipped_camera_ladder() {
         use videocall_aq::constants::SIMULCAST_VIDEO_LAYERS;
 
         let encoder = encoder_with_layers(3);
+        let published: Vec<(u32, u32)> = (0..3)
+            .map(|idx| {
+                let (w, h, _, _, _, _) = simulcast_layer_encode_params(3, idx, 1920, 1080);
+                (w, h)
+            })
+            .collect();
+        seed_published_dims(&encoder, &published);
+
         let snap = encoder.live_simulcast_snapshot();
         assert!(snap.simulcast_active, "3 layers => simulcast active");
         assert_eq!(snap.layers.len(), 3, "one entry per effective layer");

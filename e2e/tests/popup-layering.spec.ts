@@ -100,9 +100,24 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
   // only exists while the panel is mounted.
   const meetingOptionsPanel = (page: Page) => page.locator('[aria-label="Close meeting options"]');
 
+  // Since #2701 an open drawer narrows the band `action_bar_overflow_hidden`
+  // budgets against, so a secondary slot can be shed into "More actions" and
+  // the inline button reports `hidden` rather than absent.
   async function openMeetingOptions(page: Page): Promise<void> {
     await page.locator(".video-controls-container").hover();
-    await page.locator('[data-testid="open-meeting-options"]').click();
+    const inline = page.locator('[data-testid="open-meeting-options"]');
+    if (await inline.isVisible()) {
+      await inline.click({ timeout: 10_000 });
+    } else {
+      const trigger = page.locator("#overflow-menu-trigger");
+      await expect(trigger).toBeVisible({ timeout: 10_000 });
+      await trigger.click({ timeout: 10_000 });
+      const item = page.locator(".action-bar-overflow-popover button.overflow-item", {
+        has: page.locator('span:text-is("Meeting options")'),
+      });
+      await expect(item).toBeVisible({ timeout: 10_000 });
+      await item.click({ timeout: 10_000 });
+    }
     await expect(meetingOptionsPanel(page)).toBeVisible({ timeout: 10_000 });
   }
 
@@ -274,6 +289,24 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
       timeout: 5_000,
     });
     await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+  });
+
+  // The dock wrapper houses Customize and Reset as well as the position picker,
+  // and nothing represents it in the overflow popover, so shedding it on any
+  // overflow would remove those three controls outright. It must stay visible
+  // while it fits, which at 1280 it does in every drawer state.
+  test("the dock-position control survives a drawer narrowing the action bar", async ({ page }) => {
+    await joinMeeting(page, "dock_trigger_survives_drawer");
+
+    await expect(page.locator("#dock-menu-trigger")).toBeVisible({ timeout: 10_000 });
+
+    await clickPeerListButton(page);
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 5_000 });
+    await expect(page.locator("#dock-menu-trigger")).toBeVisible({ timeout: 10_000 });
+
+    await clickDiagnosticsButton(page);
+    await expect(page.locator("#diagnostics-sidebar")).toHaveClass(/visible/, { timeout: 5_000 });
+    await expect(page.locator("#dock-menu-trigger")).toBeVisible({ timeout: 10_000 });
   });
 
   test("clicking outside the mock-peers popover closes it", async ({ page }) => {

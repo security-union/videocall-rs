@@ -76,30 +76,30 @@ const MAX_PLAUSIBLE_SEQ_GAP_FRAMES: u64 = videocall_aq::constants::MAX_PLAUSIBLE
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
-    AUDIO_CONCEALMENT_PCT, AUDIO_CONGESTION_CEILING, AUDIO_DATAGRAM_LOSS_PER_SEC,
-    AUDIO_DATAGRAM_RAW_LOSS_PER_SEC, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE,
-    BATTERY_CHARGING, BATTERY_LEVEL, CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER,
-    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_AUDIO_CONCEALMENT_PCT,
-    CLIENT_CPU_THROTTLED, CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS, CLIENT_INFO,
-    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
-    CLIENT_NETWORK_DOWNLINK_MAX, CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC,
-    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS,
-    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES,
-    DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP,
-    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
-    DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS,
-    ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL, ENCODER_LAYER_HEIGHT, ENCODER_LAYER_OUTPUT_FPS,
-    ENCODER_LAYER_PIXELS, ENCODER_LAYER_PIXEL_RATE, ENCODER_LAYER_WIDTH, ENCODER_OUTPUT_FPS,
-    ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
-    KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
-    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
-    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
-    NETEQ_TARGET_DELAY_MS, NON_FINITE_SAMPLES_DROPPED_TOTAL, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
-    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER,
-    RTT_PROBE_DROPPED_TOTAL, RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_ENCODER_MAX_STALL_GAP_MS,
-    SCREEN_ENCODER_OUTPUT_FPS, SCREEN_ENCODER_STALL_EPISODES, SCREEN_KEYFRAME_REQUESTS_PER_SEC,
-    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_CONTENT_STALENESS_MS,
-    SCREEN_VIDEO_FPS, SCREEN_VIDEO_FREEZE_EPISODES_TOTAL, SCREEN_VIDEO_FREEZE_SECONDS_TOTAL,
+    AUDIO_CONCEALMENT_PCT, AUDIO_DATAGRAM_LOSS_PER_SEC, AUDIO_DATAGRAM_RAW_LOSS_PER_SEC,
+    AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, BATTERY_CHARGING, BATTERY_LEVEL,
+    CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
+    CLIENT_AGENT_MEMORY_BYTES, CLIENT_AUDIO_CONCEALMENT_PCT, CLIENT_CPU_THROTTLED,
+    CLIENT_DATAGRAM_READ_LOOP_MAX_GAP_MS, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
+    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_NETWORK_DOWNLINK_MAX,
+    CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
+    CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
+    CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL,
+    DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
+    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
+    ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL,
+    ENCODER_LAYER_HEIGHT, ENCODER_LAYER_OUTPUT_FPS, ENCODER_LAYER_PIXELS, ENCODER_LAYER_PIXEL_RATE,
+    ENCODER_LAYER_WIDTH, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL,
+    ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC,
+    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
+    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
+    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
+    NON_FINITE_SAMPLES_DROPPED_TOTAL, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER, RTT_PROBE_DROPPED_TOTAL,
+    RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_ENCODER_MAX_STALL_GAP_MS, SCREEN_ENCODER_OUTPUT_FPS,
+    SCREEN_ENCODER_STALL_EPISODES, SCREEN_KEYFRAME_REQUESTS_PER_SEC, SCREEN_SHARING_ACTIVE,
+    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS,
+    SCREEN_VIDEO_FREEZE_EPISODES_TOTAL, SCREEN_VIDEO_FREEZE_SECONDS_TOTAL,
     SCREEN_VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL, SCREEN_VIDEO_FRESHNESS_EVICTIONS_TOTAL,
     SCREEN_VIDEO_KEYFRAME_ARRIVALS_TOTAL, SCREEN_VIDEO_MAX_CONTENT_STALENESS_MS,
     SCREEN_VIDEO_MAX_DECODE_GAP_MS, SCREEN_VIDEO_PLAYOUT_LATENCY_MS,
@@ -370,9 +370,9 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = DECODE_ACTIVE_SET_SIZE.remove_label_values(&reporter_labels);
     let _ = CAPABILITY_SCORE.remove_label_values(&reporter_labels);
     let _ = BATTERY_LEVEL.remove_label_values(&reporter_labels);
-    // Layer gauges carry an extra media_kind label; GC all three kinds
-    // (camera, screen, audio) that may have been published.
-    for kind in ["camera", "screen", "audio"] {
+    // Layer gauges carry an extra media_kind label; GC both kinds
+    // (camera, screen) that may have been published.
+    for kind in ["camera", "screen"] {
         let layer_labels: [&str; 4] = [
             &session_info.meeting_id,
             &session_info.session_id,
@@ -394,8 +394,6 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         remove_camera_layer_metrics(&labels);
     }
 
-    // #1561: Audio congestion ceiling (4-label reporter gauge)
-    let _ = AUDIO_CONGESTION_CEILING.remove_label_values(&reporter_labels);
     // #1556: Battery charging, network downlink max, CPU throttled (4-label reporter gauges)
     let _ = BATTERY_CHARGING.remove_label_values(&reporter_labels);
     let _ = CLIENT_NETWORK_DOWNLINK_MAX.remove_label_values(&reporter_labels);
@@ -843,15 +841,6 @@ fn process_health_packet_to_metrics_pb(
     session_tracker: &SessionTracker,
 ) -> anyhow::Result<()> {
     HEALTH_REPORTS_TOTAL.inc();
-    // Force registration of the issue-2047 rejection counter on the first health
-    // packet. `lazy_static` registers a metric on first DEREF, and the only other
-    // deref is inside `is_publishable_sample`'s failure branch — so without this
-    // the series would be missing from /metrics entirely until the first bad
-    // sample, and a dashboard panel would read "No data" instead of 0.
-    NON_FINITE_SAMPLES_DROPPED_TOTAL.inc_by(0.0);
-    // Same for the issue-2170 geometry rejection counter: its only other derefs are the
-    // two rejection branches below, so /metrics would omit the series until first abuse.
-    ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL.inc_by(0.0);
 
     let meeting_id = if health_packet.meeting_id.is_empty() {
         "unknown"
@@ -1588,47 +1577,6 @@ fn process_health_packet_to_metrics_pb(
             ENCODER_ACTIVE_LAYERS
                 .with_label_values(&[meeting_id, session_id, reporting_user_id, "screen"])
                 .set(layers as f64);
-        }
-
-        // #1561: Audio encoder simulcast layer counts
-        if let Some(layers) = health_packet.effective_audio_layers {
-            ENCODER_EFFECTIVE_LAYERS
-                .with_label_values(&[meeting_id, session_id, reporting_user_id, "audio"])
-                .set(layers as f64);
-        }
-        // Audio active layers are reported independently from the congestion
-        // ceiling because a user-selected send cap also reduces publication.
-        // Fall back to the old derivation for rolling upgrades from clients that
-        // do not yet carry active_audio_layers.
-        if let Some(effective) = health_packet.effective_audio_layers {
-            let active = health_packet.active_audio_layers.unwrap_or_else(|| {
-                health_packet
-                    .audio_congestion_ceiling
-                    .map(|c| effective.min(c))
-                    .unwrap_or(effective)
-            });
-            ENCODER_ACTIVE_LAYERS
-                .with_label_values(&[meeting_id, session_id, reporting_user_id, "audio"])
-                .set(active as f64);
-        }
-
-        // #1561: Audio congestion ceiling. In the uncapped (healthy) state the
-        // client omits this field; emit the effective count so Grafana always
-        // has a value (ceiling == effective → no shed).
-        {
-            let ceiling_val = match (
-                health_packet.audio_congestion_ceiling,
-                health_packet.effective_audio_layers,
-            ) {
-                (Some(c), _) => Some(c as f64),
-                (None, Some(e)) => Some(e as f64),
-                _ => None,
-            };
-            if let Some(v) = ceiling_val {
-                AUDIO_CONGESTION_CEILING
-                    .with_label_values(&[meeting_id, session_id, reporting_user_id])
-                    .set(v);
-            }
         }
 
         // #1561: Receiver-side layer selections. Track which (peer, kind) pairs
@@ -2507,6 +2455,8 @@ async fn main() -> anyhow::Result<()> {
         .parse::<u16>()?;
 
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+
+    sec_api::metrics::init_health_ingest_series();
 
     info!("Starting metrics server on port {}", port);
     info!("Connecting to NATS at {}", nats_url);
@@ -3951,36 +3901,45 @@ mod tests {
     }
 
     #[test]
-    fn audio_active_layers_do_not_relabel_user_cap_as_congestion() {
+    fn audio_layer_fields_are_not_ingested_as_metrics() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
         let mut packet = create_test_health_packet(
-            "session_audio_caps_1561",
-            "meeting_audio_caps_1561",
-            "reporter_audio_caps_1561",
+            "session_audio_strip_2621",
+            "meeting_audio_strip_2621",
+            "reporter_audio_strip_2621",
             HashMap::new(),
         );
         packet.effective_audio_layers = Some(3);
-        packet.active_audio_layers = Some(1);
-        packet.audio_congestion_ceiling = None;
+        packet.active_audio_layers = Some(2);
+        packet.audio_congestion_ceiling = Some(2);
+        packet.effective_screen_layers = Some(2);
         process_health_packet_to_metrics_pb(&packet, &tracker)
-            .expect("audio layer metrics should be accepted");
+            .expect("a packet carrying legacy audio layer fields must still be accepted");
 
         let reporter_labels = [
-            ("meeting_id", "meeting_audio_caps_1561"),
-            ("session_id", "session_audio_caps_1561"),
-            ("peer_id", "reporter_audio_caps_1561"),
+            ("meeting_id", "meeting_audio_strip_2621"),
+            ("session_id", "session_audio_strip_2621"),
+            ("peer_id", "reporter_audio_strip_2621"),
         ];
-        let mut active_labels = reporter_labels.to_vec();
-        active_labels.push(("media_kind", "audio"));
-        assert_eq!(
-            gauge_value("videocall_encoder_active_layers", &active_labels),
-            Some(1.0),
-            "the user cap must reduce actual active publication"
+        let mut audio_labels = reporter_labels.to_vec();
+        audio_labels.push(("media_kind", "audio"));
+        assert!(
+            !series_exists("videocall_encoder_effective_layers", &audio_labels),
+            "audio effective layers must not be ingested"
         );
-        assert_eq!(
-            gauge_value("videocall_audio_congestion_ceiling", &reporter_labels),
-            Some(3.0),
-            "without congestion, the congestion ceiling must remain uncapped"
+        assert!(
+            !series_exists("videocall_encoder_active_layers", &audio_labels),
+            "audio active layers must not be ingested"
+        );
+        let mut screen_labels = reporter_labels.to_vec();
+        screen_labels.push(("media_kind", "screen"));
+        assert!(
+            series_exists("videocall_encoder_effective_layers", &screen_labels),
+            "positive control: `series_exists` is a subset match that returns false on a              wrong label NAME, so a rename would make every negative assertion here              permanently vacuous with no signal"
+        );
+        assert!(
+            !series_exists("videocall_audio_congestion_ceiling", &reporter_labels),
+            "the audio congestion ceiling series must no longer exist"
         );
     }
 

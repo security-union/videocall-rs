@@ -10,6 +10,6 @@ pub mod peer;
 pub mod push_pin;
 pub mod raised_hand;
 pub mod recording;
-pub mod signal_bars;
+pub mod signal_spark;
 pub mod youtube;
 pub mod zoom;

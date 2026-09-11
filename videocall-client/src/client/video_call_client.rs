@@ -3419,9 +3419,6 @@ impl VideoCallClient {
         // #1561: screen + audio layer metrics
         effective_screen_layers: u32,
         active_screen_layers: Rc<AtomicU32>,
-        effective_audio_layers: u32,
-        audio_congestion_ceiling: Arc<AtomicU32>,
-        audio_user_layer_ceiling: Rc<AtomicU32>,
     ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(hr) = &inner.health_reporter {
@@ -3442,9 +3439,6 @@ impl VideoCallClient {
                         camera_layer_metrics,
                         effective_screen_layers,
                         active_screen_layers,
-                        effective_audio_layers,
-                        audio_congestion_ceiling,
-                        audio_user_layer_ceiling,
                     );
                 }
             }

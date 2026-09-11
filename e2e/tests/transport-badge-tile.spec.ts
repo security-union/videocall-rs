@@ -1,6 +1,7 @@
 import { test, expect, Page, Locator, BrowserContext } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { setTransportBadgeFlag } from "../helpers/transport-badge-config";
 import { wakeControls } from "../helpers/controls";
 import { chromium } from "@playwright/test";
@@ -23,7 +24,8 @@ import { chromium } from "@playwright/test";
  *      `transport_badge_enabled()` (parsing `__APP_CONFIG.transportBadgeEnabled`
  *      through `videocall_types::truthy`) is true. The committed
  *      `dioxus-ui/scripts/config.js` ships `"false"`, so by default NO
- *      `.transport-badge` element exists anywhere.
+ *      `.transport-badge` element exists anywhere. Since #2673 the diagnostics
+ *      checkbox ANDs with it, seeded ON in `bringUpTwoPeerMeeting`.
  *   2. KNOWN-TRANSPORT-ONLY — the transport is read from the REMOTE
  *      `peer_status`/`peer_transport` diagnostics metric emitted by the decode
  *      pipeline. `webtransport` → `--wt`/"WT", `websocket` → `--ws`/"WS";
@@ -245,6 +247,8 @@ async function bringUpTwoPeerMeeting(
     if (opts.enableBadgeFlag) {
       await setTransportBadgeFlag(ctx, "true");
     }
+    // Flag-OFF test included: an unseeded OTHER gate would pass it for the wrong reason.
+    await enableDiagnosticsTileIndicators(ctx);
     members.push({
       page: null as unknown as Page,
       context: ctx,

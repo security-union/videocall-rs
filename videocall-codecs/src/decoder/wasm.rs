@@ -313,7 +313,7 @@ impl WasmDecoder {
     }
 
     /// New ergonomic API: simply push a frame and let the decoder handle the rest
-    pub fn push_frame(&self, frame: FrameBuffer, context: Option<StreamContext>) {
+    pub fn push_frame(&self, frame: FrameBuffer, context: Option<&StreamContext>) {
         self.post_frame(WorkerMessage::DecodeFrame(frame), context);
     }
 
@@ -323,19 +323,19 @@ impl WasmDecoder {
     /// stale head-of-line backlog so the worker's ~10ms tick trips the #1020 freshness deadline
     /// and emits an observable `freshness_skip` (#1045). Only the `MOCK_PEERS_ENABLED`-gated
     /// injection hook (`videocall_client::freshness_inject`) calls this; production never does.
-    pub fn inject_stale_frame(&self, frame: FrameBuffer, context: Option<StreamContext>) {
+    pub fn inject_stale_frame(&self, frame: FrameBuffer, context: Option<&StreamContext>) {
         self.post_frame(WorkerMessage::InjectStaleFrame(frame), context);
     }
 
     /// A frame that takes a re-emit slot has its attribution enqueued ahead of it (FIFO), but
     /// best-effort: a bound breach between the two sends posts the frame bare (issue 1741).
-    fn post_frame(&self, message: WorkerMessage, context: Option<StreamContext>) {
+    fn post_frame(&self, message: WorkerMessage, context: Option<&StreamContext>) {
         if let Some(context) = context {
             if self
                 .context_reemit
-                .take_reemit_slot(&context, js_sys::Date::now)
+                .take_reemit_slot(context, js_sys::Date::now)
             {
-                self.send_context(context);
+                self.send_context(context.clone());
             }
         }
         self.send(message);
@@ -349,6 +349,7 @@ impl WasmDecoder {
         self.send_context(context);
     }
 
+    /// Owned so the caller decides whether to clone; the frame path pays per re-emit.
     fn send_context(&self, context: StreamContext) {
         let StreamContext { from_peer, to_peer } = context;
         self.send(WorkerMessage::SetContext { from_peer, to_peer });

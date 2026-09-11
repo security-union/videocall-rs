@@ -652,14 +652,6 @@ lazy_static! {
     )
     .expect("Failed to create server_data_bytes_total metric");
 
-    /// Connection duration in seconds (when connection closes)
-    pub static ref SERVER_CONNECTION_DURATION_SECONDS: Histogram = register_histogram!(
-        "videocall_server_connection_duration_seconds",
-        "Duration of server connections in seconds",
-        vec![1.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0] // 1s to 2h buckets
-    )
-    .expect("Failed to create server_connection_duration_seconds metric");
-
     /// Connection lifecycle events counter
     pub static ref SERVER_CONNECTION_EVENTS_TOTAL: Counter = register_counter!(
         "videocall_server_connection_events_total",
@@ -1578,17 +1570,6 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id", "media_kind", "layer"]
     )
     .expect("Failed to create encoder_layer_pixel_rate metric");
-
-    /// Audio congestion ceiling: the congestion-driven dynamic layer cap (#1561).
-    /// Distinct from active layers: this is only the runtime cap applied under
-    /// congestion. In the uncapped state the exporter reports the effective
-    /// ladder depth so dashboards can compare the two without a sentinel value.
-    pub static ref AUDIO_CONGESTION_CEILING: GaugeVec = register_gauge_vec!(
-        "videocall_audio_congestion_ceiling",
-        "Audio congestion-driven layer ceiling; equals effective audio layers when uncapped and is lower while congestion shedding is active",
-        &["meeting_id", "session_id", "peer_id"]
-    )
-    .expect("Failed to create audio_congestion_ceiling metric");
 
     /// Receiver-side layer selection: which simulcast layer THIS receiver is
     /// subscribing to from a given peer for a given media kind (#1561).
@@ -3238,6 +3219,42 @@ pub fn init_ws_fragment_discard_series() {
     });
 }
 
+// `lazy_static` registers on first dereference, so an unlabelled metric is absent from
+// `/metrics` until incremented. Each binary is its own process and registry, so a metric
+// belongs only in the init of the process that increments it (issue 2645).
+
+/// `token_validator` (via `lobby`/`webtransport`) and `ChatServer` — both relays.
+fn init_relay_common_series() {
+    lazy_static::initialize(&LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL);
+    lazy_static::initialize(&RELAY_NATS_PUBLISH_LATENCY_MS);
+}
+
+/// `websocket_server`. `relay_ws_*` comes from `WsChatSession`, which only it builds.
+pub fn init_websocket_relay_series() {
+    init_relay_common_series();
+    lazy_static::initialize(&WS_FRAGMENTED_INBOUND_TOTAL);
+    init_ws_fragment_discard_series();
+}
+
+/// `webtransport_server`. Only it spawns `spawn_scheduler_lag_probe`.
+pub fn init_webtransport_relay_series() {
+    init_relay_common_series();
+    lazy_static::initialize(&RELAY_SCHEDULER_LAG_MS);
+}
+
+/// `metrics_server` — the client health-packet ingest process.
+pub fn init_health_ingest_series() {
+    lazy_static::initialize(&HEALTH_REPORTS_TOTAL);
+    lazy_static::initialize(&NON_FINITE_SAMPLES_DROPPED_TOTAL);
+    lazy_static::initialize(&TIER_TRANSITIONS_DROPPED_TOTAL);
+    lazy_static::initialize(&ENCODER_LAYER_GEOMETRY_DROPPED_TOTAL);
+}
+
+/// `metrics_server_snapshot` — the server-stats aggregation process.
+pub fn init_server_stats_series() {
+    lazy_static::initialize(&SERVER_CONNECTION_EVENTS_TOTAL);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3248,6 +3265,180 @@ mod tests {
     /// gate with `#[serial]` to keep deltas exact.
     fn snapshot(counter: &CounterVec, labels: &[&str]) -> f64 {
         counter.with_label_values(labels).get()
+    }
+
+    /// Anything not a `*Vec`. Matches a bare `static ref` too — no non-`pub` unlabelled
+    /// metric exists today, so that arm is a canary for one being added.
+    fn declared_unlabelled_statics(src: &str) -> Vec<String> {
+        src.lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l
+                    .strip_prefix("pub static ref ")
+                    .or_else(|| l.strip_prefix("static ref "))?;
+                let (name, ty) = rest.split_once(": ")?;
+                let ty = ty.split(" =").next()?;
+                (!ty.ends_with("Vec")).then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    const INIT_FNS: &[&str] = &[
+        "init_relay_common_series",
+        "init_websocket_relay_series",
+        "init_webtransport_relay_series",
+        "init_health_ingest_series",
+        "init_server_stats_series",
+    ];
+
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        src.split_once(&format!("fn {name}() {{"))
+            .unwrap_or_else(|| panic!("{name} must exist"))
+            .1
+            .split_once("\n}")
+            .unwrap_or_else(|| panic!("{name} must be brace-terminated"))
+            .0
+    }
+
+    /// Ownership EXISTENCE only; correctness is not visible to a source scan.
+    #[test]
+    fn every_unlabelled_metric_is_owned_by_some_process_init() {
+        let src = include_str!("metrics.rs");
+        let bodies: String = INIT_FNS.iter().map(|f| fn_body(src, f)).collect();
+
+        let declared = declared_unlabelled_statics(src);
+        // A count floor would misreport a legitimate metric deletion as parser rot.
+        assert!(
+            declared.iter().any(|n| n == "WS_FRAGMENTED_INBOUND_TOTAL"),
+            "parser matched no known unlabelled static — it stopped matching the source"
+        );
+
+        let missing: Vec<_> = declared
+            .iter()
+            .filter(|n| !bodies.contains(&format!("&{n})")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "unlabelled metrics absent from /metrics until first incremented \
+             (issue 2645) — add each to the init of the process that increments it: \
+             {missing:?}"
+        );
+    }
+
+    /// Each binary that serves `/metrics`, with the init its `main` must call.
+    const METRICS_BINS: &[(&str, &str, &str)] = &[
+        (
+            "websocket_server",
+            include_str!("bin/websocket_server.rs"),
+            "init_websocket_relay_series",
+        ),
+        (
+            "webtransport_server",
+            include_str!("bin/webtransport_server.rs"),
+            "init_webtransport_relay_series",
+        ),
+        (
+            "metrics_server",
+            include_str!("bin/metrics_server.rs"),
+            "init_health_ingest_series",
+        ),
+        (
+            "metrics_server_snapshot",
+            include_str!("bin/metrics_server_snapshot.rs"),
+            "init_server_stats_series",
+        ),
+    ];
+
+    /// These two increment their metrics inside the binary, so ownership is derivable.
+    /// Relay metrics live in lib modules; the delegation test pins those instead.
+    const BIN_LOCAL: &[&str] = &["metrics_server", "metrics_server_snapshot"];
+
+    #[test]
+    fn a_bin_local_metric_is_published_by_its_own_process_init_and_no_other() {
+        let src = include_str!("metrics.rs");
+        for name in declared_unlabelled_statics(src) {
+            let deref = format!("&{name})");
+            let owners: Vec<&str> = METRICS_BINS
+                .iter()
+                .filter(|(bin, bin_src, _)| BIN_LOCAL.contains(bin) && bin_src.contains(&name))
+                .map(|(_, _, init)| *init)
+                .collect();
+            let [owner] = owners[..] else { continue };
+
+            assert!(
+                fn_body(src, owner).contains(&deref),
+                "{name} is incremented in that binary but {owner} does not publish it (issue 2645)"
+            );
+            for other in INIT_FNS.iter().filter(|f| **f != owner) {
+                assert!(
+                    !fn_body(src, other).contains(&deref),
+                    "{other} publishes {name} at 0, but only {owner}'s process increments it \
+                     — a flat 0 there reads as 'this component saw none'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bin_local_init_publishes_nothing_its_own_binary_cannot_increment() {
+        let src = include_str!("metrics.rs");
+        for (bin, bin_src, init) in METRICS_BINS.iter().filter(|(b, ..)| BIN_LOCAL.contains(b)) {
+            let body = fn_body(src, init);
+            for name in declared_unlabelled_statics(src) {
+                if body.contains(&format!("&{name})")) {
+                    assert!(
+                        bin_src.contains(&name),
+                        "{init} publishes {name} at 0 but {bin} never references it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `gather()` assertion cannot pin a delegation: the registry is process-global.
+    #[test]
+    fn relay_inits_delegate_to_the_shared_and_transport_specific_helpers() {
+        let src = include_str!("metrics.rs");
+        let ws = fn_body(src, "init_websocket_relay_series");
+        let wt = fn_body(src, "init_webtransport_relay_series");
+        let common = fn_body(src, "init_relay_common_series");
+
+        for (init, body) in [
+            ("init_websocket_relay_series", ws),
+            ("init_webtransport_relay_series", wt),
+        ] {
+            assert!(
+                body.contains("init_relay_common_series()"),
+                "{init} must delegate to init_relay_common_series (issue 2645)"
+            );
+        }
+        assert!(common.contains("&LEGACY_TOKEN_TYPE_ACCEPTED_TOTAL)"));
+        assert!(common.contains("&RELAY_NATS_PUBLISH_LATENCY_MS)"));
+
+        // WsChatSession exists only in the WS binary; spawn_scheduler_lag_probe only in WT.
+        assert!(ws.contains("&WS_FRAGMENTED_INBOUND_TOTAL)"));
+        assert!(ws.contains("init_ws_fragment_discard_series()"));
+        assert!(!wt.contains("WS_FRAGMENTED_INBOUND_TOTAL"));
+        assert!(!wt.contains("init_ws_fragment_discard_series"));
+        assert!(wt.contains("&RELAY_SCHEDULER_LAG_MS)"));
+        assert!(!ws.contains("RELAY_SCHEDULER_LAG_MS"));
+    }
+
+    /// Presence, not placement: relocating a call after the server starts still passes.
+    #[test]
+    fn every_binary_serving_metrics_calls_its_process_init() {
+        for (bin, bin_src, init) in METRICS_BINS {
+            let uncommented: String = bin_src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                uncommented.contains(&format!("{init}()")),
+                "{bin} serves /metrics but never calls {init}() — its series stay absent \
+                 until first incremented (issue 2645)"
+            );
+        }
     }
 
     #[test]

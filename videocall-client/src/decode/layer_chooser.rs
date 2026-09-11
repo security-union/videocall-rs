@@ -1075,8 +1075,7 @@ impl ReceiveLayerBounds {
 ///
 /// This reflects the **post-clamp** selected layer (what is actually decoded),
 /// so it can never exceed the user's `max` bound — matching the needle's stated
-/// expectation. `width`/`height` (and `kbps`) are resolved from the per-kind
-/// layer ladder via [`received_layer_snapshot`]. `fps` is left `None` here
+/// expectation. `fps` is left `None` here
 /// (the ladder's target fps is a publisher hint, not the received rate; the UI
 /// already has received-fps elsewhere). Cheap to construct and poll per render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1089,7 +1088,9 @@ pub struct ReceivedLayerSnapshot {
     /// (e.g. how many distinct layers the source ladder defines). Lets the UI
     /// render "layer 1 of 3".
     pub layer_count: u32,
-    /// Resolution of the decoded layer in pixels (0 for audio).
+    /// Resolution of the decoded layer in pixels; `0` for audio and for an unstamped
+    /// publisher. The per-peer producers replace the bare resolver's ladder BOX with
+    /// the sender's own fit (#2659 video, #2343 screen).
     pub width: u32,
     pub height: u32,
     /// Approximate bitrate of the decoded layer in kbps, from the ladder.
@@ -1366,9 +1367,9 @@ pub fn size_cap_layer(
 /// `layer_count` are clamped into range, so an explicit 1-layer (flag-off) input
 /// always yields a valid layer-0 snapshot.
 ///
-/// Used for both layer SELECTION (notably [`size_cap_layer`]'s #1256 tile-size lid)
-/// and the readouts the user sees, because there is one camera ladder:
-/// `videocall_aq::constants::simulcast_layers` is the single source of ladder truth.
+/// The layer SELECTION resolver ([`size_cap_layer`]'s #1256 lid), which must key off
+/// `videocall_aq::constants::simulcast_layers`. Its geometry is that ladder's BOUNDING
+/// BOX, so every READOUT producer overwrites it with the sender's fit (#2659) first.
 pub fn received_layer_snapshot(
     kind: PrefMediaKind,
     layer_index: u32,

@@ -19,6 +19,7 @@
 use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::components::handler_cell::use_handler_cell;
+use crate::components::icons::peer::PeerIcon;
 use crate::components::media_metrics_overlay::{
     media_metrics_overlay, MediaMetricsOverlay, MediaMetricsOverlayCtx,
 };
@@ -99,6 +100,28 @@ impl std::fmt::Display for EncoderSettings {
     }
 }
 
+/// Inline style for `.host-video-wrapper`. Dioxus patches individual CSS
+/// properties, so every branch must state all of them. A hidden self view
+/// reuses the camera-off collapse, keeping the `<video>` mounted and attached.
+pub fn host_video_wrapper_style(
+    video_enabled: bool,
+    self_in_grid: bool,
+    self_hidden: bool,
+) -> &'static str {
+    if !video_enabled || self_hidden {
+        "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
+    } else if self_in_grid {
+        "position:relative; width:100%; height:100%; opacity:1; overflow:hidden; pointer-events:auto;"
+    } else {
+        "position:relative; width:100%; height:auto; opacity:1; overflow:hidden; pointer-events:auto;"
+    }
+}
+
+/// A hidden self view must not paint a placeholder over the collapsed tile.
+pub fn show_camera_off_placeholder(video_enabled: bool, self_hidden: bool) -> bool {
+    !video_enabled && !self_hidden
+}
+
 #[component]
 pub fn Host(
     share_screen: bool,
@@ -135,6 +158,12 @@ pub fn Host(
     /// and publishes it here once on mount; `None` until then. (#1131 unify)
     #[props(default)]
     publish_perf_controls: Option<Signal<Option<PerfControlsHandle>>>,
+    /// Issue 66: in the participant grid, where the cell owns the aspect ratio.
+    #[props(default)]
+    self_in_grid: bool,
+    /// Issue 66: hidden; the `<video>` stays mounted, only its box collapses.
+    #[props(default)]
+    self_hidden: bool,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
@@ -363,9 +392,6 @@ pub fn Host(
             // #1561: screen + audio layer metrics.
             screen.effective_screen_layer_count(),
             screen.shared_active_layer_count(),
-            microphone.effective_audio_layers(),
-            microphone.congestion_layer_ceiling(),
-            microphone.shared_user_layer_ceiling(),
         );
 
         // Wire up encoder controls. Issue #1108: the encoder AQ is now a
@@ -1158,7 +1184,7 @@ pub fn Host(
     // (the grid filters out the local session — attendants.rs), so the sending
     // overlay is rendered HERE, sourced from the live send snapshot
     // (`LiveQualitySnapshot`: send resolution / target fps / audio send kbps).
-    // Built only when the diagnostics "Show media metrics on tiles" checkbox is
+    // Built only when the diagnostics "Show diagnostics on tiles" checkbox is
     // on; `None` while the camera is off (the snapshot is camera-gated), so it
     // shows only while publishing video. It refreshes at Host's natural
     // re-render cadence rather than on a forced timer — send metrics are
@@ -1181,7 +1207,7 @@ pub fn Host(
     };
 
     // Issue 1885: the self tile's WT/WS transport badge, the connection LED, and
-    // the RTT quality warning now render TOGETHER in one flex cluster
+    // the signal meter now render TOGETHER in one flex cluster
     // (`.host-tile-chrome`) alongside the self-view in `attendants.rs`, so they
     // sit side by side and never overlap (mirroring the peer tiles'
     // `.tile-top-icons`). The badge derivation + render therefore live at that
@@ -1197,17 +1223,13 @@ pub fn Host(
         // style attribute), so both branches must set ALL properties explicitly.
         div {
             class: "host-video-wrapper",
-            style: if video_enabled {
-                "position:relative; width:100%; height:auto; opacity:1; overflow:hidden; pointer-events:auto;"
-            } else {
-                "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
-            },
+            style: host_video_wrapper_style(video_enabled, self_in_grid, self_hidden),
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
             // Issue 1768: SENDING-metrics overlay on the local self-view.
             {media_metrics_overlay(self_metrics_overlay.as_ref())}
             // Issue 1885: the transport badge is NOT rendered here anymore — it
             // moved into the `.host-tile-chrome` flex cluster (with the connection
-            // LED + quality warning) in attendants.rs, so it no longer overlaps
+            // LED + signal meter) in attendants.rs, so it no longer overlaps
             // the LED and persists through camera on/off from a single site.
         }
         // Always-mounted screen share preview — toggled via style so the element
@@ -1222,20 +1244,27 @@ pub fn Host(
             playsinline: "true",
             controls: false,
         }
-        if !video_enabled {
-            div {
-                style: "padding:var(--space-4); display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; width:100%; aspect-ratio:16/9;",
-                div { class: "placeholder-content",
-                    svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                        path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
-                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
-                    }
-                    span { class: "placeholder-text", "Camera Off" }
+        if show_camera_off_placeholder(video_enabled, self_hidden) {
+            if self_in_grid {
+                div {
+                    class: "self-tile-camera-off",
+                    div { class: "placeholder-content", PeerIcon {} }
                 }
-                // Issue 1885: the transport badge is rendered once in the
-                // `.host-tile-chrome` cluster (attendants.rs), a direct `.host`
-                // child, so it already persists through camera-off — no per-branch
-                // copy is needed here (this is what removed the LED overlap).
+            } else {
+                div {
+                    style: "padding:var(--space-4); display:flex; align-items:center; justify-content:center; border-radius: 0; position:relative; width:100%; aspect-ratio:16/9;",
+                    div { class: "placeholder-content",
+                        svg { xmlns: "http://www.w3.org/2000/svg", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                            path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                        }
+                        span { class: "placeholder-text", "Camera Off" }
+                    }
+                    // Issue 1885: the transport badge is rendered once in the
+                    // `.host-tile-chrome` cluster (attendants.rs), a direct `.host`
+                    // child, so it already persists through camera-off — no per-branch
+                    // copy is needed here (this is what removed the LED overlap).
+                }
             }
         }
 
@@ -1352,6 +1381,48 @@ fn detach_screen_preview() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_self_view_collapses_the_wrapper_without_unmounting_the_video() {
+        let collapsed = host_video_wrapper_style(false, false, false);
+        assert!(collapsed.contains("width:1px"));
+        assert!(collapsed.contains("opacity:0"));
+        assert_eq!(
+            host_video_wrapper_style(true, false, true),
+            collapsed,
+            "a hidden self view collapses exactly like camera-off"
+        );
+        assert_eq!(
+            host_video_wrapper_style(true, true, true),
+            collapsed,
+            "hidden wins over grid placement"
+        );
+    }
+
+    #[test]
+    fn grid_placement_fills_the_cell_and_corner_derives_height_from_width() {
+        let grid = host_video_wrapper_style(true, true, false);
+        assert!(grid.contains("height:100%"), "grid cell owns the height");
+        assert!(grid.contains("opacity:1"));
+
+        let corner = host_video_wrapper_style(true, false, false);
+        assert!(
+            corner.contains("height:auto"),
+            "the corner tile derives height from its 16:9 wrapper"
+        );
+        assert_ne!(grid, corner);
+    }
+
+    #[test]
+    fn a_hidden_self_view_paints_no_camera_off_placeholder() {
+        assert!(show_camera_off_placeholder(false, false));
+        assert!(
+            !show_camera_off_placeholder(false, true),
+            "hidden must not paint a placeholder over the collapsed tile"
+        );
+        assert!(!show_camera_off_placeholder(true, false));
+        assert!(!show_camera_off_placeholder(true, true));
+    }
 
     /// #1193: Dioxus constructor seeds resolve from the centralized AQ tier
     /// tables instead of the retired runtime-config bitrate keys.

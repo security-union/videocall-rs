@@ -1385,11 +1385,6 @@ impl MicrophoneEncoder {
         }
     }
 
-    /// Returns a clone of the user layer ceiling atomic for the health reporter.
-    pub fn shared_user_layer_ceiling(&self) -> Rc<AtomicU32> {
-        self.shared_user_layer_ceiling.clone()
-    }
-
     /// Replace the internal CONGESTION audio layer-ceiling atom with an
     /// externally-owned one (issue #621).
     ///
@@ -1402,12 +1397,6 @@ impl MicrophoneEncoder {
     /// (which is not running in the audio-only case).
     pub fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>) {
         self.shared_congestion_layer_ceiling = ceiling;
-    }
-
-    /// The shared CONGESTION audio layer-ceiling atom, for wiring into
-    /// [`VideoCallClient`] or for a host test to drive/observe (issue #621).
-    pub fn congestion_layer_ceiling(&self) -> Arc<AtomicU32> {
-        self.shared_congestion_layer_ceiling.clone()
     }
 
     /// Replace the internal single-layer audio BITRATE floor atom with an

@@ -79,6 +79,8 @@ pub(crate) mod screen_share_detach_sizing;
 #[cfg(target_arch = "wasm32")]
 pub mod screen_share_detach;
 pub mod search_modal;
+pub mod self_view;
+pub mod self_view_hidden_pill;
 pub mod signal_quality;
 pub mod toggle_switch;
 
@@ -88,7 +90,6 @@ pub mod video_control_buttons;
 pub mod waiting_room;
 
 pub mod canvas_generator;
-pub mod chat_sidebar;
 mod peer_list;
 pub mod peer_tile;
 pub mod pre_join_preview;

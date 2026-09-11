@@ -1,7 +1,9 @@
 import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 
 /**
  * Per-peer screen-share diagnostics (HCL issue #883).
@@ -67,6 +69,7 @@ async function joinMeetingAs(
   meetingId: string,
   username: string,
 ): Promise<Page> {
+  await enableDiagnosticsTileIndicators(context);
   const page = await context.newPage();
   await page.goto("/");
   await page.waitForTimeout(1500);
@@ -222,10 +225,9 @@ test.describe("Peer screen-share diagnostics", () => {
       // recorded — the polyline / legend / tooltip are all gated on this.
       await hostPage.waitForTimeout(5000);
 
-      // Open the signal-quality popup for the remote peer. Once screen share
-      // is active the layout is split; the bars icon is still rendered inside
-      // the peer's tile (whichever side it lives on).
-      const signalButton = hostPage.locator('button[aria-label="Show signal quality"]').first();
+      // CAMERA disc: a share is active and the screen tile's disc shares the
+      // testid, but opens the ScreenOnly popup — the polyline count would fail.
+      const signalButton = hostPage.locator(CAMERA_PEER_SIGNAL_DISC).first();
       await expect(signalButton).toBeVisible({ timeout: 15_000 });
       await signalButton.click();
 

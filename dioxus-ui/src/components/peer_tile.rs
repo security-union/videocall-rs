@@ -16,23 +16,24 @@
  * conditions.
  */
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::components::canvas_generator::{
     generate_for_peer, AudioLevels, PinnedTile, SignalPopupHandlers, TileMode,
 };
+use crate::components::icons::signal_spark::spark_svg_markup;
 use crate::components::media_metrics_overlay::{
     next_overlay_fps, overlay_audio_kbps, overlay_audio_kbps_display, overlay_painted_fps_sample,
     parse_resolution, MediaMetricsOverlay, MediaMetricsOverlayCtx, ScreenMetricsOverlay,
 };
 use crate::components::signal_quality::{
-    PeerSignalHistory, SampleData, SignalInfo, SignalMeterMode, SignalPopupPosition,
-    SignalPopupState,
+    peer_signal_aria, peer_signal_title, prefers_reduced_motion, spark_node_id, PeerSignalHistory,
+    SampleData, SignalInfo, SignalMeterMode, SignalPopupPosition, SignalPopupState, SparkPaint,
 };
 use crate::context::{
-    AppearanceSettingsCtx, MeetingTimeCtx, PeerMetadataCtx, PeerSignalHistoryMap, RaisedHandsCtx,
-    SignalPopupStateMap, VideoCallClientCtx,
+    AppearanceSettingsCtx, MeetingTimeCtx, PeerAudioLivenessMap, PeerMetadataCtx,
+    PeerSignalHistoryMap, RaisedHandsCtx, SignalPopupStateMap, VideoCallClientCtx,
 };
 use dioxus::prelude::*;
 use futures::future::AbortHandle;
@@ -190,6 +191,18 @@ pub fn PeerTile(
     // 0.0 means "never armed", which `admit_glow_deadman_rearm` reads as
     // arbitrarily old and therefore always admits.
     let glow_deadman_armed_at: Rc<RefCell<f64>> = use_hook(|| Rc::new(RefCell::new(0.0)));
+    let fast_path_verdict: Rc<Cell<FastPathVerdict>> =
+        use_hook(|| Rc::new(Cell::new(FastPathVerdict::default())));
+    // NOT a signal: ageing the reading must not re-render. Context-owned so a
+    // grid <-> split remount cannot reset it to the exempt sentinel (issue 2660).
+    let audio_buffer_stamp: Rc<Cell<f64>> = {
+        let mut map = use_context::<PeerAudioLivenessMap>();
+        let mut entry = map.write();
+        entry
+            .entry(peer_id.clone())
+            .or_insert_with(|| Rc::new(Cell::new(0.0)))
+            .clone()
+    };
 
     // Signal quality tracking: raw metrics from diagnostics events
     let mut fps_received = use_signal(|| 0.0_f64);
@@ -235,6 +248,8 @@ pub fn PeerTile(
     // `videocall-client/src/connection/connection.rs`), plus an extra
     // emission whenever that peer's media state transitions.
     let mut peer_transport = use_signal(|| None::<String>);
+    let overlay_ctx = try_use_context::<MediaMetricsOverlayCtx>().map(|c| c.0);
+    let overlay_enabled = overlay_ctx.map(|s| s()).unwrap_or(false);
     // Look up or create this peer's signal history in the shared context.
     // The history lives in a context-provided map so it survives PeerTile
     // remounts caused by layout switches (e.g., grid -> split on screen share).
@@ -261,7 +276,7 @@ pub fn PeerTile(
     let popup_key = (peer_id.clone(), meter_mode);
     let signal_popup_state: Option<SignalPopupState> =
         popup_state_map.read().get(&popup_key).copied();
-    let show_signal_popup = signal_popup_state.is_some();
+    let show_signal_popup = overlay_enabled && signal_popup_state.is_some();
     let signal_popup_free_position = match signal_popup_state {
         Some(SignalPopupState {
             position: SignalPopupPosition::Free { left, top },
@@ -336,9 +351,21 @@ pub fn PeerTile(
     let mic_hold_for_effect = mic_hold_timeout.clone();
     let glow_deadman_for_effect = glow_deadman.clone();
     let glow_deadman_armed_at_for_effect = glow_deadman_armed_at.clone();
+    let fast_path_verdict_for_effect = fast_path_verdict.clone();
+    let audio_buffer_stamp_for_effect = audio_buffer_stamp.clone();
     let last_sample_for_effect = last_sample_ts.clone();
     let last_peer_status_for_effect = last_peer_status_ts.clone();
     let signal_history_for_effect = signal_history.clone();
+    // Issue 2661. `last_paint` is the repaint guard's memory; `render_paint` is
+    // the same value handed to the render so RSX and the DOM agree and the tile
+    // does not recompute `spark_paint` on every unrelated re-render.
+    let screen_scope = matches!(render_mode, TileMode::ScreenOnly);
+    let spark_node = spark_node_id(&peer_id, screen_scope);
+    let last_paint: Rc<RefCell<Option<SparkPaint>>> = use_hook(|| Rc::new(RefCell::new(None)));
+    let render_paint: Rc<RefCell<Option<SparkPaint>>> = use_hook(|| Rc::new(RefCell::new(None)));
+    let last_paint_for_effect = last_paint.clone();
+    let render_paint_for_effect = render_paint.clone();
+    let spark_node_for_effect = spark_node.clone();
     // Issue #2190: the diagnostics sampler needs the decode-set predicate
     // (`is_decoding_peer`) to fold the signal-meter enabled flags. Cloned OUT here because
     // the `use_effect` closure below moves its captures while the render body still needs
@@ -388,11 +415,18 @@ pub fn PeerTile(
         let mic_hold = mic_hold_for_effect.clone();
         let deadman = glow_deadman_for_effect.clone();
         let deadman_armed_at = glow_deadman_armed_at_for_effect.clone();
+        let fast_path = fast_path_verdict_for_effect.clone();
+        let buffer_stamp = audio_buffer_stamp_for_effect.clone();
         let last_sample = last_sample_for_effect.clone();
         let last_peer_status = last_peer_status_for_effect.clone();
         // Clone the Rc for the async block so the outer FnMut closure can be
         // called again without consuming the captured value.
         let signal_hist = signal_history_for_effect.clone();
+        let sample_last_paint = last_paint_for_effect.clone();
+        let sample_render_paint = render_paint_for_effect.clone();
+        let sample_spark_node = spark_node_for_effect.clone();
+        let sample_screen_scope = screen_scope;
+        let sample_overlay_ctx = overlay_ctx;
 
         // Subscribe to global diagnostics for peer_status updates
         let (abort_handle, abort_reg) = AbortHandle::new_pair();
@@ -423,6 +457,8 @@ pub fn PeerTile(
                     &mic_hold,
                     &deadman,
                     &deadman_armed_at,
+                    &fast_path,
+                    &buffer_stamp,
                     &mut fps_received,
                     &mut fps_painted,
                     &mut expand_rate,
@@ -517,7 +553,41 @@ pub fn PeerTile(
                     video_enabled: sample_video_en,
                     decode_paused_locally: sample_decode_paused,
                 };
-                maybe_push_signal_sample(&last_sample, &signal_hist, &data, &mut sample_counter);
+                // The push stays LEFT of the `&&` so history accrues while the
+                // disc is hidden; `.peek()` so the sampler never wakes this scope.
+                if maybe_push_signal_sample(&last_sample, &signal_hist, &data, &mut sample_counter)
+                    && sample_overlay_ctx.map(|s| *s.peek()).unwrap_or(false)
+                {
+                    let hist = signal_hist.borrow();
+                    let level = rendered_signal_level(
+                        &hist,
+                        *audio_enabled.peek(),
+                        *video_enabled.peek(),
+                        *screen_enabled.peek(),
+                        sample_is_decoding,
+                    );
+                    let paint = hist.spark_paint(
+                        level,
+                        *audio_enabled.peek(),
+                        *video_enabled.peek(),
+                        *screen_enabled.peek(),
+                        sample_is_decoding,
+                        prefers_reduced_motion(),
+                    );
+                    drop(hist);
+                    let name = sample_client
+                        .get_peer_display_name(&sample_peer_id)
+                        .or_else(|| sample_client.get_peer_user_id(&sample_peer_id))
+                        .unwrap_or_else(|| sample_peer_id.clone());
+                    refresh_peer_disc(
+                        &sample_spark_node,
+                        &name,
+                        sample_screen_scope,
+                        &paint,
+                        &sample_last_paint,
+                    );
+                    *sample_render_paint.borrow_mut() = Some(paint);
+                }
             }
         };
         let abortable = Abortable::new(fut, abort_reg);
@@ -553,6 +623,24 @@ pub fn PeerTile(
     // copying ~3.4 MB/s of data when 20 peers update at ~2 Hz.
     let sig_history = signal_history.borrow();
     let sig_level = rendered_signal_level(&sig_history, audio_en, video_en, screen_en, is_decoding);
+    // Reuse the sampler's paint. Recomputing runs on EVERY re-render, and a
+    // fresh value defeats `SignalSparkIcon`'s memoisation, adding a second
+    // `innerHTML` write. The fallback covers the first render; the gate covers
+    // the hidden disc, whose sampler never populates the cache at all.
+    let sig_spark = if overlay_enabled {
+        render_paint.borrow().clone().unwrap_or_else(|| {
+            sig_history.spark_paint(
+                sig_level,
+                audio_en,
+                video_en,
+                screen_en,
+                is_decoding,
+                prefers_reduced_motion(),
+            )
+        })
+    } else {
+        SparkPaint::default()
+    };
     let sig_samples = if show_signal_popup {
         // Reading sample_counter subscribes this component to updates from the
         // diagnostics task, ensuring the chart re-renders when new samples arrive.
@@ -575,51 +663,18 @@ pub fn PeerTile(
         None
     };
 
-    // Issue #1483: per-tile "WT"/"WS" transport badge. Computed on EVERY render
-    // (not gated on the popup) so the badge shows whenever the flag is on and
-    // the transport is known. Gating order:
-    //   1. server-side `transportBadgeEnabled` flag (default OFF). Evaluated
-    //      ONCE here per tile render — `transport_badge_enabled()` re-parses the
-    //      `__APP_CONFIG` JSON, so hoisting it out of the three render arms in
-    //      `generate_for_peer` avoids paying that cost per arm.
-    //   2. transport source: map the raw `peer_transport()` signal string,
-    //      which is set from the REMOTE `peer_status` diagnostics metric.
-    //   3. Only `Some(Wt | Ws)` is threaded down — an `Unknown` (or no transport
-    //      yet) collapses to `None`, so the render site never draws a badge for
-    //      an unclassified transport. When the flag is off, `badge_transport`
-    //      is `None` regardless of transport, so nothing renders.
-    //
-    // REMOTE-SOURCED here (issue #1883): this signal is fed ONLY by the remote
-    // `peer_status` / `peer_transport` diagnostics metric the decode pipeline
-    // emits for REMOTE peers (`peer_decode_manager.rs`). Every tile this function
-    // renders IS a remote peer — `attendants.rs` filters the local session out of
-    // the peer-tile list (`display_peers` excludes `get_own_session_id()`), so
-    // `is_self_peer` is only ever true here for a SIBLING SAME-ACCOUNT tab, which
-    // is itself a separate remote connection with its OWN announced transport.
-    // Sourcing such a sibling tile from the LOCAL transport would be wrong (it is
-    // a different connection), so it correctly stays remote-sourced.
-    //
-    // The local user's OWN self-view is rendered by `Host` (host.rs), NOT a
-    // `PeerTile`. Issue #1883 adds the self transport badge THERE, sourced from
-    // the public `VideoCallClient::active_transport()` accessor (the client-wide
-    // active transport) — mirroring how issue #1768 puts the self media-metrics
-    // overlay in `Host` and peer overlays here.
     let badge_transport: Option<crate::components::canvas_generator::TransportBadge> =
-        if crate::constants::transport_badge_enabled().unwrap_or(false) {
+        if overlay_enabled && crate::constants::transport_badge_enabled().unwrap_or(false) {
             use crate::components::canvas_generator::{transport_badge_from_str, TransportBadge};
             let resolved = match peer_transport() {
                 Some(raw) => transport_badge_from_str(&raw),
                 None => TransportBadge::Unknown,
             };
-            // Drop Unknown to None so the render site never draws an
-            // unclassified badge (the "Unknown → nothing" half of the gate).
             match resolved {
                 TransportBadge::Unknown => None,
                 known => Some(known),
             }
         } else {
-            // Flag OFF (the default): no badge, no transport read, no extra
-            // re-render subscription.
             None
         };
 
@@ -800,7 +855,7 @@ pub fn PeerTile(
         None
     };
     // Issue 1768: per-tile media-metrics overlay payload. Computed ONLY when the
-    // diagnostics "Show media metrics on tiles" checkbox is on (default off).
+    // diagnostics "Show diagnostics on tiles" checkbox is on (default off).
     // COST: with the checkbox OFF a tile pays nothing — only the enabled flag
     // (which rarely changes) is read, so none of the per-metric signals are
     // subscribed. With it ON, the payload is rebuilt on EVERY render of this tile
@@ -811,9 +866,6 @@ pub fn PeerTile(
     // and the received-audio kbps signal (#1769). There is NO per-render
     // `per_peer_received_snapshots()` scan any more, so the payload build is O(1)
     // per tile instead of the previous O(N²)-across-N-speaking-tiles snapshot walk.
-    let overlay_enabled = try_use_context::<MediaMetricsOverlayCtx>()
-        .map(|c| (c.0)())
-        .unwrap_or(false);
     let metrics_overlay: Option<MediaMetricsOverlay> = if overlay_enabled {
         // A grid PeerTile is always a REMOTE peer: the local user's own self-view
         // is rendered by `Host` (which filters the local session out of the grid),
@@ -881,7 +933,9 @@ pub fn PeerTile(
         render_mode,
         my_session_id.as_deref(),
         SignalInfo {
+            show_signal_meter: overlay_enabled,
             level: sig_level,
+            spark: sig_spark,
             decode_paused_locally: sig_level.is_unmeasured(),
             history: sig_samples,
             meeting_start_ms: {
@@ -999,6 +1053,143 @@ fn holds_live_glow(current: f32) -> bool {
 /// lit by a level too small to clear the gate on its way down.
 fn glow_write_reaches_signal(lvl: f32, prev: f32) -> bool {
     (lvl == 0.0 && prev != 0.0) || ui_level_write_is_visible(lvl, prev)
+}
+
+/// What the decoder-side VAD last reported for this peer (issue 2660).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum FastPathVerdict {
+    #[default]
+    Unheard,
+    Speaking,
+    Silent,
+}
+
+impl FastPathVerdict {
+    fn from_speaking(speaking: bool) -> Self {
+        if speaking {
+            Self::Speaking
+        } else {
+            Self::Silent
+        }
+    }
+}
+
+pub(crate) fn record_fast_path_verdict(cell: &Cell<FastPathVerdict>, speaking: Option<bool>) {
+    if let Some(s) = speaking {
+        cell.set(FastPathVerdict::from_speaking(s));
+    }
+}
+
+/// Mirrors the unexported 1 Hz `set_interval` in `neteq/src/bin/neteq_worker.rs`.
+const NETEQ_STATS_INTERVAL_MS: u32 = 1_000;
+
+/// How long the veto survives with no further evidence audio is arriving: a full
+/// heartbeat gap PLUS one sampling period, so a `buffer_ms` flapping across the
+/// floor cannot pulse the border at the keepalive.
+const fn liveness_grace_ms(keepalive_ms: u32, stats_interval_ms: u32) -> u32 {
+    keepalive_ms + stats_interval_ms
+}
+pub(crate) const LIVENESS_GRACE_MS: u32 =
+    liveness_grace_ms(HEARTBEAT_KEEPALIVE_INTERVAL_MS, NETEQ_STATS_INTERVAL_MS);
+
+/// A stalled NetEQ pins at the `leftover_samples` residue, not zero: one output
+/// frame minus the overlap, 480 - 144 = 7 ms at 48 kHz — frame geometry, not the
+/// link. Pinned cross-crate by `buffer_depth_collapses_to_a_bounded_residue_throughout_a_stall`.
+/// One 20 ms packet is 2x that and 4x below the 80 ms target floor; the 4x is
+/// load-bearing because this snapshot swings frame-to-frame, and a dip under it
+/// lapses the veto toward a glow — the safe direction.
+const LIVE_BUFFER_FLOOR_MS: f64 = 20.0;
+
+/// Gates where the sample lands, so only a reading clearing the stall residue
+/// refreshes the grace window.
+pub(crate) fn records_live_audio(buffer_ms: f64) -> bool {
+    buffer_ms >= LIVE_BUFFER_FLOOR_MS
+}
+
+/// Distinct newtypes so the compiler rejects a swap at the call site: as bare
+/// `f64`s an exchange silently inverts the age and disables the veto for every
+/// peer, which no fixture can be trusted to catch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LiveStamp(pub(crate) f64);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NowMs(pub(crate) f64);
+
+/// Covers both failures: samples that stop age out, starved ones never refresh.
+pub(crate) fn audio_path_is_live(last_live_at: LiveStamp, now: NowMs) -> bool {
+    (0.0..=f64::from(LIVENESS_GRACE_MS)).contains(&(now.0 - last_live_at.0))
+}
+
+/// Six keepalives, so jitter cannot trip it and it outlasts the grace window.
+const fn unheard_glow_cap_ms(keepalive_ms: u32) -> u32 {
+    keepalive_ms * 6
+}
+pub(crate) const UNHEARD_GLOW_CAP_MS: u32 = unheard_glow_cap_ms(HEARTBEAT_KEEPALIVE_INTERVAL_MS);
+
+const _: () = assert!(
+    unheard_glow_cap_ms(HEARTBEAT_KEEPALIVE_INTERVAL_MS) > LIVENESS_GRACE_MS,
+    "the unheard-glow cap must sit beyond the liveness grace window"
+);
+
+/// `0.0` is the "no sample ever landed" sentinel, which is not staleness.
+pub(crate) fn audio_path_never_heard(last_live_at: LiveStamp) -> bool {
+    last_live_at.0 <= 0.0
+}
+
+/// Retire a heartbeat claim nothing has corroborated for
+/// [`UNHEARD_GLOW_CAP_MS`], so an unchanging one cannot outlive the deadman it
+/// keeps re-arming (issue 2660).
+pub(crate) fn expire_stale_claim(
+    speaking: Option<bool>,
+    last_live_at: LiveStamp,
+    now: NowMs,
+) -> Option<bool> {
+    if speaking != Some(true) || audio_path_never_heard(last_live_at) {
+        return speaking;
+    }
+    // `>` not a range, matching `lapsed_roster_speakers`: a backward wall-clock
+    // step must read as "not stale" rather than blank a peer we can hear.
+    if now.0 - last_live_at.0 > f64::from(UNHEARD_GLOW_CAP_MS) {
+        Some(false)
+    } else {
+        speaking
+    }
+}
+
+/// Fold the decoder's measurement into a **heartbeat's** claim (issue 2660): a
+/// contradicted claim takes rule 1 of [`resolve_audio_level`]. `peer_status` arm
+/// ONLY — a `peer_speaking` event carries the fast path's own verdict.
+pub(crate) fn corroborated_speaking(
+    speaking: Option<bool>,
+    fast_path: FastPathVerdict,
+    audio_path_live: bool,
+) -> Option<bool> {
+    match (speaking, fast_path) {
+        (Some(true), FastPathVerdict::Silent | FastPathVerdict::Unheard) if audio_path_live => {
+            Some(false)
+        }
+        _ => speaking,
+    }
+}
+
+/// The `peer_status` counterpart of [`speaking_event_resolution`], extracted so a
+/// harness reaches the fold without re-implementing the wiring (issue 2660).
+fn heartbeat_resolution(
+    audio_enabled: Option<bool>,
+    audio_lvl: Option<f32>,
+    speaking: Option<bool>,
+    fast_path: FastPathVerdict,
+    last_live_at: LiveStamp,
+    now: NowMs,
+    current: f32,
+) -> (Option<bool>, Option<f32>) {
+    let speaking =
+        corroborated_speaking(speaking, fast_path, audio_path_is_live(last_live_at, now));
+    let speaking = expire_stale_claim(speaking, last_live_at, now);
+    (
+        speaking,
+        effective_level(audio_enabled, audio_lvl, speaking, current),
+    )
 }
 
 /// Resolve the glow level for a peer from the `audio_level` float, the
@@ -1159,6 +1350,7 @@ fn speaking_event_resolution(
     peer_id: &str,
     audio_enabled: bool,
     current: f32,
+    fast_path: &Cell<FastPathVerdict>,
 ) -> Option<(Option<bool>, Option<f32>)> {
     let mut to_peer: Option<&str> = None;
     let mut audio_lvl: Option<f32> = None;
@@ -1174,10 +1366,9 @@ fn speaking_event_resolution(
     if to_peer != Some(peer_id) {
         return None;
     }
-    Some((
-        speaking,
-        effective_level(Some(audio_enabled), audio_lvl, speaking, current),
-    ))
+    let resolved = effective_level(Some(audio_enabled), audio_lvl, speaking, current);
+    record_fast_path_verdict(fast_path, speaking);
+    Some((speaking, resolved))
 }
 
 /// Should this event refresh the glow deadman (see [`GLOW_DEADMAN_MS`])?
@@ -1220,7 +1411,7 @@ const GLOW_DEADMAN_MS: u32 = glow_deadman_ms(HEARTBEAT_KEEPALIVE_INTERVAL_MS);
 
 /// The 2.5x rule behind [`GLOW_DEADMAN_MS`], as a function of the heartbeat
 /// period so the relationship can be exercised directly.
-const fn glow_deadman_ms(keepalive_ms: u32) -> u32 {
+pub(crate) const fn glow_deadman_ms(keepalive_ms: u32) -> u32 {
     keepalive_ms * 5 / 2
 }
 
@@ -1486,6 +1677,8 @@ fn handle_diagnostics_event(
     mic_hold_timeout: &Rc<RefCell<Option<Timeout>>>,
     glow_deadman: &Rc<RefCell<Option<Timeout>>>,
     glow_deadman_armed_at: &Rc<RefCell<f64>>,
+    fast_path_verdict: &Rc<Cell<FastPathVerdict>>,
+    audio_buffer_stamp: &Rc<Cell<f64>>,
     fps_received: &mut Signal<f64>,
     fps_painted: &mut Signal<f64>,
     expand_rate: &mut Signal<f64>,
@@ -1550,7 +1743,15 @@ fn handle_diagnostics_event(
             // `audio_level` float is producer-hardcoded to 0.0 — and a
             // heartbeat that claims muted-but-speaking is rejected outright.
             // See `effective_level` / `resolve_audio_level`.
-            let resolved_level = effective_level(audio, audio_lvl, speaking, *audio_level.peek());
+            let (speaking, resolved_level) = heartbeat_resolution(
+                audio,
+                audio_lvl,
+                speaking,
+                fast_path_verdict.get(),
+                LiveStamp(audio_buffer_stamp.get()),
+                NowMs(js_sys::Date::now()),
+                *audio_level.peek(),
+            );
             apply_resolved_level(
                 resolved_level,
                 speaking,
@@ -1588,6 +1789,7 @@ fn handle_diagnostics_event(
                 peer_id,
                 *audio_enabled.peek(),
                 *audio_level.peek(),
+                fast_path_verdict,
             ) else {
                 return;
             };
@@ -1674,6 +1876,9 @@ fn handle_diagnostics_event(
                 expand_rate.set(rate / 16.384);
             }
             if let Some(b) = buf_ms {
+                if records_live_audio(b) {
+                    audio_buffer_stamp.set(js_sys::Date::now());
+                }
                 audio_buffer_ms.set(b);
             }
         }
@@ -1797,24 +2002,117 @@ fn handle_diagnostics_event(
     }
 }
 
+/// Repaint one peer's disc in place. Doing it through Dioxus would re-render
+/// every tile once a second, and memoizing `PeerTile` is not an escape hatch —
+/// it reads non-reactive client state, which is what sank PR 2125.
+pub fn refresh_peer_disc(
+    node_id: &str,
+    name: &str,
+    screen_scope: bool,
+    paint: &SparkPaint,
+    last_paint: &RefCell<Option<SparkPaint>>,
+) {
+    // Before the markup build and before the query, so an unchanged tick costs
+    // one struct compare. Quantisation is what makes measured peers land here
+    // too, not just `Unmeasured`/`Lost` ones.
+    if last_paint.borrow().as_ref() == Some(paint) {
+        return;
+    }
+    *last_paint.borrow_mut() = Some(paint.clone());
+
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    // The attribute value is a session id plus an optional `:screen` suffix, so
+    // it cannot carry selector syntax.
+    let selector = format!("[data-signal-spark=\"{node_id}\"]");
+    let Ok(sparks) = document.query_selector_all(&selector) else {
+        return;
+    };
+    let markup = spark_svg_markup(paint);
+    let aria = peer_signal_aria(name, paint.level, paint.sample_count, screen_scope);
+    let title = peer_signal_title(
+        paint.level,
+        paint.sample_count,
+        paint.latency_ms,
+        screen_scope,
+    );
+    let state = if paint.level.is_unmeasured() {
+        "unmeasured"
+    } else if paint.level.is_lost() {
+        "lost"
+    } else {
+        "measured"
+    };
+
+    for i in 0..sparks.length() {
+        let Some(spark) = sparks
+            .item(i)
+            .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+        else {
+            continue;
+        };
+        spark.set_inner_html(&markup);
+        let Ok(Some(disc)) = spark.closest(".signal-indicator") else {
+            continue;
+        };
+        // Only when changed: setting an attribute to its current value still
+        // mutates it, and some AT re-announce on a name mutation.
+        if disc.get_attribute("aria-label").as_deref() != Some(aria.as_str()) {
+            let _ = disc.set_attribute("aria-label", &aria);
+        }
+        let _ = disc.set_attribute("title", &title);
+        let _ = disc.set_attribute("data-signal-state", state);
+        let _ = disc.set_attribute("data-signal-level", &paint.level.bars().to_string());
+        let _ = disc.set_attribute("data-signal-lost", &paint.level.is_lost().to_string());
+        let _ = disc.set_attribute("data-signal-samples", &paint.sample_count.to_string());
+    }
+}
+
 /// Push a signal quality sample at most once per second.
 /// Increments `sample_counter` so the UI re-renders when the popup is open.
+/// Returns whether a sample was actually recorded, so the caller's disc repaint
+/// runs at the same 1 Hz cadence rather than on every diagnostics event.
 fn maybe_push_signal_sample(
     last_ts: &Rc<RefCell<f64>>,
     signal_history: &Rc<RefCell<PeerSignalHistory>>,
     data: &SampleData,
     sample_counter: &mut Signal<u32>,
-) {
-    let now = js_sys::Date::now();
+) -> bool {
+    let mut counter = *sample_counter;
+    maybe_push_signal_sample_at(
+        last_ts,
+        signal_history,
+        data,
+        &mut move || {
+            let prev = *counter.peek();
+            counter.set(prev.wrapping_add(1));
+        },
+        js_sys::Date::now(),
+    )
+}
+
+/// The rate gate with the clock and the counter bump passed in so a host test
+/// can drive it — a `Signal` needs a Dioxus runtime. The returned `bool` paces
+/// the caller's repaint, so it is load-bearing.
+fn maybe_push_signal_sample_at(
+    last_ts: &Rc<RefCell<f64>>,
+    signal_history: &Rc<RefCell<PeerSignalHistory>>,
+    data: &SampleData,
+    on_recorded: &mut dyn FnMut(),
+    now: f64,
+) -> bool {
     let prev = *last_ts.borrow();
-    if now - prev < 1000.0 {
-        return;
+    if now - prev < SIGNAL_SAMPLE_INTERVAL_MS {
+        return false;
     }
     *last_ts.borrow_mut() = now;
-    signal_history.borrow_mut().push_sample(data);
-    let prev_count = *sample_counter.peek();
-    sample_counter.set(prev_count.wrapping_add(1));
+    signal_history.borrow_mut().push_sample_at(data, now);
+    on_recorded();
+    true
 }
+
+const SIGNAL_SAMPLE_INTERVAL_MS: f64 = 1000.0;
 
 /// Update `mic_audio_level` with a 1-second hold: when audio drops to zero the
 /// mic signal keeps its last positive value for 1 s so the icon stays green.
@@ -1892,9 +2190,58 @@ fn rendered_signal_level(
 mod tests {
     use super::*;
 
+    const STALLED_BUFFER_MS: f64 = 7.0;
+    /// The deployed target: `K_START_DELAY_MS` 80 (`neteq/src/delay_manager.rs`)
+    /// plus the worker's `additional_delay_ms` 80, per `target_delay_ms`.
+    const HEALTHY_BUFFER_MS: f64 = 160.0;
+
+    fn unheard() -> Cell<FastPathVerdict> {
+        Cell::new(FastPathVerdict::Unheard)
+    }
+
     /// A dark tile. Used where the `current` level is irrelevant to the rule
     /// under test, so the interesting argument stands out.
     const DARK: f32 = 0.0;
+
+    /// Flipping this `bool` to a constant disables every repaint in the app.
+    #[test]
+    fn the_rate_gate_reports_whether_it_recorded() {
+        use crate::components::signal_quality::{PeerSignalHistory, SampleData};
+
+        let last = Rc::new(RefCell::new(0.0));
+        let history = Rc::new(RefCell::new(PeerSignalHistory::new()));
+        let bumps = std::cell::Cell::new(0u32);
+        let mut on_recorded = || bumps.set(bumps.get() + 1);
+        let data = SampleData {
+            audio_enabled: true,
+            ..SampleData::default()
+        };
+
+        assert!(
+            maybe_push_signal_sample_at(&last, &history, &data, &mut on_recorded, 10_000.0),
+            "the first sample must record"
+        );
+        assert!(
+            !maybe_push_signal_sample_at(&last, &history, &data, &mut on_recorded, 10_999.0),
+            "inside the interval it must report NOT recorded, or the caller repaints per event"
+        );
+        assert!(maybe_push_signal_sample_at(
+            &last,
+            &history,
+            &data,
+            &mut on_recorded,
+            11_000.0
+        ));
+        assert_eq!(bumps.get(), 2, "the counter bumps once per RECORDED sample");
+        assert_eq!(
+            history
+                .borrow()
+                .recent_quality_series(true, false, false)
+                .len(),
+            2,
+            "exactly the recorded samples reach the history"
+        );
+    }
 
     /// Issue #2190: the level the tile RENDERS must exclude streams this client is not
     /// decoding — so a healthy parked peer is never badged "connection lost".
@@ -2443,12 +2790,24 @@ mod tests {
     #[test]
     fn a_straggler_speaking_event_cannot_relight_a_muted_peer() {
         assert_eq!(
-            speaking_event_resolution(&speaking_metrics("peer-1", 1, 0.7), "peer-1", false, DARK),
+            speaking_event_resolution(
+                &speaking_metrics("peer-1", 1, 0.7),
+                "peer-1",
+                false,
+                DARK,
+                &unheard()
+            ),
             Some((Some(true), Some(0.0))),
             "a muted peer's straggler speaking event must not light the glow"
         );
         assert_eq!(
-            speaking_event_resolution(&speaking_metrics("peer-1", 1, 0.7), "peer-1", false, 0.8),
+            speaking_event_resolution(
+                &speaking_metrics("peer-1", 1, 0.7),
+                "peer-1",
+                false,
+                0.8,
+                &unheard()
+            ),
             Some((Some(true), Some(0.0))),
             "and it must darken a glow the pre-mute fast path had already lit"
         );
@@ -2468,7 +2827,8 @@ mod tests {
                     &speaking_metrics("peer-1", speaking, level),
                     "peer-1",
                     true,
-                    DARK
+                    DARK,
+                    &unheard()
                 ),
                 Some((
                     Some(speaking != 0),
@@ -2485,10 +2845,569 @@ mod tests {
     #[test]
     fn a_speaking_event_for_another_peer_is_ignored() {
         assert!(
-            speaking_event_resolution(&speaking_metrics("peer-2", 1, 0.7), "peer-1", true, DARK)
-                .is_none(),
+            speaking_event_resolution(
+                &speaking_metrics("peer-2", 1, 0.7),
+                "peer-1",
+                true,
+                DARK,
+                &unheard()
+            )
+            .is_none(),
             "a speaking event addressed to another peer must resolve to nothing"
         );
+    }
+
+    /// Replays diagnostics events against the real glow predicates. `apply`
+    /// mirrors [`apply_resolved_level`], which needs Dioxus `Signal`s.
+    struct GlowTile {
+        level: f32,
+        deadman_armed: bool,
+        verdict: Cell<FastPathVerdict>,
+        buffer_ms: f64,
+        buffer_stamp: f64,
+        now: f64,
+    }
+
+    impl GlowTile {
+        const PEER: &'static str = "peer-1";
+
+        fn new() -> Self {
+            Self {
+                level: 0.0,
+                deadman_armed: false,
+                verdict: Cell::new(FastPathVerdict::default()),
+                buffer_ms: 0.0,
+                buffer_stamp: 0.0,
+                now: 1_000_000.0,
+            }
+        }
+
+        fn hearing_them(&mut self) -> &mut Self {
+            self.sample(HEALTHY_BUFFER_MS)
+        }
+
+        fn sample(&mut self, buffer_ms: f64) -> &mut Self {
+            self.buffer_ms = buffer_ms;
+            if records_live_audio(buffer_ms) {
+                self.buffer_stamp = self.now;
+            }
+            self
+        }
+
+        fn cannot_hear_them(&mut self) -> &mut Self {
+            self.sample(STALLED_BUFFER_MS)
+        }
+
+        fn fast_path(&mut self, speaking: u64, level: f64) {
+            let metrics = speaking_metrics(Self::PEER, speaking, level);
+            let (spoken, resolved) =
+                speaking_event_resolution(&metrics, Self::PEER, true, self.level, &self.verdict)
+                    .expect("the event is addressed to this tile");
+            self.apply(resolved, spoken);
+        }
+
+        fn heartbeat(&mut self, speaking: bool) {
+            let (speaking, resolved) = heartbeat_resolution(
+                Some(true),
+                Some(0.0),
+                Some(speaking),
+                self.verdict.get(),
+                LiveStamp(self.buffer_stamp),
+                NowMs(self.now),
+                self.level,
+            );
+            self.apply(resolved, speaking);
+        }
+
+        fn tick(&mut self, ms: f64) -> &mut Self {
+            self.now += ms;
+            self
+        }
+
+        fn apply(&mut self, resolved: Option<f32>, speaking: Option<bool>) {
+            if refreshes_glow_deadman(resolved, speaking, self.level) {
+                self.deadman_armed = true;
+            }
+            let Some(lvl) = resolved else {
+                return;
+            };
+            if glow_write_reaches_signal(lvl, self.level) {
+                self.level = lvl;
+            }
+            if lvl == 0.0 {
+                self.deadman_armed = false;
+            }
+        }
+
+        fn is_lit(&self) -> bool {
+            self.level > 0.0
+        }
+    }
+
+    /// Deleting both call sites once left all 35 tests green. Spelling-only —
+    /// wrong ARGUMENTS still pass. MUTATION: un-wiring either arm fails this.
+    #[test]
+    fn both_diagnostics_arms_route_through_the_fold() {
+        let src = include_str!("peer_tile.rs");
+        let start = src
+            .find("fn handle_diagnostics_event(")
+            .expect("handle_diagnostics_event must exist");
+        let rest = &src[start..];
+        let end = rest
+            .find("fn maybe_push_signal_sample(")
+            .expect("the scan needs the next fn as its end marker");
+        let body = &rest[..end];
+
+        for needle in ["heartbeat_resolution(", "speaking_event_resolution("] {
+            assert!(
+                body.contains(needle),
+                "the `{needle}` call is gone from handle_diagnostics_event; the decoder verdict \
+                 is no longer folded into the heartbeat and issue 2660 is back"
+            );
+        }
+    }
+
+    #[test]
+    fn the_liveness_stamp_outlives_a_tile_remount() {
+        let src = include_str!("peer_tile.rs");
+        let start = src
+            .find("let audio_buffer_stamp:")
+            .expect("the stamp binding must exist");
+        let decl = &src[start..start + 400];
+        assert!(
+            decl.contains("use_context::<PeerAudioLivenessMap>()"),
+            "`audio_buffer_stamp` is no longer taken from the shared context map. A tile-scoped \
+             stamp resets to the 0.0 never-heard sentinel on a grid <-> split remount, which \
+             `expire_stale_claim` EXEMPTS — issue 2660's stuck border comes straight back."
+        );
+        assert!(
+            !decl.contains("use_hook"),
+            "`audio_buffer_stamp` is back on a per-scope `use_hook`; see above"
+        );
+    }
+
+    #[test]
+    fn the_cap_multiplier_itself_is_pinned() {
+        assert_eq!(
+            UNHEARD_GLOW_CAP_MS, 30_000,
+            "the unheard-glow cap moved. It is the window in which a peer we cannot hear still \
+             glows on an unchanging claim — re-check issue 2660's symptom and issue 2174's glow \
+             before retuning it."
+        );
+        let t0 = 1_000_000.0;
+        assert_eq!(
+            expire_stale_claim(Some(true), LiveStamp(t0), NowMs(t0 + 29_000.0)),
+            Some(true),
+            "a claim 29s old must still stand — this is the lit-side bracket the threshold needs"
+        );
+        assert_eq!(
+            expire_stale_claim(Some(true), LiveStamp(t0), NowMs(t0 + 31_000.0)),
+            Some(false),
+            "and a claim 31s old must be retired"
+        );
+    }
+
+    /// Issue 2660: the sender's gate is latched on by ambient noise, but we ARE
+    /// receiving their audio and the decoder measured silence.
+    #[test]
+    fn a_latched_heartbeat_cannot_relight_a_peer_we_can_still_hear() {
+        let mut tile = GlowTile::new();
+        tile.hearing_them();
+
+        tile.fast_path(1, 0.6);
+        assert!(tile.is_lit(), "the fast path must light a talking peer");
+
+        tile.fast_path(0, 0.0);
+        assert!(!tile.is_lit(), "the decoder's terminal zero drives it dark");
+        assert!(!tile.deadman_armed);
+
+        for keepalive in 1..=20 {
+            tile.tick(f64::from(HEARTBEAT_KEEPALIVE_INTERVAL_MS))
+                .hearing_them();
+            tile.heartbeat(true);
+            assert!(
+                !tile.is_lit(),
+                "keepalive {keepalive}: a peer we can hear, measured silent, must stay dark \
+                 (level = {})",
+                tile.level
+            );
+            assert!(
+                !tile.deadman_armed,
+                "keepalive {keepalive}: deadman must not re-arm"
+            );
+        }
+    }
+
+    /// Issue 2174, preserved. Same verdict, path stalled — concealment sits
+    /// ~650x below the gate, so `Silent` is guaranteed and says nothing. Drives
+    /// the real arm call. MUTATION: vetoing regardless of liveness darkens this.
+    #[test]
+    fn a_stalled_audio_path_leaves_the_heartbeat_glow_alone() {
+        let mut tile = GlowTile::new();
+        tile.hearing_them();
+        tile.fast_path(1, 0.6);
+        tile.fast_path(0, 0.0);
+        assert!(!tile.is_lit());
+        assert_eq!(tile.verdict.get(), FastPathVerdict::Silent);
+
+        tile.tick(f64::from(LIVENESS_GRACE_MS) + 1.0)
+            .cannot_hear_them();
+        tile.heartbeat(true);
+        assert_eq!(
+            tile.level, HEARTBEAT_SOURCED_GLOW_LEVEL,
+            "a peer we cannot hear, still claiming speech, keeps the 2174 glow"
+        );
+        assert!(tile.deadman_armed, "and it must arm a deadman to retire it");
+    }
+
+    /// Issue 2660: brackets the cap at BOTH ends — 2174's glow survives the
+    /// grace window, but an unchanging claim cannot outlive the cap.
+    #[test]
+    fn an_unchanging_claim_cannot_hold_a_tile_lit_past_the_cap() {
+        let mut tile = GlowTile::new();
+        tile.hearing_them();
+        tile.fast_path(1, 0.6);
+        tile.fast_path(0, 0.0);
+        assert_eq!(tile.verdict.get(), FastPathVerdict::Silent);
+
+        tile.tick(f64::from(LIVENESS_GRACE_MS) + 1.0)
+            .cannot_hear_them();
+        tile.heartbeat(true);
+        assert_eq!(
+            tile.level, HEARTBEAT_SOURCED_GLOW_LEVEL,
+            "the 2174 glow must survive the grace window"
+        );
+
+        tile.tick(f64::from(UNHEARD_GLOW_CAP_MS)).cannot_hear_them();
+        tile.heartbeat(true);
+        assert_eq!(
+            tile.level, 0.0,
+            "a claim nothing has corroborated past the cap must not keep the border lit"
+        );
+        assert!(
+            !tile.deadman_armed,
+            "and the folded claim must not re-arm the deadman it would otherwise outlive"
+        );
+    }
+
+    #[test]
+    fn the_cap_never_expires_a_claim_from_a_peer_we_have_never_heard() {
+        let t0 = 1_000_000.0;
+        assert_eq!(
+            expire_stale_claim(
+                Some(true),
+                LiveStamp(0.0),
+                NowMs(t0 + f64::from(UNHEARD_GLOW_CAP_MS) * 100.0)
+            ),
+            Some(true),
+            "never-heard is not stale, however long the call has run"
+        );
+    }
+
+    #[test]
+    fn a_backward_clock_step_does_not_expire_a_live_claim() {
+        let t0 = 1_000_000.0;
+        assert_eq!(
+            expire_stale_claim(Some(true), LiveStamp(t0), NowMs(t0 - 60_000.0)),
+            Some(true),
+            "a negative age must read as 'not stale' — one extra keepalive of a stale glow \
+             beats blanking a peer we are actively hearing"
+        );
+    }
+
+    /// The two halves must diverge on the SAME verdict — the point of the gate.
+    #[test]
+    fn the_same_silent_verdict_resolves_on_whether_we_can_hear_them() {
+        let mut heard = GlowTile::new();
+        heard.hearing_them();
+        heard.fast_path(1, 0.6);
+        heard.fast_path(0, 0.0);
+
+        let mut lost = GlowTile::new();
+        lost.hearing_them();
+        lost.fast_path(1, 0.6);
+        lost.fast_path(0, 0.0);
+        lost.tick(f64::from(LIVENESS_GRACE_MS) + 1.0)
+            .cannot_hear_them();
+        heard
+            .tick(f64::from(LIVENESS_GRACE_MS) + 1.0)
+            .hearing_them();
+
+        assert_eq!(heard.verdict.get(), lost.verdict.get());
+        heard.heartbeat(true);
+        lost.heartbeat(true);
+        assert!(
+            !heard.is_lit(),
+            "audio arriving -> the measurement wins -> dark"
+        );
+        assert!(
+            lost.is_lit(),
+            "audio gone -> the measurement is vacuous -> lit"
+        );
+    }
+
+    /// 2660's likeliest victim: a quiet peer with a noisy mic. Audio IS arriving
+    /// but never crosses this listener's gate, so the verdict stays `Unheard`.
+    /// MUTATION: dropping `Unheard` from the fold leaves this lit at 0.5.
+    #[test]
+    fn a_never_heard_peer_whose_audio_is_arriving_is_not_lit_by_the_claim() {
+        let mut tile = GlowTile::new();
+        tile.hearing_them();
+        assert_eq!(tile.verdict.get(), FastPathVerdict::Unheard);
+
+        tile.heartbeat(true);
+        assert!(
+            !tile.is_lit(),
+            "we are receiving this peer and have never once heard speech in it"
+        );
+    }
+
+    /// Issue 2174, the genuine never-arrived case: no audio reaches the decoder at
+    /// all, so the claim is the only evidence and must still light the tile.
+    /// MUTATION: folding `Unheard` regardless of liveness leaves this dark.
+    #[test]
+    fn a_heartbeat_still_lights_a_peer_whose_audio_never_arrived() {
+        let mut tile = GlowTile::new();
+        tile.cannot_hear_them();
+        assert_eq!(tile.verdict.get(), FastPathVerdict::Unheard);
+
+        tile.heartbeat(true);
+        assert_eq!(tile.level, HEARTBEAT_SOURCED_GLOW_LEVEL);
+        assert!(tile.deadman_armed);
+    }
+
+    /// Start-of-call ordering, pinned not assumed: the first buffer sample is a
+    /// 1 Hz tick behind ~100 PCM frames, so a real speaker is already `Speaking`
+    /// before liveness can enable the fold.
+    #[test]
+    fn a_peer_talking_from_the_first_second_is_never_folded_dark() {
+        let mut tile = GlowTile::new();
+
+        tile.fast_path(1, 0.6);
+        assert_eq!(tile.verdict.get(), FastPathVerdict::Speaking);
+
+        tile.tick(f64::from(NETEQ_STATS_INTERVAL_MS)).hearing_them();
+        tile.heartbeat(true);
+        assert!(
+            tile.is_lit(),
+            "a real speaker must survive liveness switching on"
+        );
+    }
+
+    /// The veto cannot wedge: the next decoded speech frame releases it.
+    #[test]
+    fn a_measured_silence_is_released_by_the_next_speech_frame() {
+        let mut tile = GlowTile::new();
+        tile.hearing_them();
+        tile.fast_path(1, 0.6);
+        tile.fast_path(0, 0.0);
+        tile.heartbeat(true);
+        assert!(!tile.is_lit());
+
+        tile.fast_path(1, 0.6);
+        assert!(
+            tile.is_lit(),
+            "audible speech relights with no timer to wait out"
+        );
+        assert_eq!(tile.verdict.get(), FastPathVerdict::Speaking);
+
+        tile.heartbeat(true);
+        assert_eq!(
+            tile.level, 0.6,
+            "and the keepalive leaves a live glow untouched"
+        );
+    }
+
+    /// MUTATION: `> 0.0` lets the measured 7 ms residue through.
+    #[test]
+    fn only_a_buffer_above_the_stall_residue_records_live_audio() {
+        assert!(
+            !records_live_audio(STALLED_BUFFER_MS),
+            "the MEASURED stall floor ({STALLED_BUFFER_MS} ms of leftover residue) must not \
+             record as live — NetEQ never drains to zero"
+        );
+        assert!(!records_live_audio(0.0));
+        assert!(records_live_audio(HEALTHY_BUFFER_MS));
+        assert!(
+            records_live_audio(LIVE_BUFFER_FLOOR_MS),
+            "the floor itself is live; the residue sits below it"
+        );
+    }
+
+    /// The anti-pulse guarantee. MUTATION: removing the window lapses the veto
+    /// mid-window and the border pulses at the keepalive period.
+    #[test]
+    fn the_veto_survives_a_mid_window_gap_and_lapses_after_a_full_one() {
+        let t0 = 1_000_000.0;
+        let grace = f64::from(LIVENESS_GRACE_MS);
+
+        assert!(
+            audio_path_is_live(LiveStamp(t0), NowMs(t0)),
+            "a sample taken now is live"
+        );
+        assert!(
+            audio_path_is_live(LiveStamp(t0), NowMs(t0 + grace / 2.0)),
+            "a mid-window gap must not lapse the veto — this is the anti-pulse guarantee"
+        );
+        assert!(
+            audio_path_is_live(LiveStamp(t0), NowMs(t0 + grace)),
+            "exactly at the window is still live"
+        );
+        assert!(
+            !audio_path_is_live(LiveStamp(t0), NowMs(t0 + grace + 1.0)),
+            "past the window we are no longer a witness"
+        );
+        assert!(
+            !audio_path_is_live(LiveStamp(0.0), NowMs(t0)),
+            "the mount default (never sampled) must not read as live"
+        );
+        assert!(
+            !audio_path_is_live(LiveStamp(t0 + 60_000.0), NowMs(t0)),
+            "a backward clock step must not manufacture liveness"
+        );
+    }
+
+    /// Anti-pulse AT THE SEAM, and the only guard on the two `f64` timestamps
+    /// being passed in order — a swap turns the age negative, reading NOT live.
+    /// Every other case uses a gap where both orderings agree.
+    #[test]
+    fn a_mid_window_gap_keeps_the_veto_through_the_arm() {
+        let mut tile = GlowTile::new();
+        tile.hearing_them();
+        tile.fast_path(1, 0.6);
+        tile.fast_path(0, 0.0);
+        assert!(!tile.is_lit());
+
+        tile.tick(f64::from(LIVENESS_GRACE_MS) / 2.0);
+        tile.heartbeat(true);
+        assert!(
+            !tile.is_lit(),
+            "a mid-window gap must not lapse the veto — the border would pulse"
+        );
+    }
+
+    #[test]
+    fn a_starved_buffer_stops_refreshing_the_grace_window() {
+        let mut tile = GlowTile::new();
+        tile.hearing_them();
+        tile.fast_path(1, 0.6);
+        tile.fast_path(0, 0.0);
+
+        tile.tick(f64::from(LIVENESS_GRACE_MS) + 1.0)
+            .cannot_hear_them();
+        tile.heartbeat(true);
+        assert_eq!(
+            tile.level, HEARTBEAT_SOURCED_GLOW_LEVEL,
+            "once the grace window runs out the 2174 glow must come back"
+        );
+    }
+
+    /// Issue 2174 ordering: a DTX-silent honest peer reports `is_speaking = 0`, so
+    /// rule 1 zeroes the glow before liveness is consulted.
+    #[test]
+    fn a_not_speaking_heartbeat_is_zeroed_without_consulting_liveness() {
+        for live in [true, false] {
+            let now = 1_000_000.0;
+            let last_live_at = if live { now } else { 0.0 };
+            let (speaking, resolved) = heartbeat_resolution(
+                Some(true),
+                Some(0.0),
+                Some(false),
+                FastPathVerdict::Silent,
+                LiveStamp(last_live_at),
+                NowMs(now),
+                0.8,
+            );
+            assert_eq!(speaking, Some(false));
+            assert_eq!(
+                resolved,
+                Some(0.0),
+                "an explicit not-speaking heartbeat zeroes the glow whatever liveness says \
+                 (live = {live})"
+            );
+        }
+    }
+
+    /// Drift here disables the veto silently — no panic, no failing test. Anchored
+    /// on `stats_cb` so it pins the stats timer, not the worker's audio one.
+    #[test]
+    fn the_worker_stats_interval_matches_the_mirrored_constant() {
+        let worker = include_str!("../../../neteq/src/bin/neteq_worker.rs");
+        let at = worker
+            .find("stats_cb.as_ref().unchecked_ref(),")
+            .expect("the stats set_interval must still pass `stats_cb`");
+        let arg = worker[at..]
+            .lines()
+            .nth(1)
+            .expect("set_interval must have an interval argument on the next line")
+            .trim()
+            .trim_end_matches(',');
+        let worker_ms: u32 = arg.replace('_', "").parse().unwrap_or_else(|_| {
+            panic!("the worker's stats interval is no longer a bare literal: {arg:?}")
+        });
+        assert_eq!(
+            worker_ms, NETEQ_STATS_INTERVAL_MS,
+            "neteq_worker.rs posts stats every {worker_ms} ms but peer_tile.rs mirrors \
+             {NETEQ_STATS_INTERVAL_MS} ms; the liveness grace window is derived from this, so \
+             drift silently disables the issue-2660 veto"
+        );
+    }
+
+    /// Asserted through the production `const fn`, never a restated literal.
+    #[test]
+    fn the_grace_window_outlasts_a_whole_keepalive_gap() {
+        for (keepalive, stats) in [(5_000u32, 1_000u32), (2_000, 500), (8_000, 250)] {
+            let window = liveness_grace_ms(keepalive, stats);
+            assert!(
+                window > keepalive,
+                "window {window} must outlast a whole {keepalive} ms keepalive gap"
+            );
+            assert!(
+                window < 2 * keepalive,
+                "window {window} must not stretch to two keepalives"
+            );
+        }
+        assert_eq!(
+            LIVENESS_GRACE_MS,
+            liveness_grace_ms(HEARTBEAT_KEEPALIVE_INTERVAL_MS, NETEQ_STATS_INTERVAL_MS)
+        );
+    }
+
+    #[test]
+    fn the_fold_only_overrides_a_claim_the_decoder_contradicts() {
+        for live in [true, false] {
+            for verdict in [
+                FastPathVerdict::Unheard,
+                FastPathVerdict::Speaking,
+                FastPathVerdict::Silent,
+            ] {
+                for claim in [None, Some(false)] {
+                    assert_eq!(
+                        corroborated_speaking(claim, verdict, live),
+                        claim,
+                        "{claim:?} carries no positive claim to contradict \
+                         (verdict = {verdict:?}, live = {live})"
+                    );
+                }
+            }
+            assert_eq!(
+                corroborated_speaking(Some(true), FastPathVerdict::Speaking, live),
+                Some(true),
+                "a corroborating verdict is never folded (live = {live})"
+            );
+        }
+        for verdict in [FastPathVerdict::Silent, FastPathVerdict::Unheard] {
+            assert_eq!(
+                corroborated_speaking(Some(true), verdict, true),
+                Some(false),
+                "{verdict:?} + audio arriving means we would have heard them"
+            );
+            assert_eq!(
+                corroborated_speaking(Some(true), verdict, false),
+                Some(true),
+                "{verdict:?} + no audio arriving is vacuous; the claim stands"
+            );
+        }
     }
 
     /// The deadman is a liveness guard, so it must be refreshed by evidence of

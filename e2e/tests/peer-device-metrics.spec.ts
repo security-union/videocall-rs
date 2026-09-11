@@ -1,6 +1,8 @@
 import { test, expect, Page, BrowserContext, Browser, chromium } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
+import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 
 /**
  * E2E: per-peer device / hardware metrics (issue #1482 — "show cpu, memory, and
@@ -113,6 +115,7 @@ async function joinMeetingAs(
   cameraOn = true,
   extraInitScript?: string,
 ): Promise<Page> {
+  await enableDiagnosticsTileIndicators(context);
   const page = await context.newPage();
   if (cameraOn) {
     await page.addInitScript(() => {
@@ -560,9 +563,9 @@ test.describe("Per-peer device / hardware metrics (#1482)", () => {
       const hostPage = members[0].page;
 
       // Open the signal-quality popup for the (single) remote peer tile.
-      const signalButton = hostPage.locator(
-        '#grid-container .canvas-container button[aria-label="Show signal quality"]',
-      );
+      const signalButton = hostPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
+      // Also pins "exactly one camera peer" — `toBeVisible` would throw on two.
+      await expect(signalButton).toHaveCount(1, { timeout: 15_000 });
       await expect(signalButton).toBeVisible({ timeout: 15_000 });
       await signalButton.click();
 

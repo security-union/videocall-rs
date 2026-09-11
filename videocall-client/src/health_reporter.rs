@@ -316,12 +316,6 @@ pub struct HealthReporter {
     effective_screen_layers: Rc<RefCell<Rc<AtomicU32>>>,
     /// #1561: screen encoder ACTIVE simulcast layer count (layers currently sent).
     active_screen_layers: Rc<RefCell<Rc<AtomicU32>>>,
-    /// #1561: microphone encoder EFFECTIVE audio simulcast layer count.
-    effective_audio_layers: Rc<RefCell<Rc<AtomicU32>>>,
-    /// #1561: CONGESTION-driven audio layer-ceiling atomic (issue #621).
-    audio_congestion_ceiling: Rc<RefCell<Arc<AtomicU32>>>,
-    /// #1561: USER-driven audio layer-ceiling atomic (perf-panel control).
-    audio_user_layer_ceiling: Rc<RefCell<Rc<AtomicU32>>>,
     /// #1561: latest per-(peer,kind) desired layer map from `tick_layer_choosers`.
     /// Populated by the peer monitor tick in VideoCallClient and read here.
     received_layers: Rc<RefCell<HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>>>,
@@ -543,25 +537,6 @@ fn publish_encoder_fps(value: Option<u32>) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn publish_encoder_fps(_value: Option<u32>) {}
-
-fn audio_layer_telemetry(
-    effective_layers: u32,
-    congestion_ceiling_raw: u32,
-    user_ceiling_raw: u32,
-) -> (u32, u32) {
-    let congestion_count = crate::encode::layer_ceiling_to_count(congestion_ceiling_raw);
-    let user_count = crate::encode::layer_ceiling_to_count(user_ceiling_raw);
-    let congestion_ceiling = if congestion_count == usize::MAX {
-        u32::MAX
-    } else {
-        congestion_count as u32
-    };
-    let active_layers = (effective_layers as usize)
-        .min(congestion_count)
-        .min(user_count)
-        .max(1) as u32;
-    (congestion_ceiling, active_layers)
-}
 
 // ── issue 1853: receiver-side audio-scale instrumentation (log-only) ──────────
 //
@@ -938,9 +913,6 @@ impl HealthReporter {
             )),
             effective_screen_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             active_screen_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            effective_audio_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            audio_congestion_ceiling: Rc::new(RefCell::new(Arc::new(AtomicU32::new(u32::MAX)))),
-            audio_user_layer_ceiling: Rc::new(RefCell::new(Rc::new(AtomicU32::new(u32::MAX)))),
             received_layers: Rc::new(RefCell::new(HashMap::new())),
             tier_transitions: Rc::new(RefCell::new(Vec::new())),
             climb_limiter_snapshot: Rc::new(RefCell::new(Rc::new(RefCell::new(
@@ -1062,9 +1034,6 @@ impl HealthReporter {
         // #1561: screen + audio layer metrics
         effective_screen_layers: u32,
         active_screen_layers: Rc<AtomicU32>,
-        effective_audio_layers: u32,
-        audio_congestion_ceiling: Arc<AtomicU32>,
-        audio_user_layer_ceiling: Rc<AtomicU32>,
     ) {
         *self.encoder_queue_depth_report.borrow_mut() = queue_depth_report;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
@@ -1086,10 +1055,6 @@ impl HealthReporter {
         *self.effective_screen_layers.borrow_mut() =
             Rc::new(AtomicU32::new(effective_screen_layers));
         *self.active_screen_layers.borrow_mut() = active_screen_layers;
-        // #1561: audio layers — effective is constant, same pattern.
-        *self.effective_audio_layers.borrow_mut() = Rc::new(AtomicU32::new(effective_audio_layers));
-        *self.audio_congestion_ceiling.borrow_mut() = audio_congestion_ceiling;
-        *self.audio_user_layer_ceiling.borrow_mut() = audio_user_layer_ceiling;
     }
 
     /// #1561: Update the receiver-side layer selection map snapshot. Called by
@@ -1864,9 +1829,6 @@ impl HealthReporter {
         // #2147: screen encoder fps + its wired-ness flag.
         let screen_encoder_output_fps = self.screen_encoder_output_fps.clone();
         let screen_encoder_fps_wired = self.screen_encoder_fps_wired.clone();
-        let effective_audio_layers = self.effective_audio_layers.clone();
-        let audio_congestion_ceiling = self.audio_congestion_ceiling.clone();
-        let audio_user_layer_ceiling = self.audio_user_layer_ceiling.clone();
         let received_layers = self.received_layers.clone();
         let tier_transitions = self.tier_transitions.clone();
         let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
@@ -2012,20 +1974,6 @@ impl HealthReporter {
                             effective_screen_layers.borrow().load(Ordering::Relaxed);
                         let active_screen_layers_val =
                             active_screen_layers.borrow().load(Ordering::Relaxed);
-                        let effective_audio_layers_val =
-                            effective_audio_layers.borrow().load(Ordering::Relaxed);
-                        let audio_congestion_ceiling_raw =
-                            audio_congestion_ceiling.borrow().load(Ordering::Relaxed);
-                        let audio_user_ceiling_raw =
-                            audio_user_layer_ceiling.borrow().load(Ordering::Relaxed);
-                        // Keep the congestion-only ceiling separate from the
-                        // actual active count, which also applies the user cap.
-                        let (audio_congestion_ceiling_val, active_audio_layers_val) =
-                            audio_layer_telemetry(
-                                effective_audio_layers_val,
-                                audio_congestion_ceiling_raw,
-                                audio_user_ceiling_raw,
-                            );
                         // #1561: snapshot the received-layer map for this health packet.
                         let received_layers_snapshot = received_layers
                             .try_borrow()
@@ -2174,9 +2122,6 @@ impl HealthReporter {
                             // #1561: screen + audio layer metrics
                             effective_screen_layers_val,
                             active_screen_layers_val,
-                            effective_audio_layers_val,
-                            audio_congestion_ceiling_val,
-                            active_audio_layers_val,
                             received_layers_snapshot,
                             // Issue 2031: per-client WT receive-health telemetry,
                             // read from the transport statics. read_loop drains
@@ -2338,9 +2283,6 @@ impl HealthReporter {
         // #1561: screen + audio layer metrics. 0 = unwired/omitted.
         effective_screen_layers: u32,
         active_screen_layers: u32,
-        effective_audio_layers: u32,
-        audio_congestion_ceiling: u32,
-        active_audio_layers: u32,
         received_layers: HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
         // Issue 2031: per-client WebTransport receive-health telemetry, read from
         // the transport statics in the report loop. `Default` on WebSocket.
@@ -2487,16 +2429,6 @@ impl HealthReporter {
         if effective_screen_layers > 0 {
             pb.effective_screen_layers = Some(effective_screen_layers);
             pb.active_screen_layers = Some(active_screen_layers.min(effective_screen_layers));
-        }
-        // #1561: audio encoder layer count + congestion ceiling. Gated same as video.
-        if effective_audio_layers > 0 {
-            pb.effective_audio_layers = Some(effective_audio_layers);
-            pb.active_audio_layers = Some(active_audio_layers.min(effective_audio_layers).max(1));
-            // This field is congestion-only. The actual active count, which also
-            // incorporates the user ceiling, is carried separately above.
-            if audio_congestion_ceiling < u32::MAX {
-                pb.audio_congestion_ceiling = Some(audio_congestion_ceiling);
-            }
         }
         // #1561: receiver-side per-(peer,kind) desired layer map. Keyed by
         // session_id string so the relay/analyzer can correlate. Only constrained
@@ -3653,9 +3585,6 @@ mod tests {
             None,
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
@@ -3718,6 +3647,13 @@ mod tests {
         camera_fps: u32,
         screen_fps: Option<u32>,
     ) -> (Option<u32>, Option<u32>) {
+        let pb = built_health_packet(camera_fps, screen_fps);
+        (pb.encoder_output_fps, pb.screen_encoder_output_fps)
+    }
+
+    /// Build a `PbHealthPacket` through the production `create_health_packet`
+    /// path with the given encoder fps inputs.
+    fn built_health_packet(camera_fps: u32, screen_fps: Option<u32>) -> PbHealthPacket {
         let mut health_map = HashMap::new();
         health_map.insert(
             "peer-1".to_string(),
@@ -3770,9 +3706,6 @@ mod tests {
             None,
             0,
             0,
-            0,
-            0,
-            0,
             HashMap::new(),
             WtReceiveTelemetry::default(),
             Vec::new(),
@@ -3780,9 +3713,8 @@ mod tests {
         )
         .expect("create_health_packet returns Some unconditionally");
 
-        let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
-            .expect("HealthPacket payload must be valid protobuf");
-        (pb.encoder_output_fps, pb.screen_encoder_output_fps)
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
     }
 
     /// **THE #2147 honesty guard.** A wired screen encoder producing 0 fps must
@@ -3974,9 +3906,6 @@ mod tests {
             None,
             0,
             0,
-            0,
-            0,
-            0,
             HashMap::new(),
             WtReceiveTelemetry::default(),
             Vec::new(),
@@ -4056,21 +3985,6 @@ mod tests {
         assert_eq!(packet.received_video_layer.len(), 1);
         assert_eq!(packet.received_screen_layer.len(), 1);
         assert_eq!(packet.received_audio_layer.len(), 1);
-    }
-
-    #[test]
-    fn audio_layer_telemetry_keeps_user_and_congestion_caps_distinct() {
-        assert_eq!(
-            audio_layer_telemetry(3, u32::MAX, 1),
-            (u32::MAX, 1),
-            "a user cap reduces active layers without fabricating congestion"
-        );
-        assert_eq!(
-            audio_layer_telemetry(3, 2, u32::MAX),
-            (2, 2),
-            "a congestion cap must reduce both congestion ceiling and active layers"
-        );
-        assert_eq!(audio_layer_telemetry(3, u32::MAX, u32::MAX), (u32::MAX, 3));
     }
 
     // ── Freeze observability (#1013): video_quality_score ────────────────
@@ -4224,9 +4138,6 @@ mod tests {
             None,
             None,
             None,
-            0,
-            0,
-            0,
             0,
             0,
             HashMap::new(),
@@ -4485,9 +4396,6 @@ mod tests {
             None,
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
@@ -4579,9 +4487,6 @@ mod tests {
             None,
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
@@ -4656,9 +4561,6 @@ mod tests {
             None,
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
@@ -4775,9 +4677,6 @@ mod tests {
             None,
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
@@ -4953,9 +4852,6 @@ mod tests {
             None,           // agent_memory_bytes
             0,              // effective_screen_layers
             0,              // active_screen_layers
-            0,              // effective_audio_layers
-            0,              // audio_congestion_ceiling
-            0,              // active_audio_layers
             HashMap::new(), // received_layers
             telemetry,
             camera_layer_metrics,
@@ -5194,9 +5090,6 @@ mod tests {
             agent_memory_bytes,
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
@@ -5268,9 +5161,6 @@ mod tests {
             None,                          // agent_memory_bytes
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
@@ -5797,9 +5687,6 @@ mod tests {
             None,
             0,
             0,
-            0,
-            0,
-            0,
             HashMap::new(),
             WtReceiveTelemetry::default(),
             Vec::new(),
@@ -6256,9 +6143,6 @@ mod tests {
             None,
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
@@ -7093,9 +6977,6 @@ mod tests {
             None,
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)
@@ -7212,9 +7093,6 @@ mod tests {
             Some(512),
             0,                             // effective_screen_layers (#1561)
             0,                             // active_screen_layers (#1561)
-            0,                             // effective_audio_layers (#1561)
-            0,                             // audio_congestion_ceiling (#1561)
-            0,                             // active_audio_layers (#1561)
             HashMap::new(),                // received_layers (#1561)
             WtReceiveTelemetry::default(), // wt_telemetry (issue 2031)
             Vec::new(),                    // camera_layer_metrics (#2170)

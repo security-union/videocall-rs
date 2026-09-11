@@ -317,7 +317,7 @@ pub struct VideoPeerDecoder {
     /// [`Self::new`]) can read the `(from_peer, to_peer)` pair to tag its
     /// `video_painted` broadcast. `RefCell` because the pair is written after
     /// construction by `set_stream_context`; every access is on the render thread.
-    stream_context: Rc<RefCell<Option<(String, String)>>>,
+    stream_context: Rc<RefCell<Option<StreamContext>>>,
     /// HCL issue 893: pending acknowledgement that the underlying
     /// `WasmDecoder` has produced its first decoded frame and rendered it
     /// to the canvas. The decoder pipeline is asynchronous — `decode()`
@@ -425,7 +425,7 @@ pub struct VideoPeerDecoder {
 
 // Trait to handle VideoFrame callbacks in WASM
 trait VideoFrameDecoder {
-    fn push_frame(&self, frame: FrameBuffer, context: Option<StreamContext>);
+    fn push_frame(&self, frame: FrameBuffer, context: Option<&StreamContext>);
     fn is_waiting_for_keyframe(&self) -> bool;
     fn flush(&self);
     fn set_stream_context(&self, _from_peer: String, _to_peer: String) {}
@@ -457,8 +457,8 @@ struct NoopDecoder {
 
 #[cfg(test)]
 impl VideoFrameDecoder for NoopDecoder {
-    fn push_frame(&self, _: FrameBuffer, context: Option<StreamContext>) {
-        *self.last_context.borrow_mut() = context;
+    fn push_frame(&self, _: FrameBuffer, context: Option<&StreamContext>) {
+        *self.last_context.borrow_mut() = context.cloned();
     }
     fn is_waiting_for_keyframe(&self) -> bool {
         true
@@ -480,7 +480,7 @@ struct WasmVideoFrameDecoder {
 }
 
 impl VideoFrameDecoder for WasmVideoFrameDecoder {
-    fn push_frame(&self, frame: FrameBuffer, context: Option<StreamContext>) {
+    fn push_frame(&self, frame: FrameBuffer, context: Option<&StreamContext>) {
         self.decoder.push_frame(frame, context);
     }
 
@@ -564,7 +564,7 @@ pub(crate) fn stamp_output_and_should_offer(
 ///    session. This was the #883 regression.
 fn resolve_renderer_context(
     prior_renderer_ctx: Option<(Option<String>, Option<String>)>,
-    decoder_stream_ctx: Option<&(String, String)>,
+    decoder_stream_ctx: Option<&StreamContext>,
 ) -> (Option<String>, Option<String>) {
     if let Some((fp, tp)) = prior_renderer_ctx {
         if fp.is_some() || tp.is_some() {
@@ -572,7 +572,7 @@ fn resolve_renderer_context(
         }
     }
     match decoder_stream_ctx {
-        Some((fp, tp)) => (Some(fp.clone()), Some(tp.clone())),
+        Some(ctx) => (Some(ctx.from_peer.clone()), Some(ctx.to_peer.clone())),
         None => (None, None),
     }
 }
@@ -800,7 +800,7 @@ impl VideoPeerDecoder {
         // Issue #1784: shared peer-id context, read by the painted-fps timer to tag its broadcast.
         // Populated after construction by `set_stream_context` (which the manager calls before any
         // frame is decoded); while `None`, the timer skips emission for that tick.
-        let stream_context: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let stream_context: Rc<RefCell<Option<StreamContext>>> = Rc::new(RefCell::new(None));
 
         // Issue #1784: the 1 Hz painted-fps sampler — installed ONLY on the camera decoder
         // (`MEDIA_TYPE_CAMERA`). The overlay does not show a peer's screen-share painted-fps
@@ -830,7 +830,7 @@ impl VideoPeerDecoder {
                 // across `try_broadcast`). This single clone is the only allocation the emission
                 // costs — `build_painted_fps_event` moves the owned strings straight into the metrics.
                 let ctx = ctx_for_timer.borrow().clone();
-                if let Some((from_peer, to_peer)) = ctx {
+                if let Some(StreamContext { from_peer, to_peer }) = ctx {
                     let _ = global_sender().try_broadcast(build_painted_fps_event(
                         from_peer, to_peer, media_type, fps,
                     ));
@@ -953,7 +953,10 @@ impl VideoPeerDecoder {
         // Mirror the peer-id pair on `self` so `decode()` can tag the
         // source-resolution diag event regardless of whether the canvas
         // renderer is set yet.
-        *self.stream_context.borrow_mut() = Some((from_peer.clone(), to_peer.clone()));
+        *self.stream_context.borrow_mut() = Some(StreamContext {
+            from_peer: from_peer.clone(),
+            to_peer: to_peer.clone(),
+        });
 
         // Store peer context in the canvas renderer for resolution broadcasts.
         if let Some(renderer) = self.canvas_renderer.borrow_mut().as_mut() {
@@ -978,17 +981,6 @@ impl VideoPeerDecoder {
             }
         }
         self.decoder.set_stream_context(from_peer, to_peer);
-    }
-
-    /// The attribution stamped on every frame posted to the decoder worker (issue 1741).
-    fn worker_stream_context(&self) -> Option<StreamContext> {
-        self.stream_context
-            .borrow()
-            .as_ref()
-            .map(|(from_peer, to_peer)| StreamContext {
-                from_peer: from_peer.clone(),
-                to_peer: to_peer.clone(),
-            })
     }
 
     /// Render video frame using cached canvas and context. Only resizes when dimensions change.
@@ -1338,7 +1330,10 @@ impl VideoPeerDecoder {
     /// the assertion in the regression test will fail.
     #[cfg(test)]
     pub(crate) fn stream_context_for_test(&self) -> Option<(String, String)> {
-        self.stream_context.borrow().clone()
+        self.stream_context
+            .borrow()
+            .as_ref()
+            .map(|c| (c.from_peer.clone(), c.to_peer.clone()))
     }
 
     /// issue 1741: the `context` the production `push_frame` call site passed most recently.
@@ -1365,7 +1360,9 @@ impl PeerDecode for VideoPeerDecoder {
                 if *last != (src_w, src_h) {
                     *last = (src_w, src_h);
                     drop(last);
-                    if let Some((from_peer, to_peer)) = self.stream_context.borrow().clone() {
+                    if let Some(StreamContext { from_peer, to_peer }) =
+                        self.stream_context.borrow().clone()
+                    {
                         let evt = DiagEvent {
                             subsystem: "video_source_resolution",
                             stream_id: None,
@@ -1412,7 +1409,9 @@ impl PeerDecode for VideoPeerDecoder {
                             cause_hint.to_string(),
                         );
                         drop(last);
-                        if let Some((from_peer, to_peer)) = self.stream_context.borrow().clone() {
+                        if let Some(StreamContext { from_peer, to_peer }) =
+                            self.stream_context.borrow().clone()
+                        {
                             let evt = DiagEvent {
                                 subsystem: "screen_encoder_state",
                                 stream_id: None,
@@ -1474,8 +1473,11 @@ impl PeerDecode for VideoPeerDecoder {
 
             // Use the new ergonomic API - decoder handles jitter buffer internally,
             // and calls our VideoFrame callback for rendering
-            self.decoder
-                .push_frame(frame_buffer, self.worker_stream_context());
+            // Sound because `set_stream_context` is this cell's sole writer, takes `&self`
+            // while `decode` takes `&mut self`, and has no caller inside `decode`. Only the
+            // wasm-backed decoder reaches code that could conceivably re-enter.
+            let context = self.stream_context.borrow();
+            self.decoder.push_frame(frame_buffer, context.as_ref());
         }
 
         // HCL #893: consume the async "first frame rendered" flag set by the
@@ -1780,7 +1782,10 @@ mod tests {
     #[test]
     fn resolve_renderer_context_keeps_prior_pair_when_present() {
         let prior = Some((Some("alice".to_string()), Some("session-1".to_string())));
-        let stream_ctx = ("bob".to_string(), "session-2".to_string());
+        let stream_ctx = StreamContext {
+            from_peer: "bob".to_string(),
+            to_peer: "session-2".to_string(),
+        };
         let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
         assert_eq!(fp.as_deref(), Some("alice"));
         assert_eq!(tp.as_deref(), Some("session-1"));
@@ -1795,7 +1800,10 @@ mod tests {
     /// never fires. This is the #883 regression.
     #[test]
     fn resolve_renderer_context_seeds_from_stream_ctx_when_renderer_absent() {
-        let stream_ctx = ("alice".to_string(), "session-1".to_string());
+        let stream_ctx = StreamContext {
+            from_peer: "alice".to_string(),
+            to_peer: "session-1".to_string(),
+        };
         let (fp, tp) = resolve_renderer_context(None, Some(&stream_ctx));
         assert_eq!(fp.as_deref(), Some("alice"));
         assert_eq!(tp.as_deref(), Some("session-1"));
@@ -1807,7 +1815,10 @@ mod tests {
     #[test]
     fn resolve_renderer_context_seeds_from_stream_ctx_when_prior_pair_empty() {
         let prior = Some((None, None));
-        let stream_ctx = ("alice".to_string(), "session-1".to_string());
+        let stream_ctx = StreamContext {
+            from_peer: "alice".to_string(),
+            to_peer: "session-1".to_string(),
+        };
         let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
         assert_eq!(fp.as_deref(), Some("alice"));
         assert_eq!(tp.as_deref(), Some("session-1"));
@@ -1830,7 +1841,10 @@ mod tests {
     #[test]
     fn resolve_renderer_context_preserves_partial_prior() {
         let prior = Some((Some("alice".to_string()), None));
-        let stream_ctx = ("bob".to_string(), "session-2".to_string());
+        let stream_ctx = StreamContext {
+            from_peer: "bob".to_string(),
+            to_peer: "session-2".to_string(),
+        };
         let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
         assert_eq!(fp.as_deref(), Some("alice"));
         assert!(tp.is_none());
@@ -2800,7 +2814,9 @@ const install = () => {{
       const seq = d.DecodeFrame.frame.sequence_number;
       if (!{require_ascending} || seq > lastSeq) {{ frames += 1; lastSeq = seq; }}
     }}
-    if (d && typeof d === "object" && "SetContext" in d) {{ contexts += 1; }}
+    // Value-checked, not counted: a swapped field mapping must fail rather than still tally.
+    if (d && typeof d === "object" && "SetContext" in d
+        && d.SetContext.to_peer === "peer-sid") {{ contexts += 1; }}
     report();
   }};
   if ({post_ready}) {{ self.postMessage({{ kind: "worker_ready" }}); }}
@@ -3103,7 +3119,7 @@ if ({install_delay_ms} === 0) {{ install(); }} else {{ setTimeout(install, {inst
         let epoch_open_ms = js_sys::Date::now();
         decoder.set_context(String::new(), "peer-sid".to_string());
         for seq in 1..=u64::from(ramp) {
-            decoder.push_frame(delta_frame(seq), Some(context("")));
+            decoder.push_frame(delta_frame(seq), Some(&context("")));
         }
         let contexts = contexts_after_frames(decoder, u64::from(ramp)).await;
         assert_eq!(
@@ -3137,7 +3153,7 @@ if ({install_delay_ms} === 0) {{ install(); }} else {{ setTimeout(install, {inst
         sleep(decoder.context_reemit_interval_ms() as u32 + 200).await;
         const BURST: u64 = 20;
         for seq in 1..=BURST {
-            decoder.push_frame(delta_frame(u64::from(ramp) + seq), Some(context("")));
+            decoder.push_frame(delta_frame(u64::from(ramp) + seq), Some(&context("")));
         }
         // A second interval cannot elapse inside one synchronous 20-post loop.
         let contexts = contexts_after_frames(&decoder, u64::from(ramp) + BURST).await;
@@ -3155,13 +3171,13 @@ if ({install_delay_ms} === 0) {{ install(); }} else {{ setTimeout(install, {inst
         let interval = decoder.context_reemit_interval_ms() as u32;
 
         sleep(interval + 200).await;
-        decoder.push_frame(delta_frame(u64::from(ramp) + 1), Some(context("")));
+        decoder.push_frame(delta_frame(u64::from(ramp) + 1), Some(&context("")));
         const SPACED: u64 = 5;
         let mut seq = u64::from(ramp) + 1;
         for _ in 0..SPACED {
             sleep(interval / 3 + 20).await;
             seq += 1;
-            decoder.push_frame(delta_frame(seq), Some(context("")));
+            decoder.push_frame(delta_frame(seq), Some(&context("")));
         }
         let contexts = contexts_after_frames(&decoder, seq).await;
         assert_eq!(
@@ -3177,7 +3193,7 @@ if ({install_delay_ms} === 0) {{ install(); }} else {{ setTimeout(install, {inst
         let decoder = ready_decoder();
         let (ramp, epoch_open_ms) = exhaust_ramp(&decoder).await;
 
-        decoder.push_frame(delta_frame(u64::from(ramp) + 1), Some(context("42")));
+        decoder.push_frame(delta_frame(u64::from(ramp) + 1), Some(&context("42")));
         assert_still_inside_the_interval(&decoder, epoch_open_ms);
         let contexts = contexts_after_frames(&decoder, u64::from(ramp) + 1).await;
         assert_eq!(
@@ -3194,7 +3210,7 @@ if ({install_delay_ms} === 0) {{ install(); }} else {{ setTimeout(install, {inst
 
         // No `set_context`: it force-opens an epoch, resetting a SHARED gate and hiding the sharing.
         let rebuilt = ready_decoder();
-        rebuilt.push_frame(delta_frame(1), Some(context("")));
+        rebuilt.push_frame(delta_frame(1), Some(&context("")));
         assert_still_inside_the_interval(&rebuilt, epoch_open_ms);
         let contexts = contexts_after_frames(&rebuilt, 1).await;
         assert_eq!(

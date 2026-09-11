@@ -89,8 +89,8 @@ function encodeWav(pcm: Buffer): Buffer {
   return Buffer.concat([header, pcm]);
 }
 
-function renderSweptTone(): Buffer {
-  const totalSamples = SAMPLE_RATE * DURATION_SECONDS;
+function renderSweptTone(totalSeconds: number, toneSeconds: number): Buffer {
+  const totalSamples = SAMPLE_RATE * totalSeconds;
   const pcm = Buffer.alloc(totalSamples * 2);
   const centreHz = (SWEEP_LOW_HZ + SWEEP_HIGH_HZ) / 2;
   const swingHz = (SWEEP_HIGH_HZ - SWEEP_LOW_HZ) / 2;
@@ -104,6 +104,10 @@ function renderSweptTone(): Buffer {
   let phase = 0;
   for (let i = 0; i < totalSamples; i += 1) {
     const t = i / SAMPLE_RATE;
+    // Past the tone the buffer keeps its zero fill: digital silence.
+    if (t >= toneSeconds) {
+      break;
+    }
     const freq = centreHz + swingHz * Math.sin((2 * Math.PI * t) / SWEEP_PERIOD_SECONDS);
     phase += (2 * Math.PI * freq) / SAMPLE_RATE;
     const amplitude =
@@ -132,7 +136,28 @@ export function continuousToneWavPath(): string {
   );
 
   if (!fs.existsSync(file)) {
-    fs.writeFileSync(file, encodeWav(renderSweptTone()));
+    fs.writeFileSync(file, encodeWav(renderSweptTone(DURATION_SECONDS, DURATION_SECONDS)));
+  }
+
+  return file;
+}
+
+/** Swept tone then digital silence, so the VAD verdict FLIPS once per loop. The
+ * file advances only once `getUserMedia` opens, so `TONE_SECONDS`, not a spec's
+ * own timeout, bounds how long a spec has to observe the lit state. Chromium
+ * loops the file, so the silent tail bounds the assertion chain that follows. */
+// 8 s, not longer: a 20 s tone re-lit the tile at a real level inside the reset window (258450).
+const TONE_SECONDS = 8;
+const LOOP_SECONDS = 90;
+
+export function toneThenSilenceWavPath(): string {
+  const file = path.join(
+    os.tmpdir(),
+    `videocall-e2e-tone-then-silence-${SAMPLE_RATE}-${TONE_SECONDS}s-of-${LOOP_SECONDS}s-${PEAK_AMPLITUDE}-${FLOOR_AMPLITUDE}.wav`,
+  );
+
+  if (!fs.existsSync(file)) {
+    fs.writeFileSync(file, encodeWav(renderSweptTone(LOOP_SECONDS, TONE_SECONDS)));
   }
 
   return file;

@@ -128,15 +128,6 @@ pub struct RuntimeConfig {
     #[serde(rename = "searchApiBaseUrl")]
     #[serde(default)]
     pub search_api_base_url: Option<String>,
-    /// Base URL prefix for the JMAP chat endpoints (`/jmap`, `/sse/session`,
-    /// `/sse`). **Default: empty string = same-origin.** With an empty base the
-    /// client issues relative requests (`/jmap`, `/sse`, `/sse/session`) that go
-    /// to the same edge (Caddy) origin serving the UI, which is required for the
-    /// first-party `SameSite=Lax; Path=/sse` SSE session cookie to be sent. Set
-    /// to an absolute origin only when chat is served from a different origin.
-    #[serde(rename = "jmapBaseUrl")]
-    #[serde(default)]
-    pub jmap_base_url: Option<String>,
     #[serde(rename = "serverElectionPeriodMs")]
     pub server_election_period_ms: u64,
     #[serde(rename = "vadThreshold", default = "default_vad_threshold")]
@@ -902,20 +893,6 @@ pub fn oauth_flow() -> Option<String> {
 /// server-side OAuth should use this single predicate.
 pub fn is_pkce_flow() -> bool {
     oauth_enabled().unwrap_or(false) && oauth_flow().as_deref() == Some("pkce")
-}
-
-/// Base URL prefix for the JMAP chat endpoints. **Defaults to an empty string**
-/// (same-origin) when the `jmapBaseUrl` key is absent, empty, or the config
-/// can't be read — so requests resolve to relative paths (`/jmap`,
-/// `/sse/session`, `/sse`) against the page origin (the Caddy edge that also
-/// proxies chat to the smatter backend). This is required for the first-party
-/// `SameSite=Lax; Path=/sse` SSE cookie to be sent on the EventSource request.
-/// A non-empty absolute origin is only used when chat lives on another origin.
-pub fn jmap_base_url() -> String {
-    app_config()
-        .ok()
-        .and_then(|c| c.jmap_base_url)
-        .unwrap_or_default()
 }
 
 pub fn meeting_api_base_url() -> Result<String, String> {

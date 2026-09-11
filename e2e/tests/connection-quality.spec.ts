@@ -1,250 +1,257 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, Locator, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
+import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
+import {
+  authoredStrokeWidths,
+  keylinesMatchTrends,
+  keylinesPrecedeTrends,
+  newestTrendY,
+  SELF_SIGNAL_DISC,
+  SELF_SIGNAL_SPARK,
+  SPARK_KEYLINE,
+  SPARK_MIN_POINTS,
+  SPARK_REMOVED_CIRCLES,
+  SPARK_TREND,
+  SPARK_WARN_Y,
+  sparkAreaFillState,
+} from "../helpers/signal-meter";
+import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
- * Connection Quality Indicator E2E tests.
+ * The self-view signal disc: resting state, placement, destination (#367, #2661).
  *
- * The ConnectionQualityIndicator component renders a signal-bars badge on
- * the self-view tile when the RTT exceeds warning thresholds:
- *   - 300ms+ -> "Slow connection" (amber, 2 bars)
- *   - 500ms+ -> "Poor connection" (red, 1 bar)
- *
- * Hysteresis prevents strobe: 3 consecutive bad samples to enter,
- * 5 consecutive good samples to exit, with a 500ms fade-out animation.
- *
- * The component renders nothing (rsx! {}) when the quality level is Good,
- * so the indicator element does not exist in the DOM at all during normal
- * conditions. When active, the indicator renders with:
- *   - class: "connection-quality-indicator visible" (or "exiting")
- *   - role: "status"
- *   - aria-live: "polite"
- *   - aria-label describing the quality level and RTT
- *
- * The indicator keys off `active_server_rtt`, which the Rust-side connection
- * manager derives from an application-level probe round-trip — not from anything
- * a browser-level network throttle can shape. This file is the NEGATIVE half of
- * the coverage and stays that way. Tests focus on:
- *   1. Verifying the indicator is absent under normal (low-RTT) conditions
- *   2. Verifying the CSS rules exist in the loaded stylesheet
- *   3. Verifying no false positives on good localhost connections
- *
- * The POSITIVE half — the Good -> Warn -> Critical -> Good transitions, driven
- * by publishing synthetic `active_server_rtt` samples onto the diagnostics bus
- * through the MOCK_PEERS_ENABLED-gated `window.__videocall_inject_server_rtt`
- * hook — lives in `connection-quality-rtt-transitions.spec.ts` (issue #367).
- * That file's header documents why CDP network emulation cannot reach this
- * signal at all, and why netsim — which does reach it — is still not a usable
- * lever for driving the tri-state transitions.
+ * The NEGATIVE half. Re-pointing the pre-2661 assertions was not an option: an
+ * absence check on a deleted class passes vacuously. Transitions live next door.
  */
 
-test.describe("Connection quality indicator", () => {
+// FOUR, not five: self moved off `Excellent`. 5 is pre-move.
+const LEVEL_GOOD = "4";
+
+const TREND_GOOD = "rgb(76, 175, 80)";
+
+const KEYLINE_BLACK = "rgb(0, 0, 0)";
+
+/** The probe round-trips the authored token text into a comparable colour. */
+async function discAndTokenBackground(el: Locator): Promise<[string, string]> {
+  return await el.evaluate((node) => {
+    const probe = document.createElement("span");
+    probe.style.backgroundColor = getComputedStyle(document.documentElement)
+      .getPropertyValue("--overlay-heavy")
+      .trim();
+    document.body.appendChild(probe);
+    const token = getComputedStyle(probe).backgroundColor;
+    probe.remove();
+    return [getComputedStyle(node).backgroundColor, token];
+  });
+}
+
+const chrome = (page: Page): Locator => page.locator(".host-tile-chrome");
+const disc = (page: Page): Locator => chrome(page).locator(SELF_SIGNAL_DISC);
+const spark = (page: Page): Locator => disc(page).locator(SELF_SIGNAL_SPARK);
+
+async function joinMeeting(page: Page, label: string): Promise<void> {
+  const meetingId = `e2e_cqi_${label}_${Date.now()}`;
+  await fillAndSubmitJoinForm(page, meetingId, `CQI${label}User`);
+
+  const joinButton = page.getByText(/Start Meeting|Join Meeting/).first();
+  const grid = page.locator("#grid-container");
+  const which = await waitForVisibleState(
+    [
+      { name: "join", locator: joinButton },
+      { name: "grid", locator: grid },
+    ],
+    20_000,
+  );
+  if (which === "join" && (await joinButton.count()) > 0) {
+    await joinButton
+      .first()
+      .click()
+      .catch(() => {});
+  }
+  await expect(grid).toBeVisible({ timeout: 15_000 });
+
+  // PRESENCE GATE: an absent cluster must name itself, not time out later.
+  await expect(chrome(page)).toHaveCount(1, { timeout: 15_000 });
+}
+
+test.describe("Self signal disc (#367, #2661)", () => {
   test.beforeAll(async () => {
     await waitForServices();
   });
 
   test.beforeEach(async ({ context, baseURL }) => {
     await injectSessionCookie(context, { baseURL });
+    await enableDiagnosticsTileIndicators(context);
   });
 
-  test("indicator is not visible when connection quality is good", async ({ page }) => {
-    const meetingId = `e2e_cqi_good_${Date.now()}`;
-
-    await page.goto("/");
-    await page.waitForTimeout(1500);
-
-    await page.locator("#meeting-id").click();
-    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
-    await page.locator("#username").click();
-    await page.locator("#username").fill("");
-    await page.locator("#username").pressSequentially("CQITestUser", { delay: 80 });
-    await page.waitForTimeout(500);
-    await page.locator("#username").press("Enter");
-
-    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
-
-    // Enter the meeting
-    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-    await expect(joinButton).toBeVisible({ timeout: 20_000 });
-    await joinButton.click();
-
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
-
-    // Wait for a few seconds to allow diagnostics events to flow.
-    // On a localhost connection, RTT should be well below 300ms, so the
-    // indicator should never appear.
-    await page.waitForTimeout(5000);
-
-    // The component renders nothing when quality is Good, so the element
-    // should not exist in the DOM at all.
-    await expect(page.locator(".connection-quality-indicator.visible")).toHaveCount(0);
-    await expect(page.locator(".connection-quality-indicator.exiting")).toHaveCount(0);
-  });
-
-  test("no status role element from connection quality indicator when quality is good", async ({
+  // TAGGED @bvt1 — the ONE per-PR executing guard for 2661; the rest is untagged.
+  test("the disc is present and rests at Good on a healthy localhost link @bvt1", async ({
     page,
   }) => {
-    const meetingId = `e2e_cqi_aria_${Date.now()}`;
+    // 120 s: the per-step budgets sum past the 60 s default, so a SLOW stack
+    // would red every PR with an undiagnosable "Test timeout".
+    test.setTimeout(120_000);
 
-    await page.goto("/");
-    await page.waitForTimeout(1500);
+    // HEADLINE: nothing rendered here before 2661; restore the early return and
+    // this count goes to 0.
+    await joinMeeting(page, "present");
 
-    await page.locator("#meeting-id").click();
-    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
-    await page.locator("#username").click();
-    await page.locator("#username").fill("");
-    await page.locator("#username").pressSequentially("CQIAriaUser", { delay: 80 });
-    await page.waitForTimeout(500);
-    await page.locator("#username").press("Enter");
+    await expect(disc(page), "the self disc must be mounted on a healthy call").toHaveCount(1, {
+      timeout: 15_000,
+    });
+    await expect(disc(page)).toBeVisible({ timeout: 15_000 });
 
-    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+    await expect(disc(page)).toHaveAttribute("data-signal-state", "measured", { timeout: 20_000 });
 
-    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-    await expect(joinButton).toBeVisible({ timeout: 20_000 });
-    await joinButton.click();
-
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
-    await page.waitForTimeout(5000);
-
-    // When the component renders rsx! {} (Good quality), no status element
-    // with connection quality aria-label should exist in the DOM.
-    const qualityStatus = page.locator(
-      '[role="status"][aria-live="polite"][aria-label*="Connection quality"]',
+    await expect(disc(page)).toHaveAttribute("data-signal-level", LEVEL_GOOD);
+    await expect(disc(page)).toHaveAttribute("data-signal-lost", "false");
+    await expect(disc(page)).toHaveAttribute(
+      "aria-label",
+      "Your connection: good. Open diagnostics.",
     );
-    await expect(qualityStatus).toHaveCount(0);
+
+    // FAILS ON 0d48bec5^: the disc wore an opaque `#101114` of its own.
+    const [discBg, tokenBg] = await discAndTokenBackground(disc(page));
+    expect(tokenBg, "`--overlay-heavy` must resolve, or both sides read transparent").not.toBe(
+      "rgba(0, 0, 0, 0)",
+    );
+    expect(discBg, "the disc must wear the sibling tile icons' scrim token").toBe(tokenBg);
+
+    await expect(spark(page)).toHaveCount(1);
+    await expect
+      .poll(async () => await spark(page).locator(SPARK_TREND).count(), { timeout: 20_000 })
+      .toBeGreaterThanOrEqual(1);
+    await expect(spark(page).locator(SPARK_TREND).first()).toHaveCSS("stroke", TREND_GOOD);
+
+    // Discriminating: the un-fixed builder renders 3 circles here.
+    await expect(
+      disc(page).locator(SPARK_REMOVED_CIRCLES),
+      "2661 removed the head dot AND the ring arc; neither may come back",
+    ).toHaveCount(0);
+
+    // POSITIVE: a count-0 on the deleted `.spark-grid` would pass vacuously.
+    await expect
+      .poll(async () => await keylinesMatchTrends(spark(page)), {
+        timeout: 20_000,
+        message: "every trend run rides on its own keyline, or a run loses its backdrop",
+      })
+      .toBe(true);
+    await expect(spark(page).locator(SPARK_KEYLINE).first()).toHaveCSS("stroke", KEYLINE_BLACK);
+    await expect
+      .poll(async () => await keylinesPrecedeTrends(spark(page)), {
+        timeout: 20_000,
+        message: "every keyline must be painted UNDER the trend, not over it",
+      })
+      .toBe(true);
+    const [keylineWidth] = await authoredStrokeWidths(spark(page).locator(SPARK_KEYLINE));
+    const [trendWidth] = await authoredStrokeWidths(spark(page).locator(SPARK_TREND));
+    expect(
+      keylineWidth,
+      `a keyline no wider than the trend it backs shows nothing (${keylineWidth} vs ${trendWidth})`,
+    ).toBeGreaterThan(trendWidth);
+
+    await expect
+      .poll(async () => await sparkAreaFillState(spark(page)), {
+        timeout: 20_000,
+        message: "the disc interior is one flat colour: nothing may fill under the trend",
+      })
+      .toBe("no-area-fill");
+
+    await expect
+      .poll(async () => await newestTrendY(spark(page)), {
+        timeout: 20_000,
+        message: `a Good link's newest sample must plot at or above the 300 ms mark (y <= ${SPARK_WARN_Y})`,
+      })
+      .toBeLessThanOrEqual(SPARK_WARN_Y);
   });
 
-  test("connection quality CSS rules are present in the stylesheet", async ({ page }) => {
-    const meetingId = `e2e_cqi_css_${Date.now()}`;
+  test("the connection words are gone from the self tile", async ({ page }) => {
+    // LIVE DOM: a count-0 on `.connection-quality-label` would pass vacuously.
+    await joinMeeting(page, "nowords");
+    await expect(disc(page)).toHaveCount(1, { timeout: 15_000 });
 
-    await page.goto("/");
-    await page.waitForTimeout(1500);
+    await expect(disc(page)).toHaveText("");
 
-    await page.locator("#meeting-id").click();
-    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
-    await page.locator("#username").click();
-    await page.locator("#username").fill("");
-    await page.locator("#username").pressSequentially("CQICssUser", { delay: 80 });
-    await page.waitForTimeout(500);
-    await page.locator("#username").press("Enter");
-
-    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
-
-    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-    await expect(joinButton).toBeVisible({ timeout: 20_000 });
-    await joinButton.click();
-
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
-
-    // Verify the CSS rules for the connection quality indicator are loaded.
-    // This confirms the stylesheet includes the indicator styles even when
-    // the component is not currently rendering.
-    const hasBaseRule = await page.evaluate(() => {
-      for (const sheet of document.styleSheets) {
-        try {
-          for (const rule of sheet.cssRules) {
-            if (rule instanceof CSSStyleRule) {
-              if (rule.selectorText === ".connection-quality-indicator") {
-                return true;
-              }
-            }
-          }
-        } catch {
-          // Cross-origin stylesheets throw SecurityError — skip them.
-        }
-      }
-      return false;
+    await expect(disc(page)).toHaveAttribute("title", /^Connection: (good|measuring)/, {
+      timeout: 20_000,
     });
-
-    const hasVisibleRule = await page.evaluate(() => {
-      for (const sheet of document.styleSheets) {
-        try {
-          for (const rule of sheet.cssRules) {
-            if (rule instanceof CSSStyleRule) {
-              if (rule.selectorText === ".connection-quality-indicator.visible") {
-                return true;
-              }
-            }
-          }
-        } catch {
-          // Cross-origin stylesheets throw SecurityError — skip them.
-        }
-      }
-      return false;
-    });
-
-    const hasExitingRule = await page.evaluate(() => {
-      for (const sheet of document.styleSheets) {
-        try {
-          for (const rule of sheet.cssRules) {
-            if (rule instanceof CSSStyleRule) {
-              if (rule.selectorText === ".connection-quality-indicator.exiting") {
-                return true;
-              }
-            }
-          }
-        } catch {
-          // Cross-origin stylesheets throw SecurityError — skip them.
-        }
-      }
-      return false;
-    });
-
-    const hasLabelRule = await page.evaluate(() => {
-      for (const sheet of document.styleSheets) {
-        try {
-          for (const rule of sheet.cssRules) {
-            if (rule instanceof CSSStyleRule) {
-              if (rule.selectorText === ".connection-quality-label") {
-                return true;
-              }
-            }
-          }
-        } catch {
-          // Cross-origin stylesheets throw SecurityError — skip them.
-        }
-      }
-      return false;
-    });
-
-    expect(hasBaseRule).toBe(true);
-    expect(hasVisibleRule).toBe(true);
-    expect(hasExitingRule).toBe(true);
-    expect(hasLabelRule).toBe(true);
   });
 
-  test("indicator remains absent after extended wait on localhost", async ({ page }) => {
-    // Regression guard: verify that the indicator does not spuriously
-    // appear on a low-latency localhost connection even after an extended
-    // observation period. This catches bugs where the hysteresis state
-    // might drift or where stale diagnostics data triggers a false warning.
-    const meetingId = `e2e_cqi_extended_${Date.now()}`;
+  test("the disc sits immediately inboard of the connection LED", async ({ page }) => {
+    // Both clusters are `row-reverse`, so self must be LED then signal in DOM
+    // order — the reverse of pre-2661, and it fails if the badge moves back.
+    await joinMeeting(page, "order");
+    await expect(disc(page)).toHaveCount(1, { timeout: 15_000 });
 
-    await page.goto("/");
-    await page.waitForTimeout(1500);
+    // Presence first: a sentinel evaluate would pass on a half-built cluster.
+    await expect(chrome(page).locator(".connection-led")).toHaveCount(1, { timeout: 15_000 });
 
-    await page.locator("#meeting-id").click();
-    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
-    await page.locator("#username").click();
-    await page.locator("#username").fill("");
-    await page.locator("#username").pressSequentially("CQIExtUser", { delay: 80 });
-    await page.waitForTimeout(500);
-    await page.locator("#username").press("Enter");
+    const order = await chrome(page).evaluate((el) =>
+      Array.from(el.children).map((c) => ({
+        tag: c.tagName,
+        cls: c.className,
+        testid: c.getAttribute("data-testid"),
+      })),
+    );
+    expect(
+      order.length,
+      "the chrome cluster must have at least the LED and the disc",
+    ).toBeGreaterThanOrEqual(2);
+    expect(
+      order[0].cls,
+      "the connection LED is the first child (rightmost under row-reverse)",
+    ).toContain("connection-led");
+    expect(order[1].testid, "the signal disc is immediately inboard of the LED").toBe(
+      "self-signal-indicator",
+    );
+  });
 
-    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+  test("clicking the disc opens the Diagnostics drawer", async ({ page }) => {
+    // Self has no `PeerSignalHistory`, so it opens Diagnostics, not that popup.
+    await joinMeeting(page, "diagopen");
+    await expect(disc(page)).toHaveCount(1, { timeout: 15_000 });
+    await expect(disc(page)).toBeVisible({ timeout: 15_000 });
 
-    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-    await expect(joinButton).toBeVisible({ timeout: 20_000 });
-    await joinButton.click();
+    await expect(page.locator("#diagnostics-sidebar")).toHaveCount(0);
 
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await disc(page).click({ timeout: 15_000 });
 
-    // Wait long enough for multiple diagnostic cycles (diagnostics fire at
-    // ~1 Hz, hysteresis requires 3 consecutive bad samples to trigger).
-    // 10 seconds covers well over 3 cycles.
+    await expect(page.locator("#diagnostics-sidebar")).toHaveClass(/\bvisible\b/, {
+      timeout: 15_000,
+    });
+    await expect(page.locator("#diagnostics-sidebar")).toBeVisible({ timeout: 15_000 });
+  });
+
+  test("the disc does not drift off Good after an extended wait on localhost", async ({ page }) => {
+    await joinMeeting(page, "extended");
+    await expect(disc(page)).toHaveCount(1, { timeout: 15_000 });
+    await expect(disc(page)).toHaveAttribute("data-signal-state", "measured", { timeout: 20_000 });
+
     await page.waitForTimeout(10_000);
 
-    // Snapshot check: no indicator element of any state should exist.
-    await expect(page.locator(".connection-quality-indicator")).toHaveCount(0);
+    await expect(disc(page)).toHaveAttribute("data-signal-level", LEVEL_GOOD);
+
+    await expect(spark(page)).toHaveCount(1);
+    await expect
+      .poll(async () => await spark(page).locator(SPARK_TREND).count(), { timeout: 15_000 })
+      .toBeGreaterThanOrEqual(1);
+    await expect(spark(page).locator(SPARK_TREND).first()).toHaveCSS("stroke", TREND_GOOD);
+
+    await expect
+      .poll(async () => await newestTrendY(spark(page)), {
+        timeout: 15_000,
+        message: "after 10 s on localhost the newest sample must still sit above the 300 ms mark",
+      })
+      .toBeLessThanOrEqual(SPARK_WARN_Y);
+
+    // SPARK_MIN_POINTS not 10, for CI slack — but the product plots nothing below
+    // it, so a stalled sampler still lands under.
+    await expect
+      .poll(async () => Number(await disc(page).getAttribute("data-signal-samples")), {
+        timeout: 15_000,
+      })
+      .toBeGreaterThanOrEqual(SPARK_MIN_POINTS);
   });
 });

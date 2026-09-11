@@ -2,7 +2,7 @@
 
 //! Per-tile media-metrics overlay (issue 1768).
 //!
-//! When the diagnostics "Show media metrics on tiles" checkbox is on, each tile
+//! When the diagnostics "Show diagnostics on tiles" checkbox is on, each tile
 //! renders a small, passive readout anchored at its bottom edge:
 //!   * a REMOTE peer tile shows what THIS client is RECEIVING from that peer —
 //!     decoded video resolution and received video fps. Its audio field is always
@@ -65,7 +65,7 @@ use dioxus::prelude::*;
 use videocall_client::decode::peer_decoder::METRIC_FPS_PAINTED;
 use videocall_diagnostics::{Metric, MetricValue};
 
-/// `localStorage` key for the "Show media metrics on tiles" preference
+/// `localStorage` key for the "Show diagnostics on tiles" preference
 /// (issue 1768). Boolean, defaults to `false` (off) via [`crate::local_storage`].
 pub const MEDIA_METRICS_OVERLAY_KEY: &str = "diagnostics.media_metrics_overlay";
 

@@ -15,6 +15,9 @@
  * (case-insensitive) enable it. The committed default
  * (`dioxus-ui/scripts/config.js`) is `transportBadgeEnabled: "false"` → OFF.
  *
+ * NOT SUFFICIENT ALONE: #2673 ANDs the diagnostics checkbox in, so pair every call
+ * below with `enableDiagnosticsTileIndicators`.
+ *
  * ## Why a `/config.js` route interception (and not addInitScript)
  *
  * Identical reasoning to `helpers/simulcast-config.ts`: the Dioxus UI reads its

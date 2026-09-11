@@ -1241,6 +1241,33 @@ pub struct PeerReceiveDiag {
 /// above the encode ceiling's own budget so no honest publisher is clipped.
 const MAX_REPORTED_SCREEN_KBPS: u32 = 100_000;
 
+/// Bounds the peer-stamped source's MAGNITUDE ([`MAX_REPORTED_SCREEN_KBPS`]'s boundary).
+const MAX_REPORTED_SOURCE_DIM: u32 = 16_384;
+
+/// Bounds its SHAPE: `16384x1` clears the magnitude bound and still collapses onto
+/// `round_down_even`'s 2px floor. Checked on the FIT, so one predicate covers the
+/// camera box and the screen path's source-ORIENTED box alike.
+///
+/// **Do not raise this.** It rejects fitted OUTPUT, and video layer 0's box is only
+/// `320x180`, so honest captures fit small there: `640x480`→`240x180`, `480x640`→
+/// `134x180`, `240x1080`→**`40x180`**. Anything above ~40 em-dashes real publishers.
+const MIN_PLAUSIBLE_FITTED_DIM: u32 = 16;
+
+fn sane_reported_source_dims(decoder: &VideoPeerDecoder) -> (u32, u32) {
+    let (w, h) = decoder.reported_source_dims();
+    if w == 0 || h == 0 || w > MAX_REPORTED_SOURCE_DIM || h > MAX_REPORTED_SOURCE_DIM {
+        return (0, 0);
+    }
+    (w, h)
+}
+
+fn sane_fitted_dims((w, h): (u32, u32)) -> (u32, u32) {
+    if w < MIN_PLAUSIBLE_FITTED_DIM || h < MIN_PLAUSIBLE_FITTED_DIM {
+        return (0, 0);
+    }
+    (w, h)
+}
+
 /// The peer reports its CAPTURED surface, so it is fitted through
 /// [`screen_encode_box_for_capture`] — the same function the sender configures
 /// its encoder with. `(0, 0)` / `0` stay as "not told us yet".
@@ -1248,14 +1275,37 @@ fn enrich_screen_snapshot(
     peer: &Peer,
     snap: &mut crate::decode::layer_chooser::ReceivedLayerSnapshot,
 ) {
-    let (capture_w, capture_h) = peer.screen.reported_source_dims();
-    let (w, h) = videocall_aq::screen_encode_box_for_capture(capture_w, capture_h);
+    let (capture_w, capture_h) = sane_reported_source_dims(&peer.screen);
+    let (w, h) = sane_fitted_dims(videocall_aq::screen_encode_box_for_capture(
+        capture_w, capture_h,
+    ));
     snap.width = w;
     snap.height = h;
     snap.kbps = peer
         .screen
         .reported_target_kbps()
         .min(MAX_REPORTED_SCREEN_KBPS);
+}
+
+/// Fill a VIDEO snapshot with what the peer's layer is really ENCODED at, not its ladder
+/// box (#2659) — via the function the sender's own encode path configures with.
+fn enrich_video_snapshot(
+    peer: &Peer,
+    snap: &mut crate::decode::layer_chooser::ReceivedLayerSnapshot,
+) {
+    let (src_w, src_h) = sane_reported_source_dims(&peer.video);
+    let (w, h) = if src_w == 0 || src_h == 0 {
+        (0, 0)
+    } else {
+        sane_fitted_dims(videocall_aq::camera_layer_encode_box(
+            src_w,
+            src_h,
+            snap.layer_index as usize,
+            snap.layer_count as usize,
+        ))
+    };
+    snap.width = w;
+    snap.height = h;
 }
 
 /// Per-peer self-reported device/hardware metrics (#1482). Populated from the
@@ -4343,6 +4393,18 @@ impl PeerDecodeManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_peer_video_source_dims_for_test(
+        &mut self,
+        session_id: u64,
+        width: u32,
+        height: u32,
+    ) {
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            peer.video.set_reported_for_test(width, height, 0);
+        }
+    }
+
     /// Set the callback used to send packets back through the connection.
     /// This is required for the PLI (keyframe request) mechanism.
     pub fn set_send_packet_callback(&mut self, callback: Callback<PacketWrapper>, user_id: String) {
@@ -5489,8 +5551,10 @@ impl PeerDecodeManager {
             ),
         };
         let mut snap = received_layer_snapshot(kind, layer, count);
-        if matches!(kind, PrefMediaKind::Screen) {
-            enrich_screen_snapshot(peer, &mut snap);
+        match kind {
+            PrefMediaKind::Screen => enrich_screen_snapshot(peer, &mut snap),
+            PrefMediaKind::Video => enrich_video_snapshot(peer, &mut snap),
+            PrefMediaKind::Audio => {}
         }
         Some(snap)
     }
@@ -5546,13 +5610,15 @@ impl PeerDecodeManager {
             // reason from ONE consistent layer.
             let video = peer.video_enabled.then(|| {
                 let avail_top = peer.video_layer_availability.highest_available(now_ms);
-                received_layer_snapshot_with_reason(
+                let mut snap = received_layer_snapshot_with_reason(
                     PrefMediaKind::Video,
                     peer.selected_video_layer,
                     avail_top,
                     video_max,
                     peer.video_layer_chooser.is_constrained(),
-                )
+                );
+                enrich_video_snapshot(peer, &mut snap);
+                snap
             });
             let screen = peer.screen_enabled.then(|| {
                 let avail_top = peer.screen_layer_availability.highest_available(now_ms);
@@ -6946,6 +7012,16 @@ mod tests {
                 .min(MAX_REPORTED_SCREEN_KBPS),
             videocall_aq::constants::screen_bitrate_kbps_for(2560, 1440, 10)
         );
+
+        let (mut flat, _m5) = make_test_peer(2347);
+        flat.screen_enabled = true;
+        flat.screen.set_reported_for_test(16_384, 1, 1_000);
+        let mut mgr5 = PeerDecodeManager::new();
+        mgr5.connected_peers.insert(2347, flat);
+        let degenerate = mgr5
+            .received_layer_snapshot(crate::decode::layer_chooser::PrefMediaKind::Screen, 1000)
+            .expect("receiving");
+        assert_eq!((degenerate.width, degenerate.height), (0, 0));
     }
 
     /// #2251 leaf. MUTATION: `>=`→`>` moves a healthy guard; dropping the write pins 2.
@@ -12590,59 +12666,131 @@ mod tests {
         );
     }
 
-    /// BOTH manager-level snapshot producers must resolve rung geometry through the
-    /// camera ladder, exercised through the REAL production methods with a REAL peer
-    /// — the pure-resolver tests bypass the manager and the Playwright spec joins
-    /// solo, so neither sees a producer that stops consulting the ladder.
-    ///
-    /// Sitting the peer on the TOP rung is load-bearing: a base-rung fixture would
-    /// pass against a hardcoded table.
-    ///
-    /// MUTATION: hardcode either producer's geometry, or point the resolver at the
-    /// screen/audio arm, and the `(1280, 720, 1500)` assertions fail.
-    #[test]
-    fn manager_display_producers_resolve_the_camera_ladder_top_rung() {
+    fn video_readouts_for(
+        session_id: u64,
+        src_w: u32,
+        src_h: u32,
+    ) -> ((u32, u32, u32), (u32, u32, u32)) {
+        video_readouts_at_layer(session_id, 2, src_w, src_h)
+    }
+
+    fn video_readouts_at_layer(
+        session_id: u64,
+        layer: u32,
+        src_w: u32,
+        src_h: u32,
+    ) -> ((u32, u32, u32), (u32, u32, u32)) {
         use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
 
         let now = 2000u64;
         let mut manager = PeerDecodeManager::new();
-        manager.insert_zero_loss_top_peer_for_test(900);
-        manager.set_peer_video_layer_for_test(900, 2);
+        manager.insert_zero_loss_top_peer_for_test(session_id);
+        manager.set_peer_video_layer_for_test(session_id, layer);
+        manager.set_peer_video_source_dims_for_test(session_id, src_w, src_h);
 
-        let top = crate::adaptive_quality_constants::simulcast_layers(3)
-            .last()
-            .expect("the camera ladder is non-empty");
-        let expected = (top.max_width, top.max_height, top.ideal_bitrate_kbps);
-        assert_eq!(
-            expected,
-            (1280, 720, 1500),
-            "fixture check: the shipped camera top rung is 720p @ 1500 kbps"
-        );
-
-        // Producer 1: the per-KIND representative needle (the receive bar-meter and
-        // the `format_readout` `{w}x{h}` line).
         let needle = manager
             .received_layer_snapshot(PrefMediaKind::Video, now)
             .expect("a connected video peer yields a needle snapshot");
-        assert_eq!(
+        let rows = manager.per_peer_received_snapshots(now, &ReceiveLayerBounds::default());
+        let row = rows
+            .iter()
+            .find(|r| r.session_id == session_id)
+            .and_then(|r| r.video.as_ref())
+            .copied()
+            .expect("the peer must appear with a video snapshot");
+
+        (
             (needle.width, needle.height, needle.kbps),
-            expected,
-            "the needle producer must resolve the camera ladder's top rung"
+            (row.width, row.height, row.kbps),
+        )
+    }
+
+    #[test]
+    fn manager_video_producers_report_the_fitted_source_not_the_ladder_box() {
+        let top = crate::adaptive_quality_constants::simulcast_layers(3)
+            .last()
+            .expect("the camera ladder is non-empty");
+        let box_dims = (top.max_width, top.max_height);
+        assert_eq!(
+            (box_dims.0, box_dims.1, top.ideal_bitrate_kbps),
+            (1280, 720, 1500),
+            "fixture check: the shipped camera top layer is a 720p box @ 1500 kbps"
         );
 
-        // Producer 2: the per-PEER rows (the `720p · ~1.5M` peer-row metric, the
-        // diagnostics drawer line, and the signal-quality popup).
-        let rows = manager.per_peer_received_snapshots(now, &ReceiveLayerBounds::default());
-        let video = rows
-            .iter()
-            .find(|r| r.session_id == 900)
-            .and_then(|r| r.video.as_ref())
-            .expect("the peer must appear with a video snapshot");
+        let (needle, row) = video_readouts_for(900, 640, 480);
         assert_eq!(
-            (video.width, video.height, video.kbps),
-            expected,
-            "the PER-PEER producer must resolve the same rung the needle does"
+            needle,
+            (640, 480, 1500),
+            "the needle must report what video layer 2 is encoded at"
         );
+        assert_eq!(row, needle, "both producers must agree");
+        assert_ne!(
+            (needle.0, needle.1),
+            box_dims,
+            "reporting the box is the #2659 defect"
+        );
+
+        let (hd_needle, hd_row) = video_readouts_for(901, 1920, 1080);
+        assert_eq!(hd_needle, (1280, 720, 1500));
+        assert_eq!(hd_row, hd_needle);
+
+        for (src_w, src_h, got) in [(640u32, 480u32, needle), (1920, 1080, hd_needle)] {
+            let (fit_w, fit_h, _, _, _, _) =
+                crate::encode::camera_encoder::simulcast_layer_encode_params(3, 2, src_w, src_h);
+            assert_eq!(
+                (got.0, got.1),
+                (fit_w, fit_h),
+                "{src_w}x{src_h}: the receive readout must equal what the sender configures"
+            );
+        }
+    }
+
+    #[test]
+    fn manager_video_producers_reject_an_unreported_or_degenerate_source() {
+        let (needle, row) = video_readouts_for(902, 0, 0);
+        assert_eq!(
+            (needle.0, needle.1),
+            (0, 0),
+            "an unreported publisher stays honestly unknown"
+        );
+        assert_eq!(row, needle);
+
+        // SQUARE on purpose: its fit is describable, so only the magnitude bound rejects it.
+        let (hostile, hostile_row) = video_readouts_for(903, u32::MAX, u32::MAX);
+        assert_eq!(
+            (hostile.0, hostile.1),
+            (0, 0),
+            "a source past MAX_REPORTED_SOURCE_DIM is not a capture"
+        );
+        assert_eq!(hostile_row, hostile);
+
+        let (collapsed, collapsed_row) = video_readouts_for(905, MAX_REPORTED_SOURCE_DIM, 1);
+        assert_eq!((collapsed.0, collapsed.1), (0, 0));
+        assert_eq!(collapsed_row, collapsed);
+        let (portrait, _) = video_readouts_for(906, 1, MAX_REPORTED_SOURCE_DIM);
+        assert_eq!((portrait.0, portrait.1), (0, 0));
+
+        let (uhd, _) = video_readouts_for(904, 3840, 2160);
+        assert_eq!(
+            (uhd.0, uhd.1),
+            (1280, 720),
+            "a 4K publisher is honest and must fit, not be discarded"
+        );
+        let (span, _) = video_readouts_for(907, 9600, 540);
+        assert_eq!((span.0, span.1), (1280, 72));
+
+        // THE LOW-END PIN: an over-raised MIN_PLAUSIBLE_FITTED_DIM blanks real peers here first.
+        let (narrow, narrow_row) = video_readouts_at_layer(908, 0, 240, 1080);
+        assert_eq!(
+            (narrow.0, narrow.1),
+            (40, 180),
+            "a narrow capture legitimately fits to a 40px axis at video layer 0"
+        );
+        assert_eq!(narrow_row, narrow);
+        let (portrait, _) = video_readouts_at_layer(909, 0, 480, 640);
+        assert_eq!((portrait.0, portrait.1), (134, 180));
+        let (four_three, _) = video_readouts_at_layer(910, 0, 640, 480);
+        assert_eq!((four_three.0, four_three.1), (240, 180));
     }
 
     /// #1695 (guard must not lead the wire on a rate-limited up-switch): after a
@@ -13987,13 +14135,23 @@ mod tests {
             peer.video_layer_availability.observe(layer, 1000);
         }
         manager.connected_peers.insert(801, peer);
+        // #2659: the snapshot reports the FITTED encode box, not the nominal
+        // ladder rung. A 4:3 source is the discriminating fixture — a 16:9 720p
+        // source fits layer 2 to exactly 1280x720, so it would pass against the
+        // nominal box too and prove nothing.
+        manager.set_peer_video_source_dims_for_test(801, 640, 480);
 
         let snap = manager
             .received_layer_snapshot(PrefMediaKind::Video, 1000)
             .expect("a video-enabled peer is being received");
         assert_eq!(snap.layer_index, 2);
         assert_eq!(snap.layer_count, 3);
-        assert_eq!((snap.width, snap.height), (1280, 720));
+        assert_eq!(
+            (snap.width, snap.height),
+            (640, 480),
+            "layer 2 of a 640x480 source fits to 640x480; the nominal 1280x720 \
+             box would be an upscale (videocall_aq::camera_layer_encode_box)"
+        );
         // Audio not enabled on this peer → None for audio.
         assert!(manager
             .received_layer_snapshot(PrefMediaKind::Audio, 1000)
@@ -17786,6 +17944,58 @@ mod tests {
                 "frame {seq} must be handed to the decoder with the receiver->publisher pair"
             );
         }
+    }
+
+    /// Issue 2632: the frame path borrows the live context, so a value that changes mid-call
+    /// must reach the next frame. `every_frame_pushed_to_the_worker_carries_the_peer_attribution`
+    /// and `frames_stay_attributed_across_a_decoder_rebuild` each assert one fixed pair, so
+    /// neither would notice a stale handle.
+    #[test]
+    fn a_context_changed_mid_call_reaches_the_very_next_frame() {
+        let mut manager = manager_with_flowing_peer(7, 1741);
+        let packet =
+            || Arc::try_unwrap(video_layer_wrap(0, 1, 1741)).expect("sole owner of the wrapper");
+
+        manager
+            .decode(packet(), "local@test.com")
+            .expect("first packet decodes");
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&1741)
+                .expect("peer present")
+                .video
+                .last_pushed_context_for_test(),
+            Some(StreamContext {
+                from_peer: "7".to_string(),
+                to_peer: "1741".to_string(),
+            }),
+            "precondition: the pre-change pair is what the decoder saw"
+        );
+
+        manager
+            .connected_peers
+            .get(&1741)
+            .expect("peer present")
+            .video
+            .set_stream_context("99".to_string(), "1741".to_string());
+
+        manager
+            .decode(packet(), "local@test.com")
+            .expect("post-change packet decodes");
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&1741)
+                .expect("peer present")
+                .video
+                .last_pushed_context_for_test(),
+            Some(StreamContext {
+                from_peer: "99".to_string(),
+                to_peer: "1741".to_string(),
+            }),
+            "the frame after the change must carry the NEW pair, not the cached one"
+        );
     }
 
     /// Issue 1741, rebuild path: a rebuilt decoder owns a brand-new worker, and the peer latch

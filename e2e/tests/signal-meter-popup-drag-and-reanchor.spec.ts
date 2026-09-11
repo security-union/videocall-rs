@@ -1,8 +1,10 @@
 import { test, expect, Page, BrowserContext, Locator } from "@playwright/test";
 import { chromium } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { CAMERA_PEER_SIGNAL_DISC, PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 
 /**
  * HCL follow-up 952: addInitScript payload that replaces
@@ -82,6 +84,7 @@ async function joinMeetingAs(
   meetingId: string,
   username: string,
 ): Promise<Page> {
+  await enableDiagnosticsTileIndicators(context);
   const page = await context.newPage();
   await page.goto("/");
   await page.waitForTimeout(1500);
@@ -195,9 +198,9 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       await members[0].page.waitForTimeout(10_000);
 
       const hostPage = members[0].page;
-      const signalButton = hostPage.locator(
-        '#grid-container button[aria-label="Show signal quality"]',
-      );
+      const signalButton = hostPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
+      // Also pins "exactly one camera peer" — `toBeVisible` would throw on two.
+      await expect(signalButton).toHaveCount(1, { timeout: 30_000 });
       await expect(signalButton).toBeVisible({ timeout: 30_000 });
 
       // ── 1. Open the popup ────────────────────────────────────────────
@@ -383,7 +386,8 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       const hostPage = members[0].page;
 
       const tile = hostPage.locator("#grid-container > div[id^='peer-video-']").first();
-      const signalButton = tile.locator('button[aria-label="Show signal quality"]');
+      // Tile-scoped to a camera tile, so the bare testid cannot reach the screen disc.
+      const signalButton = tile.locator(PEER_SIGNAL_DISC);
       await expect(signalButton).toBeVisible({ timeout: 30_000 });
 
       // Capture the button's rect BEFORE clicking — popup will overlay it.
@@ -487,9 +491,8 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       const hostPage = members[0].page;
       await hostPage.waitForTimeout(10_000);
 
-      const signalButton = hostPage.locator(
-        '#grid-container button[aria-label="Show signal quality"]',
-      );
+      const signalButton = hostPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
+      await expect(signalButton).toHaveCount(1, { timeout: 30_000 });
       await expect(signalButton).toBeVisible({ timeout: 30_000 });
       await signalButton.click();
 
@@ -622,7 +625,8 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       // the captured boxes so the caller can dump them on failure.
       const assertSnapBack = async (tile: Locator, label: string): Promise<void> => {
         await expect(tile).toBeVisible({ timeout: 30_000 });
-        const sigBtn = tile.locator('button[aria-label$="signal quality"]');
+        // Deliberately kind-agnostic: called with BOTH the screen and peer tiles.
+        const sigBtn = tile.locator(PEER_SIGNAL_DISC);
         await expect(sigBtn).toBeVisible({ timeout: 15_000 });
 
         // Iter6: wait for the signal-quality button's bounding box to
@@ -893,9 +897,8 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       const hostPage = members[0].page;
       await hostPage.waitForTimeout(10_000);
 
-      const signalButton = hostPage.locator(
-        '#grid-container button[aria-label="Show signal quality"]',
-      );
+      const signalButton = hostPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
+      await expect(signalButton).toHaveCount(1, { timeout: 30_000 });
       await expect(signalButton).toBeVisible({ timeout: 30_000 });
       await signalButton.click();
 

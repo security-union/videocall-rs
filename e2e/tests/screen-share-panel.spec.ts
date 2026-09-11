@@ -633,12 +633,11 @@ test.describe("Screen share right panel layout", () => {
       const gridItems = hostPage.locator("#grid-container .grid-item");
       await expect(gridItems.first()).toBeVisible({ timeout: 10_000 });
 
-      // The normal grid should use CSS grid (grid-template-columns with
-      // repeat(N, 1fr)) rather than the split layout's flex container.
+      // `flex-wrap: nowrap` is the split arm's signature and the only one of
+      // the three flow arms to use it, so this holds at any tile count.
       const containerStyle = await hostPage.locator("#grid-container").getAttribute("style");
       expect(containerStyle).toBeTruthy();
-      expect(containerStyle).toContain("grid-template-columns");
-      expect(containerStyle).toContain("grid-template-rows");
+      expect(containerStyle).not.toContain("flex-wrap: nowrap");
     } finally {
       await browser1.close();
       await browser2.close();
@@ -798,11 +797,462 @@ test.describe("Screen share right panel layout", () => {
       const gridItems = hostPage.locator("#grid-container .grid-item");
       await expect(gridItems.first()).toBeVisible({ timeout: 10_000 });
 
-      // The #grid-container should use normal CSS grid properties.
       const containerStyle = await hostPage.locator("#grid-container").getAttribute("style");
       expect(containerStyle).toBeTruthy();
-      expect(containerStyle).toContain("grid-template-columns");
-      expect(containerStyle).toContain("grid-template-rows");
+      expect(containerStyle).not.toContain("flex-wrap: nowrap");
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 6. All tiles same size (CSS grid uniformity)
+  //
+  // The CSS grid layout uses `repeat(auto-fill, minmax(160px, 1fr))`
+  // which guarantees all grid cells are the same width, and
+  // `aspect-ratio: 3/2` on each tile guarantees uniform height.
+  // With mock peers we verify that all visible `.split-peer-tile`
+  // elements have the same width and height within 1px tolerance.
+  // ──────────────────────────────────────────────────────────────────────
+  test("all split-peer-tiles have uniform dimensions during screen share", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_uniform_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSUniformHost",
+      "SSUniformGuest",
+    );
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const mockButton = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
+      });
+      const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
+      if (!mockPeersAvailable) {
+        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
+        return;
+      }
+
+      // Add 6 mock peers — enough for 2+ rows in a 2-column grid.
+      await addMockPeers(hostPage, 6);
+      await hostPage.waitForTimeout(2000);
+
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+      await hostPage.waitForTimeout(3000);
+
+      const tiles = hostPage.locator(".split-peer-tile");
+      const tileCount = await tiles.count();
+      expect(tileCount).toBeGreaterThanOrEqual(6);
+
+      // Collect bounding box dimensions for all visible tiles.
+      const dimensions: { w: number; h: number }[] = [];
+      for (let i = 0; i < tileCount; i++) {
+        const box = await tiles.nth(i).boundingBox();
+        if (box && box.width > 0 && box.height > 0) {
+          dimensions.push({ w: box.width, h: box.height });
+        }
+      }
+      expect(dimensions.length).toBeGreaterThanOrEqual(4);
+
+      // All tiles must have the same width and height within 1px.
+      const refW = dimensions[0].w;
+      const refH = dimensions[0].h;
+      for (let i = 1; i < dimensions.length; i++) {
+        expect(Math.abs(dimensions[i].w - refW)).toBeLessThanOrEqual(1);
+        expect(Math.abs(dimensions[i].h - refH)).toBeLessThanOrEqual(1);
+      }
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 7. Gaps between adjacent tiles
+  //
+  // The `.ss-peer-panel` CSS grid has `gap: 10px`. Adjacent tiles in the
+  // same row must have at least 8px of horizontal space between them
+  // (allowing for sub-pixel rounding). This ensures tiles never visually
+  // touch each other.
+  // ──────────────────────────────────────────────────────────────────────
+  test("adjacent tiles have gaps between them during screen share", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_gaps_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSGapsHost",
+      "SSGapsGuest",
+    );
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const mockButton = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
+      });
+      const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
+      if (!mockPeersAvailable) {
+        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
+        return;
+      }
+
+      // Add 6 mock peers to get multiple columns.
+      await addMockPeers(hostPage, 6);
+      await hostPage.waitForTimeout(2000);
+
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+      await hostPage.waitForTimeout(3000);
+
+      // Collect bounding boxes of all visible tiles.
+      const tiles = hostPage.locator(".split-peer-tile");
+      const tileCount = await tiles.count();
+      expect(tileCount).toBeGreaterThanOrEqual(4);
+
+      const boxes: { left: number; right: number; top: number; bottom: number }[] = [];
+      for (let i = 0; i < tileCount; i++) {
+        const box = await tiles.nth(i).boundingBox();
+        if (box && box.width > 0) {
+          boxes.push({
+            left: box.x,
+            right: box.x + box.width,
+            top: box.y,
+            bottom: box.y + box.height,
+          });
+        }
+      }
+
+      // Find pairs of tiles in the same row (overlapping Y ranges) and
+      // verify horizontal gap >= 8px. The CSS gap is 10px; 8px allows
+      // for sub-pixel rounding.
+      let horizontalPairsChecked = 0;
+      for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i];
+          const b = boxes[j];
+          // Same row: vertical overlap > 50% of tile height.
+          const overlapY = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+          const tileH = a.bottom - a.top;
+          if (overlapY > tileH * 0.5) {
+            // These tiles are in the same row — check horizontal gap.
+            const gap = Math.abs(a.left > b.right ? a.left - b.right : b.left - a.right);
+            expect(gap).toBeGreaterThanOrEqual(8);
+            horizontalPairsChecked++;
+          }
+        }
+      }
+
+      // Find pairs of tiles in the same column (overlapping X ranges) and
+      // verify vertical gap >= 8px.
+      let verticalPairsChecked = 0;
+      for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i];
+          const b = boxes[j];
+          const overlapX = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+          const tileW = a.right - a.left;
+          if (overlapX > tileW * 0.5) {
+            // Same column — check vertical gap only for adjacent rows.
+            const vGap = Math.abs(a.top > b.bottom ? a.top - b.bottom : b.top - a.bottom);
+            if (vGap < 50) {
+              // Adjacent rows (gap < 50px means they are neighbors).
+              expect(vGap).toBeGreaterThanOrEqual(8);
+              verticalPairsChecked++;
+            }
+          }
+        }
+      }
+
+      // We must have found at least one pair in a multi-column/multi-row
+      // grid to make the gap assertion meaningful.
+      expect(horizontalPairsChecked + verticalPairsChecked).toBeGreaterThan(0);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 8. Tile width fills the grid cell
+  //
+  // Each `.split-peer-tile` has `width: 100%` so it fills the full grid
+  // cell width. The tile width should be approximately
+  // (panel_content_width - gaps) / columns. This test verifies tiles
+  // consume the available panel width minus padding and gaps.
+  // ──────────────────────────────────────────────────────────────────────
+  test("tiles fill the available grid cell width during screen share", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_fill_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSFillHost",
+      "SSFillGuest",
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+      await hostPage.waitForTimeout(2000);
+
+      const panel = hostPage.locator(".ss-peer-panel");
+      await expect(panel).toBeVisible({ timeout: 10_000 });
+
+      const tiles = hostPage.locator(".split-peer-tile");
+      const tileCount = await tiles.count();
+      expect(tileCount).toBeGreaterThan(0);
+
+      // Get the panel content width and tile width.
+      const metrics = await panel.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        const paddingLeft = parseFloat(cs.paddingLeft) || 0;
+        const paddingRight = parseFloat(cs.paddingRight) || 0;
+        const gap = parseFloat(cs.columnGap) || parseFloat(cs.gap) || 0;
+        const contentWidth = el.clientWidth - paddingLeft - paddingRight;
+        // Count resolved grid columns from computed style.
+        const cols = cs.gridTemplateColumns.split(/\s+/).filter((s) => s.length > 0).length;
+        return { contentWidth, gap, cols };
+      });
+
+      const firstTile = tiles.first();
+      const tileBox = await firstTile.boundingBox();
+      expect(tileBox).not.toBeNull();
+
+      // Expected tile width: (contentWidth - (cols-1)*gap) / cols
+      const expectedTileWidth =
+        (metrics.contentWidth - (metrics.cols - 1) * metrics.gap) / metrics.cols;
+
+      // Allow 2px tolerance for sub-pixel rounding.
+      expect(Math.abs(tileBox!.width - expectedTileWidth)).toBeLessThanOrEqual(2);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 9. Name truncation: long usernames do not overflow into icon area
+  //
+  // The `.floating-name` label uses `max-width: calc(100% - 90px)` with
+  // `white-space: nowrap; text-overflow: ellipsis; overflow: hidden` to
+  // prevent long names from overflowing into the mute/signal icon area
+  // on the right side of the tile.
+  // ──────────────────────────────────────────────────────────────────────
+  test("long usernames are truncated and do not overflow tile icons", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_trunc_${Date.now()}`;
+
+    // Use a very long guest name to test truncation.
+    const longName = "AVeryLongDisplayNameThatShouldDefinitelyBeTruncatedByCSS";
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSTruncHost",
+      longName,
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+      await hostPage.waitForTimeout(2000);
+
+      // Find the .floating-name element within a split-peer-tile.
+      const floatingNames = hostPage.locator(".split-peer-tile .floating-name");
+      const nameCount = await floatingNames.count();
+      expect(nameCount).toBeGreaterThan(0);
+
+      for (let i = 0; i < nameCount; i++) {
+        const nameEl = floatingNames.nth(i);
+        const isVisible = await nameEl.isVisible();
+        if (!isVisible) continue;
+
+        // Verify overflow is hidden (the real truncation contract).
+        // Note: text-overflow:ellipsis is declared but has no visual
+        // effect on display:inline-flex elements — the geometric check
+        // below is the authoritative truncation assertion.
+        const styles = await nameEl.evaluate((el) => {
+          const cs = getComputedStyle(el);
+          return { overflow: cs.overflow };
+        });
+        expect(styles.overflow).toBe("hidden");
+
+        // Verify the floating-name does not extend beyond the tile's
+        // right edge minus icon area (~90px). The name's right edge must
+        // not reach the tile's right edge.
+        const overflow = await nameEl.evaluate((el) => {
+          const tile = el.closest(".split-peer-tile") as HTMLElement;
+          if (!tile) return { nameRight: 0, tileRight: 0 };
+          const nr = el.getBoundingClientRect();
+          const tr = tile.getBoundingClientRect();
+          return { nameRight: nr.right, tileRight: tr.right };
+        });
+
+        // The name's right edge should leave room for icons (~90px area).
+        // Allow some tolerance but the name must not reach the tile edge.
+        if (overflow.tileRight > 0) {
+          const rightMargin = overflow.tileRight - overflow.nameRight;
+          // There should be at least 40px of space for icons (the CSS
+          // reserves 90px, but the actual icon width varies).
+          expect(rightMargin).toBeGreaterThanOrEqual(40);
+        }
+      }
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 9. Pinned split-tile chrome vars are MAXIMIZED, not a stale grid cell
+  //    (PR #1946 regression).
+  //
+  // Bug: `container_style`'s `has_screen_share` branch never set
+  // `--tile-w`/`--tile-h`. Those vars drive the pinned split-tile chrome
+  // (`.split-peer-tile.grid-item-pinned .floating-name / .tile-top-icons /
+  // .placeholder-content` in style.css). A pinned side-panel tile maximizes to
+  // the full viewport (`position: fixed; 100%×100%`), so its chrome should be
+  // sized off the maximized tile. Because the branch omitted the vars, Dioxus's
+  // `set_attribute.ts` silently PRESERVED whatever `--tile-h` the last pre-share
+  // grid render wrote — a value that SHRINKS as the pre-share participant count
+  // grows. Two clients could freeze different pinned-chrome sizes for the same
+  // meeting state (nondeterministic by join/render order).
+  //
+  // The existing 2-peer parity tests (speaker-highlight.spec.ts 5h/5i/5j)
+  // STRUCTURALLY cannot catch this: with a single remote tile the pre-share
+  // grid `--tile-h` is already the large single-tile value (~580px at 1280×720),
+  // so the frozen leftover equals the correct maximized value and the bug is
+  // invisible. This test forces a MANY-tile pre-share grid (via mock peers) so
+  // the grid `--tile-h` collapses well below the maximized value, exposing the
+  // stale-leftover divergence.
+  //
+  // Mutation sensitivity: with ~11 tiles the pre-share grid `--tile-h` is
+  // ~183px (< the 293px chrome-saturation threshold). After the fix, the
+  // screen-share `--tile-h` jumps to the maximized single-tile height (~580px);
+  // on the un-fixed code it stays frozen at ~183px. The assertions require the
+  // screen-share `--tile-h` to (a) exceed the 293px saturation threshold and
+  // (b) be far larger than the pre-share grid value and near viewport height —
+  // all THREE fail on the un-fixed code (frozen ~183px), and reverting the
+  // `--tile-w`/`--tile-h` declaration in `container_style` re-breaks them.
+  // ──────────────────────────────────────────────────────────────────────
+  test("pinned split-tile chrome var is maximized regardless of pre-share tile count @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_pin_tilevar_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSPinVarHost",
+      "SSPinVarGuest",
+      { mockDisplayMedia: true },
+    );
+
+    // Read the `--tile-h` custom property (px) set inline on `#grid-container`.
+    const readTileH = async () =>
+      hostPage.evaluate(() => {
+        const el = document.querySelector("#grid-container") as HTMLElement | null;
+        if (!el) return NaN;
+        const raw = getComputedStyle(el).getPropertyValue("--tile-h").trim();
+        return parseFloat(raw);
+      });
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const mockButton = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
+      });
+      const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
+      expect(
+        mockPeersAvailable,
+        'Mock Peers control must be present. docker/docker-compose.e2e.yaml sets MOCK_PEERS_ENABLED=true, so its absence in CI is a regression; locally set mockPeersEnabled: "true" in config.js.',
+      ).toBe(true);
+
+      // Inflate the host's grid to many tiles (1 real guest + 10 mocks = 11),
+      // so the grid `--tile-h` collapses below the maximized value.
+      await addMockPeers(hostPage, 10);
+      await hostPage.waitForTimeout(2000);
+
+      // Confirm the pre-share grid actually rendered many tiles. The decode
+      // budget caps the number of VISIBLE `.grid-item`s (the rest fold into a
+      // "+N more" overflow badge), but the layout `tile_count` that drives
+      // `--tile-h` still reflects the crowded grid — so 6+ visible cells is
+      // ample to shrink the cell below the saturation threshold asserted next.
+      const preTileCount = await hostPage.locator("#grid-container .grid-item").count();
+      expect(preTileCount).toBeGreaterThanOrEqual(6);
+
+      // Pre-share grid `--tile-h`: the many-tile grid cell height. Must be below
+      // the 293px chrome-saturation threshold, otherwise the setup does not
+      // exercise the bug (the whole point is that the grid cell has shrunk).
+      const preShareTileH = await readTileH();
+      expect(preShareTileH, "pre-share --tile-h should be a real number").toBeGreaterThan(0);
+      expect(
+        preShareTileH,
+        "pre-share grid --tile-h should be below the 293px saturation threshold (enough tiles to expose the bug)",
+      ).toBeLessThan(293);
+
+      // Guest starts screen share → host viewer switches to the split layout.
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      expect(
+        shareActivated,
+        "guest screen share must reach the host's split layout (.split-screen-tile)",
+      ).toBe(true);
+      await expect(hostPage.locator(".split-peer-tile").first()).toBeVisible({ timeout: 15_000 });
+      await hostPage.waitForTimeout(1500);
+
+      // During screen share `--tile-h` must describe the MAXIMIZED pinned tile,
+      // not the frozen many-tile grid cell.
+      const shareTileH = await readTileH();
+      const innerH = await hostPage.evaluate(() => window.innerHeight);
+
+      // (a) Chrome-saturation regime: pinned chrome renders at full size.
+      //     Un-fixed code freezes ~183px here → fails.
+      expect(
+        shareTileH,
+        "screen-share --tile-h must reach the maximized (saturated) regime, not stay at the frozen grid cell size",
+      ).toBeGreaterThanOrEqual(293);
+
+      // (b) Clearly larger than the frozen pre-share grid value. Un-fixed code
+      //     keeps them equal (Dioxus preserves the omitted property) → fails.
+      expect(shareTileH - preShareTileH).toBeGreaterThan(150);
+
+      // (c) Viewport-scale: the maximized tile fills most of the height.
+      //     (~580px vs 720px inner height at the default viewport.)
+      expect(shareTileH).toBeGreaterThanOrEqual(innerH * 0.6);
+      expect(shareTileH).toBeLessThanOrEqual(innerH);
     } finally {
       await browser1.close();
       await browser2.close();

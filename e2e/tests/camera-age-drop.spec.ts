@@ -1,5 +1,6 @@
 import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { setTransportBadgeFlag } from "../helpers/transport-badge-config";
 
 function collectConsole(page: Page): string[] {
@@ -195,6 +196,7 @@ test("camera publisher steps video down on WT stale-delta age-drops (#1737)", as
     // ELECTED transport (active_transport()) — the preference is "WT with WS
     // fallback", so the localStorage key alone cannot prove WT actually won.
     await setTransportBadgeFlag(pubCtx);
+    await enableDiagnosticsTileIndicators(pubCtx);
 
     const pubPage = await pubCtx.newPage();
     const pubConsole = collectConsole(pubPage);

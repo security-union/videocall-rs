@@ -393,6 +393,8 @@ async fn main() -> anyhow::Result<()> {
 
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
 
+    sec_api::metrics::init_server_stats_series();
+
     info!(
         "Starting stateless snapshot metrics server on port {}",
         port

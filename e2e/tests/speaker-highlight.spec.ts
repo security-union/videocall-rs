@@ -2,6 +2,7 @@ import path from "node:path";
 import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { continuousToneWavPath } from "../helpers/audio-fixtures";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
@@ -2062,11 +2063,9 @@ test.describe("Speaker highlight glow on video tiles", () => {
   // viewport:
   //   `.split-peer-tile .floating-name`   → top/left 6px, font-size var(--fs-4)
   //   `.split-peer-tile .tile-top-icons`  → top/right 4px
-  //   `.split-peer-tile .signal-indicator`→ 22×22 box, 14×14 svg
   // The normal-grid pin uses `--tile-h`/`--tile-w`-scaled formulas instead
   //   `.floating-name`   → top min(12px,…), left min(12px,…), font-size clamp(…,14px)
   //   `.tile-top-icons`  → top min(8px,…), right min(8px,…)
-  //   `.signal-indicator`→ min(32px,…) box, svg min(18px,…)
   // So a maximized split badge sat inset ~6px with smaller letters and the icon
   // cluster inset ~4px with smaller icons, vs the flush, larger normal-grid pin
   // — the user report ("name of the tile not in left corner and … smaller
@@ -2077,16 +2076,6 @@ test.describe("Speaker highlight glow on video tiles", () => {
   // SAME `--tile-h`/`--tile-w` formulas the normal grid uses, so at equal vars
   // (asserted identical below) the badge inset/font and the cluster inset/icon
   // size resolve identically.
-  //
-  // Mutation sensitivity: the assertions compare, normal-grid pin vs. under
-  // screen share, the badge's left/top inset + font-size, the cluster's
-  // right/top inset, and the always-visible signal-indicator svg size, and
-  // require them to MATCH. On the un-fixed CSS the split badge is at left 6px
-  // (vs 12) with a smaller font, the cluster at right 4px (vs 8), and the svg
-  // 14px (vs 18) — every equality assertion fails. Reverting ANY of the fix
-  // lines re-breaks its matching assertion. `--tile-h`/`--tile-w` are asserted
-  // equal across the two contexts first so a formula-based parity claim is
-  // sound (an unequal var would defeat the shared formula and is a real bug).
   // ──────────────────────────────────────────────────────────────────────
   test("pinned tile name badge and top icon cluster match position/size with and without screen share", async ({
     baseURL,
@@ -2100,7 +2089,10 @@ test.describe("Speaker highlight glow on video tiles", () => {
       meetingId,
       "ChromeSymHost",
       "ChromeSymGuest",
-      { prepareHostPage: installSyntheticDisplayCapture },
+      {
+        prepareHostPage: installSyntheticDisplayCapture,
+        prepareGuestPage: (page) => enableDiagnosticsTileIndicators(page),
+      },
     );
 
     // Reads the pinned tile's name-badge (top-left) + top-icon-cluster

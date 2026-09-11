@@ -6,7 +6,7 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
 /**
  * Per-tile media-metrics overlay (issue 1768).
  *
- * The diagnostics drawer has a "Show media metrics on tiles" checkbox
+ * The diagnostics drawer has a "Show diagnostics on tiles" checkbox
  * (`input#diag-media-metrics-overlay`, testid `media-metrics-overlay-toggle`,
  * default OFF, persisted to localStorage key `diagnostics.media_metrics_overlay`).
  * When checked, each VIDEO tile renders a bottom-anchored, pointer-events:none
@@ -306,7 +306,7 @@ test.describe("Per-tile media-metrics overlay (issue 1768)", () => {
       const toggle = hostPage.locator('[data-testid="media-metrics-overlay-toggle"]');
       await expect(toggle).toBeVisible({ timeout: 10_000 });
       await expect(hostPage.locator('label[for="diag-media-metrics-overlay"]')).toHaveText(
-        "Show media metrics on tiles",
+        "Show diagnostics on tiles",
       );
       // Default OFF and still no overlays with the drawer merely open.
       await expect(toggle).not.toBeChecked();

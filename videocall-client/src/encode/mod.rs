@@ -16,7 +16,7 @@
  * conditions.
  */
 
-mod camera_encoder;
+pub(crate) mod camera_encoder;
 pub(crate) mod classify_encode_error;
 mod dimensions;
 mod encoder_state;
@@ -31,6 +31,7 @@ use std::sync::Arc;
 use crate::VideoCallClient;
 use videocall_types::Callback;
 
+pub(crate) use camera_encoder::CameraLayerMetric;
 pub use camera_encoder::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
@@ -40,7 +41,6 @@ pub use camera_encoder::{
     CameraLayerMetricSource, LiveQualitySnapshot, QualityTierBounds, SimulcastLayerInfo,
     SimulcastSendSnapshot,
 };
-pub(crate) use camera_encoder::{layer_ceiling_to_count, CameraLayerMetric};
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{
     screen_capture_display_constraints, screen_encoder_errors_closed_codec,
@@ -172,10 +172,6 @@ pub trait MicrophoneEncoderTrait {
     fn set_screen_sharing_active_signal(&mut self, flag: Arc<AtomicBool>);
     /// Returns the effective audio simulcast layer count (#1561).
     fn effective_audio_layers(&self) -> u32;
-    /// Returns the shared CONGESTION audio layer-ceiling atom (#1561).
-    fn congestion_layer_ceiling(&self) -> Arc<AtomicU32>;
-    /// Returns the shared USER audio layer-ceiling atom (#1561).
-    fn shared_user_layer_ceiling(&self) -> Rc<AtomicU32>;
 }
 
 // Implement trait for Safari microphone encoder
@@ -245,14 +241,6 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
     fn effective_audio_layers(&self) -> u32 {
         self.effective_audio_layers()
-    }
-
-    fn congestion_layer_ceiling(&self) -> Arc<AtomicU32> {
-        self.congestion_layer_ceiling()
-    }
-
-    fn shared_user_layer_ceiling(&self) -> Rc<AtomicU32> {
-        self.shared_user_layer_ceiling()
     }
 }
 

@@ -23,13 +23,15 @@ use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
 use crate::components::icons::raised_hand::RaisedHandIcon;
 use crate::components::icons::recording::RecordingIcon;
-use crate::components::icons::signal_bars::SignalBarsIcon;
+use crate::components::icons::signal_spark::SignalSparkIcon;
 use crate::components::icons::zoom::{
     ActualSizeIcon, DetachIcon, ZoomInIcon, ZoomOutIcon, ZoomResetIcon,
 };
 use crate::components::media_metrics_overlay::{media_metrics_overlay, screen_metrics_overlay};
 use crate::components::screen_share_zoom;
-use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
+use crate::components::signal_quality::{
+    peer_signal_aria, peer_signal_title, spark_node_id, SignalInfo, SignalQualityPopup,
+};
 // SignalMeterMode is referenced via SignalInfo internally — no direct import
 // needed in this file (yet); attendants/peer_tile own the call-site values.
 use crate::constants::users_allowed_to_stream;
@@ -96,10 +98,16 @@ const INNER_ALPHA_STRENGTH_RANGE: f32 = 0.75;
 const BORDER_ALPHA_BASE: f32 = 0.50;
 /// Border alpha increase per unit of audio intensity.
 const BORDER_ALPHA_INTENSITY: f32 = 0.42;
-pub(crate) const DEFAULT_TILE_BORDER_COLOR: &str =
-    "var(--appearance-preview-tile-border-color, var(--tile-border-color-fallback))";
+/// Four longhands, not the `border-color` shorthand: `case "style"` in
+/// dioxus-interpreter-js `set_attribute.ts` re-applies every snapshotted
+/// longhand that reads back empty, and a `var()` shorthand reads back empty.
+const DEFAULT_TILE_BORDER_RESET: &str = "border-top-color: var(--grid-item-border); border-right-color: var(--grid-item-border); border-bottom-color: var(--grid-item-border); border-left-color: var(--grid-item-border);";
 const SILENT_BORDER_RESET_SECONDS: f32 = 0.30;
+/// Fade-in (attack) at velocity 0%, 50% and 100%. The 50% anchor is the fixed
+/// value the glow used before the Velocity slider existed.
+const GLOW_FADE_IN_SLOWEST: f32 = 0.45;
 const GLOW_FADE_IN_SECONDS_DEFAULT: f32 = 0.15;
+const GLOW_FADE_IN_FASTEST: f32 = 0.03;
 /// Fixed fade-out duration (the visual fade after the hold period expires).
 const GLOW_FADE_OUT_DURATION: f32 = 1.50;
 /// Hold time at 50% decay (seconds glow persists before fade begins).
@@ -159,24 +167,24 @@ pub(crate) fn calculate_glow_params(
 }
 
 /// Compute the inline CSS for the speaking glow on the outer tile container.
-/// Emits `box-shadow`, `border-color`, and `transition` values driven by the
+/// Emits `box-shadow`, border colour, and `transition` values driven by the
 /// viewer's local [`AppearanceSettings`].
-pub(crate) fn speak_style(
+pub fn speak_style(
     audio_level: f32,
     speaking_active: bool,
     settings: &AppearanceSettings,
 ) -> String {
     if !settings.glow_enabled {
         return format!(
-            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out, box-shadow {GLOW_FADE_OUT_DURATION:.2}s ease-out;"
+            "box-shadow: none; {DEFAULT_TILE_BORDER_RESET} transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out, box-shadow {GLOW_FADE_OUT_DURATION:.2}s ease-out;"
         );
     }
 
     let (fade_in_seconds, fade_out_duration, hold_delay) =
-        glow_transition_seconds(settings.glow_decay);
+        glow_transition_seconds(settings.glow_decay, settings.glow_velocity);
     if !speaking_active || audio_level <= 0.0 {
         return format!(
-            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out {hold_delay:.2}s, box-shadow {fade_out_duration:.2}s ease-out {hold_delay:.2}s;"
+            "box-shadow: none; {DEFAULT_TILE_BORDER_RESET} transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out {hold_delay:.2}s, box-shadow {fade_out_duration:.2}s ease-out {hold_delay:.2}s;"
         );
     }
 
@@ -232,7 +240,7 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceS
     }
 
     let (fade_in_seconds, fade_out_duration, hold_delay) =
-        glow_transition_seconds(settings.glow_decay);
+        glow_transition_seconds(settings.glow_decay, settings.glow_velocity);
 
     if mic_audio_level <= 0.0 && glow_audio_level <= 0.0 {
         // Fully silent: fade out both color and filter with hold delay
@@ -317,26 +325,27 @@ fn remap_brightness_slider(b: f32) -> f32 {
     }
 }
 
-/// Map the 0.0..1.0 decay slider to glow transition parameters.
+/// Map the 0.0..1.0 velocity slider to the glow's attack (fade-in) duration.
 ///
-/// Returns `(fade_in_seconds, fade_out_duration, hold_delay_seconds)`:
-/// - `fade_in_seconds`     — CSS transition-duration when glow activates
-/// - `fade_out_duration`   — CSS transition-duration for the visual fade
-/// - `hold_delay_seconds`  — CSS transition-delay before fade-out begins
-///
-/// Contracts:
-/// - 0% decay  → instant on/off, no hold
-/// - 1% decay  → no hold (fade starts immediately)
-/// - 50% decay → 1.0s hold before fade begins
-/// - 100% decay → 5.0s hold before fade begins
-pub(crate) fn glow_transition_seconds(decay: f32) -> (f32, f32, f32) {
+pub(crate) fn glow_fade_in_seconds(velocity: f32) -> f32 {
+    let v = velocity.clamp(0.0, 1.0);
+    if v <= 0.5 {
+        GLOW_FADE_IN_SLOWEST + v * 2.0 * (GLOW_FADE_IN_SECONDS_DEFAULT - GLOW_FADE_IN_SLOWEST)
+    } else {
+        GLOW_FADE_IN_SECONDS_DEFAULT
+            + (v - 0.5) * 2.0 * (GLOW_FADE_IN_FASTEST - GLOW_FADE_IN_SECONDS_DEFAULT)
+    }
+}
+
+/// Map the 0.0..1.0 decay slider to `(fade_out_duration, hold_delay_seconds)`.
+pub(crate) fn glow_tail_seconds(decay: f32) -> (f32, f32) {
     let d = decay.clamp(0.0, 1.0);
     if d <= f32::EPSILON {
-        return (0.0, 0.0, 0.0);
+        return (0.0, 0.0);
     }
 
     if d <= 0.01 {
-        return (GLOW_FADE_IN_SECONDS_DEFAULT, GLOW_FADE_OUT_DURATION, 0.0);
+        return (GLOW_FADE_OUT_DURATION, 0.0);
     }
 
     let hold = if d <= 0.5 {
@@ -347,7 +356,18 @@ pub(crate) fn glow_transition_seconds(decay: f32) -> (f32, f32, f32) {
         GLOW_HOLD_MID + (d - 0.5) * 2.0 * (GLOW_HOLD_MAX - GLOW_HOLD_MID)
     };
 
-    (GLOW_FADE_IN_SECONDS_DEFAULT, GLOW_FADE_OUT_DURATION, hold)
+    (GLOW_FADE_OUT_DURATION, hold)
+}
+
+/// `(fade_in_seconds, fade_out_duration, hold_delay_seconds)` for the speaking
+/// glow: velocity owns the attack, decay owns the tail.
+pub(crate) fn glow_transition_seconds(decay: f32, velocity: f32) -> (f32, f32, f32) {
+    let (fade_out_duration, hold_delay) = glow_tail_seconds(decay);
+    (
+        glow_fade_in_seconds(velocity),
+        fade_out_duration,
+        hold_delay,
+    )
 }
 
 /// Issue #1483: which transport a peer's media is flowing over, for the
@@ -384,12 +404,11 @@ pub fn transport_badge_from_str(raw: &str) -> TransportBadge {
 /// three `.tile-top-icons` arms (split screen-share, split peer-video, and the
 /// normal grid tile) instead of being triplicated.
 ///
-/// The caller passes `Some(TransportBadge::Wt | Ws)` ONLY when BOTH the
-/// server-side `transportBadgeEnabled` flag is on AND the transport is known —
-/// that gating happens once per tile render in `peer_tile.rs` (so the JSON
-/// re-parse in `transport_badge_enabled()` is paid once, not per render arm).
+/// The caller passes `Some(TransportBadge::Wt | Ws)` ONLY when the diagnostics
+/// checkbox AND the `transportBadgeEnabled` flag are on AND the transport is known —
+/// that gating happens once per tile render in `peer_tile.rs`.
 /// This helper therefore renders nothing for `None` or `Some(Unknown)`, which
-/// keeps the "flag OFF → nothing" and "Unknown → nothing" contract in one place.
+/// keeps the "gated off → nothing" and "Unknown → nothing" contract in one place.
 ///
 /// Issue #1883: `is_self` selects the a11y label. Peer tiles report a transport
 /// the REMOTE peer announced ("Transport reported by peer: …"); the local
@@ -823,6 +842,7 @@ pub fn generate_for_peer(
     let audio_level = audio_levels.raw;
     let mic_audio_level = audio_levels.mic;
     let signal_level = signal_info.level;
+    let show_signal_meter = signal_info.show_signal_meter;
     let signal_unmeasured = signal_info.decode_paused_locally;
     let signal_state = if signal_unmeasured {
         "unmeasured"
@@ -831,6 +851,7 @@ pub fn generate_for_peer(
     } else {
         "measured"
     };
+    let signal_spark = signal_info.spark;
     let signal_history = signal_info.history;
     let meeting_start_ms = signal_info.meeting_start_ms;
     // Pulled out once before rsx so the SignalQualityPopup call sites
@@ -847,10 +868,7 @@ pub fn generate_for_peer(
     // lookup), cloned per popup call site below.
     let signal_device_info = signal_info.device_info;
     // Issue #1483: per-tile "WT"/"WS" transport badge. `Copy`, so it can be
-    // passed to `transport_badge(...)` in each `.tile-top-icons` arm without
-    // cloning. Already gated upstream: `Some(Wt | Ws)` only when the
-    // `transportBadgeEnabled` flag is on AND the transport is known; `None`
-    // otherwise. `transport_badge` renders nothing for `None`/`Unknown`.
+    // passed to `transport_badge(...)` in each arm; see that helper for gating.
     let badge_transport = signal_info.badge_transport;
     // Issue 1768: per-tile media-metrics overlay payload (received/sending
     // res·fps·audio), or `None` when the diagnostics checkbox is off — then
@@ -876,6 +894,33 @@ pub fn generate_for_peer(
     let peer_display_name = client
         .get_peer_display_name(key)
         .unwrap_or_else(|| peer_user_id.clone());
+
+    // Issue 2661: initial paint only — `refresh_peer_disc` rewrites these
+    // attributes at 1 Hz without re-rendering the tile.
+    // `TileMode::ScreenOnly` selects the shared-content arm below, so one flag
+    // scopes the label, the tooltip and the refresh handle together.
+    let signal_screen_scope = matches!(mode, TileMode::ScreenOnly);
+    // The disc arms below are their only readers, and three of these allocate.
+    let (signal_spark_node, signal_samples, signal_aria, signal_title) = if show_signal_meter {
+        (
+            spark_node_id(key, signal_screen_scope),
+            signal_spark.sample_count,
+            peer_signal_aria(
+                &peer_display_name,
+                signal_spark.level,
+                signal_spark.sample_count,
+                signal_screen_scope,
+            ),
+            peer_signal_title(
+                signal_spark.level,
+                signal_spark.sample_count,
+                signal_spark.latency_ms,
+                signal_screen_scope,
+            ),
+        )
+    } else {
+        (String::new(), 0, String::new(), String::new())
+    };
 
     // Compare authenticated user_id (from JWT/DB) instead of user-chosen display name
     // to prevent spoofing the host crown icon. The current host can change via
@@ -1058,38 +1103,27 @@ pub fn generate_for_peer(
                     }
                     div {
                         class: "tile-top-icons",
-                        // HCL bug #2: signal-meter icon button on the
-                        // shared-content tile. Visually identical to peer
-                        // tiles (same `.signal-indicator` class + bars
-                        // icon). Toggles the SCREEN-ONLY popup for this
-                        // publisher.
-                        button {
-                            id: "{ss_signal_btn_id}",
-                            class: "signal-indicator",
-                            "aria-label": if signal_unmeasured {
-                                "Video paused to save CPU. Signal is not measured for this peer."
-                            } else {
-                                "Show screen-share signal quality"
-                            },
-                            title: if signal_unmeasured {
-                                "Video paused to save CPU. Signal is not measured for this peer."
-                            } else {
-                                "Show screen-share signal quality"
-                            },
-                            "data-signal-state": "{signal_state}",
-                            "data-signal-level": format!("{}", signal_level.bars()),
-                            "data-signal-lost": format!("{}", signal_level.is_lost()),
-                            // stop_propagation: this is a tile-overlay control, not a
-                            // background/grid click, so it must not light-dismiss an
-                            // open side panel (issue #1790).
-                            onclick: move |e: MouseEvent| {
-                                e.stop_propagation();
-                                on_toggle_signal_popup.call(());
-                            },
-                            SignalBarsIcon {
-                                level: signal_level.bars(),
-                                lost: signal_level.is_lost(),
-                                unmeasured: signal_unmeasured,
+                        // HCL bug #2: identical to the peer disc, but toggles
+                        // the SCREEN-ONLY popup for this publisher.
+                        if show_signal_meter {
+                            button {
+                                id: "{ss_signal_btn_id}",
+                                class: "signal-indicator",
+                                "aria-label": "{signal_aria}",
+                                title: "{signal_title}",
+                                "data-signal-state": "{signal_state}",
+                                "data-signal-level": format!("{}", signal_level.bars()),
+                                "data-signal-lost": format!("{}", signal_level.is_lost()),
+                                "data-signal-samples": "{signal_samples}",
+                                "data-testid": "peer-signal-indicator",
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    on_toggle_signal_popup.call(());
+                                },
+                                SignalSparkIcon {
+                                    paint: signal_spark.clone(),
+                                    spark_id: signal_spark_node.clone(),
+                                }
                             }
                         }
                         // Issue #1483: transport badge adjacent to the signal
@@ -1339,37 +1373,27 @@ pub fn generate_for_peer(
                             "data-mic-muted": if is_audio_enabled_for_peer { "false" } else { "true" },
                             MicIcon { muted: !is_audio_enabled_for_peer }
                         }
-                        // Signal icon (always visible, clickable)
-                        button {
-                            id: "{split_signal_btn_id}",
-                            class: "signal-indicator",
-                            "aria-label": if signal_unmeasured {
-                                "Video paused to save CPU. Signal is not measured for this peer."
-                            } else {
-                                "Show signal quality"
-                            },
-                            title: if signal_unmeasured {
-                                "Video paused to save CPU. Signal is not measured for this peer."
-                            } else {
-                                "Show signal quality"
-                            },
-                            "data-signal-state": "{signal_state}",
-                            "data-signal-level": format!("{}", signal_level.bars()),
-                            "data-signal-lost": format!("{}", signal_level.is_lost()),
-                            // stop_propagation: tile-overlay control, not a grid
-                            // click — must not light-dismiss a side panel (#1790).
-                            onclick: move |e: MouseEvent| {
-                                e.stop_propagation();
-                                on_toggle_signal_popup.call(());
-                            },
-                            SignalBarsIcon {
-                                level: signal_level.bars(),
-                                lost: signal_level.is_lost(),
-                                unmeasured: signal_unmeasured,
+                        if show_signal_meter {
+                            button {
+                                id: "{split_signal_btn_id}",
+                                class: "signal-indicator",
+                                "aria-label": "{signal_aria}",
+                                title: "{signal_title}",
+                                "data-signal-state": "{signal_state}",
+                                "data-signal-level": format!("{}", signal_level.bars()),
+                                "data-signal-lost": format!("{}", signal_level.is_lost()),
+                                "data-signal-samples": "{signal_samples}",
+                                "data-testid": "peer-signal-indicator",
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    on_toggle_signal_popup.call(());
+                                },
+                                SignalSparkIcon {
+                                    paint: signal_spark.clone(),
+                                    spark_id: signal_spark_node.clone(),
+                                }
                             }
                         }
-                        // Issue #1483: transport badge adjacent to the signal
-                        // meter (renders nothing unless flag on + transport known).
                         {transport_badge(badge_transport, false)}
                         // Crop (visible on hover only, hidden when video disabled)
                         if is_video_enabled_for_peer {
@@ -1830,37 +1854,27 @@ pub fn generate_for_peer(
                                 "data-mic-muted": if is_audio_enabled_for_peer { "false" } else { "true" },
                                 MicIcon { muted: !is_audio_enabled_for_peer }
                             }
-                            // Signal icon (always visible, clickable)
-                            button {
-                                id: "{grid_signal_btn_id}",
-                                class: "signal-indicator",
-                                "aria-label": if signal_unmeasured {
-                                    "Video paused to save CPU. Signal is not measured for this peer."
-                                } else {
-                                    "Show signal quality"
-                                },
-                                title: if signal_unmeasured {
-                                    "Video paused to save CPU. Signal is not measured for this peer."
-                                } else {
-                                    "Show signal quality"
-                                },
-                                "data-signal-state": "{signal_state}",
-                                "data-signal-level": format!("{}", signal_level.bars()),
-                                "data-signal-lost": format!("{}", signal_level.is_lost()),
-                                // stop_propagation: tile-overlay control, not a grid
-                                // click — must not light-dismiss a side panel (#1790).
-                                onclick: move |e: MouseEvent| {
-                                    e.stop_propagation();
-                                    on_toggle_signal_popup.call(());
-                                },
-                                SignalBarsIcon {
-                                    level: signal_level.bars(),
-                                    lost: signal_level.is_lost(),
-                                    unmeasured: signal_unmeasured,
+                            if show_signal_meter {
+                                button {
+                                    id: "{grid_signal_btn_id}",
+                                    class: "signal-indicator",
+                                    "aria-label": "{signal_aria}",
+                                    title: "{signal_title}",
+                                    "data-signal-state": "{signal_state}",
+                                    "data-signal-level": format!("{}", signal_level.bars()),
+                                    "data-signal-lost": format!("{}", signal_level.is_lost()),
+                                    "data-signal-samples": "{signal_samples}",
+                                    "data-testid": "peer-signal-indicator",
+                                    onclick: move |e: MouseEvent| {
+                                        e.stop_propagation();
+                                        on_toggle_signal_popup.call(());
+                                    },
+                                    SignalSparkIcon {
+                                        paint: signal_spark.clone(),
+                                        spark_id: signal_spark_node.clone(),
+                                    }
                                 }
                             }
-                            // Issue #1483: transport badge adjacent to the signal
-                            // meter (renders nothing unless flag on + transport known).
                             {transport_badge(badge_transport, false)}
                             // Crop (visible on hover only). Gated on `show_canvas`
                             // so off-budget avatar tiles — which have no canvas —
@@ -3263,26 +3277,54 @@ mod tests {
         );
     }
 
+    fn assert_border_reset_is_longhands(style: &str) {
+        for side in ["top", "right", "bottom", "left"] {
+            assert!(
+                style.contains(&format!("border-{side}-color: var(--grid-item-border)")),
+                "silent style must reset border-{side}-color: {style}"
+            );
+        }
+        assert!(
+            !style.contains("border-color:"),
+            "the border-color shorthand is the bug: a var() shorthand reads back \
+             empty and the interpreter restores the lit colour over it: {style}"
+        );
+    }
+
     #[test]
     fn speak_style_reset_restores_default_border_color() {
         let style = speak_style(0.0, false, &AppearanceSettings::default());
 
         assert!(style.contains("box-shadow: none;"));
-        assert!(style.contains(DEFAULT_TILE_BORDER_COLOR));
+        assert_border_reset_is_longhands(&style);
     }
 
     #[test]
-    fn glow_decay_zero_is_instant_on_and_off() {
+    fn speak_style_glow_disabled_resets_border_with_longhands() {
+        let settings = AppearanceSettings {
+            glow_enabled: false,
+            ..AppearanceSettings::default()
+        };
+        let style = speak_style(0.8, true, &settings);
+
+        assert!(style.contains("box-shadow: none;"));
+        assert_border_reset_is_longhands(&style);
+    }
+
+    #[test]
+    fn glow_decay_zero_is_instant_off_but_keeps_the_velocity_attack() {
         let settings = AppearanceSettings {
             glow_decay: 0.0,
+            glow_velocity: 0.0,
             ..AppearanceSettings::default()
         };
 
         let on = speak_style(0.8, true, &settings);
         let off = speak_style(0.0, false, &settings);
 
-        assert!(on.contains("border-color 0.00s ease-in"));
-        assert!(on.contains("box-shadow 0.00s ease-in"));
+        let attack = format!("{:.2}s ease-in", glow_fade_in_seconds(0.0));
+        assert!(on.contains(&format!("border-color {attack}")), "{on}");
+        assert!(on.contains(&format!("box-shadow {attack}")), "{on}");
         // 0% decay → 0s hold delay, 0s fade duration
         assert!(off.contains("border-color 0.3s ease-out 0.00s"));
         assert!(off.contains("box-shadow 0.00s ease-out 0.00s"));
@@ -3419,20 +3461,123 @@ mod tests {
     #[test]
     fn glow_transition_seconds_hold_anchors() {
         let eps = 1e-4;
-        // 0% → all zeros (instant)
-        let (fi, fo, h) = glow_transition_seconds(0.0);
-        assert!(fi.abs() < eps);
+        let mid_v = AppearanceSettings::default().glow_velocity;
+        let (fi, fo, h) = glow_transition_seconds(0.0, mid_v);
+        assert!((fi - glow_fade_in_seconds(mid_v)).abs() < eps);
         assert!(fo.abs() < eps);
         assert!(h.abs() < eps);
         // 50% → 1.0s hold
-        let (_, _, h) = glow_transition_seconds(0.5);
+        let (_, _, h) = glow_transition_seconds(0.5, mid_v);
         assert!((h - GLOW_HOLD_MID).abs() < eps);
         // 100% → 5.0s hold
-        let (_, _, h) = glow_transition_seconds(1.0);
+        let (_, _, h) = glow_transition_seconds(1.0, mid_v);
         assert!((h - GLOW_HOLD_MAX).abs() < eps);
         // 1% → immediate fade (0 hold)
-        let (_, _, h) = glow_transition_seconds(0.01);
+        let (_, _, h) = glow_transition_seconds(0.01, mid_v);
         assert!(h.abs() < eps);
+    }
+
+    #[test]
+    fn glow_fade_in_seconds_velocity_anchors() {
+        let eps = 1e-4;
+        assert!((glow_fade_in_seconds(0.0) - 0.45).abs() < eps);
+        // The midpoint must reproduce the pre-Velocity fade-in exactly.
+        assert!((glow_fade_in_seconds(0.5) - 0.15).abs() < eps);
+        assert!((glow_fade_in_seconds(1.0) - 0.03).abs() < eps);
+    }
+
+    #[test]
+    fn glow_fade_in_seconds_is_monotonic_and_never_instant() {
+        let a = glow_fade_in_seconds(0.0);
+        let b = glow_fade_in_seconds(0.25);
+        let c = glow_fade_in_seconds(0.5);
+        let d = glow_fade_in_seconds(0.75);
+        let e = glow_fade_in_seconds(1.0);
+        assert!(a > b, "{a} !> {b}");
+        assert!(b > c, "{b} !> {c}");
+        assert!(c > d, "{c} !> {d}");
+        assert!(d > e, "{d} !> {e}");
+        // `speak_style` re-emits this duration on every audio-level tick, so a
+        // 0s attack would jump to each new level with no interpolation.
+        assert!(e > 0.0, "fastest attack must stay non-zero: {e}");
+    }
+
+    #[test]
+    fn glow_fade_in_seconds_clamps_out_of_range_input() {
+        let eps = 1e-4;
+        assert!((glow_fade_in_seconds(-1.0) - glow_fade_in_seconds(0.0)).abs() < eps);
+        assert!((glow_fade_in_seconds(2.0) - glow_fade_in_seconds(1.0)).abs() < eps);
+    }
+
+    #[test]
+    fn glow_velocity_does_not_move_the_tail() {
+        let eps = 1e-4;
+        let (_, fo_slow, h_slow) = glow_transition_seconds(0.5, 0.0);
+        let (_, fo_fast, h_fast) = glow_transition_seconds(0.5, 1.0);
+        assert!((fo_slow - GLOW_FADE_OUT_DURATION).abs() < eps);
+        assert!((fo_fast - GLOW_FADE_OUT_DURATION).abs() < eps);
+        assert!((h_slow - h_fast).abs() < eps);
+    }
+
+    #[test]
+    fn speak_style_speaking_branch_uses_the_velocity_fade_in() {
+        let slow = AppearanceSettings {
+            glow_velocity: 0.0,
+            ..AppearanceSettings::default()
+        };
+        let fast = AppearanceSettings {
+            glow_velocity: 1.0,
+            ..AppearanceSettings::default()
+        };
+
+        let slow_style = speak_style(0.8, true, &slow);
+        let fast_style = speak_style(0.8, true, &fast);
+
+        assert!(
+            slow_style.contains(&format!(
+                "box-shadow {:.2}s ease-in",
+                glow_fade_in_seconds(0.0)
+            )),
+            "{slow_style}"
+        );
+        assert!(
+            fast_style.contains(&format!(
+                "box-shadow {:.2}s ease-in",
+                glow_fade_in_seconds(1.0)
+            )),
+            "{fast_style}"
+        );
+        assert!(slow_style.contains(&format!(
+            "border-color {:.2}s ease-in",
+            glow_fade_in_seconds(0.0)
+        )));
+        // Catches a mapping flattened to one constant, which both formats agree with.
+        assert_ne!(slow_style, fast_style);
+    }
+
+    #[test]
+    fn mic_style_speaking_branch_uses_the_velocity_fade_in() {
+        let slow = AppearanceSettings {
+            glow_velocity: 0.0,
+            ..AppearanceSettings::default()
+        };
+        let fast = AppearanceSettings {
+            glow_velocity: 1.0,
+            ..AppearanceSettings::default()
+        };
+
+        let slow_style = mic_style(0.8, 0.8, &slow);
+        let fast_style = mic_style(0.8, 0.8, &fast);
+
+        assert!(
+            slow_style.contains(&format!("filter {:.2}s ease-in", glow_fade_in_seconds(0.0))),
+            "{slow_style}"
+        );
+        assert!(
+            fast_style.contains(&format!("filter {:.2}s ease-in", glow_fade_in_seconds(1.0))),
+            "{fast_style}"
+        );
+        assert_ne!(slow_style, fast_style);
     }
 
     #[test]

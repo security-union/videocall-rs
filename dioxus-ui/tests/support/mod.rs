@@ -160,6 +160,19 @@ pub fn inject_app_config_oauth_enabled() {
     inject_app_config_with_oauth_enabled(true);
 }
 
+/// Inject a `window.__APP_CONFIG` with the `transportBadgeEnabled` deploy flag
+/// ON, so a test can reach the tile transport badge at all.
+pub fn inject_app_config_transport_badge_on() {
+    inject_app_config_with_oauth_enabled(false);
+    let window = gloo_utils::window();
+    let config = js_sys::Reflect::get(&window, &"__APP_CONFIG".into()).unwrap();
+    let next = js_sys::Object::assign(&js_sys::Object::new(), &config.into());
+    js_sys::Reflect::set(&next, &"transportBadgeEnabled".into(), &"true".into()).unwrap();
+    let frozen = js_sys::Object::freeze(&next);
+    js_sys::Reflect::set(&window, &"__APP_CONFIG".into(), &frozen).unwrap();
+    dioxus_ui::constants::reset_config_cache_for_test();
+}
+
 /// Provide the minimal browser globals that `BrowserCompatibility` checks on
 /// Home mount so headless Chrome in CI doesn't get blocked by feature gating.
 pub fn mock_browser_compatibility_features() {

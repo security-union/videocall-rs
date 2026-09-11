@@ -452,10 +452,7 @@ fn inject_stale_video_backlog_cold(num_frames: u32) {
             // its own clock, so the delta-only head ages past MAX_PLAYOUT_AGE_MS unaided.
             let now_ms = js_sys::Date::now() as u128;
             for i in 0..num_frames.max(1) {
-                decoder.push_frame(
-                    delta_frame(base + u64::from(i) + 1, now_ms),
-                    Some(context.clone()),
-                );
+                decoder.push_frame(delta_frame(base + u64::from(i) + 1, now_ms), Some(&context));
             }
         }
     });
@@ -476,7 +473,7 @@ fn inject_backlog(
     for i in 0..num_frames.max(1) {
         decoder.inject_stale_frame(
             delta_frame(seq_base + u64::from(i) + 1, arrival_time_ms),
-            Some(context.clone()),
+            Some(context),
         );
     }
 }

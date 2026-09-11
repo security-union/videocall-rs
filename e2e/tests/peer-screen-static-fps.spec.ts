@@ -1,7 +1,9 @@
 import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 
 /**
  * Per-peer screen-share `(static)` / `(no frames)` tooltip behaviour
@@ -190,7 +192,9 @@ async function openSignalPopup(page: Page) {
     await page.waitForTimeout(300);
   }
 
-  const signalButton = page.locator('button[aria-label="Show signal quality"]').first();
+  // CAMERA disc: a share is active, and the screen tile's disc shares the
+  // testid but opens a different popup, so a bare `.first()` picks the wrong one.
+  const signalButton = page.locator(CAMERA_PEER_SIGNAL_DISC).first();
   await expect(signalButton).toBeVisible({ timeout: 15_000 });
   await signalButton.click();
   const popup = page.locator(".signal-quality-popup");
@@ -259,6 +263,8 @@ test.describe("Peer screen-share static-FPS tooltip", () => {
           uiURL,
         );
         await ctx.addInitScript(MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT);
+        // Here, not `joinMeetingAs`: seeding the late joiners pinned their canvas mean at 0.
+        await enableDiagnosticsTileIndicators(ctx);
         members.push({
           page: null as unknown as Page,
           context: ctx,

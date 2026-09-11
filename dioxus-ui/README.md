@@ -155,8 +155,9 @@ Encoder bitrate tuning is code-owned and centralized:
   `VIDEO_QUALITY_TIERS` and `SIMULCAST_VIDEO_LAYERS`.
 - Screen targets and rungs come from `SCREEN_QUALITY_TIERS`; the initial tier is
   selected from current RTT and camera state.
-- Single-stream audio targets come from `AUDIO_QUALITY_TIERS`; audio simulcast
-  uses the `[12, 24, 48]` kbps ladder in `microphone_encoder.rs`.
+- Single-stream audio targets come from `AUDIO_QUALITY_TIERS`. Audio publishes
+  ONE layer (#2279), so the `[12, 24, 48]` kbps ladder in
+  `microphone_encoder.rs` is dormant publish-side code.
 
 The shared video, screen, and adaptive-audio tables live in
 `videocall-aq/src/constants.rs`. Retune those source-of-truth tables with their

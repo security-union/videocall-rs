@@ -48,21 +48,12 @@ import { waitForServices } from "../helpers/wait-for-services";
  *       (neteq_chart.rs:862-885)
  *
  * ─── Determinism / harness note ──────────────────────────────────────────────
- * The Timeline section is gated on `has_history`, which requires full NetEq
- * `stats_json` samples for the selected peer. NetEq is the AUDIO jitter buffer
- * on the receiver, so the host only accumulates history once it has decoded the
- * remote peer's audio for a few seconds (samples are throttled to <=1/sec). Per
- * project convention BOTH the camera and the mic default OFF in pre-join
- * (`vc_prejoin_camera_on` / `vc_prejoin_mic_on` both default `false` —
- * context.rs:755-766), and mock peers never decode. So the guest seeds BOTH
- * flags ON (a real camera-on + audio peer via the fake device) so the host's
- * NetEq actually receives audio samples.
- *
- * Even then, sustained NetEq sample arrival depends on the audio decode pipeline
- * running in the containerized harness, which is not guaranteed in CI. The
- * Timeline-dependent test therefore POLLS for the section and `test.skip`s with
- * a clear reason if it never appears, rather than emitting a flaky assertion.
- * The "All Peers" placeholder test needs NO history and is always live.
+ * The Timeline section is gated on `has_history`. That does NOT prove audio was
+ * decoded: `neteq_worker.rs` creates a NetEq eagerly and emits stats on a 1 s
+ * interval with no packet-arrival condition, so history fills from peer
+ * EXISTENCE. Nothing here covers the audio path — `audio-liveness-neteq.spec.ts`
+ * asserts on the frame-driven signal instead (issue 2622).
+ * The "All Peers" placeholder test needs no history and is always live.
  *
  * Structure mirrors signal-quality-peer-transport.spec.ts (auth + 2-peer meeting
  * + camera/mic seeding) and peer-screen-diagnostics.spec.ts (drawer flow).
@@ -88,12 +79,8 @@ async function joinMeetingAs(
 ): Promise<Page> {
   const page = await context.newPage();
   if (opts.ensureMediaOn) {
-    // Seed BOTH camera and mic ON before the app boots. The mic seed is the
-    // load-bearing one for this spec: NetEq history (and so the Timeline
-    // section) only fills once the host decodes this peer's AUDIO. Camera-on is
-    // seeded too so the peer publishes a full A/V stream (matching the
-    // signal-quality spec's camera-on precedent). addInitScript runs before any
-    // of the page's own scripts on every navigation, incl. the first.
+    // Camera + mic ON so the peer publishes a full A/V stream. Neither is what
+    // makes the Timeline appear — see the has_history note in the header.
     await page.addInitScript(() => {
       try {
         window.localStorage.setItem("vc_prejoin_camera_on", "true");
@@ -247,11 +234,10 @@ test.describe("Diagnostics — unified timeline chart (issue 173)", () => {
     }
   });
 
-  // ── Behaviors #1, #2, #3, #4, #6 (gated on real NetEq audio history) ───────
-  // Needs a real second peer publishing audio so the host accumulates NetEq
-  // `stats_json` history (`has_history`) and the Timeline section renders. If
-  // the harness never delivers audio NetEq samples, the test skips cleanly
-  // rather than emitting a flaky assertion.
+  // ── Behaviors #1, #2, #3, #4, #6 (gated on `has_history`) ─────────────────
+  // Needs a real second peer: `Peer::new` builds the NetEq audio decoder
+  // eagerly and its worker posts `stats_json` on a 1 s interval regardless of
+  // packet arrival, so history follows peer EXISTENCE, not audio.
   test("with a peer selected: Timeline renders above per-metric charts, legend toggles series, help is single-open", async ({
     baseURL,
   }) => {
@@ -287,8 +273,8 @@ test.describe("Diagnostics — unified timeline chart (issue 173)", () => {
         });
       }
 
-      // Host joins first. The GUEST seeds camera + mic ON so it publishes a full
-      // A/V stream — the audio is what fills the host's NetEq history.
+      // Host joins first. The GUEST seeds camera + mic ON: any media stream
+      // makes the host create a Peer, which is what fills NetEq history.
       members[0].page = await joinMeetingAs(members[0].context, meetingId, profiles[0].name);
       await clickJoinAndEnterGrid(members[0].page);
 
@@ -315,26 +301,15 @@ test.describe("Diagnostics — unified timeline chart (issue 173)", () => {
         timeout: 45_000,
       });
 
-      // ── Poll for NetEq history → the Timeline section. ──
-      // The unified chart container only renders once `has_history` is true
-      // (the host has decoded the peer's audio into NetEq samples). Poll
-      // generously; skip cleanly if the harness never delivers samples.
+      // ── Wait for NetEq history → the Timeline section. ──
       const unifiedChart = sidebar.locator('[data-testid="diag-unified-timeline"]');
-      const appeared = await unifiedChart
-        .waitFor({ state: "visible", timeout: 90_000 })
-        .then(() => true)
-        .catch(() => false);
-
-      if (!appeared) {
-        test.skip(
-          true,
-          "Unified Timeline never rendered: no audio NetEq history accumulated for the peer " +
-            "in this harness run (has_history stayed false). The Timeline is gated on sustained " +
-            "audio NetEq samples that the containerized audio decode pipeline does not reliably " +
-            "produce in CI.",
-        );
-        return;
-      }
+      await expect(
+        unifiedChart,
+        "Unified Timeline never rendered (has_history stayed false). Once the host has a " +
+          "Peer, the NetEq worker posts stats_json every 1 s with no packet-arrival " +
+          "condition, so this is a regression in peer creation, peer selection, the " +
+          "drawer's stats_json subscription, or the 1 s stats interval — NOT the audio path.",
+      ).toBeVisible({ timeout: 90_000 });
 
       // ── Behavior #1: Timeline section is positioned ABOVE the per-metric
       // charts disclosure. Both are sections under the same sidebar; compare
@@ -568,21 +543,14 @@ test.describe("Diagnostics — unified timeline chart (issue 173)", () => {
         timeout: 45_000,
       });
 
-      // Same history gate as the sibling test — skip cleanly if the
-      // containerized audio pipeline never accumulates NetEq history.
+      // Same history gate as the sibling test.
       const unifiedChart = sidebar.locator('[data-testid="diag-unified-timeline"]');
-      const appeared = await unifiedChart
-        .waitFor({ state: "visible", timeout: 90_000 })
-        .then(() => true)
-        .catch(() => false);
-      if (!appeared) {
-        test.skip(
-          true,
-          "Unified Timeline never rendered (no audio NetEq history in this harness run); " +
-            "the #1452 unmount-hide flow needs the chart mounted to exercise.",
-        );
-        return;
-      }
+      await expect(
+        unifiedChart,
+        "Unified Timeline never rendered (has_history stayed false), so the #1452 " +
+          "unmount-hide flow below cannot be exercised. History follows peer existence, " +
+          "not audio: see the sibling test's message for the paths this implicates.",
+      ).toBeVisible({ timeout: 90_000 });
 
       // Show the tooltip: hover the crosshair OVERLAY. The onmousemove handler
       // lives on an absolute HTML <div data-testid="unified-timeline-crosshair">

@@ -16,6 +16,10 @@ const HELPER_REL = "e2e/helpers/rust-mirrored-constants.ts";
  * Value of a top-level `const NAME: ty = <number>;` in `rel`. Column-0 anchored,
  * so a doc-comment mention or function-local cannot satisfy it; throws on 0 or
  * 2+ matches and on a non-literal rather than returning a fallback.
+ *
+ * The visibility prefix accepts `pub`, `pub(crate)` and `pub(super)`: the
+ * drawer constants in `attendants_layout.rs` are `pub(crate)`, and a bare
+ * `(?:pub )?` matched none of them, throwing "found 0" instead of comparing.
  */
 function rustConst(rel: string, name: string): number {
   const abs = resolve(REPO_ROOT, rel);
@@ -29,7 +33,10 @@ function rustConst(rel: string, name: string): number {
       { cause: err },
     );
   }
-  const re = new RegExp(`^(?:pub )?const ${name}\\s*:\\s*[A-Za-z0-9_]+\\s*=\\s*([^;]+);`, "gm");
+  const re = new RegExp(
+    `^(?:pub(?:\\((?:crate|super)\\))? )?const ${name}\\s*:\\s*[A-Za-z0-9_]+\\s*=\\s*([^;]+);`,
+    "gm",
+  );
   const hits = [...src.matchAll(re)];
   if (hits.length !== 1) {
     throw new Error(

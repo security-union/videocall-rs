@@ -36,9 +36,9 @@ pub mod manager;
 pub mod screen_bitrate;
 
 pub use aspect::{
-    capture_exceeds_encode_ceiling, fit_within_preserving_aspect, fit_within_tier_box,
-    orient_box_to_source, screen_encode_box_for_capture, simulcast_layer_target_dims,
-    SimulcastLayerDims,
+    camera_layer_encode_box, capture_exceeds_encode_ceiling, fit_within_preserving_aspect,
+    fit_within_tier_box, orient_box_to_source, screen_encode_box_for_capture,
+    simulcast_layer_target_dims, SimulcastLayerDims,
 };
 
 pub use clock::{default_clock, Clock, TestClock};

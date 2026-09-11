@@ -1589,6 +1589,75 @@ mod tests {
     /// ~20ms per-iteration sleep is required so the wall-clock inter-arrival gap is
     /// realistic; `insert_packet` derives arrival time from `Instant::now()` internally
     /// and exposes no injectable clock.
+    /// Pins the boundary `dioxus-ui`'s speaking-glow liveness gate keys off (issue
+    /// 2660): a stalled stream pins at the `leftover_samples` residue, not zero. If
+    /// that residue ever rose over `peer_tile.rs::LIVE_BUFFER_FLOOR_MS` the gate
+    /// would read a dead stream as live and darken a talking peer, with nothing in
+    /// `dioxus-ui` to catch it.
+    #[test]
+    fn buffer_depth_collapses_to_a_bounded_residue_throughout_a_stall() {
+        const SAMPLE_RATE: u32 = 48000;
+        const STEP: u32 = SAMPLE_RATE / 1000 * 20;
+        const OUTPUT_FRAME_MS: u32 = 10;
+        const CONSUMER_FLOOR_MS: u32 = 20;
+        const STALL_FRAMES: u32 = 300;
+
+        let config = NetEqConfig {
+            sample_rate: SAMPLE_RATE,
+            delay_config: DelayConfig {
+                resample_interval_ms: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        for seq in 0..8_u16 {
+            let ts = u32::from(seq) * STEP;
+            neteq
+                .insert_packet(create_48k_20ms_packet(seq, ts))
+                .unwrap();
+            sleep(Duration::from_millis(20));
+        }
+
+        let healthy_ms = neteq.current_buffer_size_ms();
+        assert!(
+            healthy_ms > CONSUMER_FLOOR_MS,
+            "a fed buffer must sit above the consumer's {CONSUMER_FLOOR_MS}ms floor, got {healthy_ms}ms"
+        );
+
+        let mut settled_ms = None;
+        let mut max_after_settling = 0;
+        for i in 0..STALL_FRAMES {
+            let _ = neteq.get_audio().unwrap();
+            let ms = neteq.current_buffer_size_ms();
+            match settled_ms {
+                None if ms <= OUTPUT_FRAME_MS => settled_ms = Some((i, ms)),
+                Some(_) => max_after_settling = max_after_settling.max(ms),
+                None => {}
+            }
+        }
+
+        let (settled_at, ms) = settled_ms.unwrap_or_else(|| {
+            panic!("buffer never fell to the residue within {STALL_FRAMES} frames of stall")
+        });
+        assert!(
+            settled_at < 60,
+            "the buffer should drain within ~0.6s, took {settled_at} frames"
+        );
+        assert!(
+            max_after_settling <= OUTPUT_FRAME_MS,
+            "the stall residue must stay bounded by one {OUTPUT_FRAME_MS}ms output frame; \
+             settled at {ms}ms then rose to {max_after_settling}ms"
+        );
+        assert!(
+            max_after_settling < CONSUMER_FLOOR_MS,
+            "the stall residue ({max_after_settling}ms) must stay BELOW peer_tile's \
+             {CONSUMER_FLOOR_MS}ms liveness floor, or a stalled stream reads as live \
+             and issue 2174's glow is suppressed for a talking peer"
+        );
+    }
+
     #[test]
     fn test_sample_domain_timestamps_keep_expand_near_zero() {
         // 20ms @ 48kHz = 960 samples. Sample-domain step the decoder fix produces.

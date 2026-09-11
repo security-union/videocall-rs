@@ -3,6 +3,14 @@ import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-contex
 import { continuousToneWavPath } from "../helpers/audio-fixtures";
 import { waitForServices } from "../helpers/wait-for-services";
 import { wakeControls } from "../helpers/controls";
+import {
+  GlowSample,
+  classifyGlow,
+  describeSample,
+  markGlowTimeline,
+  startGlowTimeline,
+  stopGlowTimeline,
+} from "../helpers/speaking-glow";
 
 /**
  * Issue 2174 follow-up — a mute must EXTINGUISH the speaking glow and keep it
@@ -274,180 +282,6 @@ async function openHostMuteMenuItem(page: Page) {
   const muteMenuItem = guestTile.locator(".tile-context-menu-item", { hasText: "Mute" });
   await expect(muteMenuItem).toBeVisible({ timeout: 5_000 });
   return muteMenuItem;
-}
-
-// ---------------------------------------------------------------------------
-// Glow timeline
-// ---------------------------------------------------------------------------
-
-type GlowVerdict = "lit" | "silent" | "unknown";
-
-/** One recorded state of the tracked tile, or an explicit phase marker. */
-interface GlowSample {
-  at: number;
-  style: string;
-  cls: string;
-  /**
-   * The tile's own `data-mic-muted` at capture time — `"true"` once THIS
-   * client's decode manager reports the peer as audio-off
-   * (`is_audio_enabled_for_peer` in `canvas_generator.rs`). `null` on the
-   * synthetic `oldValue` entries, which carry a past style rather than a state
-   * read. This is the zero point the deadline is measured from; it is read at
-   * 50ms resolution from inside the page rather than through a Playwright poll,
-   * because a Playwright poll can only observe the flip AFTER the fact and
-   * would move the zero point past the very window under test.
-   */
-  muted: string | null;
-  missing: boolean;
-  marker: string | null;
-}
-
-interface GlowWindow {
-  __vcGlowSamples?: GlowSample[];
-  __vcGlowMark?: (label: string) => void;
-  __vcGlowStop?: () => void;
-}
-
-/**
- * Classify a tile's inline style as `speak_style`'s GLOWING or SILENT output.
- *
- * Keyed on the transition EASING, which is the one property the two branches
- * never share (`canvas_generator.rs::speak_style`):
- *   - both silent branches emit `... ease-out ...` for border-colour AND
- *     box-shadow, and never `ease-in`;
- *   - both glowing branches emit `... ease-in ...` for both, and never
- *     `ease-out`.
- * Colour literals are unusable (themed, and already drifted once), and
- * `box-shadow: none` is emitted by a GLOWING tile too when
- * `inner_glow_strength` is 0, so neither can stand alone.
- *
- * Anything that is neither — an empty attribute, a detached node, a future
- * style this classifier does not understand — is `"unknown"` and NEVER silently
- * folded into one of the two verdicts. A predicate shaped as "silent = <two
- * substrings>" scores an empty string as glowing, which turns a missing
- * attribute into evidence, in whichever direction the caller happens to assert.
- * The callers below assert that no `"unknown"` appears in the measured window.
- */
-function classifyGlow(style: string): GlowVerdict {
-  const lit = style.includes("ease-in");
-  const silent = style.includes("ease-out");
-  if (lit === silent) {
-    return "unknown";
-  }
-  return lit ? "lit" : "silent";
-}
-
-/**
- * Start recording every rendered state of the tile with id `tileId`.
- *
- * Two capture paths run together because the defect can be shorter than a poll
- * interval. The MutationObserver records each style mutation's `oldValue`, so a
- * glow that is switched on and back off inside one microtask batch is still
- * preserved (re-reading the DOM from the callback would see only the final
- * value). The 50ms interval re-queries the id from scratch, so it keeps
- * reporting if Dioxus rebuilds the tile outside the observed subtree, and it
- * records the "tile is missing" case that would make a clean result vacuous.
- *
- * THROWS if `#grid-container` is absent: falling back to interval-only sampling
- * would still collect enough samples to satisfy every non-vacuity check while
- * quietly losing the sub-poll capture, so the degraded mode must be an error.
- */
-async function startGlowTimeline(page: Page, tileId: string): Promise<void> {
-  await page.evaluate((id) => {
-    const w = window as unknown as GlowWindow;
-    const samples: GlowSample[] = [];
-    w.__vcGlowSamples = samples;
-
-    const sample = (marker: string | null) => {
-      const el = document.getElementById(id);
-      samples.push({
-        at: performance.now(),
-        style: el?.getAttribute("style") || "",
-        cls: el?.getAttribute("class") || "",
-        muted: el?.querySelector("[data-mic-muted]")?.getAttribute("data-mic-muted") ?? null,
-        missing: el === null,
-        marker,
-      });
-    };
-
-    sample(null);
-
-    const container = document.getElementById("grid-container");
-    if (!container) {
-      throw new Error(
-        "#grid-container not found — cannot install the glow MutationObserver, so a sub-poll " +
-          "re-light would go unrecorded and a pass would be meaningless",
-      );
-    }
-
-    const observer = new MutationObserver((records) => {
-      for (const record of records) {
-        if (record.attributeName === "style" && (record.target as Element).id === id) {
-          // The value the tile held BEFORE this mutation. Pushed ahead of the
-          // post-mutation sample below, so the array stays in chronological
-          // order.
-          samples.push({
-            at: performance.now(),
-            style: record.oldValue || "",
-            cls: "",
-            muted: null,
-            missing: false,
-            marker: null,
-          });
-        }
-      }
-      sample(null);
-    });
-    observer.observe(container, {
-      subtree: true,
-      attributes: true,
-      attributeOldValue: true,
-      // `data-mic-muted` is watched too so the mute flip itself schedules a
-      // sample, pinning the deadline's zero point to the render that carried it
-      // rather than to the next 50ms tick.
-      attributeFilter: ["style", "class", "data-mic-muted"],
-    });
-
-    const timer = window.setInterval(() => sample(null), 50);
-
-    w.__vcGlowMark = (label: string) => sample(label);
-    w.__vcGlowStop = () => {
-      observer.disconnect();
-      window.clearInterval(timer);
-    };
-  }, tileId);
-}
-
-/**
- * Write a phase marker into the timeline.
- *
- * The regression assertion needs an unambiguous "the mute was issued HERE"
- * boundary. Inferring it from the samples themselves (e.g. "the first silent
- * one") would beg the question the test is asking.
- */
-async function markGlowTimeline(page: Page, label: string): Promise<void> {
-  await page.evaluate((l) => {
-    const w = window as unknown as GlowWindow;
-    if (!w.__vcGlowMark) {
-      throw new Error(`glow timeline not running — cannot mark "${l}"`);
-    }
-    w.__vcGlowMark(l);
-  }, label);
-}
-
-async function stopGlowTimeline(page: Page): Promise<GlowSample[]> {
-  return page.evaluate(() => {
-    const w = window as unknown as GlowWindow;
-    w.__vcGlowStop?.();
-    return w.__vcGlowSamples ?? [];
-  });
-}
-
-function describeSample(s: GlowSample | undefined, zero = 0): string {
-  if (!s) {
-    return "n/a";
-  }
-  return `at=+${(s.at - zero).toFixed(0)}ms verdict=${classifyGlow(s.style)} style="${s.style}"`;
 }
 
 /**

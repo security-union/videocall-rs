@@ -1,59 +1,22 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
+import { DRAWER } from "../helpers/rust-mirrored-constants";
 
 /**
- * Drawer resize + both-open (#1296).
- *
- * Two slide-in overlay drawers support a drag-to-RESIZE handle and can be open
- * at the same time. They are OVERLAY-ONLY: they float over the tiles and never
- * reflow the grid.
- *
- *   - LEFT  drawer = Attendants / peer list (`#peer-list-container`).
- *   - RIGHT drawer = Performance & Diagnostics (`#diagnostics-sidebar`).
- *
- * Behavior under test (sourced from
- * `dioxus-ui/src/components/{attendants,diagnostics,peer_list}.rs` +
- * `local_storage.rs` + `static/style.css`):
- *
- *  1. RESIZE: dragging `.drawer-resize-handle` changes the container's inline
- *     `width` px, clamped to [240, min(vw*0.5, 720)]. The left handle reads
- *     pointer `client_x` directly (left edge at x=0); the right handle width is
- *     `drag_start_vw - client_x` (drag its left-edge handle leftward to widen).
- *  2. PERSISTENCE via localStorage keys (EXACT strings, see `local_storage.rs`
- *     callers in `attendants.rs`):
- *       - `vc_drawer_left_width`  (f64)
- *       - `vc_drawer_right_width` (f64)
- *     Width persists on drag-END (pointerup / pointercancel / lostpointercapture)
- *     and is restored after reload.
- *  3. NO HOVER-LATCH: a drag must end cleanly (pointerup OR lost-capture); a
- *     later buttonless hover over the handle must NOT resize.
- *  4. VISIBLE GRIP on desktop; the handle (and grip) is hidden on mobile
- *     (< 568px), where drawers are forced full-width.
- *  5. BOTH drawers can be open at the SAME time (independent open/close).
- *
- * Drag mechanism: the resize handle is driven by POINTER events with pointer
- * capture (`set_pointer_capture`) in the Rust source. We drive it with REAL
- * Playwright `mouse.down/move/up` (NOT synthetic `dispatchEvent`) so the
- * generated pointer events are TRUSTED — synthetic untrusted events would make
- * `set_pointer_capture` a no-op and may not route through Dioxus's delegated
- * listeners. This mirrors the proven drag approach in
- * `signal-meter-popup-drag-and-reanchor.spec.ts`. Chromium emits
- * pointerdown/move/up for mouse input by default, so the Rust onpointer*
- * handlers fire, and the FINAL pointer `client_x` of the move alone determines
- * the resulting width (the handlers integrate no deltas).
+ * Drawer resize + both-open (#1296), budget-aware since #2701. Dragging
+ * `.drawer-resize-handle` sets the inline `width`, clamped to
+ * [DRAWER_MIN_WIDTH, drawer_max_for_side(...)] — a cap that now also subtracts
+ * what the OTHER open drawers keep. Width persists on drag-END and survives
+ * reload, never latches to a later hover, and the grip hides below 568px.
+ * Drags use REAL `page.mouse.*`; untrusted events no-op `set_pointer_capture`.
  */
 
 const DEFAULT_UI_URL = "http://localhost:3001";
 
-// Clamp bounds mirrored from attendants.rs: DRAWER_MIN_WIDTH / DRAWER_MAX_ABS.
-const DRAWER_MIN_WIDTH = 240;
-const DRAWER_MAX_ABS = 720;
+const { DRAWER_MIN_WIDTH, DRAWER_MAX_ABS, MIN_GRID_BAND } = DRAWER;
 
-// Desktop viewport (>= 568px so the resize handle is shown). 1280x720 matches
-// the "Desktop Chrome" device default used by the dioxus project.
 const DESKTOP = { width: 1280, height: 720 };
-// Mobile viewport (< 568px so the resize handle is hidden).
 const MOBILE = { width: 400, height: 800 };
 
 // localStorage keys — must EXACTLY match the save_*/load_* call sites in
@@ -66,11 +29,10 @@ type Side = "left" | "right";
 
 interface DrawerSpec {
   side: Side;
-  /** Container element id. */
   containerId: string;
-  /** "Open <X>" tooltip text on the video-controls button that opens it. */
   openTooltip: string;
-  /** localStorage key holding the width f64. */
+  /** `ActionBarSlot::display_name()`, the label in the "More actions" menu. */
+  overflowLabel: string;
   widthKey: string;
 }
 
@@ -79,19 +41,17 @@ const DRAWERS: Record<Side, DrawerSpec> = {
     side: "left",
     containerId: "peer-list-container",
     openTooltip: "Open Peers",
+    overflowLabel: "Participants",
     widthKey: LS_LEFT_WIDTH,
   },
   right: {
     side: "right",
     containerId: "diagnostics-sidebar",
     openTooltip: "Open Diagnostics",
+    overflowLabel: "Diagnostics",
     widthKey: LS_RIGHT_WIDTH,
   },
 };
-
-// ---------------------------------------------------------------------------
-// Meeting-entry helpers (mirror host-controls-menu-ux.spec.ts)
-// ---------------------------------------------------------------------------
 
 async function navigateToMeeting(page: Page, meetingId: string, username: string): Promise<void> {
   await page.goto("/");
@@ -127,18 +87,11 @@ async function joinMeetingFromPage(page: Page): Promise<void> {
   await expect(grid).toBeVisible({ timeout: 15_000 });
 }
 
-/**
- * Open a drawer by clicking its "Open <X>" video-controls button. The
- * controls bar auto-hides after ~1s of mouse inactivity, so wake it with a
- * hover + mouse move first (mirrors `openPeerListSidebar` in
- * host-controls-menu-ux.spec.ts).
- */
+/** Open a drawer, waking the auto-hiding bar first. At 400px every secondary
+ *  slot is shed behind `#overflow-menu-trigger` (pre-dates #2701), so the
+ *  inline button reports `hidden` and the fallback uses "More actions". */
 async function openDrawer(page: Page, spec: DrawerSpec): Promise<void> {
   await page.locator(".video-controls-container").hover();
-  // Nudge the pointer to an INTERIOR point of the live viewport to wake the
-  // auto-hiding controls bar. A fixed (400, 400) lands on / past the right edge
-  // of the 400px mobile viewport (valid x is 0..399), so derive the centre from
-  // the measured size — works for both the 1280 desktop and 400 mobile runs.
   const vp = page.viewportSize() ?? { width: 800, height: 600 };
   await page.mouse.move(Math.floor(vp.width / 2), Math.floor(vp.height / 2));
   await page.waitForTimeout(300);
@@ -146,24 +99,31 @@ async function openDrawer(page: Page, spec: DrawerSpec): Promise<void> {
   const openBtn = page.locator("button.video-control-button", {
     has: page.locator("span.tooltip", { hasText: spec.openTooltip }),
   });
-  await expect(openBtn).toBeVisible({ timeout: 10_000 });
-  await openBtn.click();
+  if (await openBtn.isVisible()) {
+    await openBtn.click();
+  } else {
+    const trigger = page.locator("#overflow-menu-trigger");
+    await expect(trigger).toBeVisible({ timeout: 10_000 });
+    await trigger.click();
+    const item = page.locator(".action-bar-overflow-popover button.overflow-item", {
+      has: page.locator(`span:text-is("${spec.overflowLabel}")`),
+    });
+    await expect(item).toBeVisible({ timeout: 10_000 });
+    await item.click();
+  }
   await expect(page.locator(`#${spec.containerId}`)).toHaveClass(/visible/, { timeout: 10_000 });
 }
 
-/** Read a number-valued inline style prop (e.g. `width`) in px. */
 async function inlineStylePx(page: Page, selector: string, prop: string): Promise<number> {
   const handle = page.locator(selector);
   const value = await handle.evaluate(
     (el, p) => (el as HTMLElement).style.getPropertyValue(p),
     prop,
   );
-  // "" when unset, "320px" when set. parseFloat("") === NaN -> treat as 0.
   const n = parseFloat(value);
   return Number.isNaN(n) ? 0 : n;
 }
 
-/** Read the container's inline `width` in px. */
 function containerWidthPx(page: Page, spec: DrawerSpec): Promise<number> {
   return inlineStylePx(page, `#${spec.containerId}`, "width");
 }
@@ -171,23 +131,6 @@ function containerWidthPx(page: Page, spec: DrawerSpec): Promise<number> {
 /**
  * Drag the drawer's resize handle so the pointer ends at viewport `targetX`,
  * driving the resize with REAL trusted mouse events.
- *
- * The Rust move handler sets the width from the single `client_x` of the
- * pointermove (it integrates NO deltas), and persists to localStorage only on
- * pointerup, so the FINAL mouse X alone determines the resulting width:
- *   left:  width = clamp(targetX, 240, maxForSide)
- *   right: width = clamp(dragStartVw - targetX, 240, maxForSide)
- *
- * Sequence: move to the handle's center -> mouse.down (pointerdown: begin-drag,
- * cache start-vw for the right side, set_pointer_capture) -> move toward targetX
- * in two steps (pointermove: width updates; the intermediate step lets the
- * signal write + repaint flush) -> mouse.up (pointerup: persist + end-drag).
- *
- * Synthetic `dispatchEvent` is deliberately NOT used: untrusted events make
- * `set_pointer_capture` a no-op and may not route through Dioxus's delegated
- * listeners. Real `page.mouse.*` emits trusted pointer events (Chromium fires
- * pointer events for mouse input by default), mirroring the proven drag in
- * `signal-meter-popup-drag-and-reanchor.spec.ts`.
  */
 async function dragResizeHandleTo(page: Page, spec: DrawerSpec, targetX: number): Promise<void> {
   const handle = page.locator(`#${spec.containerId} .drawer-resize-handle`);
@@ -211,24 +154,38 @@ async function dragResizeHandleTo(page: Page, spec: DrawerSpec, targetX: number)
   await page.waitForTimeout(300);
 }
 
-/** The per-side max width cap mirrored from attendants.rs `max_for_side`. */
+/**
+ * The cap with the dragged drawer ALONE, for viewports at or above 800 ONLY.
+ *
+ * `drawer_max_for_side` is `min(max_total_reserve(vw), vw*0.5, DRAWER_MAX_ABS)`
+ * floored at `DRAWER_MIN_WIDTH`, and `max_total_reserve` is
+ * `min(vw*0.60, vw - MIN_GRID_BAND)`. The 0.60 term never binds, since `vw*0.5`
+ * is always smaller. The `vw - 400` term binds whenever `vw < 800`, which the
+ * shorthand below does NOT model: at 700 the real cap is 300 and at 768 it is
+ * 368, where this would answer 350 and 384. Every caller runs at DESKTOP, so
+ * the precondition is asserted rather than the whole rule re-implemented.
+ */
 function maxForSide(viewportWidth: number): number {
+  expect(
+    viewportWidth,
+    "maxForSide only models vw >= 800; below that `vw - MIN_GRID_BAND` binds",
+  ).toBeGreaterThanOrEqual(2 * MIN_GRID_BAND);
   return Math.min(Math.max(viewportWidth * 0.5, DRAWER_MIN_WIDTH), DRAWER_MAX_ABS);
 }
 
-/**
- * Read the page's REAL `window.innerWidth`.
- *
- * The Rust width math uses the live viewport width, NOT the value we passed to
- * `setViewportSize`: the right drawer caches `window.inner_width` into
- * `drag_start_vw` on pointerdown (`width = clamp(inner_width - client_x, …)`),
- * and BOTH drawers derive `max_for_side = (inner_width * 0.5).clamp(240, 720)`.
- * Chromium's `innerWidth` after `setViewportSize({width: 1280})` is normally
- * 1280 (these full-bleed call pages have no scrollbar), but deriving the drag
- * targets and the max cap from the *measured* width — rather than the 1280
- * constant — makes every width assertion reference the SAME source of truth the
- * Rust handler reads, instead of a value that could silently diverge.
- */
+/** The public build strips the chat integration, so `#chat-sidebar` never
+ *  mounts. Keyed on the sidebar, not its action-bar button: the button is also
+ *  absent when a narrow band sheds it into the overflow menu. */
+const NO_CHAT = "chat integration is not part of the public build";
+
+function chatIsBuiltIn(page: Page): Promise<boolean> {
+  return page
+    .locator("#chat-sidebar")
+    .count()
+    .then((n) => n > 0);
+}
+
+/** The live `window.innerWidth` the Rust handlers read, not the requested size. */
 function pageInnerWidth(page: Page): Promise<number> {
   return page.evaluate(() => window.innerWidth);
 }
@@ -242,21 +199,18 @@ function vwMinus(vw: number, w: number): number {
   return vw - w;
 }
 
-/** Bounding box for a selector, asserting it is present. */
 async function boxOf(page: Page, selector: string): Promise<{ x: number; width: number }> {
   const b = await page.locator(selector).boundingBox();
   if (!b) throw new Error(`missing bounding box for ${selector}`);
   return { x: b.x, width: b.width };
 }
 
-/** Computed style value for a selector (resolved, e.g. z-index "9301"). */
 function computedStyle(page: Page, selector: string, prop: string): Promise<string> {
   return page
     .locator(selector)
     .evaluate((el, p) => window.getComputedStyle(el).getPropertyValue(p), prop);
 }
 
-/** Computed pseudo-element (`::before`) style value for a selector. */
 function computedPseudoStyle(
   page: Page,
   selector: string,
@@ -345,23 +299,13 @@ test.describe("Drawer resize + both-open (#1296)", () => {
         await joinMeetingFromPage(page);
         await openDrawer(page, spec);
 
-        // Use the page's MEASURED inner width — the same value the Rust handler
-        // reads (right drawer: `clamp(inner_width - client_x, …)`; both sides:
-        // `max_for_side = (inner_width * 0.5).clamp(240, 720)`). Deriving the
-        // targets + cap from this, not the 1280 constant, keeps the assertions
-        // pinned to the engine's source of truth (see `pageInnerWidth`).
         const vw = await pageInnerWidth(page);
         const maxW = maxForSide(vw); // min(vw*0.5, 720) — 640 at vw=1280
 
-        // Capture the default (pre-drag) width so the in-range drag below proves
-        // a real CHANGE, not merely that the width coincidentally equals a
-        // default. Defaults from attendants.rs use_signal initializers: left
-        // 320px, right 560px (both overlay-rendered at the raw width signal).
+        // Defaults are 320 left / 560 right, so 360 proves a real change.
         const defaultWidth = await containerWidthPx(page, spec);
 
         // Width math (final pointer client_x):
-        //   left:  width = clamp(clientX, 240, maxW)
-        //   right: width = clamp(vw - clientX, 240, maxW)
         // Pick a clientX that lands a known in-range target of ~360px so we can
         // assert an exact, non-default width.
         const targetWidth = 360;
@@ -375,9 +319,7 @@ test.describe("Drawer resize + both-open (#1296)", () => {
         // chosen to differ from BOTH defaults (320 left / 560 right) by > 10px.
         expect(Math.abs(targetWidth - defaultWidth)).toBeGreaterThan(10);
 
-        // Drag PAST the lower bound: width clamps to DRAWER_MIN_WIDTH (240).
-        //   left  -> a small clientX (e.g. 50) clamps up to 240.
-        //   right -> a clientX near the right edge (vw-50) -> width 50 -> 240.
+        // Drag PAST the lower bound: width clamps to DRAWER_MIN_WIDTH (300).
         const belowMinX = side === "left" ? 50 : vw - 50;
         await dragResizeHandleTo(page, spec, belowMinX);
         await expect
@@ -427,33 +369,12 @@ test.describe("Drawer resize + both-open (#1296)", () => {
         await joinMeetingFromPage(page);
         await openDrawer(page, spec);
 
-        // Protects the per-drag "valid" flush gate in attendants.rs
-        // (left_raf_valid / right_raf_valid, Rc<Cell<bool>> reset to false on
-        // pointerdown / on_resize_start, set true only on a real pointermove):
-        // the `if lv.get()` guards (LEFT pointerup / pointercancel /
-        // lostpointercapture) and the `if rv.get()` guard (RIGHT on_resize_end).
-        // The rAF stash defaults are 0.0. Deleting these gates makes a NO-MOVE
-        // pointerup flush the default 0.0 stash -> LEFT clamps to
-        // DRAWER_MIN_WIDTH (240, vs the 320 default), RIGHT clamps
-        // `drag_start_vw - 0.0` to max_for_side (~640 at vw=1280, vs the 560
-        // default) and persists it via save_f64 — CHANGING the inline width AND
-        // writing the width key. With the gates intact a no-move interaction
-        // leaves both the width signal and localStorage untouched, which is what
-        // this test pins.
-
-        // Capture the pre-interaction inline width and the persisted width
-        // value (may be null if nothing was ever dragged this session — the
-        // gate must hold in that case too).
+        // Pins the per-drag "valid" flush gates (left_raf_valid / right_raf_valid,
+        // set only by a real pointermove). Without them a no-move pointerup
+        // flushes the 0.0 rAF stash and persists it.
         const widthBefore = await containerWidthPx(page, spec);
         const storedBefore = await page.evaluate((k) => localStorage.getItem(k), spec.widthKey);
 
-        // Perform a NO-MOVE pointer interaction on the resize handle: locate it
-        // exactly like dragResizeHandleTo (bounding-box center), then
-        // down -> up at the SAME coords with NO `page.mouse.move` strictly
-        // between down() and up(). The pre-down positioning move presses no
-        // buttons, so it is not a captured drag pointermove and does not set the
-        // valid flag; only a move WHILE the button is down would. This mirrors a
-        // user clicking / focus-tapping the handle without dragging.
         const handle = page.locator(`#${spec.containerId} .drawer-resize-handle`);
         await expect(handle).toBeVisible({ timeout: 10_000 });
         const box = await handle.boundingBox();
@@ -469,19 +390,12 @@ test.describe("Drawer resize + both-open (#1296)", () => {
         // Let any (non-)flush + persistence settle, mirroring dragResizeHandleTo.
         await page.waitForTimeout(300);
 
-        // Width must be UNCHANGED. Tolerance is tight (0 digits => within
-        // ~0.5px): the gate-removed no-move flush would shift LEFT by 80px
-        // (320 -> 240) and RIGHT by ~80px (560 -> ~640), so this assertion
-        // FAILS hard if either gate is deleted. expect.poll allows the
-        // (non-)flush to settle while still pinning "did not change".
+        // Deleting either gate shifts LEFT 320 -> 300 and RIGHT 560 -> ~640,
+        // both far outside the ~0.5px tolerance.
         await expect
           .poll(() => containerWidthPx(page, spec), { timeout: 10_000 })
           .toBeCloseTo(widthBefore, 0);
 
-        // Storage must be UNCHANGED. With the gate intact, save_f64 is never
-        // called for a no-move interaction, so the width key keeps its prior
-        // value (null or a real number). With the gate removed it would be
-        // written ("240" left / "~640" right), so `toBe(storedBefore)` FAILS.
         const storedAfter = await page.evaluate((k) => localStorage.getItem(k), spec.widthKey);
         expect(storedAfter).toBe(storedBefore);
       } finally {
@@ -513,11 +427,10 @@ test.describe("Drawer resize + both-open (#1296)", () => {
 
         const container = page.locator(`#${spec.containerId}`);
 
-        // Resize to a known in-range width (writes the width key on pointerup).
-        // Measured inner width = the value the right drawer's handler reads for
-        // `clamp(inner_width - client_x, …)` (see `pageInnerWidth`).
+        // 400, not the old 300: 300 is now the clamp FLOOR, and a target on a
+        // bound cannot separate "the drag landed here" from "the clamp did it".
         const vw = await pageInnerWidth(page);
-        const targetWidth = 300;
+        const targetWidth = 400;
         const inRangeX = side === "left" ? targetWidth : vw - targetWidth;
         await dragResizeHandleTo(page, spec, inRangeX);
         await expect
@@ -697,14 +610,18 @@ test.describe("Drawer resize + both-open (#1296)", () => {
         });
         await page.waitForTimeout(150);
 
-        // Release the still-down real button OFF the handle. Capture was detached
-        // above, so this real `pointerup` targets the center element, NOT the
-        // handle — the handle's `onpointerup` does not fire, so it cannot mask the
-        // lost-capture reset.
+        // Off the handle so its `onpointerup` cannot mask the lost-capture
+        // reset, but INSIDE the drawer: releasing on the grid synthesises a
+        // `click` on `#main-container`, whose light-dismiss (#1790) closes the
+        // drawer and hangs the next `boundingBox()` (90s timeout on the base).
         const vh = page.viewportSize()?.height ?? DESKTOP.height;
-        await page.mouse.move(Math.floor(vw / 2), Math.floor(vh / 2));
+        const releaseX = side === "left" ? 100 : vw - 100;
+        await page.mouse.move(releaseX, Math.floor(vh / 2));
         await page.mouse.up();
         await page.waitForTimeout(150);
+        await expect(page.locator(`#${spec.containerId}`)).toHaveClass(/\bvisible\b/, {
+          timeout: 5_000,
+        });
 
         const widthAfterEnd = await containerWidthPx(page, spec);
 
@@ -949,10 +866,11 @@ test.describe("Drawer resize + both-open (#1296)", () => {
     }
   });
 
-  // Reference the `boxOf` helper so it is exercised by a real assertion (it
-  // underpins the both-open layout reasoning above): on desktop, the resized
-  // left peer-list panel sits flush against the left viewport edge.
-  test("left drawer hugs the left viewport edge (overlay, no reflow)", async ({ baseURL }) => {
+  // Before #2701 the grid was `left: 0` in every state, so `grid.x` read 0 here
+  // whatever the drawer measured.
+  test("a dragged left drawer hugs x=0 and the grid starts at its inner edge", async ({
+    baseURL,
+  }) => {
     test.setTimeout(90_000);
     const uiURL = baseURL || DEFAULT_UI_URL;
     const spec = DRAWERS.left;
@@ -973,10 +891,140 @@ test.describe("Drawer resize + both-open (#1296)", () => {
       await joinMeetingFromPage(page);
       await openDrawer(page, spec);
 
-      // The overlay left drawer is anchored at viewport x=0. FAILS if the
-      // drawer is shifted inward (e.g. a stray inset positioning regression).
-      const b = await boxOf(page, `#${spec.containerId}`);
-      expect(b.x).toBeLessThanOrEqual(1);
+      const atDefault = await boxOf(page, `#${spec.containerId}`);
+      expect(atDefault.x).toBeLessThanOrEqual(1);
+
+      const gridAtDefault = await boxOf(page, "#grid-container");
+      expect(gridAtDefault.x).toBeCloseTo(atDefault.width, 0);
+
+      await dragResizeHandleTo(page, spec, 420);
+      await expect
+        .poll(() => containerWidthPx(page, spec), { timeout: 10_000 })
+        .toBeCloseTo(420, -1);
+
+      const dragged = await boxOf(page, `#${spec.containerId}`);
+      expect(dragged.x).toBeLessThanOrEqual(1);
+      const gridAfterDrag = await boxOf(page, "#grid-container");
+      expect(gridAfterDrag.x).toBeCloseTo(dragged.width, 0);
+      expect(gridAfterDrag.x).toBeGreaterThan(gridAtDefault.x + 50);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  // The wrapper is tagged while a handle is held so chat's transition can be
+  // suppressed for the duration; it must come off again when the drag ends, or
+  // chat never animates again.
+  test("the wrapper carries drawers-dragging only while a handle is held", async ({ baseURL }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const spec = DRAWERS.left;
+    const meetingId = `e2e_drawer_dragging_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    // The wrapper has no id; it is `#main-container`'s parent.
+    const wrapperClass = (page: Page) =>
+      page.evaluate(
+        () => document.querySelector("#main-container")?.parentElement?.className ?? "",
+      );
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "dragging@videocall.rs",
+        "Dragging",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "Dragging");
+      await joinMeetingFromPage(page);
+      await openDrawer(page, spec);
+
+      expect(await wrapperClass(page)).not.toContain("drawers-dragging");
+
+      const handle = page.locator(`#${spec.containerId} .drawer-resize-handle`);
+      const box = await handle.boundingBox();
+      if (!box) throw new Error("left resize handle has no bounding box");
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(420, box.y + box.height / 2);
+      await expect.poll(() => wrapperClass(page), { timeout: 5_000 }).toContain("drawers-dragging");
+
+      await page.mouse.up();
+      await expect
+        .poll(() => wrapperClass(page), { timeout: 5_000 })
+        .not.toContain("drawers-dragging");
+    } finally {
+      await browser.close();
+    }
+  });
+
+  // Literal px at 1280 (budget 768), from the acceptance checklist: diagnostics
+  // beside chat 408, beside chat + peer list 300 (the floor), peer list beside
+  // diagnostics 468. All three clamped at 640 before #2701.
+  test("the resize clamp shrinks as other drawers open (budget-aware cap)", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_drawer_budget_cap_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "budget-cap@videocall.rs",
+        "BudgetCap",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BudgetCap");
+      await joinMeetingFromPage(page);
+      test.skip(!(await chatIsBuiltIn(page)), NO_CHAT);
+
+      const vw = await pageInnerWidth(page);
+
+      await page.locator(".video-controls-container").hover();
+      await page.mouse.move(Math.floor(vw / 2), 360);
+      await page.waitForTimeout(300);
+      await page.getByRole("button", { name: "Chat", exact: true }).click();
+      await expect(page.locator("#chat-sidebar")).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await openDrawer(page, DRAWERS.right);
+
+      await dragResizeHandleTo(page, DRAWERS.right, 1);
+      await expect
+        .poll(() => containerWidthPx(page, DRAWERS.right), { timeout: 10_000 })
+        .toBeCloseTo(408, -1);
+
+      // All three open: the cap is down to the floor, so the handle goes inert
+      // and a drag on it must be a true no-op — the stored 408 survives rather
+      // than being overwritten with the floor it renders at.
+      await openDrawer(page, DRAWERS.left);
+      const rightHandle = page.locator(`#${DRAWERS.right.containerId} .drawer-resize-handle`);
+      await expect(rightHandle).toHaveAttribute("aria-disabled", "true", { timeout: 10_000 });
+      await expect
+        .poll(() => containerWidthPx(page, DRAWERS.right), { timeout: 10_000 })
+        .toBeCloseTo(DRAWER_MIN_WIDTH, -1);
+      // Release INSIDE the drawer: ending on the grid would light-dismiss the
+      // peer list (#1790) and silently unwind the three-drawer state.
+      await dragResizeHandleTo(page, DRAWERS.right, vw - 80);
+      await expect(page.locator(`#${DRAWERS.left.containerId}`)).toHaveClass(/visible/, {
+        timeout: 5_000,
+      });
+      expect(await page.evaluate((k) => localStorage.getItem(k), LS_RIGHT_WIDTH)).toBe("408");
+
+      // 468, because the left cap reserves only the diagnostics FLOOR: it
+      // shrinks first and absorbs the drag, rather than holding its live 560.
+      await page.locator("#chat-sidebar").getByRole("button", { name: "Close chat" }).click();
+      await expect(page.locator("#chat-sidebar")).not.toHaveClass(/\bvisible\b/, {
+        timeout: 10_000,
+      });
+      await dragResizeHandleTo(page, DRAWERS.left, vw - 1);
+      await expect
+        .poll(() => containerWidthPx(page, DRAWERS.left), { timeout: 10_000 })
+        .toBeCloseTo(468, -1);
     } finally {
       await browser.close();
     }

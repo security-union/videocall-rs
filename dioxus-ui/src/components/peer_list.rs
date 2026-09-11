@@ -18,14 +18,142 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
+use crate::components::peer_tile::{
+    audio_path_is_live, corroborated_speaking, expire_stale_claim, glow_deadman_ms,
+    record_fast_path_verdict, records_live_audio, FastPathVerdict, LiveStamp, NowMs,
+};
 use crate::constants::meeting_api_client;
 use crate::context::{HostSetCtx, RaisedHandsCtx, RecordingSetCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
 use futures::future::{AbortHandle, Abortable};
-use std::cell::RefCell;
+use gloo_timers::callback::Interval;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use videocall_client::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
 use videocall_diagnostics::{recv_loop_action, subscribe, DiagEvent, MetricValue, RecvLoopAction};
+
+/// How long a roster speaking dot survives with no further evidence (issue
+/// 2660). The tile's glow-deadman rule, from the same `const fn`: two
+/// consecutive keepalives plus slack must lapse before a dot goes out.
+const ROSTER_SPEAKING_DEADMAN_MS: f64 = glow_deadman_ms(HEARTBEAT_KEEPALIVE_INTERVAL_MS) as f64;
+
+const ROSTER_SPEAKING_SWEEP_MS: u32 = 1_000;
+
+/// Stamped on EVERY qualifying event, changed or not — the stamp is what tells
+/// the sweep this peer is still reporting.
+fn stamp_roster_speaking(stamps: &RefCell<HashMap<String, f64>>, peer: &str, now_ms: f64) {
+    let mut map = stamps.borrow_mut();
+    if let Some(at) = map.get_mut(peer) {
+        *at = now_ms;
+        return;
+    }
+    map.insert(peer.to_string(), now_ms);
+}
+
+/// The two per-peer inputs the tile's fold consumes, read off the bus so a peer
+/// with no mounted tile is covered. Not signals: they steer a write that already
+/// happens, so touching them must not re-render the roster.
+#[derive(Default)]
+pub(crate) struct RosterLiveness {
+    verdicts: RefCell<HashMap<String, Cell<FastPathVerdict>>>,
+    last_live_at: RefCell<HashMap<String, f64>>,
+}
+
+impl RosterLiveness {
+    /// `HashMap::entry`/`insert` take the key BY VALUE, so passing
+    /// `peer.to_string()` allocates on every call and discards it when the peer is
+    /// already present. Look up by `&str` first; own the key only on insert.
+    fn record_verdict(&self, peer: &str, speaking: Option<bool>) {
+        if speaking.is_none() {
+            return;
+        }
+        {
+            let map = self.verdicts.borrow();
+            if let Some(cell) = map.get(peer) {
+                record_fast_path_verdict(cell, speaking);
+                return;
+            }
+        }
+        let mut map = self.verdicts.borrow_mut();
+        record_fast_path_verdict(map.entry(peer.to_string()).or_default(), speaking);
+    }
+
+    fn verdict(&self, peer: &str) -> FastPathVerdict {
+        self.verdicts
+            .borrow()
+            .get(peer)
+            .map(Cell::get)
+            .unwrap_or_default()
+    }
+
+    fn record_live_audio(&self, peer: &str, now_ms: f64) {
+        self.last_live_at
+            .borrow_mut()
+            .insert(peer.to_string(), now_ms);
+    }
+
+    /// Resolve a heartbeat's speaking claim for `peer` through the tile's rule.
+    fn resolve_claim(&self, peer: &str, claim: bool, now_ms: f64) -> bool {
+        let folded =
+            corroborated_speaking(Some(claim), self.verdict(peer), self.can_hear(peer, now_ms));
+        expire_stale_claim(folded, self.live_stamp(peer), NowMs(now_ms)) == Some(true)
+    }
+
+    /// An absent entry is the tile's `0.0` "never heard" sentinel.
+    fn live_stamp(&self, peer: &str) -> LiveStamp {
+        LiveStamp(self.last_live_at.borrow().get(peer).copied().unwrap_or(0.0))
+    }
+
+    fn can_hear(&self, peer: &str, now_ms: f64) -> bool {
+        self.last_live_at
+            .borrow()
+            .get(peer)
+            .is_some_and(|at| audio_path_is_live(LiveStamp(*at), NowMs(now_ms)))
+    }
+
+    /// Drop only the SPEAKING evidence: the sweep retires lapsed claims, not
+    /// departures, and `last_live_at` must survive (issue 2660).
+    fn forget(&self, peers: &[String]) {
+        let mut verdicts = self.verdicts.borrow_mut();
+        for peer in peers {
+            verdicts.remove(peer);
+        }
+    }
+
+    /// Departure: drop both maps so neither grows unbounded.
+    pub(crate) fn forget_departed(&self, peers: &[String]) {
+        let mut verdicts = self.verdicts.borrow_mut();
+        let mut live = self.last_live_at.borrow_mut();
+        for peer in peers {
+            verdicts.remove(peer);
+            live.remove(peer);
+        }
+    }
+}
+
+/// Peers whose evidence has lapsed. `now - at > window` reads a BACKWARD
+/// wall-clock step as "not lapsed" — one extra tick beats blanking a live dot.
+fn lapsed_roster_speakers(stamps: &HashMap<String, f64>, now_ms: f64) -> Vec<String> {
+    stamps
+        .iter()
+        .filter(|(_, at)| now_ms - **at > ROSTER_SPEAKING_DEADMAN_MS)
+        .map(|(peer, _)| peer.clone())
+        .collect()
+}
+
+/// Split from [`lapsed_roster_speakers`] so the sweep can test for an empty list
+/// BEFORE taking a write: `try_write` dirties every roster row regardless.
+fn apply_lapsed_roster_speakers(
+    speaking: &mut HashMap<String, bool>,
+    stamps: &mut HashMap<String, f64>,
+    lapsed: &[String],
+) {
+    for peer in lapsed {
+        stamps.remove(peer);
+        speaking.remove(peer);
+    }
+}
 
 /// One row in the peer-list sidebar.
 ///
@@ -95,11 +223,40 @@ pub fn PeerList(
     let mut peer_audio_states = use_signal(HashMap::<String, bool>::new);
     let mut peer_video_states = use_signal(HashMap::<String, bool>::new);
     let mut peer_speaking_states = use_signal(HashMap::<String, bool>::new);
+    let speaking_stamps: Rc<RefCell<HashMap<String, f64>>> =
+        use_hook(|| Rc::new(RefCell::new(HashMap::new())));
+    // Issue 2660: owned by the parent — this component unmounts with the drawer.
+    let roster_liveness = use_context::<Rc<RosterLiveness>>();
+    let stamps_for_sweep = speaking_stamps.clone();
+    let liveness_for_sweep = roster_liveness.clone();
+    let _speaking_sweep: Rc<Interval> = use_hook(move || {
+        let mut speaking = peer_speaking_states;
+        Rc::new(Interval::new(ROSTER_SPEAKING_SWEEP_MS, move || {
+            let now = js_sys::Date::now();
+            let lapsed = lapsed_roster_speakers(&stamps_for_sweep.borrow(), now);
+            if lapsed.is_empty() {
+                return;
+            }
+            let Ok(mut rendered) = speaking.try_write() else {
+                return;
+            };
+            apply_lapsed_roster_speakers(
+                &mut rendered,
+                &mut stamps_for_sweep.borrow_mut(),
+                &lapsed,
+            );
+            liveness_for_sweep.forget(&lapsed);
+        }))
+    });
 
     // Subscribe to diagnostics for peer_status and peer_speaking updates
     let _client = use_context::<VideoCallClientCtx>();
     let prev_abort_handle = use_hook(|| Rc::new(RefCell::new(None::<AbortHandle>)));
+    let stamps_for_effect = speaking_stamps.clone();
+    let liveness_for_effect = roster_liveness.clone();
     use_effect(move || {
+        let stamps_for_handler = stamps_for_effect.clone();
+        let liveness_for_handler = liveness_for_effect.clone();
         if let Some(h) = prev_abort_handle.borrow_mut().take() {
             h.abort();
         }
@@ -125,6 +282,8 @@ pub fn PeerList(
                     &mut peer_audio_states,
                     &mut peer_video_states,
                     &mut peer_speaking_states,
+                    &stamps_for_handler,
+                    &liveness_for_handler,
                 );
             }
         };
@@ -742,6 +901,8 @@ fn handle_peer_list_diagnostics(
     peer_audio_states: &mut Signal<HashMap<String, bool>>,
     peer_video_states: &mut Signal<HashMap<String, bool>>,
     peer_speaking_states: &mut Signal<HashMap<String, bool>>,
+    speaking_stamps: &RefCell<HashMap<String, f64>>,
+    liveness: &RosterLiveness,
 ) {
     match evt.subsystem {
         "peer_status" => {
@@ -778,6 +939,9 @@ fn handle_peer_list_diagnostics(
                     }
                 }
                 if let Some(speaking) = is_speaking {
+                    let now = js_sys::Date::now();
+                    stamp_roster_speaking(speaking_stamps, &peer, now);
+                    let speaking = liveness.resolve_claim(&peer, speaking, now);
                     let current = match peer_speaking_states.try_peek() {
                         Ok(map) => map.get(&peer).copied(),
                         Err(_) => return,
@@ -814,6 +978,8 @@ fn handle_peer_list_diagnostics(
                     Err(_) => return,
                 };
                 let speaking_val = resolve_roster_speaking(speaking_val, audio_known);
+                liveness.record_verdict(peer, speaking);
+                stamp_roster_speaking(speaking_stamps, peer, js_sys::Date::now());
                 let current = match peer_speaking_states.try_peek() {
                     Ok(map) => map.get(peer).copied(),
                     Err(_) => return,
@@ -825,6 +991,22 @@ fn handle_peer_list_diagnostics(
                 }
             }
         }
+        "neteq" => {
+            let mut target_peer: Option<&str> = None;
+            let mut buf_ms: Option<f64> = None;
+            for m in &evt.metrics {
+                match (m.name, &m.value) {
+                    ("target_peer", MetricValue::Text(p)) => target_peer = Some(p.as_ref()),
+                    ("audio_buffer_ms", MetricValue::U64(v)) => buf_ms = Some(*v as f64),
+                    _ => {}
+                }
+            }
+            if let (Some(peer), Some(b)) = (target_peer, buf_ms) {
+                if records_live_audio(b) {
+                    liveness.record_live_audio(peer, js_sys::Date::now());
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -832,7 +1014,342 @@ fn handle_peer_list_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::peer_tile::{LIVENESS_GRACE_MS, UNHEARD_GLOW_CAP_MS};
     use std::collections::HashMap;
+
+    /// Replays evidence and sweep ticks against the production functions;
+    /// `renders_speaking` mirrors the row lookup in the rsx body.
+    struct Roster {
+        speaking: HashMap<String, bool>,
+        stamps: RefCell<HashMap<String, f64>>,
+    }
+
+    impl Roster {
+        const PEER: &'static str = "sid-1";
+
+        fn new() -> Self {
+            Self {
+                speaking: HashMap::new(),
+                stamps: RefCell::new(HashMap::new()),
+            }
+        }
+
+        fn evidence(&mut self, peer: &str, speaking: bool, now_ms: f64) {
+            stamp_roster_speaking(&self.stamps, peer, now_ms);
+            self.speaking.insert(peer.to_string(), speaking);
+        }
+
+        fn sweep(&mut self, now_ms: f64) {
+            let lapsed = lapsed_roster_speakers(&self.stamps.borrow(), now_ms);
+            if lapsed.is_empty() {
+                return;
+            }
+            apply_lapsed_roster_speakers(
+                &mut self.speaking,
+                &mut self.stamps.borrow_mut(),
+                &lapsed,
+            );
+        }
+
+        fn renders_speaking(&self, peer: &str) -> bool {
+            self.speaking.get(peer).copied().unwrap_or(false)
+        }
+    }
+
+    /// The steady path must reuse the existing entry, not re-insert. Pins the
+    /// observable half of the allocation fix: one entry however many events land,
+    /// and the latest verdict written through the cell already in the map.
+    #[test]
+    fn repeated_verdicts_reuse_one_entry_per_peer() {
+        let liveness = RosterLiveness::default();
+        liveness.record_verdict(Roster::PEER, None);
+        assert!(
+            liveness.verdicts.borrow().is_empty(),
+            "a metric-less event must not create state for a peer that reported nothing"
+        );
+
+        for i in 0..50 {
+            liveness.record_verdict(Roster::PEER, Some(i % 2 == 0));
+        }
+        assert_eq!(
+            liveness.verdicts.borrow().len(),
+            1,
+            "every event for one peer must land in the same entry"
+        );
+        assert_eq!(liveness.verdict(Roster::PEER), FastPathVerdict::Silent);
+
+        liveness.record_verdict(Roster::PEER, None);
+        assert_eq!(
+            liveness.verdict(Roster::PEER),
+            FastPathVerdict::Silent,
+            "a metric-less event leaves the last verdict standing"
+        );
+        assert_eq!(liveness.verdicts.borrow().len(), 1);
+    }
+
+    /// No native test can drive `handle_peer_list_diagnostics`. Spelling-only, like
+    /// `peer_tile`'s equivalent. MUTATION: writing the raw claim fails this.
+    #[test]
+    fn the_roster_heartbeat_arm_routes_through_the_shared_rule() {
+        let src = include_str!("peer_list.rs");
+        let start = src
+            .find("fn handle_peer_list_diagnostics(")
+            .expect("handle_peer_list_diagnostics must exist");
+        let body = &src[start..];
+        let end = body
+            .find("#[cfg(test)]")
+            .expect("the scan needs the test module as its end marker");
+        assert!(
+            body[..end].contains("liveness.resolve_claim("),
+            "the roster no longer folds the decoder verdict into a heartbeat claim; its dot \
+             and the tile's border would answer different questions (issue 2660)"
+        );
+    }
+
+    /// Issue 2660's divergence: both surfaces must answer the SAME question.
+    /// MUTATION: writing the raw claim lights the dot against a dark tile.
+    #[test]
+    fn a_contradicted_claim_does_not_light_the_roster_dot() {
+        let liveness = RosterLiveness::default();
+        let now = 1_000_000.0;
+        liveness.record_verdict(Roster::PEER, Some(false));
+        liveness.record_live_audio(Roster::PEER, now);
+
+        assert!(
+            !liveness.resolve_claim(Roster::PEER, true, now),
+            "we are receiving this peer and measured silence — the dot must stay dark"
+        );
+    }
+
+    #[test]
+    fn the_speaking_sweep_does_not_clear_the_liveness_stamp() {
+        let liveness = RosterLiveness::default();
+        let now = 1_000_000.0;
+        liveness.record_verdict(Roster::PEER, Some(false));
+        liveness.record_live_audio(Roster::PEER, now);
+
+        liveness.forget(&[Roster::PEER.to_string()]);
+
+        assert!(
+            !liveness.resolve_claim(
+                Roster::PEER,
+                true,
+                now + f64::from(UNHEARD_GLOW_CAP_MS) + 1.0
+            ),
+            "the sweep wiped the liveness stamp, so the peer reads as never-heard and the cap \
+             can no longer retire their dot"
+        );
+    }
+
+    #[test]
+    fn the_roster_liveness_outlives_the_drawer() {
+        let src = include_str!("peer_list.rs");
+        let start = src
+            .find("let roster_liveness")
+            .expect("the roster_liveness binding must exist");
+        let decl = &src[start..start + 200];
+        assert!(
+            decl.contains("use_context::<Rc<RosterLiveness>>()"),
+            "`roster_liveness` is no longer taken from context. This component unmounts whenever \
+             the participants drawer closes, so per-component ownership resets both maps and \
+             issue 2660's roster dot sticks lit."
+        );
+    }
+
+    /// Issue 2660: the roster expires a claim on the tile's schedule, or the
+    /// two surfaces diverge again.
+    #[test]
+    fn an_unchanging_claim_cannot_hold_the_roster_dot_lit_past_the_cap() {
+        let liveness = RosterLiveness::default();
+        let now = 1_000_000.0;
+        liveness.record_verdict(Roster::PEER, Some(true));
+        liveness.record_live_audio(Roster::PEER, now);
+
+        let in_2174_window = now + f64::from(LIVENESS_GRACE_MS) + 1.0;
+        assert!(
+            liveness.resolve_claim(Roster::PEER, true, in_2174_window),
+            "the dot must survive the grace window, matching the tile's 2174 glow"
+        );
+
+        let past_cap = now + f64::from(UNHEARD_GLOW_CAP_MS) + 1.0;
+        assert!(
+            !liveness.resolve_claim(Roster::PEER, true, past_cap),
+            "nothing has corroborated this claim past the cap — the dot must go out"
+        );
+    }
+
+    #[test]
+    fn the_cap_never_expires_the_dot_of_a_peer_we_have_never_heard() {
+        let liveness = RosterLiveness::default();
+        let now = 1_000_000.0;
+        assert_eq!(liveness.verdict(Roster::PEER), FastPathVerdict::Unheard);
+        assert!(
+            liveness.resolve_claim(
+                Roster::PEER,
+                true,
+                now + f64::from(UNHEARD_GLOW_CAP_MS) * 10.0
+            ),
+            "no stamp ever landed, so there is nothing to have gone stale"
+        );
+    }
+
+    /// What makes recording the verdict load-bearing: `Speaking` is the only value
+    /// that survives the fold while audio is live.
+    /// MUTATION: dropping `record_verdict`'s body darkens a genuine talker.
+    #[test]
+    fn a_decoder_confirmed_speaker_keeps_the_dot_while_audio_is_live() {
+        let liveness = RosterLiveness::default();
+        let now = 1_000_000.0;
+        liveness.record_verdict(Roster::PEER, Some(true));
+        liveness.record_live_audio(Roster::PEER, now);
+
+        assert_eq!(liveness.verdict(Roster::PEER), FastPathVerdict::Speaking);
+        assert!(
+            liveness.resolve_claim(Roster::PEER, true, now),
+            "the decoder corroborates the claim — the dot must stay lit"
+        );
+    }
+
+    /// The mirror: nothing contradicts the claim, so the dot lights and matches
+    /// the tile's 2174 glow instead of inverting it.
+    #[test]
+    fn an_unheard_peer_with_no_audio_arriving_still_lights_the_dot() {
+        let liveness = RosterLiveness::default();
+        let now = 1_000_000.0;
+        assert_eq!(liveness.verdict(Roster::PEER), FastPathVerdict::Unheard);
+        assert!(
+            !liveness.can_hear(Roster::PEER, now),
+            "no neteq sample has arrived"
+        );
+
+        assert!(liveness.resolve_claim(Roster::PEER, true, now));
+    }
+
+    /// Same window and same floor as the tile — one rule, not two copies.
+    #[test]
+    fn roster_liveness_uses_the_shared_floor_and_window() {
+        let liveness = RosterLiveness::default();
+        let now = 1_000_000.0;
+        liveness.record_live_audio(Roster::PEER, now);
+        assert!(liveness.can_hear(Roster::PEER, now));
+        assert!(
+            !liveness.can_hear(Roster::PEER, now + 60_000.0),
+            "must age out"
+        );
+
+        assert!(
+            !records_live_audio(7.0),
+            "the stall residue is not hearing them"
+        );
+        assert!(records_live_audio(160.0));
+    }
+
+    #[test]
+    fn the_sweep_forgets_a_departed_peers_liveness() {
+        let liveness = RosterLiveness::default();
+        let now = 1_000_000.0;
+        liveness.record_verdict(Roster::PEER, Some(true));
+        liveness.record_live_audio(Roster::PEER, now);
+        assert_eq!(liveness.verdict(Roster::PEER), FastPathVerdict::Speaking);
+
+        liveness.forget_departed(&[Roster::PEER.to_string()]);
+        assert_eq!(
+            liveness.verdict(Roster::PEER),
+            FastPathVerdict::Unheard,
+            "a departed peer must not leave a verdict behind"
+        );
+        assert!(!liveness.can_hear(Roster::PEER, now));
+    }
+
+    /// Issue 2660 — the roster's permanent latch: `peer_speaking_states` goes
+    /// `false` only on an event saying so, and a dead peer sends none.
+    #[test]
+    fn a_roster_peer_that_stops_emitting_stops_being_shown_as_speaking() {
+        let mut roster = Roster::new();
+        let t0 = 1_000_000.0;
+
+        roster.evidence(Roster::PEER, true, t0);
+        assert!(roster.renders_speaking(Roster::PEER));
+
+        roster.sweep(t0 + ROSTER_SPEAKING_DEADMAN_MS - 1.0);
+        assert!(
+            roster.renders_speaking(Roster::PEER),
+            "the dot must survive the whole window on one piece of evidence"
+        );
+
+        roster.sweep(t0 + ROSTER_SPEAKING_DEADMAN_MS + 1.0);
+        assert!(
+            !roster.renders_speaking(Roster::PEER),
+            "a peer that has stopped emitting must not stay lit"
+        );
+    }
+
+    /// The sweep cannot wedge a live speaker still reporting every keepalive.
+    #[test]
+    fn a_still_reporting_speaker_is_never_swept() {
+        let mut roster = Roster::new();
+        let keepalive = f64::from(HEARTBEAT_KEEPALIVE_INTERVAL_MS);
+        let mut now = 1_000_000.0;
+
+        roster.evidence(Roster::PEER, true, now);
+        for beat in 1..=20 {
+            now += keepalive;
+            roster.evidence(Roster::PEER, true, now);
+            roster.sweep(now);
+            assert!(
+                roster.renders_speaking(Roster::PEER),
+                "keepalive {beat}: a peer still reporting speech must stay lit"
+            );
+        }
+    }
+
+    /// Asserted through the production `const fn`, never a restated literal.
+    #[test]
+    fn the_roster_window_outlasts_two_missed_keepalives() {
+        assert!(
+            ROSTER_SPEAKING_DEADMAN_MS > 2.0 * f64::from(HEARTBEAT_KEEPALIVE_INTERVAL_MS),
+            "the roster window ({ROSTER_SPEAKING_DEADMAN_MS}) must survive two missed keepalives"
+        );
+        assert_eq!(
+            ROSTER_SPEAKING_DEADMAN_MS,
+            f64::from(glow_deadman_ms(HEARTBEAT_KEEPALIVE_INTERVAL_MS)),
+            "the roster and the tile must expire speech evidence on the same rule"
+        );
+    }
+
+    /// Blanking a live speaker's dot on an NTP correction is the worse failure.
+    #[test]
+    fn a_backwards_clock_step_never_sweeps_a_live_speaker() {
+        let mut roster = Roster::new();
+        let t0 = 1_000_000.0;
+        roster.evidence(Roster::PEER, true, t0);
+
+        roster.sweep(t0 - 60_000.0);
+        assert!(
+            roster.renders_speaking(Roster::PEER),
+            "a backwards clock step must not expire a peer that just reported"
+        );
+    }
+
+    #[test]
+    fn a_departed_peers_stamp_is_dropped_not_just_its_dot() {
+        let mut roster = Roster::new();
+        let t0 = 1_000_000.0;
+        roster.evidence("sid-gone", false, t0);
+        roster.evidence("sid-here", true, t0);
+        assert_eq!(roster.stamps.borrow().len(), 2);
+
+        let later = t0 + ROSTER_SPEAKING_DEADMAN_MS + 1.0;
+        roster.evidence("sid-here", true, later);
+        roster.sweep(later);
+
+        assert_eq!(
+            roster.stamps.borrow().len(),
+            1,
+            "the departed peer's stamp must be dropped, not accumulated"
+        );
+        assert!(roster.renders_speaking("sid-here"));
+    }
 
     /// Issue 2174 follow-up: a peer with no `peer_status` yet must render from
     /// the client's live snapshot rather than defaulting to off, which is what

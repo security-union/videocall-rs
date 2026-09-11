@@ -13,11 +13,12 @@ use wasm_bindgen_test::*;
 use dioxus_ui::context::{
     apply_notification_prefs, apply_transport_decision, clear_display_name_from_storage,
     clear_transport_sticky_and_pref, email_to_display_name, load_appearance_settings_from_storage,
-    load_display_name_from_storage, load_transport_preference,
-    load_transport_preference_with_source, resolve_transport_config,
-    save_appearance_settings_to_storage, save_display_name_to_storage, save_transport_preference,
-    save_transport_sticky, validate_display_name, AppearanceSettings, TransportPreference,
-    DISPLAY_NAME_MAX_LEN,
+    load_display_name_from_storage, load_self_view_placement, load_self_view_visible,
+    load_transport_preference, load_transport_preference_with_source, resolve_self_view_placement,
+    resolve_self_view_visible, resolve_transport_config, save_appearance_settings_to_storage,
+    save_display_name_to_storage, save_self_view_placement, save_self_view_visible,
+    save_transport_preference, save_transport_sticky, validate_display_name, AppearanceSettings,
+    SelfViewPlacement, TransportPreference, DISPLAY_NAME_MAX_LEN,
 };
 use videocall_types::validation::normalize_spaces;
 
@@ -202,6 +203,27 @@ fn appearance_glow_decay_round_trips_through_storage() {
 
     let loaded = load_appearance_settings_from_storage();
     assert_eq!(loaded.glow_decay, 0.1);
+}
+
+#[wasm_bindgen_test]
+fn appearance_glow_velocity_defaults_to_midpoint_when_missing() {
+    let storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("test environment must have localStorage");
+    let _ = storage.remove_item("vc_appearance_glow_velocity");
+
+    let settings = load_appearance_settings_from_storage();
+    assert_eq!(settings.glow_velocity, 0.5);
+}
+
+#[wasm_bindgen_test]
+fn appearance_glow_velocity_round_trips_through_storage() {
+    let mut settings = AppearanceSettings::default();
+    settings.glow_velocity = 0.1;
+    save_appearance_settings_to_storage(&settings);
+
+    let loaded = load_appearance_settings_from_storage();
+    assert_eq!(loaded.glow_velocity, 0.1);
 }
 
 #[wasm_bindgen_test]
@@ -1037,4 +1059,94 @@ fn notification_prefs_hand_raise_sound_independent() {
         resolve_notification_prefs(None, None, None, Some("false"), None),
         (true, true, true, false, true)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Self-view placement & visibility (issue 66)
+// ---------------------------------------------------------------------------
+
+fn clear_self_view_keys() {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item("vc_self_view_placement");
+        let _ = storage.remove_item("vc_self_view_visible");
+    }
+}
+
+#[wasm_bindgen_test]
+fn self_view_placement_resolves_only_the_grid_token() {
+    assert_eq!(
+        resolve_self_view_placement(Some("grid")),
+        SelfViewPlacement::Grid
+    );
+    assert_eq!(
+        resolve_self_view_placement(Some("corner")),
+        SelfViewPlacement::Corner
+    );
+    assert_eq!(
+        resolve_self_view_placement(None),
+        SelfViewPlacement::Corner,
+        "no stored preference means the shipped corner default"
+    );
+    for garbage in ["Grid", "GRID", "", "1", "true", "centre"] {
+        assert_eq!(
+            resolve_self_view_placement(Some(garbage)),
+            SelfViewPlacement::Corner,
+            "{garbage:?} must not move the self view"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn self_view_visible_resolves_only_the_false_token() {
+    assert!(!resolve_self_view_visible(Some("false")));
+    assert!(resolve_self_view_visible(Some("true")));
+    assert!(
+        resolve_self_view_visible(None),
+        "no stored preference means visible"
+    );
+    for garbage in ["False", "FALSE", "", "0", "no"] {
+        assert!(
+            resolve_self_view_visible(Some(garbage)),
+            "{garbage:?} must not hide the self view"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn self_view_placement_round_trips_through_storage() {
+    clear_self_view_keys();
+    assert_eq!(load_self_view_placement(), SelfViewPlacement::Corner);
+
+    save_self_view_placement(SelfViewPlacement::Grid);
+    assert_eq!(load_self_view_placement(), SelfViewPlacement::Grid);
+
+    save_self_view_placement(SelfViewPlacement::Corner);
+    assert_eq!(load_self_view_placement(), SelfViewPlacement::Corner);
+
+    clear_self_view_keys();
+}
+
+#[wasm_bindgen_test]
+fn self_view_visibility_round_trips_through_storage() {
+    clear_self_view_keys();
+    assert!(load_self_view_visible());
+
+    save_self_view_visible(false);
+    assert!(!load_self_view_visible());
+
+    save_self_view_visible(true);
+    assert!(load_self_view_visible());
+
+    clear_self_view_keys();
+}
+
+#[wasm_bindgen_test]
+fn a_garbage_stored_placement_loads_as_corner() {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item("vc_self_view_placement", "sideways");
+        let _ = storage.set_item("vc_self_view_visible", "maybe");
+    }
+    assert_eq!(load_self_view_placement(), SelfViewPlacement::Corner);
+    assert!(load_self_view_visible());
+    clear_self_view_keys();
 }

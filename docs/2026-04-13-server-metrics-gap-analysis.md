@@ -59,7 +59,7 @@
 | `videocall_self_audio_enabled` / `videocall_self_video_enabled` | Self-reported media state |
 | `videocall_active_sessions_total` / `videocall_meeting_participants` / `videocall_peer_connections_total` | Session counts |
 
-### Server Connection Metrics (7 metrics, relay -> NATS -> metrics_server_snapshot)
+### Server Connection Metrics (6 metrics, relay -> NATS -> metrics_server_snapshot)
 
 | Metric | What It Tells Us |
 |--------|-----------------|
@@ -67,7 +67,6 @@
 | `videocall_server_unique_users_active` | Deduplicated user count |
 | `videocall_server_protocol_connections` | Connections per protocol |
 | `videocall_server_data_bytes_total` | Bytes per session/direction |
-| `videocall_server_connection_duration_seconds` | Connection lifetime histogram |
 | `videocall_server_connection_events_total` | Total connection events |
 | `videocall_server_reconnections_total` | Reconnection count |
 

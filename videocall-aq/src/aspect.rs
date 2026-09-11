@@ -223,6 +223,22 @@ pub fn fit_within_tier_box(src_w: u32, src_h: u32, box_w: u32, box_h: u32) -> (u
     fit_within_preserving_aspect(src_w, src_h, box_w, box_h)
 }
 
+/// The geometry a CAMERA encoder is configured at for one simulcast layer (#2659) —
+/// the camera analogue of [`screen_encode_box_for_capture`], shared by the sender's
+/// encode path and the receiver's readout. Indices clamp; a `(0, 0)` source reads the
+/// box back out, so a caller with a possibly-UNREPORTED source must guard first.
+pub fn camera_layer_encode_box(
+    src_w: u32,
+    src_h: u32,
+    layer_index: usize,
+    layer_count: usize,
+) -> (u32, u32) {
+    let tiers = crate::constants::simulcast_layers(layer_count);
+    let idx = layer_index.min(tiers.len().saturating_sub(1));
+    let tier = &tiers[idx];
+    fit_within_preserving_aspect(src_w, src_h, tier.max_width, tier.max_height)
+}
+
 /// The geometry a screen encoder is configured at for a captured surface: its
 /// OWN size, aspect-fitted into the encode ceiling only when larger. Shared by
 /// the sender and the receiver so the two cannot describe one stream
@@ -528,6 +544,46 @@ mod tests {
         // hd 1280x720 does NOT bind -> source unchanged.
         let hd = simulcast_layer_target_dims(src.0, src.1, 1280, 720, 1280, 720);
         assert_eq!((hd.target_w, hd.target_h), (640, 480));
+    }
+
+    #[test]
+    fn camera_layer_encode_box_resolves_the_ladder_and_fits_without_upscaling() {
+        let fitted: Vec<(u32, u32)> = (0..3)
+            .map(|idx| camera_layer_encode_box(640, 480, idx, 3))
+            .collect();
+        assert_eq!(fitted, vec![(240, 180), (480, 360), (640, 480)]);
+        assert_ne!(
+            fitted[2],
+            (
+                crate::constants::simulcast_layers(3)[2].max_width,
+                crate::constants::simulcast_layers(3)[2].max_height
+            ),
+            "the top layer's box is NOT what a 4:3 SD webcam encodes"
+        );
+
+        for (idx, tier) in crate::constants::simulcast_layers(3).iter().enumerate() {
+            assert_eq!(
+                camera_layer_encode_box(1920, 1080, idx, 3),
+                (tier.max_width, tier.max_height),
+                "video layer {idx}: a 16:9 source fits the box exactly"
+            );
+        }
+
+        assert_eq!(
+            camera_layer_encode_box(1920, 1080, 99, 3),
+            camera_layer_encode_box(1920, 1080, 2, 3)
+        );
+        assert_eq!(camera_layer_encode_box(0, 0, 2, 3), (1280, 720));
+    }
+
+    #[test]
+    fn an_extreme_aspect_collapses_the_short_axis_onto_the_two_pixel_floor() {
+        assert_eq!(camera_layer_encode_box(16_384, 1, 2, 3), (1280, 2));
+        assert_eq!(camera_layer_encode_box(1, 16_384, 2, 3), (2, 720));
+        assert_eq!(screen_encode_box_for_capture(16_384, 1), (2560, 2));
+
+        assert_eq!(camera_layer_encode_box(9600, 540, 0, 3), (320, 18));
+        assert_eq!(screen_encode_box_for_capture(9600, 540), (2560, 144));
     }
 
     /// The screen simulcast ladder (n == 3) is `[low 1280x720, medium

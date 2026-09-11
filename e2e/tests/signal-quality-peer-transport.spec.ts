@@ -1,13 +1,14 @@
 import { test, expect, Page, BrowserContext } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
 import { chromium } from "@playwright/test";
+import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 
 /**
  * Signal-quality popup — per-peer transport badge.
  *
- * Each remote peer's tile in the meeting grid renders a clickable signal-bars
- * icon (button with `aria-label="Show signal quality"`) that toggles the
+ * Each remote peer's tile renders a clickable signal disc that toggles the
  * `SignalQualityPopup` (`dioxus-ui/src/components/signal_quality.rs`). The
  * popup's header now renders a small WT / WS / em-dash badge inside a
  * `.popup-header-actions` cluster, indicating that peer's transport. CSS
@@ -18,9 +19,9 @@ import { chromium } from "@playwright/test";
  *   - .connection-type                    -> "—",  title="Transport unknown"
  *
  * Unlike the per-peer summary section in the diagnostics sidebar (which is
- * gated on `available_peers.len() > 2`), the signal-bars icon is rendered on
+ * gated on `available_peers.len() > 2`), the signal disc is rendered on
  * every remote peer tile. Two users (host + 1 guest) is sufficient to exercise
- * the popup — the host has a single remote peer whose tile carries the icon.
+ * the popup — the host has a single remote peer whose tile carries the disc.
  *
  * In Playwright every browser defaults to "Auto" -> WebTransport, so the
  * remote peer should always report WT in this configuration.
@@ -51,6 +52,7 @@ async function joinMeetingAs(
   username: string,
   opts: { ensureCameraOn?: boolean } = {},
 ): Promise<Page> {
+  await enableDiagnosticsTileIndicators(context);
   const page = await context.newPage();
   if (opts.ensureCameraOn) {
     await page.addInitScript(() => {
@@ -222,13 +224,8 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
         timeout: 30_000,
       });
 
-      // Open the signal-quality popup for the remote peer. The signal-bars
-      // icon is the unique button with `aria-label="Show signal quality"`
-      // inside the canvas container; with only one remote peer there is
-      // exactly one such button to click.
-      const signalButton = hostPage.locator(
-        '#grid-container .canvas-container button[aria-label="Show signal quality"]',
-      );
+      const signalButton = hostPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
+      await expect(signalButton).toHaveCount(1, { timeout: 15_000 });
       await expect(signalButton).toBeVisible({ timeout: 15_000 });
       await signalButton.click();
 

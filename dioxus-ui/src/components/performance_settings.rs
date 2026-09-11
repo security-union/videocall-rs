@@ -164,11 +164,48 @@ pub fn format_simulcast_summary(s: &SimulcastSummary) -> String {
     )
 }
 
+/// The spelled-out dims segment for a hover title: `"640×480"`, or
+/// `"resolution not published yet"` when the encoder has no geometry. The visible
+/// chip keeps the em dash ([`format_send_layer_short`]); a title has room for
+/// words, and the em dash on its own explains nothing. Pure.
+pub const DIMS_NOT_PUBLISHED: &str = "resolution not published yet";
+
+/// This VIDEO layer's ladder CEILING box, or `None` for any other kind. Issue
+/// 2659: the encode is fitted inside this box and never upscaled, which is the one
+/// fact that explains a resolution smaller than the layer's nominal size.
+///
+/// `kind_slug` is the caller's `"video"`/`"screen"` slug. Screen MUST return `None`
+/// — [`format_send_layer`] renders both ladders, and `simulcast_layers` is the
+/// CAMERA ladder, so an ungated clause would quote a camera ceiling on a screen
+/// rung. Today screen is clamped to one rung and takes a different branch, but
+/// that is an invariant to not depend on. Pure / host-tested.
+pub fn video_layer_ceiling(kind_slug: &str, layer_id: u32, count: u32) -> Option<(u32, u32)> {
+    if kind_slug != "video" {
+        return None;
+    }
+    let tiers = videocall_client::adaptive_quality_constants::simulcast_layers(count as usize);
+    tiers
+        .get(layer_id as usize)
+        .map(|t| (t.max_width, t.max_height))
+}
+
+/// The bounding-box sentence for a hover title, e.g. `"your camera fits inside
+/// this layer's 1280×720 ceiling and is never upscaled"`. `None` when the layer
+/// has no ceiling to name. `subject` carries the caller's capitalisation. Pure.
+pub fn ceiling_clause(ceiling: Option<(u32, u32)>, subject: &str) -> Option<String> {
+    ceiling.map(|(w, h)| {
+        format!("{subject} fits inside this layer's {w}×{h} ceiling and is never upscaled")
+    })
+}
+
 /// Format one SEND simulcast layer line, e.g. `"Low · 320×180 · 120 kbps"`. The
 /// `layer_id` is the internal 0-based id; `count` is the ladder size. The
 /// DISPLAYED label is the quality name (Low/Medium/High) via
-/// [`layer_quality_label`] — the internal id stays 0-based for e2e/protobuf. Pure.
+/// [`layer_quality_label`] — the internal id stays 0-based for e2e/protobuf.
+/// Rendered as the rung's hover title, so it spells out an unpublished resolution
+/// and names the layer's ceiling ([`ceiling_clause`]). Pure.
 pub fn format_send_layer(
+    kind_slug: &str,
     layer_id: u32,
     count: u32,
     width: u32,
@@ -176,7 +213,19 @@ pub fn format_send_layer(
     bitrate_kbps: u32,
 ) -> String {
     let name = layer_quality_label(layer_id, count, false);
-    format!("{name} · {width}×{height} · {bitrate_kbps} kbps")
+    let dims = if width > 0 && height > 0 {
+        format!("{width}×{height}")
+    } else {
+        DIMS_NOT_PUBLISHED.to_string()
+    };
+    let line = format!("{name} · {dims} · {bitrate_kbps} kbps");
+    match ceiling_clause(
+        video_layer_ceiling(kind_slug, layer_id, count),
+        "your camera",
+    ) {
+        Some(c) => format!("{line} — {c}"),
+        None => line,
+    }
 }
 
 /// Format the SEND simulcast header for a kind, e.g.
@@ -194,9 +243,9 @@ pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
     }
 }
 
-/// Format one RECEIVE per-kind line for a peer, e.g. `"video M · 2/3 · 1280×720"`.
-/// A peer publishing ONE rung has no position to report, so the line is just
-/// `"screen 1400×700"`. Returns `None` when the kind is not flowing.
+/// Format one RECEIVE per-kind line for a peer, e.g. `"video Medium · 2/3 ·
+/// 640×360"`. A peer publishing ONE rung has no position to report, so the line
+/// is just `"screen 1400×700"`. Returns `None` when the kind is not flowing.
 /// Pure / host-tested.
 pub fn format_peer_kind_line(
     kind_label: &str,
@@ -206,7 +255,7 @@ pub fn format_peer_kind_line(
     let detail = if matches!(s.kind, PrefMediaKind::Audio) {
         format_recv_audio_kbps(s.kbps, " kbps")
     } else {
-        format!("{}×{}", s.width, s.height)
+        format_dims_or_unknown(s.width, s.height, "×")
     };
     Some(match layer_position_suffix(s.layer_index, s.layer_count) {
         Some(pos) => format!("{kind_label} {pos} · {detail}"),
@@ -888,10 +937,13 @@ pub fn format_content_send_summary(snap: Option<&SimulcastSendSnapshot>) -> Stri
 pub fn format_content_receive_summary(top: Option<&ReceivedLayerSnapshot>) -> String {
     match top {
         None => "Nobody is sharing".to_string(),
-        Some(s) => match layer_position_suffix(s.layer_index, s.layer_count) {
-            Some(pos) => format!("Pulling full quality · {pos} · {}×{}", s.width, s.height),
-            None => format!("Pulling full quality · {}×{}", s.width, s.height),
-        },
+        Some(s) => {
+            let dims = format_dims_or_unknown(s.width, s.height, "×");
+            match layer_position_suffix(s.layer_index, s.layer_count) {
+                Some(pos) => format!("Pulling full quality · {pos} · {dims}"),
+                None => format!("Pulling full quality · {dims}"),
+            }
+        }
     }
 }
 
@@ -989,6 +1041,44 @@ pub fn peer_row_res_or_bitrate(snap: &ReceivedLayerSnapshot) -> String {
     }
 }
 
+/// Hover + accessible note for a receive reading the publisher never sent, or
+/// `None` when there is a real value. The em dash that renders in its place is
+/// unspoken at default AT punctuation levels and unexplained on screen, so every
+/// surface that can show it pairs it with this (the #1656 `title` + `aria-label`
+/// precedent). Branches match [`peer_row_res_or_bitrate`] exactly. Pure.
+pub fn unknown_reading_note(snap: &ReceivedLayerSnapshot) -> Option<&'static str> {
+    if matches!(snap.kind, PrefMediaKind::Audio) {
+        (snap.kbps == 0).then_some("Bitrate not reported by this peer")
+    } else {
+        (snap.width == 0 || snap.height == 0).then_some("Resolution not reported by this peer")
+    }
+}
+
+/// The per-peer receive row's hover `title` — which layer this is, and the ceiling
+/// that bounds its resolution (issue 2659: the resolution is the sender's camera
+/// fitted inside that box, never upscaled, which is why it can read smaller than
+/// the layer's nominal size). `None` when there is nothing to explain. Pure.
+pub fn peer_row_title(snap: &ReceivedLayerSnapshot) -> Option<String> {
+    let ceiling = match snap.kind {
+        PrefMediaKind::Video if snap.layer_count > 1 => {
+            video_layer_ceiling("video", snap.layer_index, snap.layer_count)
+        }
+        _ => None,
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(n) = unknown_reading_note(snap) {
+        parts.push(n.to_string());
+    }
+    if let Some(c) = ceiling_clause(ceiling, "The sender's camera") {
+        parts.push(format!(
+            "Layer {} of {}: {c}",
+            snap.layer_index + 1,
+            snap.layer_count
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(". "))
+}
+
 /// The per-peer row metric text (§3, Directive 4 SITE 6b). video/screen
 /// `"{res} · ~{kbps} · {Q} · {i}/{n}"`; audio `"{kbps}k · {label} · {Q} · {i}/{n}"`.
 /// The `{Q} · {i}/{n}` chip is dropped for a one-rung peer — see
@@ -1017,11 +1107,17 @@ pub fn peer_row_metric(snap: &ReceivedLayerSnapshot, audio_label: &str) -> Strin
 
 /// The `"{Q} · {i}/{n}"` chip for a received layer, or `None` when the peer
 /// publishes a single rung and there is no position to report. Pure.
+///
+/// A one-rung publisher has no ladder, so there is no position to name: naming one
+/// would borrow the ladder BASE's label (`simulcast_layers(1)[0].label == "low"`)
+/// and assert a falsehood about a stream that never had layers. Guarded here by
+/// the early return, and again by `layer_quality_label(0, 1, _)` → `"Single"`.
+/// `one_rung_readouts_carry_no_layer_position` mutation-guards this arm.
 pub fn layer_position_suffix(layer_index: u32, layer_count: u32) -> Option<String> {
     if layer_count <= 1 {
         return None;
     }
-    let q = layer_quality_label(layer_index, layer_count, true);
+    let q = layer_quality_label(layer_index, layer_count, false);
     Some(format!("{q} · {}/{layer_count}", layer_index + 1))
 }
 
@@ -1050,6 +1146,21 @@ pub fn peer_row_aria_label(
         Some(r) => format!("{base}, {}", reason_aria_clause(r)),
         None => base,
     }
+}
+
+/// [`peer_row_aria_label`] for a whole snapshot — the entry point the perf
+/// dialog's `PeerRow` and the popup's `SignalLayerRow` share, so neither can drift
+/// from the other at its own call site. Pure / host-tested.
+pub fn layer_row_aria_label(label: &str, kind_noun: &str, snap: &ReceivedLayerSnapshot) -> String {
+    peer_row_aria_label(
+        label,
+        kind_noun,
+        videocall_client::quality_state(snap.layer_index, snap.layer_count),
+        &peer_row_res_or_bitrate(snap),
+        snap.layer_index + 1,
+        snap.layer_count,
+        snap.reason,
+    )
 }
 
 // ── localStorage key + persisted shape (SEND) ─────────────────────
@@ -1838,6 +1949,23 @@ pub const SEND_LAYER_DIMS_UNKNOWN: &str = "\u{2014}";
 /// [`EMPTY_METER_LEVEL`].
 pub const SCREEN_LIVE_METER_LEVEL: u8 = MAX_METER_LEVEL;
 
+/// Hover title on every bar-meter readout. States what the bars mean and what the
+/// [`SEND_LAYER_DIMS_UNKNOWN`] em dash means, which the glyph alone does not.
+pub const METER_READOUT_TITLE: &str =
+    "Bars show the layer in use; an em dash means the value was not reported";
+
+/// A `{w}{sep}{h}` dims segment, or [`SEND_LAYER_DIMS_UNKNOWN`] when either
+/// dimension is `0`. The one spelling of the "never render `0x0`" rule for every
+/// readout that shows a MEASURED geometry. `sep` is the caller's existing
+/// separator — the meters use ASCII `x`, the per-peer and ladder lines `×`. Pure.
+pub fn format_dims_or_unknown(width: u32, height: u32, sep: &str) -> String {
+    if width > 0 && height > 0 {
+        format!("{width}{sep}{height}")
+    } else {
+        SEND_LAYER_DIMS_UNKNOWN.to_string()
+    }
+}
+
 /// Format the video readout line for the meter: `{w}x{h}·{fps}fps·{kbps}kbps`.
 /// Pure so the readout text is host-tested.
 ///
@@ -1847,11 +1975,7 @@ pub const SCREEN_LIVE_METER_LEVEL: u8 = MAX_METER_LEVEL;
 /// AQ TIER targets and stay meaningful with no frame published, so they are still
 /// shown — see [`LiveQualitySnapshot::video_width`] for that provenance split.
 pub fn format_video_readout(snap: &LiveQualitySnapshot) -> String {
-    let dims = if snap.video_width > 0 && snap.video_height > 0 {
-        format!("{}x{}", snap.video_width, snap.video_height)
-    } else {
-        SEND_LAYER_DIMS_UNKNOWN.to_string()
-    };
+    let dims = format_dims_or_unknown(snap.video_width, snap.video_height, "x");
     format!("{dims}·{}fps·{}kbps", snap.video_fps, snap.video_ideal_kbps)
 }
 
@@ -1866,11 +1990,7 @@ pub fn format_audio_readout(snap: &LiveQualitySnapshot) -> String {
 ///
 /// Unknown geometry renders [`SEND_LAYER_DIMS_UNKNOWN`] rather than `0x0`.
 pub fn format_screen_readout(snap: &ScreenQualitySnapshot) -> String {
-    let dims = if snap.width > 0 && snap.height > 0 {
-        format!("{}x{}", snap.width, snap.height)
-    } else {
-        SEND_LAYER_DIMS_UNKNOWN.to_string()
-    };
+    let dims = format_dims_or_unknown(snap.width, snap.height, "x");
     let line = format!("{dims}·{}fps·{}kbps", snap.fps, snap.target_bitrate_kbps);
     if snap.capture_capped {
         format!("{line} · capped")
@@ -2074,6 +2194,7 @@ fn PerfMeter(
                 role: "status",
                 "aria-live": "polite",
                 "aria-label": "{label}",
+                title: "{METER_READOUT_TITLE}",
                 "{initial_readout}"
             }
         }
@@ -3431,9 +3552,9 @@ pub fn peers_for_kind(peers: &[PeerReceiveDiag], kind: PrefMediaKind) -> Vec<Pee
 // ══════════════════════════════════════════════════════════════════════════
 pub mod receive {
     use super::{
-        format_receive_spread, level_from_fraction, peer_row_aria_label, peer_row_metric,
-        quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
-        reason_chip_title, tick_offsets, write_meter_level, write_readout_text, PeerKindSnap,
+        format_receive_spread, level_from_fraction, peer_row_metric, quality_state_glyph,
+        quality_state_modifier, reason_chip_modifier, reason_chip_text, reason_chip_title,
+        tick_offsets, write_meter_level, write_readout_text, PeerKindSnap,
     };
     use dioxus::prelude::*;
     // issue 1164: `WebEventExt::as_web_event` lets the <details> ontoggle handler
@@ -3922,10 +4043,11 @@ pub mod receive {
     /// `"{Q} · {i+1}/{n} · {w}x{h}"`; audio shows `"{Q} · {i+1}/{n} · {kbps} kbps"`.
     /// A peer publishing ONE rung has no position to report, so the line is just
     /// the detail — `"1400x700"`. See [`super::layer_position_suffix`]. Pure.
+    /// Issue 2659: unstamped dims read [`super::SEND_LAYER_DIMS_UNKNOWN`], never `0x0`.
     pub fn format_readout(snap: &ReceivedLayerSnapshot) -> String {
         let detail = match snap.kind {
             PrefMediaKind::Audio => super::format_recv_audio_kbps(snap.kbps, " kbps"),
-            _ => format!("{}x{}", snap.width, snap.height),
+            _ => super::format_dims_or_unknown(snap.width, snap.height, "x"),
         };
         match super::layer_position_suffix(snap.layer_index, snap.layer_count) {
             Some(pos) => format!("{pos} · {detail}"),
@@ -4426,18 +4548,8 @@ pub mod receive {
         // Audio rung label for the metric ("as sent").
         let audio_label = index_label(PrefMediaKind::Audio, snap.layer_index);
         let metric = peer_row_metric(&snap, audio_label);
-        // The human res/bitrate detail used inside the aria sentence.
-        let res_or_bitrate = super::peer_row_res_or_bitrate(&snap);
-        let aria = peer_row_aria_label(
-            &peer.label,
-            // `stream_noun` is the spoken kind ("video"/"audio"/"shared content").
-            stream_noun,
-            q,
-            &res_or_bitrate,
-            snap.layer_index + 1,
-            snap.layer_count,
-            snap.reason,
-        );
+        let aria = super::layer_row_aria_label(&peer.label, stream_noun, &snap);
+        let row_title = super::peer_row_title(&snap).unwrap_or_default();
         let session_id = peer.session_id;
 
         rsx! {
@@ -4456,7 +4568,11 @@ pub mod receive {
                     title: "{peer.label}",
                     "{peer.label}"
                 }
-                span { class: "perf-peer-row__metric", "{metric}" }
+                span {
+                    class: "perf-peer-row__metric",
+                    title: "{row_title}",
+                    "{metric}"
+                }
                 if let Some(r) = snap.reason {
                     span {
                         class: "perf-reason-chip perf-reason-chip--{reason_chip_modifier(r)}",
@@ -4915,7 +5031,7 @@ pub mod receive {
                 kbps: 900,
                 reason: None,
             };
-            assert_eq!(format_readout(&v), "M · 2/3 · 960x540");
+            assert_eq!(format_readout(&v), "Medium · 2/3 · 960x540");
             let a = ReceivedLayerSnapshot {
                 kind: PrefMediaKind::Audio,
                 layer_index: 0,
@@ -4927,7 +5043,7 @@ pub mod receive {
                 kbps: 0,
                 reason: None,
             };
-            assert_eq!(format_readout(&a), "L · 1/3 · \u{2014} kbps");
+            assert_eq!(format_readout(&a), "Low · 1/3 · \u{2014} kbps");
             let s = ReceivedLayerSnapshot {
                 kind: PrefMediaKind::Screen,
                 layer_index: 2,
@@ -4937,7 +5053,7 @@ pub mod receive {
                 kbps: 2500,
                 reason: None,
             };
-            assert_eq!(format_readout(&s), "H · 3/3 · 1920x1080");
+            assert_eq!(format_readout(&s), "High · 3/3 · 1920x1080");
         }
 
         #[test]
@@ -4957,11 +5073,41 @@ pub mod receive {
                 st.level,
                 crate::components::performance_settings::MAX_METER_LEVEL
             );
-            assert_eq!(st.text, "H · 3/3 · 1280x720");
+            assert_eq!(st.text, "High · 3/3 · 1280x720");
             let empty = gauge_state(None);
             assert_eq!(empty.level, EMPTY_METER_LEVEL);
             assert_eq!(empty.level, 0); // no signal → all bars unlit
             assert_eq!(empty.text, "Not receiving");
+        }
+
+        /// MUTATION: put `format!("{}x{}", …)` back — `0x0` is a MEASURED zero.
+        #[test]
+        fn unreported_dims_read_as_unknown_never_as_zero_by_zero() {
+            let unreported = ReceivedLayerSnapshot {
+                kind: PrefMediaKind::Video,
+                layer_index: 2,
+                layer_count: 3,
+                width: 0,
+                height: 0,
+                kbps: 1500,
+                reason: None,
+            };
+            let text = format_readout(&unreported);
+            assert!(!text.contains("0x0"), "readout was: {text}");
+            assert_eq!(
+                text,
+                format!(
+                    "High · 3/3 · {}",
+                    crate::components::performance_settings::SEND_LAYER_DIMS_UNKNOWN
+                )
+            );
+            let st = gauge_state(Some(&unreported));
+            assert_eq!(
+                st.level,
+                crate::components::performance_settings::MAX_METER_LEVEL
+            );
+            assert_eq!(st.text, text);
+            assert_ne!(st.text, gauge_state(None).text);
         }
 
         #[test]
@@ -5252,11 +5398,17 @@ mod tests {
         // base) renders "Low"; id 2 (the top) renders "High". The internal id /
         // data-testid suffix stays 0-based; only the visible label changes (#1222).
         assert_eq!(
-            format_send_layer(0, 3, 320, 180, 120),
-            "Low · 320×180 · 120 kbps"
+            format_send_layer("video", 0, 3, 320, 180, 120),
+            "Low · 320×180 · 120 kbps — your camera fits inside this layer's 320×180 ceiling and is never upscaled"
         );
         assert_eq!(
-            format_send_layer(2, 3, 1280, 720, 1500),
+            format_send_layer("video", 2, 3, 1280, 720, 1500),
+            "High · 1280×720 · 1500 kbps — your camera fits inside this layer's 1280×720 ceiling and is never upscaled"
+        );
+        // The SCREEN ladder renders through this fn too and must not be handed the
+        // CAMERA ceiling. Pins the gate, not the screen-is-clamped invariant.
+        assert_eq!(
+            format_send_layer("screen", 2, 3, 1280, 720, 1500),
             "High · 1280×720 · 1500 kbps"
         );
         // Header: active/effective vs single-stream.
@@ -5290,7 +5442,7 @@ mod tests {
         };
         assert_eq!(
             format_peer_kind_line("video", Some(&v)),
-            Some("video H · 3/3 · 1280×720".to_string())
+            Some("video High · 3/3 · 1280×720".to_string())
         );
         // Audio → the em-dash detail: the resolver reports no bitrate for audio.
         let a = ReceivedLayerSnapshot {
@@ -5304,10 +5456,95 @@ mod tests {
         };
         assert_eq!(
             format_peer_kind_line("audio", Some(&a)),
-            Some("audio L · 1/3 · \u{2014} kbps".to_string())
+            Some("audio Low · 1/3 · \u{2014} kbps".to_string())
         );
         // None → no line.
         assert_eq!(format_peer_kind_line("screen", None), None);
+    }
+
+    /// MUTATION: inline `format!("{}×{}", …)` at any of these — `(0, 0)` means
+    /// "not published yet" and `0×0` reads as a measurement.
+    #[test]
+    fn unpublished_geometry_never_renders_zero_by_zero() {
+        let dash = SEND_LAYER_DIMS_UNKNOWN;
+        assert_eq!(format_dims_or_unknown(0, 720, "×"), dash);
+        assert_eq!(format_dims_or_unknown(1280, 0, "x"), dash);
+
+        let v = snap(PrefMediaKind::Video, 2, 3, 0, 0, 1500, None);
+        assert_eq!(
+            format_peer_kind_line("video", Some(&v)),
+            Some(format!("video High · 3/3 · {dash}"))
+        );
+        let s = snap(PrefMediaKind::Screen, 0, 1, 0, 0, 2500, None);
+        assert_eq!(
+            format_content_receive_summary(Some(&s)),
+            format!("Pulling full quality · {dash}")
+        );
+        // The rung TITLE has room for words; the visible chip keeps the glyph.
+        assert_eq!(
+            format_send_layer("screen", 2, 3, 0, 0, 1500),
+            format!("High · {DIMS_NOT_PUBLISHED} · 1500 kbps")
+        );
+        assert_eq!(format_send_layer_short(0, 0), dash);
+    }
+
+    /// MUTATION: return `None` unconditionally, or flip either zero test.
+    #[test]
+    fn an_absent_reading_always_has_a_name() {
+        let res = Some("Resolution not reported by this peer");
+        let rate = Some("Bitrate not reported by this peer");
+        assert_eq!(
+            unknown_reading_note(&snap(PrefMediaKind::Video, 2, 3, 0, 0, 1500, None)),
+            res
+        );
+        assert_eq!(
+            unknown_reading_note(&snap(PrefMediaKind::Screen, 0, 1, 640, 0, 900, None)),
+            res
+        );
+        assert_eq!(
+            unknown_reading_note(&snap(PrefMediaKind::Audio, 0, 3, 0, 0, 0, None)),
+            rate
+        );
+        assert_eq!(
+            unknown_reading_note(&snap(PrefMediaKind::Video, 2, 3, 640, 480, 1500, None)),
+            None
+        );
+        assert_eq!(
+            unknown_reading_note(&snap(PrefMediaKind::Audio, 0, 3, 0, 0, 24, None)),
+            None
+        );
+    }
+
+    /// MUTATION: drop `video_layer_ceiling`'s `kind_slug` guard and the screen/audio
+    /// arms gain a camera ceiling; drop `layer_count > 1` and a one-rung peer does.
+    #[test]
+    fn the_row_title_states_the_bounding_box_rule() {
+        assert_eq!(
+            peer_row_title(&snap(PrefMediaKind::Video, 2, 3, 640, 480, 1500, None)).unwrap(),
+            "Layer 3 of 3: The sender's camera fits inside this layer's 1280×720 ceiling and is never upscaled"
+        );
+        assert_eq!(
+            peer_row_title(&snap(PrefMediaKind::Video, 2, 3, 0, 0, 1500, None)).unwrap(),
+            "Resolution not reported by this peer. Layer 3 of 3: The sender's camera fits inside this layer's 1280×720 ceiling and is never upscaled"
+        );
+        assert_eq!(
+            peer_row_title(&snap(PrefMediaKind::Video, 0, 1, 1280, 720, 1500, None)),
+            None
+        );
+        assert_eq!(
+            peer_row_title(&snap(PrefMediaKind::Screen, 2, 3, 1920, 1080, 2500, None)),
+            None
+        );
+        assert_eq!(
+            peer_row_title(&snap(PrefMediaKind::Audio, 1, 3, 0, 0, 24, None)),
+            None
+        );
+        assert_eq!(
+            peer_row_title(&snap(PrefMediaKind::Screen, 0, 1, 0, 0, 2500, None)).unwrap(),
+            "Resolution not reported by this peer"
+        );
+        assert_eq!(video_layer_ceiling("screen", 2, 3), None);
+        assert_eq!(video_layer_ceiling("video", 1, 3), Some((640, 360)));
     }
 
     #[test]
@@ -5682,7 +5919,7 @@ mod tests {
         };
         assert_eq!(
             format_content_receive_summary(Some(&top)),
-            "Pulling full quality · H · 3/3 · 1920×1080"
+            "Pulling full quality · High · 3/3 · 1920×1080"
         );
         // 2-layer ladder: index 0 is Low → compact "L".
         let low = ReceivedLayerSnapshot {
@@ -5692,7 +5929,7 @@ mod tests {
         };
         assert_eq!(
             format_content_receive_summary(Some(&low)),
-            "Pulling full quality · L · 1/2 · 1920×1080"
+            "Pulling full quality · Low · 1/2 · 1920×1080"
         );
     }
 
@@ -7026,7 +7263,7 @@ mod tests {
         let audio = snap(PrefMediaKind::Audio, 1, 3, 0, 0, 0, None);
         assert_eq!(
             peer_row_metric(&audio, "as sent"),
-            format!("{SEND_LAYER_DIMS_UNKNOWN}k · as sent · M · 2/3"),
+            format!("{SEND_LAYER_DIMS_UNKNOWN}k · as sent · Medium · 2/3"),
             "the VISUAL readout keeps the em-dash for the same snapshot"
         );
     }
@@ -7036,15 +7273,62 @@ mod tests {
         // Video/screen: "{res} · ~{kbps} · {Q} · {i}/{n}" (Directive 4 SITE 6b).
         // issue 1768: the standard (middle) camera rung is now 640×360 @ ~350 kbps.
         let v = snap(PrefMediaKind::Video, 1, 3, 640, 360, 350, None);
-        assert_eq!(peer_row_metric(&v, "ignored"), "360p · ~350k · M · 2/3");
+        assert_eq!(
+            peer_row_metric(&v, "ignored"),
+            "360p · ~350k · Medium · 2/3"
+        );
         // Audio: "{kbps}k · {label} · {Q} · {i}/{n}", where the resolver reports no
         // bitrate — so the leading segment is the em-dash, never "0k".
         let a = snap(PrefMediaKind::Audio, 1, 3, 0, 0, 0, None);
-        assert_eq!(peer_row_metric(&a, "mid"), "\u{2014}k · mid · M · 2/3");
+        assert_eq!(peer_row_metric(&a, "mid"), "\u{2014}k · mid · Medium · 2/3");
+    }
+
+    /// MUTATION: flip `layer_position_suffix`'s `compact` back to `true`. The same
+    /// 640-wide frame is a different layer per camera, so only the position names it.
+    #[test]
+    fn a_bounded_video_resolution_is_named_by_its_layer_position_not_its_pixels() {
+        let four_three_top = snap(PrefMediaKind::Video, 2, 3, 640, 480, 1500, None);
+        assert_eq!(
+            peer_row_metric(&four_three_top, "ignored"),
+            "480p · ~1.5M · High · 3/3"
+        );
+        let sixteen_nine_mid = snap(PrefMediaKind::Video, 1, 3, 640, 360, 350, None);
+        assert_eq!(
+            peer_row_metric(&sixteen_nine_mid, "ignored"),
+            "360p · ~350k · Medium · 2/3"
+        );
+    }
+
+    /// MUTATION: pass a literal instead of the snapshot at either call site.
+    /// `layer_row_aria_label` is what BOTH `PeerRow` and `SignalLayerRow` call.
+    #[test]
+    fn the_visible_metric_and_the_aria_sentence_name_the_same_layer() {
+        let s = snap(PrefMediaKind::Video, 2, 3, 640, 480, 1500, None);
+        let metric = peer_row_metric(&s, "ignored");
+        assert!(metric.contains("High · 3/3"), "metric was: {metric}");
+        assert_eq!(
+            layer_row_aria_label("Ana Ruiz", "video", &s),
+            "Ana Ruiz, receiving video, optimal quality, 480p, layer 3 of 3"
+        );
+        let degraded = snap(
+            PrefMediaKind::Video,
+            0,
+            3,
+            320,
+            240,
+            120,
+            Some(DegradeReason::Network),
+        );
+        assert_eq!(
+            layer_row_aria_label("Ana Ruiz", "video", &degraded),
+            "Ana Ruiz, receiving video, low quality, 240p, layer 1 of 3, \
+             limited by your network"
+        );
     }
 
     /// MUTATION: give `layer_position_suffix` a `Some` arm for `layer_count <= 1`,
-    /// or point any of these back at a caller-supplied ladder length.
+    /// or point any of these back at a caller-supplied ladder length. That early
+    /// return is all that keeps a one-rung peer off the ladder BASE's name.
     #[test]
     fn one_rung_readouts_carry_no_layer_position() {
         let s = snap(PrefMediaKind::Screen, 0, 1, 1400, 700, 1176, None);
@@ -7070,18 +7354,19 @@ mod tests {
             None,
         );
         assert!(!aria.contains("layer"), "aria was: {aria}");
+        assert_eq!(layer_quality_label(0, 1, false), "Single");
 
         let three = ReceivedLayerSnapshot {
             layer_index: 1,
             layer_count: 3,
             ..s
         };
-        assert_eq!(layer_position_suffix(1, 3).unwrap(), "M · 2/3");
-        assert!(peer_row_metric(&three, "ignored").ends_with("M · 2/3"));
+        assert_eq!(layer_position_suffix(1, 3).unwrap(), "Medium · 2/3");
+        assert!(peer_row_metric(&three, "ignored").ends_with("Medium · 2/3"));
         assert!(format_peer_kind_line("video", Some(&three))
             .expect("flowing")
-            .contains("M · 2/3"));
-        assert!(receive::format_readout(&three).starts_with("M · 2/3"));
+            .contains("Medium · 2/3"));
+        assert!(receive::format_readout(&three).starts_with("Medium · 2/3"));
     }
 
     /// MUTATION: print a ladder constant instead of `width`/`height`, or drop the

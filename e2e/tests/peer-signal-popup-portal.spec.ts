@@ -1,7 +1,9 @@
 import { test, expect, Page, BrowserContext } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
 import { chromium } from "@playwright/test";
+import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 
 /**
  * Signal-quality popup — portal positioning and multi-popup persistence.
@@ -32,7 +34,7 @@ import { chromium } from "@playwright/test";
  *
  * What this spec asserts:
  *
- *   1. After clicking the signal-bars icon, the popup is rendered as a
+ *   1. After clicking the signal disc, the popup is rendered as a
  *      sibling of `.canvas-container` (NOT a descendant), proving the
  *      portal-mode DOM hoist is in effect.
  *   2. The popup has `position: fixed` and z-index >= 9400, proving the
@@ -64,6 +66,7 @@ async function joinMeetingAs(
   meetingId: string,
   username: string,
 ): Promise<Page> {
+  await enableDiagnosticsTileIndicators(context);
   const page = await context.newPage();
   await page.goto("/");
   await page.waitForTimeout(1500);
@@ -176,8 +179,6 @@ test.describe("Signal-quality popup — portal positioning", () => {
         await expect(guestGrid).toBeVisible({ timeout: 15_000 });
       }
 
-      // Settle the mesh so the peer tile (and its signal-bars button) is
-      // rendered on the host's side.
       await members[0].page.waitForTimeout(10_000);
 
       const hostPage = members[0].page;
@@ -185,9 +186,9 @@ test.describe("Signal-quality popup — portal positioning", () => {
       await expect(tileCanvas).toHaveCount(1, { timeout: 30_000 });
 
       // ── 1. Open the popup ────────────────────────────────────────────
-      const signalButton = hostPage.locator(
-        '#grid-container button[aria-label="Show signal quality"]',
-      );
+      const signalButton = hostPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
+      // Also pins "exactly one camera peer" — `toBeVisible` would throw on two.
+      await expect(signalButton).toHaveCount(1, { timeout: 15_000 });
       await expect(signalButton).toBeVisible({ timeout: 15_000 });
       await signalButton.click();
 
@@ -372,15 +373,10 @@ test.describe("Signal-quality popup — portal positioning", () => {
         }
       }
 
-      // Let the mesh settle so both guest tiles + their signal-meter
-      // buttons are mounted on the host side.
       await members[0].page.waitForTimeout(12_000);
 
       const hostPage = members[0].page;
-      const signalButtons = hostPage.locator(
-        '#grid-container button[aria-label="Show signal quality"]',
-      );
-      // Two guest tiles ⇒ two signal-quality buttons on the host side.
+      const signalButtons = hostPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
       await expect(signalButtons).toHaveCount(2, { timeout: 30_000 });
 
       // ── Open popup A ────────────────────────────────────────────────

@@ -25,6 +25,8 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 const SMALL_FRAME_BYTES: usize = 600;
 const LARGE_FRAME_BYTES: usize = 3000;
+/// Video layer 2's nominal 1500 kbps at 30 fps.
+const TOP_LAYER_FRAME_BYTES: usize = 6250;
 
 fn payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
@@ -125,7 +127,7 @@ fn decode_frame_serde_cost_is_reported() {
         .performance()
         .expect("performance.now()");
 
-    for len in [SMALL_FRAME_BYTES, LARGE_FRAME_BYTES] {
+    for len in [SMALL_FRAME_BYTES, LARGE_FRAME_BYTES, TOP_LAYER_FRAME_BYTES] {
         let msg = decode_frame(len);
         // Without this the first size measured absorbs the JIT cost of both.
         for _ in 0..2_000 {
@@ -161,4 +163,59 @@ fn decode_frame_serde_cost_is_reported() {
             "both measured loops must have run {ITERATIONS} times"
         );
     }
+}
+
+/// Issue 2632. Reported, not asserted; `sunk` only proves the loops ran. Ids are
+/// production-length (20 digits) because `String::clone` allocates exactly `len` bytes.
+#[wasm_bindgen_test]
+fn attribution_clone_cost_is_reported() {
+    use std::cell::RefCell;
+    use videocall_codecs::messages::StreamContext;
+
+    const ITERATIONS: u32 = 20_000;
+    let clock = web_sys::window()
+        .expect("a browser window")
+        .performance()
+        .expect("performance.now()");
+
+    let held: RefCell<Option<StreamContext>> = RefCell::new(Some(StreamContext {
+        from_peer: "12084084513855111475".to_string(),
+        to_peer: "10293847561029384756".to_string(),
+    }));
+    let bytes_per_clone = held
+        .borrow()
+        .as_ref()
+        .map_or(0, |c| c.from_peer.len() + c.to_peer.len());
+
+    let mut sunk = 0u32;
+    for _ in 0..2_000 {
+        let owned = held.borrow().as_ref().cloned();
+        sunk = sunk.wrapping_add(owned.is_some() as u32);
+    }
+    sunk = 0;
+
+    let start = clock.now();
+    for _ in 0..ITERATIONS {
+        let owned = held.borrow().as_ref().cloned();
+        sunk = sunk.wrapping_add(owned.is_some() as u32);
+    }
+    let clone_ns = (clock.now() - start) * 1_000_000.0 / f64::from(ITERATIONS);
+
+    // 0.0 here means below `performance.now()`'s resolution, not zero cost.
+    let start = clock.now();
+    for _ in 0..ITERATIONS {
+        let guard = held.borrow();
+        sunk = sunk.wrapping_add(guard.as_ref().is_some() as u32);
+    }
+    let borrow_ns = (clock.now() - start) * 1_000_000.0 / f64::from(ITERATIONS);
+
+    web_sys::console::log_1(&JsValue::from_str(&format!(
+        "[2632 BENCH] per-frame attribution: owned clone {clone_ns:.1} ns \
+         ({bytes_per_clone} B), borrow {borrow_ns:.1} ns ({ITERATIONS} iterations)"
+    )));
+    assert_eq!(
+        sunk,
+        2 * ITERATIONS,
+        "both measured loops must have run {ITERATIONS} times"
+    );
 }

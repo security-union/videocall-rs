@@ -1,7 +1,9 @@
 import { test, expect, Page, BrowserContext } from "@playwright/test";
 import { chromium } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
 import { waitForServices } from "../helpers/wait-for-services";
+import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 
 /**
  * Signal-meter popup — survives a peer leave (HCL bug #8).
@@ -44,6 +46,7 @@ async function joinMeetingAs(
   meetingId: string,
   username: string,
 ): Promise<Page> {
+  await enableDiagnosticsTileIndicators(context);
   const page = await context.newPage();
   await page.goto("/");
   await page.waitForTimeout(1500);
@@ -161,9 +164,7 @@ test.describe("Signal-meter popup — survives peer leave (HCL bug #8)", () => {
       await members[0].page.waitForTimeout(12_000);
 
       const hostPage = members[0].page;
-      const signalButtons = hostPage.locator(
-        '#grid-container button[aria-label="Show signal quality"]',
-      );
+      const signalButtons = hostPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
       await expect(signalButtons).toHaveCount(2, { timeout: 30_000 });
 
       // Open both popups.

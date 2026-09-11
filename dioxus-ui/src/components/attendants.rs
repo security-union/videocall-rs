@@ -32,6 +32,7 @@ use crate::components::decode_budget::{
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::decode_paused_pill::DecodePausedPill;
 use crate::components::pre_join_preview::PreviewEngine;
+use crate::components::self_view_hidden_pill::SelfViewHiddenPill;
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
@@ -39,7 +40,6 @@ use crate::components::{
         next_pin_target, speak_style, transport_badge, transport_badge_from_str, PinnedTile,
         TileMode, TransportBadge,
     },
-    chat_sidebar::ChatSidebar,
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     emoji_picker::EmojiPicker,
@@ -50,17 +50,17 @@ use crate::components::{
     media_metrics_overlay::{MediaMetricsOverlayCtx, MEDIA_METRICS_OVERLAY_KEY},
     meeting_ended_overlay::MeetingEndedOverlay,
     meeting_options_controls::MeetingOptionsControls,
-    peer_list::{PeerList, PeerListEntry},
+    peer_list::{PeerList, PeerListEntry, RosterLiveness},
     peer_tile::PeerTile,
     performance_settings::{DiagnosticsReader, PerfControlsHandle},
     pre_join_settings_card::PreJoinSettingsCard,
     reactions_overlay::ReactionsOverlay,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
-        js_state_to_record_button_state, CameraButton, ChatButtonWithBadge, DensityModeButton,
-        DeviceSettingsButton, DiagnosticsButton, HangUpButton, MeetingOptionsButton,
-        MeetingTimerButton, MicButton, MockPeersButton, PeerListButton, RaiseHandButton,
-        ReactionsButton, RecordButton, RecordButtonState, ScreenShareButton,
+        js_state_to_record_button_state, CameraButton, DensityModeButton, DeviceSettingsButton,
+        DiagnosticsButton, HangUpButton, MeetingOptionsButton, MeetingTimerButton, MicButton,
+        MockPeersButton, PeerListButton, RaiseHandButton, ReactionsButton, RecordButton,
+        RecordButtonState, ScreenShareButton,
     },
 };
 use crate::console_log_collector::{
@@ -75,16 +75,18 @@ use crate::context::{
     html_media_set_sink_id_supported, load_appearance_settings_from_storage,
     load_decode_budget_override, load_density_mode, load_dock_autohide, load_dock_position,
     load_preferred_camera_on, load_preferred_device_ids, load_preferred_mic_on,
-    load_transport_preference_with_source, resolve_initial_enabled, resolve_transport_config,
-    restore_device_id, save_appearance_settings_to_storage, save_density_mode,
-    save_display_name_to_storage, save_dock_autohide, save_dock_position, save_preferred_camera_id,
-    save_preferred_camera_on, save_preferred_mic_id, save_preferred_mic_on,
-    save_preferred_speaker_id, validate_display_name, AppearanceSettingsCtx, AutohideCtx,
-    CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx, DetachedShareCtx,
-    DisplayNameCtx, DockPosition, DockPositionCtx, HostRefreshNonceCtx, HostSetCtx,
-    LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerMetadata, PeerMetadataCtx,
-    PeerSignalHistoryMap, PeerStatusMap, RaisedHandsCtx, RecordingSetCtx, ScreenActualSizeCtx,
-    ScreenZoomCtx, ScreenZoomState, SignalPopupStateMap, TransportPreference,
+    load_self_view_placement, load_self_view_visible, load_transport_preference_with_source,
+    resolve_initial_enabled, resolve_transport_config, restore_device_id,
+    save_appearance_settings_to_storage, save_density_mode, save_display_name_to_storage,
+    save_dock_autohide, save_dock_position, save_preferred_camera_id, save_preferred_camera_on,
+    save_preferred_mic_id, save_preferred_mic_on, save_preferred_speaker_id,
+    save_self_view_placement, save_self_view_visible, validate_display_name, AppearanceSettingsCtx,
+    AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
+    DetachedShareCtx, DisplayNameCtx, DockPosition, DockPositionCtx, HostRefreshNonceCtx,
+    HostSetCtx, LocalAudioLevelCtx, MeetingTime, PeerAudioLivenessMap, PeerMediaState,
+    PeerMetadata, PeerMetadataCtx, PeerSignalHistoryMap, PeerStatusMap, RaisedHandsCtx,
+    RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState, SelfViewPlacement,
+    SelfViewPlacementCtx, SelfViewVisibleCtx, SignalPopupStateMap, TransportPreference,
     TransportPreferenceCtx, UserRequestedDecodeCtx,
 };
 use crate::local_storage::{load_bool, load_f64, load_json, remove_item, save_f64, save_json};
@@ -220,16 +222,6 @@ fn js_recording_stop() {
         log::error!("[recording] window.__vcRecording.stop() threw: {e:?}");
     }
 }
-
-/// Minimum width (px) a drawer can be dragged to. Below this the panel chrome
-/// (headers, controls) stops being usable. The floor is driven by the
-/// connection-manager section's Progress `.status-item` row (a `.progress-container`
-/// with min-width 120px plus its "Progress:" label) — see issue 1482; 300px keeps
-/// that row from overflowing inside the section/sidebar padding chrome.
-const DRAWER_MIN_WIDTH: f64 = 300.0;
-/// Absolute maximum drawer width (px). The per-side cap is the smaller of this
-/// and 50% of the viewport (see `max_for_side` in the render body).
-const DRAWER_MAX_ABS: f64 = 720.0;
 
 /// Vertical space (px) reserved at the top of the tile grid for the meeting-wide
 /// status bar (`.meeting-status-bar`) while it is mounted. Added to the grid's
@@ -1371,8 +1363,12 @@ fn schedule_reconnect_no_jwt(
 }
 
 use super::attendants_layout::{
-    compute_effective_density, compute_layout, promote_speakers, screen_share_pinned_tile_size,
-    select_display_candidates, sort_camera_off_window, TILE_AR,
+    action_bar_band_width, compute_effective_density, compute_layout, drawer_max_for_side,
+    drawer_reserves, drawers_to_close_on_open, drawers_to_close_on_resize, handle_is_inert,
+    overflow_budget_width, promote_speakers, quantise_reserve, resize_notice,
+    screen_share_flow_style, screen_share_pinned_tile_size, select_display_candidates,
+    sort_camera_off_window, tile_flow_style, DrawerKind, DrawerSide, DrawerState, DrawersToClose,
+    DRAWER_MAX_ABS, DRAWER_MIN_WIDTH, TILE_AR,
 };
 use super::density::{next_density_mode, DensityMode, DENSITY_MODES};
 
@@ -1829,6 +1825,68 @@ fn focus_element_by_id(id: &str) {
     }
 }
 
+fn focus_trigger_or_grid(id: &str) {
+    let doc = web_sys::window().and_then(|w| w.document());
+    let landed = doc
+        .as_ref()
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+        .zip(doc.as_ref())
+        .map(|(html, d)| {
+            let _ = html.focus();
+            d.active_element()
+                .map(|active| active == *html.unchecked_ref::<web_sys::Element>())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !landed {
+        focus_element_by_id("grid-container");
+    }
+}
+
+const DRAWER_RESIZE_NOTICE_MS: u32 = 7_900;
+
+fn post_drawer_resize_notice(
+    msg: Option<&'static str>,
+    mut notice: Signal<Option<(u32, &'static str)>>,
+    mut seq: Signal<u32>,
+) {
+    let Some(msg) = msg else {
+        return;
+    };
+    let nonce = seq.peek().wrapping_add(1);
+    seq.set(nonce);
+    notice.set(Some((nonce, msg)));
+    Timeout::new(DRAWER_RESIZE_NOTICE_MS, move || {
+        if let Ok(mut n) = notice.try_write() {
+            if matches!(*n, Some((current, _)) if current == nonce) {
+                *n = None;
+            }
+        }
+    })
+    .forget();
+}
+
+fn drag_is_orphaned(
+    resizing: ResizingDrawer,
+    peer_list_open: bool,
+    diagnostics_open: bool,
+) -> bool {
+    match resizing {
+        ResizingDrawer::Left => !peer_list_open,
+        ResizingDrawer::Right => !diagnostics_open,
+        ResizingDrawer::None => false,
+    }
+}
+
+fn focus_within(selector: &str) -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.active_element())
+        .and_then(|el| el.closest(selector).ok().flatten())
+        .is_some()
+}
+
 /// True when a click originated inside the action bar (`.video-controls-container`).
 /// The in-meeting `#main-container` background-click handler uses this to leave the
 /// side panels (peer list, diagnostics) open when the click landed on an action-bar
@@ -1853,6 +1911,9 @@ fn click_within_action_bar(evt: &MouseEvent) -> bool {
 enum EscCloseTarget {
     Diagnostics,
     PeerList,
+    /// Issue 2693. Ranked last: a toast overlays nothing, so an open drawer is
+    /// always the layer the user meant to peel.
+    SelfViewToast,
 }
 
 impl EscCloseTarget {
@@ -1862,24 +1923,33 @@ impl EscCloseTarget {
     /// rendered `id:` attributes on `PeerListButton` / `DiagnosticsButton`; the
     /// rendered-id side of that contract is guarded by the e2e `activeElement`
     /// assertions in `popup-layering.spec.ts`.
-    fn trigger_id(self) -> &'static str {
+    fn trigger_id(self) -> Option<&'static str> {
         match self {
-            EscCloseTarget::Diagnostics => "diagnostics-trigger",
-            EscCloseTarget::PeerList => "peer-list-trigger",
+            EscCloseTarget::Diagnostics => Some("diagnostics-trigger"),
+            EscCloseTarget::PeerList => Some("peer-list-trigger"),
+            // No action-bar trigger owns the toast, and its focus move is
+            // conditional — the dismiss handler decides.
+            EscCloseTarget::SelfViewToast => None,
         }
     }
 }
 
-/// Decide which side panel Escape should close, given each panel's open state.
-/// Returns `None` when neither panel is open — Escape is then a no-op here and the
-/// popover handlers (density / mock-peers / dock menu) keep today's behavior.
+/// Decide what Escape should close, given each surface's open state. Returns
+/// `None` when none is open — Escape is then a no-op here and the popover
+/// handlers (density / mock-peers / dock menu) keep today's behavior.
 /// Diagnostics takes precedence over the peer list when both are open (topmost
-/// drawer closes first).
-fn esc_panel_close_target(diagnostics_open: bool, peer_list_open: bool) -> Option<EscCloseTarget> {
+/// drawer closes first), and both outrank the hide toast, which overlays nothing.
+fn esc_panel_close_target(
+    diagnostics_open: bool,
+    peer_list_open: bool,
+    self_view_toast_open: bool,
+) -> Option<EscCloseTarget> {
     if diagnostics_open {
         Some(EscCloseTarget::Diagnostics)
     } else if peer_list_open {
         Some(EscCloseTarget::PeerList)
+    } else if self_view_toast_open {
+        Some(EscCloseTarget::SelfViewToast)
     } else {
         None
     }
@@ -2098,19 +2168,6 @@ fn overflow_slot_icon(slot: ActionBarSlot) -> Element {
         ActionBarSlot::MeetingTimer => rsx! {
             MeetingTimerIcon { decorative: true }
         },
-        ActionBarSlot::Chat => rsx! {
-            svg {
-                "aria-hidden": "true",
-                xmlns: "http://www.w3.org/2000/svg",
-                view_box: "0 0 24 24",
-                fill: "none",
-                stroke: "currentColor",
-                stroke_width: "2",
-                stroke_linecap: "round",
-                stroke_linejoin: "round",
-                path { d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" }
-            }
-        },
         // Issue #1884: Reactions (smiley), mirroring the ReactionsButton glyph.
         ActionBarSlot::Reactions => rsx! {
             svg {
@@ -2190,7 +2247,9 @@ fn visible_action_bar_slots(slots: &[ActionBarSlot], vis: SlotVisibility) -> Vec
 
 /// Pure fit computation for the action-bar overflow ("…") menu.
 ///
-/// Given the viewport size and the ordered list of *secondary* slots (every
+/// `band_w` is the viewport less the drawer reserves — `action_bar_band_width`.
+///
+/// Given that band and the ordered list of *secondary* slots (every
 /// visible slot except the sacred Mic/Camera, which never overflow), returns
 /// the trailing slots that do NOT fit and must therefore be tucked behind the
 /// overflow trigger. `sacred_count` is the number of always-visible buttons
@@ -2205,38 +2264,35 @@ fn visible_action_bar_slots(slots: &[ActionBarSlot], vis: SlotVisibility) -> Vec
 /// at ALL widths — never the tightened narrow-viewport spacing. Because the
 /// tightened CSS spacing only makes the RENDERED bar NARROWER than this
 /// estimate, using the widest spacing here is also strictly clip-safe: the bar
-/// can never exceed the viewport it was budgeted against.
+/// can never exceed the band it was budgeted against.
+fn action_bar_slot_width(rem_px: f64) -> f64 {
+    3.1 * rem_px + 1.2 * rem_px
+}
+
+fn action_bar_fixed_width(sacred_count: usize, rem_px: f64) -> f64 {
+    let btn_size = 3.1 * rem_px;
+    let gap = 1.2 * rem_px;
+    let pad = 1.5 * rem_px * 2.0;
+    let sacred = (sacred_count as f64) * btn_size + (sacred_count as f64) * gap + pad + 2.0;
+    sacred + action_bar_slot_width(rem_px) * 2.0
+}
+
+fn dock_wrapper_fits(available: f64, sacred_count: usize, rem_px: f64) -> bool {
+    available >= action_bar_fixed_width(sacred_count, rem_px)
+}
+
 fn action_bar_overflow_hidden(
-    vw: f64,
+    band_w: f64,
     vh: f64,
     is_vertical: bool,
     rem_px: f64,
     sacred_count: usize,
     secondary: &[ActionBarSlot],
 ) -> Vec<ActionBarSlot> {
-    let available = (if is_vertical { vh } else { vw }) - 40.0;
-
-    // Button size is 3.1rem, scaled by the root font size (zoom / OS text size).
+    let available = overflow_budget_width(is_vertical, band_w, vh);
     let btn_size = 3.1 * rem_px;
-    // Full-size spacing at EVERY width. Using the widest gap/padding — rather
-    // than the narrow-viewport tightened values that the CSS applies at ≤540px
-    // / ≤440px — keeps the per-button cost independent of width, so the fitted
-    // count is monotonic and widening never re-hides a slot (issue 2044). The
-    // rendered bar's tighter spacing at narrow widths only leaves it narrower
-    // than this estimate, so the bar still never overflows the viewport.
     let gap = 1.2 * rem_px;
-    let pad = 1.5 * rem_px * 2.0;
-
-    // Sacred (Mic + Camera + Hangup) always occupy the bar.
-    let sacred_width = (sacred_count as f64) * btn_size + (sacred_count as f64) * gap + pad + 2.0;
-    let trigger_width = btn_size + gap;
-
-    // Budget for the secondary buttons once the sacred set and the overflow
-    // trigger are accounted for. The trigger width is always reserved: if every
-    // secondary slot fits inside this (smaller) budget it certainly fits with
-    // the larger dock button that replaces the trigger when nothing overflows,
-    // so no dead zone is introduced.
-    let budget = available - sacred_width - trigger_width;
+    let budget = available - action_bar_fixed_width(sacred_count, rem_px);
 
     let mut fit_count = 0usize;
     let mut used = 0.0_f64;
@@ -2255,6 +2311,31 @@ fn action_bar_overflow_hidden(
         Vec::new()
     } else {
         secondary[fit_count..].to_vec()
+    }
+}
+
+fn apply_drawer_open_rule(
+    viewport_width: Signal<f64>,
+    opening: DrawerKind,
+    mut peer_list_open: Signal<bool>,
+    mut diagnostics_open: Signal<bool>,
+    mut chat_open: Signal<bool>,
+) {
+    let close = drawers_to_close_on_open(
+        *viewport_width.peek(),
+        opening,
+        *peer_list_open.peek(),
+        *diagnostics_open.peek(),
+        *chat_open.peek(),
+    );
+    if close.peer_list {
+        peer_list_open.set(false);
+    }
+    if close.diagnostics {
+        diagnostics_open.set(false);
+    }
+    if close.chat {
+        chat_open.set(false);
     }
 }
 
@@ -2374,7 +2455,7 @@ fn next_dock_menu_index(current: usize, delta: i32, count: usize) -> usize {
 ///
 /// An empty message stays exactly empty so the "clear on customize-mode exit"
 /// path parks the region silent rather than holding a lone whitespace node.
-fn action_bar_announce_text(message: &str, nonce: u32) -> String {
+pub(crate) fn action_bar_announce_text(message: &str, nonce: u32) -> String {
     if message.is_empty() {
         String::new()
     } else if nonce % 2 == 1 {
@@ -2775,9 +2856,9 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    // No UI can open this drawer on the public build; the reserve/pair-close
+    // math still reads it so the drawer-reflow code stays identical upstream.
     let mut chat_open = use_signal(|| false);
-    // True when a chat message has arrived while the sidebar is closed.
-    let mut chat_has_unread = use_signal(|| false);
     // Latch: set true the first time the Diagnostics drawer is opened, never
     // reset. Once the drawer has been opened at least once, CLOSING it keeps a
     // lightweight `#diagnostics-sidebar` placeholder in the DOM (without the
@@ -2790,11 +2871,6 @@ pub fn AttendantsComponent(
     // `Diagnostics` component is still only mounted while actually open, so no
     // diagnostics work runs for the closed placeholder. (issue 1296 both-open close)
     let mut diagnostics_was_opened = use_signal(|| false);
-    // Drawer width state. Both drawers are overlay-only: they float over the
-    // tiles and never reflow the grid. Their widths are drag-resizable and
-    // persisted to localStorage. Widths are clamped on load in case a value
-    // persisted by an older/incompatible release no longer satisfies the current
-    // min/max.
     let mut left_width = use_signal(|| {
         load_f64("vc_drawer_left_width", 320.0).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS)
     });
@@ -2805,6 +2881,7 @@ pub fn AttendantsComponent(
     // Viewport width snapshotted at drag-start so the move handler does NOT
     // re-read `window().inner_width()` on every mousemove. (#1296)
     let mut drag_start_vw = use_signal(|| 0.0f64);
+    let mut drag_start_width = use_signal(|| 0.0f64);
     // Non-reactive rAF coalescing stash for drawer resize (#1296 perf).
     // Holds the latest pointer client_x and a "rAF scheduled" flag so a fast
     // drag writes the width signal at most ONCE per painted frame instead of
@@ -2834,6 +2911,9 @@ pub fn AttendantsComponent(
     // `viewport_width`, the slot list, and visibility filters to decide
     // which slots overflow. Dioxus render is sole authority on visibility.
     let mut overflowed_slots: Signal<Vec<ActionBarSlot>> = use_signal(Vec::new);
+    let mut dock_wrapper_hidden = use_signal(|| false);
+    let drawer_resize_notice: Signal<Option<(u32, &'static str)>> = use_signal(|| None);
+    let drawer_resize_notice_seq = use_signal(|| 0u32);
     // Tracks whether an active screen share exists — set in the render body
     // (after `active_screen_sharer` is computed) and read by the overflow
     // effect so it can filter slots correctly.
@@ -2841,6 +2921,13 @@ pub fn AttendantsComponent(
     let mut controls_visible = use_signal(|| true);
     let mut controls_expanded = use_signal(|| true);
     let mut dock_position: Signal<DockPosition> = use_signal(load_dock_position);
+    let mut self_view_placement: Signal<SelfViewPlacement> = use_signal(load_self_view_placement);
+    let mut self_view_visible: Signal<bool> = use_signal(load_self_view_visible);
+    let mut self_view_announce: Signal<String> = use_signal(String::new);
+    let mut self_view_animate: Signal<bool> = use_signal(|| false);
+    let mut self_view_hidden_toast: Signal<bool> = use_signal(|| false);
+    let mut self_view_hidden_toast_timer: Signal<Option<gloo_timers::callback::Timeout>> =
+        use_signal(|| None);
     let mut dock_menu_open = use_signal(|| false);
     // Roving-tabindex position within the dock menu (issue 1762). Exactly one
     // `.glass-select-option` carries `tabindex="0"`; the other six carry "-1",
@@ -3124,6 +3211,72 @@ pub fn AttendantsComponent(
         })
     };
 
+    use_effect(move || {
+        let close = drawers_to_close_on_resize(
+            viewport_width(),
+            peer_list_open(),
+            diagnostics_open(),
+            chat_open(),
+        );
+        if !close.any() {
+            return;
+        }
+        let restore_to = if close.diagnostics && focus_within("#diagnostics-sidebar") {
+            Some("diagnostics-trigger")
+        } else if close.peer_list && focus_within("#peer-list-container") {
+            Some("peer-list-trigger")
+        } else if close.chat && focus_within("#chat-sidebar") {
+            Some("chat-trigger")
+        } else {
+            None
+        };
+        if close.peer_list {
+            peer_list_open.set(false);
+        }
+        if close.diagnostics {
+            diagnostics_open.set(false);
+        }
+        if close.chat {
+            chat_open.set(false);
+        }
+        if let Some(id) = restore_to {
+            focus_trigger_or_grid(id);
+        }
+        post_drawer_resize_notice(
+            resize_notice(close, false),
+            drawer_resize_notice,
+            drawer_resize_notice_seq,
+        );
+    });
+
+    use_effect(move || {
+        if drag_is_orphaned(resizing_drawer(), peer_list_open(), diagnostics_open()) {
+            resizing_drawer.set(ResizingDrawer::None);
+        }
+    });
+
+    // `getComputedStyle` on the root forces a style flush. (issue 2701)
+    let rem_px_memo = use_memo(move || {
+        // Not dead: these reads subscribe the memo, and a zoom always moves vw.
+        let _ = (viewport_width(), viewport_height());
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+            .and_then(|el| w_sys_computed_font_size(&el))
+            .unwrap_or(16.0)
+    });
+
+    let drawer_reserves_memo = use_memo(move || {
+        drawer_reserves(DrawerState {
+            vw: viewport_width(),
+            peer_list_open: peer_list_open(),
+            left_w: left_width(),
+            diagnostics_open: diagnostics_open(),
+            right_w: right_width(),
+            chat_open: chat_open(),
+        })
+    });
+
     // Issue 2136: whether the meeting-timer slot is rendered for this user.
     // Computed once here and threaded into every `is_action_bar_slot_visible`
     // call, exactly as `record_slot_visible` is, so the per-slot rule stays in
@@ -3140,25 +3293,17 @@ pub fn AttendantsComponent(
         let is_customize = customize_mode();
         let dock = dock_position();
         let slots = action_bar_slots.read();
-        // Read visibility-filter deps so the effect re-runs when they change.
+        // Read BEFORE the early-return or a run that takes it unsubscribes.
         let has_ss = has_screen_share_sig();
+        let band_w = action_bar_band_width(vw, drawer_reserves_memo());
+        let is_vertical = dock != DockPosition::Bottom;
+        let rem_px = rem_px_memo();
 
-        if is_customize {
-            if !overflowed_slots.peek().is_empty() {
-                overflowed_slots.set(Vec::new());
-            }
-            overflow_menu_open.set(false);
-            return;
-        }
-
-        // Filter to only the slots that are actually rendered. This prevents
-        // dead popover items (e.g. ScreenShare on iOS, MeetingOptions for
-        // non-owners, DensityMode during screen-share).
         let ios_device = is_ios();
         let visible = visible_action_bar_slots(
             &slots,
             SlotVisibility {
-                customize_mode: false,
+                customize_mode: is_customize,
                 ios_device,
                 has_screen_share: has_ss,
                 is_owner,
@@ -3171,36 +3316,60 @@ pub fn AttendantsComponent(
             },
         );
 
-        let is_vertical = dock != DockPosition::Bottom;
-
-        // Root font size (browser zoom / OS text scaling), so the button and
-        // spacing estimate tracks environments where 1rem > 16px.
-        let rem_px = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.document_element())
-            .and_then(|el| w_sys_computed_font_size(&el))
-            .unwrap_or(16.0);
-
-        // Sacred = Mic + Camera + Hangup — always visible.
         let primary_count = visible
             .iter()
             .filter(|s| matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
             .count();
+        let sacred_count = primary_count + 1; // +1 hangup
+
+        if is_customize {
+            if !overflowed_slots.peek().is_empty() {
+                overflowed_slots.set(Vec::new());
+            }
+            if *dock_wrapper_hidden.peek() {
+                dock_wrapper_hidden.set(false);
+            }
+            overflow_menu_open.set(false);
+            // Done lives in the wrapper, so a band without it strands the user.
+            let budget = overflow_budget_width(is_vertical, band_w, vh);
+            if !dock_wrapper_fits(budget, sacred_count, rem_px) {
+                save_action_bar_layout(&slots, &action_bar_hidden.peek().clone());
+                customize_mode.set(false);
+                post_drawer_resize_notice(
+                    resize_notice(DrawersToClose::default(), true),
+                    drawer_resize_notice,
+                    drawer_resize_notice_seq,
+                );
+                Timeout::new(0, || {
+                    focus_trigger_or_grid("dock-menu-trigger");
+                })
+                .forget();
+            }
+            return;
+        }
+
         let secondary: Vec<ActionBarSlot> = visible
             .iter()
             .copied()
             .filter(|s| !matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
             .collect();
-        let sacred_count = primary_count + 1; // +1 hangup
 
         // Pure, monotonic fit: widening only ever reveals more slots (issue
         // 2044). See `action_bar_overflow_hidden` for why full-size spacing is
         // budgeted at every width.
         let hidden =
-            action_bar_overflow_hidden(vw, vh, is_vertical, rem_px, sacred_count, &secondary);
+            action_bar_overflow_hidden(band_w, vh, is_vertical, rem_px, sacred_count, &secondary);
 
         if *overflowed_slots.peek() != hidden {
             overflowed_slots.set(hidden.clone());
+        }
+        let wrapper_gone = !dock_wrapper_fits(
+            overflow_budget_width(is_vertical, band_w, vh),
+            sacred_count,
+            rem_px,
+        );
+        if *dock_wrapper_hidden.peek() != wrapper_gone {
+            dock_wrapper_hidden.set(wrapper_gone);
         }
         // Close the overflow menu when nothing is hidden (e.g. user resized wider).
         if hidden.is_empty() && *overflow_menu_open.peek() {
@@ -3720,7 +3889,7 @@ pub fn AttendantsComponent(
     // drawer can mount the `PerformanceSettingsPanel` (sliders/Auto/meters) — the
     // panel moved out of the Settings modal into the drawer (#1131 unify).
     let perf_controls_sink: Signal<Option<PerfControlsHandle>> = use_signal(|| None);
-    // Issue 1768: "Show media metrics on tiles" preference. Seeded from
+    // Issue 1768: "Show diagnostics on tiles" preference. Seeded from
     // localStorage (default off), toggled by the diagnostics-drawer checkbox, and
     // read by every PeerTile via `MediaMetricsOverlayCtx`. A single shared signal
     // so toggling the checkbox shows/hides every tile's overlay reactively.
@@ -3741,6 +3910,13 @@ pub fn AttendantsComponent(
             device_settings_open.set(false);
             device_settings_initial_section.set(None);
             diagnostics_open.set(true);
+            apply_drawer_open_rule(
+                viewport_width,
+                DrawerKind::Diagnostics,
+                peer_list_open,
+                diagnostics_open,
+                chat_open,
+            );
         }
     });
 
@@ -3913,6 +4089,10 @@ pub fn AttendantsComponent(
     // Create the shared signal history map early so on_peer_removed can clean
     // up departed peers' histories. Provided as context alongside PeerStatusMap.
     let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
+    let peer_audio_liveness_map: PeerAudioLivenessMap = use_signal(HashMap::new);
+    // Issue 2660: `PeerList` unmounts with the drawer, so it cannot own these.
+    let roster_liveness: Rc<RosterLiveness> = use_hook(|| Rc::new(RosterLiveness::default()));
+    let roster_liveness_for_removal = roster_liveness.clone();
 
     // HCL bug #8 + #9: per-(peer, mode) signal-popup state map, owned by
     // the parent so PeerTile remounts (peer leaves, layout switches) do
@@ -4487,6 +4667,10 @@ pub fn AttendantsComponent(
                 // map does not grow unboundedly over long meetings.
                 let mut hist_map = peer_signal_history_map;
                 hist_map.write().remove(&peer_id);
+                let mut liveness_map = peer_audio_liveness_map;
+                liveness_map.write().remove(&peer_id);
+                // Issue 2660: the only place the liveness stamp may be dropped.
+                roster_liveness_for_removal.forget_departed(std::slice::from_ref(&peer_id));
                 // HCL bug #8: drop only this peer's open signal-meter popup
                 // entries; every other peer's popup state stays intact so
                 // their popups remain visible across the parent re-render.
@@ -6329,6 +6513,8 @@ pub fn AttendantsComponent(
     // (or create) their history entry. This survives PeerTile remounts caused
     // by layout switches (grid -> split when screen sharing starts).
     use_context_provider(|| peer_signal_history_map);
+    use_context_provider(|| peer_audio_liveness_map);
+    use_context_provider(|| roster_liveness.clone());
 
     // HCL bug #8 + #9: provide the popup-state map so PeerTile can look up
     // each popup's open/free-position state. Surviving the parent re-render
@@ -6360,6 +6546,8 @@ pub fn AttendantsComponent(
     use_context_provider(|| DockPositionCtx(dock_position));
     use_context_provider(|| AutohideCtx(autohide_enabled));
     use_context_provider(|| DensityModeCtx(density_mode));
+    use_context_provider(|| SelfViewPlacementCtx(self_view_placement));
+    use_context_provider(|| SelfViewVisibleCtx(self_view_visible));
     // Provide the decode-budget override so the settings UI (task 1a.5) can read
     // and mutate it. Exposed exactly like density: a single shared signal.
     use_context_provider(|| DecodeBudgetCtx(decode_budget_override));
@@ -7877,6 +8065,73 @@ pub fn AttendantsComponent(
         }
     });
 
+    // Issue 66: arm the cross-fade on the FIRST placement change of the session.
+    let mut prev_self_placement: Signal<Option<SelfViewPlacement>> = use_signal(|| None);
+    use_effect(move || {
+        let current = self_view_placement();
+        let previous = *prev_self_placement.peek();
+        if previous != Some(current) {
+            prev_self_placement.set(Some(current));
+            if previous.is_some() && !*self_view_animate.peek() {
+                self_view_animate.set(true);
+            }
+        }
+    });
+
+    // Issue 66: a re-show by ANY path retires the hide toast. Issue 2693: a hide
+    // by any path clears the announcer, so the next re-show is a real text
+    // mutation — `diff_vtext` emits nothing for an identical value.
+    //
+    // Subscribes to `self_view_visible` ONLY: `peek` does not subscribe, and a
+    // `set` inside an effect does not either.
+    use_effect(move || {
+        if self_view_visible() {
+            if *self_view_hidden_toast.peek() {
+                self_view_hidden_toast.set(false);
+                self_view_hidden_toast_timer.set(None);
+            }
+        } else {
+            let latched = !self_view_announce.peek().is_empty();
+            if latched {
+                self_view_announce.set(String::new());
+            }
+        }
+    });
+
+    // Issue 66 (WCAG 2.2.1): cancelled while the toast holds focus.
+    let arm_self_view_toast: Callback<()> = use_callback(move |_| {
+        let mut toast = self_view_hidden_toast;
+        let mut timer = self_view_hidden_toast_timer;
+        timer.set(None);
+        timer.set(Some(Timeout::new(12_000, move || {
+            toast.set(false);
+            timer.set(None);
+        })));
+    });
+
+    // Issue 66: a hide destroys the focused control, so focus moves deliberately.
+    use_effect(move || {
+        if !self_view_hidden_toast() {
+            return;
+        }
+        spawn(async move {
+            gloo_timers::future::TimeoutFuture::new(0).await;
+            let doc = gloo_utils::document();
+            let target = doc
+                .query_selector("[data-testid='self-view-undo-hide']")
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    doc.query_selector("[data-testid='camera-toggle-button']")
+                        .ok()
+                        .flatten()
+                });
+            if let Some(el) = target.and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok()) {
+                let _ = el.focus();
+            }
+        });
+    });
+
     // Check for config errors
     use_effect(move || {
         if let Err(e) = crate::constants::app_config() {
@@ -7961,6 +8216,57 @@ pub fn AttendantsComponent(
     if *decode_budget_natural.peek() != total_tiles {
         decode_budget_natural.set(total_tiles);
     }
+
+    // --- Screen share stack: tracks the order of peer screen shares (LIFO) ---
+    // Hoisted above the layout arithmetic: issue 66 needs `has_screen_share`.
+    let mut screen_share_stack: Signal<Vec<String>> = use_signal(Vec::new);
+    let active_screen_sharer: Option<String> = {
+        let mut stack = screen_share_stack.write();
+        // Remove peers who stopped sharing or left
+        stack.retain(|pid| {
+            display_peers.contains(pid) && client.is_screen_share_enabled_for_peer(pid)
+        });
+        // Add new sharers to the end (most recent = last)
+        for pid in &display_peers {
+            if client.is_screen_share_enabled_for_peer(pid) && !stack.contains(pid) {
+                // Skip self — local screen share is shown in the host preview
+                let peer_user_id = client.get_peer_user_id(pid).unwrap_or_else(|| pid.clone());
+                if user_id.as_deref() != Some(peer_user_id.as_str()) {
+                    stack.push(pid.clone());
+                }
+            }
+        }
+        stack.last().cloned()
+    };
+    let has_screen_share = active_screen_sharer.is_some();
+    // Keep the signal in sync so the overflow effect can react to screen-share changes.
+    if has_screen_share != *has_screen_share_sig.peek() {
+        has_screen_share_sig.set(has_screen_share);
+    }
+
+    // Hoisted: a user who may not stream gets no nav, so no cell may be reserved.
+    let is_allowed = users_allowed_to_stream().unwrap_or_default();
+    let latest_display_name = current_display_name();
+    let effective_user_id = user_id.as_deref().unwrap_or(&latest_display_name);
+    let can_stream =
+        is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
+
+    // Issue 66: `total_tiles` is the DECODE population, `self_layout_tiles` the CELL one.
+    let self_placement_pref = self_view_placement();
+    let effective_self_placement = crate::components::self_view::effective_self_placement(
+        self_placement_pref,
+        has_screen_share,
+    );
+    let self_counts = crate::components::self_view::self_tile_counts(
+        capped_real,
+        mock_count,
+        self_placement_pref,
+        self_view_visible() && can_stream,
+        has_screen_share,
+    );
+    let self_in_grid = self_counts.self_in_grid;
+    let self_cell = usize::from(self_in_grid);
+    let self_layout_tiles = self_counts.layout_count;
 
     // Render-driven Fixed -> Auto pressured-reset (HCL #987 review). Reads
     // `decode_budget_override` REACTIVELY so this effect re-runs the instant the
@@ -8171,16 +8477,22 @@ pub fn AttendantsComponent(
         0.0
     };
     let pad_top = pad_top + status_bar_reserve;
-    // Per-side resize cap reused by the drag handler below. The smaller of the
-    // absolute max and half the viewport. The DRAWER_MIN_WIDTH lower bound here is
-    // inert above the 568px breakpoint (where the CSS hides the resize handle on
-    // mobile, vw >= 568 always yields >= 284), but kept for safety if the
-    // breakpoint ever changes.
-    let max_for_side = (vw * 0.5).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS);
-    // Both drawers are overlay-only — they float over the tiles and never carve
-    // horizontal space out of the grid, so the available tile width is just the
-    // viewport minus padding.
-    let avail_w = (vw - pad_left - pad_right).max(0.0);
+    let drawer_state = DrawerState {
+        vw,
+        peer_list_open: peer_list_open(),
+        left_w: left_width(),
+        diagnostics_open: diagnostics_open(),
+        right_w: right_width(),
+        chat_open: chat_open(),
+    };
+    let reserves = drawer_reserves_memo();
+    let max_for_left = drawer_max_for_side(drawer_state, DrawerSide::Left);
+    let max_for_right = drawer_max_for_side(drawer_state, DrawerSide::Right);
+    let dragging_drawer = resizing_drawer() != ResizingDrawer::None;
+    let left_reserve_q = quantise_reserve(reserves.left_reserve, dragging_drawer);
+    let right_reserve_q = quantise_reserve(reserves.right_reserve, dragging_drawer);
+    let diag_reserve_q = quantise_reserve(reserves.chat_right_offset, dragging_drawer);
+    let avail_w = (vw - pad_left - pad_right - left_reserve_q - right_reserve_q).max(0.0);
     let avail_h = (vh - pad_top - pad_bottom).max(0.0);
 
     // --- Count active speakers for auto-density escalation ---
@@ -8203,7 +8515,7 @@ pub fn AttendantsComponent(
     let user_mode = density_mode();
     let effective_mode = compute_effective_density(
         user_mode,
-        total_tiles,
+        self_layout_tiles,
         avail_w,
         avail_h,
         gap,
@@ -8214,8 +8526,8 @@ pub fn AttendantsComponent(
 
     // --- Determine visible tile count ---
     let min_tw = effective_mode.min_tile_width(vw);
-    let effective_visible = {
-        let mut t = total_tiles;
+    let effective_visible_cells = {
+        let mut t = self_layout_tiles;
         while t > 1 {
             let (_c, _r, tw) = compute_layout(t, avail_w, avail_h, gap);
             if tw >= min_tw {
@@ -8225,6 +8537,8 @@ pub fn AttendantsComponent(
         }
         t
     };
+    let effective_visible =
+        crate::components::self_view::remote_capacity(effective_visible_cells, &self_counts);
 
     // --- Adaptive decode-budget actuator (issue #987, task 1a.3) ---
     // `effective_cap` is the real actuator: the ceiling on the number of RENDERED
@@ -8599,8 +8913,6 @@ pub fn AttendantsComponent(
         })
         .collect();
 
-    // --- Screen share stack: tracks the order of peer screen shares (LIFO) ---
-    let mut screen_share_stack: Signal<Vec<String>> = use_signal(Vec::new);
     let previous_active_decode_set: Rc<RefCell<HashSet<u64>>> =
         use_hook(|| Rc::new(RefCell::new(HashSet::new())));
     let previous_viewport_roster: Rc<RefCell<Vec<String>>> =
@@ -8610,29 +8922,6 @@ pub fn AttendantsComponent(
     // not on every render. Sibling of `previous_active_decode_set`.
     let previous_peer_tile_hints: Rc<RefCell<HashMap<u64, videocall_client::TileHint>>> =
         use_hook(|| Rc::new(RefCell::new(HashMap::new())));
-    let active_screen_sharer: Option<String> = {
-        let mut stack = screen_share_stack.write();
-        // Remove peers who stopped sharing or left
-        stack.retain(|pid| {
-            display_peers.contains(pid) && client.is_screen_share_enabled_for_peer(pid)
-        });
-        // Add new sharers to the end (most recent = last)
-        for pid in &display_peers {
-            if client.is_screen_share_enabled_for_peer(pid) && !stack.contains(pid) {
-                // Skip self — local screen share is shown in the host preview
-                let peer_user_id = client.get_peer_user_id(pid).unwrap_or_else(|| pid.clone());
-                if user_id.as_deref() != Some(peer_user_id.as_str()) {
-                    stack.push(pid.clone());
-                }
-            }
-        }
-        stack.last().cloned()
-    };
-    let has_screen_share = active_screen_sharer.is_some();
-    // Keep the signal in sync so the overflow effect can react to screen-share changes.
-    if has_screen_share != *has_screen_share_sig.peek() {
-        has_screen_share_sig.set(has_screen_share);
-    }
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     //
@@ -8862,19 +9151,21 @@ pub fn AttendantsComponent(
     // Must count BOTH decoded video tiles AND off-budget avatar tiles (task
     // 1a.4), because both occupy real grid cells. `avatar_tile_count` is 0 when
     // no budget cap is active, so `displayed_tile_count == visible_tile_count`
-    // and this is identical to the pre-1a.4 value.
-    let tile_count = displayed_tile_count + if overflow_count > 0 { 1 } else { 0 };
+    // and this is identical to the pre-1a.4 value. Issue 66 adds the self cell.
+    let tile_count = displayed_tile_count + if overflow_count > 0 { 1 } else { 0 } + self_cell;
 
     let container_style = if has_screen_share {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85).
-        // The container is full-bleed; the overlay drawers float over it without reflowing it.
+        // Inset by the drawer reserves; `left` AND `right` EVERY render, because
+        // per the note below a dropped longhand persists. (issue 2701)
         //
         // `--tile-w`/`--tile-h` MUST be set explicitly here (PR #1946). The
         // pinned split-tile chrome — `.split-peer-tile.grid-item-pinned` name
         // badge, top-icon cluster and camera-off placeholder in style.css —
         // scales off these custom properties. A pinned side-panel tile is
-        // `position: fixed; width/height: 100%` (it MAXIMIZES over the shared
-        // screen), so the vars must describe that maximized tile, which is the
+        // `position: fixed` with its insets from the drawer reserve vars (it
+        // MAXIMIZES over the shared screen, inside the band the drawers leave),
+        // so the vars must describe that maximized tile, which is the
         // single full meeting-area 3:2 tile (`screen_share_pinned_tile_size`),
         // NOT the small side-panel thumbnail and NOT a participant-count-
         // dependent grid cell.
@@ -8903,59 +9194,29 @@ pub fn AttendantsComponent(
         // under the bar while recording is active. 16px is the base top padding.
         let (ss_tw, ss_th) = screen_share_pinned_tile_size(avail_w, avail_h);
         let ss_pad_top = 16.0 + status_bar_reserve;
+        let (ss_left, ss_right) = (left_reserve_q, right_reserve_q);
+        let flow = screen_share_flow_style();
         format!(
-            "position: absolute; left: 0; right: 0; top: 0; bottom: 0; height: 100%; \
-             display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
+            "position: absolute; left: {ss_left:.0}px; right: {ss_right:.0}px; top: 0; bottom: 0; height: 100%; \
+             gap: 10px; \
              padding: {ss_pad_top:.0}px 16px 80px 16px; \
-             align-items: stretch; box-sizing: border-box; \
-             grid-template-columns: none; grid-template-rows: none; \
+             box-sizing: border-box; \
+             {flow} \
              --tile-w: {ss_tw:.0}px; --tile-h: {ss_th:.0}px;"
         )
     } else {
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
-        // Explicitly reset all flex properties so the transition from
-        // screen-share (flex) back to normal (grid) is clean.
         let (cols, rows, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
-        // Cell height tracks the same 3:2 ratio `.grid-item` is capped at, so
-        // the cell exactly fits the tile and `place-self: center` has no
-        // surplus to distribute. Using a wider ratio here would leave
-        // `tw - th * TILE_AR` of internal padding on every cell.
         let th = tw / TILE_AR;
-        // 1-tile case (HCL #7, 2-peer meeting): let the lone remote tile
-        // stretch to fill the entire grid area. The `.participants-1
-        // .grid-item.full-bleed` CSS rule drops the 3:2 cap on this lone
-        // tile so the remote peer fills the viewport — combined with `1fr`
-        // tracks and `stretch` packing, the tile reaches edge-to-edge.
-        // 2+ tiles (HCL #6): size tracks to the natural 3:2 tile dimensions
-        // and pack left/top so surplus viewport width sits on the right
-        // edge as empty space instead of being distributed between tiles.
-        // This is the only way to guarantee the 3:2 aspect holds in narrow
-        // viewports where `1fr` cells would be taller than `cell_w * 2/3`
-        // and `.grid-item { height: 100% }` would otherwise stretch the
-        // tile vertically. See HCL bug report for the 3-peer-aspect issue.
-        let (track_cols, track_rows, pack) = if tile_count == 1 {
-            (
-                format!("repeat({cols}, 1fr)"),
-                format!("repeat({rows}, 1fr)"),
-                "justify-content: stretch; align-content: stretch;",
-            )
-        } else {
-            (
-                format!("repeat({cols}, var(--tile-w))"),
-                format!("repeat({rows}, var(--tile-h))"),
-                "justify-content: start; align-content: start;",
-            )
-        };
+        let flow = tile_flow_style(tile_count, cols, rows);
+        let (grid_left, grid_right) = (left_reserve_q, right_reserve_q);
         format!(
-            "display: grid; \
-             position: absolute; top: 0; bottom: 0; left: 0; right: 0; \
+            "position: absolute; top: 0; bottom: 0; left: {grid_left:.0}px; right: {grid_right:.0}px; \
              gap: {gap:.0}px; \
              padding: {pad_top:.0}px {pad_right:.0}px {pad_bottom:.0}px {pad_left:.0}px; \
              box-sizing: border-box; overflow: hidden; \
-             flex-direction: unset; flex-wrap: unset; align-items: unset; \
              height: 100%; \
-             grid-template-columns: {track_cols}; grid-template-rows: {track_rows}; \
-             {pack} \
+             {flow} \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px; \
              --status-bar-reserve: {status_bar_reserve:.0}px;"
         )
@@ -8979,18 +9240,18 @@ pub fn AttendantsComponent(
     // and stall for a keyframe), and add `share-detached` so CSS hides the share
     // pane OFF-SCREEN (canvas stays composited) and expands the peer grid to full.
     let share_detached = has_screen_share && detached_share_signal.read().is_some();
+    // Scopes the wrap-mode item sizing in style.css. (issue 2700)
+    let tile_flow = if has_screen_share || tile_count == 1 {
+        "grid"
+    } else {
+        "wrap"
+    };
     let mut container_class = match (has_screen_share, share_detached) {
         (true, true) => format!("participants-{tile_count} has-screen-share share-detached"),
         (true, false) => format!("participants-{tile_count} has-screen-share"),
         (false, _) => format!("participants-{tile_count}"),
     };
-    // While the meeting-wide status bar is mounted, tag the grid so CSS can inset
-    // the ONE tile type that escapes the grid `pad_top`: the `position: fixed`
-    // `.grid-item.full-bleed` single-remote-peer tile (the 2-participant case).
-    // In-flow multi-tile layouts are already handled by the `pad_top` reserve
-    // above; only the fixed full-bleed tile needs the CSS top inset (it reads the
-    // `--status-bar-reserve` px value set in `container_style`). Empty when idle,
-    // so the tile expands back to the full viewport the moment the bar unmounts.
+    // `.grid-item.full-bleed` is absolute, so `inset: 0` is the PADDING box.
     if status_bar_reserve > 0.0 {
         container_class.push_str(" status-bar-active");
     }
@@ -9000,11 +9261,6 @@ pub fn AttendantsComponent(
         format!("{}/meeting/{}", origin, id)
     };
 
-    let is_allowed = users_allowed_to_stream().unwrap_or_default();
-    let latest_display_name = current_display_name();
-    let effective_user_id = user_id.as_deref().unwrap_or(&latest_display_name);
-    let can_stream =
-        is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
     // ── Stable-identity child callbacks (issue 2103) ──────────────────────
     //
     // These are `use_callback`, not per-render closures / `EventHandler::new`.
@@ -9396,6 +9652,104 @@ pub fn AttendantsComponent(
         }
     });
 
+    // Issue 2693: announce a re-show and move focus off the pill that unmounts.
+    // `use_callback` for the issue-2103 identity contract — a prop-site closure
+    // would defeat `SelfViewHiddenPillProps::memoize` on every parent render.
+    let show_self_view: EventHandler<()> = use_callback(move |_| {
+        self_view_announce
+            .set(crate::components::self_view::SELF_VIEW_SHOWN_ANNOUNCEMENT.to_string());
+        spawn(async move {
+            gloo_timers::future::TimeoutFuture::new(0).await;
+            let doc = gloo_utils::document();
+            // `.self-tile-action` is `visibility: hidden` until hover or
+            // `:focus-within`, and a hidden element cannot take focus, so each
+            // attempt is verified. `#grid-container` has no `:focus-visible`.
+            for testid in ["self-view-hide-button", "camera-toggle-button"] {
+                if let Some(el) = doc
+                    .query_selector(&format!("[data-testid='{testid}']"))
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+                {
+                    let _ = el.focus();
+                }
+                let landed = doc
+                    .active_element()
+                    .and_then(|a| a.get_attribute("data-testid"))
+                    .is_some_and(|t| t == testid);
+                if landed {
+                    return;
+                }
+            }
+            if let Some(grid) = doc
+                .query_selector("#grid-container")
+                .ok()
+                .flatten()
+                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let _ = grid.focus();
+            }
+        });
+    });
+
+    // Issue 2693: dismissing retires the toast only — it never touches
+    // visibility or the stored preference. Focus moves only when the toast was
+    // holding it, so an Escape from elsewhere leaves the user where they are.
+    let dismiss_self_view_toast: Callback<()> = use_callback(move |_| {
+        use crate::components::self_view as sv;
+        let mut toast = self_view_hidden_toast;
+        let mut timer = self_view_hidden_toast_timer;
+        let doc = gloo_utils::document();
+        // Read before the toast unmounts and takes the answer with it.
+        let focus_was_inside = doc
+            .active_element()
+            .and_then(|a| {
+                a.closest(sv::SELF_VIEW_HIDDEN_TOAST_SELECTOR)
+                    .ok()
+                    .flatten()
+            })
+            .is_some();
+        toast.set(false);
+        timer.set(None);
+        spawn(async move {
+            gloo_timers::future::TimeoutFuture::new(0).await;
+            let doc = gloo_utils::document();
+            let icon_present = doc
+                .query_selector(sv::SELF_VIEW_SHOW_BUTTON_SELECTOR)
+                .ok()
+                .flatten()
+                .is_some();
+            let Some(selector) =
+                sv::self_view_toast_dismiss_focus_target(focus_was_inside, icon_present)
+            else {
+                return;
+            };
+            if let Some(el) = doc
+                .query_selector(selector)
+                .ok()
+                .flatten()
+                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let _ = el.focus();
+                if doc
+                    .active_element()
+                    .is_some_and(|a| a.is_same_node(Some(&el)))
+                {
+                    return;
+                }
+            }
+            // `#grid-container` is `tabindex="-1"` (issue 1175).
+            if let Some(grid) = doc
+                .query_selector("#grid-container")
+                .ok()
+                .flatten()
+                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let _ = grid.focus();
+            }
+        });
+    });
+
     // --- Pre-join screen ---
     if !meeting_joined() {
         // Every device joins regardless of capabilities (issue #1054): the
@@ -9763,8 +10117,12 @@ pub fn AttendantsComponent(
         // push would strand a stale cap and the small tile would keep pulling the high
         // layer until the next layout change (#1256). `&&` short-circuits left-to-right, so
         // set_peer_tile_hints is only called when the map actually changed.
+        //
         let mut prev = previous_peer_tile_hints.borrow_mut();
-        if *prev != peer_tile_hints && client.set_peer_tile_hints(peer_tile_hints.clone()) {
+        if *resizing_drawer.peek() == ResizingDrawer::None
+            && *prev != peer_tile_hints
+            && client.set_peer_tile_hints(peer_tile_hints.clone())
+        {
             *prev = peer_tile_hints.clone();
         }
     }
@@ -9773,7 +10131,17 @@ pub fn AttendantsComponent(
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
-            style:"display:flex;gap:var(--space-2)",
+            // The only common ancestor of `#main-container` and `ChatSidebar`.
+            class: if dragging_drawer { "drawers-dragging" } else { "" },
+            "data-dock": dock_position().css_class(),
+            style: format!(
+                "display:flex;gap:var(--space-2);\
+                 --drawer-left-reserve:{left_reserve_q:.0}px;\
+                 --drawer-right-reserve:{right_reserve_q:.0}px;\
+                 --drawer-diag-reserve:{diag_reserve_q:.0}px;\
+                 --chat-drawer-width:{:.0}px",
+                reserves.chat_render_w
+            ),
             div { id: "main-container", class: "meeting-page",
                 onclick: move |evt: MouseEvent| {
                     dock_menu_open.set(false);
@@ -9836,15 +10204,22 @@ pub fn AttendantsComponent(
                             evt.prevent_default();
                             mock_peers_open.set(false);
                             focus_element_by_id("mock-peers-trigger");
-                        } else if let Some(target) =
-                            esc_panel_close_target(diagnostics_open(), peer_list_open())
-                        {
+                        } else if let Some(target) = esc_panel_close_target(
+                            diagnostics_open(),
+                            peer_list_open(),
+                            self_view_hidden_toast(),
+                        ) {
                             evt.prevent_default();
                             match target {
                                 EscCloseTarget::Diagnostics => diagnostics_open.set(false),
                                 EscCloseTarget::PeerList => peer_list_open.set(false),
+                                EscCloseTarget::SelfViewToast => {
+                                    dismiss_self_view_toast.call(())
+                                }
                             }
-                            focus_element_by_id(target.trigger_id());
+                            if let Some(id) = target.trigger_id() {
+                                focus_element_by_id(id);
+                            }
                         }
                     } else if density_open()
                         && (key == Key::ArrowDown
@@ -9912,8 +10287,22 @@ pub fn AttendantsComponent(
                     || !matches!(record_state(), RecordButtonState::Idle)
                     || recording_saved_toast()
                     || recording_error_toast()
+                    || self_view_hidden_toast()
+                    || drawer_resize_notice().is_some()
                 {
                     div { class: "peer-toasts",
+                        if let Some((seq, msg)) = drawer_resize_notice() {
+                            div {
+                                key: "{seq}",
+                                class: "peer-toast",
+                                "data-testid": "drawer-resize-notice",
+                                role: "status",
+                                aria_live: "polite",
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "{msg}" }
+                                }
+                            }
+                        }
                         // Local recording status banner — visible only to the participant who started recording.
                         {
                             let label = match record_state() {
@@ -10218,6 +10607,56 @@ pub fn AttendantsComponent(
                                 }
                             }
                         }
+                        if self_view_hidden_toast() {
+                            div {
+                                class: "peer-toast self-view-hidden-toast",
+                                role: "status",
+                                aria_live: "polite",
+                                onfocusin: move |_| self_view_hidden_toast_timer.set(None),
+                                onfocusout: move |_| arm_self_view_toast.call(()),
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Self view hidden." }
+                                    br {}
+                                    span { class: "toast-action",
+                                        "Only affects your view — others still see you."
+                                    }
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "toast-undo-btn",
+                                    "data-testid": "self-view-undo-hide",
+                                    "aria-label": "Undo hiding the self view",
+                                    onclick: move |_| {
+                                        self_view_visible.set(true);
+                                        save_self_view_visible(true);
+                                        self_view_announce.set(
+                                            crate::components::self_view::SELF_VIEW_SHOWN_ANNOUNCEMENT
+                                                .to_string(),
+                                        );
+                                        self_view_hidden_toast.set(false);
+                                        self_view_hidden_toast_timer.set(None);
+                                    },
+                                    "Undo"
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "toast-close-btn",
+                                    "data-testid": "self-view-toast-close",
+                                    "aria-label": "Dismiss message",
+                                    onclick: move |_| dismiss_self_view_toast.call(()),
+                                    svg {
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2.5",
+                                        stroke_linecap: "round",
+                                        "aria-hidden": "true",
+                                        line { x1: "18", y1: "6", x2: "6", y2: "18" }
+                                        line { x1: "6", y1: "6", x2: "18", y2: "18" }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -10225,7 +10664,7 @@ pub fn AttendantsComponent(
                 // tab-reachable) so focus can land on the grid as a sensible
                 // fallback when a detached shared-content tile unmounts (presenter
                 // stops) and the detach toggle that would receive focus is gone.
-                div { id: "grid-container", tabindex: "-1", class: "{container_class}", style: "{container_style}",
+                div { id: "grid-container", tabindex: "-1", class: "{container_class}", "data-tile-flow": tile_flow, style: "{container_style}",
                     onmousemove: move |evt| {
                         if ss_resizing() {
                             let native = evt.as_web_event();
@@ -10480,7 +10919,10 @@ pub fn AttendantsComponent(
                             {
                                 let is_mock = tile_id.starts_with("mock-");
                                 let full_bleed = !is_mock
-                                    && sole_real_tile
+                                    && crate::components::self_view::remote_full_bleed(
+                                        sole_real_tile,
+                                        &self_counts,
+                                    )
                                     && !client.is_screen_share_enabled_for_peer(tile_id);
                                 let force_avatar = *tile_render_mode == TileRenderMode::Avatar;
                                 if is_mock {
@@ -10621,6 +11063,10 @@ pub fn AttendantsComponent(
                             class: "host",
                             style: "box-shadow: none; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;",
                             "data-speaking": if local_speaking() { "true" } else { "false" },
+                            "data-self-placement": crate::components::self_view::self_placement_attr(effective_self_placement),
+                            "data-self-hidden": if self_view_visible() { "false" } else { "true" },
+                            "data-self-full-bleed": if crate::components::self_view::self_full_bleed(&self_counts) { "true" } else { "false" },
+                            "data-self-animate": if self_view_animate() { "true" } else { "false" },
                             onmounted: move |evt| {
                                 if let Some(elem) = evt.try_as_web_event() {
                                     host_el.set(Some(elem));
@@ -10654,6 +11100,14 @@ pub fn AttendantsComponent(
                                             ""
                                         }
                                     }
+                                }
+                                // Issue 66: silent on hide; the toast carries that.
+                                div {
+                                    class: "visually-hidden",
+                                    role: "status",
+                                    "aria-live": "polite",
+                                    "data-testid": "self-view-announcer",
+                                    {self_view_announce()}
                                 }
                                 // Second live region dedicated to keyboard-reorder
                                 // feedback.  `aria-atomic=true` forces the whole
@@ -11236,13 +11690,6 @@ pub fn AttendantsComponent(
                                                                     }
                                                                 }
                                                             }
-                                                            ActionBarSlot::Chat => rsx! {
-                                                                ChatButtonWithBadge {
-                                                                    chat_has_unread,
-                                                                    chat_open,
-                                                                    describedby: slot_describedby,
-                                                                }
-                                                            },
                                                             ActionBarSlot::ScreenShare => {
                                                                 let is_active = matches!(screen_share_state(), ScreenShareState::Active);
                                                                 let is_disabled = matches!(
@@ -11365,6 +11812,13 @@ pub fn AttendantsComponent(
                                                                             reactions_open.set(false);
                                                                             dock_menu_open.set(false);
                                                                             mock_peers_open.set(false);
+                                                                            apply_drawer_open_rule(
+                                                                                viewport_width,
+                                                                                DrawerKind::PeerList,
+                                                                                peer_list_open,
+                                                                                diagnostics_open,
+                                                                                chat_open,
+                                                                            );
                                                                         }
                                                                     },
                                                                 }
@@ -11453,6 +11907,13 @@ pub fn AttendantsComponent(
                                                                             dock_menu_open.set(false);
                                                                             mock_peers_open.set(false);
                                                                             meeting_options_open.set(false);
+                                                                            apply_drawer_open_rule(
+                                                                                viewport_width,
+                                                                                DrawerKind::Diagnostics,
+                                                                                peer_list_open,
+                                                                                diagnostics_open,
+                                                                                chat_open,
+                                                                            );
                                                                         }
                                                                     },
                                                                 }
@@ -11847,6 +12308,13 @@ pub fn AttendantsComponent(
                                                                                         reactions_open.set(false);
                                                                                         dock_menu_open.set(false);
                                                                                         mock_peers_open.set(false);
+                                                                                        apply_drawer_open_rule(
+                                                                                            viewport_width,
+                                                                                            DrawerKind::PeerList,
+                                                                                            peer_list_open,
+                                                                                            diagnostics_open,
+                                                                                            chat_open,
+                                                                                        );
                                                                                     }
                                                                                 }
                                                                                 ActionBarSlot::DensityMode => {
@@ -11868,6 +12336,13 @@ pub fn AttendantsComponent(
                                                                                         dock_menu_open.set(false);
                                                                                         mock_peers_open.set(false);
                                                                                         meeting_options_open.set(false);
+                                                                                        apply_drawer_open_rule(
+                                                                                            viewport_width,
+                                                                                            DrawerKind::Diagnostics,
+                                                                                            peer_list_open,
+                                                                                            diagnostics_open,
+                                                                                            chat_open,
+                                                                                        );
                                                                                     }
                                                                                 }
                                                                                 ActionBarSlot::DeviceSettings => {
@@ -11898,9 +12373,6 @@ pub fn AttendantsComponent(
                                                                                         dock_menu_open.set(false);
                                                                                         mock_peers_open.set(false);
                                                                                     }
-                                                                                }
-                                                                                ActionBarSlot::Chat => {
-                                                                                    chat_open.set(!chat_open());
                                                                                 }
                                                                                 // Issue #1884: open the reactions palette
                                                                                 // from the overflow menu (mirrors density).
@@ -11950,8 +12422,8 @@ pub fn AttendantsComponent(
                                                                                 // overflow is the host's most likely FIRST
                                                                                 // encounter with this control. It is also
                                                                                 // the host's ONLY route to it on a bar
-                                                                                // narrower than the 1103px this slot pushed
-                                                                                // the full-fit threshold to. Without this
+                                                                                // narrower than the threshold this slot
+                                                                                // pushed up. Without this
                                                                                 // arm the item rendered (the icon and label
                                                                                 // arms both exist) and did nothing but
                                                                                 // close the menu.
@@ -11986,9 +12458,8 @@ pub fn AttendantsComponent(
                                         }
                                         } // close action-bar-overflow-wrapper div
                                         // (а) Dock position dropdown — not customizable (houses Customize/Reset)
-                                        // Hidden when overflow is active to save space for sacred buttons.
                                         div { class: "dock-position-wrapper",
-                                            style: if !overflowed_slots.read().is_empty() && !customize_mode() {
+                                            style: if dock_wrapper_hidden() && !customize_mode() {
                                                 "order: 90; display: none"
                                             } else {
                                                 "order: 90"
@@ -12645,7 +13116,6 @@ pub fn AttendantsComponent(
                                                             ActionBarSlot::Diagnostics => rsx! { DiagnosticsButton { open: diagnostics_open(), onclick: |_| {} } },
                                                             ActionBarSlot::DeviceSettings => rsx! { DeviceSettingsButton { open: device_settings_open(), onclick: |_| {} } },
                                                             ActionBarSlot::Recording => rsx! { RecordButton { state: record_state(), onclick: |_| {} } },
-                                                            ActionBarSlot::Chat => rsx! { ChatButtonWithBadge { chat_has_unread, chat_open } },
                                                             ActionBarSlot::MeetingOptions => rsx! { MeetingOptionsButton { open: meeting_options_open(), onclick: |_| {} } },
                                                             ActionBarSlot::MeetingTimer => rsx! { MeetingTimerButton { open: false, running: false, onclick: |_| {} } },
                                                         }
@@ -12860,6 +13330,8 @@ pub fn AttendantsComponent(
                                         }
                                     },
                                     reload_devices_counter: reload_devices_counter(),
+                                    self_in_grid,
+                                    self_hidden: !self_view_visible(),
                                     publish_diagnostics_reader: diagnostics_reader_sink,
                                     // Host publishes its Performance controls handle
                                     // here so the Diagnostics drawer can mount the
@@ -12872,16 +13344,16 @@ pub fn AttendantsComponent(
                             }
                             // Issue 1885: the self-view's top-right chrome — the
                             // connection LED, the WT/WS transport badge (#1885),
-                            // and the RTT quality warning — share ONE flex cluster
+                            // and the signal meter — share ONE flex cluster
                             // (mirroring the peer tiles' `.tile-top-icons`, where
                             // the badge sits adjacent to the signal meter). Before,
                             // each was absolutely pinned to the same top-right
                             // corner: the badge (#1885) landed under the LED (and
-                            // overlapped the quality pill), so they stacked instead
+                            // overlapped the meter), so they stacked instead
                             // of sitting side by side. As flex items they lay out
                             // in a row with a gap and never overlap, in any
-                            // combination (badge only-when-flag-on, quality
-                            // only-when-degraded). Row-reverse keeps the LED at the
+                            // combination (badge only-when-flag-on).
+                            // Row-reverse keeps the LED at the
                             // far-right corner it has always occupied.
                             {
                                 let status_client = client.clone();
@@ -12894,7 +13366,8 @@ pub fn AttendantsComponent(
                                 // (appears once elected; tracks reconnect / WT→WS
                                 // fallback). Only `Some(Wt|Ws)` renders.
                                 let self_badge_transport: Option<TransportBadge> =
-                                    if call_start_time().is_some()
+                                    if media_metrics_overlay_enabled()
+                                        && call_start_time().is_some()
                                         && transport_badge_enabled().unwrap_or(false)
                                     {
                                         match status_client.active_transport() {
@@ -12913,8 +13386,38 @@ pub fn AttendantsComponent(
                                             class: if status_client.is_connected() { "connection-led connected" } else { "connection-led connecting" },
                                             title: if status_client.is_connected() { "Connected" } else { "Connecting" },
                                         }
+                                        // Issue 2661: row-reverse, so this order
+                                        // paints LED, signal, badge, hand.
+                                        ConnectionQualityIndicator {
+                                            // Mirrors the toolbar's Diagnostics
+                                            // handler: a TOGGLE, and opening
+                                            // closes the other panels. An
+                                            // open-only control leaves the
+                                            // drawer with no second press to
+                                            // dismiss it, and skipping the
+                                            // exclusivity set lets two panels
+                                            // sit open at once.
+                                            on_open_diagnostics: move |_| {
+                                                let opening = !diagnostics_open();
+                                                diagnostics_open.set(opening);
+                                                if opening {
+                                                    device_settings_open.set(false);
+                                                    density_open.set(false);
+                                                    reactions_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+                                                    meeting_options_open.set(false);
+                                                    apply_drawer_open_rule(
+                                                        viewport_width,
+                                                        DrawerKind::Diagnostics,
+                                                        peer_list_open,
+                                                        diagnostics_open,
+                                                        chat_open,
+                                                    );
+                                                }
+                                            },
+                                        }
                                         {transport_badge(self_badge_transport, true)}
-                                        ConnectionQualityIndicator {}
                                         // Issue 2135: the SELF tile's raised-hand
                                         // badge. It belongs HERE and not in
                                         // `peer_tile.rs`: `display_peers` filters
@@ -12940,9 +13443,91 @@ pub fn AttendantsComponent(
                                                 }
                                             }
                                         }
+                                        // Issue 66: two more members of this cluster.
+                                        button {
+                                            r#type: "button",
+                                            class: "self-tile-action",
+                                            "data-testid": "self-view-hide-button",
+                                            "aria-label": "Hide self view",
+                                            title: "Hide self view",
+                                            onclick: move |evt: MouseEvent| {
+                                                // Tile-overlay control, not a grid click — issue 1790.
+                                                evt.stop_propagation();
+                                                self_view_visible.set(false);
+                                                save_self_view_visible(false);
+                                                self_view_announce.set(String::new());
+                                                self_view_hidden_toast.set(true);
+                                                arm_self_view_toast.call(());
+                                            },
+                                            svg {
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2.5",
+                                                stroke_linecap: "round",
+                                                line { x1: "18", y1: "6", x2: "6", y2: "18" }
+                                                line { x1: "6", y1: "6", x2: "18", y2: "18" }
+                                            }
+                                        }
+                                        // A share corner-pins the tile, so this would no-op.
+                                        if !has_screen_share {
+                                            button {
+                                                r#type: "button",
+                                                class: "self-tile-action",
+                                                "data-testid": "self-view-placement-toggle",
+                                                "aria-label": crate::components::self_view::placement_toggle_label(effective_self_placement),
+                                                title: crate::components::self_view::placement_toggle_label(effective_self_placement),
+                                                onclick: move |evt: MouseEvent| {
+                                                    // Tile-overlay control, not a grid click — issue 1790.
+                                                    evt.stop_propagation();
+                                                    let next = crate::components::self_view::toggled_placement(
+                                                        *self_view_placement.peek(),
+                                                    );
+                                                    self_view_placement.set(next);
+                                                    save_self_view_placement(next);
+                                                    self_view_announce.set(
+                                                        crate::components::self_view::self_view_announcement(
+                                                            next,
+                                                        )
+                                                        .to_string(),
+                                                    );
+                                                    // Re-asserted: a reorder blurs it in some engines.
+                                                    spawn(async move {
+                                                        gloo_timers::future::TimeoutFuture::new(0).await;
+                                                        if let Some(el) = gloo_utils::document()
+                                                            .query_selector("[data-testid='self-view-placement-toggle']")
+                                                            .ok()
+                                                            .flatten()
+                                                            .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+                                                        {
+                                                            let _ = el.focus();
+                                                        }
+                                                    });
+                                                },
+                                                svg {
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    rect { x: "3", y: "3", width: "8", height: "8", rx: "1" }
+                                                    rect { x: "13", y: "13", width: "8", height: "8", rx: "1" }
+                                                    path { d: "M13 7h6m0 0-2.5-2.5M19 7l-2.5 2.5" }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
+
+                            if self_in_grid {
+                                h4 { class: "floating-name self-tile-name", dir: "auto",
+                                    span { class: "floating-name-text", {current_display_name()} }
+                                    span { class: "self-indicator", "You" }
+                                }
+                            }
+
                         }
                     }
 
@@ -12985,14 +13570,21 @@ pub fn AttendantsComponent(
                     // instead of this RSX and every keyed `PeerTile` under it.
                     MeetingTimerChip {}
                     MeetingTimerLiveRegion {}
+
+                    // Issue 2693: last, self-gating and absolute, as above.
+                    SelfViewHiddenPill {
+                        can_stream,
+                        toast_present: self_view_hidden_toast(),
+                        settings_open: device_settings_open(),
+                        on_show: show_self_view,
+                    }
                 }
 
                 // Peer list sidebar
                 div {
                     id: "peer-list-container",
                     class: if peer_list_open() { "visible" } else { "" },
-                    // Overlay drawer: floats over the tiles at its (resizable) width.
-                    style: format!("width: {}px", left_width()),
+                    style: format!("width: {:.0}px", reserves.left_render_w),
                     // Clicks INSIDE the peer list must not bubble to
                     // `#main-container` — otherwise the background light-dismiss
                     // (issue #1790) would treat an in-panel click as an outside
@@ -13031,6 +13623,7 @@ pub fn AttendantsComponent(
                             role: "separator",
                             aria_orientation: "vertical",
                             aria_label: "Resize panel",
+                            aria_disabled: if handle_is_inert(max_for_left) { "true" } else { "false" },
                             tabindex: "0",
                             // keyboard resize is a follow-up
                             // Pointer capture: on pointerdown the handle captures the
@@ -13042,7 +13635,12 @@ pub fn AttendantsComponent(
                                 let lp = left_raf_pending.clone();
                                 move |evt: PointerEvent| {
                                     evt.prevent_default();
+                                    // Inert: no capture, no state, no write. (2701)
+                                    if handle_is_inert(max_for_left) {
+                                        return;
+                                    }
                                     resizing_drawer.set(ResizingDrawer::Left);
+                                    drag_start_width.set(left_width());
                                     // Start a fresh drag with no valid stash yet: the flush in
                                     // pointerup is skipped until a real pointermove sets this.
                                     lv.set(false);
@@ -13091,7 +13689,7 @@ pub fn AttendantsComponent(
                                                 if resizing_drawer() == ResizingDrawer::Left {
                                                     let x = x_cell.get();
                                                     left_width.set(
-                                                        x.clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                        x.clamp(DRAWER_MIN_WIDTH, max_for_left),
                                                     );
                                                 }
                                                 pending_cell.set(false);
@@ -13121,10 +13719,10 @@ pub fn AttendantsComponent(
                                         // its default and must not overwrite the current width.
                                         if lv.get() {
                                             left_width.set(
-                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_left),
                                             );
                                             // Persist on drag-end only; value is already clamped.
-                                            save_f64("vc_drawer_left_width", left_width());
+                                            if left_width() != drag_start_width() { save_f64("vc_drawer_left_width", left_width()); }
                                         }
                                         resizing_drawer.set(ResizingDrawer::None);
                                     }
@@ -13149,10 +13747,10 @@ pub fn AttendantsComponent(
                                         lp.set(false);
                                         if lv.get() {
                                             left_width.set(
-                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_left),
                                             );
                                             // Persist on cancel; value is already clamped.
-                                            save_f64("vc_drawer_left_width", left_width());
+                                            if left_width() != drag_start_width() { save_f64("vc_drawer_left_width", left_width()); }
                                         }
                                         resizing_drawer.set(ResizingDrawer::None);
                                     }
@@ -13179,10 +13777,10 @@ pub fn AttendantsComponent(
                                         lp.set(false);
                                         if lv.get() {
                                             left_width.set(
-                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_left),
                                             );
                                             // Persist on lost-capture; value is already clamped.
-                                            save_f64("vc_drawer_left_width", left_width());
+                                            if left_width() != drag_start_width() { save_f64("vc_drawer_left_width", left_width()); }
                                         }
                                         resizing_drawer.set(ResizingDrawer::None);
                                     }
@@ -13316,15 +13914,19 @@ pub fn AttendantsComponent(
                         // for the migrated Performance panel in the drawer's
                         // "Quality controls" group. (#1131 unify)
                         perf_controls: perf_controls_sink(),
-                        // Overlay drawer: floats over the tiles at its (resizable) width.
-                        width: right_width(),
+                        width: reserves.diag_render_w,
+                        resize_inert: handle_is_inert(max_for_right),
                         // The right handle lives in diagnostics.rs (no access to the width
                         // signals), so it forwards pointer events here where the math runs.
                         on_resize_start: {
                             let rv = right_raf_valid.clone();
                             let rp = right_raf_pending.clone();
                             move |_| {
+                                if handle_is_inert(max_for_right) {
+                                    return;
+                                }
                                 resizing_drawer.set(ResizingDrawer::Right);
+                                drag_start_width.set(right_width());
                                 // Cache start-of-drag viewport width (not re-read per move).
                                 drag_start_vw.set(vw);
                                 // Start a fresh drag with no valid stash yet: the flush in
@@ -13365,7 +13967,7 @@ pub fn AttendantsComponent(
                                                 let x = x_cell.get();
                                                 right_width.set(
                                                     (start_vw() - x)
-                                                        .clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                        .clamp(DRAWER_MIN_WIDTH, max_for_right),
                                                 );
                                             }
                                             pending_cell.set(false);
@@ -13398,10 +14000,10 @@ pub fn AttendantsComponent(
                                     if rv.get() {
                                         right_width.set(
                                             (drag_start_vw() - rx.get())
-                                                .clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                .clamp(DRAWER_MIN_WIDTH, max_for_right),
                                         );
                                         // Persist on drag-end only; value is already clamped.
-                                        save_f64("vc_drawer_right_width", right_width());
+                                        if right_width() != drag_start_width() { save_f64("vc_drawer_right_width", right_width()); }
                                     }
                                     resizing_drawer.set(ResizingDrawer::None);
                                 }
@@ -13421,7 +14023,7 @@ pub fn AttendantsComponent(
                     div {
                         id: "diagnostics-sidebar",
                         class: "",
-                        style: format!("width: {}px", right_width()),
+                        style: format!("width: {:.0}px", reserves.diag_render_w),
                         // No `role`/`aria-label` on the EMPTY closed placeholder: a
                         // labelled landmark with no content would announce an empty
                         // region to a screen reader. The open `Diagnostics` root
@@ -13878,28 +14480,6 @@ pub fn AttendantsComponent(
                     }
                 }
             }
-            // Chat sidebar
-                ChatSidebar {
-                    is_show: chat_open(),
-                    onclose: move |_| chat_open.set(false),
-                    conv_id: id.clone(),
-                    // View-only for non-hosts when the host has restricted chat:
-                    // everyone can READ, but only hosts may SEND unless
-                    // `chat_allowed_for_all` is on. Read the toggle reactively so
-                    // a mid-meeting flip enables/disables the composer live.
-                    can_send: crate::components::chat_sidebar::chat_send_allowed(
-                        is_owner,
-                        chat_allowed_for_all_toggle(),
-                    ),
-                    on_new_message: move |_| {
-                        // Event closure — not a reactive render-body read.
-                        // `peek()` keeps it explicitly non-subscribing so the
-                        // badge flip stays scoped to ChatButtonWithBadge.
-                        if !*chat_has_unread.peek() {
-                            chat_has_unread.set(true);
-                        }
-                    },
-                }
         }
     }
 }
@@ -14679,6 +15259,184 @@ mod tests {
         );
     }
 
+    /// Issue 2693 + 2103: the pill memoizes only while `on_show` keeps one identity.
+    #[test]
+    fn self_view_hidden_pill_props_memoize_only_with_a_stable_callback_identity() {
+        use crate::components::self_view_hidden_pill::SelfViewHiddenPillProps;
+        use dioxus_core::Properties;
+
+        thread_local! {
+            static MEMOIZED: Cell<(bool, bool, bool, bool, bool)> =
+                const { Cell::new((false, false, false, false, false)) };
+        }
+
+        #[allow(non_snake_case)]
+        fn MemoProbe() -> Element {
+            let show: EventHandler<()> = use_callback(|_: ()| {});
+
+            let mut a = SelfViewHiddenPillProps::builder()
+                .can_stream(true)
+                .toast_present(false)
+                .settings_open(false)
+                .on_show(show)
+                .build();
+            let b = SelfViewHiddenPillProps::builder()
+                .can_stream(true)
+                .toast_present(false)
+                .settings_open(false)
+                .on_show(show)
+                .build();
+            let all_stable = a.memoize(&b);
+
+            let mut c = SelfViewHiddenPillProps::builder()
+                .can_stream(true)
+                .toast_present(false)
+                .settings_open(false)
+                .on_show(show)
+                .build();
+            let d = SelfViewHiddenPillProps::builder()
+                .can_stream(false)
+                .toast_present(false)
+                .settings_open(false)
+                .on_show(show)
+                .build();
+            let gate_changed = c.memoize(&d);
+
+            let mut g = SelfViewHiddenPillProps::builder()
+                .can_stream(true)
+                .toast_present(false)
+                .settings_open(false)
+                .on_show(show)
+                .build();
+            let h = SelfViewHiddenPillProps::builder()
+                .can_stream(true)
+                .toast_present(true)
+                .settings_open(false)
+                .on_show(show)
+                .build();
+            let toast_changed = g.memoize(&h);
+
+            let mut i = SelfViewHiddenPillProps::builder()
+                .can_stream(true)
+                .toast_present(false)
+                .settings_open(true)
+                .on_show(show)
+                .build();
+            let j = SelfViewHiddenPillProps::builder()
+                .can_stream(true)
+                .toast_present(false)
+                .settings_open(false)
+                .on_show(show)
+                .build();
+            let settings_changed = i.memoize(&j);
+
+            let mut e = SelfViewHiddenPillProps::builder()
+                .can_stream(true)
+                .toast_present(false)
+                .settings_open(false)
+                .on_show(|_: ()| {})
+                .build();
+            let f = SelfViewHiddenPillProps::builder()
+                .can_stream(true)
+                .toast_present(false)
+                .settings_open(false)
+                .on_show(|_: ()| {})
+                .build();
+            let per_render = e.memoize(&f);
+
+            MEMOIZED.with(|m| {
+                m.set((
+                    all_stable,
+                    gate_changed,
+                    toast_changed,
+                    settings_changed,
+                    per_render,
+                ))
+            });
+            rsx! { div {} }
+        }
+
+        let mut vdom = VirtualDom::new(MemoProbe);
+        vdom.rebuild_in_place();
+        let (all_stable, gate_changed, toast_changed, settings_changed, per_render) =
+            MEMOIZED.with(|m| m.get());
+
+        assert!(
+            all_stable,
+            "issue 2693: a stable `on_show` and unchanged flags must memoize, \
+             so a parent-only re-render (a resize drag) does not re-diff the pill"
+        );
+        assert!(
+            !gate_changed,
+            "a changed `can_stream` must NOT memoize — the pill's own render gate \
+             reads it, so a stale prop would leave the pill on screen for a \
+             participant who can no longer stream"
+        );
+        assert!(
+            !toast_changed,
+            "a changed `toast_present` must NOT memoize — the arrival reveal reads \
+             it, and a stale prop would double up the tooltip with the toast"
+        );
+        assert!(
+            !settings_changed,
+            "a changed `settings_open` must NOT memoize — closing settings is the \
+             wake a deferred reveal is waiting for, and a stale prop strands it"
+        );
+        assert!(
+            !per_render,
+            "issue 2103: a prop-site closure gives `on_show` a new identity every \
+             render, so the pill can never memoize — this is the defect"
+        );
+    }
+
+    /// Issue 2693 wiring pin: no host test mounts `AttendantsComponent`, so the
+    /// call site is read from source. Needles are fragmented so they do not
+    /// self-match.
+    #[test]
+    fn the_pill_call_site_passes_the_stable_show_handler() {
+        let src = include_str!("attendants.rs");
+        let stable_decl = concat!(
+            "let show_self_view: EventHandler<()> = ",
+            "use_callback(move |_| {"
+        );
+        let stable_site = concat!("on_show: show_self_", "view,");
+        assert!(
+            src.contains(stable_decl),
+            "the show handler must be a `use_callback`, not a per-render handler"
+        );
+        assert!(
+            src.contains(stable_site),
+            "the pill call site must pass the named stable handler, not a closure"
+        );
+    }
+
+    /// Same constraint, same remedy: the hide toast is unmountable here, so the
+    /// close button's wiring is read from source. Needles are fragmented so
+    /// they cannot self-match this test.
+    #[test]
+    fn the_hide_toast_carries_a_close_button_wired_to_the_dismiss_handler() {
+        let src = include_str!("attendants.rs");
+        let close_button = concat!(r#""data-testid": "self-view-"#, r#"toast-close""#);
+        let wiring = concat!("onclick: move |_| dismiss_self_view_", "toast.call(())");
+        let handler = concat!(
+            "let dismiss_self_view_toast: Callback<()> = ",
+            "use_callback(move |_| {"
+        );
+        assert!(
+            src.contains(close_button),
+            "the hide toast must offer a close control, not only Undo"
+        );
+        assert!(
+            src.contains(wiring),
+            "the close button must call the dismiss handler; an inline closure \
+             here is how the focus handoff gets dropped"
+        );
+        assert!(
+            src.contains(handler),
+            "and that handler must exist as a `use_callback`"
+        );
+    }
+
     /// The production hook itself: `use_toggle_request_decode` must return the
     /// SAME `EventHandler` identity on every render of its component, and must
     /// still toggle the set.
@@ -15041,6 +15799,10 @@ mod tests {
             use_context_provider(|| client.clone());
             let history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
             use_context_provider(|| history_map);
+            // Required, not `try_use_context`: a fallback would silently restore
+            // issue 2660's stuck border when a provider is missing.
+            let liveness_map: PeerAudioLivenessMap = use_signal(HashMap::new);
+            use_context_provider(|| liveness_map);
             let popup_map: SignalPopupStateMap = use_signal(HashMap::new);
             use_context_provider(|| popup_map);
             let appearance = use_signal(AppearanceSettings::default);
@@ -15200,6 +15962,10 @@ mod tests {
             use_context_provider(|| client.clone());
             let history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
             use_context_provider(|| history_map);
+            // Required, not `try_use_context`: a fallback would silently restore
+            // issue 2660's stuck border when a provider is missing.
+            let liveness_map: PeerAudioLivenessMap = use_signal(HashMap::new);
+            use_context_provider(|| liveness_map);
             let popup_map: SignalPopupStateMap = use_signal(HashMap::new);
             use_context_provider(|| popup_map);
             let appearance = use_signal(AppearanceSettings::default);
@@ -15359,6 +16125,10 @@ mod tests {
             use_context_provider(|| client.clone());
             let history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
             use_context_provider(|| history_map);
+            // Required, not `try_use_context`: a fallback would silently restore
+            // issue 2660's stuck border when a provider is missing.
+            let liveness_map: PeerAudioLivenessMap = use_signal(HashMap::new);
+            use_context_provider(|| liveness_map);
             let popup_map: SignalPopupStateMap = use_signal(HashMap::new);
             use_context_provider(|| popup_map);
             let appearance = use_signal(AppearanceSettings::default);
@@ -15645,7 +16415,7 @@ mod tests {
     fn overflow_test_secondary() -> Vec<ActionBarSlot> {
         vec![
             ActionBarSlot::Reactions,
-            ActionBarSlot::Chat,
+            ActionBarSlot::RaiseHand,
             ActionBarSlot::ScreenShare,
             ActionBarSlot::PeerList,
             ActionBarSlot::DensityMode,
@@ -15823,14 +16593,14 @@ mod tests {
         //   pad          = 1.5rem × 2                   =  48.0
         //   sacred_width = 3·49.6 + 3·19.2 + 48 + 2     = 256.4
         //   trigger      = 49.6 + 19.2                  =  68.8
-        //   budget       = 580 - 256.4 - 68.8           = 254.8
-        //   fit: 49.6, 118.4, 187.2 all ≤ 254.8 (3 fit); 4th needs 256.0 > 254.8
-        //   → 3 fit, 4 hidden
+        //   budget       = 580 - 256.4 - 68.8 - 68.8    = 186.0
+        //   fit: 49.6, 118.4 ≤ 186.0 (2 fit); 3rd needs 187.2 > 186.0
+        //   → 2 fit, 5 hidden
         let secondary = overflow_test_secondary();
         assert_eq!(
             action_bar_overflow_hidden(620.0, 800.0, false, 16.0, 3, &secondary).len(),
-            4,
-            "at 620px exactly 3 of 7 secondary slots fit (4 hidden) with the current \
+            5,
+            "at 620px exactly 2 of 7 secondary slots fit (5 hidden) with the current \
              spacing constants; a change here means btn/gap/pad drifted",
         );
     }
@@ -15853,18 +16623,19 @@ mod tests {
     /// The narrowest viewport width, in CSS px at a 16px root, that fits the
     /// WHOLE default action bar with nothing behind the overflow trigger.
     ///
-    /// Derived from `action_bar_overflow_hidden`'s constants at 11 secondary
+    /// Derived from `action_bar_overflow_hidden`'s constants at 10 secondary
     /// slots (`DEFAULT_SLOTS` minus Mic/Camera, as an owner sees it):
-    ///   sacred 3.49.6 + 3.19.2 + 48 + 2 = 256.4 ; trigger 49.6 + 19.2 = 68.8
-    ///   secondary 49.6 + 10.68.8 = 737.6 ; so vw >= 737.6 + 256.4 + 68.8 + 40
+    ///   sacred 3.49.6 + 3.19.2 + 48 + 2 = 256.4 ; trigger 49.6 + 19.2 = 68.8 ;
+    ///   dock wrapper 68.8 ; secondary 49.6 + 9.68.8 = 668.8
+    ///   so vw >= 668.8 + 256.4 + 68.8 + 68.8 + 40
     /// Pinned rather than recomputed here so the test cannot drift with the
     /// production formula it is supposed to be watching.
     ///
     /// Moved 1034 -> 1103 in issue 2136, which added the host-only MeetingTimer
-    /// slot: one more button+gap for an owner, exactly as this pin is designed
-    /// to surface. 1103 still leaves 177px of headroom under
-    /// `ACTION_BAR_E2E_WIDE_WIDTH` (1280), so the E2E fixture still shows the
-    /// whole bar with nothing behind the overflow trigger.
+    /// slot. Moved 1103 -> 1172 in issue 2701, which charges the budget for the
+    /// always-rendered `.dock-position-wrapper`. Back to 1103 here, where the
+    /// bar carries one slot fewer. 1103 leaves 177px under
+    /// `ACTION_BAR_E2E_WIDE_WIDTH` (1280).
     const DEFAULT_ACTION_BAR_MIN_FIT_WIDTH: f64 = 1103.0;
 
     /// The fresh-install secondary set, built by the PRODUCTION filter: every
@@ -15970,6 +16741,239 @@ mod tests {
         );
     }
 
+    fn chat_and_diagnostics_at_1280() -> DrawerState {
+        DrawerState {
+            vw: ACTION_BAR_E2E_WIDE_WIDTH,
+            peer_list_open: false,
+            left_w: 320.0,
+            diagnostics_open: true,
+            right_w: 560.0,
+            chat_open: true,
+        }
+    }
+
+    /// ADVERSARIAL (mutation): return `vw` from `action_bar_band_width` → red.
+    #[test]
+    fn action_bar_band_excludes_the_drawer_reserves() {
+        let band = action_bar_band_width(
+            ACTION_BAR_E2E_WIDE_WIDTH,
+            drawer_reserves(chat_and_diagnostics_at_1280()),
+        );
+        assert!(
+            (band - 512.0).abs() < 0.5,
+            "band was {band}, want 1280 - (360 chat + 408 diagnostics)"
+        );
+
+        let secondary = default_secondary_slots();
+        let raw = action_bar_overflow_hidden(
+            ACTION_BAR_E2E_WIDE_WIDTH,
+            720.0,
+            false,
+            16.0,
+            3,
+            &secondary,
+        );
+        assert!(
+            raw.is_empty(),
+            "premise: the whole default bar fits at the raw viewport, which is why \
+             budgeting against it hid nothing and the bar spilled"
+        );
+        let banded = action_bar_overflow_hidden(band, 720.0, false, 16.0, 3, &secondary);
+        assert!(
+            !banded.is_empty(),
+            "the default bar needs {DEFAULT_ACTION_BAR_MIN_FIT_WIDTH}px but the drawers left \
+             {band}px, so slots must move behind the overflow trigger"
+        );
+    }
+
+    #[test]
+    fn action_bar_band_tracks_each_side_independently() {
+        let base = DrawerState {
+            vw: ACTION_BAR_E2E_WIDE_WIDTH,
+            peer_list_open: false,
+            left_w: 320.0,
+            diagnostics_open: false,
+            right_w: 560.0,
+            chat_open: false,
+        };
+        let band = |s: DrawerState| action_bar_band_width(s.vw, drawer_reserves(s));
+
+        assert_eq!(band(base), 1280.0, "no drawer open must not shrink the bar");
+        assert_eq!(
+            band(DrawerState {
+                peer_list_open: true,
+                ..base
+            }),
+            960.0
+        );
+        assert_eq!(
+            band(DrawerState {
+                diagnostics_open: true,
+                ..base
+            }),
+            720.0
+        );
+        assert_eq!(
+            band(DrawerState {
+                vw: 375.0,
+                peer_list_open: true,
+                diagnostics_open: true,
+                chat_open: true,
+                ..base
+            }),
+            375.0
+        );
+    }
+
+    /// Closing a drawer mid-drag strands the flag for the session.
+    ///
+    /// ADVERSARIAL (mutation): return `false` for the `Left` arm → red.
+    #[test]
+    fn a_drag_is_orphaned_when_its_own_drawer_closes() {
+        use ResizingDrawer::{Left, None as NoDrag, Right};
+        assert!(drag_is_orphaned(Right, false, false));
+        assert!(drag_is_orphaned(Left, false, false));
+        assert!(!drag_is_orphaned(Right, false, true));
+        assert!(!drag_is_orphaned(Left, true, false));
+        assert!(!drag_is_orphaned(NoDrag, false, false));
+    }
+
+    /// The hoisted call passes the live flag, which is safe only because it
+    /// gates ScreenShare and DensityMode, never the sacred pair.
+    #[test]
+    fn the_sacred_count_does_not_move_with_customize_mode() {
+        let vis = |customize_mode| SlotVisibility {
+            customize_mode,
+            ios_device: true,
+            has_screen_share: true,
+            is_owner: true,
+            recording_visible: true,
+            meeting_timer_visible: true,
+        };
+        let sacred = |customize_mode| {
+            visible_action_bar_slots(DEFAULT_SLOTS, vis(customize_mode))
+                .iter()
+                .filter(|s| matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
+                .count()
+        };
+        assert_eq!(sacred(true), sacred(false));
+        assert_eq!(sacred(true), 2, "Mic + Camera, so sacred_count is 3");
+        assert_ne!(
+            visible_action_bar_slots(DEFAULT_SLOTS, vis(true)).len(),
+            visible_action_bar_slots(DEFAULT_SLOTS, vis(false)).len()
+        );
+    }
+
+    /// The wrapper is the only route to dock position, Customize and Reset.
+    ///
+    /// ADVERSARIAL (mutation): drop the second `action_bar_slot_width` from
+    /// `action_bar_fixed_width` and the 400px band stops hiding it.
+    #[test]
+    fn the_dock_wrapper_is_budgeted_and_survives_an_open_drawer() {
+        let secondary = default_secondary_slots();
+        let budget_at = |band: f64| overflow_budget_width(false, band, 720.0);
+
+        // Peer list at 1280: slots overflow, the wrapper must stay.
+        assert!(dock_wrapper_fits(budget_at(960.0), 3, 16.0));
+        assert!(
+            !action_bar_overflow_hidden(960.0, 720.0, false, 16.0, 3, &secondary).is_empty(),
+            "premise: a 960px band does shed secondary slots"
+        );
+        assert!(dock_wrapper_fits(budget_at(512.0), 3, 16.0));
+        // 360 holds sacred + trigger (325.2) but not the wrapper too (394).
+        assert!(!dock_wrapper_fits(budget_at(400.0), 3, 16.0));
+        assert!(!dock_wrapper_fits(budget_at(320.0), 3, 16.0));
+        assert!(dock_wrapper_fits(budget_at(1280.0), 3, 16.0));
+    }
+
+    #[test]
+    fn action_bar_vertical_dock_ignores_the_drawer_band() {
+        let secondary = default_secondary_slots();
+        let raw =
+            action_bar_overflow_hidden(ACTION_BAR_E2E_WIDE_WIDTH, 720.0, true, 16.0, 3, &secondary);
+        let banded = action_bar_overflow_hidden(512.0, 720.0, true, 16.0, 3, &secondary);
+        assert!(
+            !raw.is_empty(),
+            "premise: a 720px-tall vertical dock does overflow, so this is not \
+             comparing two empty lists"
+        );
+        assert_eq!(raw, banded, "a vertical dock must budget against vh alone");
+    }
+
+    /// The openers are rsx handlers, so no host test reaches them; this scans
+    /// the source instead.
+    #[test]
+    fn every_drawer_opener_applies_the_exclusivity_rule() {
+        let src: String = include_str!("attendants.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let openers = [
+            (concat!("peer_list_open", ".set(opening);"), "PeerList"),
+            (concat!("diagnostics_open", ".set(opening);"), "Diagnostics"),
+            (concat!("diagnostics_open", ".set(true);"), "Diagnostics"),
+        ];
+        let rule = concat!("apply_drawer_", "open_rule(");
+        for (needle, want_kind) in openers {
+            let kind_arg = format!("{}{want_kind}", concat!("Drawer", "Kind::"));
+            let mut from = 0usize;
+            let mut seen = 0usize;
+            while let Some(at) = src[from..].find(needle) {
+                let start = from + at + needle.len();
+                let window = &src[start..(start + 400).min(src.len())];
+                let call = window.find(rule).unwrap_or_else(|| {
+                    panic!(
+                        "an opener `{needle}` (occurrence {seen}) is not followed by \
+                         the exclusivity rule: {}",
+                        &window[..120.min(window.len())]
+                    )
+                });
+                // Narrow: a wider window picks up a neighbouring arm's kind.
+                let args = &window[call..(call + 90).min(window.len())];
+                assert!(
+                    args.contains(&kind_arg),
+                    "opener `{needle}` (occurrence {seen}) passes the wrong kind; \
+                     expected `{kind_arg}` in: {args}"
+                );
+                seen += 1;
+                from = start;
+            }
+            assert!(
+                seen > 0,
+                "opener `{needle}` no longer appears in the source"
+            );
+        }
+    }
+
+    /// The effect leaves customize mode at exactly this threshold; Done lives
+    /// in the wrapper, so below it there is no way out.
+    #[test]
+    fn customize_mode_has_no_exit_once_the_band_drops_the_dock_wrapper() {
+        let budget_at = |band: f64| overflow_budget_width(false, band, 720.0);
+        assert!(
+            !dock_wrapper_fits(budget_at(320.0), 3, 16.0),
+            "three drawers at 1280 leave a 320px band, which cannot hold Done"
+        );
+        assert!(
+            dock_wrapper_fits(budget_at(512.0), 3, 16.0),
+            "two drawers still leave Done reachable, so customize must persist"
+        );
+    }
+
+    /// Wiring pin: the effect needs a VDOM, so no host test reaches its call.
+    #[test]
+    fn overflow_effect_budgets_against_the_drawer_band() {
+        let src: String = include_str!("attendants.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let call = concat!("action_bar_overflow_hidden(", "band_w, vh,");
+        assert!(
+            src.contains(call),
+            "the overflow effect stopped budgeting against the drawer band"
+        );
+    }
+
     // ── Deferred leave-sound debounce (notifications-OFF + sound-ON) ──
     // Pure host `#[test]`s over the helpers on_peer_left / on_peer_joined call.
 
@@ -16043,16 +17047,44 @@ mod tests {
     #[test]
     fn esc_both_open_closes_diagnostics_first() {
         assert_eq!(
-            esc_panel_close_target(true, true),
+            esc_panel_close_target(true, true, false),
             Some(EscCloseTarget::Diagnostics)
         );
+    }
+
+    /// Issue 2693: the hide toast is the LAST rung. It overlays nothing, so an
+    /// open drawer is always the layer the user meant Escape to peel.
+    #[test]
+    fn esc_ranks_the_hide_toast_below_both_drawers() {
+        assert_eq!(
+            esc_panel_close_target(true, false, true),
+            Some(EscCloseTarget::Diagnostics),
+            "diagnostics outranks the toast"
+        );
+        assert_eq!(
+            esc_panel_close_target(false, true, true),
+            Some(EscCloseTarget::PeerList),
+            "the peer list outranks the toast"
+        );
+        assert_eq!(
+            esc_panel_close_target(false, false, true),
+            Some(EscCloseTarget::SelfViewToast),
+            "with nothing else open, Escape dismisses the toast"
+        );
+    }
+
+    /// The toast has no action-bar trigger, so the shared focus restore must sit
+    /// this one out and let the dismiss handler's own rule decide.
+    #[test]
+    fn esc_the_hide_toast_restores_focus_to_no_trigger() {
+        assert_eq!(EscCloseTarget::SelfViewToast.trigger_id(), None);
     }
 
     /// Only the peer list is open → Escape closes the peer list.
     #[test]
     fn esc_only_peer_list_closes_peer_list() {
         assert_eq!(
-            esc_panel_close_target(false, true),
+            esc_panel_close_target(false, true, false),
             Some(EscCloseTarget::PeerList)
         );
     }
@@ -16061,7 +17093,7 @@ mod tests {
     #[test]
     fn esc_only_diagnostics_closes_diagnostics() {
         assert_eq!(
-            esc_panel_close_target(true, false),
+            esc_panel_close_target(true, false, false),
             Some(EscCloseTarget::Diagnostics)
         );
     }
@@ -16071,7 +17103,7 @@ mod tests {
     /// behavior.
     #[test]
     fn esc_none_open_returns_none() {
-        assert_eq!(esc_panel_close_target(false, false), None);
+        assert_eq!(esc_panel_close_target(false, false, false), None);
     }
 
     /// Lockstep pin on the trigger-button ids this handler restores focus to.
@@ -16082,9 +17114,12 @@ mod tests {
     fn esc_close_target_trigger_ids() {
         assert_eq!(
             EscCloseTarget::Diagnostics.trigger_id(),
-            "diagnostics-trigger"
+            Some("diagnostics-trigger")
         );
-        assert_eq!(EscCloseTarget::PeerList.trigger_id(), "peer-list-trigger");
+        assert_eq!(
+            EscCloseTarget::PeerList.trigger_id(),
+            Some("peer-list-trigger")
+        );
     }
 
     // ── Settings deep-link routing (#1131 unify) ──

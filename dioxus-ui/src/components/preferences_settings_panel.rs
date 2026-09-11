@@ -6,8 +6,9 @@
 use crate::components::density::{DensityMode, DENSITY_MODES};
 use crate::context::{
     save_decode_budget_override, save_density_mode, save_dock_autohide, save_dock_position,
-    AppearanceSettings, AppearanceSettingsCtx, AutohideCtx, DecodeBudgetCtx, DecodeBudgetOverride,
-    DensityModeCtx, DockPosition, DockPositionCtx,
+    save_self_view_placement, save_self_view_visible, AppearanceSettings, AppearanceSettingsCtx,
+    AutohideCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx, DockPosition,
+    DockPositionCtx, SelfViewPlacement, SelfViewPlacementCtx, SelfViewVisibleCtx,
 };
 use dioxus::prelude::*;
 
@@ -51,8 +52,14 @@ pub fn PreferencesSettingsPanel() -> Element {
     let fallback_autohide = use_signal(|| false);
     let fallback_density = use_signal(|| DensityMode::Auto);
     let fallback_decode_budget = use_signal(DecodeBudgetOverride::default);
+    let fallback_self_placement = use_signal(SelfViewPlacement::default);
+    let fallback_self_visible = use_signal(|| true);
     let mut dock_position_ctx =
         try_use_context::<DockPositionCtx>().unwrap_or(DockPositionCtx(fallback_dock));
+    let mut self_placement_ctx = try_use_context::<SelfViewPlacementCtx>()
+        .unwrap_or(SelfViewPlacementCtx(fallback_self_placement));
+    let mut self_visible_ctx = try_use_context::<SelfViewVisibleCtx>()
+        .unwrap_or(SelfViewVisibleCtx(fallback_self_visible));
     let mut autohide_ctx =
         try_use_context::<AutohideCtx>().unwrap_or(AutohideCtx(fallback_autohide));
     let mut density_ctx =
@@ -151,6 +158,52 @@ pub fn PreferencesSettingsPanel() -> Element {
                                 }
                             }
                         }
+                    }
+
+                    // Self view (issue 66) — directly under Density.
+                    div { class: "device-setting-group",
+                        span { class: "transport-segmented-label", "Self view" }
+                        div {
+                            class: "transport-segmented",
+                            role: "radiogroup",
+                            "aria-label": "Self view placement",
+                            for (placement, label) in [(SelfViewPlacement::Corner, "Corner"), (SelfViewPlacement::Grid, "Grid")] {
+                                button {
+                                    r#type: "button",
+                                    role: "radio",
+                                    "data-testid": "self-view-placement-{placement.as_str()}",
+                                    "aria-checked": if self_placement_ctx.0() == placement { "true" } else { "false" },
+                                    class: if self_placement_ctx.0() == placement { "transport-segmented-option selected" } else { "transport-segmented-option" },
+                                    onclick: move |_| {
+                                        self_placement_ctx.0.set(placement);
+                                        save_self_view_placement(placement);
+                                    },
+                                    "{label}"
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "appearance-section-header dock-autohide-row",
+                        label { class: "appearance-section-title appearance-section-title--sm", "Show self view" }
+                        label {
+                            class: "glow-switch",
+                            input {
+                                r#type: "checkbox",
+                                "aria-label": "Show self view",
+                                "data-testid": "self-view-visible-checkbox",
+                                checked: self_visible_ctx.0(),
+                                onchange: move |evt: Event<FormData>| {
+                                    let checked = evt.checked();
+                                    self_visible_ctx.0.set(checked);
+                                    save_self_view_visible(checked);
+                                },
+                            }
+                            span { class: "glow-switch-track" }
+                        }
+                    }
+                    p { class: "appearance-section-helper",
+                        "Only affects your view — others still see you."
                     }
 
                     // Video-tiles (decode-budget) override — sits directly under

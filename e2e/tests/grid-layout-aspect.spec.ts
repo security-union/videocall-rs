@@ -258,14 +258,11 @@ test.describe("Grid layout aspect ratio", () => {
         expect(aspect).toBeLessThan(1.5 * 1.05);
       }
 
-      // The container's grid-template-columns must reference the
-      // computed tile width (`var(--tile-w)`), NOT `1fr`. This is
-      // the structural assertion that catches a regression which
-      // reverts the `tile_count == 1` branch back to `tile_count <= 2`.
+      // Since #2700 the 2+ arm is a centred flex wrap, not grid tracks.
       const containerStyle = await grid.evaluate((el) => el.getAttribute("style") || "");
       expect(containerStyle).toContain("--tile-w");
-      expect(containerStyle).toContain("var(--tile-w)");
-      // The 1fr stretch path is the bug path; it must not be in the style.
+      expect(containerStyle).toContain("flex-wrap: wrap");
+      expect(containerStyle).toContain("justify-content: center");
       expect(containerStyle).not.toContain("grid-template-columns: repeat(2, 1fr)");
     } finally {
       await browser1.close();

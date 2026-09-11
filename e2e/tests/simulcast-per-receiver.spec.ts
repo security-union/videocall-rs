@@ -179,7 +179,7 @@
  *       to the full automatic range.)
  */
 
-import { test, expect, chromium, Browser, BrowserContext, Locator, Page } from "@playwright/test";
+import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwright/test";
 import { createAuthenticatedContext, BROWSER_ARGS } from "../helpers/auth-context";
 import { enableSimulcastFlag, pinSimulcastMaxLayers } from "../helpers/simulcast-config";
 import {
@@ -202,7 +202,10 @@ import {
   longestFrozenRunMs,
   distinctChecksumsInWindow,
 } from "../helpers/frame-liveness";
+import { openPerformancePanel, readNetEqPacketsPerSec } from "../helpers/diagnostics-drawer";
 import { BUDGET } from "../helpers/rust-mirrored-constants";
+import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
+import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 import { waitForServices } from "../helpers/wait-for-services";
 
 // ---------------------------------------------------------------------------
@@ -668,42 +671,6 @@ async function joinMeetingAudioOnly(
 }
 
 /**
- * Open the in-meeting Diagnostics drawer (the new home of the Performance
- * controls, #1131) and return the drawer locator that scopes the perf controls.
- *
- * #1131 RELOCATION: the Performance panel MOVED out of the Settings → Performance
- * modal tab into the right-side Diagnostics drawer (`#diagnostics-sidebar`),
- * mounted as the "Quality controls" group. The receive controls/meters
- * (`perf-recv-*` / `perf-vu-recv-*`) now render directly inside the drawer's
- * `.sidebar-content` (no `#settings-panel-performance` tabpanel any more). The
- * `perf-*` COMPONENTS are unchanged — only the mount moved — so this spec's
- * RECEIVE assertions are untouched; only the opening flow swapped from "Settings
- * → Performance tab" to "Open Diagnostics".
- *
- * The #1095 redesign already removed the `Receive | Send` direction toggle: every
- * per-kind card renders both a Sending and a Receiving column at once, so the
- * receive controls/meters are always mounted once the drawer is open. We assert
- * the receive video meter is visible INSIDE the drawer as a readiness +
- * relocation guard (this whole spec reads RECEIVE needles/controls).
- */
-async function openPerformancePanel(page: Page) {
-  // The diagnostics button carries no data-testid; locate it via its tooltip
-  // text (mirrors protocol-selection.spec.ts::openDiagnosticsPanel).
-  const diagButton = page.locator("button", {
-    has: page.locator("span.tooltip", { hasText: "Open Diagnostics" }),
-  });
-  await diagButton.click();
-  const drawer = page.locator("#diagnostics-sidebar");
-  await expect(drawer).toBeVisible({ timeout: 10_000 });
-  // Readiness + relocation proof: the migrated receive video meter is present
-  // INSIDE the drawer (not anywhere else on the page).
-  await expect(drawer.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible({
-    timeout: 10_000,
-  });
-  return drawer;
-}
-
-/**
  * Parse the video received-quality readout `#perf-vu-recv-video-readout`.
  * Returns null while the readout reads "Not receiving" (nothing decoded yet),
  * otherwise `{ layerIndex, layerCount }`.
@@ -715,20 +682,6 @@ async function openPerformancePanel(page: Page) {
  * letter itself is not load-bearing for these tests (the position/count is the
  * 0-based index basis every assertion uses), so we skip past it permissively.
  */
-// The selected peer's NetEq `Packets / s`, `NaN` before its first sample. NetEq
-// samples exist per DECODED-audio peer; `auto_select_peer` picks the sole 1:1 peer.
-async function readNetEqPacketsPerSec(drawer: Locator): Promise<number> {
-  const rows = drawer.locator(".neteq-status .status-secondary .status-row");
-  const count = await rows.count();
-  for (let i = 0; i < count; i++) {
-    const row = rows.nth(i);
-    const label = (await row.locator(".status-row__label").textContent())?.trim();
-    if (label === "Packets / s") {
-      return Number((await row.locator(".status-row__value").textContent())?.trim());
-    }
-  }
-  return NaN;
-}
 
 async function readVideoLayer(
   page: Page,
@@ -737,6 +690,38 @@ async function readVideoLayer(
   const m = text.match(/^\S+\s+·\s+(\d+)\/(\d+)/);
   if (!m) return null;
   return { layerIndex: Number(m[1]) - 1, layerCount: Number(m[2]) };
+}
+
+const VIDEO_POSITION_CHIP_WORDS = ["Low", "Medium", "High", "Single"] as const;
+
+const VIDEO_POSITION_CHIP_RE = new RegExp(
+  `\\b(${VIDEO_POSITION_CHIP_WORDS.join("|")})\\s+·\\s+(\\d+)\\/(\\d+)`,
+);
+
+function parsePositionChip(text: string): { word: string; index: number; count: number } | null {
+  const m = text.match(VIDEO_POSITION_CHIP_RE);
+  if (!m) return null;
+  return { word: m[1], index: Number(m[2]) - 1, count: Number(m[3]) };
+}
+
+function parseShortResolution(text: string): number | null {
+  const m = text.match(/(\d+)p\b/);
+  return m ? Number(m[1]) : null;
+}
+
+function parseDimsPairs(text: string): { w: number; h: number }[] {
+  return [...text.matchAll(/(\d+)×(\d+)/g)].map((m) => ({ w: Number(m[1]), h: Number(m[2]) }));
+}
+
+function parseDimsPair(text: string): { w: number; h: number } | null {
+  return parseDimsPairs(text)[0] ?? null;
+}
+
+function assertNeverZeroByZero(text: string, surface: string): void {
+  expect(
+    text,
+    `${surface} rendered a measured 0x0; unknown geometry must read the em-dash`,
+  ).not.toMatch(/\b0\s*[x×]\s*0\b/);
 }
 
 // ---------------------------------------------------------------------------
@@ -1740,6 +1725,355 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         peerRow,
         "the row's aria-label must speak the same ladder depth as its visible metric",
       ).toHaveAttribute("aria-label", new RegExp(`layer \\d+ of ${denominator}\\b`));
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // #2659. Chromium's fake capture is 640x480 (4:3) and every rung box is 16:9, so a
+  // fitted readout is 4:3 and a nominal-box one is not. PHASE 1 is the only assertion
+  // that fails un-fixed; PHASE 2 (the position chip) predates the fix and is a
+  // consistency check. A second 16:9 publisher would illustrate the issue but add no
+  // discriminator, so it is deliberately omitted (see #2659). The `0x0` checks guard
+  // the live surfaces without discriminating — that half is mutation-guarded host-side
+  // by `unreported_dims_read_as_unknown_never_as_zero_by_zero`. UNTAGGED (no @bvt).
+  //
+  // SELECTORS: `PeerRow`'s metric span has NO testid (bare-class direct child of the
+  // `li`); `SignalLayerRow`'s DOES. `diag-simulcast-recv-peer-{sid}` is NOT
+  // kind-qualified, so scope the diagnostics line by its `diag-simulcast-recv-video`
+  // ancestor.
+  test("both diagnostics panels report the FITTED video dims and name the layer (#2659)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_2659_fitted_dims_${Date.now()}`;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-2659-pub@videocall.rs",
+        "Sim2659Pub",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-2659-rx@videocall.rs",
+        "Sim2659Rx",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      await enableDiagnosticsTileIndicators(rxCtx);
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim2659Pub");
+      await joinMeeting(rxPage, meetingId, "Sim2659Rx");
+
+      // Must precede the Phase-2 skip guard: a broken override must fail, not skip.
+      await assertCapabilityOverrideActive(pubConsole);
+
+      await expect(
+        rxPage.locator("#grid-container .canvas-container"),
+        "the receiver must see exactly one remote peer tile before any readout is read",
+      ).toHaveCount(1, { timeout: 30_000 });
+
+      const drawer = await openPerformancePanel(rxPage);
+
+      // Presence gates, before any text is measured. NOT `readVideoLayer`: it parses the
+      // position chip, so it nulls forever at `layer_count == 1` — the depth Phase 1
+      // must still cover.
+      const videoBlock = drawer.locator('[data-testid="diag-simulcast-recv-video"]');
+      await expect(
+        videoBlock,
+        "the diagnostics video block must render before its per-peer line is read",
+      ).toBeVisible({ timeout: 30_000 });
+      const diagLine = videoBlock.locator(".simulcast-recv-peer-line");
+      await expect(
+        diagLine,
+        "exactly one publisher, so exactly one diagnostics video per-peer line",
+      ).toHaveCount(1, { timeout: 30_000 });
+      await expect(diagLine).toBeVisible({ timeout: 15_000 });
+
+      const peersSummary = drawer.locator('[data-testid="perf-recv-video-peers-summary"]');
+      await expect(
+        peersSummary,
+        "the video receive per-peer disclosure never rendered (no peer snapshot)",
+      ).toBeVisible({ timeout: 30_000 });
+      // Bounded on purpose: an unbounded click retries until the whole test budget is
+      // gone, turning a clear failure into an ambiguous hang.
+      await peersSummary.click({ timeout: 15_000 });
+
+      const rowMetric = drawer.locator(
+        'li[data-testid^="perf-recv-video-peer-"] .perf-peer-row__metric',
+      );
+      await expect(
+        rowMetric,
+        "the per-peer row metric did not render after expanding the disclosure",
+      ).toHaveCount(1, { timeout: 15_000 });
+      await expect(rowMetric).toBeVisible({ timeout: 15_000 });
+
+      const readBothSurfaces = () =>
+        drawer.evaluate((root) => {
+          const li = root.querySelector('li[data-testid^="perf-recv-video-peer-"]');
+          const row = li ? li.querySelector(".perf-peer-row__metric") : null;
+          const line = root.querySelector(
+            '[data-testid="diag-simulcast-recv-video"] .simulcast-recv-peer-line',
+          );
+          return {
+            row: row ? (row.textContent ?? "").trim() : null,
+            title: row ? row.getAttribute("title") : null,
+            aria: li ? li.getAttribute("aria-label") : null,
+            line: line ? (line.textContent ?? "").trim() : null,
+          };
+        });
+
+      type Surfaces = Awaited<ReturnType<typeof readBothSurfaces>>;
+      let both: Surfaces = { row: null, title: null, aria: null, line: null };
+      await expect
+        .poll(
+          async () => {
+            both = await readBothSurfaces();
+            return (
+              both.line !== null &&
+              both.row !== null &&
+              parseDimsPair(both.line) !== null &&
+              parseShortResolution(both.row) !== null
+            );
+          },
+          {
+            timeout: 60_000,
+            intervals: [500, 1000, 2000],
+            message:
+              "neither readout ever reported a measured geometry (both stayed on the " +
+              "em-dash unknown), so there is nothing to check the fit against",
+          },
+        )
+        .toBe(true);
+
+      const lineText = both.line!;
+      const rowText = both.row!;
+      const dims = parseDimsPair(lineText)!;
+      const shortP = parseShortResolution(rowText)!;
+
+      // PHASE 1 — the sole #2659 discriminator. Tolerance absorbs `round_down_even`.
+      expect(
+        Math.abs(dims.w / dims.h - 4 / 3),
+        `the diagnostics per-peer line reported ${dims.w}×${dims.h}; a fitted 4:3 ` +
+          `capture stays 4:3 at every rung, whereas every simulcast rung box is 16:9 ` +
+          `(${(16 / 9).toFixed(3)}) — reporting the box is issue #2659. Line: "${lineText}"`,
+      ).toBeLessThan(0.05);
+      expect(
+        dims.w,
+        `fitting never upscales past the 640x480 capture width; got ${dims.w}`,
+      ).toBeLessThanOrEqual(640);
+      expect(
+        dims.h,
+        `fitting never upscales past the 640x480 capture height; got ${dims.h}`,
+      ).toBeLessThanOrEqual(480);
+
+      expect(
+        shortP,
+        `the Performance per-peer row says "${rowText}" while the diagnostics line says ` +
+          `"${lineText}". Both describe the SAME snapshot, so the row's short resolution ` +
+          `must be the line's smaller axis (min(${dims.w}, ${dims.h})).`,
+      ).toBe(Math.min(dims.w, dims.h));
+      expect(
+        shortP,
+        `the row reported ${shortP}p from a 640x480 capture — the ladder's top rung BOX ` +
+          `is 720p and it is never upscaled to, so this is the nominal box (issue #2659)`,
+      ).toBeLessThanOrEqual(480);
+
+      assertNeverZeroByZero(rowText, "the Performance per-peer row");
+      assertNeverZeroByZero(lineText, "the diagnostics per-peer line");
+
+      // PHASE 2 — consistency, not a discriminator. A starved runner that sheds to one
+      // rung has no position to identify, so skip rather than assert a false negative;
+      // Phase 1 has already run.
+      let sawMultiLayer = false;
+      await expect
+        .poll(
+          async () => {
+            const s = await readVideoLayer(rxPage);
+            if (s && s.layerCount > 1) sawMultiLayer = true;
+            return sawMultiLayer;
+          },
+          { timeout: 60_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBe(true)
+        .catch(() => {
+          /* handled by the skip below */
+        });
+      test.skip(
+        !sawMultiLayer,
+        "the publisher never offered more than one rung, so there is no ladder position " +
+          "to identify (see helpers/simulcast-config.ts)",
+      );
+
+      await expect(
+        rowMetric,
+        "the per-peer row unmounted between phases (the <details> re-seeded collapsed)",
+      ).toBeVisible({ timeout: 15_000 });
+      await expect(diagLine).toBeVisible({ timeout: 15_000 });
+
+      await expect
+        .poll(
+          async () => {
+            both = await readBothSurfaces();
+            return (
+              parsePositionChip(both.row ?? "") !== null &&
+              parsePositionChip(both.line ?? "") !== null &&
+              parseDimsPair(both.line ?? "") !== null &&
+              parseDimsPair(both.title ?? "") !== null
+            );
+          },
+          {
+            timeout: 45_000,
+            intervals: [500, 1000, 2000],
+            message:
+              "a per-peer readout carried no recognisable position chip beside its " +
+              `resolution (expected one of ${VIDEO_POSITION_CHIP_WORDS.join("/")} + " · i/n"), ` +
+              "or the row title named no ceiling geometry",
+          },
+        )
+        .toBe(true);
+
+      const rowMulti = both.row!;
+      const lineMulti = both.line!;
+      const rowChip = parsePositionChip(rowMulti)!;
+      const lineChip = parsePositionChip(lineMulti)!;
+
+      expect(
+        rowChip,
+        `the two panels disagree about the peer's video layer. Row: "${rowMulti}" / ` +
+          `Line: "${lineMulti}"`,
+      ).toEqual(lineChip);
+
+      // Second #2659 discriminator: the title names the nominal CEILING, the line what
+      // was encoded, so un-fixed they are equal. WIDTHS, not heights — a 4:3 source on
+      // video layer 1 fits 480×360 inside a 640×360 box, so heights tie and a height
+      // comparison would pass on the un-fixed code too.
+      const ceiling = parseDimsPair(both.title ?? "")!;
+      const fitted = parseDimsPair(lineMulti)!;
+      expect(
+        ceiling.w,
+        `the row title names a ${ceiling.w}×${ceiling.h} ceiling while the diagnostics ` +
+          `line reports ${fitted.w}×${fitted.h}. A 4:3 capture is fitted INSIDE the ` +
+          `layer box and never upscaled, so the encoded width must be strictly less ` +
+          `than the ceiling; equal means the readout is the box (issue #2659). ` +
+          `Title: "${both.title}" / Line: "${lineMulti}"`,
+      ).toBeGreaterThan(fitted.w);
+
+      expect(
+        both.aria,
+        `the row's spoken sentence must name the layer its visible chip does. ` +
+          `aria-label: "${both.aria}" / Row: "${rowMulti}"`,
+      ).toMatch(new RegExp(`layer ${rowChip.index + 1} of ${rowChip.count}\\b`));
+
+      // PHASE 4 — the SEND rung. Neither `diag-simulcast-ladder` nor
+      // `diag-simulcast-rung-N` is kind-qualified, so the camera ladder is scoped by the
+      // only kind-qualified hook inside it (the LED); the screen ladder carries no clause.
+      const cameraLadder = drawer
+        .locator('[data-testid="diag-simulcast-ladder"]')
+        .filter({ has: rxPage.locator('[data-testid^="diag-simulcast-led-video-"]') });
+      await expect(
+        cameraLadder,
+        "exactly one camera send ladder must be scoped out of the unqualified ladders",
+      ).toHaveCount(1, { timeout: 30_000 });
+      const cameraRung = cameraLadder.locator('[data-testid="diag-simulcast-rung-0"]');
+      await expect(cameraRung).toHaveCount(1, { timeout: 15_000 });
+
+      // The title carries BOTH pairs — `{sent} · {kbps} — …{ceiling} ceiling…` — so
+      // un-fixed, having no clause, yields one pair and never satisfies the poll. The
+      // strict `<` relies on the 4:3 fake capture: a 16:9 source fits its box exactly.
+      let rungTitle = "";
+      await expect
+        .poll(
+          async () => {
+            rungTitle = (await cameraRung.getAttribute("title")) ?? "";
+            return parseDimsPairs(rungTitle).length;
+          },
+          {
+            timeout: 45_000,
+            intervals: [500, 1000, 2000],
+            message:
+              "the camera send rung's title never carried both its encoded geometry and " +
+              "the layer ceiling it was fitted into",
+          },
+        )
+        .toBe(2);
+
+      const [sentDims, rungCeiling] = parseDimsPairs(rungTitle);
+      expect(
+        sentDims.w,
+        `the send rung says it encodes ${sentDims.w}×${sentDims.h} into a ` +
+          `${rungCeiling.w}×${rungCeiling.h} ceiling. A 4:3 camera is fitted inside the ` +
+          `box and never upscaled, so the encoded width must be strictly less; equal ` +
+          `means the rung is reporting the box (issue #2659). Title: "${rungTitle}"`,
+      ).toBeLessThan(rungCeiling.w);
+
+      // PHASE 3 — `SignalLayerRow`, a second `peer_row_metric` call site. Close the
+      // drawer with Escape (`EscCloseTarget::Diagnostics`), which is the path a user
+      // takes: the open drawer's own subtree overlays `#diagnostics-trigger`, so a
+      // click on that button is intercepted and never lands (RUN, not predicted).
+      // The drawer div is ALWAYS rendered (`class: if is_open { "visible" } else { "" }`),
+      // so open-ness is the class, never `toBeHidden`.
+      await rxPage.keyboard.press("Escape");
+      await expect(rxPage.locator("#diagnostics-sidebar")).not.toHaveClass(/\bvisible\b/, {
+        timeout: 10_000,
+      });
+
+      const signalButton = rxPage.locator(`#grid-container ${CAMERA_PEER_SIGNAL_DISC}`);
+      await expect(signalButton).toHaveCount(1, { timeout: 15_000 });
+      await expect(signalButton).toBeVisible({ timeout: 15_000 });
+      await signalButton.click({ timeout: 15_000 });
+
+      const popup = rxPage.locator(".signal-quality-popup");
+      await expect(popup).toBeVisible({ timeout: 10_000 });
+
+      const popupVideoMetric = popup.locator(
+        'ul.signal-popup-layers__list li.signal-popup-layer-row [data-testid$="-layer-video-metric"]',
+      );
+      await expect(
+        popupVideoMetric,
+        "the popup's Layers section never rendered a video row for this peer",
+      ).toHaveCount(1, { timeout: 45_000 });
+      await expect(popupVideoMetric).toBeVisible({ timeout: 15_000 });
+
+      let popupText = "";
+      await expect
+        .poll(
+          async () => {
+            popupText = ((await popupVideoMetric.textContent()) ?? "").trim();
+            return parsePositionChip(popupText) !== null;
+          },
+          {
+            timeout: 45_000,
+            intervals: [500, 1000, 2000],
+            message:
+              "the signal-popup Layers row identified no ladder position beside its " +
+              "resolution — `SignalLayerRow` is the second `peer_row_metric` call site " +
+              "and the #2659 readout has to reach it too",
+          },
+        )
+        .toBe(true);
+
+      // The chooser may have moved since Phase 1, so pin the bound, not the reading.
+      const popupShortP = parseShortResolution(popupText);
+      expect(popupShortP, `the popup row reported no resolution: "${popupText}"`).not.toBeNull();
+      expect(
+        popupShortP,
+        `the popup reported ${popupShortP}p from a 640x480 capture — the ladder box is ` +
+          `never upscaled to, so this is the nominal box (issue #2659). Row: "${popupText}"`,
+      ).toBeLessThanOrEqual(480);
+      assertNeverZeroByZero(popupText, "the signal-popup Layers row");
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -2975,6 +3309,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 // (default suite). This is mandatory per #1434's stretch goal and the standing
 // fact that "both transports shed at 80%."
 // ---------------------------------------------------------------------------
+// No audio arm here (2622): `crushed_downlink` passes AUDIO unconditionally, so
+// an audio assertion would hold on every build. See audio-liveness-neteq.spec.ts.
 test.describe("#1219 Half 2 relay-side congestion validation (#1434)", () => {
   test.describe.configure({ mode: "serial", timeout: 240_000 });
 

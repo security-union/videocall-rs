@@ -238,9 +238,11 @@ pub mod adaptive_quality_constants {
     pub use videocall_aq::constants::*;
 }
 
-/// The screen encode geometry helpers, re-exported so UI code resolves a share's
-/// geometry with the SAME function the encoder configures itself from.
-pub use videocall_aq::{capture_exceeds_encode_ceiling, screen_encode_box_for_capture};
+/// The encode geometry helpers, re-exported so UI code resolves a stream's geometry
+/// with the SAME function the encoder configures itself from.
+pub use videocall_aq::{
+    camera_layer_encode_box, capture_exceeds_encode_ceiling, screen_encode_box_for_capture,
+};
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;

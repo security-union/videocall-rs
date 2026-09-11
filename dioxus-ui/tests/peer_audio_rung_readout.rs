@@ -14,8 +14,8 @@ use dioxus_ui::components::canvas_generator::PinnedTile;
 use dioxus_ui::components::media_metrics_overlay::MediaMetricsOverlayCtx;
 use dioxus_ui::components::peer_tile::PeerTile;
 use dioxus_ui::context::{
-    AppearanceSettings, AppearanceSettingsCtx, MeetingTime, PeerSignalHistoryMap,
-    SignalPopupStateMap,
+    AppearanceSettings, AppearanceSettingsCtx, MeetingTime, PeerAudioLivenessMap,
+    PeerSignalHistoryMap, SignalPopupStateMap,
 };
 use std::collections::HashMap;
 use videocall_client::VideoCallClient;
@@ -43,6 +43,8 @@ fn TileParent() -> Element {
     use_context_provider(|| client.clone());
     let history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
     use_context_provider(|| history_map);
+    let liveness_map: PeerAudioLivenessMap = use_signal(HashMap::new);
+    use_context_provider(|| liveness_map);
     let popup_map: SignalPopupStateMap = use_signal(HashMap::new);
     use_context_provider(|| popup_map);
     let appearance = use_signal(AppearanceSettings::default);

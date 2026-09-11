@@ -497,6 +497,17 @@ h3 {
   place-self: stretch;
 }
 
+/* Wrap mode (issue 2700): `height: 100%` resolves against the container here,
+   and `aspect-ratio` re-rounds width above the floored track. */
+#grid-container[data-tile-flow="wrap"] > .grid-item:not(.grid-item-pinned),
+#grid-container[data-tile-flow="wrap"]
+  > .host[data-self-placement="grid"]:not([data-self-hidden="true"]),
+#grid-container[data-tile-flow="wrap"] > .grid-overflow-badge {
+  width: var(--tile-w);
+  height: var(--tile-h);
+  flex: 0 0 auto;
+}
+
 /* Overflow badge: "+N more" tile */
 .grid-overflow-badge {
   width: 100%;
@@ -662,26 +673,29 @@ h3 {
 
 /* ============================================================
    Mobile: narrower gap/padding
-   Keep breakpoint + values in sync with attendants.rs (vw < 568.0)
+   567.98px, not 568px: Rust reflows at `vw >= 568`, so an inclusive query made
+   568 reserve grid space AND paint the drawers full-width. (issue 2701)
    ============================================================ */
 
-@media (max-width: 568px) {
+@media (max-width: 567.98px) {
   #grid-container {
     gap: var(--space-2);
     padding: var(--space-2) var(--space-2) 72px var(--space-2);
   }
 
   /* Host self-tile — square above the action bar, face-cropped */
-  .host {
+  .host[data-self-placement="corner"]:not([data-self-hidden="true"]) {
     width: 35% !important;
     max-width: 140px !important;
     aspect-ratio: 1 / 1 !important;
     right: clamp(0.5rem, 2vw, 1rem) !important;
     bottom: var(--controls-dock-clearance, 112px) !important;
+    --tile-w: min(35vw, 140px);
+    --tile-h: min(35vw, 140px);
   }
 
   /* Override the 16:9 wrapper so it fills the square tile */
-  .host .host-video-wrapper {
+  .host[data-self-placement="corner"]:not([data-self-hidden="true"]) .host-video-wrapper {
     aspect-ratio: unset !important;
     width: 100% !important;
     height: 100% !important;
@@ -694,7 +708,7 @@ h3 {
   }
 
   /* Camera-off placeholder wrapper (has inline aspect-ratio:16/9) */
-  .host > div:has(> .placeholder-content) {
+  .host[data-self-placement="corner"] > div:has(> .placeholder-content) {
     aspect-ratio: unset !important;
     padding: var(--space-2) !important;
     width: 100% !important;
@@ -702,14 +716,14 @@ h3 {
   }
 
   /* Scale placeholder icon & text */
-  .host .placeholder-content {
+  .host[data-self-placement="corner"] .placeholder-content {
     gap: 0.25rem !important;
   }
-  .host .placeholder-content svg {
+  .host[data-self-placement="corner"] .placeholder-content svg {
     width: 28px !important;
     height: 28px !important;
   }
-  .host .placeholder-text {
+  .host[data-self-placement="corner"] .placeholder-text {
     font-size: 0.55rem !important;
   }
 
@@ -855,7 +869,19 @@ canvas {
    Host camera (self-view, bottom-right corner)
    ============================================================ */
 
+/* Shared chrome, both placements. Every aspect/size/position declaration lives
+   in the corner-scoped block below instead — issue 66. */
 .host {
+  border: 2px solid var(--grid-item-border);
+  border-radius: var(--radius-lg);
+  /* Speaking glow transition is driven by inline style from Rust speak_style(). */
+  background-color: var(--surface);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.host[data-self-placement="corner"] {
   position: absolute;
   /* Sit above the action bar — uses the shared clearance token so the
      self-tile automatically adjusts if the dock height changes. */
@@ -863,14 +889,7 @@ canvas {
   right: clamp(1rem, 2vw, 1.5rem);
   width: clamp(10rem, 18vw, 15rem);
   max-width: 240px;
-  border: 2px solid var(--grid-item-border);
-  border-radius: var(--radius-lg);
-  /* Speaking glow transition is driven by inline style from Rust speak_style(). */
   z-index: 10;
-  background-color: var(--surface);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
 }
 
 .host canvas,
@@ -1418,7 +1437,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    mobile block) — which is itself `!important`, so this override MUST also be
    `!important` to beat it. (#1131 §5, review REQUIRED 2) */
 @media (prefers-reduced-motion: reduce) {
-  #diagnostics-sidebar {
+  #diagnostics-sidebar,
+  #chat-sidebar {
     transition: none !important;
   }
 }
@@ -2060,9 +2080,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .grid-item-pinned {
   position: fixed;
   top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
+  bottom: 0;
+  left: var(--drawer-left-reserve, 0px);
+  right: var(--drawer-right-reserve, 0px);
+  width: auto;
+  height: auto;
   z-index: 10;
   background-color: var(--surface);
   display: flex;
@@ -2072,7 +2094,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .grid-item-pinned .canvas-container {
   width: min(100%, calc(100vh * 16 / 9));
-  height: min(100%, calc(100vw * 9 / 16));
+  height: min(
+    100%,
+    calc(
+      (
+          100vw - var(--drawer-left-reserve, 0px) -
+            var(--drawer-right-reserve, 0px)
+        ) * 9 / 16
+    )
+  );
 }
 
 /* Screen-share split layout: a pinned side-panel peer tile must maximize over
@@ -2089,9 +2119,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .split-peer-tile.grid-item-pinned {
   position: fixed;
   top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
+  bottom: 0;
+  left: var(--drawer-left-reserve, 0px);
+  right: var(--drawer-right-reserve, 0px);
+  width: auto;
+  height: auto;
   aspect-ratio: auto;
   z-index: 100;
   /* Drop the tile's 2px thumbnail border when maximized. `.split-peer-tile`
@@ -2117,30 +2149,26 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .split-peer-tile.grid-item-pinned .canvas-container {
-  /* Fill the FULL viewport, matching the no-screen-share pinned camera. In a
+  /* Fill the pinned BOX — since issue 2701 that box is inset by the drawer
+     reserves, so it is no longer the whole viewport. In a
      2-peer meeting the no-share pin renders as
      `.grid-item.full-bleed.grid-item-pinned`, whose
      `.grid-item.full-bleed .canvas-container` (global.css) is
-     `width: 100%; height: 100%` — the container spans the entire viewport and
-     the `object-fit: cover` canvas fills it edge-to-edge.
+     `width: 100%; height: 100%`, so the `object-fit: cover` canvas fills it.
 
      This rule previously used a `min(100%, 100vh * 16 / 9)` / `min(100%,
      100vw * 9 / 16)` 16:9 box to mirror the BASE `.grid-item-pinned
      .canvas-container` rule (style.css above). But that base rule is itself
      overridden by full-bleed in the 2-peer case, so the split (screen-share)
      pin resolved to a 16:9 box while the no-share pin was full-bleed. On any
-     viewport WIDER than 16:9 — most desktop/laptop windows — the 16:9 box is
-     narrower than the viewport, so the dark tile background showed as vertical
+     box WIDER than 16:9 — most desktop/laptop windows — the 16:9 box is
+     narrower, so the dark tile background showed as vertical
      PILLARBOX bars on the left and right of the live camera during screen share
-     while the no-share pin filled the viewport edge-to-edge (user report, PR
+     while the no-share pin filled its box (user report, PR
      #1892 round 4). `object-fit: cover` was never the cause: the canvas always
      filled its container in both contexts; the CONTAINER geometry differed.
 
-     Filling `100% / 100%` makes the pinned camera's container identical to the
-     no-share pin. Verified live at a 1600x720 viewport: the no-share container
-     is 1600x720 (canvas left:0, right:1600) and, after this change, the
-     screen-share container is likewise 1600x720 (was 1280x720, left:160 —
-     160px pillarbox each side). Both stay `object-fit: cover`, so a 4:3 camera
+     Both stay `object-fit: cover`, so a 4:3 camera
      crops top/bottom to fill the width identically in both contexts. This
      targets only the peer CAMERA tile (`.split-peer-tile`); the screen-share
      canvas (`.split-screen-tile`) keeps its own aspect-preserving contain rule
@@ -2226,12 +2254,19 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 /* Fixed-box buttons (signal/pin/crop/mute): normal grid sizes the container to
    `min(32px, --tile-h*0.15)`; the split base clamps them to 22px. */
-.split-peer-tile.grid-item-pinned .signal-indicator,
 .split-peer-tile.grid-item-pinned .pin-icon,
 .split-peer-tile.grid-item-pinned .crop-icon,
 .split-peer-tile.grid-item-pinned .tile-mute-btn {
   width: min(32px, calc(var(--tile-h, 240px) * 0.15));
   height: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  padding: 0;
+}
+
+/* issue 2661: the disc takes the same 28px floor as the grid, so the SVG
+   inside it stops overflowing an 18.89px box. */
+.split-peer-tile.grid-item-pinned .signal-indicator {
+  width: clamp(28px, calc(var(--tile-h, 240px) * 0.15), 32px);
+  height: clamp(28px, calc(var(--tile-h, 240px) * 0.15), 32px);
   padding: 0;
 }
 /* Audio pill is content-sized in the normal grid (padding + svg, no fixed box);
@@ -2242,16 +2277,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: min(6px, calc(var(--tile-h, 240px) * 0.025));
 }
 /* Per-button svg sizes match each element's own normal-grid formula (audio/pin/
-   crop 0.1, signal 0.09, mute 0.08 of --tile-h); the split base clamps to 14px. */
+   crop 0.1, mute 0.08 of --tile-h; the signal svg is full-bleed); the split base
+   clamps to 14px. */
 .split-peer-tile.grid-item-pinned .audio-indicator svg,
 .split-peer-tile.grid-item-pinned .pin-icon svg,
 .split-peer-tile.grid-item-pinned .crop-icon svg {
   width: min(20px, calc(var(--tile-h, 240px) * 0.1));
   height: min(20px, calc(var(--tile-h, 240px) * 0.1));
-}
-.split-peer-tile.grid-item-pinned .signal-indicator svg {
-  width: min(18px, calc(var(--tile-h, 240px) * 0.09));
-  height: min(18px, calc(var(--tile-h, 240px) * 0.09));
 }
 .split-peer-tile.grid-item-pinned .tile-mute-btn svg {
   width: min(16px, calc(var(--tile-h, 240px) * 0.08));
@@ -2299,8 +2331,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    is intentionally LOW (not 9000): sibling overlay drawers (`#peer-list-container`
    9300, `#diagnostics-sidebar` 9300 desktop / 9301 mobile, device-settings modal)
    render OUTSIDE `#grid-container`, so they already outrank this whole subtree via
-   `#grid-container`'s z-index:0 and must keep covering the dock when open. */
-#host-controls-nav.host {
+   `#grid-container`'s z-index:0 and must keep covering the dock when open.
+
+   Corner placement only (issue 66): in grid the nav forms no stacking context,
+   so the dock's 9000 resolves against `#grid-container` without this lift. */
+#host-controls-nav.host[data-self-placement="corner"] {
   z-index: 200;
 }
 
@@ -2458,6 +2493,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   /* Suppress browser touch panning and text selection during a capture drag. */
   touch-action: none;
   user-select: none;
+}
+
+.drawer-resize-handle[aria-disabled="true"] {
+  cursor: default;
 }
 
 /* Centered grip: a short rounded vertical bar, vertically centered in the
@@ -2804,71 +2843,6 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
        cluster, no per-element corner pin. */
     width: 10px;
     height: 10px;
-  }
-}
-
-/* ============================================================
-   Connection Quality Indicator (self-view RTT warning)
-   ============================================================ */
-
-.connection-quality-indicator {
-  /* issue 1885: a flex item inside `.host-tile-chrome` (no longer pinned to the
-     corner at right:28). It renders only on a degraded connection, so it simply
-     takes its place in the cluster row when present and occupies nothing when
-     absent — no fixed offset to collide with the badge. */
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  gap: var(--space-1);
-  padding: 3px var(--space-2) 3px var(--space-1);
-  background: var(--overlay-heavy);
-  border-radius: var(--radius-lg);
-  opacity: 0;
-  transform: translateY(4px);
-  transition:
-    opacity 0.3s ease,
-    transform 0.3s ease;
-  pointer-events: none;
-}
-
-.connection-quality-indicator.visible {
-  opacity: 1;
-  transform: translateY(0);
-}
-
-.connection-quality-indicator.exiting {
-  transition-duration: 0.5s;
-}
-
-.connection-quality-indicator svg {
-  width: 16px;
-  height: 16px;
-}
-
-.connection-quality-label {
-  font-size: var(--fs-2);
-  font-weight: 500;
-  color: var(--text-on-glass-high);
-  white-space: nowrap;
-  line-height: 1;
-}
-
-@media (prefers-reduced-motion: reduce) {
-
-  .connection-quality-indicator,
-  .connection-quality-indicator.exiting {
-    transition: none;
-  }
-}
-
-@media (max-width: 37.5em) {
-  .connection-quality-label {
-    display: none;
-  }
-
-  .connection-quality-indicator svg {
-    width: 14px;
-    height: 14px;
   }
 }
 
@@ -3761,14 +3735,29 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .host-controls-container {
   position: fixed;
   top: 1rem;
-  left: 50%;
+  left: calc(
+    50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
+      2
+  );
   transform: translateX(-50%);
   z-index: 9000;
   background: var(--fixed-dark-strong);
   border-radius: var(--radius-lg);
   box-shadow: 0 4px 20px var(--shadow-error);
-  min-width: 300px;
-  max-width: 400px;
+  min-width: min(
+    300px,
+    calc(
+      100vw - var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px) -
+        32px
+    )
+  );
+  max-width: min(
+    400px,
+    calc(
+      100vw - var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px) -
+        32px
+    )
+  );
   backdrop-filter: blur(10px);
   border: 1px solid var(--glass-bg-hover);
 }
@@ -5023,13 +5012,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0;
 }
 .split-peer-tile .audio-indicator svg,
-.split-peer-tile .signal-indicator svg,
 .split-peer-tile .pin-icon svg,
 .split-peer-tile .crop-icon svg,
 .split-peer-tile .tile-mute-btn svg {
   width: 14px;
   height: 14px;
 }
+
 .split-peer-tile .guest-badge {
   font-size: 0.65em;
   padding: 1px 5px;
@@ -5139,6 +5128,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-secondary);
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
+  flex-shrink: 0;
+}
+
+/* Grow the pointer target past the 28px circle without moving the glyph.
+   `::after` is switched off above, so `::before` is the free pseudo. */
+.speaker-highlight-help-icon::before {
+  content: "";
+  position: absolute;
+  inset: -8px;
 }
 
 /* The trigger is focusable (`role="button"`, `tabindex="0"`), so it needs a
@@ -5221,6 +5219,18 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   visibility: hidden;
 }
 
+/* Under 700px the preview stacks below the controls, so the topmost row can
+   reach the top of `.settings-panel`'s scroll box and its upward bubble is
+   clipped; on wider viewports a downward bubble would cover the sliders
+   beneath it. (0,2,0) beats the base placement; the offset matches the
+   narrow-viewport rule. */
+@media (max-width: 700px) {
+  .speaker-highlight-help-icon--below .speaker-highlight-help-tip {
+    top: calc(100% + 8px);
+    bottom: auto;
+  }
+}
+
 /* issue 1871: honour a reduced-motion preference, as `.field-label__tooltip`
    already does in global.css.
 
@@ -5244,14 +5254,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 }
 
-/* Keeps "Decay" and its `(?)` trigger on one baseline inside the label column
-   of `.appearance-slider-row`'s grid, now that the trigger is a sibling of the
-   label rather than a child of it. */
+/* Keeps each slider label and its `(?)` trigger on one line inside the label
+   column of `.appearance-slider-row`'s grid, the trigger being a sibling of
+   the label rather than a child of it. */
 .appearance-slider-label-group {
   display: flex;
   align-items: center;
   gap: var(--space-1);
   min-width: 0;
+  white-space: nowrap;
 }
 
 .settings-action-row {
@@ -5464,8 +5475,18 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   overflow: hidden;
   border: none;
   box-shadow: none;
+}
+
+/* Corner only: in grid the cell owns the aspect ratio (issue 66). */
+.host[data-self-placement="corner"] .host-video-wrapper {
   aspect-ratio: 16 / 9;
   flex-shrink: 0;
+}
+
+.host[data-self-placement="grid"] .host-video-wrapper {
+  aspect-ratio: auto;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .speaking-tile {
@@ -5475,10 +5496,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 /* NOTE: these two values are dead — every branch of `mic_style()`
    (canvas_generator.rs) emits an inline `transition` covering both `color` and
    `filter` on this same element, and inline declarations beat a stylesheet
-   rule. The durations that actually run come from there: colour 0.05s easing
-   in while lit and 5.0s easing out once silent, and filter per the Decay
-   setting (0.15s in, 1.50s out, after a 0-5s hold). Tuning the numbers here
-   changes nothing on screen. Left in place rather than deleted — removing it
+   rule. The durations that actually run come from there. Tuning the numbers
+   here changes nothing on screen. Left in place rather than deleted — removing it
    is a separate cleanup, not part of the issue-2174 fix. */
 .audio-indicator {
   transition:
@@ -5498,11 +5517,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    property, so the parent's inline value never reaches this child either —
    this declaration is the only thing that animates the stroke.
 
-   0.4s is chosen on its own merits, NOT to match any other rule: it sits
-   between the glow's 0.15s fade-in and 1.50s fade-out
-   (GLOW_FADE_IN_SECONDS_DEFAULT / GLOW_FADE_OUT_DURATION), long enough to read
-   as a deliberate fade rather than a snap, short enough that the outline does
-   not visibly trail the icon's colour change. */
+   0.4s is chosen on its own merits, NOT to match any other rule: long enough
+   to read as a deliberate fade rather than a snap, short enough that the
+   outline does not visibly trail the icon's colour change. */
 .audio-indicator svg {
   transition: stroke 0.4s ease;
 }
@@ -6138,14 +6155,24 @@ html[data-theme="light"] .decode-paused-pill-action {
 .peer-toasts {
   position: fixed;
   top: 16px;
-  left: 50%;
+  left: calc(
+    50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
+      2
+  );
   transform: translateX(-50%);
   z-index: 1100;
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   pointer-events: none;
-  max-width: 360px;
+  /* A viewport-relative cap still clipped into both drawers. (2701) */
+  max-width: min(
+    360px,
+    calc(
+      100vw - var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px) -
+        32px
+    )
+  );
   width: calc(100% - 32px);
 }
 
@@ -7489,7 +7516,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .color-swatches {
   display: flex;
   align-items: flex-start;
-  width: var(--speaker-control-width);
+  width: var(--speaker-swatch-row-width);
   gap: var(--space-2);
   flex-wrap: wrap;
   overflow: hidden;
@@ -8834,34 +8861,104 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
    ============================================================ */
 
 .signal-indicator {
+  /* issue 2661: the sibling tile icons' scrim, so the cluster reads as one set.
+     Translucent, so the trend's contrast over video is NOT bounded. */
   background-color: var(--overlay-heavy);
+  border: 2px solid transparent;
   border-radius: 50%;
-  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
-  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  box-sizing: border-box;
+  /* Floor as well as ceiling: the old `min()` had none, so a dense grid shrank
+     the control to 18px -- under the target-size floor, and under the width the
+     sparkline needs to read as a trend. */
+  width: clamp(28px, calc(var(--tile-h, 240px) * 0.15), 32px);
+  height: clamp(28px, calc(var(--tile-h, 240px) * 0.15), 32px);
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  border: none;
   padding: 0;
   font: inherit;
   -webkit-appearance: none;
   appearance: none;
-  transition: background-color 0.2s ease;
+  transition:
+    border-color 200ms ease,
+    background-color 200ms ease;
+}
+
+/* Pointer target without growing the visual disc (SC 2.5.8). */
+.signal-indicator::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+}
+
+@media (pointer: coarse) {
+  /* The split-layout rules below are (0,2,0) and (0,3,0), so a bare
+     `.signal-indicator` here never reached those discs — measured at 22px with
+     overlapping hit pads on phone emulation. */
+  .signal-indicator,
+  .split-peer-tile .signal-indicator,
+  .split-peer-tile.grid-item-pinned .signal-indicator {
+    width: 32px;
+    height: 32px;
+  }
+
+  .tile-top-icons,
+  .host-tile-chrome {
+    gap: 12px;
+  }
 }
 
 .signal-indicator:hover {
-  background-color: var(--overlay-opaque);
+  background-color: var(--overlay-strong);
 }
 
 .signal-indicator:focus-visible {
   outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  /* +1 over the old 2px so the focus ring clears the state ring. */
+  outline-offset: 3px;
+}
+
+/* issue 2661: full-bleed; a fixed px width had it at 57% of the disc. */
+.signal-spark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
 }
 
 .signal-indicator svg {
-  width: min(18px, calc(var(--tile-h, 240px) * 0.09));
-  height: min(18px, calc(var(--tile-h, 240px) * 0.09));
+  /* `SPARK_VIEW_*` in signal_spark.rs owns the viewBox and so the height. */
+  width: 100%;
+  height: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Names `transition`: a keyframes-only guard would miss it. */
+  .signal-indicator {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  /* Without this, forced-colors drops the SVG strokes and the disc goes blank. */
+  .signal-indicator {
+    background: Canvas;
+    border-color: CanvasText;
+  }
+
+  .signal-spark svg polyline {
+    stroke: CanvasText;
+  }
+
+  /* BOTH halos, polyline and line: a CanvasText one would bury the mark it
+     backs. (0,2,1) beats the polyline rule; the line rule opts out by class. */
+  .signal-spark svg .spark-halo {
+    stroke: Canvas;
+  }
+
 }
 
 .signal-quality-unmeasured {
@@ -8945,11 +9042,6 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   flex-shrink: 0;
 }
 
-/* Transport badge in the signal-quality popup header.
- * Higher-specificity, theme-aware variant of the global `.connection-type` /
- * `.type-*` pill defined just below. Scoped to `.signal-quality-popup` so the
- * popup header pill picks up the token-driven (bi-theme) colors; the global
- * rules below cover every other surface (the diagnostics drawer). */
 .signal-quality-popup .connection-type {
   padding: 2px var(--space-2);
   border-radius: 4px;
@@ -8960,49 +9052,24 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   flex-shrink: 0;
 }
 
-.signal-quality-popup .type-websocket {
-  background: var(--transport-badge-bg);
-  color: var(--transport-badge-text);
-  border: 1px solid var(--transport-badge-border);
-}
-
-.signal-quality-popup .type-webtransport {
-  background: var(--transport-badge-bg);
-  color: var(--transport-badge-text);
-  border: 1px solid var(--transport-badge-border);
-}
-
-/* Connection-type WT/WS pill — global home (issue 551 / issue 552, follow-up to
- * PR 548). These unscoped rules previously lived ONLY in the diagnostics popup's
- * inline `<style>` block (`diagnostics_cm_styles.css`). Being unscoped, that
- * inline copy leaked to the whole document whenever the diagnostics drawer was
- * mounted, and it was a second, separate definition of these selectors. Lifted
- * here so the selectors are defined ONCE at global scope and apply wherever the
- * badge renders (diagnostics drawer Reception + Per-Peer Summary). The
- * higher-specificity `.signal-quality-popup .type-*` rules above still win
- * inside the signal popup, so that surface is unchanged.
- *
- * Values are byte-identical to the former inline rules (the drawer historically
- * rendered this pill with these fixed literals in BOTH themes), so the lift is
- * purely structural with no rendered change. Tokenizing bg/border the way the
- * signal popup does would flip the drawer pill light under the light theme — a
- * visual change beyond this cleanup's scope.
- * @token-exempt: preserves the existing fixed pill literals so the lift stays
- * style-neutral (tokenization is a separate, behavior-changing follow-up). */
+/* Connection-type WT/WS pill — one definition for the signal popup AND the
+ * diagnostics drawer, on the tile badge's `--transport-badge-{ws,wt}-*` tokens.
+ * `.connection-type` is load-bearing: a bare `.type-websocket` (0,1,0) loses
+ * `color` to `.peer-summary-item span` (0,1,1) — grey on amber at 1.08:1. */
 .connection-type {
   padding: 2px var(--space-2);
   border-radius: 4px;
   font-size: var(--fs-2);
 }
-.type-websocket {
-  background: var(--surface);
-  color: var(--accent-hover);
-  border: 1px solid var(--border);
+.connection-type.type-websocket {
+  background: var(--transport-badge-ws-bg);
+  color: var(--transport-badge-ws-text);
+  border: 1px solid var(--transport-badge-ws-border);
 }
-.type-webtransport {
-  background: var(--surface);
-  color: var(--accent-hover);
-  border: 1px solid var(--border);
+.connection-type.type-webtransport {
+  background: var(--transport-badge-wt-bg);
+  color: var(--transport-badge-wt-text);
+  border: 1px solid var(--transport-badge-wt-border);
 }
 
 .signal-quality-popup .popup-close {
@@ -9499,7 +9566,10 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .mock-peers-popover {
   position: fixed;
   bottom: 104px;
-  left: 50%;
+  left: calc(
+    50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
+      2
+  );
   transform: translateX(-50%);
   background: var(--mock-popover-bg)
     /* @token-exempt: dark near-opaque, themed via token */
@@ -9582,7 +9652,10 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .density-popover {
   position: fixed;
   bottom: 104px;
-  left: 50%;
+  left: calc(
+    50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
+      2
+  );
   transform: translateX(-50%);
   background: var(--glass-popover-bg);
   border: 1px solid var(--glass-popover-border);
@@ -9660,7 +9733,10 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .reactions-palette {
   position: fixed;
   bottom: 104px;
-  left: 50%;
+  left: calc(
+    50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
+      2
+  );
   transform: translateX(-50%);
   background: var(--glass-popover-bg);
   border: 1px solid var(--glass-popover-border);
@@ -10211,9 +10287,18 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .reactions-overlay {
   position: fixed;
   bottom: 96px;
-  left: 50%;
+  left: calc(
+    50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
+      2
+  );
   transform: translateX(-50%);
-  width: min(480px, calc(100% - 32px));
+  width: min(
+    480px,
+    calc(
+      100vw - var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px) -
+        32px
+    )
+  );
   height: 60vh;
   max-height: 420px;
   z-index: 1090;
@@ -10886,18 +10971,22 @@ html[data-theme="light"] .settings-divider {
    Chat Sidebar — Google Meet style
    ========================================================================== */
 
+/* Chat is the INBOARD right drawer: one diagnostics-width in, and its closed
+   slide clears that too. Reading the wrapper's vars rather than taking props
+   keeps a diagnostics drag from re-rendering it. (issue 2701) */
 #chat-sidebar {
   position: fixed;
   top: 0;
-  right: -360px;
-  width: 360px;
+  right: var(--drawer-diag-reserve, 0px);
+  width: var(--chat-drawer-width, 360px);
+  transform: translateX(calc(100% + var(--drawer-diag-reserve, 0px)));
   height: 100%;
   background-color: var(--chat-surface);
   color: var(--chat-text-primary);
   display: flex;
   flex-direction: column;
   visibility: hidden;
-  transition: right 0.25s ease, visibility 0.25s ease;
+  transition: transform 0.25s ease, right 0.25s ease, visibility 0.25s ease;
   z-index: 200;
   box-shadow: -2px 0 10px var(--chat-shadow);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -10905,8 +10994,13 @@ html[data-theme="light"] .settings-divider {
 }
 
 #chat-sidebar.visible {
-  right: 0;
+  transform: translateX(0);
   visibility: visible;
+}
+
+/* The `right` transition would restart on every 8px drag step. (2701) */
+.drawers-dragging #chat-sidebar {
+  transition: none;
 }
 
 /* Notice bar */
@@ -11091,11 +11185,34 @@ html[data-theme="light"] .settings-divider {
   opacity: 0.6;
 }
 
-/* Responsive: full-width on small screens */
-@media (max-width: 600px) {
+/* A full-width SHEET below `CHAT_OVERLAY_MIN_VW`, not a 360px panel: at
+   568-680 a panel would cover most of the tiles. 0.02 under the constant
+   because Rust reflows at `>=` and a media query is inclusive. (2701) */
+@media (max-width: 679.98px) {
   #chat-sidebar {
-    width: 100%;
-    right: -100%;
+    width: 100% !important;
+    right: 0 !important;
+    transform: translateX(100%) !important;
+  }
+
+  #chat-sidebar.visible {
+    transform: translateX(0) !important;
+  }
+
+  /* A BOTTOM dock paints over the sheet's composer; a side dock does not,
+     hence the `data-dock` gate on the wrapper. (issue 2701) */
+  [data-dock="dock-bottom"] #chat-sidebar .chat-input-area {
+    padding-bottom: calc(
+      var(--space-3) + var(--controls-dock-clearance, 112px)
+    );
+  }
+}
+
+/* The mobile bar zone is ~73px, not 112px. Mirrors the `vw < 568` action-bar
+   zone in attendants.rs's grid-padding table. (issue 2701) */
+@media (max-width: 567.98px) {
+  [data-dock="dock-bottom"] #chat-sidebar .chat-input-area {
+    padding-bottom: calc(var(--space-3) + 73px);
   }
 }
 
@@ -12437,7 +12554,7 @@ html {
   position: fixed;
   /* Clears the controls dock the same way the decode-paused pill does. */
   bottom: var(--controls-dock-clearance);
-  left: clamp(0.75rem, 2vw, 1.25rem);
+  left: calc(clamp(0.75rem, 2vw, 1.25rem) + var(--drawer-left-reserve, 0px));
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -12536,7 +12653,11 @@ html {
    width plus a gap. */
 
 .meeting-timer-chip--dock-left {
-  left: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap));
+  /* Overrides the base `left`, so it has to re-add the reserve term. (2701) */
+  left: calc(
+    16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap) +
+      var(--drawer-left-reserve, 0px)
+  );
 }
 
 /* Mobile: the self-view tile takes 35% of the width at bottom-right and the
@@ -12616,7 +12737,10 @@ html {
 .meeting-timer-popover {
   position: fixed;
   bottom: 104px;
-  left: 50%;
+  left: calc(
+    50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
+      2
+  );
   transform: translateX(-50%);
   z-index: 9100;
   display: flex;
@@ -12861,4 +12985,387 @@ html {
 .meeting-timer-popover-action:disabled:hover,
 .meeting-timer-popover-action[aria-disabled="true"]:hover {
   background: transparent;
+}
+
+/* ============================================================
+   Self view placement (issue 66). The nav also wraps the `position: fixed`
+   action bar; it stays DOM-last and paints first via `order`, so the
+   positional `#grid-container > div` screen-share selectors keep their
+   indices. Sizing mirrors `.grid-item`.
+   ============================================================ */
+
+.host[data-self-placement="grid"] {
+  /* Same surface the peer `.grid-item` uses; `.host`'s own plain surface is a
+     visible shade step behind a camera-off self cell. */
+  background-color: var(--surface-elevated);
+  order: -1;
+  /* Containing block for the absolute chrome, with no stacking context. */
+  position: relative;
+  width: auto;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 3 / 2;
+  place-self: center;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Without this `.controls` stays content-sized and the camera's `height: 100%`
+   has nothing to resolve against. Deliberately not positioned. */
+.host[data-self-placement="grid"] > .controls {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* The local share preview must not crowd out the camera in a grid cell. */
+.host[data-self-placement="grid"] .screen-share-preview {
+  max-height: 35%;
+}
+
+/* Alone in a room: the self tile is the `participants-1` full-bleed tile. */
+.participants-1 .host[data-self-placement="grid"][data-self-full-bleed="true"] {
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: auto;
+  place-self: stretch;
+}
+
+/* Camera off in grid placement: sized by the cell, not a fixed 16:9 wrapper. */
+.self-tile-camera-off {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  box-sizing: border-box;
+}
+
+/* Top-left like peers; only wider, because the "You" pill follows the name. */
+.self-tile-name {
+  max-width: 70%;
+}
+
+/* A separate element, not text inside the name: a peer whose display name ends
+   in "(You)" gets plain text, never this pill. */
+.self-indicator {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  background: var(--fixed-dark-strong);
+  color: var(--on-dark-text-high);
+  font-size: 0.85em;
+  font-weight: 700;
+  line-height: 1.4;
+  text-transform: none;
+}
+
+/* Members of `.host-tile-chrome`, mirroring the peers' `.pin-icon` /
+   `.crop-icon`: same clamp, same circular chrome, same `visibility` reveal. */
+.self-tile-action {
+  flex: 0 0 auto;
+  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--overlay-heavy);
+  border-radius: 50%;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  font: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.self-tile-action svg {
+  width: min(20px, calc(var(--tile-h, 240px) * 0.1));
+  height: min(20px, calc(var(--tile-h, 240px) * 0.1));
+  flex-shrink: 0;
+}
+
+.self-tile-action:hover {
+  background-color: var(--overlay-opaque);
+}
+
+.self-tile-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The `:not(:has())` is load-bearing: the dock lives inside this same nav, so a
+   plain `.host:hover` fires with the pointer anywhere on it. */
+@media (hover: hover) {
+  .self-tile-action {
+    visibility: hidden;
+  }
+
+  .host:hover:not(:has(.video-controls-container:hover)) .self-tile-action,
+  .host:focus-within:not(:has(.video-controls-container:focus-within)) .self-tile-action {
+    visibility: visible;
+  }
+}
+
+/* Nothing reveals them on touch, so they stay up at the peers' clamp. */
+@media (pointer: coarse) {
+  .self-tile-action {
+    visibility: visible;
+  }
+
+  .host .host-tile-chrome {
+    gap: var(--space-1);
+  }
+}
+
+/* Measured: six members overflow the tile and `.host`'s `overflow: hidden`
+   clips the leftmost — the two buttons. See the PR body. */
+@media (max-width: 37.5em) {
+  .host .host-tile-chrome {
+    gap: var(--space-1);
+  }
+
+  .host[data-self-placement="corner"] .host-tile-chrome .transport-badge {
+    display: none;
+  }
+}
+
+/* Two identically-shaped keyframes under DIFFERENT names on purpose: the
+   animation restarts only when `animation-name` changes. Applied to the media,
+   never the nav — a transform there would move the fixed action bar. */
+@media (prefers-reduced-motion: no-preference) {
+  .host[data-self-animate="true"][data-self-placement="grid"]:not([data-self-hidden="true"]) .host-video-wrapper {
+    animation: self-view-enter-grid 180ms ease-out;
+  }
+
+  .host[data-self-animate="true"][data-self-placement="corner"]:not([data-self-hidden="true"]) .host-video-wrapper {
+    animation: self-view-enter-corner 180ms ease-out;
+  }
+}
+
+@keyframes self-view-enter-grid {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes self-view-enter-corner {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* The nav stays mounted (it carries the action bar and Host's `<video>`), so
+   hiding collapses the box instead of unmounting. */
+.host[data-self-hidden="true"] {
+  position: absolute;
+  width: 0;
+  height: 0;
+  min-width: 0;
+  min-height: 0;
+  max-width: none;
+  max-height: none;
+  aspect-ratio: auto;
+  border: none;
+  background-color: transparent;
+  overflow: visible;
+  /* Beats the speaking glow's INLINE box-shadow, which would otherwise paint
+     its blur around the zero-size box. */
+  box-shadow: none !important;
+}
+
+.host[data-self-hidden="true"] .host-tile-chrome,
+.host[data-self-hidden="true"] .self-tile-name,
+.host[data-self-hidden="true"] .screen-share-preview,
+.host[data-self-hidden="true"] .device-settings-menu-button,
+.host[data-self-hidden="true"] .guest-badge-preview {
+  display: none;
+}
+
+/* `.peer-toasts` sets `pointer-events: none`. */
+.self-view-hidden-toast {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  pointer-events: auto;
+  animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .self-view-hidden-toast {
+    animation: toast-enter-reduced 0.15s ease-out;
+  }
+}
+
+.toast-undo-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.toast-undo-btn:hover {
+  background: var(--overlay-strong);
+}
+
+.toast-undo-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.toast-close-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--on-dark-text-secondary);
+  cursor: pointer;
+}
+
+.toast-close-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.toast-close-btn:hover {
+  background: var(--overlay-strong);
+  color: var(--on-dark-text);
+}
+
+.toast-close-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  .toast-close-btn {
+    width: 44px;
+    height: 44px;
+  }
+
+  .toast-undo-btn {
+    min-height: 44px;
+  }
+}
+
+/* global.css loads AFTER this file, so every override of
+   `.video-control-button` here is doubled up to out-specify it. */
+.video-control-button.self-view-hidden-icon {
+  position: absolute;
+  bottom: var(--controls-dock-clearance);
+  right: clamp(1rem, 2vw, 1.5rem);
+  z-index: 56;
+  /* The base rule transitions `all`, which would animate the runtime
+     `bottom`/`right` re-anchors below on the main thread. */
+  transition-property: background-color, box-shadow, border-color;
+}
+
+/* This one floats over video with no action bar behind it. */
+.video-control-button.self-view-hidden-icon {
+  border-color: var(--on-dark-text-muted);
+}
+
+/* Centred, the 240px tooltip hangs off the viewport at this corner. */
+.video-control-button.self-view-hidden-icon .tooltip {
+  left: auto;
+  right: 0;
+  transform: translateX(0) scale(0.95);
+  transform-origin: bottom right;
+}
+
+.video-control-button.self-view-hidden-icon:hover .tooltip,
+.video-control-button.self-view-hidden-icon:focus-visible .tooltip {
+  transform: translateX(0) scale(1);
+}
+
+/* The timed arrival reveal. Rust owns the attribute at every width. */
+.video-control-button.self-view-hidden-icon[data-tooltip-open="true"] .tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(0) scale(1);
+}
+
+/* global.css drops action-bar tooltips here; 0,3,0 beats its 0,2,0. */
+@media (max-width: 640px) {
+  .video-control-button.self-view-hidden-icon .tooltip {
+    display: flex;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .video-control-button.self-view-hidden-icon {
+    animation: self-view-enter-corner 180ms ease-out;
+  }
+}
+
+/* `--decode-pill-bottom` mirrors the three rules that set the decode pill's row,
+   at the same relative precedence. 46px = its 44px action plus a 2px border. */
+#grid-container {
+  --decode-paused-pill-h: 46px;
+  --decode-pill-bottom: var(--controls-dock-clearance);
+}
+
+#grid-container:not(.has-screen-share):has(.meeting-timer-chip) {
+  --decode-pill-bottom: var(--meeting-timer-stack-next-bottom);
+}
+
+@media (max-width: 639px) {
+  #grid-container {
+    --decode-pill-bottom: 98px;
+  }
+}
+
+#grid-container:not(.has-screen-share):has(.decode-paused-pill)
+  .video-control-button.self-view-hidden-icon {
+  bottom: calc(
+    var(--decode-pill-bottom) + var(--decode-paused-pill-h) + var(--space-4)
+  );
+}
+
+/* 568px is the mobile corner-tile breakpoint, not the 639px decode-pill one. */
+@media (max-width: 568px) {
+  .video-control-button.self-view-hidden-icon {
+    right: clamp(0.5rem, 2vw, 1rem);
+  }
+}
+
+/* Mirrors `.meeting-timer-chip--dock-left`. AFTER the mobile block, which sets
+   `right` at the same specificity, because a right dock persists at every width. */
+.video-control-button.self-view-hidden-icon--dock-right {
+  right: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap));
 }

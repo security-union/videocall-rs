@@ -341,10 +341,11 @@ code-owned tier tables; stale copies of those keys are ignored.
 Tune camera, screen, and adaptive-audio targets in
 `videocall-aq/src/constants.rs` (`VIDEO_QUALITY_TIERS`,
 `SIMULCAST_VIDEO_LAYERS`, `SCREEN_QUALITY_TIERS`, and
-`AUDIO_QUALITY_TIERS`). Audio simulcast's `[12, 24, 48]` kbps publisher ladder
-is defined in `videocall-client/src/encode/microphone_encoder.rs` and is checked
-against the receiver ladder. These values affect encoder CPU and sender uplink;
-the relay then fans each selected layer out per receiver.
+`AUDIO_QUALITY_TIERS`). Audio publishes a SINGLE layer
+(`audio_published_layer_count()` returns `1`, #2279) at the top
+`AUDIO_QUALITY_TIERS` bitrate, so audio bitrate is owned by the AQ tier. The
+`[12, 24, 48]` kbps ladder in `videocall-client/src/encode/microphone_encoder.rs`
+is dormant publish-side code, and the relay does not layer-filter audio.
 
 ### Local/Docker: start-dioxus.sh
 

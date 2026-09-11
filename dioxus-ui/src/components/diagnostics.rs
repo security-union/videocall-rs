@@ -26,8 +26,8 @@ use crate::components::performance_settings::{
     format_kbps_compact, format_mbps, format_peer_device_lines, format_peer_kind_line,
     format_send_header, format_send_layer, format_send_layer_short, format_send_total_kbps,
     format_simulcast_summary, layer_led_on, layer_quality_label, peers_for_kind,
-    received_layer_led_on, DiagnosticsReader, HelpPopover, PerfControlsHandle,
-    PerformanceSettingsPanel,
+    received_layer_led_on, unknown_reading_note, DiagnosticsReader, HelpPopover,
+    PerfControlsHandle, PerformanceSettingsPanel,
 };
 use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
 use crate::local_storage::save_bool;
@@ -837,6 +837,10 @@ pub fn Diagnostics(
     /// Current drawer width in px, owned by the parent so it can persist the
     /// drag-resized width. (#1296)
     width: f64,
+    /// True when the other drawers leave no room to grow, so the handle is
+    /// announced disabled and drops its resize cursor. (issue 2701)
+    #[props(default = false)]
+    resize_inert: bool,
     /// Fired on resize-handle pointerdown so the parent can begin a drag. (#1296)
     on_resize_start: EventHandler<()>,
     /// Fired on each resize-handle pointermove, carrying the pointer's `client_x`.
@@ -847,7 +851,7 @@ pub fn Diagnostics(
     on_resize_end: EventHandler<()>,
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
-    // Issue 1768: the shared "Show media metrics on tiles" flag. The checkbox
+    // Issue 1768: the shared "Show diagnostics on tiles" flag. The checkbox
     // below writes it (and persists to localStorage); every PeerTile reads the
     // same signal to show/hide its overlay.
     let mut media_metrics_overlay_enabled = use_context::<MediaMetricsOverlayCtx>().0;
@@ -1355,7 +1359,8 @@ pub fn Diagnostics(
         div {
             id: "diagnostics-sidebar",
             class: if is_open { "visible" } else { "" },
-            style: format!("width: {}px", width),
+            // `{:.0}` matches the grid inset's rounding. (issue 2701)
+            style: format!("width: {width:.0}px"),
             // Non-modal drawer: a labelled region (the modal-trap behaviour stays
             // off — the call UI behind it remains interactive). (#1131 §5 a11y)
             role: "region",
@@ -1430,11 +1435,6 @@ pub fn Diagnostics(
                         "Changing protocol will reload the page."
                     }
                 }
-                // Issue 1768: per-tile media-metrics overlay toggle. A real
-                // checkbox with an explicit `label for=id` so it is properly
-                // labeled and keyboard-operable; the overlay it controls is a
-                // passive (aria-hidden) readout, so the checkbox is the sole a11y
-                // control surface for the feature.
                 section { class: "diagnostics-section", "aria-labelledby": "diag-h-display-options",
                     h3 { id: "diag-h-display-options", "Display options" }
                     div { class: "device-setting-group diag-overlay-toggle",
@@ -1450,12 +1450,13 @@ pub fn Diagnostics(
                             },
                         }
                         label { r#for: "diag-media-metrics-overlay",
-                            "Show media metrics on tiles"
+                            "Show diagnostics on tiles"
                         }
                     }
                     p { class: "transport-preference-note",
-                        "Overlays each peer's received resolution, fps and audio bitrate at the \
-                         bottom of their tile, and your own sending metrics on your tile."
+                        "Peer tiles: signal meter, its popup, resolution and fps. Your tile: your \
+                         sending resolution, fps and audio bitrate. Your own signal meter is always \
+                         shown. Where this deployment enables it, the WT/WS badge follows too."
                     }
                 }
                 // Raw stats: the four low-level pre-dumps (Reception + Sending +
@@ -1816,6 +1817,7 @@ pub fn Diagnostics(
                 role: "separator",
                 aria_orientation: "vertical",
                 aria_label: "Resize panel",
+                aria_disabled: if resize_inert { "true" } else { "false" },
                 tabindex: "0",
                 // keyboard resize is a follow-up
                 // Pointer capture: capturing the pointer on pointerdown routes every
@@ -1825,6 +1827,10 @@ pub fn Diagnostics(
                 // owns the width signals; this handle only forwards pointer coords.
                 onpointerdown: move |evt| {
                     evt.prevent_default();
+                    // Inert: start nothing, and do not capture the pointer.
+                    if resize_inert {
+                        return;
+                    }
                     on_resize_start.call(());
                     let native = evt.as_web_event();
                     if let Some(t) = native.target() {
@@ -2325,7 +2331,7 @@ fn SimulcastSendLadder(
                                 };
                                 let led_label = if active { "sending" } else { "not sending" };
                                 let full = format_send_layer(
-                                    layer.layer_id, ladder_count, layer.width, layer.height, layer.bitrate_kbps,
+                                    kind, layer.layer_id, ladder_count, layer.width, layer.height, layer.bitrate_kbps,
                                 );
                                 let res_short = format_send_layer_short(layer.width, layer.height);
                                 let kbps_short = format_kbps_compact(layer.bitrate_kbps);
@@ -2462,6 +2468,13 @@ fn SimulcastReceiveBreakdown(
                                         let line = format_peer_kind_line(kind_label, Some(&p.snap))
                                             .map(|l| format!("{}: {l}", p.label))
                                             .unwrap_or(p.label);
+                                        let line_note =
+                                            unknown_reading_note(&p.snap).unwrap_or_default();
+                                        let line_aria = if line_note.is_empty() {
+                                            line.clone()
+                                        } else {
+                                            format!("{line}. {line_note}")
+                                        };
                                         // issue 1656: per-peer VIDEO readout. Only the video
                                         // kind shows the recv/painted fps pair and the
                                         // content-staleness chip; audio/screen render nothing
@@ -2545,7 +2558,12 @@ fn SimulcastReceiveBreakdown(
                                                         }
                                                     }
                                                 }
-                                                span { class: "simulcast-recv-peer-line", "{line}" }
+                                                span {
+                                                    class: "simulcast-recv-peer-line",
+                                                    title: "{line_note}",
+                                                    "aria-label": "{line_aria}",
+                                                    "{line}"
+                                                }
                                                 if is_video {
                                                     div {
                                                         class: "simulcast-recv-peer-stats",

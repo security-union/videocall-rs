@@ -160,6 +160,94 @@ pub fn save_dock_autohide(enabled: bool) {
 }
 
 // ---------------------------------------------------------------------------
+// Self-view placement & visibility persistence (issue 66)
+// ---------------------------------------------------------------------------
+
+/// Where the local user's own video tile is drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SelfViewPlacement {
+    /// Floating tile pinned to the lower-right corner, above the action bar.
+    #[default]
+    Corner,
+    /// A first-position cell inside the participant grid.
+    Grid,
+}
+
+impl SelfViewPlacement {
+    /// Stable token used both as the persisted value and as the
+    /// `data-self-placement` DOM attribute.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SelfViewPlacement::Corner => "corner",
+            SelfViewPlacement::Grid => "grid",
+        }
+    }
+}
+
+/// Context for the self-view placement preference.
+#[derive(Clone, Copy)]
+pub struct SelfViewPlacementCtx(pub Signal<SelfViewPlacement>);
+
+/// Context for the self-view show/hide preference.
+#[derive(Clone, Copy)]
+pub struct SelfViewVisibleCtx(pub Signal<bool>);
+
+const SELF_VIEW_PLACEMENT_KEY: &str = "vc_self_view_placement";
+const SELF_VIEW_VISIBLE_KEY: &str = "vc_self_view_visible";
+
+/// Resolve a raw localStorage value into a placement. Anything but the exact
+/// `"grid"` token — an absent key or a garbage value included — yields
+/// `Corner`.
+pub fn resolve_self_view_placement(stored: Option<&str>) -> SelfViewPlacement {
+    match stored {
+        Some("grid") => SelfViewPlacement::Grid,
+        _ => SelfViewPlacement::Corner,
+    }
+}
+
+/// Resolve a raw localStorage value into the self-view visibility. Only the
+/// exact `"false"` token hides it; absent or garbage means visible.
+pub fn resolve_self_view_visible(stored: Option<&str>) -> bool {
+    match stored {
+        Some(v) => v != "false",
+        None => true,
+    }
+}
+
+/// Load the self-view placement from localStorage. Defaults to `Corner`.
+pub fn load_self_view_placement() -> SelfViewPlacement {
+    let stored = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(SELF_VIEW_PLACEMENT_KEY).ok().flatten());
+    resolve_self_view_placement(stored.as_deref())
+}
+
+/// Load the self-view visibility from localStorage. Defaults to `true`.
+pub fn load_self_view_visible() -> bool {
+    let stored = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(SELF_VIEW_VISIBLE_KEY).ok().flatten());
+    resolve_self_view_visible(stored.as_deref())
+}
+
+/// Persist the self-view placement to localStorage.
+pub fn save_self_view_placement(placement: SelfViewPlacement) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(SELF_VIEW_PLACEMENT_KEY, placement.as_str());
+    }
+}
+
+/// Persist the self-view visibility to localStorage.
+pub fn save_self_view_visible(visible: bool) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(
+            SELF_VIEW_VISIBLE_KEY,
+            if visible { "true" } else { "false" },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Density mode persistence
 // ---------------------------------------------------------------------------
 
@@ -477,6 +565,7 @@ pub struct AppearanceSettings {
     pub glow_brightness: f32,     // 0.0–1.0 scale factor
     pub inner_glow_strength: f32, // 0.0–1.0 scale factor
     pub glow_decay: f32,          // 0.0–1.0 scale factor
+    pub glow_velocity: f32,       // 0.0–1.0 attack speed
     pub show_entry_notifications: bool,
     pub show_exit_notifications: bool,
     pub play_entry_sound: bool,
@@ -500,6 +589,7 @@ impl Default for AppearanceSettings {
             glow_brightness: 0.5,
             inner_glow_strength: 0.5,
             glow_decay: 0.5,
+            glow_velocity: 0.5,
             show_entry_notifications: true,
             show_exit_notifications: true,
             play_entry_sound: true,
@@ -518,6 +608,7 @@ const APPEARANCE_COLOR_STORAGE_KEY: &str = "vc_appearance_glow_color";
 const APPEARANCE_BRIGHTNESS_STORAGE_KEY: &str = "vc_appearance_glow_brightness";
 const APPEARANCE_INNER_STORAGE_KEY: &str = "vc_appearance_inner_glow_strength";
 const APPEARANCE_DECAY_STORAGE_KEY: &str = "vc_appearance_glow_decay";
+const APPEARANCE_VELOCITY_STORAGE_KEY: &str = "vc_appearance_glow_velocity";
 const APPEARANCE_ENTRY_NOTIFICATIONS_KEY: &str = "vc_appearance_entry_notifications";
 const APPEARANCE_EXIT_NOTIFICATIONS_KEY: &str = "vc_appearance_exit_notifications";
 const APPEARANCE_ENTRY_SOUND_KEY: &str = "vc_appearance_entry_sound";
@@ -559,6 +650,12 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
         read_local_storage(APPEARANCE_DECAY_STORAGE_KEY).and_then(|v| v.parse::<f32>().ok())
     {
         settings.glow_decay = value.clamp(0.0, 1.0);
+    }
+
+    if let Some(value) =
+        read_local_storage(APPEARANCE_VELOCITY_STORAGE_KEY).and_then(|v| v.parse::<f32>().ok())
+    {
+        settings.glow_velocity = value.clamp(0.0, 1.0);
     }
 
     apply_notification_prefs(
@@ -636,6 +733,10 @@ pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
     write_local_storage(
         APPEARANCE_DECAY_STORAGE_KEY,
         &settings.glow_decay.clamp(0.0, 1.0).to_string(),
+    );
+    write_local_storage(
+        APPEARANCE_VELOCITY_STORAGE_KEY,
+        &settings.glow_velocity.clamp(0.0, 1.0).to_string(),
     );
     write_local_storage(
         APPEARANCE_ENTRY_NOTIFICATIONS_KEY,
@@ -737,6 +838,11 @@ pub type PeerSignalHistoryMap = Signal<
         Rc<RefCell<crate::components::signal_quality::PeerSignalHistory>>,
     >,
 >;
+
+/// Issue 2660: wall-clock ms of the last decodable audio sample per peer.
+/// Lifted out of `PeerTile`'s scope for the reason [`PeerSignalHistoryMap`] is:
+/// `expire_stale_claim` EXEMPTS the `0.0` a remount would restore.
+pub type PeerAudioLivenessMap = Signal<std::collections::HashMap<String, Rc<std::cell::Cell<f64>>>>;
 
 /// HCL bug #8 / #9: per-(peer, mode) signal-quality popup state, lifted out
 /// of `PeerTile`'s per-component lifecycle so a peer leaving the meeting (or

@@ -156,6 +156,11 @@ message VideoStats {
   // counts FRAMES.
   optional double video_seq_loss_per_sec = 18;
   optional double keyframe_requests_per_sec = 19;
+
+  // Decoder OUTPUT (on_output/sec), not decode calls; absent => unreported (#2657).
+  optional double fps_decoder_output = 20;
+  // Lifetime on_output count (#2657).
+  optional uint64 frames_emitted_total = 21;
 }
 
 message PeerStats {

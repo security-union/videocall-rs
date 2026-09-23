@@ -1123,13 +1123,6 @@ pub fn Host(
             as usize
     });
 
-    // AUDIO ladder depth for the SEND audio layer-count slider, read back from the
-    // mic encoder so the control can never offer positions the publisher does not
-    // emit.
-    let mic_state = state.clone();
-    let audio_layer_max =
-        use_hook(move || mic_state.borrow().microphone.effective_audio_layers() as usize);
-
     // Bundle the Performance controls into ONE handle and publish it to the parent
     // (attendants) so the Diagnostics drawer — a sibling of `Host` that can't
     // reach the encoders or the preference signals — can mount the
@@ -1153,11 +1146,9 @@ pub fn Host(
             read_screen_snapshot: read_screen_snap,
             received_reader: recv_reader,
             diagnostics_reader: diag_reader,
-            // Video/screen share the CPU-derived effective ceiling; audio is the mic
-            // encoder's published count.
+            // Video/screen share the CPU-derived effective ceiling.
             video_layer_max: send_layer_max,
             screen_layer_max: send_layer_max,
-            audio_layer_max,
         })
     };
     {

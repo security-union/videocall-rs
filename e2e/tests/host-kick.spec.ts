@@ -1,10 +1,107 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
+import { openPeerList } from "../helpers/controls";
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+const KICK_MESSAGE = "You have been removed from the meeting by the host.";
+/** `meeting_ended_overlay.rs`: the card inside `.meeting-ended-overlay`. */
+const MEETING_ENDED_CARD = '.meeting-ended-overlay [role="alertdialog"]';
+/** `meeting_ended_overlay.rs`: the overlay root (`class: "glass-backdrop meeting-ended-overlay"`). */
+const MEETING_ENDED_OVERLAY = ".meeting-ended-overlay";
+/** `meeting_ended_overlay.rs`: the card's only button ("Return to Home"). */
+const MEETING_ENDED_HOME_BTN = "button.meeting-ended-home-btn";
+const PEER_LIST = "#peer-list-container";
+const FOOTER_TRIGGER = "#meeting-footer-trigger";
+const MEETING_INFO_DIALOG = "#meeting-info-dialog";
+
+// Focus must land on the CARD, not on "Return to Home": the chat composer sends
+// on Enter, so a user mid-sentence must not have their next Enter navigate.
+async function expectOverlayOwnsFocus(page: Page, message: string, when: string): Promise<void> {
+  const card = page.locator(MEETING_ENDED_CARD);
+  await expect(card, `${when}: the overlay card must be an alertdialog`).toHaveCount(1, {
+    timeout: 20_000,
+  });
+  await expect(card).toHaveAttribute("aria-modal", "true");
+  await expect(card).toHaveAttribute("aria-labelledby", "meeting-ended-title");
+  await expect(card).toHaveAttribute("aria-describedby", "meeting-ended-message");
+  await expect(card).toHaveAttribute("tabindex", "-1");
+  // Neither id the card names may be a dangling reference.
+  await expect(card.locator("#meeting-ended-title")).toHaveText("Meeting Ended");
+  await expect(card.locator("#meeting-ended-message")).toHaveText(message);
+
+  await expect
+    .poll(
+      () =>
+        page.evaluate((selector) => {
+          const overlayCard = document.querySelector(selector);
+          if (!overlayCard) {
+            throw new Error("the meeting-ended overlay card is not in the DOM");
+          }
+          const active = document.activeElement;
+          if (!active) {
+            throw new Error("the document reports no activeElement");
+          }
+          const name = active.tagName.toLowerCase() + (active.id ? `#${active.id}` : "");
+          if (active === overlayCard) {
+            return "the overlay card";
+          }
+          return overlayCard.contains(active) ? `inside the card: ${name}` : name;
+        }, MEETING_ENDED_CARD),
+      { timeout: 15_000, message: `${when}: the overlay must hold focus` },
+    )
+    .toBe("the overlay card");
+}
+
+/** Where `document.activeElement` sits relative to the ended-meeting overlay. */
+type OverlayFocus = {
+  where: string;
+  inOverlay: boolean;
+  onFooterTrigger: boolean;
+};
+
+async function readOverlayFocus(page: Page): Promise<OverlayFocus> {
+  return page.evaluate(
+    (sel: { overlay: string; homeBtn: string; trigger: string }) => {
+      const active = document.activeElement;
+      if (!active) {
+        return { where: "no activeElement", inOverlay: false, onFooterTrigger: false };
+      }
+      const name = active.tagName.toLowerCase() + (active.id ? `#${active.id}` : "");
+      const inOverlay = active.closest(sel.overlay) !== null;
+      const where = active.matches(sel.homeBtn)
+        ? "the Home button"
+        : inOverlay
+          ? `inside the overlay: ${name}`
+          : `outside the overlay: ${name}`;
+      return { where, inOverlay, onFooterTrigger: active.matches(sel.trigger) };
+    },
+    { overlay: MEETING_ENDED_OVERLAY, homeBtn: MEETING_ENDED_HOME_BTN, trigger: FOOTER_TRIGGER },
+  );
+}
+
+/**
+ * The card's Tab-only `onkeydown` (`meeting_ended_overlay.rs` ->
+ * `trap_tab_in_dialog`) cycles Tab and Shift+Tab onto the card's one button.
+ */
+async function expectHomeButtonKeepsFocus(page: Page, when: string): Promise<void> {
+  await expect
+    .poll(() => readOverlayFocus(page).then((focus) => focus.where), {
+      timeout: 5_000,
+      message: `${when}: the Tab trap must park focus on the overlay's Home button`,
+    })
+    .toBe("the Home button");
+
+  const focus = await readOverlayFocus(page);
+  expect(focus.inOverlay, `${when}: focus must stay inside ${MEETING_ENDED_OVERLAY}`).toBe(true);
+  expect(
+    focus.onFooterTrigger,
+    `${when}: ${FOOTER_TRIGGER} sits under the z-9999 overlay and must not take focus`,
+  ).toBe(false);
+}
 
 async function navigateToMeeting(page: Page, meetingId: string, username: string): Promise<void> {
   await page.goto("/");
@@ -211,9 +308,7 @@ test.describe("Host kick controls", () => {
 
       // The overlay's message paragraph carries the configured text.
       await expect(
-        guestPage.locator(".meeting-ended-message", {
-          hasText: "You have been removed from the meeting by the host.",
-        }),
+        guestPage.locator(".meeting-ended-message", { hasText: KICK_MESSAGE }),
       ).toBeVisible({ timeout: 5_000 });
 
       // The overlay sits above the in-call controls — verify the "Return to
@@ -222,6 +317,9 @@ test.describe("Host kick controls", () => {
       await expect(guestPage.locator("button.meeting-ended-home-btn")).toBeVisible({
         timeout: 5_000,
       });
+
+      // ...and the top-most FOCUS layer too.
+      await expectOverlayOwnsFocus(guestPage, KICK_MESSAGE, "when the overlay appears");
 
       // ---- Host's grid loses the kicked guest's tile: on_peer_left fires on
       // the host session once the server broadcasts PEER_LEFT. Without this
@@ -372,6 +470,131 @@ test.describe("Host kick controls", () => {
       await expect(hostPage.getByTitle("Host actions")).toHaveCount(0);
     } finally {
       await browser1.close();
+    }
+  });
+
+  /**
+   * Test 4: `MeetingInfoDialog` is gated on
+   * `is_active: meeting_ended_message().is_none()` (`attendants.rs`), so an
+   * ended meeting unmounts the dialog and the element that held focus goes
+   * with it. The peer list is open so the Escape that follows has a visible
+   * target: with no panel open `esc_panel_close_target` returns `None` and the
+   * assertion would hold whatever the overlay did with the event.
+   */
+  test("the meeting-ended overlay takes focus from the Meeting info dialog and swallows Escape", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(150_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_hostkick_focus_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-kickfocus@videocall.rs",
+        "KickFocusHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-kickfocus@videocall.rs",
+        "KickFocusGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // ---- Both users join the meeting ----
+      await navigateToMeeting(hostPage, meetingId, "KickFocusHost");
+      expect(await joinMeetingFromPage(hostPage)).toBe("in-meeting");
+
+      await navigateToMeeting(guestPage, meetingId, "KickFocusGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // ---- Guest opens the peer list, then the Meeting info dialog ----
+      const peerList = guestPage.locator(PEER_LIST);
+      await openPeerList(guestPage);
+
+      await expect(guestPage.locator(FOOTER_TRIGGER)).toBeVisible({ timeout: 15_000 });
+      await guestPage.locator(FOOTER_TRIGGER).click({ timeout: 10_000 });
+      const infoDialog = guestPage.locator(MEETING_INFO_DIALOG);
+      await expect(infoDialog).toBeVisible({ timeout: 5_000 });
+      await expect(infoDialog, "the dialog holds focus before the meeting ends").toBeFocused({
+        timeout: 5_000,
+      });
+      await expect(peerList, "the peer list stays open behind the dialog").toHaveClass(
+        /\bvisible\b/,
+      );
+
+      // ---- Host kicks the guest ----
+      await hostKickPeerViaTile(hostPage);
+
+      // The dialog unmounts with the meeting, so the focused element is gone.
+      await expect(infoDialog, "the ended meeting unmounts the dialog").toHaveCount(0, {
+        timeout: 20_000,
+      });
+      await expect(
+        guestPage.locator('[data-testid="meeting-footer-ended"]'),
+        "the footer line flips to Ended",
+      ).toBeVisible({ timeout: 10_000 });
+
+      await expectOverlayOwnsFocus(
+        guestPage,
+        KICK_MESSAGE,
+        "when the meeting ends under the dialog",
+      );
+
+      // ---- Escape must not reach the meeting view behind the overlay ----
+      await expect(peerList, "the peer list is the Escape chain's target").toHaveClass(
+        /\bvisible\b/,
+      );
+      await guestPage.keyboard.press("Escape");
+      await guestPage.waitForTimeout(500); // window for an unwanted close to render
+      await expect(
+        peerList,
+        "Escape in the overlay must not close the panel behind it",
+      ).toHaveClass(/\bvisible\b/);
+      await expectOverlayOwnsFocus(guestPage, KICK_MESSAGE, "after Escape");
+
+      // ---- Tab must not walk out of the overlay either ----
+      // `meeting_footer.rs` renders `#meeting-footer-trigger` whether or not
+      // the meeting is active, so it stays mounted and tabbable under the
+      // z-9999 overlay. That is the premise of the checks below: without a
+      // live trigger, "Tab never reached it" would hold trivially.
+      await expect(
+        guestPage.locator(FOOTER_TRIGGER),
+        "the footer trigger stays mounted under the overlay, so Tab has somewhere to escape to",
+      ).toHaveCount(1);
+
+      // The card is `tabindex="-1"`, so the first Tab reaches the Home button
+      // either way. The second Tab and the Shift+Tab are what the card's
+      // `onkeydown` decides: delete it and both walk off the button into the
+      // meeting view behind the overlay.
+      await guestPage.keyboard.press("Tab");
+      await expectHomeButtonKeepsFocus(guestPage, "after the first Tab inside the overlay");
+
+      await guestPage.keyboard.press("Tab");
+      await expectHomeButtonKeepsFocus(guestPage, "after a second Tab inside the overlay");
+
+      await guestPage.keyboard.press("Shift+Tab");
+      await expectHomeButtonKeepsFocus(guestPage, "after Shift+Tab inside the overlay");
+
+      // The Home button is left focused but NEVER activated: its onclick sets
+      // `location.href = "/"`, which would navigate the page mid-test.
+    } finally {
+      await browser1.close();
+      await browser2.close();
     }
   });
 });

@@ -3,13 +3,15 @@ import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-contex
 import { waitForServices } from "../helpers/wait-for-services";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 import { joinMeetingFromPage } from "../helpers/two-user-meeting";
+import { MEETING_FOOTER } from "../helpers/rust-mirrored-constants";
 
 /**
  * The tile group is centred horizontally in the free band (#2700). The 2+ tile
  * arm is `flex-wrap: wrap; justify-content: center`, so every line centres,
  * including a partial last row; the 1-tile and screen-share arms are untouched.
- * Numbers are acceptance-checklist literals at 1280x720 (gap 16, padding
- * 20/20/120/20, avail 1240x580).
+ * Numbers are acceptance-checklist literals for a 1240x580 meeting area (gap
+ * 16, padding 20/20/152/20). The viewport is 1280x720 plus the meeting footer's
+ * reserve (issue 2791), which the bottom padding includes.
  *
  * Observed on 3bdabd49, where the arm was start-packed CSS grid: 3 failed,
  * 1 passed — every row started at 20 (340 with the peer list open) instead of
@@ -17,7 +19,7 @@ import { joinMeetingFromPage } from "../helpers/two-user-meeting";
  */
 
 const DEFAULT_UI_URL = "http://localhost:3001";
-const DESKTOP = { width: 1280, height: 720 };
+const DESKTOP = { width: 1280, height: 720 + MEETING_FOOTER.MEETING_FOOTER_RESERVE };
 
 const EPS = 1;
 

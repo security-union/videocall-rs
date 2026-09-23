@@ -2494,6 +2494,19 @@ pub fn paint_lag_ms(
     outstanding as f64 * source_frame_interval_ms
 }
 
+/// Decoder-output rate (issue #2657): emitted frames per wall-second between two 1 Hz emits.
+/// `None` when there is no interval to divide by, which is NOT a rate of zero — a zero here
+/// reads as "the decoder emitted nothing".
+pub fn fps_from_deltas(
+    frames_now: u64,
+    prev_frames: u64,
+    now_ms: f64,
+    prev_ms: f64,
+) -> Option<f64> {
+    let dt = now_ms - prev_ms;
+    (prev_ms > 0.0 && dt > 0.0).then(|| frames_now.wrapping_sub(prev_frames) as f64 * 1000.0 / dt)
+}
+
 /// Content-staleness (content AGE) in ms of the video currently being painted (issue #1641).
 ///
 /// This surfaces the observability hole behind #1631 M2 — "video lagged by minutes" while
@@ -4621,6 +4634,26 @@ mod tests {
             got, 0.0,
             "painted > emitted must floor to 0.0 (at live), got {got}"
         );
+    }
+
+    #[test]
+    fn fps_from_deltas_is_frame_delta_over_elapsed_seconds() {
+        assert_eq!(fps_from_deltas(40, 10, 2000.0, 1000.0), Some(30.0));
+    }
+
+    #[test]
+    fn fps_from_deltas_is_none_on_the_first_emit() {
+        assert_eq!(fps_from_deltas(40, 0, 1000.0, 0.0), None);
+    }
+
+    #[test]
+    fn fps_from_deltas_is_none_when_the_clock_did_not_advance() {
+        assert_eq!(fps_from_deltas(40, 10, 1000.0, 1000.0), None);
+    }
+
+    #[test]
+    fn fps_from_deltas_wraps_across_a_counter_reset() {
+        assert_eq!(fps_from_deltas(7, u64::MAX - 2, 2000.0, 1000.0), Some(10.0));
     }
 
     // --- Resync-to-live governor (issue #1252, v1) ---

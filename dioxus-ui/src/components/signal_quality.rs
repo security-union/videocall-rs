@@ -27,6 +27,8 @@ use crate::components::performance_settings::{
     quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
     reason_chip_title,
 };
+
+use crate::components::attendants_layout::MEETING_FOOTER_RESERVE;
 use crate::theme::color as theme_color;
 
 // ---------------------------------------------------------------------------
@@ -1001,10 +1003,10 @@ impl Rect {
 ///      i.e. `target_left = btn.left + btn.width * X_FRAC - popup_w`
 ///      and  `target_top  = btn.top  + btn.height * Y_FRAC`.
 ///   2. Clamp the result into `[VIEWPORT_MARGIN_PX, viewport - popup - margin]`
-///      on both axes so the popup never extends past a screen edge.
-///      Buttons near the viewport left can otherwise push `target_left`
-///      negative; buttons near the bottom can otherwise push the popup
-///      off the bottom edge.
+///      horizontally, and vertically into the same range with
+///      `MEETING_FOOTER_RESERVE` also taken off the viewport. Each upper bound
+///      falls back to `VIEWPORT_MARGIN_PX`, so a popup too large for the space
+///      left pins to the margin and overhangs the far edge.
 ///
 /// The function operates on pure data, so unit tests can drive every
 /// edge-case path without a browser.
@@ -1030,7 +1032,8 @@ pub(crate) fn compute_popup_position(
     // midpoint (`btn.top + btn.height * Y_FRAC`). Clamp into the viewport
     // so a button near the bottom edge can't push the popup off-screen,
     // and a button scrolled above the viewport can't yield a negative top.
-    let max_top = (viewport_h - popup_h - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
+    let max_top = (viewport_h - MEETING_FOOTER_RESERVE - popup_h - VIEWPORT_MARGIN_PX)
+        .max(VIEWPORT_MARGIN_PX);
     let min_top = VIEWPORT_MARGIN_PX;
     let target_top = anchor.top + anchor.height() * POPUP_BUTTON_OVERLAY_Y_FRACTION;
     let top = target_top.clamp(min_top, max_top.max(min_top));
@@ -1272,7 +1275,8 @@ pub(crate) fn clamp_free_position(
 ) -> (f64, f64) {
     let max_left = (viewport_w - popup_w - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
     let min_left = VIEWPORT_MARGIN_PX;
-    let max_top = (viewport_h - popup_h - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
+    let max_top = (viewport_h - MEETING_FOOTER_RESERVE - popup_h - VIEWPORT_MARGIN_PX)
+        .max(VIEWPORT_MARGIN_PX);
     let min_top = VIEWPORT_MARGIN_PX;
     let l = left.clamp(min_left, max_left.max(min_left));
     let t = top.clamp(min_top, max_top.max(min_top));
@@ -4463,18 +4467,19 @@ mod tests {
     fn popup_clamps_vertically_when_button_is_near_bottom() {
         // Anchor at the bottom of the viewport — the downward Y_FRAC
         // shift would push the popup off-screen, so the clamp pulls
-        // it back to `viewport_h - popup_h - margin`.
+        // it back above the meeting footer.
         let anchor = rect_from(100.0, 950.0, 32.0, 32.0);
         let popup_h = 500.0;
         let viewport_h = 1000.0;
         let (_left, top) =
             super::compute_popup_position(anchor, 420.0, popup_h, 1920.0, viewport_h);
-        let expected_max_top = viewport_h - popup_h - super::VIEWPORT_MARGIN_PX;
+        let expected_max_top =
+            viewport_h - MEETING_FOOTER_RESERVE - popup_h - super::VIEWPORT_MARGIN_PX;
         assert!(
             (top - expected_max_top).abs() < 0.01,
             "expected clamp to {expected_max_top}, got {top}"
         );
-        assert!(top + popup_h <= viewport_h);
+        assert!(top + popup_h <= viewport_h - MEETING_FOOTER_RESERVE);
     }
 
     #[test]
@@ -4511,8 +4516,11 @@ mod tests {
             let (l, t) =
                 super::compute_popup_position(anchor, popup_w, popup_h, viewport_w, viewport_h);
             assert!(
-                l >= 0.0 && (l + popup_w) <= viewport_w && t >= 0.0 && (t + popup_h) <= viewport_h,
-                "popup off-screen at anchor=({left},{top}): pos=({l},{t})"
+                l >= 0.0
+                    && (l + popup_w) <= viewport_w
+                    && t >= 0.0
+                    && (t + popup_h) <= viewport_h - MEETING_FOOTER_RESERVE,
+                "popup off-screen or under the meeting footer at anchor=({left},{top}): pos=({l},{t})"
             );
         }
     }
@@ -4612,12 +4620,12 @@ mod tests {
 
     #[test]
     fn clamp_free_bottom_overflow_clamps_to_max_top() {
-        // Target top that would push the popup off the bottom edge ->
-        // clamp to (viewport_h - popup_h - margin).
+        // Target top that would push the popup off the bottom edge or under
+        // the meeting footer -> clamp to just above the footer.
         let viewport_h = 1080.0;
         let popup_h = 400.0;
         let (_, t) = super::clamp_free_position(100.0, 2000.0, 420.0, popup_h, 1920.0, viewport_h);
-        let expected = viewport_h - popup_h - super::VIEWPORT_MARGIN_PX;
+        let expected = viewport_h - MEETING_FOOTER_RESERVE - popup_h - super::VIEWPORT_MARGIN_PX;
         assert!((t - expected).abs() < 0.01, "got {t}, expected {expected}");
     }
 

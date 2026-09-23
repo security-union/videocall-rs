@@ -16,7 +16,10 @@
 //! Renders a centered card with an X icon, a configurable message,
 //! and a "Return to Home" button that navigates to `/`.
 
+use crate::components::meeting_footer::trap_tab_in_dialog;
 use dioxus::prelude::*;
+
+const MEETING_ENDED_CARD_ID: &str = "meeting-ended-card";
 
 /// A glass-backdrop overlay that tells the user the meeting has ended
 /// and offers a button to return to the home page.
@@ -29,9 +32,29 @@ pub fn MeetingEndedOverlay(
         div {
             class: "glass-backdrop meeting-ended-overlay",
             style: "z-index: 9999;",
+            onkeydown: move |e: Event<KeyboardData>| e.stop_propagation(),
             div {
-                class: "card-apple",
+                id: MEETING_ENDED_CARD_ID,
+                class: "card-apple meeting-ended-card",
                 style: "width: 420px; text-align: center;",
+                role: "alertdialog",
+                "aria-modal": "true",
+                "aria-labelledby": "meeting-ended-title",
+                "aria-describedby": "meeting-ended-message",
+                tabindex: "-1",
+                onkeydown: move |e: Event<KeyboardData>| {
+                    if e.key() == Key::Tab
+                        && trap_tab_in_dialog(MEETING_ENDED_CARD_ID, e.modifiers().shift())
+                    {
+                        e.prevent_default();
+                    }
+                },
+                onmounted: move |element| {
+                    let element = element.data();
+                    spawn(async move {
+                        let _ = element.set_focus(true).await;
+                    });
+                },
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
                     width: "64",
@@ -45,11 +68,15 @@ pub fn MeetingEndedOverlay(
                     line { x1: "15", y1: "9", x2: "9", y2: "15" }
                     line { x1: "9", y1: "9", x2: "15", y2: "15" }
                 }
-                h4 { style: "margin-top:0; margin-bottom: var(--space-2);", "Meeting Ended" }
+                h4 {
+                    id: "meeting-ended-title",
+                    style: "margin-top:0; margin-bottom: var(--space-2);",
+                    "Meeting Ended"
+                }
                 p {
+                    id: "meeting-ended-message",
                     class: "meeting-ended-message",
-                    // @token-exempt: muted text on overlay + 1.5rem margin has no matching token
-                    style: "font-size: var(--fs-7); margin: 1.5rem 0; color: #666;",
+                    style: "font-size: var(--fs-7); margin: 1.5rem 0; color: var(--text-secondary);",
                     "{message}"
                 }
                 button {

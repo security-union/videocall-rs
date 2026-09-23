@@ -49,6 +49,7 @@ use crate::components::{
     icons::raised_hand::RaisedHandIcon,
     media_metrics_overlay::{MediaMetricsOverlayCtx, MEDIA_METRICS_OVERLAY_KEY},
     meeting_ended_overlay::MeetingEndedOverlay,
+    meeting_footer::{MeetingFooter, MeetingInfoDialog},
     meeting_options_controls::MeetingOptionsControls,
     peer_list::{PeerList, PeerListEntry, RosterLiveness},
     peer_tile::PeerTile,
@@ -83,11 +84,11 @@ use crate::context::{
     save_self_view_placement, save_self_view_visible, validate_display_name, AppearanceSettingsCtx,
     AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
     DetachedShareCtx, DisplayNameCtx, DockPosition, DockPositionCtx, HostRefreshNonceCtx,
-    HostSetCtx, LocalAudioLevelCtx, MeetingTime, PeerAudioLivenessMap, PeerMediaState,
-    PeerMetadata, PeerMetadataCtx, PeerSignalHistoryMap, PeerStatusMap, RaisedHandsCtx,
-    RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState, SelfViewPlacement,
-    SelfViewPlacementCtx, SelfViewVisibleCtx, SignalPopupStateMap, TransportPreference,
-    TransportPreferenceCtx, UserRequestedDecodeCtx,
+    HostSetCtx, LocalAudioLevelCtx, LocalSpeakingCtx, MeetingTime, PeerAudioLivenessMap,
+    PeerMediaState, PeerMetadata, PeerMetadataCtx, PeerSignalHistoryMap, PeerStatusMap,
+    RaisedHandsCtx, RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState,
+    SelfViewPlacement, SelfViewPlacementCtx, SelfViewVisibleCtx, SignalPopupStateMap,
+    TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
 };
 use crate::local_storage::{load_bool, load_f64, load_json, remove_item, save_f64, save_json};
 use crate::types::DeviceInfo;
@@ -1364,11 +1365,11 @@ fn schedule_reconnect_no_jwt(
 
 use super::attendants_layout::{
     action_bar_band_width, compute_effective_density, compute_layout, drawer_max_for_side,
-    drawer_reserves, drawers_to_close_on_open, drawers_to_close_on_resize, handle_is_inert,
-    overflow_budget_width, promote_speakers, quantise_reserve, resize_notice,
-    screen_share_flow_style, screen_share_pinned_tile_size, select_display_candidates,
-    sort_camera_off_window, tile_flow_style, DrawerKind, DrawerSide, DrawerState, DrawersToClose,
-    DRAWER_MAX_ABS, DRAWER_MIN_WIDTH, TILE_AR,
+    drawer_reserves, drawers_to_close_on_open, drawers_to_close_on_resize, grid_padding,
+    handle_is_inert, overflow_budget_width, promote_speakers, quantise_reserve, resize_notice,
+    screen_share_flow_style, screen_share_padding, screen_share_pinned_tile_size,
+    select_display_candidates, sort_camera_off_window, tile_flow_style, DrawerKind, DrawerSide,
+    DrawerState, DrawersToClose, DRAWER_MAX_ABS, DRAWER_MIN_WIDTH, TILE_AR,
 };
 use super::density::{next_density_mode, DensityMode, DENSITY_MODES};
 
@@ -1825,7 +1826,7 @@ fn focus_element_by_id(id: &str) {
     }
 }
 
-fn focus_trigger_or_grid(id: &str) {
+pub(crate) fn focus_trigger_or_grid(id: &str) {
     let doc = web_sys::window().and_then(|w| w.document());
     let landed = doc
         .as_ref()
@@ -1887,19 +1888,25 @@ fn focus_within(selector: &str) -> bool {
         .is_some()
 }
 
-/// True when a click originated inside the action bar (`.video-controls-container`).
+/// True when a click originated inside the action bar (`.video-controls-container`)
+/// or the meeting footer (`.meeting-footer`).
 /// The in-meeting `#main-container` background-click handler uses this to leave the
 /// side panels (peer list, diagnostics) open when the click landed on an action-bar
-/// control — the panel toggles themselves, mic, camera, etc. — rather than on the
-/// video grid. Any failure to resolve the click target defaults to `false`
-/// ("not in the action bar"), the safe default that lets a genuine background click
-/// still light-dismiss the panels. Uses the file's established
-/// `target().closest(".video-controls-container")` idiom.
-fn click_within_action_bar(evt: &MouseEvent) -> bool {
+/// control or on the footer line rather than on the video grid. Any failure to
+/// resolve the click target defaults to `false` ("not in the persistent chrome"),
+/// the safe default that lets a genuine background click still light-dismiss
+/// the panels.
+fn click_within_persistent_chrome(evt: &MouseEvent) -> bool {
     evt.as_web_event()
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-        .and_then(|el| el.closest(".video-controls-container").ok().flatten())
+        .is_some_and(|el| element_within_persistent_chrome(&el))
+}
+
+fn element_within_persistent_chrome(el: &web_sys::Element) -> bool {
+    el.closest(".video-controls-container, .meeting-footer")
+        .ok()
+        .flatten()
         .is_some()
 }
 
@@ -3942,7 +3949,8 @@ pub fn AttendantsComponent(
     let mut meeting_start_time_server = use_signal(|| None::<f64>);
     let mut call_start_time = use_signal(|| None::<f64>);
     let meeting_ended_message = use_signal(|| None::<String>);
-    let mut meeting_info_open = use_signal(|| false);
+    let meeting_info_open = use_signal(|| false);
+    let show_build_git = use_hook(crate::constants::show_build_git_info);
     let peer_list_version = use_signal(|| 0u32);
     // Phase 6 render-storm fix: shared "bump pending?" flag for the
     // `peer_speaking` event handler. Lives on a `use_hook` so it survives
@@ -6470,6 +6478,7 @@ pub fn AttendantsComponent(
     use_context_provider(|| PeerMetadataCtx(peer_metadata_signal));
     let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
     let _ = local_audio_level_ctx.0;
+    use_context_provider(|| LocalSpeakingCtx(local_speaking));
     use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
     let appearance_save_timeout: Rc<RefCell<Option<Timeout>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
@@ -8428,36 +8437,7 @@ pub fn AttendantsComponent(
         .ok()
         .and_then(|v| v.as_f64())
         .unwrap_or(768.0);
-    // Gap/padding must match #grid-container in style.css.
-    // Breakpoint (568px) must match @media (max-width: 568px) in style.css.
-    // pad_top: breathing room above top tile row.
-    // pad_bottom: pad_top + action-bar zone so tiles are visually centred
-    //             in the space ABOVE the action bar (Google Meet style).
-    //   Desktop action-bar zone ≈ 99px (79px bar + 20px offset).
-    //   Mobile  action-bar zone ≈ 73px (57px bar + 16px offset).
-    let (gap, pad_top, pad_right, pad_bottom, pad_left) = match dock_position() {
-        DockPosition::Bottom => {
-            if vw < 568.0 {
-                (8.0, 8.0, 8.0, 80.0, 8.0)
-            } else {
-                (16.0, 20.0, 20.0, 120.0, 20.0)
-            }
-        }
-        DockPosition::Left => {
-            if vw < 568.0 {
-                (8.0, 8.0, 8.0, 8.0, 80.0)
-            } else {
-                (16.0, 20.0, 20.0, 20.0, 120.0)
-            }
-        }
-        DockPosition::Right => {
-            if vw < 568.0 {
-                (8.0, 8.0, 80.0, 8.0, 8.0)
-            } else {
-                (16.0, 20.0, 120.0, 20.0, 20.0)
-            }
-        }
-    };
+    let (gap, pad_top, pad_right, pad_bottom, pad_left) = grid_padding(dock_position(), vw);
     // Meeting-wide status bar reserve (recording status, today). While the bar
     // is mounted it occupies `[0, reserve]` at the very top of `#main-container`;
     // add that height to `pad_top` so tiles (and their `.floating-name` labels)
@@ -9193,13 +9173,14 @@ pub fn AttendantsComponent(
         // condition as the grid path, so the share/participant panels never sit
         // under the bar while recording is active. 16px is the base top padding.
         let (ss_tw, ss_th) = screen_share_pinned_tile_size(avail_w, avail_h);
-        let ss_pad_top = 16.0 + status_bar_reserve;
+        let (ss_pad_top, ss_pad_right, ss_pad_bottom, ss_pad_left) =
+            screen_share_padding(status_bar_reserve);
         let (ss_left, ss_right) = (left_reserve_q, right_reserve_q);
         let flow = screen_share_flow_style();
         format!(
             "position: absolute; left: {ss_left:.0}px; right: {ss_right:.0}px; top: 0; bottom: 0; height: 100%; \
              gap: 10px; \
-             padding: {ss_pad_top:.0}px 16px 80px 16px; \
+             padding: {ss_pad_top:.0}px {ss_pad_right:.0}px {ss_pad_bottom:.0}px {ss_pad_left:.0}px; \
              box-sizing: border-box; \
              {flow} \
              --tile-w: {ss_tw:.0}px; --tile-h: {ss_th:.0}px;"
@@ -10152,14 +10133,15 @@ pub fn AttendantsComponent(
                     // Background (video-grid) clicks also light-dismiss the open
                     // side panels — the peer list and diagnostics drawer (issue
                     // #1790). Clicks on the action bar (`.video-controls-container`)
-                    // are excluded so the panel toggles, mic and camera keep the
-                    // panels open; clicks INSIDE a panel are stopped on the panel
-                    // container itself, so they never reach this handler. Closing
-                    // by flipping the signal runs the SAME teardown as the toggle:
+                    // and the meeting footer are excluded so the panel toggles, mic
+                    // and camera keep the panels open; clicks INSIDE a panel are
+                    // stopped on the panel container itself, so they never reach
+                    // this handler. Closing by flipping the signal runs the SAME
+                    // teardown as the toggle:
                     // the diagnostics drawer is only mounted while `diagnostics_open`
                     // is true, so setting it false unmounts it and runs its cleanup;
                     // the peer list has no extra close-time work.
-                    if !click_within_action_bar(&evt) {
+                    if !click_within_persistent_chrome(&evt) {
                         peer_list_open.set(false);
                         diagnostics_open.set(false);
                     }
@@ -13597,18 +13579,7 @@ pub fn AttendantsComponent(
                             onclose: move |_| peer_list_open.set(false),
                             self_muted: !mic_enabled(),
                             self_speaking: local_speaking(),
-                            show_meeting_info: meeting_info_open(),
                             room_id: id_for_peer_list.clone(),
-                            num_participants: num_display_peers,
-                            is_active: meeting_joined() && meeting_ended_message().is_none(),
-                            on_toggle_meeting_info: move |_| {
-                                meeting_info_open.set(!meeting_info_open());
-                                if meeting_info_open() {
-                                    diagnostics_open.set(false);
-                                    device_settings_open.set(false);
-                                    device_settings_initial_section.set(None);
-                                }
-                            },
                             host_display_name: host_display_name.clone(),
                             host_user_id: host_user_id.clone(),
                             local_user_display_name: current_display_name(),
@@ -14479,7 +14450,22 @@ pub fn AttendantsComponent(
                         }
                     }
                 }
+
+                MeetingFooter {
+                    open: meeting_info_open,
+                    meeting_id: id.clone(),
+                    participant_count: num_display_peers + 1,
+                    is_active: meeting_ended_message().is_none(),
+                }
             }
+                MeetingInfoDialog {
+                    open: meeting_info_open,
+                    meeting_id: id.clone(),
+                    meeting_link: meeting_link.clone(),
+                    participant_count: num_display_peers + 1,
+                    is_active: meeting_ended_message().is_none(),
+                    show_git: show_build_git,
+                }
         }
     }
 }
@@ -17935,6 +17921,22 @@ mod tests {
             recording_allowed_for_all: false,
             chat_allowed_for_all: true,
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn meeting_footer_and_action_bar_clicks_do_not_light_dismiss_the_drawers() {
+        let doc = web_sys::window().unwrap().document().unwrap();
+        let root = doc.create_element("div").unwrap();
+        root.set_inner_html(
+            "<footer class=\"meeting-footer\"><button id=\"pc-footer\"><span id=\"pc-footer-text\"></span></button></footer>\
+             <div class=\"video-controls-container\"><button id=\"pc-mic\"></button></div>\
+             <div id=\"grid-container\"><div class=\"grid-item\" id=\"pc-tile\"></div></div>",
+        );
+        let by_id = |id: &str| root.query_selector(&format!("#{id}")).unwrap().unwrap();
+        assert!(element_within_persistent_chrome(&by_id("pc-footer")));
+        assert!(element_within_persistent_chrome(&by_id("pc-footer-text")));
+        assert!(element_within_persistent_chrome(&by_id("pc-mic")));
+        assert!(!element_within_persistent_chrome(&by_id("pc-tile")));
     }
 
     /// The security-critical clobber guard: after the in-flight `/participants`

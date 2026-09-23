@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn palette_is_height_bounded_and_the_keyboard_resizes_the_layout_viewport() {
-        // The palette is `position: fixed; bottom: 104px` and grows UPWARD, so
+        // The palette is `position: fixed`, bottom-anchored, and grows UPWARD, so
         // without a cap the ~400px picker column runs off the top of a short
         // viewport and clips the search field, which is first in the column.
         let css = strip_css_comments(SHIPPED_CSS);
@@ -1311,11 +1311,11 @@ mod tests {
             .expect("`.reactions-palette` block must close");
         let block = &rest[..end];
         assert!(
-            block.contains("max-height: calc(100dvh - 124px)"),
+            block.contains("max-height: calc(100dvh - 124px - var(--meeting-footer-h, 0px))"),
             "`.reactions-palette` must be height-bounded against the viewport"
         );
         assert!(
-            block.contains("max-height: calc(100vh - 124px)"),
+            block.contains("max-height: calc(100vh - 124px - var(--meeting-footer-h, 0px))"),
             "and must keep the `vh` fallback for engines without `dvh`"
         );
         // The bound stays on `.reactions-palette` (it is the border-box the

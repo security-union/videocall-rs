@@ -1322,7 +1322,7 @@ test.describe("Two users in a meeting", () => {
       await expect(input).toBeVisible({ timeout: 5000 });
 
       // On touch, focusing the field raises the soft keyboard over a
-      // `position: fixed; bottom: 104px` palette — so the picker must open
+      // bottom-anchored `position: fixed` palette — so the picker must open
       // BROWSABLE, not with a keyboard covering it. Settle past the palette's
       // own 100ms focus timer before judging, then confirm focus never landed
       // in the field.

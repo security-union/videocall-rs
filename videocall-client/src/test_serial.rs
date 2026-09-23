@@ -47,6 +47,10 @@ static SCREEN_ENCODER_STALL_COUNTER_GUARD: Mutex<()> = Mutex::new(());
 /// reached from tests via the `force_*_for_stream` helpers.
 static TRANSPORT_STREAM_COUNTER_GUARD: Mutex<()> = Mutex::new(());
 
+/// Serialises the PARTICIPATING tests that set the process-global
+/// `log::max_level`, which #2760's audio-health coalescer reads per sample.
+static LOG_MAX_LEVEL_GUARD: Mutex<()> = Mutex::new(());
+
 /// Exclude OTHER GUARD-TAKERS from the screen-encoder stall counters for the
 /// duration of the returned guard.
 ///
@@ -63,6 +67,13 @@ pub(crate) fn lock_screen_encoder_stall_counters() -> MutexGuard<'static, ()> {
 /// this bounds guard-takers only.
 pub(crate) fn lock_transport_stream_counters() -> MutexGuard<'static, ()> {
     lock_ignoring_poison(&TRANSPORT_STREAM_COUNTER_GUARD)
+}
+
+/// Exclude OTHER GUARD-TAKERS from `log::max_level` for the duration of the
+/// returned guard; callers must restore the level they found. Same lock-free
+/// caveat as the siblings above.
+pub(crate) fn lock_log_max_level() -> MutexGuard<'static, ()> {
+    lock_ignoring_poison(&LOG_MAX_LEVEL_GUARD)
 }
 
 /// Lock a guard mutex, treating POISONING as benign.

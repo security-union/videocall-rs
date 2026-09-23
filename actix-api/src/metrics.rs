@@ -841,6 +841,20 @@ lazy_static! {
     )
     .expect("Failed to create video_playout_paint_lag_ms metric");
 
+    pub static ref VIDEO_FPS_DECODER_OUTPUT: GaugeVec = register_gauge_vec!(
+        "videocall_video_fps_decoder_output",
+        "Per-peer WebCodecs decoder-output rate (on_output callbacks/sec) — not decode calls (#2657)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_fps_decoder_output metric");
+
+    pub static ref VIDEO_FRAMES_EMITTED_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_video_frames_emitted_total",
+        "Cumulative WebCodecs decoder-output frames per receiver→source pair (#2657). Read with increase(); resets on a worker respawn",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_frames_emitted_total metric");
+
     /// Per-peer content staleness in ms (#1641): the AGE of the video content currently being
     /// painted — how old the just-painted frame's content is relative to live — as distinct from
     /// `videocall_video_playout_paint_lag_ms`, which measures queue DEPTH (decoded-but-unpainted
@@ -1697,6 +1711,20 @@ lazy_static! {
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create screen_video_playout_paint_lag_ms metric");
+
+    pub static ref SCREEN_VIDEO_FPS_DECODER_OUTPUT: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_fps_decoder_output",
+        "Per-peer WebCodecs decoder-output rate for the screen stream (on_output callbacks/sec) — not decode calls (#2657)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_fps_decoder_output metric");
+
+    pub static ref SCREEN_VIDEO_FRAMES_EMITTED_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_frames_emitted_total",
+        "Cumulative WebCodecs decoder-output frames per receiver→source pair for the screen stream (#2657). Read with increase(); resets on a worker respawn",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create screen_video_frames_emitted_total metric");
 
     /// Per-peer content staleness in ms for the screen stream (#1660): the AGE of the screen
     /// content currently being painted, as distinct from the queue-DEPTH gauges above. Screen

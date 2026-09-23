@@ -39,7 +39,7 @@
 //!
 //! The receive path tracks per peer-stream loss/PLI rates, which the client
 //! folds into the chooser once per **monitor tick — every 5s**
-//! (`connection.rs`'s `heartbeat_monitor = Interval::new(5000, …)` drives
+//! (`connection.rs`'s `heartbeat_monitor` interval, [`PEER_MONITOR_TICK_MS`], drives
 //! `run_peer_monitor` → `tick_layer_choosers`). The loss/PLI window itself rolls
 //! over every ~1s (`peer_decode_manager.rs`'s `observe_window`), and
 //! `last_video_downlink` is OVERWRITTEN with each new ~1s window's rates — it is
@@ -870,7 +870,7 @@ impl LayerChooser {
     /// tick (issue #1179, Part B).
     ///
     /// ## Why
-    /// `choose` is only fed every 5s (`connection.rs` `Interval::new(5000, …)`).
+    /// `choose` is only fed once per [`PEER_MONITOR_TICK_MS`] monitor tick.
     /// A freshly-joined peer whose downlink is already congested therefore
     /// decodes the FULL-quality top layer for up to ~5s before the first monitor
     /// tick can react — long enough to stall a constrained receiver at join. For
@@ -1067,6 +1067,162 @@ impl ReceiveLayerBounds {
             PrefMediaKind::Screen => self.screen = b,
             PrefMediaKind::Audio => self.audio = b,
         }
+    }
+}
+
+pub const PEER_MONITOR_TICK_MS: u64 = 5_000;
+
+pub const LID_DWELL_BASE_MS: u64 = 6_000;
+
+/// Bounded because a suppressed layer is also an unobservable one: availability, and the
+/// chooser's climb, only recover off-lid.
+pub const LID_DWELL_MAX_MS: u64 = 18_000;
+
+const _: () = assert!(LID_DWELL_BASE_MS > PEER_MONITOR_TICK_MS);
+const _: () = assert!(LID_DWELL_BASE_MS > videocall_aq::constants::LAYER_AVAILABILITY_WINDOW_MS);
+const _: () = assert!(LID_DWELL_MAX_MS >= LID_DWELL_BASE_MS);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LidTick {
+    pub value: u32,
+    pub ceiling: u32,
+    /// The real [`LayerAvailability::highest_available`]. Only this may start or extend a
+    /// hold.
+    pub observed: u32,
+}
+
+/// Dwell state for ONE (peer, kind) advertised layer preference (issue 2630).
+///
+/// A sub-top preference stops the relay forwarding the layers above it; those stale out of
+/// [`LayerAvailability`]'s window, `highest_available` collapses to the advertised layer,
+/// and the relay fails open — the lid erases the evidence for itself. While a hold is live,
+/// [`Self::ladder`] and [`Self::peek_ladder`] substitute `held + 1` for that collapsed
+/// observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LidDwell {
+    held: Option<u32>,
+    established_ceiling: u32,
+    hold_until_ms: u64,
+    dwell_ms: u64,
+    lidded_ms: u64,
+    last_settle_ms: u64,
+    base_dwell_next: bool,
+}
+
+impl LidDwell {
+    /// Call before [`Self::settle`]: this is the only place a stale hold expires.
+    ///
+    /// `hold_until_ms` is stamped from a WALL clock, so a backward step can leave a
+    /// deadline further out than the `dwell_ms` window that granted it.
+    pub fn ladder(&mut self, highest_available: u32, now_ms: u64) -> u32 {
+        if let Some(held) = self.held {
+            if self.hold_until_ms.saturating_sub(now_ms) > self.dwell_ms {
+                self.hold_until_ms = now_ms + self.dwell_ms;
+            }
+            if now_ms < self.hold_until_ms {
+                return highest_available.max(held + 1);
+            }
+            self.expire();
+        }
+        highest_available
+    }
+
+    /// The layer to advertise, or `None` to omit the entry (issue #1079 M1/M2). Call once
+    /// per tick, after the chooser has produced `t.value`.
+    pub fn settle(&mut self, t: LidTick, now_ms: u64) -> Option<u32> {
+        let elapsed = now_ms.saturating_sub(self.last_settle_ms);
+        self.last_settle_ms = now_ms;
+        if self.held.is_some() && self.surviving_hold(t).is_none() {
+            self.release();
+        }
+        if self.held.is_none() && t.value >= t.observed {
+            self.lidded_ms = self.lidded_ms.saturating_sub(elapsed);
+            return None;
+        }
+        // Only real evidence starts or extends a hold, so one running on the substituted
+        // ladder always reaches its deadline.
+        if t.value < t.observed {
+            if self.held != Some(t.value) {
+                self.dwell_ms = if self.base_dwell_next {
+                    LID_DWELL_BASE_MS
+                } else {
+                    (LID_DWELL_BASE_MS + self.lidded_ms).min(LID_DWELL_MAX_MS)
+                };
+                self.established_ceiling = t.ceiling;
+            }
+            self.held = Some(t.value);
+            self.hold_until_ms = now_ms + self.dwell_ms;
+        }
+        Some(t.value)
+    }
+
+    /// [`Self::ladder`] without its expiry side effect.
+    pub fn peek_ladder(&self, highest_available: u32) -> u32 {
+        self.held
+            .map_or(highest_available, |h| highest_available.max(h + 1))
+    }
+
+    /// A loosened ceiling retires the hold: its cause is gone.
+    fn held_under_ceiling(&self, ceiling: u32) -> Option<u32> {
+        self.held.filter(|_| ceiling <= self.established_ceiling)
+    }
+
+    /// The hold this tick leaves standing — also retired by an anchor the chooser has
+    /// walked off while the source is keeping up, which describes nothing. Shared with
+    /// [`Self::settle`] so the mutating and read-only paths cannot drift apart.
+    fn surviving_hold(&self, t: LidTick) -> Option<u32> {
+        self.held_under_ceiling(t.ceiling)
+            .filter(|h| t.value <= t.observed && (t.value == *h || t.value < t.observed))
+    }
+
+    /// Decode-guard baseline for a lid-aware push, standing in for the `choose` it may not
+    /// call: an unconstrained chooser tracks the raw observation. Only across a loosened
+    /// ceiling is the substituted ladder right — that is what lets a grown tile move.
+    pub fn peek_baseline(&self, ceiling: u32, highest_available: u32) -> u32 {
+        match self.held_under_ceiling(ceiling) {
+            Some(_) => highest_available,
+            None => self.peek_ladder(highest_available),
+        }
+    }
+
+    /// [`Self::settle`]'s advertise-or-omit decision without its state transitions: the same
+    /// [`LidTick`] yields the same answer, so a read-only publish cannot contradict the tick.
+    pub fn peek_settle(&self, t: LidTick) -> Option<u32> {
+        if self.surviving_hold(t).is_none() && t.value >= t.observed {
+            return None;
+        }
+        Some(t.value)
+    }
+
+    pub fn reset_for_reconnect(&mut self) {
+        self.held = None;
+        self.base_dwell_next = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_layer(&self) -> Option<u32> {
+        self.held
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lidded_ms_for_test(&self) -> u64 {
+        self.lidded_ms
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_until_ms_for_test(&self) -> u64 {
+        self.hold_until_ms
+    }
+
+    fn release(&mut self) {
+        self.held = None;
+        self.lidded_ms = 0;
+    }
+
+    fn expire(&mut self) {
+        self.held = None;
+        self.lidded_ms = (self.lidded_ms + self.dwell_ms).min(LID_DWELL_MAX_MS);
+        self.base_dwell_next = false;
     }
 }
 
@@ -3206,5 +3362,876 @@ mod tests {
             !avail.layer_available_peek(0, after_window),
             "a base rung that has stopped arriving must eventually read as gone"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue 2630: dwell on the ADVERTISED lid
+    // -----------------------------------------------------------------
+
+    fn established_lid(value: u32, observed: u32, now_ms: u64) -> LidDwell {
+        let mut dwell = LidDwell::default();
+        dwell.ladder(observed, now_ms);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value,
+                    ceiling: value,
+                    observed,
+                },
+                now_ms
+            ),
+            Some(value),
+            "premise: a value below a live observation must advertise"
+        );
+        dwell
+    }
+
+    fn hold_ticks(dwell: &mut LidDwell, now: &mut u64) -> u32 {
+        for elapsed in 1..=64u32 {
+            *now += PEER_MONITOR_TICK_MS;
+            dwell.ladder(1, *now);
+            let _ = dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 1,
+                    observed: 1,
+                },
+                *now,
+            );
+            if dwell.held_layer().is_none() {
+                return elapsed;
+            }
+        }
+        panic!("a hold must be time-bounded");
+    }
+
+    fn relid_on_the_next_tick(dwell: &mut LidDwell, now: &mut u64) {
+        *now += PEER_MONITOR_TICK_MS;
+        dwell.ladder(2, *now);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 1,
+                    observed: 2,
+                },
+                *now
+            ),
+            Some(1),
+            "premise: a value below a live observation must advertise"
+        );
+    }
+
+    #[test]
+    fn a_backward_clock_step_cannot_pin_a_hold_past_its_window() {
+        // A real `js_sys::Date::now()` reading, so the backward step below stays in range.
+        let t0 = 1_700_000_000_000u64;
+        let mut dwell = established_lid(1, 2, t0);
+
+        // The wall clock steps back an hour while the hold is live, so the deadline
+        // already stamped sits an hour beyond any `now_ms` the ticks will supply.
+        let mut now = t0 - 3_600_000;
+        let ticks = hold_ticks(&mut dwell, &mut now);
+        assert!(
+            u64::from(ticks) * PEER_MONITOR_TICK_MS <= LID_DWELL_MAX_MS,
+            "this hold ran {ticks} ticks"
+        );
+    }
+
+    #[test]
+    fn a_held_lid_outlives_the_monitor_tick_that_follows_the_availability_window() {
+        let t0 = 0;
+        let mut dwell = established_lid(1, 2, t0);
+
+        let t1 = t0 + PEER_MONITOR_TICK_MS;
+        assert!(
+            t1 > videocall_aq::constants::LAYER_AVAILABILITY_WINDOW_MS,
+            "premise: the first monitor tick after the availability window"
+        );
+        dwell.ladder(1, t1);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 1,
+                    observed: 1,
+                },
+                t1
+            ),
+            Some(1),
+            "the receiver only ACTS on the monitor tick, so a hold that expires between \
+             the availability window and that tick is inert"
+        );
+    }
+
+    #[test]
+    fn the_dwell_escalates_on_cumulative_lidded_time_and_a_cause_release_resets_it() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+
+        let mut ticks = Vec::new();
+        for _ in 0..6 {
+            relid_on_the_next_tick(&mut dwell, &mut now);
+            ticks.push(hold_ticks(&mut dwell, &mut now));
+        }
+        let last = ticks.len() - 1;
+        assert!(
+            ticks[last] > ticks[0],
+            "back-to-back lids must dwell progressively longer: {ticks:?}"
+        );
+        assert!(
+            ticks.windows(2).all(|w| w[1] >= w[0]),
+            "the escalation must be monotonic: {ticks:?}"
+        );
+        let cap_ticks = (LID_DWELL_MAX_MS / PEER_MONITOR_TICK_MS + 1) as u32;
+        assert!(
+            ticks.iter().all(|&t| t <= cap_ticks),
+            "no hold may exceed the cap: {ticks:?}"
+        );
+        assert_eq!(
+            ticks[last - 1],
+            ticks[last],
+            "the escalation must saturate: {ticks:?}"
+        );
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        now += PEER_MONITOR_TICK_MS;
+        dwell.ladder(1, now);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 2,
+                    observed: 1,
+                },
+                now
+            ),
+            None,
+            "premise: a loosened ceiling releases the hold"
+        );
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        assert_eq!(
+            hold_ticks(&mut dwell, &mut now),
+            ticks[0],
+            "a lid whose predecessor was released by its own cause must start at the base dwell"
+        );
+    }
+
+    #[test]
+    fn healthy_ticks_between_lids_decay_the_escalation_back_to_the_base_dwell() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let first = hold_ticks(&mut dwell, &mut now);
+        let mut escalated = first;
+        for _ in 0..4 {
+            relid_on_the_next_tick(&mut dwell, &mut now);
+            escalated = hold_ticks(&mut dwell, &mut now);
+        }
+        assert!(
+            escalated > first,
+            "premise: back-to-back lids escalate ({first} -> {escalated})"
+        );
+
+        for _ in 0..(LID_DWELL_MAX_MS / PEER_MONITOR_TICK_MS + 2) {
+            now += PEER_MONITOR_TICK_MS;
+            dwell.ladder(2, now);
+            assert_eq!(
+                dwell.settle(
+                    LidTick {
+                        value: 2,
+                        ceiling: 2,
+                        observed: 2,
+                    },
+                    now
+                ),
+                None,
+                "premise: an unconstrained tick advertises nothing"
+            );
+        }
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        assert_eq!(
+            hold_ticks(&mut dwell, &mut now),
+            first,
+            "a lid that follows a healthy stretch must not inherit the old escalation"
+        );
+    }
+
+    #[test]
+    fn a_held_lid_survives_the_availability_collapse_it_causes() {
+        let t0 = 10_000;
+        let mut dwell = established_lid(1, 2, t0);
+
+        let t1 = t0 + videocall_aq::constants::LAYER_AVAILABILITY_WINDOW_MS + 1;
+        assert_eq!(
+            dwell.ladder(1, t1),
+            2,
+            "the held ladder must outlive the observation"
+        );
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 1,
+                    observed: 1,
+                },
+                t1
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_hold_expires_and_the_real_observation_decides_again() {
+        let t0 = 10_000;
+        let mut dwell = established_lid(1, 2, t0);
+
+        let t1 = t0 + LID_DWELL_MAX_MS + 1;
+        assert_eq!(dwell.ladder(1, t1), 1, "an expired hold stops substituting");
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 1,
+                    observed: 1,
+                },
+                t1
+            ),
+            None,
+            "the entry is omitted once nothing above the lid is observed"
+        );
+        assert_eq!(dwell.held_layer(), None);
+    }
+
+    #[test]
+    fn the_substituted_ladder_cannot_extend_the_hold() {
+        let t0 = 10_000;
+        let mut dwell = established_lid(1, 2, t0);
+
+        let mut now = t0;
+        for _ in 0..(LID_DWELL_MAX_MS / 1000 + 4) {
+            now += 1000;
+            dwell.ladder(1, now);
+            let _ = dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 1,
+                    observed: 1,
+                },
+                now,
+            );
+        }
+        assert_eq!(
+            dwell.held_layer(),
+            None,
+            "a hold fed only the substituted ladder must reach its deadline"
+        );
+    }
+
+    #[test]
+    fn a_loosened_ceiling_releases_the_hold_on_the_same_tick() {
+        let t0 = 10_000;
+        let mut dwell = established_lid(1, 2, t0);
+
+        let t1 = t0 + 1000;
+        dwell.ladder(1, t1);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 2,
+                    observed: 1,
+                },
+                t1
+            ),
+            None,
+            "with the reason gone the entry must be omitted so the relay reopens"
+        );
+        assert_eq!(dwell.held_layer(), None);
+    }
+
+    #[test]
+    fn a_tightening_ceiling_re_anchors_downward_immediately() {
+        let t0 = 10_000;
+        let mut dwell = established_lid(1, 2, t0);
+
+        let t1 = t0 + 1000;
+        dwell.ladder(1, t1);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 0,
+                    ceiling: 0,
+                    observed: 1,
+                },
+                t1
+            ),
+            Some(0),
+            "a lower value backed by a live observation applies at once"
+        );
+        assert_eq!(dwell.held_layer(), Some(0));
+    }
+
+    #[test]
+    fn a_downward_re_anchor_re_stamps_the_ceiling_the_release_is_measured_against() {
+        let mut dwell = LidDwell::default();
+
+        let t0 = 10_000;
+        dwell.ladder(2, t0);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 1,
+                    observed: 2,
+                },
+                t0
+            ),
+            Some(1),
+            "premise: a mid tile lids video at layer 1 against a live 3-layer ladder"
+        );
+
+        let t1 = t0 + PEER_MONITOR_TICK_MS;
+        dwell.ladder(2, t1);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 0,
+                    ceiling: 0,
+                    observed: 2,
+                },
+                t1
+            ),
+            Some(0),
+            "premise: shrinking the tile re-anchors the lid down to layer 0"
+        );
+
+        let t2 = t1 + PEER_MONITOR_TICK_MS;
+        dwell.ladder(0, t2);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 0,
+                    ceiling: 1,
+                    observed: 0,
+                },
+                t2
+            ),
+            None,
+            "the release is measured against the ceiling of the lid actually held, so \
+             growing the tile back must lift a re-anchored lid, not only the first one"
+        );
+        assert_eq!(dwell.held_layer(), None);
+    }
+
+    #[test]
+    fn a_silent_peer_is_not_pinned_to_its_held_lid() {
+        let t0 = 10_000;
+        let mut dwell = established_lid(1, 2, t0);
+
+        let t1 = t0 + 1000;
+        dwell.ladder(0, t1);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 0,
+                    ceiling: 1,
+                    observed: 0,
+                },
+                t1
+            ),
+            None,
+            "nothing is observed, so there is no constraint left to advertise"
+        );
+        assert_eq!(dwell.held_layer(), None);
+    }
+
+    #[test]
+    fn a_reconnect_keeps_the_escalation_but_caps_the_first_dwell_at_base() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let first = hold_ticks(&mut dwell, &mut now);
+        let mut escalated = first;
+        for _ in 0..4 {
+            relid_on_the_next_tick(&mut dwell, &mut now);
+            escalated = hold_ticks(&mut dwell, &mut now);
+        }
+        assert!(
+            escalated > first,
+            "premise: back-to-back lids escalate ({first} -> {escalated})"
+        );
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let accrued = dwell.lidded_ms_for_test();
+        assert!(
+            accrued > 0,
+            "premise: the escalation is banked as lidded time"
+        );
+
+        dwell.reset_for_reconnect();
+        assert_eq!(
+            dwell.held_layer(),
+            None,
+            "a fresh session applies no preference map, so the hold must go"
+        );
+        assert_eq!(
+            dwell.lidded_ms_for_test(),
+            accrued,
+            "the reset must not discard the accrued lidded time"
+        );
+
+        now += 30_000;
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        assert_eq!(
+            hold_ticks(&mut dwell, &mut now),
+            first,
+            "the first lid on a fresh session must not pin it for the escalated dwell \
+             before the constraint has proven durable on this link"
+        );
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        assert_eq!(
+            hold_ticks(&mut dwell, &mut now),
+            escalated,
+            "the cap is one-shot: once the first post-reset hold reached its deadline the \
+             retained accrual applies again"
+        );
+    }
+
+    #[test]
+    fn a_base_anchored_lid_keeps_its_ramp_across_an_outage_and_the_reconnect() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+        let mut spans = Vec::new();
+
+        for _ in 0..8 {
+            now += PEER_MONITOR_TICK_MS;
+            dwell.ladder(2, now);
+            assert_eq!(
+                dwell.settle(
+                    LidTick {
+                        value: 0,
+                        ceiling: 0,
+                        observed: 2,
+                    },
+                    now
+                ),
+                Some(0),
+                "premise: a thumbnail lids video at base"
+            );
+            let mut span = 0usize;
+            while dwell.held_layer().is_some() && span < 64 {
+                span += 1;
+                now += PEER_MONITOR_TICK_MS;
+                dwell.ladder(0, now);
+                let _ = dwell.settle(
+                    LidTick {
+                        value: 0,
+                        ceiling: 0,
+                        observed: 0,
+                    },
+                    now,
+                );
+            }
+            spans.push(span);
+        }
+        assert!(
+            spans[spans.len() - 1] > spans[0],
+            "premise: back-to-back base lids escalate ({spans:?})"
+        );
+
+        now += PEER_MONITOR_TICK_MS;
+        dwell.ladder(2, now);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 0,
+                    ceiling: 0,
+                    observed: 2,
+                },
+                now
+            ),
+            Some(0),
+            "premise: the lid is live when the outage lands"
+        );
+        let banked = dwell.lidded_ms_for_test();
+        assert!(banked > 0, "premise: the ramp is banked as lidded time");
+
+        now += PEER_MONITOR_TICK_MS;
+        dwell.ladder(0, now);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 0,
+                    ceiling: 0,
+                    observed: 0,
+                },
+                now
+            ),
+            Some(0),
+            "a base anchor cannot be moved off, so neither release branch fires"
+        );
+        assert_eq!(dwell.held_layer(), Some(0));
+
+        dwell.reset_for_reconnect();
+        assert_eq!(
+            dwell.lidded_ms_for_test(),
+            banked,
+            "so a thumbnail lid keeps its ramp through the outage AND the reset, and the \
+             SECOND post-reset lid runs the escalated dwell the base cap softened once"
+        );
+    }
+
+    #[test]
+    fn a_ceiling_that_tightens_and_returns_keeps_the_lid_and_its_ramp() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let first = hold_ticks(&mut dwell, &mut now);
+        for _ in 0..4 {
+            relid_on_the_next_tick(&mut dwell, &mut now);
+            let escalated = hold_ticks(&mut dwell, &mut now);
+            assert!(escalated >= first, "premise: back-to-back lids escalate");
+        }
+
+        // Anchor a lid whose ceiling sits ABOVE the layer it holds, so the ceiling can
+        // move without re-anchoring the hold.
+        now += PEER_MONITOR_TICK_MS;
+        dwell.ladder(2, now);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 0,
+                    ceiling: 2,
+                    observed: 2,
+                },
+                now
+            ),
+            Some(0),
+            "premise: congestion lids below an unconstrained ceiling"
+        );
+        let banked = dwell.lidded_ms_for_test();
+        assert!(banked > 0, "premise: the ramp is banked as lidded time");
+
+        for ceiling in [1u32, 2] {
+            now += PEER_MONITOR_TICK_MS;
+            dwell.ladder(2, now);
+            assert_eq!(
+                dwell.settle(
+                    LidTick {
+                        value: 0,
+                        ceiling,
+                        observed: 2,
+                    },
+                    now
+                ),
+                Some(0),
+                "premise: the lid is unchanged by the tile resize under it"
+            );
+        }
+        assert_eq!(
+            dwell.lidded_ms_for_test(),
+            banked,
+            "the release is measured against the ceiling the lid was ANCHORED at, not the \
+             previous tick's — a tile that shrinks and grows back has loosened nothing"
+        );
+    }
+
+    #[test]
+    fn the_escalation_and_the_dwell_it_buys_are_both_bounded() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+        let mut spans = Vec::new();
+        let mut widest = 0u64;
+
+        for _ in 0..24 {
+            relid_on_the_next_tick(&mut dwell, &mut now);
+            widest = widest.max(dwell.hold_until_ms_for_test().saturating_sub(now));
+            assert!(
+                dwell.lidded_ms_for_test() <= LID_DWELL_MAX_MS,
+                "the banked ramp must stay inside the bound ({} > {LID_DWELL_MAX_MS})",
+                dwell.lidded_ms_for_test()
+            );
+            spans.push(hold_ticks(&mut dwell, &mut now));
+        }
+
+        assert_eq!(
+            spans.last().copied(),
+            Some(4),
+            "the bound's only observable is the hold it buys: an unbroken run of lids must \
+             saturate at a four-tick hold, not climb past it ({spans:?})"
+        );
+        assert!(
+            spans.iter().all(|&s| s <= 4),
+            "and no hold along the way may exceed it ({spans:?})"
+        );
+        // A tick-quantised span cannot see an overshoot smaller than one tick, so the
+        // dwell itself is pinned too.
+        assert_eq!(
+            widest, LID_DWELL_MAX_MS,
+            "the dwell a saturated ramp buys must stop at the bound"
+        );
+    }
+
+    #[test]
+    fn an_outage_a_tick_observes_releases_a_lid_held_above_base() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let first = hold_ticks(&mut dwell, &mut now);
+        for _ in 0..4 {
+            relid_on_the_next_tick(&mut dwell, &mut now);
+            let escalated = hold_ticks(&mut dwell, &mut now);
+            assert!(escalated >= first, "premise: back-to-back lids escalate");
+        }
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        assert!(
+            dwell.lidded_ms_for_test() > 0,
+            "premise: the escalation is banked as lidded time"
+        );
+
+        now += PEER_MONITOR_TICK_MS;
+        dwell.ladder(0, now);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 0,
+                    ceiling: 0,
+                    observed: 0,
+                },
+                now
+            ),
+            None,
+            "premise: a tick with nothing arriving has no constraint to advertise"
+        );
+        assert_eq!(
+            dwell.lidded_ms_for_test(),
+            0,
+            "the advertised value moved off its non-zero anchor, so the hold describes \
+             nothing and its ramp is released with it"
+        );
+
+        dwell.reset_for_reconnect();
+        now += 30_000;
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        assert_eq!(
+            hold_ticks(&mut dwell, &mut now),
+            first,
+            "so the first post-reset lid runs the base dwell"
+        );
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        assert_eq!(
+            hold_ticks(&mut dwell, &mut now),
+            first,
+            "and so does the second: there is no ramp left for the reset to retain"
+        );
+    }
+
+    #[test]
+    fn a_tightening_ceiling_keeps_the_escalation_the_lid_already_earned() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let first = hold_ticks(&mut dwell, &mut now);
+        for _ in 0..4 {
+            relid_on_the_next_tick(&mut dwell, &mut now);
+            let escalated = hold_ticks(&mut dwell, &mut now);
+            assert!(escalated >= first, "premise: back-to-back lids escalate");
+        }
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let banked = dwell.lidded_ms_for_test();
+        assert!(
+            banked > 0,
+            "premise: the escalation is banked as lidded time"
+        );
+
+        now += PEER_MONITOR_TICK_MS;
+        dwell.ladder(2, now);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 0,
+                    ceiling: 0,
+                    observed: 2,
+                },
+                now
+            ),
+            Some(0),
+            "premise: a TIGHTENING ceiling re-anchors the lid downward"
+        );
+        assert_eq!(
+            dwell.lidded_ms_for_test(),
+            banked,
+            "only a LOOSENED ceiling means the cause is gone; a tightening one must \
+             re-anchor the same chronic lid, not reset its ramp"
+        );
+    }
+
+    #[test]
+    fn the_held_ladder_never_lowers_a_live_observation() {
+        let t0 = 10_000;
+        let mut dwell = established_lid(0, 2, t0);
+
+        assert_eq!(
+            dwell.ladder(2, t0 + 1000),
+            2,
+            "a hold at layer 0 must not shrink a still-observed 3-layer ladder to 1"
+        );
+    }
+
+    #[test]
+    fn the_escalation_ledger_is_debited_by_elapsed_time_not_per_call() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let first = hold_ticks(&mut dwell, &mut now);
+        for _ in 0..4 {
+            relid_on_the_next_tick(&mut dwell, &mut now);
+            let escalated = hold_ticks(&mut dwell, &mut now);
+            assert!(escalated >= first, "premise: back-to-back lids escalate");
+        }
+        let banked = dwell.lidded_ms_for_test();
+        assert!(banked > 0, "premise: the ramp is banked as lidded time");
+
+        // `set_receive_layer_bounds` is bound to `oninput`: many settles, no elapsed time.
+        for _ in 0..8 {
+            dwell.ladder(2, now);
+            assert_eq!(
+                dwell.settle(
+                    LidTick {
+                        value: 2,
+                        ceiling: 2,
+                        observed: 2,
+                    },
+                    now
+                ),
+                None,
+                "premise: each extra settle takes the unconstrained branch"
+            );
+        }
+        assert_eq!(
+            dwell.lidded_ms_for_test(),
+            banked,
+            "off-cadence settles must not erase the ramp a chronic receiver earned"
+        );
+    }
+
+    #[test]
+    fn an_unconstrained_receiver_still_advertises_nothing() {
+        let mut dwell = LidDwell::default();
+        for (value, observed) in [(0, 0), (2, 2)] {
+            dwell.ladder(observed, 1000);
+            assert_eq!(
+                dwell.settle(
+                    LidTick {
+                        value,
+                        ceiling: observed,
+                        observed,
+                    },
+                    1000
+                ),
+                None,
+                "value {value} at the top of a {observed}-layer ladder is no constraint"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hold_whose_layer_stops_arriving_forfeits_the_escalation() {
+        let mut dwell = LidDwell::default();
+        let mut now = 0u64;
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let base = hold_ticks(&mut dwell, &mut now);
+        let mut escalated = base;
+        for _ in 0..4 {
+            relid_on_the_next_tick(&mut dwell, &mut now);
+            escalated = hold_ticks(&mut dwell, &mut now);
+        }
+        assert!(
+            escalated > base,
+            "premise: back-to-back lids escalate ({base} -> {escalated})"
+        );
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        let banked = dwell.lidded_ms_for_test();
+        assert!(banked > 0, "premise: the ramp is banked as lidded time");
+
+        now += PEER_MONITOR_TICK_MS;
+        dwell.ladder(0, now);
+        assert_eq!(
+            dwell.settle(
+                LidTick {
+                    value: 1,
+                    ceiling: 1,
+                    observed: 0,
+                },
+                now
+            ),
+            None,
+            "layer 1 stopped arriving, so there is no lid on it left to advertise"
+        );
+        assert_eq!(dwell.held_layer(), None, "the hold outlived its evidence");
+        assert_eq!(
+            dwell.lidded_ms_for_test(),
+            0,
+            "a stall banked lidded time the receiver did not spend under a lid \
+             (was {banked} before the stall)"
+        );
+
+        relid_on_the_next_tick(&mut dwell, &mut now);
+        assert_eq!(
+            hold_ticks(&mut dwell, &mut now),
+            base,
+            "the lid after a stall ran longer than the base dwell"
+        );
+    }
+
+    #[test]
+    fn no_state_lets_settle_or_peek_settle_advertise_above_the_observation() {
+        for value in 0..=3u32 {
+            for observed in 0..=3u32 {
+                for ceiling in 0..=3u32 {
+                    for established_ceiling in 0..=3u32 {
+                        for held in [None, Some(0), Some(1), Some(2), Some(3)] {
+                            let mut dwell = LidDwell {
+                                held,
+                                established_ceiling,
+                                ..LidDwell::default()
+                            };
+                            let t = LidTick {
+                                value,
+                                ceiling,
+                                observed,
+                            };
+                            let peeked = dwell.peek_settle(t);
+                            let settled = dwell.settle(t, PEER_MONITOR_TICK_MS);
+                            assert_eq!(
+                                peeked, settled,
+                                "peek_settle and settle disagree on {t:?} with \
+                                 held={held:?} established_ceiling={established_ceiling}"
+                            );
+                            if let Some(advertised) = settled {
+                                assert!(
+                                    advertised <= observed,
+                                    "advertised {advertised} above the observed \
+                                     {observed} on {t:?} with held={held:?} \
+                                     established_ceiling={established_ceiling}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

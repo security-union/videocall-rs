@@ -307,7 +307,7 @@ describe("BOT_HW_CONCURRENCY vs the audio a bot publishes (#2359)", () => {
   /** The runtime flag, and the RECEIVE ladder depth: since #2279 neither is an audio input. */
   const FLAG = "experimental_simulcast_max_layers";
   const RECEIVE_LADDER = "max_layers_for_kind";
-  /** The publisher's own count, which both SEND readouts must read back. */
+  /** The publisher's own count, which the SEND readout must read back. */
   const PUBLISHED = "effective_audio_layers()";
 
   it("keeps the camera cap on the check the spoof feeds", () => {
@@ -326,14 +326,11 @@ describe("BOT_HW_CONCURRENCY vs the audio a bot publishes (#2359)", () => {
     expect(mic, "the publisher no longer takes the pinned audio count").toContain(
       "audio_published_layer_count()",
     );
-    // The two SEND readouts derive the depth FROM the publisher, so neither can name
-    // a layer count the mic encoder does not emit.
-    for (const readout of ["audio_layer_max", "audio_published"]) {
-      expect(hostLet(readout), `${readout} stopped reading the publisher's count`).toContain(
-        PUBLISHED,
-      );
-    }
-    for (const name of ["microphone", "audio_layer_max", "audio_published"]) {
+    expect(
+      hostLet("audio_published"),
+      "audio_published stopped reading the publisher's count",
+    ).toContain(PUBLISHED);
+    for (const name of ["microphone", "audio_published"]) {
       const src = hostLet(name);
       const capped = `${name} follows the capability cap, so the README's claim that BOT_HW_CONCURRENCY leaves audio alone is fiction`;
       expect(src, capped).not.toMatch(CAMERA);

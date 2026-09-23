@@ -6,6 +6,7 @@
 //! Dioxus dependencies, so they can be unit-tested under plain `cargo test`.
 
 use super::density::{DensityMode, MOBILE_WIDTH_BREAKPOINT_PX};
+use crate::context::DockPosition;
 use std::collections::HashMap;
 
 /// Tile aspect ratio (width / height) — 3 : 2.
@@ -382,6 +383,33 @@ const MIN_TILE_BAND: f64 = 320.0;
 
 pub(crate) const ACTION_BAR_EDGE_MARGIN: f64 = 40.0;
 
+/// Must equal `--meeting-footer-h` in global.css.
+pub(crate) const MEETING_FOOTER_RESERVE: f64 = 32.0;
+
+/// `(top, right, bottom, left)` for `#grid-container` in the screen-share layout.
+pub(crate) fn screen_share_padding(status_bar_reserve: f64) -> (f64, f64, f64, f64) {
+    (
+        16.0 + status_bar_reserve,
+        16.0,
+        80.0 + MEETING_FOOTER_RESERVE,
+        16.0,
+    )
+}
+
+/// `(gap, top, right, bottom, left)` for `#grid-container`.
+pub(crate) fn grid_padding(dock: DockPosition, vw: f64) -> (f64, f64, f64, f64, f64) {
+    let mobile = vw < MOBILE_WIDTH_BREAKPOINT_PX;
+    let (gap, top, right, bottom, left) = match (dock, mobile) {
+        (DockPosition::Bottom, true) => (8.0, 8.0, 8.0, 80.0, 8.0),
+        (DockPosition::Bottom, false) => (16.0, 20.0, 20.0, 120.0, 20.0),
+        (DockPosition::Left, true) => (8.0, 8.0, 8.0, 8.0, 80.0),
+        (DockPosition::Left, false) => (16.0, 20.0, 20.0, 20.0, 120.0),
+        (DockPosition::Right, true) => (8.0, 8.0, 80.0, 8.0, 8.0),
+        (DockPosition::Right, false) => (16.0, 20.0, 120.0, 20.0, 20.0),
+    };
+    (gap, top, right, bottom + MEETING_FOOTER_RESERVE, left)
+}
+
 const DRAWER_SHRINK_FLOORS: [f64; 2] = [DRAWER_MIN_WIDTH, DRAWER_MIN_WIDTH];
 
 const DRAWER_DRAG_QUANTUM: f64 = 8.0;
@@ -432,7 +460,11 @@ pub(crate) fn handle_is_inert(cap: f64) -> bool {
 }
 
 pub(crate) fn overflow_budget_width(is_vertical: bool, band_w: f64, vh: f64) -> f64 {
-    (if is_vertical { vh } else { band_w }) - ACTION_BAR_EDGE_MARGIN
+    (if is_vertical {
+        vh - MEETING_FOOTER_RESERVE
+    } else {
+        band_w
+    }) - ACTION_BAR_EDGE_MARGIN
 }
 
 pub(crate) fn quantise_reserve(px: f64, dragging: bool) -> f64 {
@@ -2025,8 +2057,48 @@ mod tests {
         );
         close_to(
             overflow_budget_width(true, band, 720.0),
-            680.0,
-            "a vertical dock budgets against vh, untouched by the band",
+            648.0,
+            "a vertical dock budgets against vh above the meeting footer, untouched by the band",
+        );
+    }
+
+    #[test]
+    fn grid_padding_reserves_the_meeting_footer_under_every_dock() {
+        let cases = [
+            (
+                DockPosition::Bottom,
+                1280.0,
+                (16.0, 20.0, 20.0, 152.0, 20.0),
+            ),
+            (DockPosition::Bottom, 568.0, (16.0, 20.0, 20.0, 152.0, 20.0)),
+            (DockPosition::Bottom, 567.0, (8.0, 8.0, 8.0, 112.0, 8.0)),
+            (DockPosition::Left, 1280.0, (16.0, 20.0, 20.0, 52.0, 120.0)),
+            (DockPosition::Left, 375.0, (8.0, 8.0, 8.0, 40.0, 80.0)),
+            (DockPosition::Right, 1280.0, (16.0, 20.0, 120.0, 52.0, 20.0)),
+            (DockPosition::Right, 375.0, (8.0, 8.0, 80.0, 40.0, 8.0)),
+        ];
+        for (dock, vw, want) in cases {
+            assert_eq!(grid_padding(dock, vw), want, "{dock:?} at {vw}px");
+        }
+    }
+
+    #[test]
+    fn screen_share_padding_reserves_the_meeting_footer() {
+        assert_eq!(screen_share_padding(0.0), (16.0, 16.0, 112.0, 16.0));
+        assert_eq!(
+            screen_share_padding(36.0),
+            (52.0, 16.0, 112.0, 16.0),
+            "the recording bar adds to the top only"
+        );
+    }
+
+    #[test]
+    fn meeting_footer_reserve_matches_the_css_token() {
+        let css = include_str!("../../static/global.css");
+        let token = format!("--meeting-footer-h: {}px;", MEETING_FOOTER_RESERVE as u32);
+        assert!(
+            css.contains(&token),
+            "global.css must declare `{token}` to match MEETING_FOOTER_RESERVE"
         );
     }
 

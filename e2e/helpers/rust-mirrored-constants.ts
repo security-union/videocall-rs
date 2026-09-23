@@ -11,6 +11,12 @@ export const HEARTBEAT_KEEPALIVE_INTERVAL_MS = 5000;
 export const MAX_PLAYOUT_AGE_MS = 1800;
 export const MAX_KEYFRAME_LESS_HOLD_MS = 6000;
 
+/** Lid-dwell arithmetic (2630): the dwell is served on monitor ticks and measured
+ *  against the availability window, so a spec floor derived from one needs all three. */
+export const LID_DWELL_BASE_MS = 6000;
+export const PEER_MONITOR_TICK_MS = 5000;
+export const LAYER_AVAILABILITY_WINDOW_MS = 4000;
+
 export const BUDGET = {
   FPS_STEP_DOWN: 24,
   FPS_STEP_UP: 30,
@@ -51,14 +57,26 @@ export const DRAWER = {
   MIN_GRID_BAND: 400,
 } as const;
 
+/** The in-call meeting footer's height, reserved under every dock (issue 2791). */
+export const MEETING_FOOTER = {
+  MEETING_FOOTER_RESERVE: 32,
+} as const;
+
 export const RUST_MIRRORS: Record<string, Record<string, number>> = {
-  "videocall-aq/src/constants.rs": { HEARTBEAT_KEEPALIVE_INTERVAL_MS },
+  "videocall-aq/src/constants.rs": {
+    HEARTBEAT_KEEPALIVE_INTERVAL_MS,
+    LAYER_AVAILABILITY_WINDOW_MS,
+  },
   "videocall-codecs/src/jitter_buffer.rs": {
     MAX_PLAYOUT_AGE_MS,
     MAX_KEYFRAME_LESS_HOLD_MS,
   },
+  "videocall-client/src/decode/layer_chooser.rs": {
+    LID_DWELL_BASE_MS,
+    PEER_MONITOR_TICK_MS,
+  },
   "dioxus-ui/src/components/decode_budget.rs": { ...BUDGET },
   "dioxus-ui/src/components/density.rs": { ...DENSITY },
   "dioxus-ui/src/components/connection_quality_indicator.rs": { ...CQI },
-  "dioxus-ui/src/components/attendants_layout.rs": { ...DRAWER },
+  "dioxus-ui/src/components/attendants_layout.rs": { ...DRAWER, ...MEETING_FOOTER },
 };

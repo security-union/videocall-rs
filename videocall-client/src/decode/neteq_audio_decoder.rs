@@ -19,9 +19,18 @@ use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, Me
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{AudioContext, AudioWorkletNode, MessageEvent, Worker};
+use web_sys::{AudioContext, AudioWorkletNode, GainNode, MessageEvent, Worker};
 
 const WORKLET_CODE: &str = include_str!("../scripts/pcmPlayerWorker.js");
+
+/// A peer's slot in the shared audio graph. `Dead` is terminal: once
+/// [`NetEqAudioPeerDecoder`]'s `Drop` has run, no pair may be stored again.
+#[derive(Debug)]
+enum PlaybackSlot {
+    Empty,
+    Live(AudioWorkletNode, GainNode),
+    Dead,
+}
 
 thread_local! {
     /// Scratch buffer for [`NetEqAudioPeerDecoder::calculate_rms`] (issue 2225).
@@ -281,7 +290,7 @@ pub struct NetEqAudioPeerDecoder {
     /// one `String` the diagnostics event needs is built only on the
     /// (edge-triggered, rare) frames that actually broadcast.
     peer_id: Rc<str>,
-    _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // AudioWorklet PCM player
+    pcm_player: Rc<RefCell<PlaybackSlot>>,
 
     // Message queueing system
     pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
@@ -396,7 +405,7 @@ impl NetEqAudioPeerDecoder {
     /// Create Safari-optimized AudioContext with PCM player worklet
     async fn create_safari_audio_context(
         speaker_device_id: Option<Rc<str>>,
-    ) -> Result<(AudioContext, AudioWorkletNode), JsValue> {
+    ) -> Result<(AudioContext, AudioWorkletNode, GainNode), JsValue> {
         // Use shared context and ensure worklet is registered before creating node
         // `SharedAudioContext` owns its device id, so the `Rc<str>` the PCM path
         // carries is materialised into a `String` here — on first-init only, not
@@ -406,9 +415,9 @@ impl NetEqAudioPeerDecoder {
         SharedAudioContext::ensure_pcm_worklet_ready(WORKLET_CODE).await?;
 
         // Create per-peer nodes after registration completes
-        let (pcm_player, _peer_gain) = SharedAudioContext::create_peer_playback_nodes("safari")?;
+        let (pcm_player, peer_gain) = SharedAudioContext::create_peer_playback_nodes("safari")?;
 
-        Ok((audio_context, pcm_player))
+        Ok((audio_context, pcm_player, peer_gain))
     }
 
     /// Calculate RMS (Root Mean Square) of audio samples for voice activity detection.
@@ -478,7 +487,7 @@ impl NetEqAudioPeerDecoder {
     /// borrow cannot be.
     fn handle_pcm_data(
         pcm: Float32Array,
-        pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
+        pcm_player: Rc<RefCell<PlaybackSlot>>,
         audio_context: &AudioContext,
         speaker_device_id: Option<Rc<str>>,
         peer_id: &str,
@@ -521,7 +530,7 @@ impl NetEqAudioPeerDecoder {
         wasm_bindgen_futures::spawn_local(async move {
             Self::ensure_worklet_initialized(&pcm_player_clone, speaker_device_id).await;
 
-            if let Some(ref worklet) = *pcm_player_clone.borrow() {
+            if let PlaybackSlot::Live(worklet, _peer_gain) = &*pcm_player_clone.borrow() {
                 Self::send_pcm_to_safari_worklet(worklet, &pcm);
             }
         });
@@ -613,24 +622,56 @@ impl NetEqAudioPeerDecoder {
 
     /// Ensure AudioWorklet is initialized (lazy initialization)
     async fn ensure_worklet_initialized(
-        pcm_player: &Rc<RefCell<Option<AudioWorkletNode>>>,
+        pcm_player: &Rc<RefCell<PlaybackSlot>>,
         speaker_device_id: Option<Rc<str>>,
     ) {
-        if pcm_player.borrow().is_some() {
+        let was_empty = matches!(*pcm_player.borrow(), PlaybackSlot::Empty);
+        if !was_empty {
             return;
         }
 
         log::info!("Initializing AudioWorklet for PCM playback");
 
         match Self::create_safari_audio_context(speaker_device_id).await {
-            Ok((_, worklet)) => {
-                *pcm_player.borrow_mut() = Some(worklet);
-                log::info!("AudioWorklet initialized successfully");
+            Ok((_, worklet, peer_gain)) => {
+                Self::store_or_retire(pcm_player, worklet, peer_gain);
             }
             Err(e) => {
                 web_sys::console::error_2(&"Failed to initialize worklet:".into(), &e);
             }
         }
+    }
+
+    /// Adopt a freshly built pair only if the slot is still `Empty`.
+    fn store_or_retire(
+        pcm_player: &Rc<RefCell<PlaybackSlot>>,
+        worklet: AudioWorkletNode,
+        peer_gain: GainNode,
+    ) {
+        let mut slot = pcm_player.borrow_mut();
+        if matches!(*slot, PlaybackSlot::Empty) {
+            *slot = PlaybackSlot::Live(worklet, peer_gain);
+            log::info!("AudioWorklet initialized successfully");
+        } else {
+            drop(slot);
+            Self::retire_playback_pair(&worklet, &peer_gain);
+        }
+    }
+
+    /// Stop the worklet's render callback and remove both of the pair's edges
+    /// from the shared graph. `disconnect()` alone does NOT stop `process()`.
+    fn retire_playback_pair(worklet: &AudioWorkletNode, peer_gain: &GainNode) {
+        if let Ok(port) = worklet.port() {
+            let stop = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &stop,
+                &JsValue::from_str("command"),
+                &JsValue::from_str("stop"),
+            );
+            let _ = port.post_message(&stop);
+        }
+        let _ = worklet.disconnect();
+        let _ = peer_gain.disconnect();
     }
 
     /// Handle statistics messages from NetEq worker
@@ -816,7 +857,7 @@ impl NetEqAudioPeerDecoder {
     /// Create message handler for NetEq worker
     #[allow(clippy::too_many_arguments)]
     fn create_message_handler(
-        pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
+        pcm_player: Rc<RefCell<PlaybackSlot>>,
         audio_context: AudioContext,
         peer_id: Rc<str>,
         speaker_device_id: Option<Rc<str>>,
@@ -940,7 +981,7 @@ impl NetEqAudioPeerDecoder {
         let peer_id: Rc<str> = Rc::from(peer_id);
         let speaker_device_id: Option<Rc<str>> = speaker_device_id.map(Rc::from);
 
-        let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
+        let pcm_player_ref = Rc::new(RefCell::new(PlaybackSlot::Empty));
 
         let threshold = vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD);
 
@@ -1015,7 +1056,7 @@ impl NetEqAudioPeerDecoder {
             _audio_context: audio_context.clone(),
             decoded: false,
             peer_id: peer_id.clone(),
-            _pcm_player: pcm_player_ref.clone(),
+            pcm_player: pcm_player_ref.clone(),
 
             // Message queueing system
             pending_messages,
@@ -1201,6 +1242,22 @@ impl Drop for NetEqAudioPeerDecoder {
             }
         }
         self.worker.terminate();
+
+        match self.pcm_player.try_borrow_mut() {
+            Ok(mut slot) => {
+                if let PlaybackSlot::Live(worklet, peer_gain) = &*slot {
+                    Self::retire_playback_pair(worklet, peer_gain);
+                }
+                *slot = PlaybackSlot::Dead;
+            }
+            Err(e) => {
+                debug_assert!(false, "playback slot borrowed at Drop: {e}");
+                log::warn!(
+                    "playback slot for {} was borrowed at Drop; it was not retired: {e}",
+                    self.peer_id
+                );
+            }
+        }
     }
 }
 
@@ -1979,6 +2036,230 @@ mod tests {
         );
     }
 
+    /// Ask the worklet how many times `process()` has run and await the reply.
+    async fn read_process_count(port: &web_sys::MessagePort, seen: &Rc<RefCell<Vec<f64>>>) -> f64 {
+        let before = seen.borrow().len();
+        let msg = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("command"),
+            &JsValue::from_str("reportProcessCount"),
+        )
+        .expect("set command");
+        port.post_message(&msg).expect("post report command");
+        for _ in 0..100 {
+            gloo_timers::future::TimeoutFuture::new(20).await;
+            if seen.borrow().len() > before {
+                return seen.borrow()[before];
+            }
+        }
+        panic!("worklet never reported its process count");
+    }
+
+    /// Bring up the shared graph and return the master gain the per-peer chain
+    /// is connected into.
+    async fn shared_master_gain() -> GainNode {
+        SharedAudioContext::prepare_recording_stream();
+        SharedAudioContext::ensure_pcm_worklet_ready(WORKLET_CODE)
+            .await
+            .expect("register the pcm-player worklet module");
+        let win = web_sys::window().expect("browser test needs a window");
+        let ctx: AudioContext =
+            js_sys::Reflect::get(&win, &JsValue::from_str("__vcSharedAudioCtx"))
+                .expect("shared context seam")
+                .dyn_into()
+                .expect("shared context is an AudioContext");
+        let _ = ctx.resume();
+        js_sys::Reflect::get(&win, &JsValue::from_str("__vcMasterGain"))
+            .expect("master gain seam")
+            .dyn_into()
+            .expect("master gain is a GainNode")
+    }
+
+    /// Issue 2288: a dropped decoder must leave nothing of its playback chain
+    /// running or connected in the shared audio graph.
+    #[wasm_bindgen_test]
+    async fn dropping_a_decoder_stops_and_unhooks_its_playback_chain() {
+        install_stub_neteq_worker_link();
+        let master = shared_master_gain().await;
+
+        let decoder =
+            NetEqAudioPeerDecoder::build(None, "issue-2288-drop".to_string(), false, None)
+                .expect("build decoder");
+        NetEqAudioPeerDecoder::ensure_worklet_initialized(&decoder.pcm_player, None).await;
+        let (worklet, peer_gain) = match &*decoder.pcm_player.borrow() {
+            PlaybackSlot::Live(w, g) => (w.clone(), g.clone()),
+            _ => panic!("the harness must have built the playback pair"),
+        };
+
+        let seen: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+        let on_report = Closure::wrap(Box::new({
+            let seen = seen.clone();
+            move |event: MessageEvent| {
+                if let Some(count) =
+                    js_sys::Reflect::get(&event.data(), &JsValue::from_str("count"))
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                {
+                    seen.borrow_mut().push(count);
+                }
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        let port = worklet.port().expect("worklet port");
+        port.set_onmessage(Some(on_report.as_ref().unchecked_ref()));
+
+        let mut a1 = read_process_count(&port, &seen).await;
+        for _ in 0..40 {
+            if a1 > 0.0 {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(50).await;
+            a1 = read_process_count(&port, &seen).await;
+        }
+        assert!(
+            a1 > 0.0,
+            "the shared AudioContext never started pulling: the rest of this test would be vacuous"
+        );
+        gloo_timers::future::TimeoutFuture::new(120).await;
+        let a2 = read_process_count(&port, &seen).await;
+        assert!(
+            a2 > a1,
+            "the worklet must still be pulling before the drop, got a1={a1} a2={a2}"
+        );
+
+        drop(decoder);
+
+        gloo_timers::future::TimeoutFuture::new(120).await;
+        let b = read_process_count(&port, &seen).await;
+        gloo_timers::future::TimeoutFuture::new(120).await;
+        let c = read_process_count(&port, &seen).await;
+        assert_eq!(
+            b, c,
+            "process() must be frozen after the decoder is dropped"
+        );
+
+        assert!(
+            worklet.disconnect_with_audio_node(&peer_gain).is_err(),
+            "the worklet must no longer be connected to its peer gain"
+        );
+        assert!(
+            peer_gain.disconnect_with_audio_node(&master).is_err(),
+            "the peer gain must no longer be connected to the master gain"
+        );
+
+        port.set_onmessage(None);
+    }
+
+    #[wasm_bindgen_test]
+    async fn dropping_a_decoder_marks_its_playback_slot_dead() {
+        install_stub_neteq_worker_link();
+        let _master = shared_master_gain().await;
+
+        let decoder =
+            NetEqAudioPeerDecoder::build(None, "issue-2288-slot".to_string(), false, None)
+                .expect("build decoder");
+        NetEqAudioPeerDecoder::ensure_worklet_initialized(&decoder.pcm_player, None).await;
+        let slot = decoder.pcm_player.clone();
+        assert!(
+            matches!(*slot.borrow(), PlaybackSlot::Live(..)),
+            "the harness must have built the playback pair"
+        );
+
+        drop(decoder);
+
+        assert!(
+            matches!(*slot.borrow(), PlaybackSlot::Dead),
+            "Drop must mark the slot Dead: an in-flight PCM future would otherwise rebuild it unowned"
+        );
+    }
+
+    /// Issue 2288: a decoder that never received PCM has no playback chain.
+    #[wasm_bindgen_test]
+    fn dropping_a_decoder_that_never_played_pcm_is_safe() {
+        install_stub_neteq_worker_link();
+
+        let decoder =
+            NetEqAudioPeerDecoder::build(None, "issue-2288-cold".to_string(), false, None)
+                .expect("build decoder");
+        let slot = decoder.pcm_player.clone();
+        assert!(
+            matches!(*slot.borrow(), PlaybackSlot::Empty),
+            "a decoder that never decoded PCM must have no playback nodes"
+        );
+
+        drop(decoder);
+
+        assert!(
+            matches!(*slot.borrow(), PlaybackSlot::Dead),
+            "Drop must close an Empty slot too, or a late init future can still build into it"
+        );
+    }
+
+    /// Both edges of `pair` are gone from the graph.
+    fn pair_is_detached(pair: &(AudioWorkletNode, GainNode), master: &GainNode) -> bool {
+        pair.0.disconnect_with_audio_node(&pair.1).is_err()
+            && pair.1.disconnect_with_audio_node(master).is_err()
+    }
+
+    /// Issue 2288: a pair built after its decoder was dropped has no owner and
+    /// no `Drop` to reach it, so the init path must retire it rather than store it.
+    #[wasm_bindgen_test]
+    async fn a_pair_built_into_a_dead_slot_is_retired_not_stored() {
+        let master = shared_master_gain().await;
+        let slot = Rc::new(RefCell::new(PlaybackSlot::Dead));
+        let late = SharedAudioContext::create_peer_playback_nodes("issue-2288-dead")
+            .expect("build a late pair");
+
+        NetEqAudioPeerDecoder::store_or_retire(&slot, late.0.clone(), late.1.clone());
+
+        assert!(
+            matches!(*slot.borrow(), PlaybackSlot::Dead),
+            "a Dead slot must stay Dead"
+        );
+        assert!(
+            pair_is_detached(&late, &master),
+            "the late pair must have been disconnected from the graph"
+        );
+    }
+
+    /// Issue 2288: when a sibling init future has already stored its pair, the
+    /// loser must retire its own and leave the winner's alone.
+    #[wasm_bindgen_test]
+    async fn a_pair_that_loses_the_init_race_is_retired_and_the_winner_kept() {
+        let master = shared_master_gain().await;
+        let winner = SharedAudioContext::create_peer_playback_nodes("issue-2288-winner")
+            .expect("build the winning pair");
+        let loser = SharedAudioContext::create_peer_playback_nodes("issue-2288-loser")
+            .expect("build the losing pair");
+        let slot = Rc::new(RefCell::new(PlaybackSlot::Live(
+            winner.0.clone(),
+            winner.1.clone(),
+        )));
+
+        NetEqAudioPeerDecoder::store_or_retire(&slot, loser.0.clone(), loser.1.clone());
+
+        match &*slot.borrow() {
+            PlaybackSlot::Live(worklet, peer_gain) => {
+                assert!(
+                    js_sys::Object::is(worklet.as_ref(), winner.0.as_ref())
+                        && js_sys::Object::is(peer_gain.as_ref(), winner.1.as_ref()),
+                    "the winner's pair must still be the one in the slot"
+                );
+            }
+            _ => panic!("the slot must still be Live"),
+        }
+        assert!(
+            pair_is_detached(&loser, &master),
+            "the losing pair must have been disconnected from the graph"
+        );
+        assert!(
+            winner.0.disconnect_with_audio_node(&winner.1).is_ok()
+                && winner.1.disconnect_with_audio_node(&master).is_ok(),
+            "the winner's edges must be untouched"
+        );
+        NetEqAudioPeerDecoder::retire_playback_pair(&winner.0, &winner.1);
+    }
+
     /// Issue 2225: the `onmessage` closure is now OWNED by the decoder instead of
     /// `.forget()`-ed, so `Drop` frees it. That is only safe if `Drop` detaches
     /// the handler first — a worker message dispatched into a freed
@@ -2028,7 +2309,7 @@ mod tests {
         let peer_id = "issue-2174-late-pcm";
         let vad = Rc::new(RefCell::new(VadState::new()));
         let audio_context = AudioContext::new().expect("test needs a WebAudio context");
-        let pcm_player: Rc<RefCell<Option<AudioWorkletNode>>> = Rc::new(RefCell::new(None));
+        let pcm_player: Rc<RefCell<PlaybackSlot>> = Rc::new(RefCell::new(PlaybackSlot::Empty));
 
         // One 20 ms frame of steady, clearly-audible speech: RMS 0.05 sits well
         // above DEFAULT_VAD_THRESHOLD (0.002).

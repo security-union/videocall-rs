@@ -99,6 +99,7 @@ use sec_api::metrics::{
     RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_ENCODER_MAX_STALL_GAP_MS, SCREEN_ENCODER_OUTPUT_FPS,
     SCREEN_ENCODER_STALL_EPISODES, SCREEN_KEYFRAME_REQUESTS_PER_SEC, SCREEN_SHARING_ACTIVE,
     SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS,
+    SCREEN_VIDEO_FPS_DECODER_OUTPUT, SCREEN_VIDEO_FRAMES_EMITTED_TOTAL,
     SCREEN_VIDEO_FREEZE_EPISODES_TOTAL, SCREEN_VIDEO_FREEZE_SECONDS_TOTAL,
     SCREEN_VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL, SCREEN_VIDEO_FRESHNESS_EVICTIONS_TOTAL,
     SCREEN_VIDEO_KEYFRAME_ARRIVALS_TOTAL, SCREEN_VIDEO_MAX_CONTENT_STALENESS_MS,
@@ -108,15 +109,16 @@ use sec_api::metrics::{
     SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_DROPPED_TOTAL, TIER_TRANSITIONS_TOTAL,
     UNISTREAM_BYTES_DRAINED_TOTAL, UNISTREAM_BYTES_OFFERED_TOTAL,
     UNISTREAM_STALE_DELTA_DROPS_TOTAL, VIDEOCALL_PEER_INFO, VIDEO_BITRATE_KBPS,
-    VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_FREEZE_EPISODES_TOTAL,
-    VIDEO_FREEZE_SECONDS_TOTAL, VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL,
-    VIDEO_FRESHNESS_EVICTIONS_TOTAL, VIDEO_KEYFRAME_ARRIVALS_TOTAL, VIDEO_MAX_CONTENT_STALENESS_MS,
-    VIDEO_MAX_DECODE_GAP_MS, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
-    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SEQ_MAX_GAP,
-    VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPPED_BYTES_BY_STREAM, WEBSOCKET_DROPS,
-    WEBSOCKET_INACTIVE_DROPPED_BYTES_BY_STREAM, WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STATE,
-    WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STREAM, WEBSOCKET_OFFERED_BYTES_BY_STREAM,
-    WT_INCOMING_DATAGRAM_HIGH_WATER_MARK, WT_INCOMING_DATAGRAM_MAX_AGE_MS,
+    VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FPS_DECODER_OUTPUT, VIDEO_FRAMES_DROPPED,
+    VIDEO_FRAMES_EMITTED_TOTAL, VIDEO_FREEZE_EPISODES_TOTAL, VIDEO_FREEZE_SECONDS_TOTAL,
+    VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL, VIDEO_FRESHNESS_EVICTIONS_TOTAL,
+    VIDEO_KEYFRAME_ARRIVALS_TOTAL, VIDEO_MAX_CONTENT_STALENESS_MS, VIDEO_MAX_DECODE_GAP_MS,
+    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
+    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SEQ_MAX_GAP, VIDEO_SKIP_TO_LIVE_TOTAL,
+    WEBSOCKET_DROPPED_BYTES_BY_STREAM, WEBSOCKET_DROPS, WEBSOCKET_INACTIVE_DROPPED_BYTES_BY_STREAM,
+    WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STATE, WEBSOCKET_INACTIVE_DROPPED_FRAMES_BY_STREAM,
+    WEBSOCKET_OFFERED_BYTES_BY_STREAM, WT_INCOMING_DATAGRAM_HIGH_WATER_MARK,
+    WT_INCOMING_DATAGRAM_MAX_AGE_MS,
 };
 
 async fn metrics_handler(
@@ -567,7 +569,6 @@ fn remove_per_peer_metrics(
 ) {
     let labels = [meeting_id, session_id, reporting_user_id, to_peer];
 
-    // Per-peer metrics (22 kept, 7 low-value ones removed for cardinality reduction)
     let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
     let _ = PEER_CAN_SEE.remove_label_values(&labels);
     let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
@@ -605,6 +606,9 @@ fn remove_per_peer_metrics(
     let _ = VIDEO_SEQ_MAX_GAP.remove_label_values(&labels);
     let _ = VIDEO_FRESHNESS_EVICTIONS_TOTAL.remove_label_values(&labels);
     let _ = VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL.remove_label_values(&labels);
+    // #2657: same per-pair label set, so the same leak applies.
+    let _ = VIDEO_FPS_DECODER_OUTPUT.remove_label_values(&labels);
+    let _ = VIDEO_FRAMES_EMITTED_TOTAL.remove_label_values(&labels);
     let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
@@ -631,6 +635,9 @@ fn remove_per_peer_metrics(
     let _ = SCREEN_VIDEO_FRESHNESS_EVICTIONS_KEYFRAMELESS_TOTAL.remove_label_values(&labels);
     let _ = SCREEN_VIDEO_SEQ_LOSS_PER_SEC.remove_label_values(&labels);
     let _ = SCREEN_KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
+    // #2657: screen sibling of the decoder-output GC above.
+    let _ = SCREEN_VIDEO_FPS_DECODER_OUTPUT.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_FRAMES_EMITTED_TOTAL.remove_label_values(&labels);
 
     // NOTE: RECEIVED_LAYER is intentionally NOT reaped here. Its series are
     // reaped authoritatively from the #1561 tracked set
@@ -2134,6 +2141,16 @@ fn process_health_packet_to_metrics_pb(
                             .freshness_evictions_keyframeless_total
                             .map(|v| v as f64),
                     );
+                    publish_or_clear(
+                        &VIDEO_FPS_DECODER_OUTPUT,
+                        &peer_labels,
+                        video_stats.fps_decoder_output,
+                    );
+                    publish_or_clear(
+                        &VIDEO_FRAMES_EMITTED_TOTAL,
+                        &peer_labels,
+                        video_stats.frames_emitted_total.map(|v| v as f64),
+                    );
                 }
 
                 // Screen video metrics (separate from camera)
@@ -2256,6 +2273,16 @@ fn process_health_packet_to_metrics_pb(
                         &SCREEN_KEYFRAME_REQUESTS_PER_SEC,
                         &peer_labels,
                         screen_stats.keyframe_requests_per_sec,
+                    );
+                    publish_or_clear(
+                        &SCREEN_VIDEO_FPS_DECODER_OUTPUT,
+                        &peer_labels,
+                        screen_stats.fps_decoder_output,
+                    );
+                    publish_or_clear(
+                        &SCREEN_VIDEO_FRAMES_EMITTED_TOTAL,
+                        &peer_labels,
+                        screen_stats.frames_emitted_total.map(|v| v as f64),
                     );
                 }
 
@@ -4590,6 +4617,236 @@ mod tests {
             gauge_value("videocall_screen_video_keyframe_arrivals_total", &labels),
             None,
             "the screen arrival series must be swept too"
+        );
+    }
+
+    #[test]
+    fn fps_decoder_output_exports_per_bucket_and_is_gc_d() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut camera_vs = PbVideoStats::new();
+        camera_vs.fps_received = 15.0;
+        camera_vs.fps_decoder_output = Some(0.0);
+        camera_vs.frames_emitted_total = Some(1000);
+
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 10.0;
+        screen_vs.fps_decoder_output = Some(7.5);
+        screen_vs.frames_emitted_total = Some(250);
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_fdo_2657".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_fdo_2657",
+            "meet_fdo_2657",
+            "alice_fdo_2657",
+            peer_stats,
+        );
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_fdo_2657"),
+            ("session_id", "sess_fdo_2657"),
+            ("from_peer", "alice_fdo_2657"),
+            ("to_peer", "bob_fdo_2657"),
+        ];
+
+        assert_eq!(
+            gauge_value("videocall_video_fps_decoder_output", &labels),
+            Some(0.0),
+            "the CAMERA decoder-output gauge must export a reported 0.0 from video_stats; None \
+             => the publish_or_clear(&VIDEO_FPS_DECODER_OUTPUT, ..) line was dropped"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_fps_decoder_output", &labels),
+            Some(7.5),
+            "the SCREEN decoder-output gauge must export screen_video_stats (7.5, NOT the \
+             camera's 0.0 — a bucket transposition fails here)"
+        );
+        assert_eq!(
+            gauge_value("videocall_video_frames_emitted_total", &labels),
+            Some(1000.0),
+            "None => the publish_or_clear(&VIDEO_FRAMES_EMITTED_TOTAL, ..) line was dropped"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_frames_emitted_total", &labels),
+            Some(250.0),
+            "the SCREEN counter must export screen_video_stats (250, NOT the camera's 1000)"
+        );
+
+        remove_per_peer_metrics(
+            "meet_fdo_2657",
+            "sess_fdo_2657",
+            "alice_fdo_2657",
+            "bob_fdo_2657",
+        );
+        assert_eq!(
+            gauge_value("videocall_video_fps_decoder_output", &labels),
+            None,
+            "the camera decoder-output series must be swept with its per-pair siblings; Some => \
+             the remove_label_values line is missing and the series leaks per departed pair"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_fps_decoder_output", &labels),
+            None,
+            "the screen decoder-output series must be swept too"
+        );
+        assert_eq!(
+            gauge_value("videocall_video_frames_emitted_total", &labels),
+            None,
+            "Some => the camera counter's remove_label_values line is missing and the series \
+             leaks per departed pair"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_frames_emitted_total", &labels),
+            None,
+            "the screen counter series must be swept too"
+        );
+    }
+
+    #[test]
+    fn absent_fps_decoder_output_publishes_no_series() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut camera_vs = PbVideoStats::new();
+        camera_vs.fps_received = 15.0;
+        assert_eq!(camera_vs.fps_decoder_output, None);
+        assert_eq!(camera_vs.frames_emitted_total, None);
+
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 10.0;
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_fdo_abs".to_string(), ps);
+
+        let hp =
+            create_test_health_packet("sess_fdo_abs", "meet_fdo_abs", "alice_fdo_abs", peer_stats);
+        assert!(process_health_packet_to_metrics_pb(&hp, &tracker).is_ok());
+
+        let labels = [
+            ("meeting_id", "meet_fdo_abs"),
+            ("session_id", "sess_fdo_abs"),
+            ("from_peer", "alice_fdo_abs"),
+            ("to_peer", "bob_fdo_abs"),
+        ];
+
+        assert_eq!(
+            gauge_value("videocall_video_fps_decoder_output", &labels),
+            None,
+            "an unreported camera decoder-output must publish NO series; Some(0.0) => the \
+             presence guard was replaced by an unwrap_or(0.0)"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_fps_decoder_output", &labels),
+            None,
+            "an unreported screen decoder-output must publish NO series"
+        );
+        // A forged 0 on a COUNTER is worse than on the rate: it never moves, so
+        // increase() reads 0 and fabricates the freeze evidence this PR exists to gather.
+        assert_eq!(
+            gauge_value("videocall_video_frames_emitted_total", &labels),
+            None,
+            "an unreported camera frame COUNT must publish NO series; Some(0.0) => the \
+             presence guard was replaced by an unwrap_or(0)"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_frames_emitted_total", &labels),
+            None,
+            "an unreported screen frame COUNT must publish NO series"
+        );
+    }
+
+    #[test]
+    fn fps_decoder_output_series_is_cleared_when_the_field_is_absent() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let labels = [
+            ("meeting_id", "meet_fdo_clr"),
+            ("session_id", "sess_fdo_clr"),
+            ("from_peer", "alice_fdo_clr"),
+            ("to_peer", "bob_fdo_clr"),
+        ];
+
+        // Both buckets, because each has its OWN export call: a camera-only fixture leaves the
+        // screen pair revertible-green.
+        let packet = |fps: Option<f64>, emitted: Option<u64>| {
+            let mut camera_vs = PbVideoStats::new();
+            camera_vs.fps_received = 15.0;
+            camera_vs.fps_decoder_output = fps;
+            camera_vs.frames_emitted_total = emitted;
+            let mut screen_vs = PbVideoStats::new();
+            screen_vs.fps_received = 12.0;
+            screen_vs.fps_decoder_output = fps.map(|v| v + 1.0);
+            screen_vs.frames_emitted_total = emitted.map(|v| v + 100);
+            let mut ps = PbPeerStats::new();
+            ps.can_see = true;
+            ps.video_enabled = true;
+            ps.video_stats = ::protobuf::MessageField::some(camera_vs);
+            ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+            let mut peer_stats = std::collections::HashMap::new();
+            peer_stats.insert("bob_fdo_clr".to_string(), ps);
+            create_test_health_packet("sess_fdo_clr", "meet_fdo_clr", "alice_fdo_clr", peer_stats)
+        };
+
+        assert!(
+            process_health_packet_to_metrics_pb(&packet(Some(5.0), Some(900)), &tracker).is_ok()
+        );
+        assert_eq!(
+            gauge_value("videocall_video_fps_decoder_output", &labels),
+            Some(5.0),
+            "precondition: the reported value must publish before absence can clear it"
+        );
+        assert_eq!(
+            gauge_value("videocall_video_frames_emitted_total", &labels),
+            Some(900.0),
+            "precondition: the reported count must publish before absence can clear it"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_fps_decoder_output", &labels),
+            Some(6.0),
+            "precondition: the screen rate must publish first"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_frames_emitted_total", &labels),
+            Some(1000.0),
+            "precondition: the screen count must publish first"
+        );
+
+        assert!(process_health_packet_to_metrics_pb(&packet(None, None), &tracker).is_ok());
+        assert_eq!(
+            gauge_value("videocall_video_fps_decoder_output", &labels),
+            None,
+            "Some(5.0) => a packet with the field ABSENT left the previous value published; \
+             publish_or_clear's None arm was dropped"
+        );
+        assert_eq!(
+            gauge_value("videocall_video_frames_emitted_total", &labels),
+            None,
+            "Some(900.0) => the counter series LATCHED; a latched counter reads increase() == 0, \
+             which is indistinguishable from a real output stall"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_fps_decoder_output", &labels),
+            None,
+            "Some(6.0) => the SCREEN rate latched; its export is a separate call from the camera's"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_frames_emitted_total", &labels),
+            None,
+            "Some(1000.0) => the SCREEN counter latched"
         );
     }
 

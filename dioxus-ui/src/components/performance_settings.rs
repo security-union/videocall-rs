@@ -46,6 +46,7 @@
 //! (bypassing the Dioxus diff). Send and receive meters use DISTINCT DOM ids so
 //! the two drivers never fight over the same node.
 
+use crate::constants::audio_published_layer_count;
 use dioxus::prelude::*;
 use std::rc::Rc;
 use videocall_client::{
@@ -453,8 +454,6 @@ pub struct PerfControlsHandle {
     pub video_layer_max: usize,
     /// Effective SCREEN ladder depth (shares the video CPU capability ceiling).
     pub screen_layer_max: usize,
-    /// Audio's published layer count.
-    pub audio_layer_max: usize,
 }
 
 impl PartialEq for PerfControlsHandle {
@@ -472,7 +471,6 @@ impl PartialEq for PerfControlsHandle {
             && self.diagnostics_reader == other.diagnostics_reader
             && self.video_layer_max == other.video_layer_max
             && self.screen_layer_max == other.screen_layer_max
-            && self.audio_layer_max == other.audio_layer_max
     }
 }
 
@@ -3000,6 +2998,10 @@ fn SendLayerCell(
     auto_testid: &'static str,
     help_testid: &'static str,
     help_body: &'static str,
+    /// Copy shown instead of `help_body` when the ladder has one rung and the
+    /// control is suppressed; `None` keeps `help_body`, which already says so.
+    #[props(default = None)]
+    help_body_single: Option<&'static str>,
     vu_testid: &'static str,
     vu_meter_id: &'static str,
     vu_readout_id: &'static str,
@@ -3056,6 +3058,14 @@ fn SendLayerCell(
     // closure can use it WITHOUT borrowing `labels` after it is moved into the
     // closure / cloned into the slider below (Directive 4 SITE 2/3).
     let ladder_count = labels.len();
+    // A one-rung ladder has nothing to choose, so the whole layer control goes;
+    // the summary line stays as the cell's state readout.
+    let single_layer = ladder_count <= 1;
+    let help_body = if single_layer {
+        help_body_single.unwrap_or(help_body)
+    } else {
+        help_body
+    };
 
     rsx! {
         div { class: "perf-side perf-side--send",
@@ -3101,55 +3111,63 @@ fn SendLayerCell(
                     }
                 }
             }
-            DualRangeSlider {
-                id_prefix,
-                min_testid,
-                max_testid,
-                stream_noun,
-                labels: labels.clone(),
-                sel,
-                layer_mode: true,
-                max_valuetext: ceiling_valuetext,
-                on_change: move |s: RangeSel| {
-                    // Only the ceiling (max) thumb is interactive; map its position
-                    // to the stored layer-ceiling (None at full = Auto).
-                    on_ceiling_change.call(thumb_pos_to_layer_ceiling(s.max_pos, ladder_count));
-                },
-            }
-            div {
-                class: "perf-rungs",
-                "data-testid": "{id_prefix}-send-rungs",
-                role: "img",
-                "aria-label": "{rungs_aria}",
-                for rung in rungs.iter() {
-                    span {
-                        key: "{rung.layer_id}",
-                        class: if rung.active { "perf-rung is-active" } else { "perf-rung is-shed" },
-                        "data-testid": "{id_prefix}-send-rung-{rung.layer_id}",
-                        title: if rung.active {
-                            format!(
-                                "{} layer — publishing {}",
-                                layer_quality_label(rung.layer_id, ladder_count as u32, false),
-                                rung.res_label
-                            )
-                        } else {
-                            format!(
-                                "{} layer — not published (ceiling lowered)",
-                                layer_quality_label(rung.layer_id, ladder_count as u32, false)
-                            )
-                        },
-                        span { class: "perf-rung__bar", "aria-hidden": "true" }
-                        span { class: "perf-rung__label", "{rung.res_label}" }
+            if !single_layer {
+                DualRangeSlider {
+                    id_prefix,
+                    min_testid,
+                    max_testid,
+                    stream_noun,
+                    labels: labels.clone(),
+                    sel,
+                    layer_mode: true,
+                    max_valuetext: ceiling_valuetext,
+                    on_change: move |s: RangeSel| {
+                        // Only the ceiling (max) thumb is interactive; map its position
+                        // to the stored layer-ceiling (None at full = Auto).
+                        on_ceiling_change.call(thumb_pos_to_layer_ceiling(s.max_pos, ladder_count));
+                    },
+                }
+                div {
+                    class: "perf-rungs",
+                    "data-testid": "{id_prefix}-send-rungs",
+                    role: "img",
+                    "aria-label": "{rungs_aria}",
+                    for rung in rungs.iter() {
+                        span {
+                            key: "{rung.layer_id}",
+                            class: if rung.active { "perf-rung is-active" } else { "perf-rung is-shed" },
+                            "data-testid": "{id_prefix}-send-rung-{rung.layer_id}",
+                            title: if rung.active {
+                                format!(
+                                    "{} layer — publishing {}",
+                                    layer_quality_label(rung.layer_id, ladder_count as u32, false),
+                                    rung.res_label
+                                )
+                            } else {
+                                format!(
+                                    "{} layer — not published (ceiling lowered)",
+                                    layer_quality_label(rung.layer_id, ladder_count as u32, false)
+                                )
+                            },
+                            span { class: "perf-rung__bar", "aria-hidden": "true" }
+                            span { class: "perf-rung__label", "{rung.res_label}" }
+                        }
                     }
                 }
             }
             div { class: "perf-side__caption",
-                p {
-                    class: "perf-range-value",
-                    "data-testid": "{id_prefix}-range-value",
-                    "{count_caption}"
+                if !single_layer {
+                    p {
+                        class: "perf-range-value",
+                        "data-testid": "{id_prefix}-range-value",
+                        "{count_caption}"
+                    }
                 }
-                p { class: "perf-summary-line", "{summary_line}" }
+                p {
+                    class: "perf-summary-line",
+                    "data-testid": "{id_prefix}-send-summary",
+                    "{summary_line}"
+                }
             }
         }
     }
@@ -3179,7 +3197,18 @@ pub struct PeerKindSnap {
 /// `<span>`s carried is conveyed by the wording instead.
 const HELP_PERF_INTRO: &str = "Each stream adapts to your connection automatically. Limit what you RECEIVE (saves your download) and what you SEND (saves your upload + CPU). For sending, the base layer is always sent so every viewer can see you; the right handle sets the highest layer you publish — how many layers you send. For receiving, the two handles bound the quality you'll accept. Reset returns to the full automatic range. The meter shows what's flowing right now.";
 
-const HELP_VIDEO_SEND: &str = "Your camera sends several quality versions ('layers') so each viewer gets the best one their connection can handle. The base layer is ALWAYS sent (so every viewer can always see you); the right handle sets the HIGHEST layer you publish — i.e. how many layers you send. Lower it to send fewer top layers (saves your upload + CPU); raise it to send more, up to your device's limit. The encoder still adapts quality within what you allow. Reset returns to the full automatic ladder.";
+const HELP_VIDEO_SEND: &str = "Your camera sends several quality versions ('layers') so each viewer gets the best one their connection can handle. The base layer is ALWAYS sent (so every viewer can always see you); the right handle sets the HIGHEST layer you publish — i.e. how many layers you send. Lower it to send fewer top layers (saves your upload + CPU); raise it to send more, up to the ladder's top. The encoder still adapts quality within what you allow. Reset returns to the full automatic ladder.";
+
+/// Every SEND ladder is one rung when video is: audio and screen always are.
+fn perf_intro_help(video_layer_max: usize) -> &'static str {
+    if send_layer_labels_with_top(PrefMediaKind::Video, video_layer_max, "").len() <= 1 {
+        HELP_PERF_INTRO_SEND_PINNED
+    } else {
+        HELP_PERF_INTRO
+    }
+}
+const HELP_VIDEO_SEND_SINGLE: &str = "Only one video layer is available here, so there is nothing to set. The encoder still adapts quality within that layer automatically.";
+const HELP_PERF_INTRO_SEND_PINNED: &str = "Each stream adapts to your connection automatically. Limit what you RECEIVE (saves your download); the two handles bound the quality you'll accept, and Reset returns to the full automatic range. Every stream here sends a single layer, so there is nothing to set on the sending side. The meter shows what's flowing right now.";
 const HELP_AUDIO_SEND: &str = "Your mic sends a single audio stream, and its bitrate adapts to your connection automatically. There are no quality layers to choose between, so there is nothing to set here.";
 const HELP_CONTENT_SEND: &str = "When you share your screen it is sent as a single stream at the resolution of the window or screen you picked, up to 2560x1440. There are no sharpness layers to choose between, so there is nothing to set here.";
 
@@ -3223,9 +3252,6 @@ pub fn PerformanceSettingsPanel(
     // compile and render a 1-rung (no-op) layer control.
     #[props(default = 1)] video_layer_max: usize,
     #[props(default = 1)] screen_layer_max: usize,
-    /// Audio's published layer count.
-    #[props(default = 1)]
-    audio_layer_max: usize,
     /// Whether the MIC is currently capturing (threaded from `host.rs`'s
     /// `mic_enabled` prop). Audio has no per-layer SEND snapshot to infer this from
     /// (unlike video/screen, whose source-active state is the snapshot being
@@ -3308,8 +3334,11 @@ pub fn PerformanceSettingsPanel(
     // lowers the audio layer count — consistent with the "N of M layers" caption
     // the SendLayerCell renders. (The old bare-tier `format_audio_send_summary`
     // read "Sending high quality" regardless, contradicting the rungs.)
-    let audio_send_line =
-        format_audio_send_layer_summary(pref.audio_layers, audio_layer_max, audio_source_active);
+    let audio_send_line = format_audio_send_layer_summary(
+        pref.audio_layers,
+        audio_published_layer_count() as usize,
+        audio_source_active,
+    );
     let audio_recv_line = format_audio_receive_summary(recv_audio_peers.len());
     let content_send_line = format_content_send_summary(send_screen_snap.as_ref());
     // Top-layer screen-share peer (highest layer_index) for the content receive line.
@@ -3358,7 +3387,7 @@ pub fn PerformanceSettingsPanel(
                 key_id: "perf-intro",
                 help_testid: "perf-intro-help",
                 help_label: "About the Performance panel",
-                help_body: HELP_PERF_INTRO,
+                help_body: perf_intro_help(video_layer_max),
                 open_help,
             }
         }
@@ -3381,6 +3410,7 @@ pub fn PerformanceSettingsPanel(
                     auto_testid: TESTID_VIDEO_AUTO,
                     help_testid: "perf-video-help",
                     help_body: HELP_VIDEO_SEND,
+                    help_body_single: Some(HELP_VIDEO_SEND_SINGLE),
                     vu_testid: TESTID_VU_VIDEO,
                     vu_meter_id: VIDEO_METER_ID,
                     vu_readout_id: VIDEO_READOUT_ID,
@@ -3437,7 +3467,7 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_readout: g.audio_text.clone(),
                     consequence: "your upload".to_string(),
                     kind: PrefMediaKind::Audio,
-                    layer_max: audio_layer_max,
+                    layer_max: audio_published_layer_count() as usize,
                     layers: pref.audio_layers,
                     // Mic active iff the mic is enabled (threaded from host —
                     // audio has no per-layer SEND snapshot to infer it from).
@@ -6890,6 +6920,42 @@ mod tests {
         assert!(
             !off.contains("Sending"),
             "off-state must NOT claim to be sending"
+        );
+    }
+
+    #[test]
+    fn send_help_copy_never_describes_a_control_that_is_suppressed() {
+        assert_eq!(super::perf_intro_help(3), super::HELP_PERF_INTRO);
+        assert_eq!(
+            super::perf_intro_help(1),
+            super::HELP_PERF_INTRO_SEND_PINNED
+        );
+        for (copy, what) in [
+            (super::HELP_VIDEO_SEND_SINGLE, "video single-layer"),
+            (super::HELP_AUDIO_SEND, "audio"),
+            (super::HELP_CONTENT_SEND, "screen"),
+        ] {
+            for word in ["handle", "Reset", "Lower it", "raise it", "device"] {
+                assert!(
+                    !copy.contains(word),
+                    "{what} SEND help still says {word:?}, but a one-rung ladder \
+                     renders no slider and show_reset is `0 < 0`"
+                );
+            }
+        }
+        // The intro covers BOTH directions and receive keeps its handles, so only
+        // its SEND claim may not survive.
+        assert!(
+            !super::HELP_PERF_INTRO_SEND_PINNED.contains("highest layer you publish"),
+            "the pinned intro still describes a send handle that renders nowhere"
+        );
+        assert!(
+            !super::HELP_PERF_INTRO_SEND_PINNED.contains("device"),
+            "the pinned intro must not attribute the single layer to the device"
+        );
+        assert!(
+            super::HELP_PERF_INTRO.contains("highest layer you publish"),
+            "the unpinned intro must still describe the send handle it has"
         );
     }
 

@@ -1089,6 +1089,8 @@ html[data-theme="dark"] {
   --settings-swatch-border-hover: rgba(255, 255, 255, 0.5);
   --settings-swatch-shadow-hover: rgba(255, 255, 255, 0.16);
   --settings-swatch-shadow-active: rgba(255, 255, 255, 0.18);
+  --settings-swatch-selected-ring: rgba(255, 255, 255, 0.92);
+  --settings-swatch-delete-bg: var(--error);
   --settings-input-bg: var(--glass-bg);
   --settings-input-border: rgba(255, 255, 255, 0.14);
   --settings-input-border-focus: rgba(255, 255, 255, 0.32);
@@ -1202,22 +1204,6 @@ html[data-theme="dark"] {
   /* Speaker Highlight preview tile — calm surface, not bright (dark). */
   --appearance-preview-tile-bg: rgba(255, 255, 255, 0.03);
   --appearance-preview-tile-border-color: var(--grid-item-border);
-  --preview-glow-speaking-box-shadow:
-    0 0 calc(var(--preview-glow-outer-blur) * 1px)
-      calc(var(--preview-glow-outer-spread) * 1px)
-      rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-outer-alpha)),
-    inset 0 0 calc(var(--preview-glow-inner-blur) * 1px)
-      calc(var(--preview-glow-inner-spread) * 1px)
-      rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-inner-alpha));
-  --preview-glow-speaking-border-color:
-    rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-border-alpha));
-  --preview-glow-speaking-transition:
-    border-color var(--preview-glow-fade-in) ease-in,
-    box-shadow var(--preview-glow-fade-in) ease-in;
-  --preview-glow-silent-border-color: var(--appearance-preview-tile-border-color);
-  --preview-glow-silent-transition:
-    border-color var(--preview-glow-fade-out) ease-out var(--preview-glow-hold-delay),
-    box-shadow var(--preview-glow-fade-out) ease-out var(--preview-glow-hold-delay);
 }
 
 /* Settings-specific tokens — light theme */
@@ -1265,6 +1251,8 @@ html[data-theme="light"] {
   --settings-swatch-border-hover: rgba(60, 65, 72, 0.6);
   --settings-swatch-shadow-hover: rgba(100, 150, 220, 0.12);
   --settings-swatch-shadow-active: rgba(100, 150, 220, 0.18);
+  --settings-swatch-selected-ring: rgba(16, 26, 44, 0.88);
+  --settings-swatch-delete-bg: var(--error-text);
   --settings-input-bg: rgba(0, 0, 0, 0.04);
   --settings-input-border: rgba(100, 140, 180, 0.2);
   --settings-input-border-focus: rgba(100, 150, 220, 0.4);
@@ -1398,22 +1386,7 @@ html[data-theme="light"] {
   /* Speaker Highlight preview tile — muted slate, not near-white (light). */
   --appearance-preview-tile-bg: rgba(40, 55, 80, 0.06);
   --appearance-preview-tile-border-color: var(--grid-item-border);
-  --preview-glow-speaking-box-shadow:
-    0 0 calc(var(--preview-glow-outer-blur) * 1px)
-      calc(var(--preview-glow-outer-spread) * 1px)
-      rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-outer-alpha)),
-    inset 0 0 calc(var(--preview-glow-inner-blur) * 1px)
-      calc(var(--preview-glow-inner-spread) * 1px)
-      rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-inner-alpha));
-  --preview-glow-speaking-border-color:
-    rgb(var(--preview-glow-r) var(--preview-glow-g) var(--preview-glow-b) / var(--preview-glow-border-alpha));
-  --preview-glow-speaking-transition:
-    border-color var(--preview-glow-fade-in) ease-in,
-    box-shadow var(--preview-glow-fade-in) ease-in;
-  --preview-glow-silent-border-color: var(--appearance-preview-tile-border-color);
-  --preview-glow-silent-transition:
-    border-color var(--preview-glow-fade-out) ease-out var(--preview-glow-hold-delay),
-    box-shadow var(--preview-glow-fade-out) ease-out var(--preview-glow-hold-delay);
+  --appearance-preview-caption-light: rgba(22, 28, 38, 0.72);
 }
 
 /* Light theme invite window text — override for dark text readability */
@@ -1573,6 +1546,12 @@ html[data-theme="light"] #invite-overlay p {
      #d70015 in light theme for 2.12:1. On the bare surface this reads 6.3:1. */
   --on-dark-error-text: #ff8f85;
 
+  /* Meeting footer (issue 2791): fixed-dark in both themes. */
+  --meeting-footer-h: 32px;
+  --meeting-footer-bg: rgba(16, 17, 20, 0.6);
+  --meeting-footer-bg-hover: rgba(16, 17, 20, 0.8);
+  --meeting-footer-border: rgba(255, 255, 255, 0.08);
+
   /* ─── Dock popover surface (issue 2091) ───────────────────────────────────
      A FIXED-DARK surface, deliberately theme-independent — a member of the
      --fixed-dark family above, not a theme-aware chrome surface. It is the
@@ -1631,10 +1610,10 @@ html[data-theme="light"] #invite-overlay p {
   /* Vertical room to reserve below the controls dock: dock bottom 20px + dock
      height ~79px + ~12px gap = 112px. (The ~79px = .video-control-button 3.1rem
      ≈49.6px + .video-controls-container padding 0.85rem×2 ≈27.2px + 2px border;
-     anchored at bottom 20px so its top edge is ≈99px from the viewport bottom.)
+     anchored 20px above the meeting footer, so its top edge is ≈99px above it.)
      Used to anchor the decode-paused pill just above the controls dock in grid
      mode. Issue 1142. */
-  --controls-dock-clearance: 112px;
+  --controls-dock-clearance: calc(112px + var(--meeting-footer-h));
 
   /* Gradient tokens — consolidated fade/rim/reflection effects */
   --gradient-fade-video: linear-gradient(
@@ -1711,6 +1690,14 @@ html[data-theme="light"] #invite-overlay p {
   --chat-shadow: rgba(0, 0, 0, 0.4);
   --chat-error-text: #f28b82;
   --chat-error-bg: #3c2a2a;
+}
+
+/* issue 2793: five swatches per row on phones, so the last column's ring and
+   delete badge stay inside the settings panel's horizontal clip. */
+@media (max-width: 37.5em) {
+  :root {
+    --speaker-swatch-row-width: 152px;
+  }
 }
 
 /* Accessibility: high-contrast fallback */
@@ -2173,7 +2160,7 @@ html[data-theme="light"] #invite-overlay p {
     100vw - var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px) -
       32px
   );
-  bottom: 20px;
+  bottom: calc(20px + var(--meeting-footer-h, 0px));
   transform: translateX(-50%);
   flex-direction: row;
 }
@@ -2191,7 +2178,7 @@ html[data-theme="light"] #invite-overlay p {
 /* Left side */
 .video-controls-container.dock-left {
   left: calc(16px + var(--drawer-left-reserve, 0px));
-  top: 50%;
+  top: calc(50% - var(--meeting-footer-h, 0px) / 2);
   transform: translateY(-50%);
   flex-direction: column;
   border-radius: 1.8rem;
@@ -2211,7 +2198,7 @@ html[data-theme="light"] #invite-overlay p {
 /* Right side */
 .video-controls-container.dock-right {
   right: calc(16px + var(--drawer-right-reserve, 0px));
-  top: 50%;
+  top: calc(50% - var(--meeting-footer-h, 0px) / 2);
   transform: translateY(-50%);
   flex-direction: column;
   border-radius: 1.8rem;
@@ -2297,10 +2284,10 @@ html[data-theme="light"] #invite-overlay p {
   animation: overflow-popover-fade-in 0.12s ease-out;
   /* Cap the height so the upward-opening list can't clip off the top of a
      short / landscape viewport now that up to 5-7 items can land here. The
-     popover's bottom edge sits ~120px above the viewport bottom (20px bar
+     popover's bottom edge sits ~120px above the meeting footer (20px bar
      offset + ~79px bar height + 12px gap); leave that plus a small top margin,
      and scroll anything taller. */
-  max-height: calc(100vh - 120px);
+  max-height: calc(100vh - 120px - var(--meeting-footer-h, 0px));
   overflow-y: auto;
 }
 
@@ -2758,7 +2745,7 @@ html[data-theme="light"] #invite-overlay p {
 
 @media (max-width: 640px) {
   .video-controls-container.dock-bottom {
-    bottom: 1rem;
+    bottom: calc(1rem + var(--meeting-footer-h, 0px));
   }
   .video-controls-container {
     padding: var(--space-3) var(--space-5);
@@ -3604,17 +3591,11 @@ html[data-theme="light"] #invite-overlay p {
    because focus-within reveals it and its buttons stay in the tab order. */
 .ss-zoom-controls {
   position: absolute;
-  /* issue 1175: raise the bar ABOVE the meeting action bar so it is never
-     obscured (user-test round 2). Anchored to --controls-dock-clearance
-     (global.css:1525) — the shared clearance token the decode-paused pill
-     already uses; a static constant DERIVED from the dock-bottom geometry (20px
-     + ~79px + gap = 112px), kept in sync manually if the dock ever changes
-     height (the dock itself does not reference the token). It clears the dock in
-     its BOTTOM position (the reported overlap); LEFT/RIGHT docks sit on the
-     edge-midlines, which a lower-CENTER bar never meets; and in screen-share
-     mode the decode-paused pill has already moved to the TOP, so this
-     lower-center zone is otherwise empty. */
-  bottom: var(--controls-dock-clearance, 112px);
+  /* issue 1175: clears the meeting action bar in its BOTTOM dock position.
+     Absolute inside .canvas-container, whose bottom edge the meeting-footer
+     reserve already lifted, so the footer term in --controls-dock-clearance is
+     subtracted back out to keep the net lift at one. */
+  bottom: calc(var(--controls-dock-clearance, 112px) - var(--meeting-footer-h, 0px));
   left: 50%;
   transform: translateX(-50%);
   display: flex;
@@ -4324,6 +4305,258 @@ html[data-theme="light"] #invite-overlay p {
   }
   .about-modal-row--header {
     display: none;
+  }
+}
+
+/* Meeting footer + Meeting info dialog (issue 2791) */
+.meeting-footer {
+  position: fixed;
+  left: var(--drawer-left-reserve, 0px);
+  right: var(--drawer-right-reserve, 0px);
+  bottom: 0;
+  height: var(--meeting-footer-h);
+  z-index: 20;
+  box-sizing: border-box;
+  border-top: 1px solid var(--meeting-footer-border);
+  background: var(--meeting-footer-bg);
+  container: meeting-footer / inline-size;
+  transition: background-color var(--motion-fast) ease;
+}
+.meeting-footer-trigger {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0 var(--space-3);
+  border: 0;
+  background: transparent;
+  color: var(--on-dark-text-secondary);
+  font: inherit;
+  font-size: var(--fs-3);
+  line-height: 1;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: color var(--motion-fast) ease;
+}
+.meeting-footer-trigger:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -3px;
+  border-radius: var(--radius-sm);
+  color: var(--on-dark-text-high);
+}
+.meeting-footer-trigger:active {
+  color: var(--on-dark-text);
+}
+@media (hover: hover) {
+  .meeting-footer:hover {
+    background: var(--meeting-footer-bg-hover);
+  }
+  .meeting-footer-trigger:hover {
+    color: var(--on-dark-text-high);
+  }
+}
+.meeting-footer-content {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  min-width: 0;
+}
+.meeting-footer-group {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  white-space: nowrap;
+}
+.meeting-footer-group--meeting {
+  flex: 1 1 auto;
+  overflow-x: clip;
+}
+.meeting-footer-group--app {
+  flex: 0 0 auto;
+}
+.meeting-footer-live-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--success);
+}
+.meeting-footer-status-label {
+  margin-right: 4px;
+}
+.meeting-footer-timer {
+  font-variant-numeric: tabular-nums;
+}
+.meeting-footer-sep {
+  flex: none;
+  padding: 0 var(--space-2);
+  color: var(--on-dark-text-muted);
+}
+.meeting-footer-room {
+  flex: 0 1 auto;
+  min-width: 3ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.meeting-footer-count,
+.meeting-footer-count-compact {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.meeting-footer-count-compact svg {
+  width: 12px;
+  height: 12px;
+}
+.meeting-footer-affordance {
+  display: inline-flex;
+  margin-left: var(--space-2);
+}
+.meeting-footer-affordance svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Tier S (container < 400px) is the default; wider tiers opt items back in. */
+.meeting-footer-status-label,
+.meeting-footer-room-label,
+.meeting-footer-sep--count,
+.meeting-footer-count,
+.meeting-footer-count-text,
+.meeting-footer-app-name,
+.meeting-footer-built-label,
+.meeting-footer-built--full {
+  display: none;
+}
+@container meeting-footer (min-width: 400px) {
+  .meeting-footer-sep--count,
+  .meeting-footer-count {
+    display: inline-flex;
+  }
+}
+@container meeting-footer (min-width: 560px) {
+  .meeting-footer-trigger {
+    padding: 0 var(--space-4);
+  }
+  .meeting-footer-status-label,
+  .meeting-footer-room-label,
+  .meeting-footer-built-label,
+  .meeting-footer-count-text {
+    display: inline;
+  }
+  .meeting-footer-count-compact {
+    display: none;
+  }
+}
+@container meeting-footer (min-width: 760px) {
+  .meeting-footer-app-name,
+  .meeting-footer-built--full {
+    display: inline;
+  }
+  .meeting-footer-built--short {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .meeting-footer,
+  .meeting-footer-trigger {
+    transition: none;
+  }
+}
+@media (forced-colors: active) {
+  .meeting-footer {
+    border-top-color: CanvasText;
+  }
+  .meeting-footer-live-dot {
+    forced-color-adjust: none;
+  }
+}
+
+#grid-container .grid-item.full-bleed {
+  bottom: var(--meeting-footer-h, 0px);
+  height: calc(100% - var(--meeting-footer-h, 0px));
+  max-height: calc(100% - var(--meeting-footer-h, 0px));
+}
+#grid-container.status-bar-active .grid-item.full-bleed {
+  top: var(--status-bar-reserve, 0px);
+  height: calc(100% - var(--status-bar-reserve, 0px) - var(--meeting-footer-h, 0px));
+  max-height: calc(100% - var(--status-bar-reserve, 0px) - var(--meeting-footer-h, 0px));
+}
+
+.meeting-info-backdrop {
+  z-index: 9590;
+}
+.meeting-info-card {
+  width: min(480px, 94vw);
+  max-height: min(85vh, 640px);
+  overflow-y: auto;
+  padding: 1.5rem;
+  background: var(--surface-overlay);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.meeting-info-card:focus,
+.meeting-ended-card:focus {
+  outline: none;
+}
+.meeting-info-row {
+  display: grid;
+  grid-template-columns: minmax(104px, 0.4fr) minmax(0, 1fr);
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--glass-bg);
+  align-items: baseline;
+  font-size: var(--fs-5);
+  color: var(--text-primary);
+}
+.meeting-info-row .about-modal-value {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.meeting-info-value--id {
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+}
+.meeting-info-value--timer {
+  font-variant-numeric: tabular-nums;
+}
+.meeting-info-link-cell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.meeting-info-link {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  user-select: all;
+  color: var(--text-secondary);
+  font-size: var(--fs-4);
+}
+.meeting-info-copy {
+  flex: none;
+}
+@media (max-width: 567.98px) {
+  .meeting-info-card {
+    padding: var(--space-5);
+  }
+  .meeting-info-card .btn-sm {
+    height: 44px;
+  }
+}
+@media (max-width: 400px) {
+  .meeting-info-row {
+    grid-template-columns: 1fr;
+    gap: 2px;
   }
 }
 

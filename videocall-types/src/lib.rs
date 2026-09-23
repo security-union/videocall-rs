@@ -280,6 +280,50 @@ mod video_stats_wire_tests {
         );
     }
 
+    /// Issue #2657: guards codegen/toolchain drift that would zero-elide an explicitly-set
+    /// field 20 or 21 while the generated type still looks optional. (Removing `optional` from
+    /// the schema changes that type and breaks compilation at every `Some(v)` site instead.)
+    #[test]
+    fn decoder_output_fields_round_trip_and_preserve_presence() {
+        let mut vs = VideoStats::new();
+        vs.fps_decoder_output = Some(0.0);
+        vs.frames_emitted_total = Some(0);
+        let decoded =
+            VideoStats::parse_from_bytes(&vs.write_to_bytes().expect("VideoStats must serialize"))
+                .expect("serialized VideoStats must parse back");
+        assert_eq!(
+            decoded.fps_decoder_output,
+            Some(0.0),
+            "an explicit 0.0 rate must survive as Some(0.0); None => it was zero-elided and \
+             'decoder emitted nothing' is now indistinguishable from 'not reported'"
+        );
+        assert_eq!(
+            decoded.frames_emitted_total,
+            Some(0),
+            "an explicit 0 count must survive as Some(0)"
+        );
+
+        let mut nonzero = VideoStats::new();
+        nonzero.fps_decoder_output = Some(23.5);
+        nonzero.frames_emitted_total = Some(1234);
+        let decoded_nonzero = VideoStats::parse_from_bytes(
+            &nonzero.write_to_bytes().expect("VideoStats must serialize"),
+        )
+        .expect("serialized VideoStats must parse back");
+        assert_eq!(decoded_nonzero.fps_decoder_output, Some(23.5));
+        assert_eq!(decoded_nonzero.frames_emitted_total, Some(1234));
+
+        // An OLD client that never sets either field must decode as None, not Some(0).
+        let decoded_old =
+            VideoStats::parse_from_bytes(&[]).expect("an empty VideoStats must parse (additive)");
+        assert_eq!(
+            decoded_old.fps_decoder_output, None,
+            "a pre-#2657 peer must decode as None so the server OMITS the series rather than \
+             publishing a 0 that reads as a decoder emitting nothing"
+        );
+        assert_eq!(decoded_old.frames_emitted_total, None);
+    }
+
     /// Issue 2511: fields 11-14 round-trip with explicit presence, and field 14 is a
     /// VARINT — changing that once clients ship it would require a new field number.
     #[test]

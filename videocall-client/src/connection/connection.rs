@@ -38,6 +38,13 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 
+/// `gloo`'s interval takes `u32`; the source of truth is `u64`, so the narrowing is
+/// pinned at compile time rather than silently wrapping.
+const PEER_MONITOR_TICK_INTERVAL_MS: u32 = {
+    assert!(crate::decode::layer_chooser::PEER_MONITOR_TICK_MS <= u32::MAX as u64);
+    crate::decode::layer_chooser::PEER_MONITOR_TICK_MS as u32
+};
+
 /// Delay before re-sending a media-state heartbeat exactly once after a
 /// mute / camera-off transition.
 ///
@@ -191,7 +198,7 @@ impl Connection {
         let connection = Self {
             task,
             heartbeat: None,
-            heartbeat_monitor: Some(Interval::new(5000, move || {
+            heartbeat_monitor: Some(Interval::new(PEER_MONITOR_TICK_INTERVAL_MS, move || {
                 monitor.emit(());
             })),
             status,

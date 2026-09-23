@@ -64,6 +64,13 @@ test-scripts:
 		python3 scripts/test_e2e_up_stamp_clear.py
 		python3 scripts/test_check_native_test_coverage.py
 		python3 scripts/test_mutation_check.py
+		python3 scripts/test_meeting_quality_xref.py
+		python3 scripts/test_meeting_quality_xref_load.py
+		@if [ -f scripts/test_sync_strip_blocked_paths.py ]; then \
+			python3 scripts/test_sync_strip_blocked_paths.py; \
+		else \
+			echo "SKIP: scripts/test_sync_strip_blocked_paths.py absent (stripped for public sync)"; \
+		fi
 
 build-videocall-postgres:
 		./scripts/build-videocall-postgres-dependencies.sh

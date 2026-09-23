@@ -2173,9 +2173,12 @@ impl ConnectionManager {
                 if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
                         if media_packet.media_type == MediaType::RTT.into() {
-                            debug!(
+                            // PER-ECHO hot path; demoted debug!->trace! (#2760).
+                            trace!(
                                 "RTT response received on connection {} at {}, sent at {}",
-                                connection_id, reception_time, media_packet.timestamp
+                                connection_id,
+                                reception_time,
+                                media_packet.timestamp
                             );
                             if let Ok(mut responses) = rtt_responses.try_borrow_mut() {
                                 responses.push((
@@ -2417,8 +2420,7 @@ impl ConnectionManager {
         self.packets_sent.set(self.packets_sent.get() + 1);
         // PER-PROBE hot path: fires on every RTT probe (~1 Hz per connection,
         // O(connections) during election). Demoted debug!->trace! (#1100/#1129
-        // follow-up); not on the meeting-analyzer keep-list (the analyzer reads
-        // the "RTT response received ..." line, not this send-side probe log).
+        // follow-up); not on the meeting-analyzer keep-list.
         trace!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }

@@ -276,6 +276,72 @@ function helpTip(page: import("@playwright/test").Page, key: string) {
   return page.locator(`[data-testid="speaker-highlight-${key}-help-text"]`);
 }
 
+function previewTile(page: import("@playwright/test").Page) {
+  return page.locator(".speaker-highlight-preview .preview-tile");
+}
+
+/**
+ * The preview's inline style is `speak_style` output, which alternates between
+ * a lit and a silent string, so a fragment of either is only present during its
+ * own phase.
+ */
+async function expectPreviewStyle(
+  page: import("@playwright/test").Page,
+  fragment: string,
+  message: string,
+): Promise<void> {
+  const tile = previewTile(page);
+  await expect
+    .poll(
+      async () => {
+        const style = (await tile.getAttribute("style")) || "";
+        return style.includes(fragment) ? fragment : `style: ${style}`;
+      },
+      { timeout: 15_000, intervals: [100], message },
+    )
+    .toBe(fragment);
+}
+
+function selectSwatch(page: import("@playwright/test").Page, label: string) {
+  return page.getByRole("button", { name: `Select ${label}`, exact: true });
+}
+
+function swatchItem(page: import("@playwright/test").Page, label: string) {
+  return page.locator(".color-swatch-item", { has: selectSwatch(page, label) });
+}
+
+/** A concealed delete badge takes no pointer events, so reveal it first. */
+async function deleteSwatch(page: import("@playwright/test").Page, label: string): Promise<void> {
+  await swatchItem(page, label).hover({ timeout: 5_000 });
+  await page
+    .getByRole("button", { name: `Delete ${label}`, exact: true })
+    .click({ timeout: 5_000 });
+}
+
+async function addCustomColor(page: import("@playwright/test").Page, hex: string): Promise<void> {
+  await page.locator('[aria-label="Add custom color"]').click({ timeout: 5_000 });
+  const popover = page.locator(".custom-color-popover");
+  await expect(popover).toBeVisible({ timeout: 5_000 });
+  await popover.locator(".custom-color-input").fill(hex, { timeout: 5_000 });
+  await popover.locator(".custom-color-add-btn").click({ timeout: 5_000 });
+  await expect(popover).toHaveCount(0, { timeout: 5_000 });
+}
+
+async function storedPalette(page: import("@playwright/test").Page): Promise<string | null> {
+  return page.evaluate(() => localStorage.getItem("vc_appearance_glow_palette"));
+}
+
+/** The panel ignores a second delete within 400ms, a touch double-tap guard. */
+const REPEAT_DELETE_GAP_MS = 500;
+
+const PRESET_SELECT_LABELS = [
+  "Select White highlight",
+  "Select Cyan highlight",
+  "Select Magenta highlight",
+  "Select Plum highlight",
+  "Select Mint Green highlight",
+];
+
 test.describe("Device settings modal", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -715,24 +781,11 @@ test.describe("Device settings modal", () => {
     await decaySlider.fill("0");
     await page.waitForTimeout(300);
 
-    // At 0% decay the preview variables must reflect an instant-off tail
-    // (no hold, no fade-out).
-    await expect
-      .poll(
-        async () => {
-          const style = await previewStyle();
-          const instantOff =
-            style.includes("--preview-glow-hold-delay: 0.00s;") &&
-            style.includes("--preview-glow-fade-out: 0.00s;");
-          return instantOff ? "instant-off" : `style: ${style}`;
-        },
-        {
-          timeout: 15_000,
-          intervals: [200],
-          message: "expected preview tile to show instant-off transition at 0% decay",
-        },
-      )
-      .toBe("instant-off");
+    await expectPreviewStyle(
+      page,
+      "box-shadow 0.00s ease-out 0.00s",
+      "expected preview tile to show instant-off transition at 0% decay",
+    );
 
     // The preview loop should include a silent phase when motion is enabled.
     await expect
@@ -753,22 +806,11 @@ test.describe("Device settings modal", () => {
     await decaySlider.fill("100");
     await page.waitForTimeout(300);
 
-    // At 100% decay the preview variables must advertise the long hold used by
-    // the production glow.
-    await expect
-      .poll(
-        async () => {
-          const style = await previewStyle();
-          const longLinger = style.includes("--preview-glow-hold-delay: 5.00s;");
-          return longLinger ? "long-linger" : `style: ${style}`;
-        },
-        {
-          timeout: 15_000,
-          intervals: [200],
-          message: "expected preview tile to show long-linger transition at 100% decay",
-        },
-      )
-      .toBe("long-linger");
+    await expectPreviewStyle(
+      page,
+      "box-shadow 1.50s ease-out 5.00s",
+      "expected preview tile to show long-linger transition at 100% decay",
+    );
 
     // With high decay configured, we should still observe the silent phase.
     await expect
@@ -793,7 +835,8 @@ test.describe("Device settings modal", () => {
           const className = await previewClass();
           const style = await previewStyle();
           return className.includes("preview-tile--speaking") &&
-            style.includes("--preview-glow-border-alpha:")
+            style.includes("border-color: rgba(91, 207, 159,") &&
+            style.includes("box-shadow 0.15s ease-in")
             ? "speaking"
             : "silent";
         },
@@ -895,37 +938,26 @@ test.describe("Device settings modal", () => {
     await expect(velocitySlider).toHaveAttribute("aria-label", "Velocity");
     await expect(previewTile).toBeVisible({ timeout: 5_000 });
 
-    const previewStyle = async () => (await previewTile.getAttribute("style")) || "";
     const expectFadeIn = async (expected: string) =>
-      expect
-        .poll(
-          async () => {
-            const style = await previewStyle();
-            return style.includes(expected) ? expected : `style: ${style}`;
-          },
-          {
-            timeout: 15_000,
-            intervals: [200],
-            message: `expected preview tile to publish ${expected}`,
-          },
-        )
-        .toBe(expected);
+      expectPreviewStyle(page, expected, `expected preview tile to publish ${expected}`);
 
     // This default anchor also passes pre-Velocity (0.15s was the constant);
     // the two below cannot.
-    await expectFadeIn("--preview-glow-fade-in: 0.15s;");
+    await expectFadeIn("box-shadow 0.15s ease-in");
 
     await velocitySlider.fill("0");
     await expect(velocityValue).toHaveText("0%");
-    await expectFadeIn("--preview-glow-fade-in: 0.45s;");
+    await expectFadeIn("box-shadow 0.45s ease-in");
 
     await velocitySlider.fill("100");
     await expect(velocityValue).toHaveText("100%");
-    await expectFadeIn("--preview-glow-fade-in: 0.03s;");
+    await expectFadeIn("box-shadow 0.03s ease-in");
 
-    const styleAtTopVelocity = await previewStyle();
-    expect(styleAtTopVelocity).toContain("--preview-glow-fade-out: 1.50s;");
-    expect(styleAtTopVelocity).toContain("--preview-glow-hold-delay: 1.00s;");
+    await expectPreviewStyle(
+      page,
+      "box-shadow 1.50s ease-out 1.00s",
+      "expected the default decay tail to survive a velocity change",
+    );
 
     const sliderOrder = await page.evaluate(() =>
       Array.from(
@@ -974,22 +1006,16 @@ test.describe("Device settings modal", () => {
 
     // Pre-Velocity code returned `(0.0, 0.0, 0.0)` at zero decay: keeping that
     // early-out publishes a 0.00s attack here and times this poll out.
-    await expect
-      .poll(
-        async () => {
-          const style = (await previewTile.getAttribute("style")) || "";
-          const slowAttackInstantOff =
-            style.includes("--preview-glow-fade-in: 0.45s;") &&
-            style.includes("--preview-glow-fade-out: 0.00s;");
-          return slowAttackInstantOff ? "slow-attack-instant-off" : `style: ${style}`;
-        },
-        {
-          timeout: 15_000,
-          intervals: [200],
-          message: "expected a slow attack and an instant-off tail at velocity 0 / decay 0",
-        },
-      )
-      .toBe("slow-attack-instant-off");
+    await expectPreviewStyle(
+      page,
+      "box-shadow 0.45s ease-in",
+      "expected a slow attack at velocity 0 / decay 0",
+    );
+    await expectPreviewStyle(
+      page,
+      "box-shadow 0.00s ease-out 0.00s",
+      "expected an instant-off tail at velocity 0 / decay 0",
+    );
   });
 
   test("every speaker highlight slider has an accessible help trigger", async ({ page }) => {
@@ -1945,14 +1971,14 @@ test.describe("Device settings modal", () => {
     await addColorBtn.click();
     await expect(popover).toHaveCount(0);
 
-    const customSwatch = page.locator('[aria-label*="Select custom highlight #FF5733"]').first();
+    const customSwatch = selectSwatch(page, "custom highlight #FF5733");
     await expect(customSwatch).toBeVisible();
 
-    const deleteBtn = customSwatch.locator(".color-swatch-delete-btn");
-    await expect(deleteBtn).toHaveAttribute(
-      "aria-label",
-      /Delete custom highlight #[0-9A-Fa-f]{6}/,
+    const deleteBtn = swatchItem(page, "custom highlight #FF5733").locator(
+      ".color-swatch-delete-btn",
     );
+    await expect(deleteBtn).toHaveAccessibleName("Delete custom highlight #FF5733");
+    await expect(customSwatch.locator(".color-swatch-delete-btn")).toHaveCount(0);
   });
 
   test("typing a valid hex in the text input updates the hue slider value", async ({ page }) => {
@@ -2357,14 +2383,14 @@ test.describe("Device settings modal", () => {
     expect(customSwatchPressedAfterClick).toBe("true");
     await expect(cyanSwatch).toHaveAttribute("aria-pressed", "false");
 
-    // Preview tile uses fixed-intensity glow — selecting custom #12ABEF
-    // (rgb 18, 171, 239) now appears in the preview CSS custom properties.
-    const previewTile = page.locator(".speaker-highlight-preview .preview-tile");
-    await expect(previewTile).toBeVisible();
-    await expect(previewTile).toHaveAttribute("style", /--preview-glow-r: 18;/);
-    await expect(previewTile).toHaveAttribute("style", /--preview-glow-g: 171;/);
-    await expect(previewTile).toHaveAttribute("style", /--preview-glow-b: 239;/);
-    await expect(previewTile).toHaveClass(/preview-tile-pulsing/);
+    const tile = previewTile(page);
+    await expect(tile).toBeVisible();
+    await expectPreviewStyle(
+      page,
+      "border-color: rgba(18, 171, 239,",
+      "expected the lit preview to glow in custom #12ABEF",
+    );
+    await expect(tile).toHaveClass(/preview-tile-pulsing/);
   });
 
   test("custom color can be deleted via delete button", async ({ page }) => {
@@ -2416,21 +2442,17 @@ test.describe("Device settings modal", () => {
     await expect(customSwatch).toBeVisible();
     await expect(customSwatch).toHaveAttribute("aria-pressed", "true");
 
-    // Hover over the custom swatch to reveal delete button and click it
-    await customSwatch.hover();
-    const deleteBtn = customSwatch.locator(".color-swatch-delete-btn");
+    await swatchItem(page, "custom highlight #FF5733").hover();
+    const deleteBtn = page.getByRole("button", {
+      name: "Delete custom highlight #FF5733",
+      exact: true,
+    });
     await expect(deleteBtn).toBeVisible();
 
     // Delete button renders an inline SVG × icon (not a text glyph)
     await expect(deleteBtn.locator("svg")).toBeVisible();
 
-    // a11y: delete button must have a descriptive accessible name including hex
-    await expect(deleteBtn).toHaveAttribute(
-      "aria-label",
-      /Delete custom highlight #[0-9A-Fa-f]{6}/,
-    );
-
-    await deleteBtn.click();
+    await deleteBtn.click({ timeout: 5_000 });
 
     // Verify swatch was deleted
     await expect(
@@ -2439,7 +2461,7 @@ test.describe("Device settings modal", () => {
     const swatchCountAfter = await page.locator(".color-swatches .color-swatch").count();
     expect(swatchCountAfter).toBe(swatchCountBefore);
 
-    // Verify user is switched back to default color (Mint Green) after deletion
+    // The deleted swatch was last, so selection moves to the one before it.
     const mintSwatch = page.locator('[aria-label="Select Mint Green highlight"]');
     await expect(mintSwatch).toHaveAttribute("aria-pressed", "true");
   });
@@ -2463,11 +2485,7 @@ test.describe("Device settings modal", () => {
       await expect(popover).toHaveCount(0);
     }
 
-    const middleSwatch = page.locator('[aria-label*="Select custom highlight #00FF00"]').first();
-    const middleDeleteBtn = middleSwatch.locator(".color-swatch-delete-btn");
-    await middleSwatch.hover();
-    await expect(middleDeleteBtn).toBeVisible();
-    await middleDeleteBtn.click();
+    await deleteSwatch(page, "custom highlight #00FF00");
 
     await expect
       .poll(
@@ -2476,9 +2494,8 @@ test.describe("Device settings modal", () => {
       )
       .toContain("Select custom highlight #0000FF");
 
-    const lastSwatch = page.locator('[aria-label*="Select custom highlight #0000FF"]').first();
-    const lastDeleteBtn = lastSwatch.locator(".color-swatch-delete-btn");
-    await lastDeleteBtn.click();
+    await page.waitForTimeout(REPEAT_DELETE_GAP_MS);
+    await deleteSwatch(page, "custom highlight #0000FF");
 
     await expect
       .poll(
@@ -2803,5 +2820,262 @@ test.describe("Device settings modal", () => {
 
     // Verify UI reflects the cap: add button is hidden once limit is reached.
     await expect(page.locator('[aria-label="Add custom color"]')).toHaveCount(0);
+  });
+
+  test("the speaker highlight preview glows in the chosen color @bvt1", async ({ page }) => {
+    test.setTimeout(90_000);
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    await openAppearanceTab(page, `e2e_preview_color_${Date.now()}`, "preview-color-user");
+
+    const tile = previewTile(page);
+    await expect(tile).toBeVisible({ timeout: 5_000 });
+    const cyan = selectSwatch(page, "Cyan highlight");
+    await cyan.click({ timeout: 5_000 });
+    await expect(cyan).toHaveAttribute("aria-pressed", "true");
+
+    const cyanRgb = /rgba?\(12, 175, 255[,)]/;
+    await expect(tile).toHaveCSS("box-shadow", cyanRgb, { timeout: 10_000 });
+    await expect(tile).toHaveCSS("border-top-color", cyanRgb, { timeout: 10_000 });
+  });
+
+  test("with no sound the preview simulates speech, alternating lit and silent", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    await openAppearanceTab(page, `e2e_preview_simulated_${Date.now()}`, "preview-sim-user");
+
+    await expect(page.locator('[data-testid="mic-toggle-button"]')).not.toHaveClass(/\bactive\b/);
+    await expect(previewTile(page)).toHaveAttribute("data-preview-source", "simulated", {
+      timeout: 5_000,
+    });
+
+    const samples = await page.evaluate(async (windowMs) => {
+      const out: { source: string | null; cls: string; style: string }[] = [];
+      const end = performance.now() + windowMs;
+      while (performance.now() < end) {
+        const tile = document.querySelector(".speaker-highlight-preview .preview-tile");
+        if (!tile) {
+          throw new Error("the preview tile unmounted mid-window");
+        }
+        out.push({
+          source: tile.getAttribute("data-preview-source"),
+          cls: tile.getAttribute("class") || "",
+          style: tile.getAttribute("style") || "",
+        });
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return out;
+    }, 8_000);
+
+    expect(samples.length).toBeGreaterThan(80);
+    expect(samples.filter((s) => s.source !== "simulated")).toEqual([]);
+    const lit = samples.filter((s) => s.cls.includes("preview-tile--speaking"));
+    const silent = samples.filter((s) => s.cls.includes("preview-tile--silent"));
+    expect(lit.length, "no lit phase in an 8s window").toBeGreaterThan(0);
+    expect(silent.length, "no silent phase in an 8s window").toBeGreaterThan(0);
+    expect(lit.filter((s) => !s.style.includes("box-shadow 0.15s ease-in"))).toEqual([]);
+    expect(silent.filter((s) => !s.style.includes("box-shadow 1.50s ease-out 1.00s"))).toEqual([]);
+  });
+
+  test("a swatch's delete badge sits off the circle, so the center still selects it @bvt1", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    await openAppearanceTab(page, `e2e_swatch_badge_${Date.now()}`, "swatch-badge-user");
+
+    await addCustomColor(page, "#FF5733");
+    const swatchSelector = '#color-swatches-container [style*="--glow-color: #FF5733"]';
+    const custom = page.locator(swatchSelector);
+    await expect(custom).toHaveCount(1);
+    await selectSwatch(page, "Cyan highlight").click({ timeout: 5_000 });
+    await expect(custom).toHaveAttribute("aria-pressed", "false");
+
+    const badge = page.getByRole("button", {
+      name: "Delete custom highlight #FF5733",
+      exact: true,
+    });
+    await custom.hover({ timeout: 5_000 });
+    await expect(badge).toHaveCSS("opacity", "1", { timeout: 5_000 });
+
+    const box = await custom.boundingBox({ timeout: 5_000 });
+    expect(box, "the custom swatch has no layout box").not.toBeNull();
+    const center = { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 };
+    const hit = await page.evaluate(
+      ({ x, y, selector }) => {
+        const el = document.elementFromPoint(x, y);
+        if (!el) {
+          throw new Error(`nothing is painted at the swatch center (${x}, ${y})`);
+        }
+        return {
+          onDeleteBadge: el.closest(".color-swatch-delete-btn") !== null,
+          onSwatch: el.closest(selector) !== null,
+        };
+      },
+      { ...center, selector: swatchSelector },
+    );
+    expect(hit).toEqual({ onDeleteBadge: false, onSwatch: true });
+
+    await page.mouse.click(center.x, center.y);
+    await expect(custom).toHaveAttribute("aria-pressed", "true", { timeout: 5_000 });
+    await expect(custom).toHaveCount(1);
+
+    await page.mouse.move(0, 0);
+    await expect(badge).toHaveCSS("opacity", "0", { timeout: 5_000 });
+    await expect(badge).toHaveCSS("pointer-events", "none");
+  });
+
+  test("a preset can be deleted, and deleting the selected one selects the swatch that slides in", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    await openAppearanceTab(page, `e2e_delete_preset_${Date.now()}`, "delete-preset-user");
+
+    const cyan = selectSwatch(page, "Cyan highlight");
+    const magenta = selectSwatch(page, "Magenta highlight");
+    await cyan.click({ timeout: 5_000 });
+    await expect(cyan).toHaveAttribute("aria-pressed", "true");
+
+    await deleteSwatch(page, "Cyan highlight");
+
+    await expect(cyan).toHaveCount(0);
+    await expect(magenta).toHaveAttribute("aria-pressed", "true");
+    await expect
+      .poll(
+        async () => page.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? ""),
+        { timeout: 3_000 },
+      )
+      .toBe("Select Magenta highlight");
+    await expect(page.locator('[data-testid="speaker-highlight-palette-status"]')).toContainText(
+      "Cyan highlight deleted. Magenta selected.",
+    );
+    await expect
+      .poll(() => storedPalette(page), { timeout: 5_000 })
+      .toBe("white,magenta,plum,mint-green");
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("vc_appearance_glow_color")), {
+        timeout: 5_000,
+      })
+      .toBe("magenta");
+  });
+
+  test("deleting every swatch leaves only the add button, and the empty palette survives a reload", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await openAppearanceTab(page, `e2e_empty_palette_${Date.now()}`, "empty-palette-user");
+
+    const items = page.locator("#color-swatches-container .color-swatch-item");
+    await expect(items).toHaveCount(PRESET_SELECT_LABELS.length, { timeout: 5_000 });
+    for (let remaining = PRESET_SELECT_LABELS.length; remaining > 0; remaining -= 1) {
+      const first = items.first();
+      await first.hover({ timeout: 5_000 });
+      await first.locator(".color-swatch-delete-btn").click({ timeout: 5_000 });
+      await expect(items).toHaveCount(remaining - 1, { timeout: 5_000 });
+      await page.waitForTimeout(REPEAT_DELETE_GAP_MS);
+    }
+
+    const addButton = page.locator("#add-custom-color-btn");
+    await expect(page.locator("#color-swatches-container .color-swatch")).toHaveCount(1);
+    await expect(addButton).toBeVisible();
+    await expect
+      .poll(async () => page.evaluate(() => document.activeElement?.id ?? ""), { timeout: 3_000 })
+      .toBe("add-custom-color-btn");
+    await expect(page.locator('[data-testid="speaker-highlight-palette-status"]')).toContainText(
+      "All highlight colors deleted.",
+    );
+    await expect.poll(() => storedPalette(page), { timeout: 5_000 }).toBe("");
+    await expectPreviewStyle(
+      page,
+      "border-color: rgba(91, 207, 159,",
+      "expected the glow to keep its color once the palette is empty",
+    );
+
+    await page.reload();
+    await expect(
+      page
+        .locator("#grid-container")
+        .or(page.getByRole("button", { name: /Start Meeting|Join Meeting/ })),
+    ).toBeVisible({ timeout: 20_000 });
+    await openDeviceSettingsModal(page);
+    await page.getByRole("tab", { name: "Appearance" }).click({ timeout: 5_000 });
+
+    await expect(addButton).toBeVisible({ timeout: 10_000 });
+    await expect(items).toHaveCount(0);
+  });
+
+  test("Reset highlight restores exactly the five presets and drops custom colors @bvt1", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    await openAppearanceTab(page, `e2e_reset_palette_${Date.now()}`, "reset-palette-user");
+
+    await addCustomColor(page, "#FF5733");
+    await deleteSwatch(page, "Cyan highlight");
+    await expect(selectSwatch(page, "Cyan highlight")).toHaveCount(0);
+    await expect(selectSwatch(page, "custom highlight #FF5733")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    await page.locator('[data-testid="speaker-highlight-reset-btn"]').click({ timeout: 5_000 });
+
+    const selects = page.locator("#color-swatches-container .color-swatch:not(.add-color-btn)");
+    await expect(selects).toHaveCount(PRESET_SELECT_LABELS.length, { timeout: 5_000 });
+    expect(
+      await selects.evaluateAll((els) => els.map((el) => el.getAttribute("aria-label"))),
+    ).toEqual(PRESET_SELECT_LABELS);
+    await expect(selectSwatch(page, "Mint Green highlight")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await expect(page.locator("#add-custom-color-btn")).toBeVisible();
+    await expect(page.locator('[data-testid="speaker-highlight-palette-status"]')).toContainText(
+      "Speaker highlight reset to defaults.",
+    );
+    await expect
+      .poll(() => storedPalette(page), { timeout: 5_000 })
+      .toBe("white,cyan,magenta,plum,mint-green");
+  });
+
+  test("only the selected swatch wears the selection ring", async ({ page }) => {
+    test.setTimeout(90_000);
+    await openAppearanceTab(page, `e2e_swatch_ring_${Date.now()}`, "swatch-ring-user");
+
+    const ring = (label: string) =>
+      selectSwatch(page, label).evaluate(
+        (el) => {
+          const after = getComputedStyle(el, "::after");
+          return {
+            content: after.content,
+            border: `${after.borderTopWidth} ${after.borderTopStyle}`,
+            opacity: after.opacity,
+          };
+        },
+        undefined,
+        { timeout: 2_000 },
+      );
+    const worn = { content: '""', border: "2px solid", opacity: "1" };
+
+    await expect(selectSwatch(page, "Mint Green highlight")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await expect.poll(() => ring("Mint Green highlight"), { timeout: 5_000 }).toEqual(worn);
+    await expect
+      .poll(() => ring("Cyan highlight"), { timeout: 5_000 })
+      .toMatchObject({ opacity: "0" });
+
+    await selectSwatch(page, "Cyan highlight").click({ timeout: 5_000 });
+    await expect.poll(() => ring("Cyan highlight"), { timeout: 5_000 }).toEqual(worn);
+    await expect
+      .poll(() => ring("Mint Green highlight"), { timeout: 5_000 })
+      .toMatchObject({ opacity: "0" });
+
+    await page.locator("label.glow-switch").click({ timeout: 5_000 });
+    await expect(page.getByLabel("Toggle speaker highlight")).not.toBeChecked();
+    await expect
+      .poll(() => ring("Cyan highlight"), { timeout: 5_000 })
+      .toMatchObject({ opacity: "0.6" });
   });
 });

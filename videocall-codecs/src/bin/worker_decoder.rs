@@ -39,8 +39,8 @@ use std::cell::{Cell, RefCell};
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
 use videocall_codecs::jitter_buffer::{
-    decide_keyframe_less_escalation, paint_lag_ms, EscalationSignal, FreshnessSkip, JitterBuffer,
-    KeyframeArrival,
+    decide_keyframe_less_escalation, fps_from_deltas, paint_lag_ms, EscalationSignal,
+    FreshnessSkip, JitterBuffer, KeyframeArrival,
 };
 use videocall_codecs::messages::{
     FreshnessSkipMessage, KeyframeArrivalMessage, RequestKeyframeMessage, VideoStatsMessage,
@@ -690,8 +690,9 @@ fn check_jitter_buffer_for_ready_frames() {
                                     // (stage 2) cannot observe. Compute on the same 1 Hz emit path
                                     // so the metric reflects the same sampling cadence as the rest
                                     // of the video diagnostic packet.
+                                    let frames_emitted_total = FRAMES_EMITTED.with(|c| c.get());
                                     let playout_paint_lag_ms = paint_lag_ms(
-                                        FRAMES_EMITTED.with(|c| c.get()),
+                                        frames_emitted_total,
                                         FRAMES_PAINTED.with(|c| c.get()),
                                         jb.source_frame_interval_ms(),
                                     );
@@ -725,21 +726,23 @@ fn check_jitter_buffer_for_ready_frames() {
                                     // because the decode loop keeps being called — see
                                     // peer_decode_manager.rs. `wrapping_sub` guards a counter reset;
                                     // `dt`/`prev_ms` guards divide-by-zero and the very first emit.
-                                    let fps_painted = {
-                                        let frames_now = FRAMES_EMITTED.with(|c| c.get());
+                                    // #2657: `None` on the first emit after a worker respawn, which
+                                    // `fps_painted` still renders as 0.0 for the worker-local log.
+                                    let fps_opt = {
                                         let prev_frames = LAST_FPS_PAINTED_FRAMES.with(|c| c.get());
                                         let prev_ms = LAST_FPS_PAINTED_MS.with(|c| c.get());
-                                        let dt = now - prev_ms;
-                                        let fps = if prev_ms > 0.0 && dt > 0.0 {
-                                            (frames_now.wrapping_sub(prev_frames) as f64) * 1000.0
-                                                / dt
-                                        } else {
-                                            0.0
-                                        };
-                                        LAST_FPS_PAINTED_FRAMES.with(|c| c.set(frames_now));
+                                        let fps = fps_from_deltas(
+                                            frames_emitted_total,
+                                            prev_frames,
+                                            now,
+                                            prev_ms,
+                                        );
+                                        LAST_FPS_PAINTED_FRAMES
+                                            .with(|c| c.set(frames_emitted_total));
                                         LAST_FPS_PAINTED_MS.with(|c| c.set(now));
                                         fps
                                     };
+                                    let fps_painted = fps_opt.unwrap_or(0.0);
 
                                     let evt = DiagEvent {
                                         subsystem: "video",
@@ -799,6 +802,8 @@ fn check_jitter_buffer_for_ready_frames() {
                                             jb.keyframe_arrival_count(),
                                             freshness_evictions_total,
                                             freshness_evictions_keyframeless_total,
+                                            fps_opt,
+                                            frames_emitted_total,
                                         );
                                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                             let _ = scope.post_message(&val);

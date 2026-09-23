@@ -2118,7 +2118,6 @@ fn DiagnosticsPerformancePanel(controls: PerfControlsHandle, audio_source_active
             // SEND layer-count ceilings (real ladder depth from host).
             video_layer_max: controls.video_layer_max,
             screen_layer_max: controls.screen_layer_max,
-            audio_layer_max: controls.audio_layer_max,
             // Mic capture state for the audio SEND caption.
             audio_source_active,
         }

@@ -17,7 +17,9 @@
  */
 
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
-use super::layer_chooser::{DownlinkSample, LayerAvailability, LayerChooser, PrefMediaKind};
+use super::layer_chooser::{
+    DownlinkSample, LayerAvailability, LayerChooser, LidDwell, LidTick, PrefMediaKind,
+};
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder, MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
 use super::pli_budget::{PliBudget, PliBudgetDecision};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
@@ -37,6 +39,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::{fmt::Display, sync::Arc};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -47,6 +50,7 @@ use videocall_types::protos::peer_event::PeerEvent;
 use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
+use web_time::Instant;
 
 /// Cumulative count of keyframe requests (PLI) sent by this client.
 static KEYFRAME_REQUESTS_SENT: AtomicU64 = AtomicU64::new(0);
@@ -1395,6 +1399,11 @@ thread_local! {
     static LAST_GATE_SKIPS_LOG: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+/// Issue #2760: minimum gap between two `LAYER_GATE_SKIPS` lines for one peer.
+/// The counters are cumulative and the analyzer takes the max per pair, so the
+/// only cost is freshness: the last line before a peer goes quiet can trail.
+const LAYER_GATE_SKIPS_LOG_MIN_INTERVAL: Duration = Duration::from_millis(30_000);
+
 pub struct Peer {
     pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
@@ -1510,6 +1519,9 @@ pub struct Peer {
     /// fallback; see `set_selected_audio_layer`.)
     audio_layer_chooser: LayerChooser,
     audio_layer_availability: LayerAvailability,
+    /// Issue 2630: per-kind dwell on the ADVERTISED layer preference.
+    video_lid_dwell: LidDwell,
+    screen_lid_dwell: LidDwell,
     /// Reorder-tolerant sequence tracker for video packets.
     video_seq_tracker: SequenceTracker,
     /// Reorder-tolerant sequence tracker for screen packets.
@@ -1552,6 +1564,10 @@ pub struct Peer {
     /// Issue #1460 observability: SCREEN-kind sibling of `last_video_switch`.
     last_screen_switch: LastLayerSwitch,
     layer_gate_skips: LayerGateSkips,
+    /// Issue #2760: when this peer last emitted a `LAYER_GATE_SKIPS` line.
+    /// MONOTONIC, never `now_ms()`: a wall clock stepping back would pin the
+    /// elapsed time at 0 and suppress this peer until real time caught up.
+    last_gate_skips_log: Cell<Option<Instant>>,
     /// Issue #1878: whether THIS receiver's active transport is WebTransport,
     /// refreshed by [`PeerDecodeManager::decode`] on every packet from the
     /// authoritative [`ConnectionController::active_is_webtransport`] signal.
@@ -1943,6 +1959,8 @@ impl Peer {
             selected_audio_layer: 0,
             audio_layer_chooser: LayerChooser::new(now_ms()),
             audio_layer_availability: LayerAvailability::new(),
+            video_lid_dwell: LidDwell::default(),
+            screen_lid_dwell: LidDwell::default(),
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             // HCL bug #1: 0 means "no media frame observed yet". The
@@ -1958,6 +1976,7 @@ impl Peer {
             last_video_switch: LastLayerSwitch::default(),
             last_screen_switch: LastLayerSwitch::default(),
             layer_gate_skips: LayerGateSkips::default(),
+            last_gate_skips_log: Cell::new(None),
             // Issue #1878: default to false; set per-packet by the manager from
             // the live active transport. A fresh peer accrues no audio datagram
             // loss until we confirm the receiver is on WebTransport.
@@ -2777,12 +2796,8 @@ impl Peer {
     ///      `Some(layer)` only while the chooser is actively constrained, `None`
     ///      otherwise), then
     ///   2. clamps that layer to the user's per-kind receive [`KindLayerBounds`]
-    ///      and advertises it ONLY when the clamped layer is `< highest_available`
-    ///      for that kind — byte-identical to the tick's advertise predicate
-    ///      (`if clamped < highest_available { insert }`). This is what keeps the
-    ///      advertised preference at or below the user's `max`, and what suppresses
-    ///      a spurious `Some(0)` for a source whose only learned layer is the base
-    ///      (`highest_available == 0`), matching the tick (NIT 1).
+    ///      and gates it through [`LidDwell::peek_settle`], which reproduces the
+    ///      tick's advertise-or-omit decision without advancing the hold.
     ///
     /// `highest_available(now_ms)` PRUNES the rolling availability map; that is a
     /// read of "what layers exist right now" (exactly what the next tick would do),
@@ -2808,19 +2823,14 @@ impl Peer {
     /// until the next 5s tick re-asserts it (the ~5s oscillation / permanent
     /// defeat under congestion described in #1256 P1).
     ///
-    /// The fix mirrors the tick EXACTLY: for VIDEO/SCREEN the advertised layer is
+    /// For VIDEO/SCREEN the advertised layer is
     /// `min(baseline, effective_max)` where `baseline` is the chooser's own pick
     /// (its constrained `desired_preference()` clamped to bounds, else decode-best =
     /// `highest_available`) and `effective_max = size_lid.max(user_min).min(user_max)`.
     /// The size lid lowers the ceiling toward the user's receive MIN but never BELOW
     /// it — the user min is an authoritative FLOOR the lid must yield to (#1256
-    /// user-min regression), then an explicit user MAX still caps the result. Gated
-    /// on `< highest_available` — the SAME `< highest_available` advertise predicate
-    /// the tick uses. This composes the lid with congestion: a constrained chooser
-    /// holding L1 under a size lid of L0 (no user min) advertises `min(1, 0) = 0`, so
-    /// congestion can NEVER advertise ABOVE the lid; and with a user min of L1 the lid
-    /// of L0 yields up to L1 (the floor), never below. AUDIO is UNCHANGED (never
-    /// size-capped). This stays READ-ONLY:
+    /// user-min regression), then an explicit user MAX still caps the result.
+    /// This stays READ-ONLY:
     /// `size_cap_layer` is pure, and `desired_preference()` / `highest_available()`
     /// are the SAME reads the prior code already did (the lazy prune inside
     /// `highest_available` advances no chooser hysteresis — see the paragraph
@@ -2841,16 +2851,8 @@ impl Peer {
         // seeds), not just the 5s tick. Without this the lid is cleared on the wire
         // by the next seed publish (the chooser is unconstrained for a healthy
         // lidded peer, so `desired_preference()` is None) — see #1256 P1.
-        let vh = self.video_layer_availability.highest_available(now_ms);
-        // Baseline = the chooser's own pick: its constrained preference (clamped to
-        // the user's bounds) if any, else decode-best (`highest_available`). This
-        // makes the lid compose with congestion: `min(constrained_layer, size_lid)`
-        // so congestion can NEVER advertise above the size lid.
-        let v_base = self
-            .video_layer_chooser
-            .desired_preference()
-            .map(|raw| bounds.for_kind(PrefMediaKind::Video).clamp(raw))
-            .unwrap_or(vh);
+        let v_obs = self.video_layer_availability.highest_available(now_ms);
+        let vh = self.video_lid_dwell.peek_ladder(v_obs);
         let v_lid = match hint {
             TileHint::Uncapped => vh,
             TileHint::Capped { device_px_h } => {
@@ -2871,18 +2873,27 @@ impl Peer {
             .max
             .unwrap_or(u32::MAX);
         let v_effective_max = v_lid.max(v_user_min).min(v_user_max);
+        // Baseline = the chooser's own pick: its constrained preference (clamped to the
+        // user's bounds) if any, else the tick's decode-best. This makes the lid compose
+        // with congestion: `min(constrained_layer, size_lid)`, so congestion can NEVER
+        // advertise above the size lid.
+        let v_base = self
+            .video_layer_chooser
+            .desired_preference()
+            .map(|raw| bounds.for_kind(PrefMediaKind::Video).clamp(raw))
+            .unwrap_or(v_obs);
         let v_layer = v_base.min(v_effective_max);
-        if v_layer < vh {
-            out.insert((session_id, PrefMediaKind::Video), v_layer);
+        if let Some(v) = self.video_lid_dwell.peek_settle(LidTick {
+            value: v_layer,
+            ceiling: v_effective_max,
+            observed: v_obs,
+        }) {
+            out.insert((session_id, PrefMediaKind::Video), v);
         }
 
         // SCREEN — identical fold (screen_* fields, PrefMediaKind::Screen).
-        let sh = self.screen_layer_availability.highest_available(now_ms);
-        let s_base = self
-            .screen_layer_chooser
-            .desired_preference()
-            .map(|raw| bounds.for_kind(PrefMediaKind::Screen).clamp(raw))
-            .unwrap_or(sh);
+        let s_obs = self.screen_layer_availability.highest_available(now_ms);
+        let sh = self.screen_lid_dwell.peek_ladder(s_obs);
         let s_lid = match hint {
             TileHint::Uncapped => sh,
             TileHint::Capped { device_px_h } => {
@@ -2897,13 +2908,21 @@ impl Peer {
             .max
             .unwrap_or(u32::MAX);
         let s_effective_max = s_lid.max(s_user_min).min(s_user_max);
+        let s_base = self
+            .screen_layer_chooser
+            .desired_preference()
+            .map(|raw| bounds.for_kind(PrefMediaKind::Screen).clamp(raw))
+            .unwrap_or(s_obs);
         let s_layer = s_base.min(s_effective_max);
-        if s_layer < sh {
-            out.insert((session_id, PrefMediaKind::Screen), s_layer);
+        if let Some(v) = self.screen_lid_dwell.peek_settle(LidTick {
+            value: s_layer,
+            ceiling: s_effective_max,
+            observed: s_obs,
+        }) {
+            out.insert((session_id, PrefMediaKind::Screen), v);
         }
 
-        // AUDIO — UNCHANGED. Audio is NEVER size-capped, so the hint is ignored
-        // here; advertise the chooser's constrained preference exactly as before.
+        // AUDIO — never size-capped, so the tile hint is ignored here.
         if let Some(raw) = self.audio_layer_chooser.desired_preference() {
             let layer = bounds.for_kind(PrefMediaKind::Audio).clamp(raw);
             if layer < self.audio_layer_availability.highest_available(now_ms) {
@@ -3044,17 +3063,31 @@ impl Peer {
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
     /// can update peer tiles.
     fn broadcast_peer_status(&self) {
-        if let Some(fields) = self.layer_gate_skips_log_fields() {
-            let line = format!("LAYER_GATE_SKIPS session_id={} {fields}", self.session_id);
-            #[cfg(test)]
-            LAST_GATE_SKIPS_LOG.with(|c| *c.borrow_mut() = Some(line.clone()));
-            log::info!("{line}");
+        let now = Instant::now();
+        if self.gate_skips_log_due(now) {
+            if let Some(fields) = self.layer_gate_skips_log_fields() {
+                let line = format!("LAYER_GATE_SKIPS session_id={} {fields}", self.session_id);
+                self.last_gate_skips_log.set(Some(now));
+                #[cfg(test)]
+                LAST_GATE_SKIPS_LOG.with(|c| *c.borrow_mut() = Some(line.clone()));
+                log::debug!("{line}");
+            }
         }
         let _ = global_sender().try_broadcast(self.peer_status_event());
     }
 
+    /// The first line for a peer always passes so the onset stays visible;
+    /// afterwards one per [`LAYER_GATE_SKIPS_LOG_MIN_INTERVAL`]. A stamp NEWER
+    /// than `now` comes from a clock that stepped back, so it re-opens the
+    /// throttle instead of wedging this peer for the rest of the meeting.
+    fn gate_skips_log_due(&self, now: Instant) -> bool {
+        self.last_gate_skips_log.get().is_none_or(|last| {
+            now.checked_duration_since(last)
+                .is_none_or(|elapsed| elapsed >= LAYER_GATE_SKIPS_LOG_MIN_INTERVAL)
+        })
+    }
+
     /// Nonzero `LAYER_GATE_SKIPS` fields, or `None` while every counter is zero.
-    /// Rides `broadcast_peer_status` (per heartbeat); the gate fires per packet.
     fn layer_gate_skips_log_fields(&self) -> Option<String> {
         let s = self.layer_gate_skips;
         let fields: Vec<String> = [
@@ -4372,6 +4405,52 @@ impl PeerDecodeManager {
         self.superseded_candidates.len()
     }
 
+    /// TEST-ONLY: record `layers` as arriving for a peer's VIDEO stream at `now_ms`.
+    #[cfg(test)]
+    pub(crate) fn observe_video_layers_for_test(
+        &mut self,
+        session_id: u64,
+        layers: &[u32],
+        now_ms: u64,
+    ) {
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            for layer in layers {
+                peer.video_layer_availability.observe(*layer, now_ms);
+            }
+        }
+    }
+
+    /// TEST-ONLY: a copy of a peer's VIDEO lid-dwell state.
+    #[cfg(test)]
+    pub(crate) fn video_lid_dwell_for_test(&self, session_id: u64) -> Option<LidDwell> {
+        self.connected_peers
+            .get(&session_id)
+            .map(|p| p.video_lid_dwell)
+    }
+
+    /// TEST-ONLY: record `layers` as arriving for a peer's SCREEN stream at `now_ms`.
+    #[cfg(test)]
+    pub(crate) fn observe_screen_layers_for_test(
+        &mut self,
+        session_id: u64,
+        layers: &[u32],
+        now_ms: u64,
+    ) {
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            for layer in layers {
+                peer.screen_layer_availability.observe(*layer, now_ms);
+            }
+        }
+    }
+
+    /// TEST-ONLY: a copy of a peer's SCREEN lid-dwell state.
+    #[cfg(test)]
+    pub(crate) fn screen_lid_dwell_for_test(&self, session_id: u64) -> Option<LidDwell> {
+        self.connected_peers
+            .get(&session_id)
+            .map(|p| p.screen_lid_dwell)
+    }
+
     /// TEST-ONLY: zero a peer's activity so the next monitor pass reads it as silent.
     #[cfg(test)]
     pub(crate) fn silence_peer_for_test(&mut self, session_id: u64) {
@@ -4760,6 +4839,15 @@ impl PeerDecodeManager {
         self.superseded_eligible = false;
     }
 
+    pub fn reset_lid_dwells_for_reconnect(&mut self) {
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                peer.video_lid_dwell.reset_for_reconnect();
+                peer.screen_lid_dwell.reset_for_reconnect();
+            }
+        }
+    }
+
     /// Make the staged ids eligible for the next [`Self::run_peer_monitor`] pass,
     /// which drops those still unconfirmed AND silent.
     pub fn promote_roster_reconcile(&mut self) {
@@ -4867,12 +4955,13 @@ impl PeerDecodeManager {
                 .copied()
                 .unwrap_or(TileHint::Uncapped);
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
-                // Highest available per kind, computed ONCE and reused for BOTH the
-                // size lid (below) and the #1079 advertise gate (further down), so
-                // the lid and the gate can never disagree on the top.
-                let vh = peer.video_layer_availability.highest_available(now_ms);
-                let sh = peer.screen_layer_availability.highest_available(now_ms);
+                let v_obs = peer.video_layer_availability.highest_available(now_ms);
+                let s_obs = peer.screen_layer_availability.highest_available(now_ms);
                 let ah = peer.audio_layer_availability.highest_available(now_ms);
+                // Issue 2630: while a lid is held this is a HELD assumption, not the live
+                // observation the lid suppressed; `*_obs` stays the real reading.
+                let vh = peer.video_lid_dwell.ladder(v_obs, now_ms);
+                let sh = peer.screen_lid_dwell.ladder(s_obs, now_ms);
 
                 // Selected layers BEFORE this tick — used to detect an UP-switch
                 // (size lid lifting, or a congestion recovery) so we can request a
@@ -4974,18 +5063,25 @@ impl PeerDecodeManager {
                 //   * the chooser dropped below the top under congestion, and
                 //   * the user's receive `max` bound (or #1256 size lid) capped it
                 //     below the top.
-                // On cold start / a healthy unclamped receiver, the chooser tracks
-                // the top (M2: it no longer ramps from base), so layer == highest
-                // and the entry is OMITTED → relay fail-open forwards all layers
-                // (no base-pin HD dip after reconnect). An all-omitted map yields
-                // no entries, so no LAYER_PREFERENCE packet goes out when there is
-                // nothing to constrain (M1). Reuses the `vh`/`sh`/`ah` computed
-                // above — never recomputed, so the gate and lid agree on the top.
-                if video < vh {
-                    desired.insert((session_id, PrefMediaKind::Video), video);
+                if let Some(v) = peer.video_lid_dwell.settle(
+                    LidTick {
+                        value: video,
+                        ceiling: v_effective_max,
+                        observed: v_obs,
+                    },
+                    now_ms,
+                ) {
+                    desired.insert((session_id, PrefMediaKind::Video), v);
                 }
-                if screen < sh {
-                    desired.insert((session_id, PrefMediaKind::Screen), screen);
+                if let Some(v) = peer.screen_lid_dwell.settle(
+                    LidTick {
+                        value: screen,
+                        ceiling: s_effective_max,
+                        observed: s_obs,
+                    },
+                    now_ms,
+                ) {
+                    desired.insert((session_id, PrefMediaKind::Screen), v);
                 }
                 if audio < ah {
                     desired.insert((session_id, PrefMediaKind::Audio), audio);
@@ -5045,13 +5141,11 @@ impl PeerDecodeManager {
     /// every resize-drag render (the UI bumps `viewport_version` on the RAW, un-debounced
     /// resize listener) would compound into N down-steps + bank the sticky latch. Instead
     /// this sets the guard purely from the lid composed with the chooser's EXISTING
-    /// pick — idempotent: N calls in one window re-assert the SAME layer.
+    /// pick: N calls in one window re-assert the SAME layer, banking no hysteresis.
+    /// Across a LOOSENED ceiling the paired reconcile pulls that layer back, so a push
+    /// there is a round trip, not a no-op.
     ///
-    /// Per peer + VIDEO/SCREEN: baseline = the chooser's current pick clamped to the
-    /// user's bounds (`desired_preference().map(|r| bounds.clamp(r))`) or decode-best
-    /// (`highest_available`) when unconstrained — the SAME `v_base`
-    /// [`Peer::collect_desired_preferences`] computes, NOT a fresh `choose()`. The
-    /// guard layer = `min(baseline, effective_max)` where
+    /// Per peer + VIDEO/SCREEN: NOT a fresh `choose()`. The guard layer = `min(baseline, effective_max)` where
     /// `effective_max = size_lid.max(user_min).min(user_max)` (the SAME floor-respecting
     /// composition as the tick / read-only fold). AUDIO is never touched. Re-anchors the
     /// seq tracker on an actual guard change (mirrors `tick_layer_chooser`). Returns the
@@ -5074,17 +5168,11 @@ impl PeerDecodeManager {
                 .copied()
                 .unwrap_or(TileHint::Uncapped);
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
-                // VIDEO — baseline + lid composition byte-identical to
-                // `collect_desired_preferences` so the guard and the advertised
-                // layer AGREE. Only chooser reads here are `desired_preference()`
-                // (pure getter) and `highest_available()` (benign prune); NO
-                // `choose()` / `tick_*` → advances NO hysteresis.
-                let vh = peer.video_layer_availability.highest_available(now_ms);
-                let v_base = peer
-                    .video_layer_chooser
-                    .desired_preference()
-                    .map(|raw| bounds.for_kind(PrefMediaKind::Video).clamp(raw))
-                    .unwrap_or(vh);
+                // Only chooser reads here are `desired_preference()` (pure getter) and
+                // `highest_available()` (benign prune); NO `choose()` / `tick_*` →
+                // advances NO hysteresis.
+                let v_obs = peer.video_layer_availability.highest_available(now_ms);
+                let vh = peer.video_lid_dwell.peek_ladder(v_obs);
                 let v_lid = match hint {
                     TileHint::Uncapped => vh,
                     TileHint::Capped { device_px_h } => {
@@ -5097,6 +5185,11 @@ impl PeerDecodeManager {
                     .max
                     .unwrap_or(u32::MAX);
                 let v_effective_max = v_lid.max(v_user_min).min(v_user_max);
+                let v_base = peer
+                    .video_layer_chooser
+                    .desired_preference()
+                    .map(|raw| bounds.for_kind(PrefMediaKind::Video).clamp(raw))
+                    .unwrap_or_else(|| peer.video_lid_dwell.peek_baseline(v_effective_max, v_obs));
                 let v_new = v_base.min(v_effective_max);
                 let v_old = peer.selected_video_layer();
                 if v_new != v_old {
@@ -5108,12 +5201,8 @@ impl PeerDecodeManager {
                 }
 
                 // SCREEN — identical with screen_* fields / PrefMediaKind::Screen.
-                let sh = peer.screen_layer_availability.highest_available(now_ms);
-                let s_base = peer
-                    .screen_layer_chooser
-                    .desired_preference()
-                    .map(|raw| bounds.for_kind(PrefMediaKind::Screen).clamp(raw))
-                    .unwrap_or(sh);
+                let s_obs = peer.screen_layer_availability.highest_available(now_ms);
+                let sh = peer.screen_lid_dwell.peek_ladder(s_obs);
                 let s_lid = match hint {
                     TileHint::Uncapped => sh,
                     TileHint::Capped { device_px_h } => {
@@ -5126,6 +5215,11 @@ impl PeerDecodeManager {
                     .max
                     .unwrap_or(u32::MAX);
                 let s_effective_max = s_lid.max(s_user_min).min(s_user_max);
+                let s_base = peer
+                    .screen_layer_chooser
+                    .desired_preference()
+                    .map(|raw| bounds.for_kind(PrefMediaKind::Screen).clamp(raw))
+                    .unwrap_or_else(|| peer.screen_lid_dwell.peek_baseline(s_effective_max, s_obs));
                 let s_new = s_base.min(s_effective_max);
                 let s_old = peer.selected_screen_layer();
                 if s_new != s_old {
@@ -5228,10 +5322,7 @@ impl PeerDecodeManager {
                 //     match the top it forwards — NOT "leave the guard where it is".
                 //
                 // LOAD-BEARING, DO NOT SIMPLIFY the `unwrap_or(highest_available)`
-                // branch. `collect_desired_preferences`/`current_desired_preferences`
-                // only inserts an entry when `layer < highest_available`, so a peer at
-                // top has NO entry → this branch fires and pins the guard to the top.
-                // If we instead left the guard alone, a DOWN-cap whose publish was
+                // branch. If we instead left the guard alone, a DOWN-cap whose publish was
                 // rate-limited (entry not yet on the wire) would keep guard=L0 while
                 // the relay still forwards the old L2 → exact-match drop → the SAME
                 // freeze this fix removes. Fail-open forward-the-top is exactly what
@@ -5413,15 +5504,12 @@ impl PeerDecodeManager {
     /// advertise, WITHOUT advancing any chooser hysteresis (issue #1179, Part B;
     /// clamp/gate added in PR #1192 review).
     ///
-    /// Mirrors the shape AND the advertise semantics of
-    /// [`Self::tick_layer_choosers`]'s return value but does NOT call
-    /// `choose` / `tick_*`: per peer it reads each chooser's
+    /// Mirrors the shape of [`Self::tick_layer_choosers`]'s return value but does NOT
+    /// call `choose` / `tick_*`: per peer it reads each chooser's
     /// [`LayerChooser::desired_preference`], clamps it to the user's per-kind
-    /// receive `bounds`, and advertises it only when the clamped layer is
-    /// `< highest_available` for that kind — the SAME post-clamp + advertise gate
-    /// the tick applies (see [`Peer::collect_desired_preferences`]). It therefore
-    /// never advertises above the user's `max`, and never advertises `Some(0)` for
-    /// a base-only source — matching the tick exactly.
+    /// receive `bounds`, and gates the result through [`LidDwell::peek_settle`]
+    /// (see [`Peer::collect_desired_preferences`]). It therefore never advertises above
+    /// the user's `max`.
     ///
     /// It advances no clean-window / score / sticky / last-change hysteresis. The
     /// only mutation it performs is the lazy prune inside `highest_available`,
@@ -6863,6 +6951,8 @@ fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
         },
         screen_keyframe_starved_since_ms: Rc::new(std::cell::Cell::new(None)),
         selected_audio_layer: 0,
+        video_lid_dwell: Default::default(),
+        screen_lid_dwell: Default::default(),
         audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
         audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
         video_seq_tracker: SequenceTracker::new(),
@@ -6874,6 +6964,7 @@ fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
         last_video_switch: LastLayerSwitch::default(),
         last_screen_switch: LastLayerSwitch::default(),
         layer_gate_skips: LayerGateSkips::default(),
+        last_gate_skips_log: Cell::new(None),
         receiver_on_webtransport: false,
         audio_datagram_loss: AudioDatagramLossTracker::new(),
     };
@@ -7498,6 +7589,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn layer_gate_skips_log_emits_the_onset_then_throttles() {
+        let (mut peer, _muted) = make_test_peer(2760);
+        peer.set_selected_video_layer(2);
+        peer.video_layer_availability.observe(2, now_ms());
+        peer.decode(
+            &gate_packet(2760, MediaType::VIDEO, MediaKind::VIDEO, 0),
+            "local@test.com",
+        )
+        .expect("a gated layer-0 video packet must not error");
+
+        LAST_GATE_SKIPS_LOG.with(|c| *c.borrow_mut() = None);
+        peer.broadcast_peer_status();
+        assert_eq!(
+            LAST_GATE_SKIPS_LOG.with(|c| c.borrow().clone()).as_deref(),
+            Some("LAYER_GATE_SKIPS session_id=2760 video_above=1"),
+            "the FIRST line for a peer always emits, so the onset stays visible"
+        );
+
+        LAST_GATE_SKIPS_LOG.with(|c| *c.borrow_mut() = None);
+        peer.broadcast_peer_status();
+        assert_eq!(
+            LAST_GATE_SKIPS_LOG.with(|c| c.borrow().clone()),
+            None,
+            "a second broadcast inside the interval must be suppressed"
+        );
+
+        peer.last_gate_skips_log
+            .set(Some(Instant::now() - Duration::from_millis(30_000)));
+        peer.broadcast_peer_status();
+        assert_eq!(
+            LAST_GATE_SKIPS_LOG.with(|c| c.borrow().clone()).as_deref(),
+            Some("LAYER_GATE_SKIPS session_id=2760 video_above=1"),
+            "once the interval has elapsed the line emits again"
+        );
+    }
+
+    /// Literal 29_999/30_000 bracket `LAYER_GATE_SKIPS_LOG_MIN_INTERVAL`; the
+    /// pure predicate takes an explicit `now` so the bracket is exact.
+    #[test]
+    fn gate_skips_log_due_brackets_the_throttle_interval() {
+        let (peer, _muted) = make_test_peer(2760);
+        let t0 = Instant::now();
+        assert!(
+            peer.gate_skips_log_due(t0),
+            "a peer that has never logged is always due"
+        );
+        peer.last_gate_skips_log.set(Some(t0));
+        assert!(
+            !peer.gate_skips_log_due(t0 + Duration::from_millis(29_999)),
+            "29_999ms after the last line is still inside the interval"
+        );
+        assert!(
+            peer.gate_skips_log_due(t0 + Duration::from_millis(30_000)),
+            "30_000ms after the last line is due"
+        );
+    }
+
+    #[test]
+    fn gate_skips_log_due_does_not_wedge_when_the_stamp_is_in_the_future() {
+        let (peer, _muted) = make_test_peer(2760);
+        let now = Instant::now();
+        peer.last_gate_skips_log
+            .set(Some(now + Duration::from_millis(600_000)));
+        assert!(
+            peer.gate_skips_log_due(now),
+            "a stamp 10 minutes in the future must re-anchor, not suppress"
+        );
+    }
+
     /// Guards the WIRING, not the leaf fn: deleting the emission from
     /// `peer_status_event` left every other test in both crates green.
     #[test]
@@ -7587,7 +7748,9 @@ mod tests {
     use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
     use videocall_types::protos::packet_wrapper::PacketWrapper;
+    // Explicit: `wasm_bindgen_test::*` glob-exports an `Instant` too.
     use wasm_bindgen_test::*;
+    use web_time::Instant;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -12236,6 +12399,334 @@ mod tests {
         assert_eq!(manager.selected_screen_layer_for_test(904), Some(0));
     }
 
+    #[test]
+    fn an_advertised_video_lid_outlives_the_availability_it_suppresses() {
+        use crate::decode::layer_chooser::{LayerAvailability, PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(1));
+
+        let t0 = 10_000;
+        {
+            let peer = manager.connected_peers.get_mut(&2630).expect("peer");
+            for layer in 0..3u32 {
+                peer.video_layer_availability.observe(layer, t0);
+            }
+        }
+        let first = manager.tick_layer_choosers(t0, &capped);
+        assert_eq!(
+            first.get(&(2630, PrefMediaKind::Video)),
+            Some(&1),
+            "premise: a receive ceiling below the top is a real constraint"
+        );
+
+        let t1 = t0 + LayerAvailability::DEFAULT_WINDOW_MS + 1;
+        {
+            let peer = manager.connected_peers.get_mut(&2630).expect("peer");
+            peer.video_layer_availability.observe(0, t1);
+            peer.video_layer_availability.observe(1, t1);
+            assert_eq!(
+                peer.video_layer_availability.highest_available(t1),
+                1,
+                "premise: the observation that justified the lid is gone"
+            );
+        }
+
+        let held = manager.tick_layer_choosers(t1, &capped);
+        assert_eq!(
+            held.get(&(2630, PrefMediaKind::Video)),
+            Some(&1),
+            "dropping the entry here fails the relay open and re-admits every layer"
+        );
+
+        let tick = crate::decode::layer_chooser::PEER_MONITOR_TICK_MS;
+        let t2 = t1 + tick;
+        {
+            let peer = manager.connected_peers.get_mut(&2630).expect("peer");
+            for layer in 0..3u32 {
+                peer.video_layer_availability.observe(layer, t2);
+            }
+        }
+        assert_eq!(
+            manager
+                .tick_layer_choosers(t2, &capped)
+                .get(&(2630, PrefMediaKind::Video)),
+            Some(&1),
+            "premise: real evidence re-extends the hold, so it is still live at t3"
+        );
+
+        let mut raised = ReceiveLayerBounds::default();
+        raised.set_kind(PrefMediaKind::Video, None, Some(2));
+        let t3 = t2 + tick;
+        {
+            let peer = manager.connected_peers.get_mut(&2630).expect("peer");
+            peer.video_layer_availability.observe(0, t3);
+            peer.video_layer_availability.observe(1, t3);
+        }
+        assert!(
+            !manager
+                .tick_layer_choosers(t3, &raised)
+                .contains_key(&(2630, PrefMediaKind::Video)),
+            "raising the receive ceiling removes the lid's reason, so a LIVE hold must be \
+             released rather than run to its deadline"
+        );
+    }
+
+    #[test]
+    fn a_grown_tile_publishes_the_layer_its_guard_was_raised_to() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, TileHint};
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        let bounds = ReceiveLayerBounds::default();
+
+        let t0 = 10_000;
+        manager.observe_video_layers_for_test(2630, &[0, 1, 2], t0);
+        manager.set_peer_tile_hints(HashMap::from([(
+            2630u64,
+            TileHint::Capped { device_px_h: 180 },
+        )]));
+        assert_eq!(
+            manager
+                .tick_layer_choosers(t0, &bounds)
+                .get(&(2630, PrefMediaKind::Video)),
+            Some(&0),
+            "premise: a 180px tile lids video at the base layer and holds it"
+        );
+
+        let t1 = t0 + 1_000;
+        manager.observe_video_layers_for_test(2630, &[0, 1, 2], t1);
+        manager.set_peer_tile_hints(HashMap::from([(
+            2630u64,
+            TileHint::Capped { device_px_h: 360 },
+        )]));
+        let _ = manager.apply_size_lid_to_decode_guards(t1, &bounds);
+        assert_eq!(
+            manager.selected_video_layer_for_test(2630),
+            Some(1),
+            "premise: the grown tile raised the decode guard to layer 1"
+        );
+
+        assert_eq!(
+            manager
+                .current_desired_preferences(t1, &bounds)
+                .get(&(2630, PrefMediaKind::Video)),
+            Some(&1),
+            "the wire must carry the layer the guard was raised to; publishing the held \
+             lid instead makes the guard LEAD the wire and the tile renders upscaled"
+        );
+    }
+
+    #[test]
+    fn the_tick_and_the_read_only_publish_path_agree_on_a_held_lid() {
+        use crate::decode::layer_chooser::{LayerAvailability, PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(1));
+
+        let t0 = 10_000;
+        {
+            let peer = manager.connected_peers.get_mut(&2630).expect("peer");
+            for layer in 0..3u32 {
+                peer.video_layer_availability.observe(layer, t0);
+            }
+        }
+        assert_eq!(
+            manager
+                .tick_layer_choosers(t0, &capped)
+                .get(&(2630, PrefMediaKind::Video)),
+            Some(&1),
+            "premise: a receive ceiling below the top is a real constraint"
+        );
+
+        let t1 = t0 + LayerAvailability::DEFAULT_WINDOW_MS + 1;
+        {
+            let peer = manager.connected_peers.get_mut(&2630).expect("peer");
+            peer.video_layer_availability.observe(0, t1);
+            peer.video_layer_availability.observe(1, t1);
+            assert_eq!(
+                peer.video_layer_availability.highest_available(t1),
+                1,
+                "premise: the observation that justified the lid is gone"
+            );
+        }
+
+        let ticked = manager.tick_layer_choosers(t1, &capped);
+        let read_only = manager.current_desired_preferences(t1, &capped);
+        assert_eq!(
+            ticked.get(&(2630, PrefMediaKind::Video)),
+            Some(&1),
+            "premise: the tick holds the lid past the collapse"
+        );
+        assert_eq!(
+            read_only, ticked,
+            "the read-only publish path must not erase a lid the tick is holding"
+        );
+    }
+
+    #[test]
+    fn the_read_only_publish_path_holds_a_screen_lid_too() {
+        use crate::decode::layer_chooser::{LayerAvailability, PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Screen, None, Some(1));
+
+        let t0 = 10_000;
+        {
+            let peer = manager.connected_peers.get_mut(&2630).expect("peer");
+            for layer in 0..3u32 {
+                peer.screen_layer_availability.observe(layer, t0);
+            }
+        }
+        let first = manager.tick_layer_choosers(t0, &capped);
+        assert_eq!(
+            first.get(&(2630, PrefMediaKind::Screen)),
+            Some(&1),
+            "premise: a screen receive ceiling below the top is a real constraint"
+        );
+
+        let t1 = t0 + LayerAvailability::DEFAULT_WINDOW_MS + 1;
+        {
+            let peer = manager.connected_peers.get_mut(&2630).expect("peer");
+            peer.screen_layer_availability.observe(0, t1);
+            peer.screen_layer_availability.observe(1, t1);
+        }
+
+        let ticked = manager.tick_layer_choosers(t1, &capped);
+        let read_only = manager.current_desired_preferences(t1, &capped);
+        assert_eq!(ticked.get(&(2630, PrefMediaKind::Screen)), Some(&1));
+        assert_eq!(
+            read_only, ticked,
+            "the read-only publish path must not erase a screen lid the tick is holding"
+        );
+    }
+
+    #[test]
+    fn the_read_only_publish_path_holds_a_lid_until_the_tick_expires_it() {
+        use crate::decode::layer_chooser::{
+            LayerAvailability, PrefMediaKind, ReceiveLayerBounds, LID_DWELL_BASE_MS,
+        };
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(1));
+
+        let t0 = 10_000;
+        manager.observe_video_layers_for_test(2630, &[0, 1, 2], t0);
+        assert_eq!(
+            manager
+                .tick_layer_choosers(t0, &capped)
+                .get(&(2630, PrefMediaKind::Video)),
+            Some(&1),
+            "premise: the receive ceiling establishes a hold at video layer 1"
+        );
+
+        let t1 = t0 + LID_DWELL_BASE_MS + 1;
+        assert!(
+            t1 > t0 + LayerAvailability::DEFAULT_WINDOW_MS,
+            "premise: the observation that justified the lid has aged out"
+        );
+        manager.observe_video_layers_for_test(2630, &[0, 1], t1);
+        assert_eq!(
+            manager
+                .current_desired_preferences(t1, &capped)
+                .get(&(2630, PrefMediaKind::Video)),
+            Some(&1),
+            "the tick is the sole authority on expiry, so a publish between two ticks \
+             must not fail the relay open early"
+        );
+        assert!(
+            !manager
+                .tick_layer_choosers(t1, &capped)
+                .contains_key(&(2630, PrefMediaKind::Video)),
+            "the tick that observes the passed deadline is what drops the entry"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_keeps_the_escalation_the_link_already_earned() {
+        use crate::decode::layer_chooser::{
+            PrefMediaKind, ReceiveLayerBounds, PEER_MONITOR_TICK_MS,
+        };
+
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(1));
+        capped.set_kind(PrefMediaKind::Screen, None, Some(1));
+
+        let mut now = 10_000u64;
+        manager.observe_video_layers_for_test(2630, &[0, 1, 2], now);
+        manager.observe_screen_layers_for_test(2630, &[0, 1, 2], now);
+        let ticked = manager.tick_layer_choosers(now, &capped);
+        assert_eq!(
+            ticked.get(&(2630, PrefMediaKind::Screen)),
+            Some(&1),
+            "premise: the receive ceiling holds a SCREEN lid too"
+        );
+        let mut expired = false;
+        for _ in 0..8 {
+            now += PEER_MONITOR_TICK_MS;
+            manager.observe_video_layers_for_test(2630, &[0, 1], now);
+            manager.observe_screen_layers_for_test(2630, &[0, 1, 2], now);
+            if !manager
+                .tick_layer_choosers(now, &capped)
+                .contains_key(&(2630, PrefMediaKind::Video))
+            {
+                expired = true;
+                break;
+            }
+        }
+        assert!(expired, "premise: the hold reaches its deadline");
+        now += PEER_MONITOR_TICK_MS;
+        manager.observe_video_layers_for_test(2630, &[0, 1, 2], now);
+        manager.observe_screen_layers_for_test(2630, &[0, 1, 2], now);
+        let _ = manager.tick_layer_choosers(now, &capped);
+
+        let accrued = manager
+            .video_lid_dwell_for_test(2630)
+            .expect("peer")
+            .lidded_ms_for_test();
+        assert!(accrued > 0, "premise: a completed lid banks lidded time");
+
+        assert!(
+            manager
+                .screen_lid_dwell_for_test(2630)
+                .expect("peer")
+                .held_layer()
+                .is_some(),
+            "premise: the SCREEN hold is live when the reconnect lands"
+        );
+        manager.reset_lid_dwells_for_reconnect();
+        let after = manager.video_lid_dwell_for_test(2630).expect("peer");
+        assert_eq!(
+            after.held_layer(),
+            None,
+            "a fresh relay session applies no preference map, so the hold must go"
+        );
+        assert_eq!(
+            manager
+                .screen_lid_dwell_for_test(2630)
+                .expect("peer")
+                .held_layer(),
+            None,
+            "the SCREEN dwell is reset by the same helper"
+        );
+        assert_eq!(
+            after.lidded_ms_for_test(),
+            accrued,
+            "a receiver that reconnects more often than the ramp takes to climb would \
+             otherwise never leave the base dwell"
+        );
+    }
+
     /// Phase 2/3 (#989): the manager's per-peer tick returns an independent
     /// desired-layer entry for every connected peer AND every media kind
     /// (VIDEO/SCREEN/AUDIO), keyed by (session_id, PrefMediaKind).
@@ -13363,9 +13854,7 @@ mod tests {
     /// This is mutation-sensitive WITHOUT relying on top-convergence: the seeded
     /// state is held at layer 1, so any climb (which a `choose` mutation would
     /// eventually cause once the streak/dwell are met) moves it OFF 1 and the
-    /// assertion fires. It is also belt-and-suspenders to the compile-time
-    /// guarantee that `current_desired_preferences`/`collect_desired_preferences`
-    /// take `&self` (a `choose` call needs `&mut self` and would not compile).
+    /// assertion fires.
     ///
     /// MUTATION CHECK: fails if the accessor is changed to drive `choose`/`tick_*`
     /// (the seeded layer would climb away from 1 / the returned map would change),
@@ -14019,14 +14508,8 @@ mod tests {
         );
     }
 
-    /// NIT 1 (PR #1192 review): a source whose ONLY learned layer is the base
-    /// (`highest_available == 0`) must advertise NOTHING from the early-seed path,
-    /// matching the tick's `clamped < highest_available` gate — never `Some(0)`.
-    ///
-    /// MUTATION CHECK: drop the `< highest_available` gate in
-    /// `Peer::collect_desired_preferences` (advertise unconditionally on
-    /// `desired_preference()`) and this test fails — the base-only constrained
-    /// chooser would advertise `Some(0)`.
+    /// NIT 1 (PR #1192 review): a genuinely single-layer source must advertise
+    /// NOTHING from the early-seed path.
     #[test]
     fn early_seed_base_only_source_advertises_nothing() {
         use crate::decode::layer_chooser::{DownlinkSample, PrefMediaKind, ReceiveLayerBounds};
@@ -14050,8 +14533,7 @@ mod tests {
         assert_eq!(
             desired.get(&(950, PrefMediaKind::Video)),
             None,
-            "a base-only source (highest_available == 0) must advertise nothing — \
-             the `< highest_available` gate suppresses a spurious Some(0): {desired:?}"
+            "a single-layer source must advertise nothing, not Some(0): {desired:?}"
         );
     }
 
@@ -15289,6 +15771,8 @@ mod tests {
                 },
                 screen_keyframe_starved_since_ms: Rc::new(std::cell::Cell::new(None)),
                 selected_audio_layer: 0,
+                video_lid_dwell: Default::default(),
+                screen_lid_dwell: Default::default(),
                 audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
                 audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
                 video_seq_tracker: SequenceTracker::new(),
@@ -15300,6 +15784,7 @@ mod tests {
                 last_video_switch: LastLayerSwitch::default(),
                 last_screen_switch: LastLayerSwitch::default(),
                 layer_gate_skips: LayerGateSkips::default(),
+                last_gate_skips_log: Cell::new(None),
                 receiver_on_webtransport: false,
                 audio_datagram_loss: AudioDatagramLossTracker::new(),
             };
@@ -15416,6 +15901,8 @@ mod tests {
             },
             screen_keyframe_starved_since_ms: Rc::new(std::cell::Cell::new(None)),
             selected_audio_layer: 0,
+            video_lid_dwell: Default::default(),
+            screen_lid_dwell: Default::default(),
             audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
             audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
@@ -15427,6 +15914,7 @@ mod tests {
             last_video_switch: LastLayerSwitch::default(),
             last_screen_switch: LastLayerSwitch::default(),
             layer_gate_skips: LayerGateSkips::default(),
+            last_gate_skips_log: Cell::new(None),
             receiver_on_webtransport: false,
             audio_datagram_loss: AudioDatagramLossTracker::new(),
         };
@@ -15503,6 +15991,8 @@ mod tests {
             },
             screen_keyframe_starved_since_ms: Rc::new(std::cell::Cell::new(None)),
             selected_audio_layer: 0,
+            video_lid_dwell: Default::default(),
+            screen_lid_dwell: Default::default(),
             audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
             audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
@@ -15514,6 +16004,7 @@ mod tests {
             last_video_switch: LastLayerSwitch::default(),
             last_screen_switch: LastLayerSwitch::default(),
             layer_gate_skips: LayerGateSkips::default(),
+            last_gate_skips_log: Cell::new(None),
             receiver_on_webtransport: false,
             audio_datagram_loss: AudioDatagramLossTracker::new(),
         };
@@ -18036,5 +18527,446 @@ mod tests {
             expected,
             "the rebuilt decoder must still be handed the peer pair"
         );
+    }
+    #[test]
+    fn the_lid_aware_publish_and_the_size_lid_guard_agree_across_tile_heights() {
+        use crate::decode::layer_chooser::{
+            size_cap_layer, PrefMediaKind, ReceiveLayerBounds, TileHint, LID_DWELL_MAX_MS,
+            PEER_MONITOR_TICK_MS,
+        };
+        let open = ReceiveLayerBounds::default();
+        let mut lidded_rows = 0usize;
+
+        for tile_h in [
+            60u32, 120, 180, 200, 240, 300, 360, 400, 480, 600, 720, 1080,
+        ] {
+            let mut manager = PeerDecodeManager::new();
+            manager.insert_zero_loss_top_peer_for_test(2630);
+            manager.set_peer_tile_hints(std::collections::HashMap::from([(
+                2630u64,
+                TileHint::Capped {
+                    device_px_h: tile_h,
+                },
+            )]));
+            let mut now = 10_000u64;
+            let mut wire: Option<u32> = None;
+            let mut lidded_steps = 0usize;
+
+            for step in 0..16 {
+                // The relay's filter is exact-match per receiver; with no entry it fails
+                // open and forwards all.
+                match wire {
+                    Some(l) => manager.observe_video_layers_for_test(2630, &[0, l], now),
+                    None => manager.observe_video_layers_for_test(2630, &[0, 1, 2], now),
+                }
+
+                let _ = manager.apply_size_lid_to_decode_guards(now, &open);
+                let ro = manager
+                    .current_desired_preferences(now, &open)
+                    .get(&(2630, PrefMediaKind::Video))
+                    .copied();
+                if let Some(v) = ro {
+                    lidded_steps += 1;
+                    assert_eq!(
+                        Some(v),
+                        manager.selected_video_layer_for_test(2630),
+                        "tile {tile_h} t={now}: the read-only publish must not leave the \
+                         size-lid guard disagreeing with the layer it advertised"
+                    );
+                }
+
+                let tk = manager
+                    .tick_layer_choosers(now, &open)
+                    .get(&(2630, PrefMediaKind::Video))
+                    .copied();
+                if let Some(v) = tk {
+                    lidded_steps += 1;
+                    assert_eq!(
+                        Some(v),
+                        manager.selected_video_layer_for_test(2630),
+                        "tile {tile_h} t={now}: the tick must not leave the decode guard \
+                         disagreeing with the layer it advertised"
+                    );
+                }
+                wire = tk;
+                now += if step == 10 {
+                    LID_DWELL_MAX_MS + PEER_MONITOR_TICK_MS
+                } else {
+                    PEER_MONITOR_TICK_MS
+                };
+            }
+
+            // A tile the top layer already covers is never lidded, so a per-row minimum
+            // has to key off the same size predicate the production path applies.
+            if size_cap_layer(tile_h, 2, 3, PrefMediaKind::Video) < 2 {
+                lidded_rows += 1;
+                assert!(
+                    lidded_steps >= 20,
+                    "premise: tile {tile_h} must be lidded on most of its steps, not pass \
+                     vacuously ({lidded_steps} advertised steps)"
+                );
+            } else {
+                assert_eq!(
+                    lidded_steps, 0,
+                    "tile {tile_h} needs the top layer, so nothing may advertise a lid \
+                     for it"
+                );
+            }
+        }
+        assert_eq!(
+            lidded_rows, 7,
+            "the matrix must exercise the lid on the rows the predicate lids"
+        );
+    }
+
+    #[test]
+    fn a_maximized_tile_releases_the_lid_on_the_read_only_publish_path() {
+        use crate::decode::layer_chooser::{
+            PrefMediaKind, ReceiveLayerBounds, TileHint, PEER_MONITOR_TICK_MS,
+        };
+        let open = ReceiveLayerBounds::default();
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        manager.set_peer_tile_hints(std::collections::HashMap::from([(
+            2630u64,
+            TileHint::Capped { device_px_h: 120 },
+        )]));
+
+        let mut now = 10_000u64;
+        let mut wire: Option<u32> = None;
+        for _ in 0..2 {
+            match wire {
+                Some(l) => manager.observe_video_layers_for_test(2630, &[0, l], now),
+                None => manager.observe_video_layers_for_test(2630, &[0, 1, 2], now),
+            }
+            wire = manager
+                .tick_layer_choosers(now, &open)
+                .get(&(2630, PrefMediaKind::Video))
+                .copied();
+            now += PEER_MONITOR_TICK_MS;
+        }
+        assert_eq!(wire, Some(0), "premise: a thumbnail lids video at layer 0");
+        now -= PEER_MONITOR_TICK_MS - 500;
+        let dwell = manager.video_lid_dwell_for_test(2630).expect("peer");
+        assert_eq!(dwell.held_layer(), Some(0));
+        assert!(
+            now < dwell.hold_until_ms_for_test(),
+            "premise: the hold has not reached its deadline, so only a release can lift it"
+        );
+
+        manager.set_peer_tile_hints(std::collections::HashMap::from([(
+            2630u64,
+            TileHint::Capped { device_px_h: 1080 },
+        )]));
+        let _ = manager.apply_size_lid_to_decode_guards(now, &open);
+        assert!(!manager
+            .current_desired_preferences(now, &open)
+            .contains_key(&(2630, PrefMediaKind::Video)));
+        assert_eq!(
+            manager.selected_video_layer_for_test(2630),
+            Some(1),
+            "the held ladder is what lets the grown tile move at all; the collapsed \
+             observation alone reads as the lid and would pin the guard to it"
+        );
+    }
+
+    #[test]
+    fn a_congestion_lid_stays_on_the_wire_after_it_suppresses_its_own_evidence() {
+        use crate::decode::layer_chooser::{
+            PrefMediaKind, ReceiveLayerBounds, PEER_MONITOR_TICK_MS,
+        };
+        let open = ReceiveLayerBounds::default();
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+
+        let mut now = 10_000u64;
+        let observe = |m: &mut PeerDecodeManager, layers: &[u32], t: u64| {
+            m.observe_video_layers_for_test(2630, layers, t);
+            m.observe_screen_layers_for_test(2630, layers, t);
+        };
+
+        observe(&mut manager, &[0, 1, 2], now);
+        // One clean tick first, so the choosers are at the top and the seed has a rung to
+        // step down FROM.
+        let _ = manager.tick_layer_choosers(now, &open);
+        assert!(
+            manager.seed_downlink_congestion_for_connected_peers(now, &open, false),
+            "premise: the downlink seed constrains the choosers"
+        );
+
+        now += PEER_MONITOR_TICK_MS;
+        observe(&mut manager, &[0, 1, 2], now);
+        let lidded = manager.tick_layer_choosers(now, &open);
+        assert_eq!(
+            (
+                lidded.get(&(2630, PrefMediaKind::Video)).copied(),
+                lidded.get(&(2630, PrefMediaKind::Screen)).copied()
+            ),
+            (Some(1), Some(1)),
+            "premise: congestion lids both kinds at layer 1 with no tile hint at all"
+        );
+
+        // The relay honours the lid, so layer 2 stops arriving — and with it the evidence
+        // the choosers need to stay constrained.
+        now += PEER_MONITOR_TICK_MS;
+        observe(&mut manager, &[0, 1], now);
+        let _ = manager.tick_layer_choosers(now, &open);
+
+        // A seed republish lands between two ticks, inside the dwell.
+        now += 500;
+        let peer = manager.connected_peers.get(&2630).expect("peer present");
+        assert!(
+            !peer.video_layer_chooser.is_constrained()
+                && !peer.screen_layer_chooser.is_constrained(),
+            "premise: the collapsed observation cleared `constrained`, so \
+             `desired_preference()` is None and the baseline fallback decides"
+        );
+        let dwell = manager.video_lid_dwell_for_test(2630).expect("peer");
+        assert_eq!(
+            (
+                dwell.held_layer(),
+                manager
+                    .screen_lid_dwell_for_test(2630)
+                    .expect("peer")
+                    .held_layer()
+            ),
+            (Some(1), Some(1)),
+            "premise: both dwells still hold the lid the tick will re-advertise"
+        );
+        assert!(
+            now < dwell.hold_until_ms_for_test(),
+            "premise: the hold has not reached its deadline"
+        );
+
+        let ro = manager.current_desired_preferences(now, &open);
+        let tk = manager.tick_layer_choosers(now, &open);
+        for kind in [PrefMediaKind::Video, PrefMediaKind::Screen] {
+            assert_eq!(
+                (
+                    ro.get(&(2630, kind)).copied(),
+                    tk.get(&(2630, kind)).copied()
+                ),
+                (Some(1), Some(1)),
+                "{kind:?}: a seed publish between two ticks must not drop the entry the \
+                 tick holds — `take_if_changed` reads the vanished key as a cleared cap \
+                 and the relay fails open to the top layer mid-dwell"
+            );
+        }
+    }
+
+    #[test]
+    fn the_read_only_publish_stops_advertising_a_layer_the_publisher_has_shed() {
+        use crate::decode::layer_chooser::{
+            PrefMediaKind, ReceiveLayerBounds, TileHint, PEER_MONITOR_TICK_MS,
+        };
+        // VIDEO is lidded by the 300px tile; SCREEN carries no ladder geometry, so its
+        // lid comes from the user ceiling instead.
+        let mut bounds = ReceiveLayerBounds::default();
+        bounds.set_kind(PrefMediaKind::Screen, None, Some(1));
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        manager.set_peer_tile_hints(std::collections::HashMap::from([(
+            2630u64,
+            TileHint::Capped { device_px_h: 300 },
+        )]));
+
+        let mut now = 10_000u64;
+        manager.observe_video_layers_for_test(2630, &[0, 1, 2], now);
+        manager.observe_screen_layers_for_test(2630, &[0, 1, 2], now);
+        let lidded = manager.tick_layer_choosers(now, &bounds);
+        assert_eq!(
+            (
+                lidded.get(&(2630, PrefMediaKind::Video)).copied(),
+                lidded.get(&(2630, PrefMediaKind::Screen)).copied()
+            ),
+            (Some(1), Some(1)),
+            "premise: both kinds are lidded at layer 1"
+        );
+
+        // The publisher sheds everything above the base while the holds are still live.
+        now += PEER_MONITOR_TICK_MS;
+        manager.observe_video_layers_for_test(2630, &[0], now);
+        manager.observe_screen_layers_for_test(2630, &[0], now);
+        assert!(
+            now < manager
+                .video_lid_dwell_for_test(2630)
+                .expect("peer")
+                .hold_until_ms_for_test(),
+            "premise: the hold has not reached its deadline, so the substituted ladder is \
+             still in play"
+        );
+
+        let _ = manager.apply_size_lid_to_decode_guards(now, &bounds);
+        // SCREEN is a canary: `clamp_selected_layer(Screen, _)` is 0 for any input while
+        // `SCREEN_SIMULCAST_MAX_LAYERS == 1`, so only the VIDEO element can fail here.
+        assert_eq!(
+            (
+                manager.selected_video_layer_for_test(2630),
+                manager.selected_screen_layer_for_test(2630)
+            ),
+            (Some(0), Some(0)),
+            "the guard the tile-hint push writes must not lead the only layer arriving"
+        );
+
+        let ro = manager.current_desired_preferences(now, &bounds);
+        let tk = manager.tick_layer_choosers(now, &bounds);
+        for kind in [PrefMediaKind::Video, PrefMediaKind::Screen] {
+            let advertised = ro.get(&(2630, kind)).copied();
+            assert!(
+                !matches!(advertised, Some(l) if l > 0),
+                "{kind:?}: only layer 0 is arriving; advertising {advertised:?} pins the \
+                 receiver's exact-match guard above the wire and freezes the tile"
+            );
+            assert_eq!(
+                advertised,
+                tk.get(&(2630, kind)).copied(),
+                "{kind:?}: the read-only publish must not diverge from the tick"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_receive_min_cannot_hold_the_advertisement_above_the_arriving_layer() {
+        use crate::decode::layer_chooser::{
+            PrefMediaKind, ReceiveLayerBounds, TileHint, PEER_MONITOR_TICK_MS,
+        };
+        // A user receive MIN of 1 is the floor `KindLayerBounds::clamp` raises a
+        // below-min pick UP to, so the tick's `video` can exceed what is arriving.
+        let mut bounds = ReceiveLayerBounds::default();
+        bounds.set_kind(PrefMediaKind::Video, Some(1), None);
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        manager.set_peer_tile_hints(std::collections::HashMap::from([(
+            2630u64,
+            TileHint::Capped { device_px_h: 300 },
+        )]));
+
+        let mut now = 10_000u64;
+        manager.observe_video_layers_for_test(2630, &[0, 1, 2], now);
+        assert_eq!(
+            manager
+                .tick_layer_choosers(now, &bounds)
+                .get(&(2630, PrefMediaKind::Video))
+                .copied(),
+            Some(1),
+            "premise: the 300px tile lids video at layer 1, establishing the hold"
+        );
+
+        // The publisher sheds everything above the base while the hold is still live,
+        // so the floor now sits ABOVE the only layer on the wire.
+        now += PEER_MONITOR_TICK_MS;
+        manager.observe_video_layers_for_test(2630, &[0], now);
+        assert_eq!(
+            (
+                manager
+                    .video_lid_dwell_for_test(2630)
+                    .expect("peer")
+                    .held_layer(),
+                now < manager
+                    .video_lid_dwell_for_test(2630)
+                    .expect("peer")
+                    .hold_until_ms_for_test()
+            ),
+            (Some(1), true),
+            "premise: the hold is at the floor and has not reached its deadline"
+        );
+
+        let ro = manager.current_desired_preferences(now, &bounds);
+        let tk = manager.tick_layer_choosers(now, &bounds);
+        assert_eq!(
+            (
+                ro.get(&(2630, PrefMediaKind::Video)).copied(),
+                tk.get(&(2630, PrefMediaKind::Video)).copied()
+            ),
+            (None, None),
+            "only layer 0 is arriving; advertising the floor pins the relay above the wire"
+        );
+    }
+
+    #[test]
+    fn a_tile_grown_while_the_top_layer_still_arrives_reopens_to_the_whole_ladder() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, TileHint};
+        let open = ReceiveLayerBounds::default();
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        manager.set_peer_tile_hints(std::collections::HashMap::from([(
+            2630u64,
+            TileHint::Capped { device_px_h: 120 },
+        )]));
+
+        let t0 = 10_000u64;
+        manager.observe_video_layers_for_test(2630, &[0, 1, 2], t0);
+        assert_eq!(
+            manager
+                .tick_layer_choosers(t0, &open)
+                .get(&(2630, PrefMediaKind::Video))
+                .copied(),
+            Some(0),
+            "premise: a thumbnail lids video at layer 0"
+        );
+
+        // Grown before the suppressed layers age out, so the raw observation is still 2
+        // and `held + 1` alone would UNDERSTATE the ladder.
+        let t1 = t0 + 500;
+        manager.set_peer_tile_hints(std::collections::HashMap::from([(
+            2630u64,
+            TileHint::Capped { device_px_h: 1080 },
+        )]));
+        let _ = manager.apply_size_lid_to_decode_guards(t1, &open);
+        assert!(
+            !manager
+                .current_desired_preferences(t1, &open)
+                .contains_key(&(2630, PrefMediaKind::Video)),
+            "a maximized tile must reopen the relay, not re-advertise a layer one above \
+             the lid it just left"
+        );
+        assert_eq!(
+            manager.selected_video_layer_for_test(2630),
+            Some(2),
+            "and the guard must reach the top that is still arriving, or it pins the tile \
+             a layer below the wire the same publish reopened"
+        );
+    }
+
+    #[test]
+    fn the_read_only_publish_path_advances_no_lid_state() {
+        use crate::decode::layer_chooser::{ReceiveLayerBounds, TileHint};
+        let open = ReceiveLayerBounds::default();
+        let mut manager = PeerDecodeManager::new();
+        manager.insert_zero_loss_top_peer_for_test(2630);
+        manager.set_peer_tile_hints(std::collections::HashMap::from([(
+            2630u64,
+            TileHint::Capped { device_px_h: 120 },
+        )]));
+        let now = 10_000u64;
+        manager.observe_video_layers_for_test(2630, &[0, 1, 2], now);
+        let _ = manager.tick_layer_choosers(now, &open);
+
+        let dwell_before = manager.video_lid_dwell_for_test(2630);
+        assert_eq!(
+            dwell_before.and_then(|d| d.held_layer()),
+            Some(0),
+            "premise: there is a hold whose state could be advanced"
+        );
+        let guard_before = manager.selected_video_layer_for_test(2630);
+        let base = manager.current_desired_preferences(now, &open);
+        for i in 0..20 {
+            let _ = manager.apply_size_lid_to_decode_guards(now, &open);
+            assert_eq!(
+                manager.current_desired_preferences(now, &open),
+                base,
+                "read #{i} was not idempotent"
+            );
+            assert_eq!(
+                manager.selected_video_layer_for_test(2630),
+                guard_before,
+                "read #{i} moved the decode guard"
+            );
+            assert_eq!(
+                manager.video_lid_dwell_for_test(2630),
+                dwell_before,
+                "read #{i} advanced dwell state"
+            );
+        }
     }
 }

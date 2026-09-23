@@ -1,0 +1,10 @@
+{
+  "goog:chromeOptions": {
+    "args": [
+      "--headless=new",
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--autoplay-policy=no-user-gesture-required"
+    ]
+  }
+}

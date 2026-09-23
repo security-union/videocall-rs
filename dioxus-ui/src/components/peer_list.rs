@@ -16,7 +16,6 @@
  * conditions.
  */
 
-use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
 use crate::components::peer_tile::{
     audio_path_is_live, corroborated_speaking, expire_stale_claim, glow_deadman_ms,
@@ -199,18 +198,13 @@ pub fn PeerList(
     onclose: EventHandler<MouseEvent>,
     #[props(default = true)] self_muted: bool,
     #[props(default = false)] self_speaking: bool,
-    show_meeting_info: bool,
     room_id: String,
-    num_participants: usize,
-    is_active: bool,
-    on_toggle_meeting_info: EventHandler<()>,
     #[props(default)] host_display_name: Option<String>,
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] local_user_display_name: String,
     #[props(default)] on_edit_self_name: EventHandler<()>,
 ) -> Element {
     let mut search_query = use_signal(String::new);
-    let mut show_context_menu = use_signal(|| false);
     let mut show_incall_menu = use_signal(|| false);
     let mut is_muting_all = use_signal(|| false);
     let mut is_disabling_video_all = use_signal(|| false);
@@ -362,69 +356,13 @@ pub fn PeerList(
 
     rsx! {
         div {
-            // Show meeting information at the top when enabled
-            if show_meeting_info {
-                MeetingInfo {
-                    is_open: true,
-                    onclose: move |_| on_toggle_meeting_info.call(()),
-                    room_id: room_id.clone(),
-                    num_participants: num_participants,
-                    is_active: is_active,
-                }
-            }
-
             div { class: "sidebar-header",
                 h2 { "Attendants" }
                 div { class: "header-actions",
                     button {
-                        class: "menu-button",
-                        onclick: move |e: MouseEvent| {
-                            e.stop_propagation();
-                            show_context_menu.set(!show_context_menu());
-                        },
-                        aria_label: "More options",
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg",
-                            width: "20",
-                            height: "20",
-                            view_box: "0 0 24 24",
-                            fill: "none",
-                            stroke: "currentColor",
-                            stroke_width: "2",
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            circle { cx: "12", cy: "12", r: "1" }
-                            circle { cx: "12", cy: "5", r: "1" }
-                            circle { cx: "12", cy: "19", r: "1" }
-                        }
-                    }
-                    button {
                         class: "close-button",
                         onclick: move |e| onclose.call(e),
                         "\u{00d7}"
-                    }
-                    if show_context_menu() {
-                        div { class: "context-menu",
-                            button {
-                                class: "context-menu-item",
-                                onclick: move |_| on_toggle_meeting_info.call(()),
-                                svg {
-                                    xmlns: "http://www.w3.org/2000/svg",
-                                    width: "16",
-                                    height: "16",
-                                    view_box: "0 0 24 24",
-                                    fill: "none",
-                                    stroke: "currentColor",
-                                    stroke_width: "2",
-                                    stroke_linecap: "round",
-                                    stroke_linejoin: "round",
-                                    circle { cx: "12", cy: "12", r: "10" }
-                                    line { x1: "12", y1: "16", x2: "12", y2: "12" }
-                                    line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
-                                }
-                                if show_meeting_info { "Hide Meeting Info" } else { "Show Meeting Info" }
-                            }
-                        }
                     }
                 }
             }
@@ -1571,5 +1509,71 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].session_id, "sid-alpha");
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dom_tests {
+    use super::*;
+    use crate::context::{AppearanceSettings, AppearanceSettingsCtx};
+    use videocall_client::VideoCallClient;
+    use wasm_bindgen_futures::JsFuture;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[allow(non_snake_case)]
+    fn RosterHarness() -> Element {
+        let client = use_hook(|| VideoCallClient::new_for_test("local-user"));
+        use_context_provider(|| client.clone());
+        use_context_provider(|| Rc::new(RosterLiveness::default()));
+        let appearance = use_signal(AppearanceSettings::default);
+        use_context_provider(|| AppearanceSettingsCtx(appearance));
+        rsx! {
+            PeerList {
+                peers: Vec::new(),
+                onclose: move |_| {},
+                room_id: "room-2791".to_string(),
+            }
+        }
+    }
+
+    async fn next_frame() {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let _ = gloo_utils::window().request_animation_frame(&resolve);
+        });
+        let _ = JsFuture::from(promise).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_attendants_header_has_no_more_options_menu() {
+        let doc = gloo_utils::document();
+        let mount = doc.create_element("div").unwrap();
+        doc.body().unwrap().append_child(&mount).unwrap();
+        dioxus::web::launch::launch_virtual_dom(
+            VirtualDom::new(RosterHarness),
+            dioxus::web::Config::new().rootelement(mount.clone()),
+        );
+        next_frame().await;
+        next_frame().await;
+
+        let heading = mount
+            .query_selector(".sidebar-header h2")
+            .unwrap()
+            .and_then(|h| h.text_content());
+        assert_eq!(heading.as_deref(), Some("Attendants"));
+        assert!(
+            mount
+                .query_selector(".sidebar-header .header-actions .close-button")
+                .unwrap()
+                .is_some(),
+            "the close button stays in the header"
+        );
+        assert!(
+            mount
+                .query_selector(".sidebar-header [aria-label='More options']")
+                .unwrap()
+                .is_none(),
+            "the peer-list More options menu was removed (issue 2791)"
+        );
+        mount.remove();
     }
 }

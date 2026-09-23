@@ -61,7 +61,7 @@
 # | datagram dropped                            | datagram_drops | videocall-client (WT transport)                        |
 # | handshake failed / Opening handshake failed | handshake_failures | videocall-client (WT transport)                     |
 # | Speaking changed: false -> true             | speaking_transitions (open-mic energy, NOT speech)    | videocall-client mic/VAD        |
-# | audio health (buffer: Nms) for peer: X      | audio_buffer_median_ms per peer   | videocall-client/src/health_reporter.rs |
+# | audio health (buffer: Nms) for peer: X      | audio_buffer_median_ms: median across all samples from all peers (not a per-peer median — pass 3c discards the peer id); since #2760 up to 64 samples share one "Updated audio health xN (from Y): ... | ..." line, which `grep -oE` below still counts individually | videocall-client/src/health_reporter.rs |
 # | "level":"preamble"                          | cores / memory / platform / etc. | videocall-client console-logger initialization |
 # | ProtectiveMode: ENTERED                     | audio-starve cap (#1597) | dioxus-ui/src/components/attendants.rs            |
 # | ProtectiveMode: EMERGENCY cap N->M          | tile collapse       | dioxus-ui/src/components/attendants.rs               |
@@ -75,7 +75,7 @@
 # | Simulcast layer change: active N->M (reason=...) | simulcast_layer shed/restore counts + timeline | videocall-client/src/encode/camera_encoder.rs |
 # | [JITTER_BUFFER] freshness_skip              | freeze episodes (receiver from FILENAME; publisher is the 2nd id, often absent) | videocall-codecs/src/messages.rs (console_line) |
 # | [JITTER_BUFFER] keyframe_arrival            | keyframe arrivals per pair; carries NO simulcast-layer id, so cadence is not derivable | videocall-codecs/src/messages.rs (console_line) |
-# | LAYER_GATE_SKIPS                            | cumulative gate counters; session_id is the PUBLISHER being gated, take the max per pair | videocall-client/src/decode/peer_decode_manager.rs (layer_gate_skips_log_fields) |
+# | LAYER_GATE_SKIPS                            | cumulative gate counters; session_id is the PUBLISHER being gated, take the max per pair. Since #2760 the emitter is debug! and throttled to one line per peer per 30s (first line always emitted), so the max can trail the true total by up to one interval; ABSENT entirely from an e2e-stack corpus, whose config.js pins logLevel:"info" — zero rows there means "dropped by the level", not "no gate skips" | videocall-client/src/decode/peer_decode_manager.rs (layer_gate_skips_log_fields) |
 # | network=                                    | net_downlink, net_rtt | preamble (Navigator.connection API)                  |
 # | battery=                                    | battery_state       | preamble (Navigator.getBattery API)                    |
 #

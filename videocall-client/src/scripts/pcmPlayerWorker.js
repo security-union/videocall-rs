@@ -155,7 +155,9 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         this.lowWatermarkRatio = 0.50;  // drop down to 20%
         this.lastDropWarnTime = 0;
         this.dropWarnCooldownMs = 1000; // rate-limit warnings
-        
+        this.alive = true;
+        this.processCalls = 0;
+
         console.log('Ultra-Fast PCM Player Worklet initialized - JavaScript optimized for maximum performance');
         
         // Setup message handler  
@@ -205,6 +207,14 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
             case 'flush':
                 this.buffer.reset();
                 break;
+
+            case 'stop':
+                this.alive = false;
+                break;
+
+            case 'reportProcessCount':
+                this.port.postMessage({ type: 'processCount', count: this.processCalls });
+                break;
         }
     }
     
@@ -213,8 +223,9 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
      * This is the critical hot path - must be ultra-fast
      */
     process(inputs, outputs, parameters) {
+        this.processCalls++;
         const output = outputs[0];
-        
+
         if (output.length >= 2) {
             // Stereo output - use direct channel access for maximum speed
             this.buffer.pullToChannels(output[0], output[1]);
@@ -222,8 +233,8 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
             // Mono output - pass the same channel twice
             this.buffer.pullToChannels(output[0], output[0]);
         }
-        
-        return true;
+
+        return this.alive;
     }
     
     static get parameterDescriptors() {

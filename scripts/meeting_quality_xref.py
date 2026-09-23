@@ -166,7 +166,15 @@ RE = {
     "audio_tier": re.compile(r"audio tier updated to '(\w+)' \((\d+)kbps"),
     "mic_layers": re.compile(r"MicrophoneEncoder: effective audio (?:simulcast )?layers = (\d+)"),
     "congestion_ceiling": re.compile(r"congestion ceiling (?:cut to|->) (\d+)"),
-    # Updated audio health (buffer: 660ms) for peer: 12175... (from current_user)
+    # Samples count only when the line OPENS with the emitter's prefix (\A):
+    # display_name reaches console lines verbatim with `|(): ` intact.
+    # Coalesced (#2760): Updated audio health x2 (from current_user): audio health
+    # (buffer: 660ms) for peer: 12175 | audio health (buffer: 0ms) for peer: 98123
+    "audio_health_batch": re.compile(r"\AUpdated audio health x\d+ \(from [^)]*\): "),
+    "audio_health_one": re.compile(
+        r"\AUpdated audio health \(buffer:\s*(\d+)ms\) for peer:\s*(\d+)"
+    ),
+    # Applied only AFTER an audio_health_batch prefix match.
     "audio_health": re.compile(r"audio health \(buffer:\s*(\d+)ms\) for peer:\s*(\d+)"),
     # issue 1853 (instrumentation-only): per-receiver audio-scale posture, emitted
     # ~5s from the health loop. ADDITIVE parse contract ONLY — no rule consumes it
@@ -447,10 +455,21 @@ def _classify(meeting, p, epoch, msg):
     if m:
         _ev(p, epoch, "mic_layers", layers=int(m.group(1)))
         return
-    m = RE["audio_health"].search(msg)
+    m = RE["audio_health_batch"].search(msg)
+    if m:
+        for s in RE["audio_health"].finditer(msg, m.end()):
+            _ev(p, epoch, "audio_health", buffer_ms=int(s.group(1)), peer=s.group(2))
+        return
+    m = RE["audio_health_one"].search(msg)
     if m:
         _ev(p, epoch, "audio_health", buffer_ms=int(m.group(1)), peer=m.group(2))
         return
+    if "Updated audio health x" in msg:
+        # Canary, never yet observed: `console_log/color` prepends a header that
+        # would silently zero the \A rules above.
+        sys.stderr.write(
+            f"WARN: audio-health line not at message start: {msg[:60]!r}; its samples are dropped\n"
+        )
     m = RE["ws_backpressure"].search(msg)
     if m:
         _ev(p, epoch, "ws_backpressure",

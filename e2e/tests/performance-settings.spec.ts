@@ -100,13 +100,14 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *   SEND row (this spec's primary coverage; testids unchanged by #1078):
  *   VU gauges:      perf-vu-video / -audio / -screen (one per section)
  *                   readouts: perf-vu-{video,audio,screen}-readout (by id)
- *   Range inputs:   perf-{video,audio,screen}-range-min / -range-max
- *                   (native <input type=range>; audio both enabled, video/screen
- *                   min is DISABLED — the pinned base-layer floor)
- *   Auto toggles:   perf-{video,audio,screen}-auto (have aria-pressed)
+ *   Range inputs:   perf-video-range-min / -range-max (native <input type=range>).
+ *                   Audio and screen publish ONE layer, so their cells render NO
+ *                   slider, NO `-send-rungs` strip and NO `-range-value` caption.
+ *   Reset button:   perf-{video,audio,screen}-auto (shown only while constrained)
  *   Help buttons:   perf-{video,audio,screen}-help (aria-expanded popover)
- *   Range value:    perf-{video,audio,screen}-range-value
- *   Fixed badge:    perf-{video,audio,screen}-fixed-badge
+ *   Range value:    perf-video-range-value (video only — see above)
+ *   Send summary:   perf-{video,audio,screen}-send-summary (all three; for audio
+ *                   and screen it is the cell's only state line)
  *
  *   RECEIVE row (#1078; covered by the "Receive-side controls" describe block):
  *   VU gauges:      perf-vu-recv-video / -audio / -screen
@@ -117,7 +118,7 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *                           receiver-observable bitrate),
  *                           "Not receiving" placeholder when nothing decoded.
  *   Range inputs:   perf-recv-{video,audio,screen}-range-min / -range-max
- *   Auto toggles:   perf-recv-{video,audio,screen}-auto (have aria-pressed)
+ *   Auto toggles:   perf-recv-{video,audio,screen}-auto
  *   Help buttons:   perf-recv-{video,audio,screen}-help
  *   Range value:    perf-recv-{video,audio,screen}-range-value
  *   Fixed badge:    perf-recv-{video,audio,screen}-fixed-badge
@@ -397,6 +398,15 @@ async function selectReceiveDirection(page: Page): Promise<void> {
   await expect(page.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible({ timeout: 5_000 });
 }
 
+/**
+ * Force video to three layers so its SEND slider renders (a one-layer ladder
+ * renders no slider): `capabilityMaxLayersOverride` beats a weak runner's
+ * sniffed core count.
+ */
+async function enableThreeLayerSimulcast(page: Page): Promise<void> {
+  await enableSimulcastFlag(page.context(), 3, { capabilityMaxLayersOverride: 3 });
+}
+
 /** Read and parse localStorage["vc_performance_quality"], or null if unset. */
 async function readPerfPref(page: Page): Promise<PerformancePreference | null> {
   const raw = await page.evaluate((key) => localStorage.getItem(key), PERF_PREF_KEY);
@@ -457,14 +467,6 @@ async function expectPinnedFloor(minInput: Locator, expectedValuetext?: string):
   // kind but VIDEO. Callers that pass this MUST therefore assert the ladder depth
   // (`max="2"`), as both video callers in this file do.
   //
-  // Passing it from a caller that sits above a `test.skip` ladder-depth guard buys
-  // nothing: on a 1-layer runner the assertion passes VACUOUSLY (depth 1 → buggy ==
-  // fixed) and the test then reports "skipped", so it contributes no signal either
-  // way. To be precise about the mechanism — MEASURED with a probe spec, because an
-  // earlier revision of this comment asserted the opposite without checking: a
-  // genuinely failing assertion above `test.skip` is reported as `1 failed`, with the
-  // full diff. Playwright does NOT swallow it; the hard `expect` throws before the
-  // skip is reached. The hazard is silent vacuity, not a hidden failure.
   if (expectedValuetext !== undefined) {
     await expect(
       minInput,
@@ -485,6 +487,7 @@ test.describe("Performance settings panel (#961)", () => {
   test("panel renders: 3 VU gauges, 3 threshold groups, all Auto by default (enabled sliders, thumbs at extremes)", async ({
     page,
   }) => {
+    await enableThreeLayerSimulcast(page);
     await joinMeeting(page, "render");
     await openPerformanceDrawer(page);
     // Both directions render together now (no toggle); this guards the send
@@ -503,9 +506,16 @@ test.describe("Performance settings panel (#961)", () => {
     // CONDITIONALLY RENDERED — absent at the default full range, present only when
     // constrained. The `perf-{stream}-auto` testid was REPURPOSED onto Reset.)
     for (const stream of ["video", "audio", "screen"] as const) {
-      await expect(panel.locator(`[data-testid="perf-${stream}-range-min"]`)).toBeVisible();
-      await expect(panel.locator(`[data-testid="perf-${stream}-range-max"]`)).toBeVisible();
       await expect(panel.locator(`[data-testid="perf-${stream}-help"]`)).toBeVisible();
+      await expect(panel.locator(`[data-testid="perf-${stream}-send-summary"]`)).toBeVisible();
+    }
+    // Only VIDEO has a multi-layer SEND ladder, so only VIDEO renders a slider.
+    // Audio and screen publish one layer each.
+    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toBeVisible();
+    await expect(panel.locator('[data-testid="perf-video-range-max"]')).toBeVisible();
+    for (const stream of ["audio", "screen"] as const) {
+      await expect(panel.locator(`[data-testid="perf-${stream}-range-min"]`)).toHaveCount(0);
+      await expect(panel.locator(`[data-testid="perf-${stream}-range-max"]`)).toHaveCount(0);
     }
 
     // ── Default = full automatic range: the Reset button is ABSENT (nothing to
@@ -515,40 +525,33 @@ test.describe("Performance settings panel (#961)", () => {
     //    ceiling (max) thumb moves, defaulting to the top position = the full
     //    ladder.
     //
-    // CAPABILITY note: VIDEO's effective depth is
-    // `min(flag, capability_max_simulcast_layers())` and clamps to 1 on weak
-    // (<6-core) runners. AUDIO and SCREEN are always 1 since issues #2279 and
-    // #2343 — screen's arm of
-    // `send_layer_labels_with_top` ignores `layer_max` entirely, so neither the
-    // flag nor the core count moves it. We read each ceiling thumb's `max` attribute (== effective
-    // layers - 1) from the DOM and assert the DEFAULT ceiling == that max (the
-    // "default == effective max" guarantee), so the single loop is correct for all
-    // three regardless of runner capability. The pinned-floor assertions are
-    // capability-independent.
+    // The ceiling thumb's `max` attribute is read from the DOM so a ladder-depth
+    // change moves the tick count with it rather than failing on a literal.
     for (const stream of ["video", "screen", "audio"] as const) {
       // Reset not rendered while at the full default ladder.
       await expect(panel.locator(`[data-testid="perf-${stream}-auto"]`)).toHaveCount(0);
-      const minInput = panel.locator(`[data-testid="perf-${stream}-range-min"]`);
-      const maxInput = panel.locator(`[data-testid="perf-${stream}-range-max"]`);
-      // FLOOR thumb is PINNED at the base layer (position 0): the base is always
-      // published. Non-interactive WITHOUT the `disabled` attr (WebKit fix — see
-      // expectPinnedFloor).
-      await expectPinnedFloor(minInput);
-      // CEILING thumb is interactive and defaults to the TOP position = full
-      // ladder. Read the rendered top position (the `max` attr) and assert the
-      // default value matches it — works for a 1-, 2-, or 3-layer ladder.
-      await expect(maxInput).toBeEnabled();
-      const topPos = await maxInput.getAttribute("max");
-      expect(topPos, "ceiling slider exposes its max position").not.toBeNull();
-      await expect(maxInput).toHaveValue(topPos as string);
-      // TICK MARKS: one decorative notch per step position (0..=max → max+1
-      // ticks), aligned to the thumb stops. The ticks layer is aria-hidden +
-      // pointer-events:none (must never block the drag — the WebKit fix).
-      const expectedTicks = Number(topPos) + 1;
-      const ticksLayer = panel.locator(`[data-testid="perf-${stream}-range-ticks"]`);
-      await expect(ticksLayer).toHaveAttribute("aria-hidden", "true");
-      await expect(ticksLayer.locator(".perf-range-tick")).toHaveCount(expectedTicks);
     }
+
+    const minInput = panel.locator('[data-testid="perf-video-range-min"]');
+    const maxInput = panel.locator('[data-testid="perf-video-range-max"]');
+    // FLOOR thumb is PINNED at the base layer (position 0): the base is always
+    // published. Non-interactive WITHOUT the `disabled` attr (WebKit fix — see
+    // expectPinnedFloor).
+    await expectPinnedFloor(minInput);
+    // CEILING thumb is interactive and defaults to the TOP position = full
+    // ladder. Read the rendered top position (the `max` attr) and assert the
+    // default value matches it.
+    await expect(maxInput).toBeEnabled();
+    const topPos = await maxInput.getAttribute("max");
+    expect(topPos, "ceiling slider exposes its max position").not.toBeNull();
+    await expect(maxInput).toHaveValue(topPos as string);
+    // TICK MARKS: one decorative notch per step position (0..=max → max+1
+    // ticks), aligned to the thumb stops. The ticks layer is aria-hidden +
+    // pointer-events:none (must never block the drag — the WebKit fix).
+    const expectedTicks = Number(topPos) + 1;
+    const ticksLayer = panel.locator('[data-testid="perf-video-range-ticks"]');
+    await expect(ticksLayer).toHaveAttribute("aria-hidden", "true");
+    await expect(ticksLayer.locator(".perf-range-tick")).toHaveCount(expectedTicks);
   });
 
   test("desktop layout: the Quality-controls perf cards stay contained in the drawer (#1208/#1213, adapted to the drawer)", async ({
@@ -610,6 +613,7 @@ test.describe("Performance settings panel (#961)", () => {
   test("Reset button: absent at the full range, appears after a thumb drag, and clears back to the full range when clicked (#1131)", async ({
     page,
   }) => {
+    await enableThreeLayerSimulcast(page);
     await joinMeeting(page, "reset_button");
     await openPerformanceDrawer(page);
     await selectSendDirection(page);
@@ -629,22 +633,14 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(resetBtn).toHaveCount(0);
     await expectPinnedFloor(minInput);
     await expect(maxInput).toBeEnabled();
-    // CAPABILITY-ADAPTIVE: read the rendered top position (== effective layers - 1).
     const topPosStr = await maxInput.getAttribute("max");
     expect(topPosStr, "ceiling slider exposes its max position").not.toBeNull();
     const topPos = Number(topPosStr);
     await expect(maxInput).toHaveValue(String(topPos));
 
-    // On a runner whose capability ceiling clamped the publisher to a SINGLE layer
-    // (topPos === 0, <6-core CI — see helpers/simulcast-config.ts), there is no
-    // ceiling to lower: the drag is impossible and Reset can never appear. Skip the
-    // drag/clear assertions there (the pinned-floor + default-ceiling assertions
-    // above already ran and are capability-independent).
-    test.skip(
-      topPos < 1,
-      "runner capability ceiling clamped the publisher to a single layer; the SEND " +
-        "ceiling has only one position and cannot be lowered (see helpers/simulcast-config.ts)",
-    );
+    // The flag above forces three layers, so the ceiling has positions 0..=2. A
+    // silent skip here would hide the override decaying; hold the premise instead.
+    expect(topPos, "capability override kept the SEND ladder at three layers").toBe(2);
 
     // Lower the ceiling by one (publish fewer top layers) → Reset APPEARS as a live
     // button. (The base floor stays pinned at 0 throughout.)
@@ -669,6 +665,11 @@ test.describe("Performance settings panel (#961)", () => {
   test("help popover: '?' opens an explanation, Escape and outside-click dismiss it", async ({
     page,
   }) => {
+    // Depth >= 2 is required: at depth 1 the video help serves
+    // HELP_VIDEO_SEND_SINGLE, which describes no handle and no Reset, so the three
+    // laddered assertions below would fail. No suppressed testid is used here, so a
+    // testid sweep does not find this coupling.
+    await enableSimulcastFlag(page.context(), 3, { capabilityMaxLayersOverride: 3 });
     await joinMeeting(page, "help_popover");
     await openPerformanceDrawer(page);
     await selectSendDirection(page);
@@ -771,6 +772,7 @@ test.describe("Performance settings panel (#961)", () => {
   test("setting a video threshold persists to localStorage and restores after reload", async ({
     page,
   }) => {
+    await enableThreeLayerSimulcast(page);
     await joinMeeting(page, "persist");
     await openPerformanceDrawer(page);
     await selectSendDirection(page);
@@ -779,22 +781,14 @@ test.describe("Performance settings panel (#961)", () => {
 
     // VIDEO SEND is a LAYER-COUNT control: the floor (min) thumb is PINNED at the
     // base layer (non-interactive, NOT `disabled` — WebKit fix), and lowering the
-    // CEILING (max) thumb publishes fewer top layers. CAPABILITY-ADAPTIVE: read the
-    // rendered top position (== effective layers - 1); on a single-layer runner
-    // (<6-core CI, topPos === 0) there is no ceiling to lower, so skip the
-    // drag/persist/reload assertions there (see helpers/simulcast-config.ts).
+    // CEILING (max) thumb publishes fewer top layers.
     const minInput = panel.locator('[data-testid="perf-video-range-min"]');
     const maxInputLoc = panel.locator('[data-testid="perf-video-range-max"]');
     await expectPinnedFloor(minInput);
     const topPosStr = await maxInputLoc.getAttribute("max");
     expect(topPosStr, "ceiling slider exposes its max position").not.toBeNull();
     const topPos = Number(topPosStr);
-    test.skip(
-      topPos < 1,
-      "runner capability ceiling clamped the publisher to a single layer; the SEND " +
-        "ceiling cannot be lowered, so there is nothing to persist (see " +
-        "helpers/simulcast-config.ts)",
-    );
+    expect(topPos, "capability override kept the SEND ladder at three layers").toBe(2);
 
     // Drag the ceiling DOWN by one → publish (topPos) layers (L0..=L{topPos-1}).
     // The stored layer COUNT is `lowered + 1` (position+1). With the standard
@@ -924,9 +918,8 @@ test.describe("Performance settings panel (#961)", () => {
     // lookup and the fixed layer-mode lookup return the SAME string — the assertions
     // would pass identically on fixed and unfixed code. With 3 rungs VIDEO diverges
     // (base `180p` vs top `720p`), which is what makes it a guard rather than a
-    // tautology. SCREEN no longer diverges at any flag value (issue #2343 collapsed it
-    // to one rung) and neither does AUDIO (#2279) — see the note above
-    // `expectedFloorValuetext`.
+    // tautology. SCREEN no longer diverges at any flag value (it is collapsed to one
+    // rung) and neither does AUDIO; neither renders a slider at all.
     //
     // `capabilityMaxLayersOverride: 3` is load-bearing for the CPU-clamped VIDEO kind:
     // video takes `min(flag, capability_max_simulcast_layers())`, so on a
@@ -976,13 +969,10 @@ test.describe("Performance settings panel (#961)", () => {
     // are the `aria-valuetext` ones below — if a future cleanup deletes the dead-badge
     // check, KEEP those (or move them, with the ladder-depth guard above, to a
     // dedicated a11y test; there is no a11y-focused spec in e2e/tests/ yet to host
-    // them). `SEND ceiling thumb is grabbable…` carries a capability-independent
-    // duplicate of the audio floor assertion for exactly this reason.
+    // them).
     //
-    // The expected `aria-valuetext` per kind is the BASE of that kind's lowest-first
-    // ladder — video `180p` on its 3-rung ladder, screen `Native` and audio `Single`
-    // on their single rungs. Unfixed, `position_label`'s tier inversion made video
-    // announce the TOP (`720p`).
+    // Unfixed, `position_label`'s tier inversion made video announce the TOP
+    // (`720p`).
     //
     // MUTATION RUN: reverting the CALL SITE only (`min_valuetext =
     // position_label(sel.min_pos, &labels)`) while leaving the helper intact fails
@@ -1004,28 +994,16 @@ test.describe("Performance settings panel (#961)", () => {
     // vacuity into a loud failure, which is why it was added.)
     //
     //
-    // SCREEN is `Native` (issue #2343). Screen no longer simulcasts: the Screen arm
-    // of `send_layer_labels_with_top` returns a single `screen_display_label("native")`
-    // and ignores `layer_max`, so its ladder is `["Native"]` whatever the flag says.
-    //
-    // BE HONEST ABOUT WHAT THE SCREEN AND AUDIO ITERATIONS PROVE NOW. The mutation
-    // this test was built for — `position_label`'s tier inversion making the floor
-    // announce the TOP rung — is only detectable when base != top, which now holds for
-    // VIDEO alone (`180p` vs `720p`). That is where this test's discriminating power
-    // lives ENTIRELY. Screen and audio are single-rung, so the inverted and correct
-    // lookups return the same string; both are retained as LABEL guards. Screen still
-    // fails if its ladder regains rungs (the loop would read `720p` at the floor) or if
-    // `screen_display_label`'s `native` arm is dropped (which returns `"?"`); audio
-    // still fails if the floor regains a ladder BITRATE — `12k` against a 48 kbps
-    // publisher is the wrong number #2279 removed. Do not cite either as inversion
-    // coverage.
-    const expectedFloorValuetext = { video: "180p", audio: "Single", screen: "Native" } as const;
+    // AUDIO and SCREEN publish one layer, so their cells render no slider at all —
+    // there is no floor left to announce. VIDEO is
+    // where this test's discriminating power lived ENTIRELY anyway (`180p` vs `720p`);
+    // for the other two the surviving property is that no control renders.
     for (const stream of ["video", "audio", "screen"] as const) {
       await expect(panel.locator(`[data-testid="perf-${stream}-fixed-badge"]`)).toHaveCount(0);
-      await expectPinnedFloor(
-        panel.locator(`[data-testid="perf-${stream}-range-min"]`),
-        expectedFloorValuetext[stream],
-      );
+    }
+    await expectPinnedFloor(panel.locator('[data-testid="perf-video-range-min"]'), "180p");
+    for (const stream of ["audio", "screen"] as const) {
+      await expect(panel.locator(`[data-testid="perf-${stream}-range-min"]`)).toHaveCount(0);
     }
   });
 
@@ -1105,27 +1083,34 @@ test.describe("Performance settings panel (#961)", () => {
   });
 
   test("send rung strip + directional arrows render (#1131)", async ({ page }) => {
-    // §2: AUDIO now renders a SEND rung strip with one pip (#2279). The strip is
-    // present even single-page with no peers, so it is the deterministic anchor
-    // for the strip markup. §1: each side title is prefixed with an
-    // aria-hidden directional arrow (`.perf-dir-arrow`).
+    // §2: the SEND rung strip belongs to VIDEO alone. Audio and screen publish one
+    // layer, so they render no rung strip along with the rest of their layer
+    // control. §1: each side title is
+    // prefixed with an aria-hidden directional arrow (`.perf-dir-arrow`).
+    //
+    // The 3-layer override is load-bearing: at the committed
+    // `experimentalSimulcastMaxLayers: 1` video's strip is suppressed too, and every
+    // assertion below would be checking absences only.
+    await enableSimulcastFlag(page.context(), 3, { capabilityMaxLayersOverride: 3 });
     await joinMeeting(page, "send_rungs");
     await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
     const panel = perfDrawer(page);
 
-    // The audio send rung strip is a role=img container with at least one pip.
-    const audioStrip = panel.locator('[data-testid="perf-audio-send-rungs"]');
-    await expect(audioStrip).toBeVisible({ timeout: 5_000 });
-    await expect(audioStrip).toHaveAttribute("role", "img");
-    // EXACTLY one pip: the publisher emits one audio layer (#2279), so a second pip
-    // would mean the strip and the publisher disagree. `>= 1` passed on both the
-    // 3-layer and the 1-layer build, which is why it is pinned to the count here.
-    const audioPips = panel.locator('[data-testid^="perf-audio-send-rung-"]');
-    await expect(audioPips).toHaveCount(1);
-    await expect(panel.locator('[data-testid="perf-audio-send-rung-0"]')).toBeVisible();
-    await expect(panel.locator('[data-testid="perf-audio-send-rung-1"]')).toHaveCount(0);
+    // The video send rung strip is a role=img container with one pip per layer.
+    const videoStrip = panel.locator('[data-testid="perf-video-send-rungs"]');
+    await expect(videoStrip).toBeVisible({ timeout: 5_000 });
+    await expect(videoStrip).toHaveAttribute("role", "img");
+    await expect(panel.locator('[data-testid^="perf-video-send-rung-"]')).toHaveCount(3);
+
+    // Audio and screen: no strip, and no stray pip from it.
+    for (const stream of ["audio", "screen"] as const) {
+      await expect(panel.locator(`[data-testid="perf-${stream}-send-rungs"]`)).toHaveCount(0);
+      await expect(panel.locator(`[data-testid^="perf-${stream}-send-rung-"]`)).toHaveCount(0);
+      // The summary line survives as the cell's state readout.
+      await expect(panel.locator(`[data-testid="perf-${stream}-send-summary"]`)).toBeVisible();
+    }
 
     // §1 directional arrows: present on BOTH a Sending and a Receiving title, and
     // aria-hidden so they are decorative (the title text is the a11y label).
@@ -1146,60 +1131,65 @@ test.describe("Performance settings panel (#961)", () => {
     // breaking the OFF-state premise. The caption must NOT falsely claim to be
     // "Sending" — it reads the future "Will send {N} … when {…}" form using the
     // configured count, and names each kind's trigger.
-    await enableSimulcastFlag(page.context(), 3);
+    // The capability override keeps VIDEO at 3 layers so its caption renders at all
+    // (a 1-layer ladder renders no caption).
+    await enableSimulcastFlag(page.context(), 3, { capabilityMaxLayersOverride: 3 });
     await joinMeeting(page, "caption_source_aware", { cameraOff: true });
     await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
     const panel = perfDrawer(page);
-    // Per-kind trigger phrase in the OFF-state caption.
-    const triggers: Record<string, RegExp> = {
-      video: /Will send \d+ layers? when the camera is on/,
-      screen: /Will send \d+ layers? when sharing/,
-      audio: /Will send \d+ layers? when the mic is on/,
+    // VIDEO still has a slider, so it still has the position caption.
+    const videoCaption = panel.locator('[data-testid="perf-video-range-value"]');
+    await expect(videoCaption).toHaveText(/Will send \d+ layers? when the camera is on/);
+    await expect(videoCaption).not.toContainText("Sending");
+
+    // AUDIO and SCREEN have no control and so no caption; the OFF-state "never
+    // claims to be Sending" property now lives on the summary line,
+    // which is their entire state readout.
+    const summaryTriggers: Record<string, RegExp> = {
+      audio: /Will send audio when the mic is on/,
+      screen: /Will send up to your screen's own resolution when you share/,
     };
-    for (const stream of ["video", "audio", "screen"] as const) {
-      const caption = panel.locator(`[data-testid="perf-${stream}-range-value"]`);
-      // Future form present; never the present-tense "Sending …" while OFF.
-      await expect(caption).toHaveText(triggers[stream]);
-      await expect(caption).not.toContainText("Sending");
+    for (const stream of ["audio", "screen"] as const) {
+      await expect(panel.locator(`[data-testid="perf-${stream}-range-value"]`)).toHaveCount(0);
+      const summary = panel.locator(`[data-testid="perf-${stream}-send-summary"]`);
+      await expect(summary).toHaveText(summaryTriggers[stream]);
+      await expect(summary).not.toContainText("Sending");
     }
   });
 
-  // Issue #2343: the Screen arm of `send_layer_labels_with_top` returns a single
-  // `screen_display_label("native")` == "Native" and IGNORES `layer_max`, so the
-  // strip is one pip whatever the flag says. `enableSimulcastFlag(ctx, 3)` is kept
-  // to prove that flag-independence — and it is what makes this fail on the old
-  // code two ways: the old arm built the strip from `simulcast_screen_layers` so a
-  // flag of 3 rendered THREE pips reading `720p`/`1080p`/`1440p`.
-  //
-  // ANCHOR: the label is the pip's `.perf-rung__label` child span, which renders
-  // `rung.res_label` bare; the pip's `title` is a composed sentence and is the
-  // wrong surface to assert on.
-  test("screen SEND rung strip is a single Native pip, even with the simulcast flag at 3", async ({
+  // Screen publishes ONE layer whatever the flag says, so its SEND cell renders no
+  // layer control — no slider, no rung strip, no position
+  // caption. `enableSimulcastFlag(ctx, 3, {capabilityMaxLayersOverride: 3})` is what
+  // makes this a guard rather than a tautology: it is the setting under which VIDEO
+  // renders all three, so the screen absences below are flag-independence, not a
+  // globally-empty panel.
+  test("screen SEND cell renders no layer control, even with the simulcast flag at 3", async ({
     page,
   }) => {
-    await enableSimulcastFlag(page.context(), 3);
+    await enableSimulcastFlag(page.context(), 3, { capabilityMaxLayersOverride: 3 });
     await joinMeeting(page, "screen_single_rung", { cameraOff: true });
     await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
     const panel = perfDrawer(page);
 
-    const strip = panel.locator('[data-testid="perf-screen-send-rungs"]');
-    await expect(strip).toBeVisible({ timeout: 5_000 });
+    // Video's strip proves the panel mounted; without it every assertion below is an
+    // absence that a blank panel would satisfy.
+    await expect(panel.locator('[data-testid="perf-video-send-rungs"]')).toBeVisible({
+      timeout: 5_000,
+    });
 
-    // Exactly one rung — the whole point of #2343. `toHaveCount` retries, so this
-    // does not race the strip's first paint.
-    const pips = panel.locator('[data-testid^="perf-screen-send-rung-"]');
-    await expect(pips, "screen must publish exactly ONE simulcast rung").toHaveCount(1);
-
-    // ...and it is layer_id 0, named for the capture itself rather than a tier box.
-    await expect(panel.locator('[data-testid="perf-screen-send-rung-0"]')).toBeVisible();
-    await expect(
-      pips.first().locator(".perf-rung__label"),
-      "the single screen rung must read Native, not a tier resolution",
-    ).toHaveText("Native");
+    for (const suffix of ["range-min", "range-max", "send-rungs", "range-value"] as const) {
+      await expect(
+        panel.locator(`[data-testid="perf-screen-${suffix}"]`),
+        `screen publishes one layer, so perf-screen-${suffix} must not render`,
+      ).toHaveCount(0);
+    }
+    await expect(panel.locator('[data-testid^="perf-screen-send-rung-"]')).toHaveCount(0);
+    // The summary line survives as the cell's state readout.
+    await expect(panel.locator('[data-testid="perf-screen-send-summary"]')).toBeVisible();
   });
 
   // The idle promise deliberately names NO resolution: the reachable top rung
@@ -1257,12 +1247,13 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     await expect(panel.locator('[data-testid="perf-direction-receive"]')).toHaveCount(0);
     await expect(panel.locator('[data-testid="perf-direction-send"]')).toHaveCount(0);
 
-    // For EVERY kind (video / audio / content) the Send-side meter + dual-range
-    // AND the Receive-side meter + dual-range must be visible AT THE SAME TIME.
+    // For EVERY kind (video / audio / content) the Send-side meter + summary AND
+    // the Receive-side meter + dual-range must be visible AT THE SAME TIME.
     // Asserting both sides per kind is what makes this a real regression guard
     // for the "show both directions" requirement: a redesign that hid one side
     // (or only kept video's receive column) would fail here, whereas checking a
-    // single direction would silently pass.
+    // single direction would silently pass. The SEND anchor is the summary line,
+    // not a slider: only video has a multi-layer ladder to render one.
     for (const kind of ["video", "audio", "screen"] as const) {
       // Send side present…
       await expect(
@@ -1270,8 +1261,8 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
         `${kind} SEND meter visible`,
       ).toBeVisible();
       await expect(
-        panel.locator(`[data-testid="perf-${kind}-range-min"]`),
-        `${kind} SEND min thumb visible`,
+        panel.locator(`[data-testid="perf-${kind}-send-summary"]`),
+        `${kind} SEND summary visible`,
       ).toBeVisible();
       // …and the receive side present simultaneously.
       await expect(

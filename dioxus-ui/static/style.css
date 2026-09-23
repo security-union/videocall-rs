@@ -2080,7 +2080,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .grid-item-pinned {
   position: fixed;
   top: 0;
-  bottom: 0;
+  bottom: var(--meeting-footer-h, 0px);
   left: var(--drawer-left-reserve, 0px);
   right: var(--drawer-right-reserve, 0px);
   width: auto;
@@ -2093,7 +2093,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .grid-item-pinned .canvas-container {
-  width: min(100%, calc(100vh * 16 / 9));
+  width: min(100%, calc((100vh - var(--meeting-footer-h, 0px)) * 16 / 9));
   height: min(
     100%,
     calc(
@@ -2119,7 +2119,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .split-peer-tile.grid-item-pinned {
   position: fixed;
   top: 0;
-  bottom: 0;
+  bottom: var(--meeting-footer-h, 0px);
   left: var(--drawer-left-reserve, 0px);
   right: var(--drawer-right-reserve, 0px);
   width: auto;
@@ -2308,7 +2308,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   top: 0;
   left: 0;
   width: 100%;
-  height: 100%;
+  height: calc(100% - var(--meeting-footer-h, 0px));
   z-index: 100;
 }
 
@@ -2603,60 +2603,6 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .context-menu-item svg {
   flex-shrink: 0;
-}
-
-/* Meeting Info Panel */
-.meeting-info-compact {
-  padding: var(--space-3) var(--space-4);
-  border-bottom: 1px solid var(--glass-bg-hover);
-  font-size: var(--fs-4);
-}
-
-.info-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: var(--space-1) 0;
-}
-
-.info-label {
-  color: var(--text-on-glass-faint);
-}
-
-.info-value {
-  color: var(--text-primary);
-  font-weight: 500;
-  display: flex;
-  align-items: center;
-  gap: 0.375rem;
-}
-
-.live-dot {
-  width: 6px;
-  height: 6px;
-  background: var(--error);
-  border-radius: 50%;
-  animation: blink 1.5s ease-in-out infinite;
-}
-
-.status-active {
-  color: var(--success);
-}
-
-.status-ended {
-  color: var(--error-text);
-}
-
-@keyframes blink {
-
-  0%,
-  100% {
-    opacity: 1;
-  }
-
-  50% {
-    opacity: 0.3;
-  }
 }
 
 /* ============================================================
@@ -5219,12 +5165,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   visibility: hidden;
 }
 
-/* Under 700px the preview stacks below the controls, so the topmost row can
-   reach the top of `.settings-panel`'s scroll box and its upward bubble is
-   clipped; on wider viewports a downward bubble would cover the sliders
+/* Under 59.75em (956px) the preview stacks below the controls, so the topmost
+   row can reach the top of `.settings-panel`'s scroll box and its upward bubble
+   is clipped; on wider viewports a downward bubble would cover the sliders
    beneath it. (0,2,0) beats the base placement; the offset matches the
    narrow-viewport rule. */
-@media (max-width: 700px) {
+@media (max-width: 59.75em) {
   .speaker-highlight-help-icon--below .speaker-highlight-help-tip {
     top: calc(100% + 8px);
     bottom: auto;
@@ -6124,8 +6070,9 @@ html[data-theme="light"] .decode-paused-pill-action {
 /* Mobile ≤639px: tighter chrome, swap the full label for the compact count,
    and raise the grid-mode bottom anchor to clear the mobile controls dock. The
    dock shrinks at @media (max-width: 640px) (NOT 568px) to button 2.75rem ≈44px
-   + padding 0.75rem×2 (24px) + 2px border ≈70px tall, at bottom: 1rem (16px), so
-   its top edge is ≈86px; pill bottom 98px = 86px + ~12px gap. At exactly 640px
+   + padding 0.75rem×2 (24px) + 2px border ≈70px tall, 1rem (16px) above the
+   meeting footer, so its top edge is ≈86px above it; pill bottom 98px = 86px +
+   ~12px gap, both measured from the footer. At exactly 640px
    the pill uses the desktop 112px clearance while the dock is already mobile
    (top ~86px), so the pill sits comfortably above it — the 639/640 one-pixel
    breakpoint offset is harmless. The SS-mode `top:12px` override above has higher
@@ -6136,7 +6083,7 @@ html[data-theme="light"] .decode-paused-pill-action {
     padding: 0 5px 0 10px;
     gap: 7px;
     max-width: calc(100% - 16px);
-    bottom: 98px;
+    bottom: calc(98px + var(--meeting-footer-h, 0px));
   }
   .decode-paused-pill-label {
     display: none;
@@ -7240,6 +7187,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .appearance-settings-panel {
   display: block;
+  isolation: isolate;
 }
 
 .appearance-section {
@@ -7517,18 +7465,32 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: flex;
   align-items: flex-start;
   width: var(--speaker-swatch-row-width);
-  gap: var(--space-2);
+  column-gap: var(--space-2);
+  row-gap: var(--space-3);
   flex-wrap: wrap;
-  overflow: hidden;
-  padding: 2px 0;
+  /* issue 2793: the delete badge and the selection/focus rings paint outside
+     each 24px item, so the row must not clip them. */
+  overflow: visible;
+  padding: 8px 0;
+}
+
+.color-swatch-item {
+  position: relative;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
 }
 
 .color-swatch {
   position: relative;
+  display: block;
   width: 24px;
   height: 24px;
   flex: 0 0 auto;
   margin: 0;
+  padding: 0;
+  appearance: none;
+  -webkit-tap-highlight-color: transparent;
   border-radius: var(--radius-pill);
   border: 1.5px solid var(--settings-swatch-border);
   background-color: var(--glow-color,
@@ -7547,63 +7509,128 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   border-color: var(--settings-swatch-border-hover);
 }
 
-.color-swatch:focus-visible {
-  box-shadow: inset 0 0 0 2px var(--focus-ring);
-  border-color: var(--settings-swatch-border-hover);
-}
-
 .color-swatch.selected {
-  /* Remove glow effect, keep only border for selection */
   box-shadow: none;
   border-color: var(--settings-swatch-border-hover);
 }
 
+.color-swatch-item .color-swatch::after {
+  content: "";
+  position: absolute;
+  inset: -5.5px;
+  border: 2px solid var(--settings-swatch-selected-ring);
+  border-radius: var(--radius-pill);
+  opacity: 0;
+  transform: scale(0.8);
+  pointer-events: none;
+  transition:
+    opacity 0.16s ease,
+    transform 0.16s ease;
+}
+
+.color-swatch-item .color-swatch.selected::after {
+  opacity: 1;
+  transform: none;
+}
+
+.color-swatch:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
+.color-swatch.selected:focus-visible {
+  outline-offset: 5px;
+}
+
 .color-swatch-delete-btn {
   position: absolute;
-  /* Inset to the swatch's top-right corner (was top/right: -6px, which spilled
-     outside the swatch box and got cropped by `.color-swatches { overflow: hidden }`
-     — issue #1406). At 0/0 the whole button renders inside the swatch's 24px box,
-     so it is never clipped regardless of which row/cell the swatch lands in.
-    Sized 16px with transparent hit-slop so the visible glyph stays compact
-    while the hit target still meets 24px minimum guidance. */
-  top: 0;
-  right: 0;
-  width: 16px;
-  height: 16px;
-  padding: 4px;
+  top: -9px;
+  right: -9px;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  appearance: none;
+  border: none;
   display: flex;
   align-items: center;
   justify-content: center;
-  box-sizing: content-box;
-  background: var(--error);
-  border: none;
   border-radius: var(--radius-pill);
-  color: var(--text-primary);
+  background: var(--settings-swatch-delete-bg);
+  color: var(--on-dark-text);
+  box-shadow: 0 0 0 2px var(--surface);
   cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  /* issue 2793: a concealed badge must not take clicks meant for the swatch. */
   opacity: 0;
+  pointer-events: none;
+  transform: scale(0.85);
   transition:
     opacity 0.14s ease,
-    background 0.14s ease;
-  padding: 0;
+    transform 0.14s ease,
+    filter 0.14s ease;
 }
 
-.color-swatch:has(.color-swatch-delete-btn):hover .color-swatch-delete-btn {
+.color-swatch-delete-btn svg {
+  width: 10px;
+  height: 10px;
+}
+
+.color-swatch-item:has(:focus-visible) .color-swatch-delete-btn {
   opacity: 1;
+  pointer-events: auto;
+  transform: none;
 }
 
-/* Keyboard parity: show delete control when focus enters a swatch. */
-.color-swatch:has(.color-swatch-delete-btn):focus-within .color-swatch-delete-btn {
-  opacity: 1;
+@media (hover: hover) {
+  .color-swatch-item:hover .color-swatch-delete-btn {
+    opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
+
+  .color-swatch-delete-btn:hover {
+    filter: brightness(1.12);
+  }
 }
 
-.color-swatch-delete-btn:hover {
-  background: var(--error);
+/* Touch has no hover: reveal only on the selected swatch, where a stray tap
+   on the badge's overlap selects nothing new. */
+@media (hover: none), (pointer: coarse) {
+  .color-swatch-item:has(.color-swatch.selected) .color-swatch-delete-btn {
+    opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
+
+  .color-swatch-delete-btn::before {
+    content: "";
+    position: absolute;
+    inset: -3px;
+    border-radius: var(--radius-pill);
+  }
 }
 
 .color-swatch-delete-btn:focus-visible {
-  opacity: 1;
-  outline: 2px solid var(--text-primary);
-  outline-offset: 1px;
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* (0,3,1) beats the light theme's (0,2,1) `.settings-panel *` colour blanket,
+   which also lands on the glyph's own svg and line elements. */
+html[data-theme="light"] .settings-panel .color-swatch-delete-btn,
+html[data-theme="light"] .settings-panel .color-swatch-delete-btn * {
+  color: var(--on-dark-text);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .color-swatch-item .color-swatch::after,
+  .color-swatch-delete-btn {
+    transition: none;
+    transform: none;
+  }
 }
 
 .add-color-btn {
@@ -8122,6 +8149,9 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   padding-left: 0;
   border-left: none;
   position: relative;
+  /* issue 2793: the tile's real glow floods behind the controls, never over
+     the swatches it is previewing. */
+  z-index: -1;
   overflow: visible;
   justify-self: end;
   align-self: start;
@@ -8132,17 +8162,16 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   margin-top: 10px;
   font-size: var(--fs-3);
   line-height: 1.25;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   white-space: normal;
   overflow: visible;
   text-overflow: unset;
-  opacity: 0.75;
   text-align: center;
   width: max-content;
   max-width: 220px;
 }
 
-@media (max-width: 700px) {
+@media (max-width: 59.75em) {
   .speaker-highlight-layout {
     grid-template-columns: minmax(0, 1fr);
     row-gap: var(--space-4);
@@ -8691,19 +8720,6 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .preview-tile {
-  --preview-glow-r: 100;
-  --preview-glow-g: 100;
-  --preview-glow-b: 100;
-  --preview-glow-outer-blur: 0;
-  --preview-glow-outer-spread: 0;
-  --preview-glow-outer-alpha: 0;
-  --preview-glow-inner-blur: 0;
-  --preview-glow-inner-spread: 0;
-  --preview-glow-inner-alpha: 0;
-  --preview-glow-border-alpha: 1;
-  --preview-glow-fade-in: 0.15s;
-  --preview-glow-fade-out: 0.30s;
-  --preview-glow-hold-delay: 0s;
   width: 100%;
   aspect-ratio: 16 / 9;
   display: flex;
@@ -8713,21 +8729,6 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border: 3px solid var(--grid-item-border);
   padding: 0;
   overflow: hidden;
-  transition:
-    box-shadow var(--preview-glow-fade-in) ease-in,
-    border-color var(--preview-glow-fade-in) ease-in;
-}
-
-.preview-tile.preview-tile--speaking {
-  box-shadow: var(--preview-glow-speaking-box-shadow);
-  border-color: var(--preview-glow-speaking-border-color);
-  transition: var(--preview-glow-speaking-transition);
-}
-
-.preview-tile.preview-tile--silent {
-  box-shadow: none;
-  border-color: var(--preview-glow-silent-border-color);
-  transition: var(--preview-glow-silent-transition);
 }
 
 @keyframes preview-pulse {
@@ -8747,10 +8748,6 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .preview-tile {
-    transition: none;
-  }
-
   .preview-tile-pulsing {
     animation: none;
   }
@@ -8807,11 +8804,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   animation-play-state: paused;
 }
 
-.appearance-settings-panel.glow-disabled .preview-tile,
-.appearance-settings-panel.glow-disabled .preview-tile.preview-tile--speaking,
-.appearance-settings-panel.glow-disabled .preview-tile.preview-tile--silent {
-  box-shadow: none;
-  border-color: var(--appearance-preview-tile-border-color);
+.appearance-settings-panel.glow-disabled .color-swatch-item .color-swatch.selected::after {
+  opacity: 0.6;
 }
 
 /* Mobile */
@@ -9565,7 +9559,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 
 .mock-peers-popover {
   position: fixed;
-  bottom: 104px;
+  bottom: calc(104px + var(--meeting-footer-h, 0px));
   left: calc(
     50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
       2
@@ -9651,7 +9645,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 
 .density-popover {
   position: fixed;
-  bottom: 104px;
+  bottom: calc(104px + var(--meeting-footer-h, 0px));
   left: calc(
     50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
       2
@@ -9732,7 +9726,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 /* ===== Reactions palette — mirrors .density-popover vocabulary (issue 1884) ===== */
 .reactions-palette {
   position: fixed;
-  bottom: 104px;
+  bottom: calc(104px + var(--meeting-footer-h, 0px));
   left: calc(
     50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
       2
@@ -9769,8 +9763,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
      The `dvh` line re-measures when mobile browser chrome collapses (and, under
      `interactive-widget=resizes-content`, when the keyboard opens); the `vh`
      line above it is the fallback for engines without `dvh`. */
-  max-height: calc(100vh - 124px);
-  max-height: calc(100dvh - 124px);
+  max-height: calc(100vh - 124px - var(--meeting-footer-h, 0px));
+  max-height: calc(100dvh - 124px - var(--meeting-footer-h, 0px));
   z-index: 9100;
   backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
@@ -10286,7 +10280,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 /* ===== Floating reactions overlay (net-new animation, issue 1884) ===== */
 .reactions-overlay {
   position: fixed;
-  bottom: 96px;
+  bottom: calc(96px + var(--meeting-footer-h, 0px));
   left: calc(
     50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
       2
@@ -10899,10 +10893,14 @@ html[data-theme="light"] .settings-panel .speaker-highlight-help-tip {
 }
 
 html[data-theme="light"] .appearance-section-helper,
-html[data-theme="light"] .settings-section-description,
-html[data-theme="light"] .speaker-highlight-preview-caption {
+html[data-theme="light"] .settings-section-description {
   color: rgba(42, 52, 68, 0.58) !important;
   /* @token-exempt: theme variant */
+}
+
+/* (0,3,1) beats the `.settings-panel *` colour blanket. */
+html[data-theme="light"] .settings-panel .speaker-highlight-preview-caption {
+  color: var(--appearance-preview-caption-light);
 }
 
 
@@ -10950,6 +10948,23 @@ html[data-theme="light"] .settings-divider {
 
 .speaker-highlight-preview {
   transform: translateX(var(--speaker-preview-shift-x));
+}
+
+/* issue 2793: must follow the desktop offsets above, which it undoes once the
+   preview stacks under the controls. */
+@media (max-width: 59.75em) {
+  .speaker-highlight-preview {
+    margin-top: 0;
+    transform: none;
+  }
+
+  .appearance-section:has(.speaker-highlight-layout) .appearance-section-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .appearance-section:has(.speaker-highlight-layout) .glow-switch {
+    transform: none;
+  }
 }
 
 /*------------------------------------------------*/
@@ -11212,7 +11227,7 @@ html[data-theme="light"] .settings-divider {
    zone in attendants.rs's grid-padding table. (issue 2701) */
 @media (max-width: 567.98px) {
   [data-dock="dock-bottom"] #chat-sidebar .chat-input-area {
-    padding-bottom: calc(var(--space-3) + 73px);
+    padding-bottom: calc(var(--space-3) + 73px + var(--meeting-footer-h, 0px));
   }
 }
 
@@ -12736,7 +12751,7 @@ html {
 
 .meeting-timer-popover {
   position: fixed;
-  bottom: 104px;
+  bottom: calc(104px + var(--meeting-footer-h, 0px));
   left: calc(
     50% + (var(--drawer-left-reserve, 0px) - var(--drawer-right-reserve, 0px)) /
       2
@@ -12757,8 +12772,8 @@ html {
      browser chrome collapses and when the keyboard opens; the `vh` line above it
      is the fallback for engines without `dvh`. Same fix as `.reactions-palette`
      took for issue 2141. */
-  max-height: calc(100vh - 124px);
-  max-height: calc(100dvh - 124px);
+  max-height: calc(100vh - 124px - var(--meeting-footer-h, 0px));
+  max-height: calc(100dvh - 124px - var(--meeting-footer-h, 0px));
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 12px;
@@ -12781,18 +12796,18 @@ html {
   left: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap));
   right: auto;
   bottom: auto;
-  top: 50%;
+  top: calc(50% - var(--meeting-footer-h, 0px) / 2);
   transform: translateY(-50%);
-  max-height: calc(100dvh - 32px);
+  max-height: calc(100dvh - 32px - var(--meeting-footer-h, 0px));
 }
 
 .meeting-timer-popover--dock-right {
   right: calc(16px + var(--action-bar-dock-w) + var(--action-bar-dock-gap));
   left: auto;
   bottom: auto;
-  top: 50%;
+  top: calc(50% - var(--meeting-footer-h, 0px) / 2);
   transform: translateY(-50%);
-  max-height: calc(100dvh - 32px);
+  max-height: calc(100dvh - 32px - var(--meeting-footer-h, 0px));
 }
 
 .meeting-timer-popover-row {
@@ -13346,7 +13361,7 @@ html {
 
 @media (max-width: 639px) {
   #grid-container {
-    --decode-pill-bottom: 98px;
+    --decode-pill-bottom: calc(98px + var(--meeting-footer-h, 0px));
   }
 }
 

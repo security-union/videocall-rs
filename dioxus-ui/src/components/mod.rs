@@ -33,8 +33,8 @@ pub mod icons;
 pub mod login;
 pub mod media_metrics_overlay;
 pub mod meeting_ended_overlay;
+pub mod meeting_footer;
 pub mod meeting_format;
-pub mod meeting_info;
 pub mod meeting_options_controls;
 // Issue 1613: the meeting-password prompt. The error-code -> prompt mapping and
 // the prompt's attempt bookkeeping are pure and host-testable; the component is

@@ -509,9 +509,7 @@ test.describe("Per-tile media-metrics overlay (issue 1768)", () => {
       // above (it is what exposed the overlay toggle), and the perf panel mounts
       // inside it, so this locator resolves. Deliberately NOT re-opening it — that
       // clicks the same tooltip button and would TOGGLE the drawer shut.
-      const videoSummary = hostPage.locator(
-        '[data-testid="perf-video-range-value"] + .perf-summary-line',
-      );
+      const videoSummary = hostPage.locator('[data-testid="perf-video-send-summary"]');
       await expect
         .poll(
           async () => {

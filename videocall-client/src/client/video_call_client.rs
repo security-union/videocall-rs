@@ -1477,6 +1477,7 @@ fn handle_connected_reconnect_resets(
             let current_session = inner.own_session_id;
             let fresh_session = current_session != inner.last_reconnect_reconciled_session;
             if fresh_session {
+                inner.peer_decode_manager.reset_lid_dwells_for_reconnect();
                 let bounds = inner.receive_layer_bounds;
                 let ups = inner
                     .peer_decode_manager
@@ -7396,6 +7397,125 @@ mod cooldown_reset_hardening_tests {
             inner.layer_preference_sender.last_sent().is_none(),
             "#1700: reset_for_reconnect must have cleared the wire — confirms the snap \
              came from the reset path's None-wire reconcile, not a stale tick"
+        );
+    }
+
+    #[test]
+    fn same_session_fallback_keeps_a_lid_the_relay_is_still_applying() {
+        use crate::decode::layer_chooser::{
+            PrefMediaKind, ReceiveLayerBounds, PEER_MONITOR_TICK_MS,
+        };
+
+        let client = build_test_client();
+        let sid = 2630u64;
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(1));
+
+        let t0 = 10_000u64;
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .insert_zero_loss_top_peer_for_test(sid);
+            inner.own_session_id = Some(99);
+            inner.last_reconnect_reconciled_session = Some(99);
+            for t in [t0, t0 + PEER_MONITOR_TICK_MS] {
+                inner
+                    .peer_decode_manager
+                    .observe_video_layers_for_test(sid, &[0, 1, 2], t);
+                assert_eq!(
+                    inner
+                        .peer_decode_manager
+                        .tick_layer_choosers(t, &capped)
+                        .get(&(sid, PrefMediaKind::Video)),
+                    Some(&1),
+                    "premise: the receive ceiling lids video at 1 and the hold stays live"
+                );
+            }
+        }
+
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+            &client.audio_congestion_bitrate_floor,
+            &client.audio_detector_reconnect_reseed,
+            t0 + PEER_MONITOR_TICK_MS,
+        );
+
+        let t2 = t0 + 2 * PEER_MONITOR_TICK_MS;
+        let mut inner = client.inner.borrow_mut();
+        inner
+            .peer_decode_manager
+            .observe_video_layers_for_test(sid, &[0, 1], t2);
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .tick_layer_choosers(t2, &capped)
+                .get(&(sid, PrefMediaKind::Video)),
+            Some(&1),
+            "a same-session fallback leaves the relay holding the OLD prefs, so clearing \
+             the hold here would drop a lid that is still in force and fail the relay open"
+        );
+    }
+
+    #[test]
+    fn reconnect_discards_a_lid_held_against_the_previous_session() {
+        use crate::decode::layer_chooser::{
+            PrefMediaKind, ReceiveLayerBounds, PEER_MONITOR_TICK_MS,
+        };
+
+        let client = build_test_client();
+        let sid = 2630u64;
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(1));
+
+        let t0 = 10_000u64;
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .insert_zero_loss_top_peer_for_test(sid);
+            inner.own_session_id = Some(42);
+            for t in [t0, t0 + PEER_MONITOR_TICK_MS] {
+                inner
+                    .peer_decode_manager
+                    .observe_video_layers_for_test(sid, &[0, 1, 2], t);
+                assert_eq!(
+                    inner
+                        .peer_decode_manager
+                        .tick_layer_choosers(t, &capped)
+                        .get(&(sid, PrefMediaKind::Video)),
+                    Some(&1),
+                    "premise: the receive ceiling lids video at 1 and real evidence keeps \
+                     the hold live"
+                );
+            }
+        }
+
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+            &client.audio_congestion_bitrate_floor,
+            &client.audio_detector_reconnect_reseed,
+            t0 + PEER_MONITOR_TICK_MS,
+        );
+
+        let t2 = t0 + 2 * PEER_MONITOR_TICK_MS;
+        let mut inner = client.inner.borrow_mut();
+        inner
+            .peer_decode_manager
+            .observe_video_layers_for_test(sid, &[0, 1], t2);
+        assert!(
+            !inner
+                .peer_decode_manager
+                .tick_layer_choosers(t2, &capped)
+                .contains_key(&(sid, PrefMediaKind::Video)),
+            "a reconnect must discard the held lid; keeping it fabricates a ladder the \
+             fresh session never offered and advertises a constraint of nothing"
         );
     }
 

@@ -452,6 +452,11 @@ pub struct DisplayNameCtx(pub Signal<Option<String>>);
 #[derive(Clone, Copy)]
 pub struct LocalAudioLevelCtx(pub Signal<f32>);
 
+/// Local user's encoder-side VAD verdict, the `speaking_active` half of the
+/// self-tile glow that [`LocalAudioLevelCtx`] carries the level half of.
+#[derive(Clone, Copy)]
+pub struct LocalSpeakingCtx(pub Signal<bool>);
+
 /// Glow color choices for the appearance customization.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GlowColor {
@@ -540,14 +545,7 @@ impl GlowColor {
     /// disambiguation — call this instead of stringifying to hex and going
     /// back through `from_hex`.
     pub fn from_rgb(r: u8, g: u8, b: u8) -> Self {
-        let presets = [
-            GlowColor::White,
-            GlowColor::Cyan,
-            GlowColor::Magenta,
-            GlowColor::Plum,
-            GlowColor::MintGreen,
-        ];
-        for preset in presets {
+        for preset in PRESET_GLOW_COLORS {
             if preset.to_rgb() == (r, g, b) {
                 return preset;
             }
@@ -615,8 +613,19 @@ const APPEARANCE_ENTRY_SOUND_KEY: &str = "vc_appearance_entry_sound";
 const APPEARANCE_EXIT_SOUND_KEY: &str = "vc_appearance_exit_sound";
 const APPEARANCE_HAND_RAISE_SOUND_KEY: &str = "vc_appearance_hand_raise_sound";
 const CUSTOM_COLORS_STORAGE_KEY: &str = "vc_appearance_custom_colors";
+const GLOW_PALETTE_STORAGE_KEY: &str = "vc_appearance_glow_palette";
 
 pub const MAX_CUSTOM_COLORS: usize = 10;
+
+pub const PRESET_GLOW_COLORS: [GlowColor; 5] = [
+    GlowColor::White,
+    GlowColor::Cyan,
+    GlowColor::Magenta,
+    GlowColor::Plum,
+    GlowColor::MintGreen,
+];
+
+pub const MAX_PALETTE_COLORS: usize = PRESET_GLOW_COLORS.len() + MAX_CUSTOM_COLORS;
 
 /// Load local-only appearance settings from storage.
 ///
@@ -760,11 +769,11 @@ pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
     );
 }
 
-/// Load custom glow colors from local storage.
-pub fn load_custom_colors_from_storage() -> Vec<GlowColor> {
-    let Some(csv) = read_local_storage(CUSTOM_COLORS_STORAGE_KEY) else {
-        return Vec::new();
-    };
+pub fn default_glow_palette() -> Vec<GlowColor> {
+    PRESET_GLOW_COLORS.to_vec()
+}
+
+fn parse_legacy_custom_colors(csv: &str) -> impl Iterator<Item = GlowColor> + '_ {
     csv.split(',')
         .filter_map(|hex| {
             let hex = hex.trim();
@@ -778,21 +787,55 @@ pub fn load_custom_colors_from_storage() -> Vec<GlowColor> {
             }
         })
         .take(MAX_CUSTOM_COLORS)
-        .collect()
 }
 
-/// Save custom glow colors to local storage.
-pub fn save_custom_colors_to_storage(colors: &[GlowColor]) {
-    let csv: String = colors
+/// `stored` is the raw palette value: `Some("")` is a palette the user emptied,
+/// and only `None` migrates the presets plus the legacy custom-color list.
+pub fn parse_glow_palette(stored: Option<&str>, legacy_custom: Option<&str>) -> Vec<GlowColor> {
+    let colors: Box<dyn Iterator<Item = GlowColor> + '_> = match stored {
+        Some(csv) => Box::new(
+            csv.split(',')
+                .filter_map(|token| GlowColor::from_storage(token.trim())),
+        ),
+        None => Box::new(
+            PRESET_GLOW_COLORS.into_iter().chain(
+                legacy_custom
+                    .into_iter()
+                    .flat_map(parse_legacy_custom_colors),
+            ),
+        ),
+    };
+    let mut palette = Vec::with_capacity(MAX_PALETTE_COLORS);
+    for color in colors {
+        if palette.len() == MAX_PALETTE_COLORS {
+            break;
+        }
+        let (r, g, b) = color.to_rgb();
+        let color = GlowColor::from_rgb(r, g, b);
+        if !palette.contains(&color) {
+            palette.push(color);
+        }
+    }
+    palette
+}
+
+pub fn serialize_glow_palette(palette: &[GlowColor]) -> String {
+    palette
         .iter()
-        .filter_map(|c| match c {
-            GlowColor::Custom { r, g, b } => Some(format!("{r:02x}{g:02x}{b:02x}")),
-            _ => None,
-        })
-        .take(MAX_CUSTOM_COLORS)
+        .map(|color| color.to_storage())
         .collect::<Vec<_>>()
-        .join(",");
-    write_local_storage(CUSTOM_COLORS_STORAGE_KEY, &csv);
+        .join(",")
+}
+
+pub fn load_glow_palette_from_storage() -> Vec<GlowColor> {
+    parse_glow_palette(
+        read_local_storage_raw(GLOW_PALETTE_STORAGE_KEY).as_deref(),
+        read_local_storage(CUSTOM_COLORS_STORAGE_KEY).as_deref(),
+    )
+}
+
+pub fn save_glow_palette_to_storage(palette: &[GlowColor]) {
+    write_local_storage(GLOW_PALETTE_STORAGE_KEY, &serialize_glow_palette(palette));
 }
 
 /// VideoCallClient context for sharing the client instance across components.
@@ -1086,10 +1129,13 @@ const DEVICE_PREF_CAMERA_ON_KEY: &str = "vc_prejoin_camera_on";
 const DEVICE_PREF_MIC_ON_KEY: &str = "vc_prejoin_mic_on";
 
 fn read_local_storage(key: &str) -> Option<String> {
+    read_local_storage_raw(key).filter(|v| !v.is_empty())
+}
+
+fn read_local_storage_raw(key: &str) -> Option<String> {
     web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
         .and_then(|s| s.get_item(key).ok().flatten())
-        .filter(|v| !v.is_empty())
 }
 
 fn write_local_storage(key: &str, value: &str) {
@@ -2379,6 +2425,95 @@ mod tests {
         assert_eq!(
             GlowColor::from_storage("mint-green"),
             Some(GlowColor::MintGreen)
+        );
+    }
+
+    const CORAL: GlowColor = GlowColor::Custom {
+        r: 0xff,
+        g: 0x57,
+        b: 0x33,
+    };
+    const LIME: GlowColor = GlowColor::Custom {
+        r: 0x00,
+        g: 0xff,
+        b: 0x00,
+    };
+
+    #[test]
+    fn glow_palette_absent_key_migrates_presets_then_legacy_customs() {
+        let mut expected = PRESET_GLOW_COLORS.to_vec();
+        expected.extend([CORAL, LIME]);
+        assert_eq!(parse_glow_palette(None, Some("ff5733,00ff00")), expected);
+        assert_eq!(parse_glow_palette(None, None), default_glow_palette());
+    }
+
+    #[test]
+    fn glow_palette_present_but_empty_key_stays_empty() {
+        assert_eq!(parse_glow_palette(Some(""), Some("ff5733")), Vec::new());
+    }
+
+    #[test]
+    fn glow_palette_round_trip_keeps_deleted_presets_deleted() {
+        let palette = vec![CORAL, GlowColor::Cyan, LIME];
+        let stored = serialize_glow_palette(&palette);
+        assert_eq!(parse_glow_palette(Some(&stored), Some("aaaaaa")), palette);
+    }
+
+    #[test]
+    fn glow_palette_migration_keeps_a_full_legacy_list() {
+        let legacy: Vec<String> = (0..MAX_CUSTOM_COLORS)
+            .map(|i| format!("{:02x}0000", i + 1))
+            .collect();
+        let palette = parse_glow_palette(None, Some(&legacy.join(",")));
+        assert_eq!(palette.len(), PRESET_GLOW_COLORS.len() + MAX_CUSTOM_COLORS);
+        assert_eq!(palette.len(), MAX_PALETTE_COLORS);
+        assert_eq!(
+            palette.last(),
+            Some(&GlowColor::Custom {
+                r: MAX_CUSTOM_COLORS as u8,
+                g: 0,
+                b: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn glow_palette_keeps_the_first_colors_up_to_the_cap() {
+        let tokens: Vec<String> = (0..MAX_PALETTE_COLORS + 5)
+            .map(|i| format!("custom:{:02x}0000", i + 1))
+            .collect();
+        let palette = parse_glow_palette(Some(&tokens.join(",")), None);
+        assert_eq!(palette.len(), MAX_PALETTE_COLORS);
+        assert_eq!(
+            palette.last(),
+            Some(&GlowColor::Custom {
+                r: MAX_PALETTE_COLORS as u8,
+                g: 0,
+                b: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn glow_palette_rejects_hostile_tokens() {
+        assert_eq!(
+            parse_glow_palette(
+                Some("custom:ff5733;}x{,custom:ééé,custom:\u{1F600}ab,WHITE,custom:ff5733\"><b>,custom:00ff00"),
+                None
+            ),
+            vec![LIME]
+        );
+    }
+
+    #[test]
+    fn glow_palette_folds_a_preset_hex_onto_the_preset() {
+        assert_eq!(
+            parse_glow_palette(None, Some("0cafff,ff5733")),
+            [PRESET_GLOW_COLORS.to_vec(), vec![CORAL]].concat()
+        );
+        assert_eq!(
+            parse_glow_palette(Some("custom:0cafff,cyan"), None),
+            vec![GlowColor::Cyan]
         );
     }
 

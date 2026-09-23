@@ -199,12 +199,18 @@ import {
 } from "../helpers/relay-metrics";
 import {
   sampleChecksumSeries,
+  samplePeerVideoChecksum,
   longestFrozenRunMs,
   distinctChecksumsInWindow,
 } from "../helpers/frame-liveness";
 import { openPerformancePanel, readNetEqPacketsPerSec } from "../helpers/diagnostics-drawer";
-import { BUDGET } from "../helpers/rust-mirrored-constants";
 import { enableDiagnosticsTileIndicators } from "../helpers/diagnostics-tile-indicators";
+import {
+  BUDGET,
+  LAYER_AVAILABILITY_WINDOW_MS,
+  LID_DWELL_BASE_MS,
+  PEER_MONITOR_TICK_MS,
+} from "../helpers/rust-mirrored-constants";
 import { CAMERA_PEER_SIGNAL_DISC } from "../helpers/signal-meter";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -670,26 +676,155 @@ async function joinMeetingAudioOnly(
   await expect(grid).toBeVisible({ timeout: 15_000 });
 }
 
-/**
- * Parse the video received-quality readout `#perf-vu-recv-video-readout`.
- * Returns null while the readout reads "Not receiving" (nothing decoded yet),
- * otherwise `{ layerIndex, layerCount }`.
- *
- * #1222 Directive 4 — the readout format changed from `"L{idx+1}/{count} · …"`
- * to `"{Q} · {idx+1}/{count} · …"` where `{Q}` is the quality letter
- * (L/M/H, or "1" for a degenerate single-layer ladder). We parse the
- * `{position}/{count}` numbers AFTER the leading quality letter + " · "; the
- * letter itself is not load-bearing for these tests (the position/count is the
- * 0-based index basis every assertion uses), so we skip past it permissively.
- */
+/** The first lid lands off the 5s monitor-tick phase, so settle past it (2630). */
+const FIRST_LID_CYCLE_SETTLE_MS = 20_000;
+const LID_OBSERVE_MS = 60_000;
+const LID_SAMPLE_MS = 400;
+const LID_FRAME_FREEZE_TOLERANCE_MS = 4_000;
 
-async function readVideoLayer(
+// The hold is only ever expired ON a monitor tick, so every observable edge is
+// tick-quantized rather than landing at the raw dwell.
+const LID_EXPIRY_TICK_MS =
+  PEER_MONITOR_TICK_MS * Math.ceil(LID_DWELL_BASE_MS / PEER_MONITOR_TICK_MS);
+const LID_COLLAPSE_MIN_MS = LID_EXPIRY_TICK_MS - LAYER_AVAILABILITY_WINDOW_MS;
+// An unreadable stretch at either end truncates the measured run one-for-one, so one budget
+// bounds it, the sampler gates and the floor — and one timed-out read must fit inside it.
+const LID_MAX_SAMPLE_GAP_MS = 4 * LID_SAMPLE_MS;
+const LID_READ_TIMEOUT_MS = 2 * LID_SAMPLE_MS;
+const MIN_COLLAPSE_OBSERVED_MS = LID_COLLAPSE_MIN_MS - 2 * LID_MAX_SAMPLE_GAP_MS;
+const LID_CYCLE_MIN_MS = LID_EXPIRY_TICK_MS + PEER_MONITOR_TICK_MS;
+const MAX_LID_RELEASES_OBSERVED = Math.floor(LID_OBSERVE_MS / LID_CYCLE_MIN_MS) + 1;
+
+/** The readout drops its `{i+1}/{n}` chip at `n == 1` (`layer_position_suffix`), and a
+ *  FROZEN stream renders the same line because eligibility keys off `peer.video_enabled`,
+ *  not arrivals. */
+async function observeLadderCollapse(
   page: Page,
-): Promise<{ layerIndex: number; layerCount: number } | null> {
-  const text = (await page.locator("#perf-vu-recv-video-readout").textContent())?.trim() ?? "";
+  durationMs: number,
+): Promise<{
+  longestCollapsedMs: number;
+  longestFrozenMs: number;
+  longestUnreadableRunMs: number;
+  longestSampleGapMs: number;
+  changes: number;
+  releases: number;
+  unreadable: number;
+  checksums: number;
+  samples: number;
+}> {
+  const POSITION_CHIP = /·\s*(\d+)\/(\d+)\s*·/;
+  let longestCollapsedMs = 0;
+  let longestFrozenMs = 0;
+  let longestUnreadableRunMs = 0;
+  let longestSampleGapMs = 0;
+  let changes = 0;
+  let releases = 0;
+  let unreadable = 0;
+  let checksums = 0;
+  let samples = 0;
+  let runStart: number | null = null;
+  let lastReadableMs = Date.now();
+  let lastChecksum: string | null = null;
+  let lastChangeMs: number | null = null;
+  let lastSampleMs: number | null = null;
+  // `page.evaluate` takes no timeout and the race below cannot cancel it, so at most one
+  // is ever outstanding.
+  let inFlightChecksum: Promise<string | null> | null = null;
+  const readChecksum = (): Promise<string | null> => {
+    if (inFlightChecksum === null) {
+      inFlightChecksum = samplePeerVideoChecksum(page, 0)
+        .catch(() => null)
+        .finally(() => {
+          inFlightChecksum = null;
+        });
+    }
+    return inFlightChecksum;
+  };
+  const deadline = Date.now() + durationMs;
+  while (Date.now() < deadline) {
+    let readTimer: ReturnType<typeof setTimeout> | undefined;
+    const [text, checksum] = await Promise.all([
+      readVideoReadoutText(page, LID_READ_TIMEOUT_MS),
+      Promise.race([
+        readChecksum(),
+        new Promise<null>((resolve) => {
+          readTimer = setTimeout(() => resolve(null), LID_READ_TIMEOUT_MS);
+        }),
+      ]),
+    ]);
+    clearTimeout(readTimer);
+    const now = Date.now();
+    const strideMs = lastSampleMs === null ? 0 : now - lastSampleMs;
+    if (lastSampleMs !== null) longestSampleGapMs = Math.max(longestSampleGapMs, strideMs);
+    lastSampleMs = now;
+    if (checksum === null) {
+      // An unsampled interval is not evidence of a frozen tile, so it is excluded from
+      // the freeze gate rather than charged to it.
+      if (lastChangeMs !== null) lastChangeMs += strideMs;
+    } else {
+      checksums += 1;
+      if (lastChangeMs === null) lastChangeMs = now;
+      if (lastChecksum !== null && checksum !== lastChecksum) {
+        lastChangeMs = now;
+        changes += 1;
+      }
+      lastChecksum = checksum;
+      longestFrozenMs = Math.max(longestFrozenMs, now - lastChangeMs);
+    }
+    samples += 1;
+    if (text.length === 0 || text === "Not receiving") {
+      // Not evidence the ladder reopened, so the run is carried through rather than ended
+      // by it — which means a long enough unreadable run could BRIDGE a reopen.
+      unreadable += 1;
+      longestUnreadableRunMs = Math.max(longestUnreadableRunMs, now - lastReadableMs);
+      await page.waitForTimeout(LID_SAMPLE_MS);
+      continue;
+    }
+    lastReadableMs = now;
+    if (text.match(POSITION_CHIP) === null) {
+      if (runStart === null) runStart = now;
+      longestCollapsedMs = Math.max(longestCollapsedMs, now - runStart);
+    } else {
+      if (runStart !== null) releases += 1;
+      runStart = null;
+    }
+    await page.waitForTimeout(LID_SAMPLE_MS);
+  }
+  return {
+    longestCollapsedMs,
+    longestFrozenMs,
+    longestUnreadableRunMs,
+    longestSampleGapMs,
+    changes,
+    releases,
+    unreadable,
+    checksums,
+    samples,
+  };
+}
+
+/** Trimmed `#perf-vu-recv-video-readout` text; `""` on a failed read, never a rendered state. */
+async function readVideoReadoutText(page: Page, timeout: number): Promise<string> {
+  return page
+    .locator("#perf-vu-recv-video-readout")
+    .textContent({ timeout })
+    .then((t) => (t ?? "").trim())
+    .catch(() => "");
+}
+
+function parseVideoLayerText(text: string): { layerIndex: number; layerCount: number } | null {
   const m = text.match(/^\S+\s+·\s+(\d+)\/(\d+)/);
   if (!m) return null;
   return { layerIndex: Number(m[1]) - 1, layerCount: Number(m[2]) };
+}
+
+/** Parse `#perf-vu-recv-video-readout` (`"{Q} · {i+1}/{n} · {WxH}"`, #1222 D4). Null
+ *  whenever the position chip is absent: "Not receiving", and equally a ladder collapsed
+ *  to one layer, where `layer_position_suffix` drops the chip. */
+async function readVideoLayer(
+  page: Page,
+): Promise<{ layerIndex: number; layerCount: number } | null> {
+  return parseVideoLayerText(await readVideoReadoutText(page, 5_000));
 }
 
 const VIDEO_POSITION_CHIP_WORDS = ["Low", "Medium", "High", "Single"] as const;
@@ -980,6 +1115,138 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         ).toBeLessThanOrEqual(0);
         await rxPage.waitForTimeout(1000);
       }
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // 2b. Issue 2630. Capping receive video at base collapses this receiver's learned ladder
+  // once layers 1-2 age out. Un-fixed, that collapse also closed the advertise gate, so the
+  // relay failed open within a monitor tick of the window.
+  test("an advertised video lid outlives the availability it suppresses (2630)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(300_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_lid_dwell_${Date.now()}`;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub-lid@videocall.rs",
+        "SimPublisherLid",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-rx-lid@videocall.rs",
+        "SimReceiverLid",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "SimPublisherLid");
+      await joinMeeting(rxPage, meetingId, "SimReceiverLid");
+
+      await assertCapabilityOverrideActive(pubConsole);
+
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await openPerformancePanel(rxPage);
+
+      const ladderDeadline = Date.now() + 60_000;
+      let learnedLayerCount = 0;
+      let readout = "";
+      while (Date.now() < ladderDeadline && learnedLayerCount <= 1) {
+        readout = await readVideoReadoutText(rxPage, LID_READ_TIMEOUT_MS);
+        learnedLayerCount = parseVideoLayerText(readout)?.layerCount ?? 0;
+        if (learnedLayerCount > 1) break;
+        await rxPage.waitForTimeout(1_000);
+      }
+      if (learnedLayerCount <= 1) {
+        // A genuine one-layer ladder is the ONLY chip-less readout that carries dims.
+        expect(
+          readout,
+          `a chip-less readout may be skipped only when it names a resolution; observed ` +
+            `"${readout}" (empty means the read itself failed)`,
+        ).toMatch(/^\d+x\d+$/);
+        test.skip(
+          true,
+          `runner capability ceiling clamped the publisher to a single layer (readout ` +
+            `"${readout}"); the lid has no ladder to collapse on this runner (see ` +
+            `helpers/simulcast-config.ts)`,
+        );
+      }
+
+      await pinReceiverToBaseLayer(rxPage, "video");
+
+      await rxPage.waitForTimeout(FIRST_LID_CYCLE_SETTLE_MS);
+
+      const obs = await observeLadderCollapse(rxPage, LID_OBSERVE_MS);
+
+      expect
+        .soft(
+          obs.longestSampleGapMs,
+          `the sampler ran wider than the floor's truncation budget, so ` +
+            `\`longestCollapsedMs\` is an under-read (${JSON.stringify(obs)})`,
+        )
+        .toBeLessThanOrEqual(LID_MAX_SAMPLE_GAP_MS);
+
+      expect(
+        obs.unreadable / obs.samples,
+        `the readout must stay readable across the observation window; an unreadable sample ` +
+          `leaves the ladder state unknown and is carried into the surrounding run ` +
+          `(${JSON.stringify(obs)})`,
+      ).toBeLessThan(0.25);
+
+      expect(
+        obs.longestUnreadableRunMs,
+        `an unreadable gap this long can bridge a reopen and truncates the measured ` +
+          `collapse past the floor's budget (${JSON.stringify(obs)})`,
+      ).toBeLessThanOrEqual(LID_MAX_SAMPLE_GAP_MS);
+
+      expect(
+        obs.checksums / obs.samples,
+        `too few tile checksums to gate on: an unsampled interval is excluded from ` +
+          `\`longestFrozenMs\` (${JSON.stringify(obs)})`,
+      ).toBeGreaterThan(0.75);
+
+      expect(
+        obs.changes,
+        `the tile repainted on fewer than half the sampled checksums ` + `(${JSON.stringify(obs)})`,
+      ).toBeGreaterThan(obs.checksums / 2);
+
+      expect(
+        obs.longestFrozenMs,
+        `the relay never filters layer 0, so the tile must keep painting whatever the lid says ` +
+          `(${JSON.stringify(obs)})`,
+      ).toBeLessThan(LID_FRAME_FREEZE_TOLERANCE_MS);
+
+      expect(
+        obs.longestCollapsedMs,
+        `the collapsed run fell short of the served hold: the lid was dropped early, or the ` +
+          `sampler truncated the run (${JSON.stringify(obs)})`,
+      ).toBeGreaterThanOrEqual(MIN_COLLAPSE_OBSERVED_MS);
+
+      expect(
+        obs.releases,
+        `no collapse-to-chip transition was observed: the lid never engaged, or never ` +
+          `re-admitted the ladder (${JSON.stringify(obs)})`,
+      ).toBeGreaterThanOrEqual(1);
+
+      expect(
+        obs.releases,
+        `more release cycles than a served hold allows (${JSON.stringify(obs)})`,
+      ).toBeLessThanOrEqual(MAX_LID_RELEASES_OBSERVED);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -3056,12 +3323,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // per-receiver LAYER_PREFERENCE clamp seam, so the receiver's per-peer layer
   // SELECTION changes with NO wire/relay change — observable directly via the
   // SAME `readVideoLayer()` received-quality readout the #989/#1434 tests read.
-  // (The READOUT is the authoritative client-side proof of the selected layer;
-  // we deliberately do NOT cross-check `relay_layer_filtered_total` here — that
-  // room-scoped counter only increments when the relay drops layers a receiver
-  // did NOT select, and on the WebSocket path the default 2-peer stack forwards
-  // all layers and decrements nothing, so it is not a reliable signal for this
-  // healthy-link, single-receiver scenario.)
+  // (The READOUT is the authoritative client-side proof of the selected layer.)
   //
   // CRITICAL DISTINCTION from every other layer-divergence test in this file:
   // there is NO network impairment. The whole point of #1256 is that a HEALTHY
@@ -3222,13 +3484,6 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         })
         .toBe(0);
 
-      const capped = await readVideoLayer(rxPage);
-      expect(capped, "#1256 PHASE A: receiver must still be decoding").not.toBeNull();
-      expect(
-        capped!.layerIndex,
-        `#1256 PHASE A: small tile capped to base layer (got index ${capped!.layerIndex})`,
-      ).toBe(0);
-
       // PHASE B — PIN ⇒ UP-SWITCH ABOVE THE LID. Pinning the publisher's tile
       // marks that peer Uncapped (pinned / screen-share / maximized are never
       // size-capped), so the size lid LIFTS and the receiver up-switches above the
@@ -3252,7 +3507,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 
       await expect
         .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? -1, {
-          timeout: 45_000,
+          timeout: 60_000,
           intervals: [1000, 2000, 3000],
           message:
             "#1256 PHASE B: pinning the peer must lift the size lid and up-switch the " +

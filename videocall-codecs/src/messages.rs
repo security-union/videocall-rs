@@ -113,11 +113,21 @@ pub struct VideoStatsMessage {
     pub freshness_evictions_total: Option<u64>,
     #[serde(default)]
     pub freshness_evictions_keyframeless_total: Option<u64>,
+    /// WebCodecs `on_output` callbacks per wall-second (issue #2657): decoder OUTPUT, not the
+    /// decode-CALL count `fps_received`. `None` from a worker predating the field, and `None` on
+    /// the first emit after a worker respawn, when there is no interval to divide by. Never 0.0
+    /// for either — a 0.0 means the decoder emitted nothing.
+    #[serde(default)]
+    pub fps_decoder_output: Option<f64>,
+    /// Lifetime `on_output` count (issue #2657). Cumulative per WORKER — NOT reset by a
+    /// jitter-buffer flush or pipeline rebuild (see `reset_jitter_buffer`), only by a respawn.
+    #[serde(default)]
+    pub frames_emitted_total: Option<u64>,
 }
 
 impl VideoStatsMessage {
-    // 11 worker→main video-diagnostic fields; bundling them into a struct just to dodge
-    // the lint would not improve this thin DTO ctor.
+    // Bundling these worker→main video-diagnostic fields into a struct just to dodge the
+    // lint would not improve this thin DTO ctor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         from_peer: String,
@@ -131,6 +141,8 @@ impl VideoStatsMessage {
         keyframe_arrivals_total: u64,
         freshness_evictions_total: u64,
         freshness_evictions_keyframeless_total: u64,
+        fps_decoder_output: Option<f64>,
+        frames_emitted_total: u64,
     ) -> Self {
         Self {
             kind: "video_stats".to_string(),
@@ -145,6 +157,8 @@ impl VideoStatsMessage {
             keyframe_arrivals_total: Some(keyframe_arrivals_total),
             freshness_evictions_total: Some(freshness_evictions_total),
             freshness_evictions_keyframeless_total: Some(freshness_evictions_keyframeless_total),
+            fps_decoder_output,
+            frames_emitted_total: Some(frames_emitted_total),
         }
     }
 }
@@ -606,7 +620,21 @@ mod worker_log_disambiguation_tests {
         // fields (level/target/message) are absent from every other message, so none of them can
         // deserialize into WorkerLogMessage at all -> the branch is structurally unable to swallow
         // them, independent of the kind guard.
-        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0, 6, 7, 8);
+        let vs = VideoStatsMessage::new(
+            "a".into(),
+            "b".into(),
+            5,
+            1.0,
+            2.0,
+            3.0,
+            4,
+            5.0,
+            6,
+            7,
+            8,
+            Some(9.0),
+            900,
+        );
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
         );
@@ -687,11 +715,86 @@ mod worker_log_disambiguation_tests {
         assert_eq!(bare.freshness_evictions_keyframeless_total, None);
     }
 
+    #[test]
+    fn fps_decoder_output_rides_the_video_stats_wire_and_defaults_absent() {
+        let msg = VideoStatsMessage::new(
+            "pub".to_string(),
+            "sub".to_string(),
+            3,
+            120.0,
+            80.0,
+            40.0,
+            2,
+            900.0,
+            7,
+            5,
+            4,
+            Some(23.5),
+            1234,
+        );
+        let wire = serde_json::to_string(&msg).unwrap();
+        let back: VideoStatsMessage = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.fps_decoder_output, Some(23.5));
+        assert_eq!(back.frames_emitted_total, Some(1234));
+
+        let legacy = r#"{"kind":"video_stats","from_peer":"pub","to_peer":"sub"}"#;
+        let old: VideoStatsMessage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            old.fps_decoder_output, None,
+            "a worker build predating the field must read None, never a forged 0.0"
+        );
+        assert_eq!(old.frames_emitted_total, None);
+    }
+
+    /// Issue #2657: the ctor must PASS THROUGH an absent rate rather than forging a 0.0. The
+    /// worker reports `None` on its first emit after a respawn, when no interval exists yet.
+    #[test]
+    fn video_stats_ctor_preserves_an_absent_fps_decoder_output() {
+        let msg = VideoStatsMessage::new(
+            "pub".to_string(),
+            "sub".to_string(),
+            3,
+            120.0,
+            80.0,
+            40.0,
+            2,
+            900.0,
+            7,
+            5,
+            4,
+            None,
+            1234,
+        );
+        assert_eq!(
+            msg.fps_decoder_output, None,
+            "Some(0.0) => the ctor forged a rate the worker did not measure"
+        );
+        assert_eq!(
+            msg.frames_emitted_total,
+            Some(1234),
+            "the cumulative counter is always present at the source"
+        );
+    }
+
     /// Issue #2201: the arrival branch must not SWALLOW another message type. Its required
     /// `seq` + bool fields are absent from every other payload.
     #[test]
     fn keyframe_arrival_branch_cannot_swallow_other_messages() {
-        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0, 6, 7, 8);
+        let vs = VideoStatsMessage::new(
+            "a".into(),
+            "b".into(),
+            5,
+            1.0,
+            2.0,
+            3.0,
+            4,
+            5.0,
+            6,
+            7,
+            8,
+            Some(9.0),
+            900,
+        );
         assert!(serde_json::from_str::<KeyframeArrivalMessage>(
             &serde_json::to_string(&vs).unwrap()
         )
@@ -737,8 +840,22 @@ mod worker_message_kind_dispatch_tests {
     fn each_message_kind_routes_to_its_own_branch() {
         let cases = [
             (
-                VideoStatsMessage::new("a".into(), "b".into(), 0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0, 0)
-                    .kind,
+                VideoStatsMessage::new(
+                    "a".into(),
+                    "b".into(),
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0,
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    Some(0.0),
+                    0,
+                )
+                .kind,
                 WorkerMessageKind::VideoStats,
             ),
             (

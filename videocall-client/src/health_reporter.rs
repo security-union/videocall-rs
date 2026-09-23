@@ -236,6 +236,92 @@ type SharedClimbLimiterSnapshot = Rc<RefCell<Rc<RefCell<ClimbLimiterSnapshot>>>>
 /// Shared dwell-time sample buffer (double-wrapped for late binding).
 type SharedDwellSamples = Rc<RefCell<Rc<RefCell<Vec<(String, f64)>>>>>;
 
+const AUDIO_HEALTH_LOG_FLUSH_MS: u64 = 1000;
+
+const AUDIO_HEALTH_LOG_BATCH_MAX: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    static AUDIO_HEALTH_LOG_LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Issue #2760: N peers' NetEQ buffer samples inside one window share ONE line.
+/// Each stays verbatim as `audio health (buffer: {n}ms) for peer: {id}`, so both
+/// analyzers keep reading the same uniform sample stream — coalescing, NOT
+/// change-point logging, which would bias n_samples / median / n_nonzero.
+#[derive(Debug, Default)]
+struct AudioHealthLogBatch {
+    samples: Vec<(String, u64)>,
+    reporting_peer: String,
+    /// `None` until the first sample anchors the window.
+    last_flush_ms: Option<u64>,
+}
+
+impl AudioHealthLogBatch {
+    fn take_line(&mut self, now_ms: u64) -> Option<String> {
+        self.last_flush_ms = Some(now_ms);
+        if self.samples.is_empty() {
+            return None;
+        }
+        let count = self.samples.len();
+        let body = self
+            .samples
+            .drain(..)
+            .map(|(peer, buffer_ms)| {
+                format!("audio health (buffer: {buffer_ms}ms) for peer: {peer}")
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        Some(format!(
+            "Updated audio health x{count} (from {}): {body}",
+            self.reporting_peer
+        ))
+    }
+
+    fn record(
+        &mut self,
+        target_peer: &str,
+        buffer_ms: u64,
+        reporting_peer: &str,
+        now_ms: u64,
+    ) -> Option<String> {
+        if self.samples.is_empty() {
+            self.reporting_peer = reporting_peer.to_string();
+        }
+        self.samples.push((target_peer.to_string(), buffer_ms));
+        let anchor = *self.last_flush_ms.get_or_insert(now_ms);
+        (now_ms.saturating_sub(anchor) >= AUDIO_HEALTH_LOG_FLUSH_MS
+            || self.samples.len() >= AUDIO_HEALTH_LOG_BATCH_MAX)
+            .then(|| self.take_line(now_ms))
+            .flatten()
+    }
+}
+
+fn emit_audio_health_line(line: Option<String>) {
+    let Some(line) = line else { return };
+    #[cfg(test)]
+    AUDIO_HEALTH_LOG_LINES.with(|c| c.borrow_mut().push(line.clone()));
+    debug!("{line}");
+}
+
+/// Drain any residual batch — `record` only closes a window when the NEXT
+/// sample arrives. Drains UNCONDITIONALLY, including below Debug: the level can
+/// drop mid-meeting, and a guard here would strand the pending window.
+fn flush_audio_health_batch(batch: &Rc<RefCell<AudioHealthLogBatch>>) {
+    let line = match batch.try_borrow_mut() {
+        Ok(mut b) => b.take_line(wall_clock_ms()),
+        Err(_) => None,
+    };
+    emit_audio_health_line(line);
+}
+
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Health reporter that collects diagnostics and sends health packets
 #[derive(Debug)]
 pub struct HealthReporter {
@@ -244,6 +330,7 @@ pub struct HealthReporter {
     display_name: String,
     reporting_peer: String,
     peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>>,
+    audio_health_log_batch: Rc<RefCell<AudioHealthLogBatch>>,
     send_packet_callback: Option<Callback<PacketWrapper>>,
     health_interval_ms: u64,
     reporting_audio_enabled: Rc<RefCell<bool>>,
@@ -885,6 +972,7 @@ impl HealthReporter {
             display_name: String::new(),
             reporting_peer,
             peer_health_data: Rc::new(RefCell::new(HashMap::new())),
+            audio_health_log_batch: Rc::new(RefCell::new(AudioHealthLogBatch::default())),
             send_packet_callback: None,
             health_interval_ms,
             reporting_audio_enabled: Rc::new(RefCell::new(false)),
@@ -1072,6 +1160,7 @@ impl HealthReporter {
     /// Start subscribing to real diagnostics events via videocall_diagnostics
     pub fn start_diagnostics_subscription(&self) {
         let peer_health_data = Rc::downgrade(&self.peer_health_data);
+        let audio_health_log_batch = Rc::downgrade(&self.audio_health_log_batch);
         let audio_enabled = Rc::downgrade(&self.reporting_audio_enabled);
         let video_enabled = Rc::downgrade(&self.reporting_video_enabled);
         let active_server_url = Rc::downgrade(&self.active_server_url);
@@ -1101,7 +1190,10 @@ impl HealthReporter {
                         RecvLoopAction::Break => break,
                     },
                 };
-                if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
+                if let (Some(peer_health_data), Some(audio_health_log_batch)) = (
+                    Weak::upgrade(&peer_health_data),
+                    Weak::upgrade(&audio_health_log_batch),
+                ) {
                     // Capture self-state from sender diagnostics events
                     if event.subsystem == "sender" {
                         if let (Some(ae), Some(ve)) =
@@ -1219,7 +1311,11 @@ impl HealthReporter {
                             }
                         }
                     }
-                    let audio_loss = Self::process_diagnostics_event(event, &peer_health_data);
+                    let audio_loss = Self::process_diagnostics_event(
+                        event,
+                        &peer_health_data,
+                        &audio_health_log_batch,
+                    );
 
                     // Issue 2029: hand each per-peer WT audio-datagram loss
                     // sample (peer id + pkt/s, ~1 Hz per audio-active WT peer,
@@ -1259,6 +1355,7 @@ impl HealthReporter {
     fn process_diagnostics_event(
         event: DiagEvent,
         peer_health_data: &Rc<RefCell<HashMap<String, PeerHealthData>>>,
+        audio_health_log_batch: &Rc<RefCell<AudioHealthLogBatch>>,
     ) -> Option<(String, f64)> {
         // Prefer structured from/to fields if present; fall back to stream_id if set
         let mut reporting_peer: Option<String> = None;
@@ -1318,22 +1415,21 @@ impl HealthReporter {
                                 }
                             }
                         }
-                        "audio_buffer_ms" => {
+                        // Re-read per sample: `attendants.rs` raises the dial long
+                        // after connect. `max_level()`, not `log_enabled!`, which also
+                        // consults the logger — the no-op one when none is installed.
+                        "audio_buffer_ms" if log::max_level() >= log::Level::Debug => {
                             if let MetricValue::U64(buffer_ms) = &metric.value {
-                                // NOTE: kept as a PERIODIC sample (logged every ~1 Hz
-                                // NetEQ tick per peer), NOT edge-triggered. The meeting
-                                // analyzer (`scripts/parse_meeting_console_logs.sh`)
-                                // computes n_samples / n_nonzero / median / median_nonzero
-                                // from this line as a uniform sample stream — change-point
-                                // logging would bias all four (a stable 150ms buffer would
-                                // report n=1, median=150 instead of the true distribution).
-                                // The large per-tick offenders demoted in this PR are
-                                // elsewhere (MEDIA receive, heartbeat, ConnectionManager,
-                                // Rendering-meeting-view, Host-render); this analyzer-
-                                // critical sample is left intact at debug!.
-                                debug!(
-                                    "Updated audio health (buffer: {buffer_ms}ms) for peer: {target_peer} (from {reporting_peer})"
-                                );
+                                let line = match audio_health_log_batch.try_borrow_mut() {
+                                    Ok(mut batch) => batch.record(
+                                        &target_peer,
+                                        *buffer_ms,
+                                        &reporting_peer,
+                                        wall_clock_ms(),
+                                    ),
+                                    Err(_) => None,
+                                };
+                                emit_audio_health_line(line);
                             }
                         }
                         "packets_awaiting_decode" => {
@@ -1568,6 +1664,16 @@ impl HealthReporter {
                                 video_stats["playout_paint_lag_ms"] = json!(v);
                             }
                         }
+                        "fps_decoder_output" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["fps_decoder_output"] = json!(v);
+                            }
+                        }
+                        "frames_emitted_total" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                video_stats["frames_emitted_total"] = json!(v);
+                            }
+                        }
                         // Content-staleness (#1641): the content AGE of the painted video
                         // (drift-baselined), distinct from the paint-lag DEPTH above. Same
                         // camera/screen bucket and same fps_received > 0 fold guard as the ms
@@ -1782,6 +1888,28 @@ impl HealthReporter {
     fn start_agent_memory_sampler(&self) {}
 
     /// Start periodic health reporting
+    /// One health-report tick's pre-work, returning whether the loop continues.
+    /// The #2760 drain precedes the exit so a hangup still emits its last window.
+    /// The shutdown flag exists because `send_callback` is an `Rc` back into
+    /// `VideoCallClient`, so without this exit the loop keeps the client alive.
+    #[must_use]
+    fn health_tick_continue(
+        shutdown: &Weak<AtomicBool>,
+        audio_health_log_batch: &Weak<RefCell<AudioHealthLogBatch>>,
+    ) -> bool {
+        if let Some(batch) = Weak::upgrade(audio_health_log_batch) {
+            flush_audio_health_batch(&batch);
+        }
+        match Weak::upgrade(shutdown) {
+            Some(flag) if flag.load(Ordering::Acquire) => {
+                debug!("HealthReporter shutdown signalled, stopping health reporting");
+                false
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
     pub fn start_health_reporting(&self) {
         if self.send_packet_callback.is_none() {
             warn!("Cannot start health reporting: no send packet callback set");
@@ -1794,6 +1922,7 @@ impl HealthReporter {
         self.start_agent_memory_sampler();
 
         let peer_health_data = Rc::downgrade(&self.peer_health_data);
+        let audio_health_log_batch = Rc::downgrade(&self.audio_health_log_batch);
         let session_id = Rc::downgrade(&self.session_id);
         let meeting_id = self.meeting_id.clone();
         let reporting_peer = self.reporting_peer.clone();
@@ -1854,20 +1983,7 @@ impl HealthReporter {
                 // Wait for the interval
                 gloo_timers::future::TimeoutFuture::new(interval_ms as u32).await;
 
-                // Honour an explicit shutdown signal (e.g. UI unmount) without
-                // waiting for the HealthReporter's `Rc` count to fall to zero.
-                // `send_callback` is an `Rc` strong reference back into
-                // `VideoCallClient`, so without this exit the reporter loop
-                // would keep the entire client alive until the server tore the
-                // session down on its own — the leak observed in cc7tp.
-                if let Some(flag) = Weak::upgrade(&shutdown) {
-                    if flag.load(Ordering::Acquire) {
-                        debug!("HealthReporter shutdown signalled, stopping health reporting");
-                        break;
-                    }
-                } else {
-                    // The HealthReporter (and its shutdown flag) have been
-                    // dropped already — nothing to report against.
+                if !Self::health_tick_continue(&shutdown, &audio_health_log_batch) {
                     break;
                 }
 
@@ -2943,6 +3059,9 @@ impl HealthReporter {
                     if let Some(v) = video.get("content_staleness_ms").and_then(|v| v.as_f64()) {
                         vs.content_staleness_ms = v;
                     }
+                    if let Some(v) = video.get("fps_decoder_output").and_then(|v| v.as_f64()) {
+                        vs.fps_decoder_output = Some(v);
+                    }
                 }
                 // Resync-to-live governor skips (#1252): folded UNCONDITIONALLY for camera video,
                 // OUTSIDE the fps_received > 0 gate above. The ms gauges are gated because a
@@ -2967,6 +3086,10 @@ impl HealthReporter {
                     .and_then(|v| v.as_u64())
                 {
                     vs.keyframe_arrivals_total = Some(v);
+                }
+                // #2657: unconditional, see the arrival counter above.
+                if let Some(v) = video.get("frames_emitted_total").and_then(|v| v.as_u64()) {
+                    vs.frames_emitted_total = Some(v);
                 }
                 // #2511: outside the fps gate — fps 0 IS the freeze these describe — but
                 // inside the sender's own camera-enabled flag.
@@ -3053,6 +3176,9 @@ impl HealthReporter {
                     if let Some(v) = screen.get("content_staleness_ms").and_then(|v| v.as_f64()) {
                         svs.content_staleness_ms = v;
                     }
+                    if let Some(v) = screen.get("fps_decoder_output").and_then(|v| v.as_f64()) {
+                        svs.fps_decoder_output = Some(v);
+                    }
                 }
                 // Resync-to-live governor skips (#1252): cumulative COUNTER, folded
                 // UNCONDITIONALLY (outside the fps gate) exactly like the camera path — a stream
@@ -3072,6 +3198,10 @@ impl HealthReporter {
                     .and_then(|v| v.as_u64())
                 {
                     svs.keyframe_arrivals_total = Some(v);
+                }
+                // #2657: unconditional, see the camera fold.
+                if let Some(v) = screen.get("frames_emitted_total").and_then(|v| v.as_u64()) {
+                    svs.frames_emitted_total = Some(v);
                 }
                 // Freeze episodes (#2511): deliberately NOT gated on `video_enabled` like the
                 // camera fold — that flag is the CAMERA's, and a share must survive camera-off.
@@ -3381,6 +3511,217 @@ fn decode_eligible_from(stats: &Option<Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process_event(
+        event: DiagEvent,
+        peer_health_data: &Rc<RefCell<HashMap<String, PeerHealthData>>>,
+    ) -> Option<(String, f64)> {
+        let batch = Rc::new(RefCell::new(AudioHealthLogBatch::default()));
+        HealthReporter::process_diagnostics_event(event, peer_health_data, &batch)
+    }
+
+    fn audio_buffer_event(to_peer: &str, buffer_ms: u64) -> DiagEvent {
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+        DiagEvent {
+            subsystem: "neteq",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "from_peer",
+                    value: MetricValue::Text(Cow::Borrowed("current_user")),
+                },
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Owned(to_peer.to_string())),
+                },
+                Metric {
+                    name: "audio_buffer_ms",
+                    value: MetricValue::U64(buffer_ms),
+                },
+            ],
+        }
+    }
+
+    fn with_log_level<T>(level: log::LevelFilter, body: impl FnOnce() -> T) -> T {
+        let _guard = crate::test_serial::lock_log_max_level();
+        let previous = log::max_level();
+        log::set_max_level(level);
+        let out = body();
+        log::set_max_level(previous);
+        out
+    }
+
+    fn feed_audio_samples(
+        batch: &Rc<RefCell<AudioHealthLogBatch>>,
+        samples: &[(&str, u64)],
+    ) -> Vec<String> {
+        AUDIO_HEALTH_LOG_LINES.with(|c| c.borrow_mut().clear());
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        for (peer, buffer_ms) in samples {
+            HealthReporter::process_diagnostics_event(
+                audio_buffer_event(peer, *buffer_ms),
+                &peer_health_data,
+                batch,
+            );
+        }
+        AUDIO_HEALTH_LOG_LINES.with(|c| c.borrow().clone())
+    }
+
+    const AUDIO_SAMPLES: [(&str, u64); 3] = [
+        ("9547815290404412626", 274),
+        ("11322898268744594248", 0),
+        ("3310028821455180942", 51),
+    ];
+
+    #[test]
+    fn audio_health_samples_in_one_window_share_a_single_line() {
+        let batch = Rc::new(RefCell::new(AudioHealthLogBatch::default()));
+        let during = with_log_level(log::LevelFilter::Debug, || {
+            feed_audio_samples(&batch, &AUDIO_SAMPLES)
+        });
+        assert!(
+            during.is_empty(),
+            "samples inside the window must not reach the console one by one: {during:?}"
+        );
+
+        flush_audio_health_batch(&batch);
+        let lines = AUDIO_HEALTH_LOG_LINES.with(|c| c.borrow().clone());
+        assert_eq!(
+            lines.len(),
+            1,
+            "three peers' samples must coalesce into exactly one line, got {lines:?}"
+        );
+        for (peer, buffer_ms) in AUDIO_SAMPLES {
+            assert!(
+                lines[0].contains(&format!(
+                    "audio health (buffer: {buffer_ms}ms) for peer: {peer}"
+                )),
+                "sample for {peer} must survive verbatim so the analyzers still parse it: {}",
+                lines[0]
+            );
+        }
+
+        flush_audio_health_batch(&batch);
+        assert_eq!(
+            AUDIO_HEALTH_LOG_LINES.with(|c| c.borrow().len()),
+            1,
+            "an empty batch must emit nothing"
+        );
+    }
+
+    #[test]
+    fn audio_health_samples_are_not_accumulated_below_debug() {
+        let batch = Rc::new(RefCell::new(AudioHealthLogBatch::default()));
+        let during = with_log_level(log::LevelFilter::Info, || {
+            feed_audio_samples(&batch, &AUDIO_SAMPLES)
+        });
+        assert!(during.is_empty(), "nothing may be emitted at Info");
+        assert!(
+            batch.borrow().samples.is_empty(),
+            "no sample may even be buffered at Info"
+        );
+
+        // A mid-meeting level drop must not strand what Debug collected.
+        with_log_level(log::LevelFilter::Debug, || {
+            feed_audio_samples(&batch, &AUDIO_SAMPLES)
+        });
+        assert_eq!(batch.borrow().samples.len(), 3, "Debug buffers again");
+        with_log_level(log::LevelFilter::Info, || flush_audio_health_batch(&batch));
+        assert!(
+            batch.borrow().samples.is_empty(),
+            "a Debug->Info flip must not strand the pending window"
+        );
+    }
+
+    /// Pins the WIRING a deleted `flush_audio_health_batch` call broke silently:
+    /// the tick both drains and decides, so the drain cannot be dropped alone.
+    #[test]
+    fn health_tick_drains_the_coalescer_on_the_continue_and_the_shutdown_path() {
+        let shutdown = Rc::new(AtomicBool::new(false));
+        let batch = Rc::new(RefCell::new(AudioHealthLogBatch::default()));
+
+        batch.borrow_mut().record("p", 42, "current_user", 1_000);
+        assert!(HealthReporter::health_tick_continue(
+            &Rc::downgrade(&shutdown),
+            &Rc::downgrade(&batch)
+        ));
+        assert!(
+            batch.borrow().samples.is_empty(),
+            "a live tick must drain the coalescer"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        batch.borrow_mut().record("q", 7, "current_user", 2_000);
+        assert!(!HealthReporter::health_tick_continue(
+            &Rc::downgrade(&shutdown),
+            &Rc::downgrade(&batch)
+        ));
+        assert!(
+            batch.borrow().samples.is_empty(),
+            "a hangup must emit the last window, not discard it"
+        );
+
+        let dropped: Weak<AtomicBool> = Rc::downgrade(&Rc::new(AtomicBool::new(false)));
+        assert!(
+            !HealthReporter::health_tick_continue(&dropped, &Rc::downgrade(&batch)),
+            "a dropped HealthReporter stops the loop"
+        );
+    }
+
+    /// Literal 999/1000 bracket `AUDIO_HEALTH_LOG_FLUSH_MS` — using the constant
+    /// in the arithmetic would pin nothing.
+    #[test]
+    fn audio_health_batch_flushes_at_the_window_edge_not_before() {
+        let mut batch = AudioHealthLogBatch::default();
+        let t0 = 1_700_000_000_000u64;
+        assert_eq!(
+            batch.record("a", 10, "me", t0),
+            None,
+            "the first sample anchors the window rather than flushing"
+        );
+        assert_eq!(
+            batch.record("b", 20, "me", t0 + 999),
+            None,
+            "999ms after the anchor is still inside the window"
+        );
+        assert_eq!(
+            batch.record("c", 30, "me", t0 + 1000).as_deref(),
+            Some(
+                "Updated audio health x3 (from me): audio health (buffer: 10ms) for peer: a | \
+                 audio health (buffer: 20ms) for peer: b | \
+                 audio health (buffer: 30ms) for peer: c"
+            ),
+            "the window closes at 1000ms and carries every buffered sample in order"
+        );
+        assert_eq!(
+            batch.record("d", 40, "me", t0 + 1999),
+            None,
+            "the flush re-anchors the window"
+        );
+    }
+
+    #[test]
+    fn audio_health_batch_cap_forces_a_flush_inside_the_window() {
+        let mut batch = AudioHealthLogBatch::default();
+        let t0 = 1_700_000_000_000u64;
+        let emitted = (0..63)
+            .filter(|i| batch.record(&format!("p{i}"), *i, "me", t0).is_some())
+            .count();
+        assert_eq!(
+            emitted, 0,
+            "63 samples inside the window stay buffered; only the cap can flush early"
+        );
+        let line = batch
+            .record("p63", 63, "me", t0)
+            .expect("the 64th hits the cap");
+        assert!(
+            line.starts_with("Updated audio health x64 (from me): "),
+            "the capped line carries all 64 samples: {line}"
+        );
+    }
 
     #[test]
     fn encoder_fps_publish_value_gates_correctly() {
@@ -5245,22 +5586,10 @@ mod tests {
         };
 
         // Rise then FALL: the peak is neither the first nor the last sample.
-        HealthReporter::process_diagnostics_event(
-            staleness_event("VIDEO", 120.0),
-            &peer_health_data,
-        );
-        HealthReporter::process_diagnostics_event(
-            staleness_event("VIDEO", 4_800.0),
-            &peer_health_data,
-        );
-        HealthReporter::process_diagnostics_event(
-            staleness_event("VIDEO", 90.0),
-            &peer_health_data,
-        );
-        HealthReporter::process_diagnostics_event(
-            staleness_event("SCREEN", 240_000.0),
-            &peer_health_data,
-        );
+        process_event(staleness_event("VIDEO", 120.0), &peer_health_data);
+        process_event(staleness_event("VIDEO", 4_800.0), &peer_health_data);
+        process_event(staleness_event("VIDEO", 90.0), &peer_health_data);
+        process_event(staleness_event("SCREEN", 240_000.0), &peer_health_data);
 
         let maxes = peer_health_data
             .borrow_mut()
@@ -5327,8 +5656,8 @@ mod tests {
             ],
         };
 
-        HealthReporter::process_diagnostics_event(staleness_event(0, 240_000.0), &peer_health_data);
-        HealthReporter::process_diagnostics_event(staleness_event(1, 1_200.0), &peer_health_data);
+        process_event(staleness_event(0, 240_000.0), &peer_health_data);
+        process_event(staleness_event(1, 1_200.0), &peer_health_data);
 
         let __maxes = peer_health_data
             .borrow_mut()
@@ -5373,7 +5702,7 @@ mod tests {
             ],
         };
 
-        HealthReporter::process_diagnostics_event(event, &peer_health_data);
+        process_event(event, &peer_health_data);
 
         let __maxes = peer_health_data
             .borrow_mut()
@@ -5437,7 +5766,7 @@ mod tests {
             ],
         };
 
-        HealthReporter::process_diagnostics_event(eligibility_event(0), &peer_health_data);
+        process_event(eligibility_event(0), &peer_health_data);
         {
             let health_map = peer_health_data.borrow();
             let peer = health_map.get("peer-1").expect("peer entry");
@@ -5456,7 +5785,7 @@ mod tests {
             );
         }
 
-        HealthReporter::process_diagnostics_event(staleness_event(240_000.0), &peer_health_data);
+        process_event(staleness_event(240_000.0), &peer_health_data);
         let __maxes = peer_health_data
             .borrow_mut()
             .get_mut("peer-1")
@@ -5469,8 +5798,8 @@ mod tests {
              latest visibility gate, not the default-open helper"
         );
 
-        HealthReporter::process_diagnostics_event(eligibility_event(1), &peer_health_data);
-        HealthReporter::process_diagnostics_event(staleness_event(1_200.0), &peer_health_data);
+        process_event(eligibility_event(1), &peer_health_data);
+        process_event(staleness_event(1_200.0), &peer_health_data);
         let __maxes = peer_health_data
             .borrow_mut()
             .get_mut("peer-1")
@@ -5513,14 +5842,8 @@ mod tests {
             ],
         };
 
-        HealthReporter::process_diagnostics_event(
-            eligibility_event(MEDIA_TYPE_CAMERA, 1),
-            &peer_health_data,
-        );
-        HealthReporter::process_diagnostics_event(
-            eligibility_event(MEDIA_TYPE_SCREEN, 0),
-            &peer_health_data,
-        );
+        process_event(eligibility_event(MEDIA_TYPE_CAMERA, 1), &peer_health_data);
+        process_event(eligibility_event(MEDIA_TYPE_SCREEN, 0), &peer_health_data);
 
         let peer = peer_health_data
             .borrow()
@@ -5864,8 +6187,8 @@ mod tests {
             ],
         };
 
-        HealthReporter::process_diagnostics_event(freeze_event("VIDEO", 3), &peer_health_data);
-        HealthReporter::process_diagnostics_event(freeze_event("SCREEN", 2), &peer_health_data);
+        process_event(freeze_event("VIDEO", 3), &peer_health_data);
+        process_event(freeze_event("SCREEN", 2), &peer_health_data);
 
         let map = peer_health_data.borrow();
         let peer = map.get("peer-1").expect("peer entry");
@@ -6088,6 +6411,8 @@ mod tests {
             // #2201: keyframe ARRIVALS. Distinct from skip_to_live_total above so a
             // transposition between the two counters is observable.
             "keyframe_arrivals_total": 9u64,
+            "fps_decoder_output": 23.5,
+            "frames_emitted_total": 1234u64,
         }));
 
         let mut health_map = HashMap::new();
@@ -6216,6 +6541,120 @@ mod tests {
         assert_eq!(stats.playout_paint_lag_ms, 0.0);
     }
 
+    #[test]
+    fn fps_decoder_output_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_decoder_output, Some(23.5));
+    }
+
+    #[test]
+    fn fps_decoder_output_absent_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_decoder_output, None);
+        // The cumulative counter is folded OUTSIDE that gate, so it survives fps 0 — the state
+        // it exists to be read in.
+        assert_eq!(
+            stats.frames_emitted_total,
+            Some(1234),
+            "None => the counter fold was moved inside the fps_received > 0 gate, which blanks \
+             it during the very freeze it is for"
+        );
+    }
+
+    /// Issue #2657: a camera blob that never carried the counter must fold to `None`, not
+    /// `Some(0)`. A forged 0 on a counter never moves, so `increase()` reads 0 and fabricates
+    /// an output stall.
+    #[test]
+    fn frames_emitted_total_absent_when_the_key_is_missing() {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.last_camera_stats = Some(json!({ "fps_received": 20.0 }));
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+        let pb = build_health_packet(health_map);
+
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(
+            stats.frames_emitted_total, None,
+            "Some(0) => the fold forged a count the client never reported"
+        );
+        assert_eq!(stats.fps_decoder_output, None);
+    }
+
+    #[test]
+    fn fps_decoder_output_folds_from_the_screen_bucket() {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.last_camera_stats = Some(json!({
+            "fps_received": 20.0,
+            "fps_decoder_output": 19.0,
+        }));
+        peer.last_screen_stats = Some(json!({
+            "fps_received": 8.0,
+            "fps_decoder_output": 0.0,
+            "frames_emitted_total": 250u64,
+        }));
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+        let pb = build_health_packet(health_map);
+
+        let peer_stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present");
+
+        assert_eq!(
+            peer_stats
+                .screen_video_stats
+                .as_ref()
+                .expect("screen video stats must be present")
+                .fps_decoder_output,
+            Some(0.0),
+            "the screen fold must carry its own REPORTED 0.0; None => the \
+             svs.fps_decoder_output fold is gone, Some(19.0) => it read the camera bucket"
+        );
+        assert_eq!(
+            peer_stats
+                .video_stats
+                .as_ref()
+                .expect("camera video stats must be present")
+                .fps_decoder_output,
+            Some(19.0),
+            "the camera bucket must keep its own value"
+        );
+        assert_eq!(
+            peer_stats
+                .screen_video_stats
+                .as_ref()
+                .expect("screen video stats must be present")
+                .frames_emitted_total,
+            Some(250),
+            "the screen counter must fold from the screen bucket"
+        );
+    }
+
     /// #1641 content-staleness (content AGE) folds into the wire VideoStats when fps_received > 0,
     /// and — unlike playout_latency_ms (capped at 1800ms) — carries a value ABOVE that cap. This
     /// pins both that the field round-trips AND that it is the unbounded age metric, not a clone of
@@ -6320,11 +6759,11 @@ mod tests {
         };
 
         // Distinct staleness per kind: 9000ms (screen) vs 1000ms (camera).
-        HealthReporter::process_diagnostics_event(
+        process_event(
             make_video_event(MEDIA_TYPE_SCREEN, 9000.0),
             &peer_health_data,
         );
-        HealthReporter::process_diagnostics_event(
+        process_event(
             make_video_event(MEDIA_TYPE_CAMERA, 1000.0),
             &peer_health_data,
         );
@@ -6403,14 +6842,8 @@ mod tests {
             ],
         };
 
-        HealthReporter::process_diagnostics_event(
-            make_event(MEDIA_TYPE_SCREEN, 7),
-            &peer_health_data,
-        );
-        HealthReporter::process_diagnostics_event(
-            make_event(MEDIA_TYPE_CAMERA, 3),
-            &peer_health_data,
-        );
+        process_event(make_event(MEDIA_TYPE_SCREEN, 7), &peer_health_data);
+        process_event(make_event(MEDIA_TYPE_CAMERA, 3), &peer_health_data);
 
         let map = peer_health_data.borrow();
         let peer = map.get("peer-1").expect("peer-1 health entry must exist");
@@ -6495,24 +6928,12 @@ mod tests {
             ],
         };
 
-        HealthReporter::process_diagnostics_event(
-            make_event(MEDIA_TYPE_SCREEN, 7.0),
-            &peer_health_data,
-        );
-        HealthReporter::process_diagnostics_event(
-            make_event(MEDIA_TYPE_CAMERA, 3.0),
-            &peer_health_data,
-        );
+        process_event(make_event(MEDIA_TYPE_SCREEN, 7.0), &peer_health_data);
+        process_event(make_event(MEDIA_TYPE_CAMERA, 3.0), &peer_health_data);
 
         // A SECOND, smaller gap per kind: the export must be the interval MAX, not the last.
-        HealthReporter::process_diagnostics_event(
-            gap_only_event(MEDIA_TYPE_SCREEN, 1),
-            &peer_health_data,
-        );
-        HealthReporter::process_diagnostics_event(
-            gap_only_event(MEDIA_TYPE_CAMERA, 0),
-            &peer_health_data,
-        );
+        process_event(gap_only_event(MEDIA_TYPE_SCREEN, 1), &peer_health_data);
+        process_event(gap_only_event(MEDIA_TYPE_CAMERA, 0), &peer_health_data);
 
         let (camera_blob, screen_blob, maxes) = {
             let mut map = peer_health_data.borrow_mut();
@@ -6600,14 +7021,8 @@ mod tests {
             ],
         };
 
-        HealthReporter::process_diagnostics_event(
-            make_event(MEDIA_TYPE_SCREEN, 0),
-            &peer_health_data,
-        );
-        HealthReporter::process_diagnostics_event(
-            make_event(MEDIA_TYPE_CAMERA, 1),
-            &peer_health_data,
-        );
+        process_event(make_event(MEDIA_TYPE_SCREEN, 0), &peer_health_data);
+        process_event(make_event(MEDIA_TYPE_CAMERA, 1), &peer_health_data);
 
         let map = peer_health_data.borrow();
         let peer = map.get("peer-1").expect("peer-1 health entry must exist");
@@ -6619,6 +7034,84 @@ mod tests {
         assert!(
             decode_eligible_from(&peer.last_camera_stats),
             "the CAMERA bucket must keep its own value, NOT inherit the screen's 0"
+        );
+    }
+
+    #[test]
+    fn fps_decoder_output_ingests_into_the_media_type_bucket() {
+        use crate::decode::peer_decoder::{MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        let make_event = |media_type: &'static str, fps: f64, total: u64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(media_type)),
+                },
+                Metric {
+                    name: "from_peer",
+                    value: MetricValue::Text(Cow::Borrowed("reporter")),
+                },
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                Metric {
+                    name: "fps_decoder_output",
+                    value: MetricValue::F64(fps),
+                },
+                Metric {
+                    name: "frames_emitted_total",
+                    value: MetricValue::U64(total),
+                },
+            ],
+        };
+
+        process_event(make_event(MEDIA_TYPE_SCREEN, 11.0, 250), &peer_health_data);
+        process_event(make_event(MEDIA_TYPE_CAMERA, 0.0, 1000), &peer_health_data);
+
+        let map = peer_health_data.borrow();
+        let peer = map.get("peer-1").expect("peer-1 health entry must exist");
+
+        assert_eq!(
+            peer.last_camera_stats
+                .as_ref()
+                .and_then(|s| s.get("fps_decoder_output"))
+                .and_then(|v| v.as_f64()),
+            Some(0.0),
+            "None => the \"fps_decoder_output\" ingest arm is gone and nothing downstream can \
+             ever see a decoder-output reading"
+        );
+        assert_eq!(
+            peer.last_screen_stats
+                .as_ref()
+                .and_then(|s| s.get("fps_decoder_output"))
+                .and_then(|v| v.as_f64()),
+            Some(11.0),
+            "the SCREEN reading must land in the screen bucket (11.0, NOT the camera's 0.0)"
+        );
+        assert_eq!(
+            peer.last_camera_stats
+                .as_ref()
+                .and_then(|s| s.get("frames_emitted_total"))
+                .and_then(|v| v.as_u64()),
+            Some(1000),
+            "None => the \"frames_emitted_total\" ingest arm is gone"
+        );
+        assert_eq!(
+            peer.last_screen_stats
+                .as_ref()
+                .and_then(|s| s.get("frames_emitted_total"))
+                .and_then(|v| v.as_u64()),
+            Some(250),
+            "the screen counter must land in the screen bucket"
         );
     }
 
@@ -6657,16 +7150,13 @@ mod tests {
 
         // A nonzero loss sample is surfaced with its peer id and rate.
         assert_eq!(
-            HealthReporter::process_diagnostics_event(
-                loss_event("peer-1", 22.0),
-                &peer_health_data
-            ),
+            process_event(loss_event("peer-1", 22.0), &peer_health_data),
             Some(("peer-1".to_string(), 22.0)),
             "a nonzero WT audio-loss sample must be forwarded"
         );
         // A ZERO sample is still surfaced (healthy peer stays in the denominator).
         assert_eq!(
-            HealthReporter::process_diagnostics_event(loss_event("peer-2", 0.0), &peer_health_data),
+            process_event(loss_event("peer-2", 0.0), &peer_health_data),
             Some(("peer-2".to_string(), 0.0)),
             "a 0.0 WT audio-loss sample must also be forwarded"
         );
@@ -6687,7 +7177,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            HealthReporter::process_diagnostics_event(unrelated, &peer_health_data),
+            process_event(unrelated, &peer_health_data),
             None,
             "an event without the loss gauge must not be forwarded"
         );
@@ -6782,6 +7272,7 @@ mod tests {
             // screen fold is observable. Without this key the whole screen fold block was
             // revertible-green.
             "keyframe_arrivals_total": 4u64,
+            "frames_emitted_total": 4321u64,
         }));
 
         let mut health_map = HashMap::new();
@@ -6910,6 +7401,8 @@ mod tests {
         // camera fixture's 9, so a bucket transposition fails. Deleting the screen fold block
         // makes this `None` (measured: it was previously revertible-green).
         assert_eq!(stats.keyframe_arrivals_total, Some(4));
+        // #2657: same unconditional rule, same reason.
+        assert_eq!(stats.frames_emitted_total, Some(4321));
     }
 
     /// Build a health packet whose peer carries NetEQ audio stats. `playout_latency_ms` is

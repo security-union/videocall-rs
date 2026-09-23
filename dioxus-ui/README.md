@@ -58,7 +58,7 @@ dioxus-ui/
       okta_sign_in_button.rs    # Okta branded button
       meetings_list.rs   # Active meetings list with CRUD
       meeting_ended_overlay.rs  # Post-meeting overlay
-      meeting_info.rs    # Meeting ID display + copy to clipboard
+      meeting_footer.rs  # In-call footer line + "Meeting info" dialog
       top_bar.rs         # Top navigation bar
       browser_compatibility.rs  # Browser feature detection
       config_error.rs    # Error display when __APP_CONFIG is missing

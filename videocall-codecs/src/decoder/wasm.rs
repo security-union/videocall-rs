@@ -734,7 +734,13 @@ fn handle_worker_diag_message(
                         ),
                     ],
                 );
-                if let Some(evt) = evt {
+                if let Some(mut evt) = evt {
+                    if let Some(fps) = stats_msg.fps_decoder_output {
+                        evt.metrics.push(metric!("fps_decoder_output", fps));
+                    }
+                    if let Some(total) = stats_msg.frames_emitted_total {
+                        evt.metrics.push(metric!("frames_emitted_total", total));
+                    }
                     let _ = global_sender().try_broadcast(evt);
                 }
             }

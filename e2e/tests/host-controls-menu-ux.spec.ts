@@ -163,18 +163,15 @@ test.describe("Host context menus — click-outside-to-close", () => {
       await openPeerListSidebar(hostPage);
 
       // ---- Locate the in-call header host-actions toggle ----
-      // Two `.menu-button` elements live inside the sidebar:
-      //   - `.sidebar-header .menu-button` (aria-label="More options"), and
-      //   - `.in-call-header .menu-button[aria-label="Host actions"]`.
-      // Scope to the in-call one explicitly — it is the menu that received
-      // the new backdrop behaviour.
+      // Scoped to `.in-call-header`: it is the menu that received the new
+      // backdrop behaviour.
       const inCallToggle = hostPage
         .locator(".in-call-header")
         .locator('button.menu-button[aria-label="Host actions"]');
       await expect(inCallToggle).toBeVisible({ timeout: 10_000 });
 
       // Scope assertions to the in-call menu wrapper to avoid matching the
-      // sidebar-header's context menu (which is a different feature).
+      // per-row peer menus, which also render `.context-menu`.
       const inCallMenuWrapper = hostPage.locator(".in-call-menu-wrapper");
       const menuItems = inCallMenuWrapper.locator(".context-menu");
       // The backdrop has no class; it is identified by its inline style.

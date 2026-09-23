@@ -1081,15 +1081,7 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
   //
   // Both bars are horizontally centered, so vertical clearance is the sole
   // discriminator: the zoom bar's BOTTOM edge must sit at or above the action
-  // bar's TOP edge.
-  //
-  // Fails-on-unfixed (geometry at 1200x800): the docked action bar (bottom:20px,
-  // ~79px tall) has its TOP edge ~99px above the viewport bottom.
-  //   - PRE-FIX `bottom:10px` → the zoom bar's BOTTOM edge sits ~10px above the
-  //     viewport bottom, i.e. ~89px BELOW the action bar's top → the boxes
-  //     overlap by ~18px and `zoomBox.y + zoomBox.height <= barBox.y` FAILS.
-  //   - POST-FIX `bottom:112px` → the zoom bar's BOTTOM edge sits ~112px above
-  //     the viewport bottom, ~13px ABOVE the action bar's top → clear.
+  // bar's TOP edge. The pre-fix `bottom:10px` zoom bar was the reported overlap.
   // ──────────────────────────────────────────────────────────────────────────
   test("the zoom bar clears the meeting action bar with no overlap", async ({ baseURL }) => {
     test.setTimeout(180_000);
@@ -1117,16 +1109,22 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
       await viewport.focus();
       await expect(zoomControls).toBeVisible();
 
-      // The action bar is fixed + `dock-bottom` by default and auto-hides via
-      // `.controls-hidden`. Park the mouse over its footprint (bottom center) so
-      // `:hover` holds it fully docked — the strictest (highest) position —
-      // through the 0.55s dock transition, then measure. (600,768) lies inside
-      // the bar's box in BOTH the hidden and docked positions, so :hover is never
-      // lost as it animates up.
+      // Hold the bar fully docked (its highest, strictest position) with `:hover`.
+      // A mousemove wakes it; hover() then waits for the reveal to settle and
+      // parks the pointer on the centre of the bar's real box.
       await expect(actionBar).toHaveCount(1);
       await expect(actionBar).toHaveClass(/\bdock-bottom\b/);
-      await hostPage.mouse.move(600, 768);
-      await hostPage.waitForTimeout(700);
+      const vp = hostPage.viewportSize();
+      expect(vp, "viewport size is known").not.toBeNull();
+      await hostPage.mouse.move(Math.floor(vp!.width / 2), Math.floor(vp!.height / 2));
+      await actionBar.hover({ timeout: 10_000 });
+      await expect
+        .poll(() => actionBar.evaluate((el) => el.matches(":hover")), {
+          timeout: 5_000,
+          message: "the pointer must be holding the action bar docked",
+        })
+        .toBe(true);
+      await hostPage.waitForTimeout(700); // the hover lift's transform transition
 
       // Presence before measurement.
       const zoomBox = await zoomControls.boundingBox();
